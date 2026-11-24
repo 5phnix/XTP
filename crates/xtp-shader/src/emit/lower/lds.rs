@@ -595,9 +595,9 @@ mod tests {
     /// The CPU's answer: each lane's read result, then its LDS dwords.
     fn expected(write: Option<&str>, read: Option<&str>, lanes: &[Lane]) -> Vec<[u32; 5]> {
         let mut lds = [0u8; LDS];
-        for (l, d) in lds.chunks_exact_mut(16).enumerate() {
-            for w in d.chunks_exact_mut(4) {
-                w.copy_from_slice(&init(l).to_le_bytes());
+        for (l, d) in lds.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            for w in d.as_chunks_mut::<4>().0 {
+                *w = init(l).to_le_bytes();
             }
         }
         if let Some(name) = write {
