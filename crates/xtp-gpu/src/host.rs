@@ -13,8 +13,13 @@
 //! `XTP_SYNC_SUBMIT=1` brings back the old synchronous model, to bisect a
 //! failure (gpu.md, risk 2): each submission is waited for and finished
 //! before `execute` returns, and there is no completion thread.
+//!
+//! A present finishes every submission before it returns, unless one frame
+//! is let run on while the title prepares the next (`XTP_FRAMES_IN_FLIGHT`,
+//! [`frames`]).
 
 pub(crate) mod buffers;
+mod frames;
 #[cfg(test)]
 mod submissions;
 mod timeline;
@@ -59,6 +64,9 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// The value the last present's copy signals: the frame a flip wait
+    /// and the next present wait for (0: none yet).
+    presented: AtomicU64,
     /// Submissions not finished yet, oldest first.
     timeline: Timeline<Pending>,
     /// Whether the completion thread runs.
@@ -88,14 +96,17 @@ unsafe impl Sync for Host {}
 /// Time spent on submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), the GPU running them (from each one's submission, or the
-/// end of the one before, until it was seen done), and the title's threads
-/// waiting for them (for the GPU, or for finishing: [`Host::waiting`]).
-static SUBMISSION_US: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// end of the one before, until it was seen done), the title's threads
+/// waiting for them (for the GPU, or for finishing: [`Host::waiting`]),
+/// and of that waiting, the part at frame ends (flip waits and presents:
+/// [`Host::at_frame_end`]).
+static SUBMISSION_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// The parts of [`SUBMISSION_US`].
 const PREPARING_US: usize = 0;
 const GPU_US: usize = 1;
 const WAITED_US: usize = 2;
+const FRAME_END_US: usize = 3;
 
 /// After submissions: GPU copy destinations and shader-written ranges
 /// written back into title memory (microseconds, bytes written), since the
@@ -396,6 +407,7 @@ fn create(software: bool) -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            presented: AtomicU64::new(0),
             timeline: Timeline::new(),
             finisher: std::sync::Once::new(),
             seen_done: Mutex::new(None),
@@ -608,6 +620,9 @@ pub(crate) struct HostList {
     /// Up to which of its submissions the list's memory was handed to the
     /// timeline by a reset: its recording since uses none of theirs.
     fresh_after: AtomicU64,
+    /// Whether its last submission was ours ([`Host::execute`]), not the
+    /// title's: a reset then waits for it to finish.
+    ours: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads:
     /// shared like `pipelines`.
@@ -832,10 +847,6 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
-/// Submissions in flight at most: a submission past them waits for the
-/// oldest first.
-const IN_FLIGHT: usize = 16;
-
 /// A list a submission in flight names.
 #[derive(Clone, Copy)]
 struct ListRef(*const HostList);
@@ -1048,6 +1059,7 @@ impl Host {
                 budget: Mutex::default(),
                 last: AtomicU64::new(0),
                 fresh_after: AtomicU64::new(0),
+                ours: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1134,7 +1146,8 @@ impl Host {
                 self.settle(list.last.load(Ordering::Acquire));
             }
         }
-        if self.timeline.len() >= IN_FLIGHT
+        // Submissions in flight at most (`frames::cap`).
+        if self.timeline.len() >= frames::cap()
             && let Some((oldest, _)) = self.timeline.span()
         {
             self.settle(oldest);
@@ -1220,6 +1233,7 @@ impl Host {
         let _ = &firsts;
         for list in runs {
             list.last.store(*submitted, Ordering::Release);
+            list.ours.store(!title, Ordering::Release);
         }
         self.timeline.push(*submitted, touches, pending);
         // `XTP_SYNC_SUBMIT`, and timed lists: finished before returning,
@@ -1259,6 +1273,37 @@ impl Host {
         if let Some((_, newest)) = self.timeline.span() {
             self.settle(newest);
         }
+    }
+
+    /// Finishes the frame presented last, up to its present's copy: before
+    /// a flip wait ends (a console flips a frame once the GPU is done with
+    /// it), and before a present records its copy (the title is then never
+    /// more than one frame ahead, even without flip waits). At once when
+    /// that present finished every submission (frames in flight off).
+    pub(crate) fn flip(&self) {
+        let presented = self.presented.load(Ordering::Acquire);
+        self.at_frame_end(|| self.settle(presented));
+    }
+
+    /// Once a present's copy is submitted (by `copy`): the frame it ends is
+    /// the one the next flip and present wait for. Unless it may run on
+    /// (`ahead`), every submission is finished now, as before frames in
+    /// flight: the title may take a present for the GPU being done.
+    fn presented(&self, copy: &HostList, ahead: bool) {
+        self.presented
+            .store(copy.last.load(Ordering::Acquire), Ordering::Release);
+        if !ahead {
+            self.at_frame_end(|| self.drain());
+        }
+    }
+
+    /// Runs `f`, a wait at a frame end, adding what this thread waited in
+    /// it to the frame-rate line's waiting at flips and presents.
+    fn at_frame_end(&self, f: impl FnOnce()) {
+        let before = waited_here();
+        f();
+        let waited = waited_here() - before;
+        SUBMISSION_US[FRAME_END_US].fetch_add(waited, Ordering::Relaxed);
     }
 
     /// Before a submission's step reads title memory `[address, address +
@@ -1808,7 +1853,17 @@ impl HostList {
     /// dynamic descriptors it keeps, its budget word) then goes to the
     /// timeline, freed or reused once that submission has finished, and
     /// the list records into fresh ones.
+    ///
+    /// A list of ours (last run by [`Host::execute`]) waits for its
+    /// submission instead. The title waits for its fences before it
+    /// rewrites what its running lists read; our code rewrites its own as
+    /// soon as it records again (the plane compositor's shader-visible
+    /// views, `dxgi::planes`), which a present finishing every submission
+    /// used to make safe, and one frame in flight does not.
     pub(crate) fn reset(&self) {
+        if self.ours.load(Ordering::Acquire) && self.running() {
+            self.settle();
+        }
         let running = if self.running() { made() } else { None };
         let allocator = {
             let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
@@ -2611,6 +2666,10 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// With frames in flight (diagnostics builds): the readback buffer of
+    /// the last frame's black-frame probe, read once that frame finished.
+    #[cfg(feature = "diagnostics")]
+    probe: Option<ID3D12Resource>,
 }
 
 /// How often the frame-rate line is logged: every 5 s, or every
@@ -2639,6 +2698,9 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// The last present, and the longest time between two this second.
+    last: std::time::Instant,
+    longest: std::time::Duration,
 }
 
 impl Meter {
@@ -2652,6 +2714,8 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            last: now,
+            longest: std::time::Duration::ZERO,
         }
     }
 
@@ -2664,6 +2728,9 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        let now = std::time::Instant::now();
+        self.longest = self.longest.max(now - self.last);
+        self.last = now;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -2674,9 +2741,10 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // Of a frame, ms preparing submissions, the GPU running them, and
-        // the title's threads waiting for them.
-        let [cpu, gpu, waited] = [PREPARING_US, GPU_US, WAITED_US]
+        // Of a frame, ms preparing submissions, the GPU running them, the
+        // title's threads waiting for them, and of that the waits at flips
+        // and presents.
+        let [cpu, gpu, waited, at_ends] = [PREPARING_US, GPU_US, WAITED_US, FRAME_END_US]
             .map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
@@ -2690,6 +2758,20 @@ impl Meter {
         // GPU and the copying back run beside them for the rest.
         let outside_ms = outside(ms, cpu + waited);
         let overlap_ms = overlapped(gpu, back_ms, waited);
+        let longest_frame = std::mem::take(&mut self.longest).as_secs_f64() * 1000.0;
+        frames::measured(
+            std::time::Instant::now(),
+            frames::Second {
+                seconds: elapsed.as_secs_f64(),
+                frames,
+                gpu,
+                waited,
+                at_ends,
+                overlap: overlap_ms,
+                longest: longest_frame,
+            },
+        );
+        let ahead = if frames::ahead() { "on" } else { "off" };
         let title = std::mem::replace(
             &mut *TITLE.lock().unwrap_or_else(|e| e.into_inner()),
             Submissions::new(),
@@ -2711,8 +2793,10 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {waited:.1} waiting for them, \
-                 {overlap_ms:.1} overlapped; {outside_ms:.1} outside submissions), \
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {waited:.1} waiting for them \
+                 ({at_ends:.1} at flips and presents), {overlap_ms:.1} overlapped; {outside_ms:.1} \
+                 outside submissions; frames in flight {ahead}, the longest frame \
+                 {longest_frame:.0} ms), \
                  {submissions:.1} submissions/frame of {lists:.1} lists, the \
                  longest {longest:.1} ms ({longest_gpu:.1} on the GPU, {longest_lists} lists), \
                  buffer copies {gpu_copies:.0} on the GPU {gpu_copy_mb:.1} MB and \
@@ -2781,7 +2865,16 @@ impl Meter {
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
+    /// shown; else, in diagnostics builds, whether the frame was black: with
+    /// frames in flight, whether the frame before it was (this one's copy
+    /// runs later; `XTP_FRAMES_IN_FLIGHT=0` reports each frame at its own
+    /// present).
+    ///
+    /// The frame presented last is finished first ([`Host::flip`]): its
+    /// copy list, back buffer and probe are free then. Then every
+    /// submission is finished before returning, unless frames in flight
+    /// let this one run on while the title prepares the next; a captured
+    /// frame is finished, to be read back.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -2818,6 +2911,11 @@ impl Host {
             }
         }
         let state = D3D12_RESOURCE_STATES(state as i32);
+        let ahead = frames::ahead();
+        self.flip();
+        // The frame before's probe: its copy has run.
+        #[cfg(feature = "diagnostics")]
+        let before = p.probe.take().map(|b| crate::capture::black(&b));
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -2854,19 +2952,21 @@ impl Host {
             p.copy.close();
             self.execute(&[&p.copy]);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            // shortcut: the frame's submissions are finished before the
-            // present returns, as when every submission was waited for (the
-            // title may take a present for the GPU being done with the
-            // frame). Only work within a frame overlaps; let one frame run
-            // on once titles are known to wait for their fences instead.
-            self.drain();
+            #[cfg(feature = "diagnostics")]
+            let ahead = ahead && capture.is_none();
+            self.presented(&p.copy, ahead);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return Some(if ahead {
+                p.probe = probe;
+                before.unwrap_or(false)
+            } else {
+                probe.is_some_and(|b| crate::capture::black(&b))
+            });
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
@@ -2912,6 +3012,8 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                probe: None,
             })
         }
     }
