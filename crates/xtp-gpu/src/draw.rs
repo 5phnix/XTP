@@ -117,6 +117,9 @@ pub(crate) struct State {
     /// (compute, unordered access): a copy of the list's own made before
     /// one is not reused after it.
     writes: u64,
+    /// A dispatch was dropped since the list's last one that ran: the next
+    /// that runs starts with a UAV barrier ([`State::dispatch_dropped`]).
+    dropped_dispatch: bool,
     /// Memory of the list's own that root views are copied into.
     own: Own,
 }
@@ -1198,12 +1201,12 @@ impl State {
         Some(copied)
     }
 
-    /// Runs a dispatch on the host.
+    /// Runs a dispatch on the host; the first that runs after dropped ones
+    /// starts with a barrier ([`State::dispatch_dropped`]).
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        const PATH: &str = "dispatch";
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            dropped(PATH, self.pipeline, Unready::NoPipeline);
+            self.dispatch_dropped(Unready::NoPipeline);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1211,23 +1214,47 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            dropped(PATH, self.pipeline, Unready::NoPipeline);
+            self.dispatch_dropped(Unready::NoPipeline);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            dropped(PATH, self.pipeline, "a graphics pipeline bound".into());
+            self.dispatch_dropped("a graphics pipeline bound".into());
             return;
         }
         if let Err(why) = self.bind(list, p, true) {
-            dropped(PATH, self.pipeline, why.into());
+            self.dispatch_dropped(why.into());
             return;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // SAFETY: an open list with everything set; the barrier names no
+        // resource.
+        unsafe {
+            if std::mem::take(&mut self.dropped_dispatch) {
+                list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+            }
+            list.list.Dispatch(x, y, z)
+        };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a dispatch that does not run; the next one of the list that
+    /// runs, direct or indirect, starts with a global UAV barrier. From Marvisak/VIctory#1392 by
+    /// kunalkhude99, for issue #1347: an RTX 4060 lost its device on a
+    /// dispatch of `4c0ac499ad613809` right after three dropped ones, and
+    /// an RTX 3060 Ti named the same program (docs/upstream/watch.md, items
+    /// 99 and 108).
+    /// The PR's reason does not hold here as such: XTP records the title's
+    /// own barriers (`list::barrier`, `list::barrier_groups`) and a dropped
+    /// dispatch records nothing, so no barrier the title asked for goes
+    /// missing. The barrier is a guard, not a proven fix. The PR puts one
+    /// after each dropped dispatch; the Series S world drops about 1,000
+    /// direct dispatches a frame (most do not translate), so here one waits
+    /// for the next dispatch that runs: one a run of drops.
+    fn dispatch_dropped(&mut self, why: Unready) {
+        self.dropped_dispatch = true;
+        dropped("dispatch", self.pipeline, why);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1770,8 +1797,12 @@ impl State {
             )
         });
         // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // copies the list keeps alive (refresh), the signature is cached;
+        // the barrier names no resource.
         unsafe {
+            if kind == DISPATCH && std::mem::take(&mut self.dropped_dispatch) {
+                list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+            }
             list.list.ExecuteIndirect(
                 &signature,
                 max,
@@ -2533,6 +2564,28 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(rectangle_vertices(7, 12, true), (12, 0));
         assert_eq!(rectangle_vertices(7, 12, false), (6, 12));
         assert_eq!(rectangle_vertices(2, 5, false), (0, 5));
+    }
+
+    /// Dropped dispatches (no pipeline) mark the list, so that its next
+    /// dispatch that runs starts with a UAV barrier (VIctory #1392): one a
+    /// run of drops; the mark goes with the title's reset. No test here
+    /// runs a dispatch (no title pipeline), nor could one see what the
+    /// barrier orders (WARP runs commands in order).
+    #[test]
+    fn dropped_dispatches_mark_the_list_for_one_barrier() {
+        let test = "draw::tests::dropped_dispatches_mark_the_list_for_one_barrier";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let list = TitleList::new();
+        let mut state = State::default();
+        assert!(!state.dropped_dispatch);
+        state.dispatch(list.host(), 1, 1, 1);
+        state.dispatch(list.host(), 1, 1, 1);
+        assert!(state.dropped_dispatch, "marked");
+        state.reset(std::ptr::null());
+        assert!(!state.dropped_dispatch, "gone with the reset");
+        list.run();
     }
 
     /// An indirect execution of no record draws and dispatches nothing,
