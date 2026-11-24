@@ -26,7 +26,9 @@ $script:XtpCloudDefaults = [ordered]@{
     imageFamily       = 'windows-2025'
     bootDiskGb        = 100
     dataDiskGb        = 300
-    diskType          = 'pd-balanced'
+    diskType          = 'pd-balanced'   # the boot disk's type
+    dataDiskType      = $null          # default: diskType; hyperdisk-ml where SSD_TOTAL_GB is short
+    dataDiskThroughput = 400           # MiB/s, for a hyperdisk-ml data disk (billed per MiB/s)
     serviceAccount    = 'xtp-vm'       # account id; created in the project if missing
     gameDir           = $null          # your dump of the title, on your PC (read only)
     goldenDir         = $null          # optional: an XTP data folder that runs start from
@@ -73,6 +75,7 @@ function Get-XtpCloudConfig {
     $cfg['path'] = $full
     $cfg['serviceAccountEmail'] = "$($cfg.serviceAccount)@$($cfg.project).iam.gserviceaccount.com"
     $cfg['dataDisk'] = "$($cfg.vm)-data"
+    if (-not $cfg.dataDiskType) { $cfg.dataDiskType = $cfg.diskType }
     return [pscustomobject]$cfg
 }
 

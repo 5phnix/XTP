@@ -18,15 +18,18 @@ param(
     [string]$Ref = '',
     [string]$Bundle = '',
     [string]$CargoArgs = '',
-    [string]$SessionUser = 'xtp'
+    [string]$SessionUser = 'xtp',
+    [string]$Owner = '',
+    [switch]$NoWait
 )
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\lib.ps1"
+if ($Owner) { $script:XtpOwner = $Owner }
 if ($CargoArgs -match '"') { throw 'CargoArgs may not contain double quotes.' }
 New-Item -ItemType Directory -Force -Path 'C:\xtp\logs' | Out-Null
 $log = Join-Path 'C:\xtp\logs' ("{0}-{1}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $Mode)
 
-Enter-XtpLock 'src'
+Enter-XtpLock 'src' -NoWait:$NoWait
 try {
     Set-XtpSource $Bundle $Ref
     $t0 = Get-Date

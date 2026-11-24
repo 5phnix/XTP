@@ -55,6 +55,8 @@ param(
     [Parameter(ParameterSetName = 'Game')] [switch]$NoBuild,
     [Parameter(ParameterSetName = 'Game')] [switch]$NoGolden,
     [Parameter(ParameterSetName = 'Game')] [switch]$NoCapture,
+    # Fail at once when another session holds the VM, instead of waiting.
+    [switch]$NoWait,
     [string]$Config
 )
 . "$PSScriptRoot\common.ps1"
@@ -65,6 +67,11 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 
 $zone = Start-XtpVm $cfg
 Send-XtpVmToolFolder $cfg $zone
+
+# Who runs this, shown to whoever waits for the VM: the Hangar pane (or the
+# user) and the worktree.
+$who = if ($env:HANGAR_PANE_NAME) { $env:HANGAR_PANE_NAME } else { $env:USERNAME }
+$owner = "$who ($(Split-Path -Leaf $(if ($Repo) { $Repo } else { $script:XtpRepoRoot })), $env:COMPUTERNAME)"
 
 # The code to build: a bundle of the local commit, or the VM clone's origin.
 $source = @{}
@@ -87,6 +94,8 @@ if ($what -ne 'device') {
         $source = @{ Bundle = 'C:\xtp\jobs\src.bundle' }
     }
     if ($Ref) { $source['Ref'] = $Ref }
+    $source['Owner'] = $owner
+    $source['NoWait'] = $NoWait.IsPresent
 }
 
 function Get-RemoteLog([string[]]$Lines) {

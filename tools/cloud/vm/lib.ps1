@@ -12,6 +12,8 @@
 #>
 
 $script:XtpJobs = 'C:\xtp\jobs'
+# Who holds the locks this script takes (set by the caller: -Owner).
+$script:XtpOwner = 'unknown'
 $script:XtpGit = 'C:\Program Files\Git\cmd\git.exe'
 
 function Enter-XtpLock([string]$Name, [switch]$NoWait) {
@@ -22,16 +24,19 @@ function Enter-XtpLock([string]$Name, [switch]$NoWait) {
         try {
             $fs = [System.IO.File]::Open($lock, 'CreateNew', 'Write', 'Read')
             $w = New-Object System.IO.StreamWriter($fs)
-            $w.WriteLine($PID); $w.WriteLine((Get-Date).ToString('o')); $w.Close()
+            # pid, since, who (run-remote.ps1 passes the Hangar pane or user, and the worktree).
+            $w.WriteLine($PID); $w.WriteLine((Get-Date).ToString('o')); $w.WriteLine($script:XtpOwner); $w.Close()
             return
         } catch [System.IO.IOException] {
-            $holder = Get-Content -LiteralPath $lock -ErrorAction SilentlyContinue | Select-Object -First 1
+            $info = @(Get-Content -LiteralPath $lock -ErrorAction SilentlyContinue)
+            $holder = $info | Select-Object -First 1
             if ($holder -match '^\d+$' -and -not (Get-Process -Id ([int]$holder) -ErrorAction SilentlyContinue)) {
                 Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
                 continue
             }
-            if ($NoWait) { throw "$lock is held by pid $holder." }
-            if (-not $said) { [Console]::Out.WriteLine("waiting for $Name (held by pid $holder)"); $said = $true }
+            $who = "pid $holder, $($info[2]), since $($info[1])"
+            if ($NoWait) { throw "The VM is busy: $Name is held by $who." }
+            if (-not $said) { [Console]::Out.WriteLine("waiting for $Name, held by $who"); $said = $true }
             Start-Sleep -Seconds 10
         }
     }

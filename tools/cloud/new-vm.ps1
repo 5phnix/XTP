@@ -142,14 +142,17 @@ if ($zone) {
 $region = $zone -replace '-[a-z]$', ''
 
 # --- 2. The data disk ------------------------------------------------------
-Write-Step "Data disk $($cfg.dataDisk) ($($cfg.dataDiskGb) GB $($cfg.diskType)) in $zone"
+Write-Step "Data disk $($cfg.dataDisk) ($($cfg.dataDiskGb) GB $($cfg.dataDiskType)) in $zone"
 $null = Invoke-Gcloud -Arguments (@('compute', 'disks', 'describe', $cfg.dataDisk, "--zone=$zone", '--format=value(name)') + $base) -AllowFail
 if ($LASTEXITCODE -ne 0) {
-    $null = Invoke-Gcloud -Arguments (@('compute', 'disks', 'create', $cfg.dataDisk, "--zone=$zone", "--size=$($cfg.dataDiskGb)GB",
-            "--type=$($cfg.diskType)", '--labels=app=xtp') + $base) -AllowFail
+    $a = @('compute', 'disks', 'create', $cfg.dataDisk, "--zone=$zone", "--size=$($cfg.dataDiskGb)GB",
+        "--type=$($cfg.dataDiskType)", '--labels=app=xtp')
+    # Hyperdisk ML has its own quota (HDML_TOTAL_GB), and bills its throughput.
+    if ($cfg.dataDiskType -eq 'hyperdisk-ml') { $a += "--provisioned-throughput=$($cfg.dataDiskThroughput)" }
+    $null = Invoke-Gcloud -Arguments ($a + $base) -AllowFail
     if ($LASTEXITCODE -ne 0) {
         if ($global:XtpGcloudError -match 'SSD_TOTAL_GB|[Qq]uota') {
-            throw "Disk quota refused in ${region}: the boot and data disks need $($cfg.bootDiskGb + $cfg.dataDiskGb) GB of SSD_TOTAL_GB. See docs/dev/cloud-setup.md, 'Quotas'.`n$global:XtpGcloudError"
+            throw "Disk quota refused in ${region}: the boot and data disks need $($cfg.bootDiskGb + $cfg.dataDiskGb) GB of SSD_TOTAL_GB (or set dataDiskType to hyperdisk-ml). See docs/dev/cloud-setup.md, 'Quotas'.`n$global:XtpGcloudError"
         }
         throw $global:XtpGcloudError
     }

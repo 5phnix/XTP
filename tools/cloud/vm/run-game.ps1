@@ -33,16 +33,22 @@ param(
     [string]$XtpArgs = '',
     [switch]$NoGolden,
     [switch]$NoCapture,
-    [string]$SessionUser = 'xtp'
+    [string]$SessionUser = 'xtp',
+    # Who runs it (shown to whoever waits for the VM), and fail at once when busy.
+    [string]$Owner = '',
+    [switch]$NoWait
 )
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\lib.ps1"
+if ($Owner) { $script:XtpOwner = $Owner }
 
 $title = Join-Path 'D:\game' $TitleExe
 if (-not (Test-Path -LiteralPath $title)) { throw "No title at $title (sync-game.ps1 copies the game files)." }
 if (-not (Test-XtpSession $SessionUser)) { throw "$SessionUser is not logged on to the console (no desktop session): restart the VM, or run setup-vm.ps1." }
 
-Enter-XtpLock 'src'
+# One session at a time on this VM: the clone stays locked from the build to
+# the end of the run ('src'), and the desktop session runs one job ('session').
+Enter-XtpLock 'src' -NoWait:$NoWait
 try {
     if ($Build) {
         Set-XtpSource $Bundle $Ref
