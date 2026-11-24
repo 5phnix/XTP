@@ -1,5 +1,13 @@
 # Console wave64 compute on 32-lane hosts
 
+> From VIctory (GPL-3.0-or-later, like XTP): the plan of Marvisak/VIctory
+> #233, #320 and #439 by r4tedx, with Peter Bonanni (whole-wave sections
+> across the halves, backward permutes) and ifBars (deferred mask phis),
+> ported into XTP with the code it describes. Numbers such as #233 below
+> are VIctory pull requests, and the measurements (RTX 5070, Radeon iGPU,
+> testers' title runs) are theirs unless XTP is named. What XTP has of it,
+> and what it measured, is in [In XTP](#in-xtp).
+
 Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
@@ -29,7 +37,8 @@ layout declares the console's (`WaveSize(64)`, see `emit::lower`, where
 D3D12 reports NVIDIA's wave range as 32..32, so these programs cannot run
 there as they are. Since step 1 they stop at translation with the reason
 (`emit::Target`) instead of being refused at pipeline creation.
-`victory translate --host-lanes 32-32` counts them.
+`xtp translate --host-lanes 32-32` and `xtp shader-survey --host-lanes
+32-32` count them.
 
 ## The form
 
@@ -131,7 +140,7 @@ reach every LDS access together, so a group barrier before each access puts
 it after every earlier one. This also takes the programs that needed 64-lane
 waves only for that (one console wave per group, LDS, no cross-lane read).
 Two testers' counts on the title put those first: 120 of the 223 programs
-#233 still stopped on a 32-lane host. On an RTX 5070 most LDS tests pass
+VIctory #233 still stopped on a 32-lane host. On an RTX 5070 most LDS tests pass
 without the barrier too (that card keeps the two waves in step, and a
 branch on EXEC is an exchange, which is a barrier itself). One does not:
 with a write under one EXEC mask and a read under another and no branch
@@ -148,7 +157,7 @@ lower half's total. Only in a group of exactly 64 threads, so both halves
 are whole. Floats cross as their bits: minimum and maximum stay exact, and
 a sum is each half's sum added last, one more order of additions next to
 the console's and the host wave's own (the last bits may differ, as they
-already may in one host wave). A title run on #439 put sections next: 24
+already may in one host wave). A title run on VIctory #439 put sections next: 24
 of the 45 programs the stack still stopped.
 
 What still stops says why: `console wave64 lanes in a group of more than 64
@@ -190,7 +199,7 @@ multiply the record's x where the indirect records are already rewritten
 
 **With LDS and `s_barrier`:** the waves of a group do meet there, so they
 must stay one host group. Open; candidates are group barriers where every
-console wave provably arrives (as #189 places them) and, for the rest, a
+console wave provably arrives (as VIctory #189 places them) and, for the rest, a
 group-wide form in which every thread runs every block any console wave of
 its group enters, with each wave's scalars and effects guarded by whether
 that wave is really there.
@@ -199,7 +208,7 @@ that wave is really there.
 
 The per-lane form is wrong for a program that reads or writes a named
 lane (`v_readlane`, `v_writelane`) where its lanes branch differently
-(#225). Those instructions ignore EXEC on the console and a wave runs a loop
+(VIctory #225). Those instructions ignore EXEC on the console and a wave runs a loop
 while any lane does. Per lane, a lane that left a loop or skipped a branch
 is not there to be read or written, and never sees scalars set inside.
 Measured before the change: a loop lane t runs t times, reading lane L in
@@ -237,8 +246,8 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
 1. ~~Translate for the host's wave range; cache by it; `--host-lanes`.~~
 2. ~~Adapter selection for tests and tools.~~
 3. ~~Measure the title's programs by reason (`--host-lanes 32-32`), to
-   order the later steps.~~ Testers did, and from `965ce30` on a local
-   offline run does.
+   order the later steps.~~ Testers did, and from VIctory `965ce30` on a
+   local offline run does; in XTP, `xtp shader-survey --host-lanes 32-32`.
 4. ~~In-half programs: console-lane programs whose cross-lane operations
    all stay inside a half, with no mask read whole.~~ No new lane assignment
    was needed (see above). A later widening is LDS in multi-wave groups,
@@ -250,6 +259,68 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
 7. Multi-wave groups without LDS: one console wave per host group (the
    translator's ids, then direct and indirect dispatch counts).
 8. Multi-wave groups with LDS.
+
+## In XTP
+
+Ported from VIctory #223, #233, #320 and #439 (heads `714b818`, `d1fecaa`,
+`0fa6af4`, `c153b21`), one commit each, then XTP's own review commits.
+
+- **Translator** (`crates/xtp-shader`): everything above. `emit::translate`,
+  `translate_program` and `emit` keep their signatures and translate for
+  `Target::ANY`; `translate_for`, `translate_program_for` and `emit_for`
+  take an `emit::Target`. `HostShader::wave_size` reads the wave size a
+  translation requires from its `PSV0`.
+- **Tools** (`apps/xtp`): `xtp translate --host-lanes MIN-MAX` (and
+  `--pipelines` translates for the device's own range), `xtp translate
+  --validate` adds the module's summary to validator failures, and `xtp
+  shader-survey --host-lanes MIN-MAX` surveys for a host's waves.
+- **Not yet: the runtime** (`crates/xtp-gpu`, ported on its own): reading
+  the device's range (D3D12 options 1: `WaveLaneCountMin` and `Max` when
+  `WaveOps`), translating pipelines with `translate_for` for it, and keying
+  the shader cache by `Target::key()`. Until then the runtime translates
+  for any host, so on NVIDIA these programs still declare `WaveSize(64)`.
+
+**Measured** on the person's `shaders.rpf` (26,698 programs), every
+translation checked by dxil.dll, 2026-11-24:
+
+| | before the stack | after, any host or AMD (`32-64`) | after, NVIDIA (`32-32`) |
+|---|---|---|---|
+| programs translated | 22,485 | 22,508 | 22,464 |
+| compute programs translated | 1,444 | 1,467 | 1,423 |
+| compute requiring `WaveSize(64)` | 320 (see below) | 332 | 0 |
+| console wave64 compute at `WaveSize(32)` | 0 | 0 | 288 (276 valid) |
+
+- On NVIDIA, 288 of the 332 console wave64 programs that require 64-lane
+  waves elsewhere translate at `WaveSize(32)`. 276 are valid; the other
+  12 are refused at `WaveSize(64)` too, for a compute `sample` with
+  implicit derivatives (not this stack's). 320 of the 332 translated
+  before the stack, requiring `WaveSize(64)` then too (the stack does not
+  change the wave size a translation for 64-lane waves declares; the old
+  survey did not count it), which NVIDIA refuses at pipeline creation. 44
+  still stop: 40 in groups of more than 64 threads (steps 7
+  and 8), 4 with a whole-wave section in a group of another size.
+- For any host, nothing that translated before is lost. 250 compute
+  translations change (the console flow on every host) and are as valid
+  as before (240 valid, 10 refused before and after); 23 more translate
+  (12 valid; the other 11 have the same compute `sample` refusal).
+- Tests: on the PC's RTX 4080 SUPER (two halves) and its Radeon iGPU
+  (native wave64), every split and console-flow test was exact. Tests on
+  that PC now run on WARP (`XTP_TEST_ADAPTER=warp`), where the tests that
+  need hardware adapters skip.
+
+**Changed in review** (the commits after the four ports): where the
+console flow is not needed for a program to run, a program both forms
+refuse reports the per-lane form's blocker (the survey's buckets); the
+module summary allocates once per operation, not per call; this crate's
+GPU tests follow `XTP_TEST_ADAPTER`. **Known risks, not changed:** the
+halves branch alike only while their scalars agree, which holds for
+everything the translator computes but not for a scalar load of memory
+another group changes during the dispatch (then the halves' exchanges
+would not pair); lanes outside EXEC still read LDS at their own address
+in the console flow (an out-of-range read of group-shared memory is
+undefined in D3D12 but does not fault, and its value is discarded); every
+console branch costs a ballot and two group barriers, and every LDS access
+one barrier.
 
 ## Credit
 
