@@ -11,6 +11,7 @@
 //! often states the reason. Panics of ours go to the crash log too.
 
 use std::ptr::null_mut;
+
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -25,6 +26,8 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleExW,
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+
+use crate::insn;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
@@ -120,7 +123,9 @@ fn title_output() -> String {
         .collect()
 }
 
-/// Installs the handlers; call once before running title code.
+/// Installs the handlers, and the reports of failures no handler sees
+/// (`fastfail`: CRT invalid parameters, the process ending with a
+/// failure status); call once before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
@@ -134,6 +139,7 @@ pub fn report_crashes() {
         AddVectoredExceptionHandler(0, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));
     }
+    crate::fastfail::install();
 }
 
 /// What the vectored handler reports as it happens.
@@ -148,8 +154,12 @@ const FATAL: [i32; 6] = [
 
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
-/// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
-/// a spin loop around them works with mwaitx as a yield.
+/// line at `rax` (at `eax` with an address-size prefix, a whole loop of
+/// them at once: `insn::clzero_loop`); `monitorx`/`mwaitx` (`0f 01 fa`/`fb`)
+/// are wait hints, so a spin loop around them works with mwaitx as a yield;
+/// `rdpru` (`0f 01 fd`) reads MPERF and APERF from the TSC; `rdpid` reads
+/// the processor number; `clwb` has nothing to do; SSE4a works on the
+/// saved registers.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
@@ -160,46 +170,129 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             return false;
         }
         let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
-            _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
-                let mut bytes = [0u8; 32];
-                let n = room.min(bytes.len());
-                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
-                    // A whole write-back loop in one exception (see `clwb_loop`).
-                    let limit = *gpr(context, pass.limit);
-                    let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
-                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
-                    context.Rip += pass.len as u64;
-                    return true;
-                }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
-                {
-                    // A write-back hint: the PC's memory is coherent, so it has nothing to do.
-                    context.Rip += len as u64;
-                    return true;
-                }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
-                    return false;
-                };
-                context.Rip += len as u64;
-                return true;
+        // Only bytes inside the faulting instruction's page are read: the
+        // next page may not be mapped.
+        let room = 0x1000 - (context.Rip as usize & 0xfff);
+        let mut buffer = [0u8; 32];
+        let n = room.min(buffer.len());
+        std::ptr::copy_nonoverlapping(code, buffer.as_mut_ptr(), n);
+        let Some(len) = emulate(&buffer[..n], code, context) else {
+            return false;
+        };
+        context.Rip += len as u64;
+    }
+    true
+}
+
+/// Does the job of the instruction `bytes` (read from `code`) start with,
+/// on the saved `context`; returns its length (that of a whole loop for
+/// the loops), or `None` if it is not one we emulate.
+///
+/// # Safety
+/// `code` is the faulting instruction, readable up to its end, and the
+/// memory `context`'s registers make it write is the title's to write.
+unsafe fn emulate(bytes: &[u8], code: *const u8, context: &mut CONTEXT) -> Option<usize> {
+    // SAFETY: what the caller guarantees.
+    unsafe {
+        match bytes {
+            [0x0f, 0x01, 0xfc, ..] => return Some(clzero(bytes, context)),
+            [0x67, 0x0f, 0x01, 0xfc, ..] => {
+                // The line at `eax`, zero-extended, as a 32-bit address.
+                (((context.Rax as u32) & !63) as usize as *mut u8).write_bytes(0, 64);
+                return Some(4);
             }
+            [0x0f, 0x01, 0xfa, ..] => return Some(3),
+            [0x0f, 0x01, 0xfb, ..] => {
+                std::thread::yield_now();
+                return Some(3);
+            }
+            [0x0f, 0x01, 0xfd, ..] => {
+                let read = insn::rdpru(context.Rcx as u32, std::arch::x86_64::_rdtsc());
+                let read = read.unwrap_or(0);
+                (context.Rax, context.Rdx) = (read & 0xffff_ffff, read >> 32);
+                return Some(3);
+            }
+            _ => {}
         }
-        context.Rip += 3;
+        if let Some((register, len)) = insn::rdpid(bytes) {
+            let number = windows_sys::Win32::System::Threading::GetCurrentProcessorNumber();
+            *gpr(context, register) = u64::from(number);
+            return Some(len);
+        }
+        if let Some(pass) = clwb_loop(bytes) {
+            // A whole write-back loop in one exception (see `clwb_loop`).
+            let limit = *gpr(context, pass.limit);
+            let base = gpr(context, pass.base);
+            *base = if *base <= limit {
+                base.wrapping_add(((limit - *base) / 64 + 1) * 64)
+            } else {
+                base.wrapping_add(64)
+            };
+            let flags = cmp_flags(*base, limit);
+            context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+            return Some(pass.len);
+        }
+        if bytes.len() >= 15
+            && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
+        {
+            // A write-back hint: the PC's memory is coherent, so it has nothing to do.
+            return Some(len);
+        }
+        sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters)
+    }
+}
+
+/// `clzero` at the start of `bytes`: a whole loop of them if it is one
+/// (`insn::clzero_loop`) and all of its lines are writable, else the line
+/// at `rax`. Returns the length done.
+///
+/// # Safety
+/// The line at `rax` is the title's to write.
+unsafe fn clzero(bytes: &[u8], context: &mut CONTEXT) -> usize {
+    let line = context.Rax & !63;
+    if let Some(pass) = insn::clzero_loop(bytes) {
+        let limit = *gpr(context, pass.limit);
+        if let Some(passes) = pass.passes(context.Rax, limit)
+            && writable(line, passes * 64)
+        {
+            // SAFETY: committed and writable, checked just above; the
+            // title's loop would write the same lines.
+            unsafe { (line as *mut u8).write_bytes(0, (passes * 64) as usize) };
+            context.Rax += passes * 64;
+            let flags = cmp_flags(context.Rax, limit);
+            context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+            return pass.len;
+        }
+    }
+    // SAFETY: the caller's guarantee.
+    unsafe { (line as *mut u8).write_bytes(0, 64) };
+    3
+}
+
+/// Whether all of `[start, start + len)` is committed, writable memory (a
+/// guard page is not).
+fn writable(start: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let mut at = start;
+    while at < end {
+        // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: reads the address space's bookkeeping, not the memory.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let write = matches!(
+            info.Protect & 0xff,
+            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+        );
+        if n == 0 || info.State != MEM_COMMIT || !write || info.Protect & PAGE_GUARD != 0 {
+            return false;
+        }
+        at = info.BaseAddress as u64 + info.RegionSize as u64;
     }
     true
 }
@@ -541,7 +634,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
 /// instruction up, by the unwind data of each image (the Windows loader
 /// registered it for title images too). Code without unwind data (our
 /// thunks, leaf functions) is taken to have its return address at `rsp`.
-fn unwind(context: CONTEXT) -> Vec<u64> {
+pub(crate) fn unwind(context: CONTEXT) -> Vec<u64> {
     let (mut low, mut high) = (0, 0);
     // SAFETY: writes the current thread's stack bounds.
     unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
@@ -1006,5 +1099,247 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    /// Gives `code` to the emulation as if it faulted at its first byte with
+    /// `context`'s registers, like `emulate_as`; the registers it changes
+    /// are left in `context`.
+    fn emulate_in(code: &[u8], context: &mut CONTEXT) -> Option<u64> {
+        let mut bytes = [0xcc_u8; 16];
+        bytes[..code.len()].copy_from_slice(code);
+        let start = bytes.as_ptr() as u64;
+        context.Rip = start;
+        // SAFETY: a zeroed record is valid; the emulation reads only `bytes`
+        // and writes `context` and the memory its registers name, which the
+        // tests own.
+        unsafe {
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: context,
+            };
+            let emulated = emulate_amd_only(&mut pointers);
+            emulated.then(|| context.Rip - start)
+        }
+    }
+
+    fn context() -> CONTEXT {
+        // SAFETY: a zeroed CONTEXT is valid.
+        unsafe { std::mem::zeroed() }
+    }
+
+    #[test]
+    fn emulated_rdpru_reads_mperf_and_aperf_from_the_tsc() {
+        let rdpru = [0x0f, 0x01, 0xfd];
+        let mut c = context();
+        c.Rcx = 1; // APERF
+        c.EFlags = 0x8d5; // every status flag, which rdpru leaves alone
+        // SAFETY: reads the time-stamp counter.
+        let before = unsafe { std::arch::x86_64::_rdtsc() };
+        assert_eq!(emulate_in(&rdpru, &mut c), Some(3));
+        assert_eq!((c.Rax >> 32, c.Rdx >> 32), (0, 0), "32-bit halves");
+        assert!(c.Rdx << 32 | c.Rax >= before);
+        assert_eq!(c.EFlags, 0x8d5);
+        // No such register: zero.
+        c.Rcx = 2;
+        assert_eq!(emulate_in(&rdpru, &mut c), Some(3));
+        assert_eq!((c.Rax, c.Rdx), (0, 0));
+    }
+
+    #[test]
+    fn emulated_rdpid_writes_the_processor_number() {
+        let mut c = context();
+        c.R9 = u64::MAX;
+        // rdpid r9
+        assert_eq!(emulate_in(&[0xf3, 0x41, 0x0f, 0xc7, 0xf9], &mut c), Some(5));
+        assert!(c.R9 < 64, "a processor of the group: {:#x}", c.R9);
+        assert_eq!(c.Rax, 0, "no other register");
+    }
+
+    /// A fresh page of ours below 4 GiB, where a 32-bit address reaches.
+    fn low_page() -> *mut u8 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        for hint in (0x1000_0000_usize..0xf000_0000).step_by(0x10_0000) {
+            // SAFETY: a fresh allocation at a free address, or null.
+            let page = unsafe {
+                VirtualAlloc(
+                    hint as *const _,
+                    0x1000,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            };
+            if !page.is_null() {
+                return page.cast();
+            }
+        }
+        panic!("no free page below 4 GiB");
+    }
+
+    #[test]
+    fn emulated_clzero_with_an_address_size_prefix_zeroes_the_line_at_eax() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        let page = low_page();
+        // SAFETY: our page.
+        let bytes = unsafe {
+            page.write_bytes(0xff, 0x1000);
+            std::slice::from_raw_parts(page, 0x1000)
+        };
+        let mut c = context();
+        // The upper half of rax is not part of a 32-bit address.
+        c.Rax = 0xdead_0000_0000_0000 | (page as u64 + 0x45);
+        assert_eq!(emulate_in(&[0x67, 0x0f, 0x01, 0xfc], &mut c), Some(4));
+        assert!(bytes[0x40..0x80].iter().all(|&b| b == 0));
+        assert!(
+            bytes[..0x40]
+                .iter()
+                .chain(&bytes[0x80..])
+                .all(|&b| b == 0xff)
+        );
+        // SAFETY: releases the page, which nothing uses any more.
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// clzero; add rax, 0x40; cmp rax, rcx; jbe top
+    const CLZERO_JBE: [u8; 12] = [
+        0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xc8, 0x76, 0xf4,
+    ];
+
+    #[test]
+    fn emulated_clzero_loop_zeroes_every_line_in_one_exception() {
+        #[repr(align(64))]
+        struct Lines([u8; 6 * 64]);
+        let mut lines = Lines([0xff; 6 * 64]);
+        let start = lines.0.as_mut_ptr() as u64;
+        let mut c = context();
+        c.Rax = start + 0x45; // in line 1
+        c.Rcx = start + 0x105; // in line 4: lines 1 to 4, then past it
+        assert_eq!(emulate_in(&CLZERO_JBE, &mut c), Some(12));
+        assert_eq!(c.Rax, start + 0x145, "as the last pass leaves it");
+        assert_eq!(c.EFlags & 0x41, 0, "CF and ZF clear: the loop ends");
+        assert!(lines.0[0x40..0x140].iter().all(|&b| b == 0));
+        assert!(lines.0[..0x40].iter().all(|&b| b == 0xff));
+        assert!(lines.0[0x140..].iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn a_clzero_loop_into_memory_it_cannot_write_goes_a_line_at_a_time() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // SAFETY: two fresh pages of ours, the second made read-only.
+        let page = unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            page.write_bytes(0xff, 0x1000);
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(page.add(0x1000).cast(), 0x1000, PAGE_READONLY, &mut old),
+                0
+            );
+            page
+        };
+        let mut c = context();
+        c.Rax = page as u64 + 0xfc0; // the first page's last line
+        c.Rcx = page as u64 + 0x1100; // into the read-only page
+        assert_eq!(emulate_in(&CLZERO_JBE, &mut c), Some(3), "clzero alone");
+        assert_eq!(c.Rax, page as u64 + 0xfc0, "the loop's add is still to run");
+        // SAFETY: our first page, still readable.
+        let first = unsafe { std::slice::from_raw_parts(page, 0x1000) };
+        assert!(first[0xfc0..].iter().all(|&b| b == 0));
+        assert!(first[..0xfc0].iter().all(|&b| b == 0xff));
+        // SAFETY: releases the pages, which nothing uses any more.
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// On a CPU that has them they run natively, and the tests above test
+    /// the emulation; on one that lacks them, the vectored handler runs them.
+    #[test]
+    fn rdpru_rdpid_and_clzero_loops_run_on_any_cpu() {
+        report_crashes();
+        let (low, high): (u32, u32);
+        // SAFETY: rdpru (APERF) reads a counter into eax and edx.
+        unsafe {
+            std::arch::asm!(".byte 0x0f, 0x01, 0xfd",
+                in("ecx") 1, out("eax") low, out("edx") high)
+        };
+        assert_ne!(u64::from(high) << 32 | u64::from(low), 0, "APERF counts");
+        let id: u64;
+        // SAFETY: rdpid rax writes rax only.
+        unsafe { std::arch::asm!(".byte 0xf3, 0x0f, 0xc7, 0xf8", out("rax") id) };
+        assert_eq!(id >> 32, 0, "{id:#x}");
+        #[repr(align(64))]
+        struct Lines([u8; 4 * 64]);
+        let mut lines = Lines([0xff; 4 * 64]);
+        let start = lines.0.as_mut_ptr() as u64;
+        let end: u64;
+        // SAFETY: clzero; add rax, 0x40; cmp rax, rcx; jb top: zeroes the
+        // three lines from `start`, ours.
+        unsafe {
+            std::arch::asm!(
+                ".byte 0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xc8, 0x72, 0xf4",
+                inout("rax") start => end, in("rcx") start + 0xc0)
+        };
+        assert_eq!(end, start + 0xc0);
+        assert!(lines.0[..0xc0].iter().all(|&b| b == 0));
+        assert!(lines.0[0xc0..].iter().all(|&b| b == 0xff));
+    }
+
+    /// The title's handlers (registered after ours) still get what we do
+    /// not emulate.
+    #[test]
+    fn an_unknown_instruction_reaches_the_handlers_after_ours() {
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+        use windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        static PAGE: AtomicUsize = AtomicUsize::new(0);
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn title(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes valid exception pointers.
+            let (record, context) =
+                unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+            if record.ExceptionAddress as usize != PAGE.load(Ordering::SeqCst)
+                || record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            SEEN.fetch_add(1, Ordering::SeqCst);
+            context.Rip += 2; // past ud2
+            -1 // EXCEPTION_CONTINUE_EXECUTION
+        }
+        report_crashes();
+        // SAFETY: a fresh page of ours holding `ud2; ret`, run once with
+        // the title's handler registered after ours.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            page.copy_from_nonoverlapping([0x0f, 0x0b, 0xc3].as_ptr(), 3);
+            PAGE.store(page as usize, Ordering::SeqCst);
+            let handler = AddVectoredExceptionHandler(0, Some(title));
+            assert!(!handler.is_null());
+            let f: extern "system" fn() = std::mem::transmute(page);
+            f();
+            RemoveVectoredExceptionHandler(handler);
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+        assert_eq!(SEEN.load(Ordering::SeqCst), 1);
     }
 }
