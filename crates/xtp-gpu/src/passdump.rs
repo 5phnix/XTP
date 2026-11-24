@@ -64,12 +64,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 enum Pick {
     /// The title resource at this address.
     Address(usize),
-    /// The `n`-th texture of this size (and host format) the frame writes.
+    /// The `n`-th texture of this size (and host format) the frame writes
+    /// (through an op of this program, if given).
     Written {
         width: u32,
         height: u32,
         format: Option<u32>,
         n: usize,
+        program: Option<u64>,
     },
 }
 
@@ -92,6 +94,13 @@ fn parse(text: &str) -> Option<Selector> {
     let pick = match pick.strip_prefix("0x").or_else(|| pick.strip_prefix("0X")) {
         Some(hex) => Pick::Address(usize::from_str_radix(hex, 16).ok().filter(|&a| a != 0)?),
         None => {
+            let (pick, program) = match pick.split_once('@') {
+                Some((pick, hash)) => (
+                    pick,
+                    Some(u64::from_str_radix(hash.trim(), 16).ok().filter(|_| hash.trim().len() == 16)?),
+                ),
+                None => (pick, None),
+            };
             let mut fields = pick.split(':');
             let (w, h) = fields.next()?.split_once('x')?;
             let (width, height) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
@@ -107,6 +116,7 @@ fn parse(text: &str) -> Option<Selector> {
                 height,
                 format,
                 n,
+                program,
             }
         }
     };
@@ -122,7 +132,7 @@ fn selector() -> Option<Selector> {
             Some(s) => tracing::info!(?s, "XTP_PRESENT_TARGET: a target is shown instead of the title's image"),
             None => tracing::warn!(
                 text,
-                "XTP_PRESENT_TARGET is not <width>x<height>[:f<format>][:<n>] or 0x<address>, with an optional *<scale>"
+                "XTP_PRESENT_TARGET is not <width>x<height>[:f<format>][:<n>][@<program>] or 0x<address>, with an optional *<scale>"
             ),
         }
         selector
@@ -140,6 +150,57 @@ struct Written {
 static WRITTEN: Mutex<Option<Written>> = Mutex::new(None);
 /// The texture shown last, shown again by frames that write no match.
 static SHOWN: Mutex<Option<Arc<HostTexture>>> = Mutex::new(None);
+
+/// The program `XTP_PRESENT_TARGET`'s texture must be written by, if any.
+fn pick_program() -> Option<u64> {
+    match selector()?.pick {
+        Pick::Written { program, .. } => program,
+        Pick::Address(_) => None,
+    }
+}
+
+/// Per list, for a pick by program: the render targets and depth set last,
+/// and the unordered-access textures of the op being prepared.
+static OUTPUTS: Mutex<Option<HashMap<usize, ListOutputs>>> = Mutex::new(None);
+
+/// A list's render targets and depth, and its op's unordered-access
+/// textures.
+type ListOutputs = (Vec<usize>, Vec<usize>);
+
+/// A texture the frame writes through `targets` or `written`: noted for
+/// `XTP_PRESENT_TARGET`, at once or (a pick by program) when the op that
+/// writes it turns out to be the program's.
+fn note_output(list: &HostList, resource: This, target: bool) {
+    if pick_program().is_none() {
+        note_written(resource);
+        return;
+    }
+    let mut outputs = lock(&OUTPUTS);
+    let (targets, pending) = outputs.get_or_insert_with(HashMap::new).entry(key(list)).or_default();
+    let to = if target { targets } else { pending };
+    if !to.contains(&(resource as usize)) {
+        to.push(resource as usize);
+    }
+}
+
+/// An op of `list` described by `text`, for a pick by program: its outputs
+/// are noted if it runs the program.
+fn note_op_outputs(list: &HostList, text: &str, program: u64) {
+    let mut outputs = lock(&OUTPUTS);
+    let (targets, pending) = outputs.get_or_insert_with(HashMap::new).entry(key(list)).or_default();
+    let uavs = std::mem::take(pending);
+    if !programs(text).iter().any(|h| u64::from_str_radix(h, 16) == Ok(program)) {
+        return;
+    }
+    let written: Vec<usize> = match kind_of(text) {
+        Kind::Graphics => targets.iter().chain(&uavs).copied().collect(),
+        _ => uavs,
+    };
+    drop(outputs);
+    for r in written {
+        note_written(r as This);
+    }
+}
 
 /// Notes a texture the frame writes, for `XTP_PRESENT_TARGET`.
 fn note_written(resource: This) {
@@ -186,7 +247,14 @@ fn picked(selector: Selector) -> Option<Arc<HostTexture>> {
             let mut written = lock(&WRITTEN);
             let written = written.get_or_insert_with(Written::default);
             written.seen.clear();
-            std::mem::take(&mut written.matches).into_iter().nth(n)
+            let matches = std::mem::take(&mut written.matches);
+            // The texture shown stays while the frames write it: the order
+            // of first writes changes from frame to frame.
+            let shown = lock(&SHOWN);
+            match shown.as_ref().and_then(|s| matches.iter().find(|m| Arc::ptr_eq(s, m))) {
+                Some(same) => Some(same.clone()),
+                None => matches.into_iter().nth(n),
+            }
         }
     };
     let mut shown = lock(&SHOWN);
@@ -617,7 +685,9 @@ impl Show {
 /// Rows of each output sampled after a pass.
 const ROWS: u32 = 24;
 /// Bytes of read-back memory a frame's samples may take.
-const BUDGET: u64 = 256 << 20;
+const BUDGET: u64 = 1 << 30;
+/// Buffers this small that an op reads or writes are sampled before it.
+const SMALL: u64 = 64;
 
 /// Whether `XTP_PASS_DUMP` (and a capture folder) is set.
 fn dump_on() -> bool {
@@ -701,10 +771,18 @@ struct After {
 #[derive(Debug, Default)]
 struct Pass {
     outputs: Vec<(usize, Out)>,
-    /// Each op: whether it ran, and its text.
-    ops: Vec<(bool, String)>,
+    ops: Vec<Op>,
     /// The outputs sampled after it (empty while it goes on).
     after: Vec<After>,
+}
+
+/// An op: whether it ran, its text, and the small buffers it names
+/// (address, bytes, and where their sample is or why there is none).
+#[derive(Debug)]
+struct Op {
+    ran: bool,
+    text: String,
+    buffers: Vec<(u64, u64, Result<u64, &'static str>)>,
 }
 
 /// What one list recorded.
@@ -727,7 +805,12 @@ struct Readback {
 }
 
 impl Readback {
-    fn reserve(&mut self, device: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64), &'static str> {
+    fn reserve(
+        &mut self,
+        device: &ID3D12Device,
+        bytes: u64,
+        align: u64,
+    ) -> Result<(ID3D12Resource, u64), &'static str> {
         if self.buffer.is_none() && !self.failed {
             match readback_buffer(device, self.budget) {
                 Ok(b) => self.buffer = Some(b),
@@ -738,7 +821,7 @@ impl Readback {
             }
         }
         let buffer = self.buffer.clone().ok_or("no read-back buffer")?;
-        let at = self.used.next_multiple_of(512);
+        let at = self.used.next_multiple_of(align);
         if at + bytes > self.budget {
             return Err("read-back budget spent");
         }
@@ -862,8 +945,16 @@ impl Dump {
             _ if r.passes.is_empty() => r.passes.push(Pass::default()),
             _ => {}
         }
+        let buffers = small_buffers(text)
+            .into_iter()
+            .map(|(address, len)| (address, len, sample_buffer(readback, device, list, address, len)))
+            .collect();
         if let Some(p) = r.passes.last_mut() {
-            p.ops.push((true, text.to_owned()));
+            p.ops.push(Op {
+                ran: true,
+                text: text.to_owned(),
+                buffers,
+            });
         }
     }
 
@@ -877,7 +968,11 @@ impl Dump {
             r.passes.push(Pass::default());
         }
         if let Some(p) = r.passes.last_mut() {
-            p.ops.push((false, text));
+            p.ops.push(Op {
+                ran: false,
+                text,
+                buffers: Vec::new(),
+            });
         }
     }
 
@@ -1001,6 +1096,54 @@ fn kind_of(text: &str) -> Kind {
     }
 }
 
+/// The buffers of at most [`SMALL`] bytes an op's text names
+/// (`buffer Some((<address>, <bytes>))`), once each.
+fn small_buffers(text: &str) -> Vec<(u64, u64)> {
+    let mut found = Vec::new();
+    for part in text.split("buffer Some((").skip(1) {
+        let Some((address, rest)) = part.split_once(", ") else {
+            continue;
+        };
+        let len: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if let (Ok(address), Ok(len)) = (address.parse::<u64>(), len.parse::<u64>())
+            && (1..=SMALL).contains(&len)
+            && !found.contains(&(address, len))
+        {
+            found.push((address, len));
+        }
+    }
+    found
+}
+
+/// Records a copy of a title buffer's host copy, `len` bytes at `address`,
+/// into the read-back buffer, in `list` where it stands: where it is.
+fn sample_buffer(
+    readback: &mut Readback,
+    device: &ID3D12Device,
+    list: &HostList,
+    address: u64,
+    len: u64,
+) -> Result<u64, &'static str> {
+    let shadow = crate::shadow::find(address, len).ok_or("no host copy")?;
+    let (buffer, at) = readback.reserve(device, len, 16)?;
+    let (common, source) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    // SAFETY: an open list; the host copy (which the list keeps) and our
+    // read-back buffer, the ranges inside both. Host copies are taken as
+    // common, as `shadow` takes them.
+    unsafe {
+        list.list.ResourceBarrier(&[
+            crate::host::uav_barrier(),
+            crate::host::transition(&shadow.buffer, common, source),
+        ]);
+        list.list
+            .CopyBufferRegion(&buffer, at, &shadow.buffer, shadow.offset(address), len);
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&shadow.buffer, source, common)]);
+    }
+    list.keep(&shadow.buffer);
+    Ok(at)
+}
+
 /// Samples the outputs of `pass`, in `list` after its ops.
 fn sample_pass(readback: &mut Readback, device: &ID3D12Device, list: &HostList, pass: &mut Pass, width: u64) {
     for &(resource, how) in &pass.outputs {
@@ -1062,7 +1205,7 @@ fn sample(
     let ys = rows_of(d.Height);
     let row_bytes = pitch.next_multiple_of(512);
     let bytes = if whole { total } else { ys.len() as u64 * row_bytes };
-    let (buffer, at) = match readback.reserve(device, bytes) {
+    let (buffer, at) = match readback.reserve(device, bytes, 512) {
         Ok(r) => r,
         Err(why) => return (desc, Err(why)),
     };
@@ -1369,6 +1512,21 @@ fn programs(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// A small buffer's sample: its words as floats, then in hex.
+fn words(bytes: &[u8], len: u64, at: &Result<u64, &'static str>) -> String {
+    let at = match at {
+        Ok(at) => *at as usize,
+        Err(why) => return format!("not sampled: {why}"),
+    };
+    let Some(b) = bytes.get(at..at + len as usize) else {
+        return "not read back".to_owned();
+    };
+    let words: Vec<u32> = b.as_chunks::<4>().0.iter().map(|&w| u32::from_le_bytes(w)).collect();
+    let floats: Vec<String> = words.iter().map(|&w| format!("{}", f32::from_bits(w))).collect();
+    let hex: Vec<String> = words.iter().map(|w| format!("{w:08x}")).collect();
+    format!("[{}] ({})", floats.join(", "), hex.join(" "))
+}
+
 /// The report of `lists` (in submission order), their samples in `bytes`.
 fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
     let passes: usize = lists.iter().map(|l| l.passes.len()).sum();
@@ -1377,7 +1535,7 @@ fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
         .iter()
         .flat_map(|l| &l.passes)
         .flat_map(|p| &p.ops)
-        .filter(|o| !o.0)
+        .filter(|o| !o.ran)
         .count();
     let mut out = format!(
         "XTP pass dump of frame {frame}: {} lists, {passes} passes, {ops} ops ({dropped} dropped).\n\
@@ -1400,8 +1558,8 @@ fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
     for (l, list) in lists.iter().enumerate() {
         for pass in &list.passes {
             n += 1;
-            let ran = pass.ops.iter().filter(|o| o.0).count();
-            let mut hashes: Vec<&str> = pass.ops.iter().flat_map(|o| programs(&o.1)).collect();
+            let ran = pass.ops.iter().filter(|o| o.ran).count();
+            let mut hashes: Vec<&str> = pass.ops.iter().flat_map(|o| programs(&o.text)).collect();
             hashes.sort_unstable();
             hashes.dedup();
             let _ = writeln!(
@@ -1436,8 +1594,11 @@ fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
         for pass in &list.passes {
             n += 1;
             let _ = writeln!(out, "P{n} L{}", l + 1);
-            for (ran, text) in &pass.ops {
-                let _ = writeln!(out, "  {}{text}", if *ran { "" } else { "DROPPED " });
+            for op in &pass.ops {
+                let _ = writeln!(out, "  {}{}", if op.ran { "" } else { "DROPPED " }, op.text);
+                for (address, len, at) in &op.buffers {
+                    let _ = writeln!(out, "    buffer {address:#x}+{len} before it: {}", words(bytes, *len, at));
+                }
             }
         }
     }
@@ -1462,10 +1623,17 @@ pub(crate) fn op<'a, F: FnOnce() -> String + 'a>(
     list: &HostList,
     what: F,
 ) -> Box<dyn FnOnce() -> String + 'a> {
-    if !recording() {
+    let program = pick_program();
+    if !recording() && program.is_none() {
         return Box::new(what);
     }
     let text = what();
+    if let Some(program) = program {
+        note_op_outputs(list, &text, program);
+    }
+    if !recording() {
+        return Box::new(move || text);
+    }
     if let Some(host) = crate::host::host() {
         CURRENT.set(key(list));
         dump()
@@ -1478,13 +1646,19 @@ pub(crate) fn op<'a, F: FnOnce() -> String + 'a>(
 /// `State::set_targets`: the render targets and depth of `list`'s next
 /// draws (title resources; depth 0 for none).
 pub(crate) fn targets(list: &HostList, targets: &[usize], depth: usize) {
+    if pick_program().is_some()
+        && let Some(o) = lock(&OUTPUTS).as_mut()
+        && let Some((t, _)) = o.get_mut(&key(list))
+    {
+        t.clear();
+    }
+    CURRENT.set(key(list));
     for &t in targets.iter().chain((depth != 0).then_some(&depth)) {
-        note_written(t as This);
+        note_output(list, t as This, true);
     }
     if !recording() {
         return;
     }
-    CURRENT.set(key(list));
     dump()
         .get_or_insert_with(|| Dump::new(BUDGET, dump_width()))
         .targets(list, targets, depth);
@@ -1493,11 +1667,11 @@ pub(crate) fn targets(list: &HostList, targets: &[usize], depth: usize) {
 /// `readable`: a texture the op being prepared in `list` binds for
 /// unordered access.
 pub(crate) fn written(list: &HostList, resource: This) {
-    note_written(resource);
+    CURRENT.set(key(list));
+    note_output(list, resource, false);
     if !recording() {
         return;
     }
-    CURRENT.set(key(list));
     dump()
         .get_or_insert_with(|| Dump::new(BUDGET, dump_width()))
         .written(list, resource as usize);
@@ -1506,10 +1680,16 @@ pub(crate) fn written(list: &HostList, resource: This) {
 /// `note_unready`: a draw or dispatch of `pipeline`, recorded at `path`,
 /// that does not run for `why`.
 pub(crate) fn dropped(path: &str, pipeline: usize, why: &impl std::fmt::Debug) {
+    let list = CURRENT.get();
+    if pick_program().is_some()
+        && let Some(o) = lock(&OUTPUTS).as_mut()
+        && let Some((_, pending)) = o.get_mut(&list)
+    {
+        pending.clear();
+    }
     if !recording() {
         return;
     }
-    let list = CURRENT.get();
     if let Some(d) = dump().as_mut() {
         d.dropped(list, format!("{path}: pipeline {pipeline:#x} {why:?}"));
     }
@@ -1576,7 +1756,8 @@ mod tests {
                     width: 1280,
                     height: 720,
                     format: Some(62),
-                    n: 0
+                    n: 0,
+                    program: None
                 },
                 scale: 1.0
             })
@@ -1588,7 +1769,8 @@ mod tests {
                     width: 1920,
                     height: 1080,
                     format: Some(10),
-                    n: 2
+                    n: 2,
+                    program: None
                 },
                 scale: 0.25
             })
@@ -1600,7 +1782,30 @@ mod tests {
                 scale: 4.0
             })
         );
-        for bad in ["", "1280", "1280x", "0x", "0x0", "1280x720:fz", "1280x720*x", "1280x720*inf"] {
+        assert_eq!(
+            parse("1280x720:f62@2dc364df5d3278b8*2"),
+            Some(Selector {
+                pick: Pick::Written {
+                    width: 1280,
+                    height: 720,
+                    format: Some(62),
+                    n: 0,
+                    program: Some(0x2dc3_64df_5d32_78b8)
+                },
+                scale: 2.0
+            })
+        );
+        for bad in [
+            "",
+            "1280",
+            "1280x",
+            "0x",
+            "0x0",
+            "1280x720:fz",
+            "1280x720*x",
+            "1280x720*inf",
+            "1280x720@12",
+        ] {
             assert_eq!(parse(bad), None, "{bad}");
         }
     }
@@ -1636,6 +1841,10 @@ mod tests {
         assert_eq!(
             programs("dispatch 1x1x1 compute x | 1f55c45de66dc2c4: u0=0x0 [heap 3: a] | 0123456789abcdef: u1=0x4"),
             vec!["1f55c45de66dc2c4", "0123456789abcdef"]
+        );
+        assert_eq!(
+            small_buffers(r#"x tables ["a Srv s0+16: buffer Some((40221212656, 16))", "a Srv s0+40: buffer Some((41111749488, 384))", "a Uav s1+8: uav buffer Some((7, 64))", "b Srv s0+16: buffer Some((40221212656, 16))"]"#),
+            vec![(40221212656, 16), (7, 64)]
         );
     }
 
@@ -1732,10 +1941,18 @@ mod tests {
             return;
         };
         let target = cleared(8, 4, 10, [0.5, 0.25, 0.0, 1.0]);
+        // A 16-byte buffer the draw reads, its host copy up to date.
+        let exposure = crate::testgpu::TitleBuffer::new(256);
+        exposure.set_words(|i| [0x3f80_0000, 0x4000_0000, 0, 0x3e80_0000][i % 4]);
         let mut dump = Dump::new(1 << 20, 0);
         let list = host.new_list().unwrap();
+        exposure.shadow().refresh(&list, exposure.address(), 16);
         dump.targets(&list, &[target as usize], 0);
-        dump.op(&host.device, &list, "draw 3x1 vertex x | 0123456789abcdef: u0=0x0");
+        let draw = format!(
+            "draw 3x1 vertex x | 0123456789abcdef: u0=0x0 tables [\"0123456789abcdef Srv s0+16: buffer Some(({}, 16))\"]",
+            exposure.address()
+        );
+        dump.op(&host.device, &list, &draw);
         dump.op(&host.device, &list, "draw 3x1 vertex x | 0123456789abcdef: u0=0x0");
         dump.dropped(key(&list), "dispatch: pipeline 0x1 NoPipeline".into());
         dump.op(&host.device, &list, "dispatch 1x1x1 compute y | fedcba9876543210: u0=0x0");
@@ -1752,6 +1969,11 @@ mod tests {
         assert!(text.contains(&after), "{text}");
         assert!(text.contains("P2 L1 1/1 ran, programs [fedcba9876543210]"), "{text}");
         assert!(text.contains("  DROPPED dispatch: pipeline 0x1 NoPipeline"), "{text}");
+        let sampled = format!(
+            "    buffer {:#x}+16 before it: [1, 2, 0, 0.25] (3f800000 40000000 00000000 3e800000)",
+            exposure.address()
+        );
+        assert!(text.contains(&sampled), "{text}");
         // Nothing is left: the read-back memory starts again.
         assert_eq!(dump.readback.used, 0);
         assert_eq!(dump.report(8), None);
