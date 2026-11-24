@@ -204,6 +204,7 @@ pub(crate) const ROWS: &[Row] = &[
         texts: &[
             "an address not from a root parameter",
             "an address from a phi",
+            "an address read from the first lane of a per-lane value",
         ],
     },
     Row {
