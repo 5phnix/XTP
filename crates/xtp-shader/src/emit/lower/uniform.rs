@@ -623,10 +623,10 @@ impl<'a> Run<'a> {
         match &inst.fields {
             Fields::Sopp { .. } | Fields::Exp { .. } => {}
             Fields::Sop { .. } => {
-                let l = if name.starts_with("s_getreg") {
+                let l = if name.starts_with("s_getreg") || source_regs(inst) == Sources::Lane {
                     Level::Lane
                 } else {
-                    self.reads(inst, b, |_| true)
+                    self.reads(inst, b)
                 };
                 all(self, l);
             }
@@ -635,7 +635,7 @@ impl<'a> Run<'a> {
                     "s_memtime" | "s_memrealtime" => Level::Lane,
                     "s_get_waveid_in_workgroup" => Level::Wave,
                     _ if self.writes_memory => Level::Lane,
-                    _ => self.reads(inst, b, |_| true),
+                    _ => self.reads(inst, b),
                 };
                 all(self, l);
             }
@@ -669,35 +669,34 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// The highest level among the reads of `inst` that `take` keeps
-    /// (by register), as block `at` reads them.
-    fn reads(&self, inst: &Inst, at: usize, take: impl Fn(Reg) -> bool) -> Level {
+    /// The highest level among the reads of the scalar instruction `inst`,
+    /// as block `at` reads them.
+    fn reads(&self, inst: &Inst, at: usize) -> Level {
         inst.reads
             .iter()
-            .filter(|&&(r, _)| take(r))
             .map(|&(_, v)| self.read(v, at))
             .max()
             .unwrap_or(Level::Group)
     }
 
-    /// A vector instruction's result: its sources (lane masks by their
-    /// lane bit), and under a guard, or where part of the register stays,
-    /// the old value and the guard.
+    /// A vector instruction's result: its sources, and under a guard, or
+    /// where part of the register stays, the old value and the guard.
     fn computed(&mut self, inst: &Inst, b: usize, i: usize) -> Level {
-        let sources = source_regs(inst, if self.p.wave64 { 2 } else { 1 });
+        let sources = source_regs(inst);
+        if sources == Sources::Lane {
+            return Level::Lane;
+        }
         let written: HashSet<Reg> = inst.writes.iter().map(|w| w.0).collect();
         let guard = self.st.guards[b][i];
         let keeps = guard.is_some() || keeps_old(inst);
         let mut l = Level::Group;
         for &(r, v) in &inst.reads {
-            if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1) {
-                continue;
-            }
-            let source = sources.as_ref().is_none_or(|s| s.contains(&r));
             let x = match r {
-                _ if !source && !(keeps && written.contains(&r)) => continue,
-                Reg::S(_) if self.is_mask(v) => self.mask_level(v, b).unwrap_or(Level::Lane),
-                _ => self.read(v, b),
+                _ if sources.has(r) => self.operand_level(inst, r, v, b),
+                // The guard, below.
+                _ if is_exec(r) => continue,
+                _ if keeps && written.contains(&r) => self.read(v, b),
+                _ => continue,
             };
             l = l.max(x);
         }
@@ -707,24 +706,42 @@ impl<'a> Run<'a> {
         l
     }
 
+    /// The level of operand register `r` of the vector instruction `inst`,
+    /// holding `v`, in block `at`: the select or carry-in by its lane bit
+    /// ([`lane_bit_operand`]); EXEC and any other lane mask read as a number
+    /// the lane's (the per-lane form holds no lane's mask as the console
+    /// has it); other registers by their value.
+    fn operand_level(&mut self, inst: &Inst, r: Reg, v: Value, at: usize) -> Level {
+        let bit = match lane_bit_operand(inst) {
+            Some(Operand::Scalar { code, dwords }) => (code..code.saturating_add(dwords))
+                .map(Reg::S)
+                .any(|s| s == r),
+            _ => false,
+        };
+        match r {
+            Reg::S(_) if bit => self.mask_level(v, at).unwrap_or(Level::Lane),
+            _ if is_exec(r) => Level::Lane,
+            Reg::S(_) if self.is_mask(v) => Level::Lane,
+            _ => self.read(v, at),
+        }
+    }
+
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) {
         let l = self.computed(inst, b, i);
         // The lane bits a compare or a carry writes do not depend on EXEC
         // (the guard): structurisation masks them.
         let bits = {
-            let sources = source_regs(inst, if self.p.wave64 { 2 } else { 1 });
-            let mut m = Level::Group;
+            let sources = source_regs(inst);
+            let mut m = if sources == Sources::Lane {
+                Level::Lane
+            } else {
+                Level::Group
+            };
             for &(r, v) in &inst.reads {
-                if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1)
-                    || sources.as_ref().is_some_and(|s| !s.contains(&r))
-                {
-                    continue;
+                if sources.has(r) {
+                    let x = self.operand_level(inst, r, v, b);
+                    m = m.max(x);
                 }
-                let x = match r {
-                    Reg::S(_) if self.is_mask(v) => self.mask_level(v, b).unwrap_or(Level::Lane),
-                    _ => self.read(v, b),
-                };
-                m = m.max(x);
             }
             m
         };
@@ -744,11 +761,18 @@ impl<'a> Run<'a> {
     /// result is the console wave's either way; a waterfall loop's read
     /// is the lane's own (`resource::Waterfall`).
     fn first_lane_read(&mut self, inst: &Inst, b: usize) {
-        let l = self.reads(
-            inst,
-            b,
-            |r| !matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1),
-        );
+        let sources = source_regs(inst);
+        let mut l = if sources == Sources::Lane {
+            Level::Lane
+        } else {
+            Level::Group
+        };
+        for &(r, v) in &inst.reads {
+            if sources.has(r) {
+                let x = self.operand_level(inst, r, v, b);
+                l = l.max(x);
+            }
+        }
         for &(_, w) in &inst.writes {
             self.first_lane
                 .entry(w)
@@ -825,11 +849,46 @@ impl<'a> Run<'a> {
     }
 }
 
-/// The registers `inst` reads as its operands (not EXEC, nor the old value
-/// of a VGPR it writes, which [`crate::ir`] adds); `None` where every read
-/// counts.
-pub(crate) fn source_regs(inst: &Inst, lanes: u8) -> Option<Vec<Reg>> {
+/// What an instruction reads as its operands ([`source_regs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Sources {
+    /// Every read counts (`v_movrel*`, `v_swap_b32`, encodings without a
+    /// list of operands).
+    All,
+    /// The registers it names as operands: not the EXEC that guards it, nor
+    /// the old value of a VGPR it writes, which [`crate::ir`] adds.
+    Regs(Vec<Reg>),
+    /// It names `vccz`, `execz` or `lds_direct`. The first two are a bit
+    /// of a whole wave's mask, which no lane holds in the per-lane form; the
+    /// third is a dword of LDS at M0, which another lane may have written.
+    /// Per lane, whatever the registers behind them (VCC, EXEC, M0) hold.
+    Lane,
+}
+
+impl Sources {
+    /// Whether a read of `r` counts as an operand. A read of EXEC counts
+    /// only where the instruction names EXEC; where every read counts,
+    /// EXEC is still only the guard.
+    pub(crate) fn has(&self, r: Reg) -> bool {
+        match self {
+            Sources::Regs(s) => s.contains(&r),
+            Sources::All | Sources::Lane => !is_exec(r),
+        }
+    }
+}
+
+/// Whether `r` is a dword of EXEC.
+pub(crate) fn is_exec(r: Reg) -> bool {
+    matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1)
+}
+
+/// Operand codes of `vccz`, `execz` and `lds_direct` ([`Sources::Lane`]).
+const PER_LANE_OPERANDS: [u8; 3] = [251, 252, 254];
+
+/// The operands `inst` reads ([`Sources`]).
+pub(crate) fn source_regs(inst: &Inst) -> Sources {
     let mut out = Vec::new();
+    let mut lane = false;
     let mut add = |op: &Operand| match *op {
         Operand::Scalar { code, .. } if code == NULL => {}
         Operand::Scalar { code, dwords } => {
@@ -838,10 +897,8 @@ pub(crate) fn source_regs(inst: &Inst, lanes: u8) -> Option<Vec<Reg>> {
         Operand::Vector { reg, dwords } => {
             out.extend((0..dwords).map(|k| Reg::V(reg.wrapping_add(k))));
         }
-        Operand::Const(251) => out.extend((0..lanes).map(|k| Reg::S(crate::ir::VCC + k))),
-        Operand::Const(252) => out.extend((0..lanes).map(|k| Reg::S(EXEC + k))),
         Operand::Const(253) => out.push(Reg::Scc),
-        Operand::Const(254) => out.push(Reg::S(M0)),
+        Operand::Const(c) if PER_LANE_OPERANDS.contains(&c) => lane = true,
         _ => {}
     };
     let name = inst.name();
@@ -849,7 +906,7 @@ pub(crate) fn source_regs(inst: &Inst, lanes: u8) -> Option<Vec<Reg>> {
     match &inst.fields {
         Fields::Valu(v) => {
             if name.contains("movrel") || name.contains("swaprel") || name == "v_swap_b32" {
-                return None;
+                return Sources::All;
             }
             v.src.iter().for_each(&mut add);
         }
@@ -888,12 +945,36 @@ pub(crate) fn source_regs(inst: &Inst, lanes: u8) -> Option<Vec<Reg>> {
         } => {
             [addr, data, saddr].into_iter().flatten().for_each(&mut add);
         }
-        _ => return None,
+        // Every read of a scalar instruction counts, its special operands
+        // aside.
+        Fields::Sop { src, .. } => {
+            src.iter().for_each(&mut add);
+            return if lane { Sources::Lane } else { Sources::All };
+        }
+        _ => return Sources::All,
+    }
+    if lane {
+        return Sources::Lane;
     }
     if matches!(inst.fields, Fields::Buffer { lds: true, .. }) {
         out.push(Reg::S(M0));
     }
-    Some(out)
+    Sources::Regs(out)
+}
+
+/// The lane mask `inst` reads bit by bit, the lane's own bit: the select
+/// of `v_cndmask_b32` and the carry-in of the `*_co_ci_u32` forms, their
+/// third operand (VOP2's implicit VCC included). A VALU instruction reads
+/// any other SGPR, a mask too, as a number.
+pub(crate) fn lane_bit_operand(inst: &Inst) -> Option<Operand> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    let name = inst.name();
+    if name != "v_cndmask_b32" && !name.contains("_co_ci_") {
+        return None;
+    }
+    v.src.get(2).copied()
 }
 
 /// Whether `inst` keeps part of a register it writes even in the lanes
@@ -1298,7 +1379,10 @@ mod tests {
     /// that are done join an exit mask, EXEC loses them, and the mask is
     /// counted after the loop. On the console every lane counts 64; each
     /// lane of the per-lane form knows only its own path. The count (and
-    /// any value made from it) is the lane's, never proven alike.
+    /// any value made from it) is the lane's, never proven alike. What
+    /// pins it is the rule for masks read as numbers (the exit mask is made
+    /// of compares' lane bits); the loop-exit rules alone are pinned by
+    /// the tests after it.
     #[test]
     fn a_mask_counted_after_a_loop_lanes_leave_apart() {
         let words = [
@@ -1320,6 +1404,287 @@ mod tests {
         ]
         .concat();
         assert_eq!(first_lanes(&words), [Level::Lane]);
+    }
+
+    /// A barrier inside a loop that lanes leave at different iterations
+    /// runs a different number of times in each lane: not the group's,
+    /// though every lane enters the loop. The loop's own branch decides how
+    /// often its blocks run (control dependence through the back edge).
+    /// After the loop every lane gets there once; with a scalar exit the
+    /// barrier inside is the group's too.
+    #[test]
+    fn barriers_in_a_loop_lanes_leave_apart() {
+        let body = |exit: &[u32]| -> Vec<u32> {
+            [
+                &LANE[..],
+                &[
+                    0xBE84_0380, // s_mov_b32 s4, 0
+                    0xBE8A_047E, // s_mov_b64 s[10:11], exec
+                    // loop:
+                    0x8104_8104, // s_add_i32 s4, s4, 1
+                    0xBF8A_0000, // s_barrier
+                ],
+                exit,
+                &[
+                    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+                    0xBF8A_0000, // s_barrier
+                ],
+            ]
+            .concat()
+        };
+        let apart = body(&[
+            0x7D82_0004, // v_cmp_lt_u32 vcc, s4, v0
+            0x8AFE_6A7E, // s_andn2_b64 exec, exec, vcc
+            0xBF89_FFFB, // s_cbranch_execnz loop
+        ]);
+        holds(&apart, &["s_barrier", "s_cbranch_execnz label_0010"]);
+        assert_eq!(barriers(&apart), [Level::Lane, Level::Group]);
+        let together = body(&[
+            0xBF0A_8404, // s_cmp_lt_u32 s4, 4
+            0xBF85_FFFC, // s_cbranch_scc1 loop
+        ]);
+        holds(&together, &["s_cbranch_scc1 label_0010"]);
+        assert_eq!(barriers(&together), [Level::Group, Level::Group]);
+    }
+
+    /// Lanes that end the program on their own (`s_endpgm` behind a branch
+    /// on their EXEC bit) never reach a barrier after it: not the group's.
+    /// Behind a branch on a scalar every lane ends or none does. (Ends lead
+    /// to one exit node in the post-dominators.)
+    #[test]
+    fn a_barrier_after_lanes_end_the_program() {
+        let lane = [
+            &LANE[..],
+            &[
+                0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+                0xBF89_0001, // s_cbranch_execnz +1
+                S_ENDPGM,    // the lanes from 20 on end here
+                0xBF8A_0000, // s_barrier
+            ],
+        ]
+        .concat();
+        holds(&lane, &["s_cbranch_execnz label_0018", "s_barrier"]);
+        assert_eq!(barriers(&lane), [Level::Lane]);
+        let scalar = [
+            S_MOV_S4_7,
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            S_ENDPGM,    // every lane ends here or none does
+            0xBF8A_0000, // s_barrier
+        ];
+        holds(&scalar, &["s_cbranch_scc1 label_0010"]);
+        assert_eq!(barriers(&scalar), [Level::Group]);
+    }
+
+    /// A loop header reached by two back edges, from the two sides of a
+    /// branch on the lane: each side sets s6 to a constant of its own, so
+    /// the header's phi has the group's arguments only, yet lanes come back
+    /// with different values. The header's phi takes the level of such
+    /// branches ([`Loop::returning`]). With one back edge after the sides
+    /// meet, s6 is the lane's by the join's phi instead, and with a branch
+    /// on the loop counter, which every lane takes alike, the group's.
+    /// (A branch on VCC tests the lane's EXEC bit too: never the group's.)
+    #[test]
+    fn a_header_reached_by_two_back_edges() {
+        // `branch`: a compare, and a branch to `other` on it.
+        let words = |branch: [u32; 2], side: u32| -> Vec<u32> {
+            [
+                &LANE[..],
+                &[
+                    0xBE84_0380, // s_mov_b32 s4, 0
+                    0xBE86_0380, // s_mov_b32 s6, 0
+                    // head:
+                    0x7E02_0206, // v_mov_b32 v1, s6
+                    RFL_S5_V1,
+                    0x8104_8104, // s_add_i32 s4, s4, 1
+                    0xBF09_8404, // s_cmp_ge_u32 s4, 4
+                    0xBF85_0006, // s_cbranch_scc1 exit
+                    branch[0],
+                    branch[1],
+                    0xBE86_0381, // s_mov_b32 s6, 1
+                    side,        // back to head, or to the join
+                    // other:
+                    0xBE86_0382, // s_mov_b32 s6, 2
+                    0xBF82_FFF5, // s_branch head
+                                 // exit:
+                ],
+            ]
+            .concat()
+        };
+        let lane = [
+            0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+            0xBF86_0002, // s_cbranch_vccz other
+        ];
+        let scalar = [
+            0xBF06_8204, // s_cmp_eq_u32 s4, 2
+            0xBF85_0002, // s_cbranch_scc1 other
+        ];
+        let back = 0xBF82_FFF7; // s_branch head
+        let to_join = 0xBF82_0001; // s_branch +1 (the other side's branch)
+        holds(
+            &words(lane, back),
+            &[
+                "v_cmp_gt_u32 vcc, 20, v0",
+                "s_cbranch_scc1 label_003C",
+                "s_cbranch_vccz label_0034",
+                "s_branch label_0010",
+            ],
+        );
+        holds(
+            &words(scalar, to_join),
+            &[
+                "s_cmp_eq_u32 s4, 2",
+                "s_cbranch_scc1 label_0034",
+                "s_branch label_0038",
+            ],
+        );
+        assert_eq!(first_lanes(&words(lane, back)), [Level::Lane]);
+        assert_eq!(first_lanes(&words(lane, to_join)), [Level::Lane]);
+        assert_eq!(first_lanes(&words(scalar, back)), [Level::Group]);
+    }
+
+    /// Two exits of a loop, one on the lane (leaving at the first
+    /// iteration) and one on a scalar (at the fourth): each exit's block
+    /// sets s6 to a constant of its own, outside the loop, so the phi
+    /// where they meet has the group's arguments only, and the only branch
+    /// it is a join point of is the scalar one. Lanes still arrive by
+    /// different exits: the phi takes the loop's leaving level
+    /// ([`Run::exit_joins_of`]). With the first exit on the loop counter
+    /// too (at the second iteration), the group's.
+    #[test]
+    fn exits_that_meet_after_the_loop() {
+        // `branch`: a compare, and a branch back to `head` on it.
+        let words = |branch: [u32; 2]| -> Vec<u32> {
+            [
+                &LANE[..],
+                &[
+                    0xBE84_0380, // s_mov_b32 s4, 0
+                    // head:
+                    0xBF09_8404, // s_cmp_ge_u32 s4, 4
+                    0xBF85_0005, // s_cbranch_scc1 late
+                    0x8104_8104, // s_add_i32 s4, s4, 1
+                    branch[0],
+                    branch[1],
+                    // early:
+                    0xBE86_0381, // s_mov_b32 s6, 1
+                    0xBF82_0001, // s_branch join
+                    // late:
+                    0xBE86_0382, // s_mov_b32 s6, 2
+                    // join:
+                    0x7E02_0206, // v_mov_b32 v1, s6
+                    RFL_S5_V1,
+                ],
+            ]
+            .concat()
+        };
+        let lane = [
+            0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+            0xBF86_FFFB, // s_cbranch_vccz head
+        ];
+        let scalar = [
+            0xBF0A_8204, // s_cmp_lt_u32 s4, 2
+            0xBF85_FFFB, // s_cbranch_scc1 head
+        ];
+        holds(
+            &words(lane),
+            &[
+                "v_cmp_gt_u32 vcc, 20, v0",
+                "s_cbranch_scc1 label_0028",
+                "s_cbranch_vccz label_000C",
+                "s_branch label_002C",
+            ],
+        );
+        holds(
+            &words(scalar),
+            &["s_cmp_lt_u32 s4, 2", "s_cbranch_scc1 label_000C"],
+        );
+        assert_eq!(first_lanes(&words(lane)), [Level::Lane]);
+        assert_eq!(first_lanes(&words(scalar)), [Level::Group]);
+    }
+
+    /// `vccz`, `execz` and `lds_direct` are the lane's, whatever VCC, EXEC
+    /// and M0 hold: a bit of a whole wave's mask, which no lane holds in
+    /// the per-lane form, and a dword of LDS. (VCC here has the group's
+    /// lane bit, M0 the group's value.) Scalar instructions too.
+    #[test]
+    fn special_operands_are_the_lanes() {
+        let vcc = [
+            S_MOV_S4_7,
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0x85EA_807E, // s_cselect_b64 vcc, exec, 0
+        ];
+        for (words, what) in [
+            (&[0x7E02_02FB][..], "v_mov_b32 v1, src_vccz"),
+            (&[0x7E02_02FC], "v_mov_b32 v1, src_execz"),
+            (
+                &[
+                    0xBEFC_0380, // s_mov_b32 m0, 0
+                    0x7E02_02FE, // v_mov_b32 v1, src_lds_direct
+                ],
+                "v_mov_b32 v1, src_lds_direct",
+            ),
+            (
+                &[
+                    0xBEEA_0480, // s_mov_b64 vcc, 0
+                    0xBE84_03FB, // s_mov_b32 s4, src_vccz
+                    0x7E02_0204, // v_mov_b32 v1, s4
+                ],
+                "s_mov_b32 s4, src_vccz",
+            ),
+        ] {
+            let p = [&vcc[..], words, &[RFL_S5_V1]].concat();
+            holds(&p, &[what]);
+            assert_eq!(first_lanes(&p), [Level::Lane], "{what}");
+        }
+    }
+
+    /// A lane mask read lane by lane, as a select or a carry-in, counts by
+    /// its lane bit (the group's here, as in BTP 6's validity flags); read
+    /// as a number by any other VALU operation, it is the lane's.
+    #[test]
+    fn masks_count_by_their_lane_bit_only_as_selects_and_carries() {
+        let mask = [
+            S_MOV_S4_7,
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0x8580_807E, // s_cselect_b64 s[0:1], exec, 0
+        ];
+        for (words, what, want) in [
+            (
+                [0xD501_0001, 0x0001_0280],
+                "v_cndmask_b32 v1, 0, 1, s[0:1]",
+                Level::Group,
+            ),
+            (
+                [0xD528_6A01, 0x0001_0080],
+                "v_add_co_ci_u32 v1, vcc, 0, 0, s[0:1]",
+                Level::Group,
+            ),
+            (
+                [0xD525_0001, 0x0001_0000],
+                "v_add_nc_u32 v1, s0, 0",
+                Level::Lane,
+            ),
+        ] {
+            let p = [&mask[..], &words, &[RFL_S5_V1]].concat();
+            holds(&p, &[what]);
+            assert_eq!(first_lanes(&p), [want], "{what}");
+        }
+    }
+
+    /// Asserts that the program of `words` ([`mesh`]) holds each
+    /// instruction of `want`: the hand-assembled words read as written (a
+    /// wrong word would test another program).
+    fn holds(words: &[u32], want: &[&str]) {
+        let p = mesh(words);
+        let text: Vec<String> = crate::gfx10::decode(&p.code)
+            .unwrap()
+            .iter()
+            .map(|i| i.text(true))
+            .collect();
+        for w in want {
+            assert!(text.iter().any(|t| t == w), "{w}: {text:#?}");
+        }
     }
 
     /// Memory the program writes may change between the loads of two host

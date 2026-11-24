@@ -34,6 +34,23 @@ impl<'a> Lower<'a> {
             // vertex fetch call, whose results arrive as inputs.
             return Err("a register the emitter does not model");
         }
+        if name == "s_getpc_b64" {
+            // Ported from fxceless's VIctory fork (commit 578d459): the address
+            // of the next instruction is no number the host has, and tables in
+            // the code are read by their tracked address. As a number the
+            // counter is that instruction's offset in the code, high dword 0,
+            // so a join of paths into tables in the code, or a first-lane read
+            // of such an address, is the byte in the code (resource tracking
+            // gives either as the computed term, `Tracer::counts_code`).
+            // shortcut: a program that uses the counter otherwise, as data,
+            // computes with that offset where the console has the address.
+            let code = dst_code.ok_or("a missing operand")?;
+            let at = self.s.m.i32(inst.machine.offset as u32 + 4);
+            let z = self.s.m.i32(0);
+            self.write(inst, Reg::S(code), at, None);
+            self.write(inst, Reg::S(code + 1), z, None);
+            return Ok(());
+        }
         let c = self.cur;
         let src32 = |l: &mut Self, k: usize| -> Result<V, Why> {
             // SOPK arithmetic reads its destination as the first source.
@@ -493,5 +510,242 @@ impl<'a> Lower<'a> {
             Val::Bit(x) => Ok(x),
             _ => Err("SCC without a value"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `s_getpc_b64` as its offset in the code: tables in the code that
+    //! resource tracking reaches through a join or a first-lane read
+    //! (`resource::Tracer::counts_code`), read back by a dispatch.
+    use crate::emit::Target;
+    use crate::emit::host::{Dispatch, Host, Root, View};
+    use crate::native::{ComputeIo, NativeProgram, RootParam, RootType, StageIo};
+
+    /// The UAV table in s0: its descriptor in s[4:7]; v5 = 4 x the lane.
+    const PROLOGUE: [u32; 6] = [
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF408_0101,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+    ];
+
+    /// `v[1:2]` = the table at `s_getpc_b64` + `lit`, plus v5.
+    const fn table_address(lit: u32) -> [u32; 8] {
+        [
+            0xBE8C_1F00, // s_getpc_b64 s[12:13]
+            0x800C_FF0C,
+            lit,         // s_add_u32 s12, s12, lit
+            0x820D_800D, // s_addc_u32 s13, s13, 0
+            0xD70F_6A01,
+            0x0000_1905, // v_add_co_u32 v1, vcc_lo, v5, s12
+            0xD528_6A02,
+            0x01A8_1A80, // v_add_co_ci_u32 v2, vcc_lo, 0, s13, vcc_lo
+        ]
+    }
+
+    /// The dwords of table `k` (1000 k + i).
+    fn table(k: u32) -> Vec<u32> {
+        (0..32).map(|i| 1000 * k + i).collect()
+    }
+
+    /// A wave32 compute program of one wave of 32 lanes, its UAV table in
+    /// user SGPR 0.
+    fn compute(words: &[u32]) -> NativeProgram {
+        NativeProgram {
+            stage: crate::HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// Lanes 0 to 15 read table 1 at their lane, lanes 16 to 31 table 2
+    /// (another `s_getpc_b64`): the address is a join of VGPRs, each lane
+    /// its own path's, as on the console. Table 1 at byte 0x80, table 2 at
+    /// 0x100.
+    fn joined() -> NativeProgram {
+        let mut w = PROLOGUE.to_vec();
+        w.extend(table_address(0x80 - 0x1C)); // s_getpc_b64 at 0x18
+        w.extend([
+            0x7D82_008F, // v_cmp_lt_u32 vcc_lo, 15, v0
+            0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+            0xBF88_0008, // s_cbranch_execz join
+        ]);
+        w.extend(table_address(0x100 - 0x48)); // s_getpc_b64 at 0x44
+        w.extend([
+            0x887E_0A7E, // join: s_or_b32 exec_lo, exec_lo, s10
+            0xDC30_8000,
+            0x037D_0001, // global_load_dword v3, v[1:2], off
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_1000,
+            0x8001_0305, // buffer_store_dword v3, v5, s[4:7], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        assert_eq!(w.len(), 0x80 / 4);
+        w.extend(table(1));
+        w.extend(table(2));
+        compute(&w)
+    }
+
+    /// Every lane computes the address of its own entry of table 1, and the
+    /// scalar load reads at the first lane's: every lane stores entry 0.
+    /// Table 1 at byte 0x5c.
+    fn first_lane() -> NativeProgram {
+        let mut w = PROLOGUE.to_vec();
+        w.extend(table_address(0x5C - 0x1C)); // s_getpc_b64 at 0x18
+        w.extend([
+            0x7E1C_0501, // v_readfirstlane_b32 s14, v1
+            0x7E1E_0502, // v_readfirstlane_b32 s15, v2
+            0xF400_0207,
+            0xFA00_0000, // s_load_dword s8, s[14:15], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E06_0208, // v_mov_b32 v3, s8
+            0xE070_1000,
+            0x8001_0305, // buffer_store_dword v3, v5, s[4:7], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        assert_eq!(w.len(), 0x5C / 4);
+        w.extend(table(1));
+        compute(&w)
+    }
+
+    /// The hand-assembled programs read as written.
+    #[test]
+    fn the_programs_decode_as_written() {
+        let text = |p: &NativeProgram| -> Vec<String> {
+            crate::gfx10::decode(&p.code)
+                .unwrap()
+                .iter()
+                .map(|i| i.text(false))
+                .collect()
+        };
+        let j = text(&joined());
+        for (at, want) in [
+            (4, "v_lshlrev_b32 v5, 2, v0"),
+            (5, "s_getpc_b64 s[12:13]"),
+            (8, "v_add_co_u32 v1, vcc_lo, v5, s12"),
+            (9, "v_add_co_ci_u32 v2, vcc_lo, 0, s13, vcc_lo"),
+            (10, "v_cmp_lt_u32 vcc_lo, 15, v0"),
+            (12, "s_cbranch_execz label_0064"),
+            (18, "s_or_b32 exec_lo, exec_lo, s10"),
+            (21, "buffer_store_dword v3, v5, s[4:7], 0 offen"),
+        ] {
+            assert_eq!(j[at], want, "{j:#?}");
+        }
+        assert!(j[19].starts_with("global_load_dword v3, v[1:2]"), "{j:#?}");
+        let f = text(&first_lane());
+        for (at, want) in [
+            (10, "v_readfirstlane_b32 s14, v1"),
+            (11, "v_readfirstlane_b32 s15, v2"),
+            (12, "s_load_dword s8, s[14:15], null"),
+            (14, "v_mov_b32 v3, s8"),
+        ] {
+            assert_eq!(f[at], want, "{f:#?}");
+        }
+    }
+
+    /// The translation of `native` for `target`, checked by dxil.dll where
+    /// it is installed, and the module's summary.
+    fn emit(native: &NativeProgram, target: Target) -> (crate::emit::HostShader, String) {
+        let c = crate::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![],
+        };
+        let s = crate::emit::translate_program_for(&c, native, target)
+            .unwrap_or_else(|(step, e)| panic!("{}: {e}", step.name()));
+        let ops = crate::emit::last_module_summary();
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut s.dxil.clone())
+                .unwrap_or_else(|e| panic!("validation: {e}\n{ops}"));
+        }
+        (s, ops)
+    }
+
+    /// What `native` stores, lane by lane, on `host`.
+    fn run(host: &Host, native: &NativeProgram) -> Vec<u32> {
+        let (cs, _) = emit(native, host.target());
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+        host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(data))],
+                views: &[View::RawUav(32)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    /// Both programs translate for 32-lane and 32-to-64-lane hosts; the
+    /// first-lane read stays a wave operation.
+    #[test]
+    fn code_tables_through_joins_and_first_lanes_translate() {
+        for target in [
+            Target {
+                lanes_min: 32,
+                lanes_max: 32,
+            },
+            Target {
+                lanes_min: 32,
+                lanes_max: 64,
+            },
+        ] {
+            emit(&joined(), target);
+            let (_, ops) = emit(&first_lane(), target);
+            assert!(ops.contains("waveReadLaneFirst"), "{target:?}: {ops}");
+        }
+    }
+
+    /// [`joined`] on the test adapter (WARP on this PC): each lane reads
+    /// its own path's table at its lane. Per lane, so any wave size runs
+    /// it.
+    #[test]
+    fn a_join_of_two_code_tables_reads_each_paths_table() {
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let out = run(&host, &joined());
+        let want: Vec<u32> = (0..32)
+            .map(|t| if t < 16 { 1000 + t } else { 2000 + t })
+            .collect();
+        assert_eq!(out[..32], want[..], "{:?}", host.target());
+    }
+
+    /// [`first_lane`] on a hardware adapter of 32-lane waves (the console
+    /// program's): every lane stores the first lane's entry, 1000. (Each
+    /// lane's own index, as the fork took it, would store 1000 + t.) WARP's
+    /// 4-lane waves have other first lanes: run with `--ignored` on the
+    /// cloud L4.
+    #[test]
+    #[ignore = "hardware: 32-lane waves"]
+    fn a_first_lane_code_table_read_is_the_first_lanes_for_every_lane() {
+        let host = Host::new(false).expect("an SM 6.6 device");
+        assert!(host.target().runs(32), "{:?}", host.target());
+        let out = run(&host, &first_lane());
+        assert_eq!(out[..32], [1000; 32], "{:?}", host.target());
     }
 }
