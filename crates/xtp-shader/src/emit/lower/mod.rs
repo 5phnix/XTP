@@ -131,7 +131,20 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// The wave sizes the host runs.
     pub target: super::Target,
+    /// Run the program as the console does (see [`CONSOLE_FLOW`]); `st`
+    /// is then [`crate::structure::structure_console`]'s.
+    pub console_cf: bool,
 }
+
+/// What [`lower`] stops with when a wave64 program needs its two 32-lane
+/// halves to exchange values on a host without 64-lane waves: lower it
+/// again from [`crate::structure::structure_console`] with
+/// [`Parts::console_cf`]. Every lane of the group (one console wave) then
+/// runs every block, branches are the console's (taken wave-wide, from
+/// masks both halves exchange through group-shared memory), and EXEC
+/// guards the vector instructions; both halves reach every exchange, so
+/// a group barrier orders it.
+pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange lanes (console flow)";
 
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
@@ -202,6 +215,18 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// A console wave64 compute program run as two 32-lane host waves
+    /// (each lane's reads stay in its half; see `Lower::new`).
+    split: bool,
+    /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
+    console_cf: bool,
+    /// Split without [`Self::console_cf`] cannot run it, the console flow can.
+    wants_console_flow: bool,
+    /// The console thread's flat id in the group (relabelled; see
+    /// [`Self::thread_id`]).
+    console_flat: Option<V>,
+    /// Group-shared slots the two halves exchange a dword through.
+    xchg: Option<V>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -290,21 +315,29 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut split = false;
+        let mut wants_console_flow = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            // Swizzles and DPP read lanes of the same 32 (rows of 16, groups
+            // of 8, 32 or 4): the rest may read the other half of a wave64.
+            let in_half = |i: &Inst| {
+                i.name().starts_with("ds_swizzle")
+                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+            };
+            let whole = |i: &Inst| {
                 let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
+                n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || {
+            };
+            let reads_whole = insts().any(whole);
+            let masks_held = {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
                 let whens = x.st.exits.iter().filter_map(|e| match *e {
@@ -328,9 +361,46 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
+            console_lanes = reads_whole || masks_held || insts().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            // On a host without 64-lane waves, a wave64 program whose lanes
+            // read only their own half runs as two 32-lane waves: what each
+            // lane reads is in its host wave, at its host lane's place in the
+            // row. Not with LDS (the console compiler may leave out barriers
+            // between the halves) nor whole-wave sections (their reductions
+            // become wave operations over the host's wave).
+            // (`v_readfirstlane` reads the console wave's first lane, which
+            // the upper half does not hold: such programs take the console
+            // flow below.)
+            split = console_lanes
+                && x.native.wave64
+                && !reads_whole
+                && !insts().any(|i| i.name() == "v_readfirstlane_b32")
+                && !masks_held
+                && s.lds_dwords == 0
+                && !x.target.runs(64)
+                && x.target.runs(32)
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            // The rest of such programs need the halves to exchange values
+            // (masks read whole, lanes of the other half): the console flow,
+            // for a group of one console wave without LDS.
+            wants_console_flow = console_lanes
+                && !split
+                && x.native.wave64
+                && !x.target.runs(64)
+                && x.target.runs(32)
+                && s.lds_dwords == 0
+                && cs.threads.iter().product::<u32>() <= 64
+                && !insts().any(|i| i.name().contains("permute"))
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            if x.console_cf {
+                console_lanes = true;
+                split = true;
+            }
+            if split {
+                s.wave_size = Some(32);
+            } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
         }
@@ -416,6 +486,11 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            split,
+            console_cf: x.console_cf,
+            wants_console_flow,
+            console_flat: None,
+            xchg: None,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -449,6 +524,9 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        if self.wants_console_flow && !self.x.console_cf {
+            return Err(unsupported(0, CONSOLE_FLOW));
+        }
         if let Some(n) = self.s.wave_size
             && !self.x.target.runs(n)
         {

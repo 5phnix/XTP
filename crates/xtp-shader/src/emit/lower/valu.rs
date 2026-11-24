@@ -3,12 +3,12 @@
 //! `v_mad_f32`), S5 (f64), S3 (`v_cvt_f32_f64`), M1 (`v_cndmask_b32` on
 //! an untracked mask).
 
-use super::mask::MaskData;
+use super::mask::{LANE_MASK, MaskData};
 use super::{Lower, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{Inst, Reg};
+use crate::ir::{EXEC, Inst, Reg};
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 
@@ -535,7 +535,11 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
-                let r = self.read_lane(a, lane);
+                let r = if self.console_cf {
+                    self.console_read_lane(a, lane)
+                } else {
+                    self.read_lane(a, lane)
+                };
                 int(self, r)
             }
             "v_writelane_b32" => {
@@ -549,7 +553,11 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
-                let me = self.lane_index();
+                let me = if self.console_cf {
+                    self.console_lane().0
+                } else {
+                    self.lane_index()
+                };
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -563,6 +571,32 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32" if self.console_cf => {
+                // The console's first lane in EXEC (lane 0 when none).
+                let a = s(self, 0)?;
+                let word = |l: &mut Self, r: u8| -> Result<V, Why> {
+                    match l.get(inst.read(Reg::S(r)).ok_or("EXEC")?)? {
+                        Val::I32(x) => Ok(x),
+                        _ => Err(LANE_MASK),
+                    }
+                };
+                let (lo, hi) = (word(self, EXEC)?, word(self, EXEC + 1)?);
+                let i32t = self.s.t.i32;
+                let flo = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+                let fhi = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+                let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+                let none_hi = self.s.m.cmp(c, pred::EQ, hi, z);
+                let fhi = self.s.m.select(c, none_hi, z, fhi);
+                let some_lo = self.s.m.cmp(c, pred::NE, lo, z);
+                let first = self.s.m.select(c, some_lo, flo, fhi);
+                let r = self.console_read_lane(a, first);
+                int(self, r)
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
