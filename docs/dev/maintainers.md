@@ -41,10 +41,16 @@ Every working day:
 3. **New issues** (`needs triage`): reproduce or ask for the missing run
    report, set the `area/...` label, remove `needs triage`. Mark small,
    well-pointed ones `good first issue` and say where to start in the issue.
-4. **Anything from the game** in an issue, PR or comment: hide or delete it
+4. **Anything from a game** in an issue, PR or comment: hide or delete it
    at once and say why. In the repository, follow
    [docs/asset-policy.md](../asset-policy.md), "If something slips through".
-5. **Waiting too long**: PRs past the turnaround of CONTRIBUTING.md
+5. **Names in issue and PR texts**: `cargo xtask policy` checks files only.
+   Read the titles, bodies and comments of new issues and PRs, and their
+   commit messages, for what CONTRIBUTING.md ("Writing about titles") leaves
+   out: names of commercial titles, their publishers and their settings,
+   local game paths, title file names. Edit them out and delete the old
+   revision from the edit history (GitHub shows edits to everyone).
+6. **Waiting too long**: PRs past the turnaround of CONTRIBUTING.md
    ("Review") get a reviewer or a comment saying when.
 
 ## Labels
@@ -72,7 +78,7 @@ not allowed to create them; a missing label makes the job fail).
 | `overlap` | `c5def5` | intake | another open PR changes the same files |
 | `first-time contributor` | `7057ff` | intake | the author's first PR here |
 | `bug` | `d73a4a` | issue form | |
-| `game progress` | `0e8a16` | issue form | |
+| `compatibility` | `0e8a16` | issue form | a compatibility report |
 | `enhancement` | `a2eeef` | issue form | |
 | `needs triage` | `ededed` | issue forms | not looked at yet |
 | `good first issue` | `7057ff` | maintainers | small, with a pointer to the code |

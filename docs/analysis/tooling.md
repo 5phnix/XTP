@@ -141,7 +141,7 @@ variable name and remember `--ignored`. xcl's convention is better for many cont
 
 XTP's version (backlog B1–B3): `XTP_SAMPLE_<KIND>` variables, also readable from a `[samples]`
 table in `xtp.toml` (env wins, as for paths today), and defaults derived from `game_dir` where
-the file has a known place in the dump (the executable, an archive). A helper in a test-support
+the file has a known place in the title folder (the executable, an archive). A helper in a test-support
 crate returns the path or skips with the standard marker (4.5). `#[ignore]` stays for benchmarks
 only.
 
@@ -301,7 +301,7 @@ bounded-memory header probe for archives of several gigabytes.
 | T1 unit | `#[cfg(test)] mod tests`, pure, data built by the test | CI and locally | nothing |
 | T2 fixtures | `hle-probe` (in process), the test title through `xtp run` (out of process) | CI and locally | Windows |
 | T3 host-dependent | translator output validated by `dxil.dll`, pipelines created, draws on WARP or a GPU, diff tests against a console DXC | locally; in CI what WARP and the runner can do | a GPU, the Windows SDK, the console SDK's DXC: skipped with the marker otherwise |
-| T4 samples | tests reading `XTP_SAMPLE_*` (formats, translator on the game's shaders, build identity and signatures) | locally, on the contributor's files | the contributor's dump: skipped with the marker otherwise |
+| T4 samples | tests reading `XTP_SAMPLE_*` (formats, translator on the game's shaders, build identity and signatures) | locally, on the contributor's inputs | a title folder: skipped with the marker otherwise |
 | T5 smoke | `cargo xtask smoke` on the game, a fixed time, from `main` and from the branch | locally, required for runtime changes | the game and a GPU |
 | T6 run reports | `report.json` of every `xtp run`, compared by `smoke-compare` and attached to bug reports | locally | as T5 |
 
@@ -561,7 +561,7 @@ read it, do not copy it.
   by hash ignores case; the policy test still passes (signatures are short, no long encoded
   runs).
 
-### B16. Game layer: tests on the contributor's dump (S; depends: B2, B15)
+### B16. Game layer: tests on a title folder (S; depends: B2, B15)
 
 - **Goal**: T4 tests for `xtp-game`: on `XTP_SAMPLE_SGD5`, every record unpacks to its stated
   size and most have a name; on the executable under `game_dir`, the build is identified or
@@ -571,7 +571,7 @@ read it, do not copy it.
 - **xcl reference**: `crates/xcl/tests/console_dlls_e2e.rs` `setup` (one shared lookup of the
   sample per test binary).
 - **Acceptance**: without the files the tests print `SKIPPED` and pass; with them they pass on
-  the contributor's dump; no assertion message contains bytes from it.
+  a title folder; no assertion message contains bytes from it.
 
 ### B17. Engine archive reader (M, when a runtime feature needs it; depends: B2)
 

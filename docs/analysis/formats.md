@@ -1,6 +1,6 @@
 # Formats and the data pipeline: VIctory (XTP's base) and xcl
 
-Analysis for XTP, 2026-11-24. XTP is VIctory imported at `ffe310e`; xcl is
+Analysis for XTP. XTP is VIctory imported at `ffe310e`; xcl is
 read as a reference only (GPL-2.0-only: behaviour may be re-implemented, code
 is never copied). Crate names below are the XTP ones (`xtp-formats` is
 VIctory's `victory-formats`, and so on); paths in VIctory are given where the
@@ -31,9 +31,9 @@ rename has not landed yet only when they differ in more than the prefix.
   of the BCPack dictionary one 16-bit word off (section 5.3). Upstream
   VIctory fixed it after `ffe310e` (its PR #658). That fix is GPL-3.0 and may
   be taken as it is.
-* **RPF needs no parser to run the title.** The title opens and decrypts its
-  own archives. Both projects only scan for plain shader records, and the
-  TOCs stay encrypted.
+* **RPF needs no parser to run the title.** XTP does not read the title's
+  archives; the title reads them itself. Both projects only scan for plain
+  shader records.
 
 ## 2. Scope and files
 
@@ -57,7 +57,7 @@ Where a fix in this area touches a GPU file, this report says so.
 
 Documents read: VIctory `README.md`, `docs/architecture.md`,
 `docs/asset-policy.md`; xcl `README.md`, `AGENTS.md`, `HANDOFF.md` (searched),
-`THIRD_PARTY.md`, `docs/specs/2026-11-20-xcl-design.md`.
+`THIRD_PARTY.md`, xcl's design notes (`docs/specs/`).
 
 ## 3. How data reaches the title in XTP today
 
@@ -79,14 +79,13 @@ samples them; a change detiles the whole texture).
 
 ## 4. Measurements
 
-Taken on the person's machine (32 logical cores), the dump read-only, no game
-data copied.
+Taken on a local title folder, read-only (32 logical cores), no game data
+copied.
 
 | What | Result |
 |---|---|
-| Dump `E:\uwu` | 22 RPF archives, 161.3 GB; largest `levels.rpf` 76.2 GB, `audio.rpf` 28.5 GB, `story000.rpf` 20.0 GB; `shaders.rpf` 0.41 GB |
-| RPF headers | all start with `9FPR` (RPF9); the 32 bytes at 0x40 are non-zero in every archive (the encrypted TOC area that xcl's probe classifies) |
-| Disk, sequential | 3,668 MB/s (4 MiB reads, 2 GiB from the middle of `levels.rpf`, one thread) |
+| RPF headers | all start with `9FPR` (RPF9) |
+| Disk, sequential | 3,668 MB/s (4 MiB reads, 2 GiB from the middle of a large archive, one thread) |
 | Disk, random | 4,914 IOPS, 322 MB/s (64 KiB reads, queue depth 1, one thread) |
 | BCPack decode, `xtp-formats` (`bcpack_throughput`, release, synthetic) | BC1 93.8 MB/s, BC4 90.8 MB/s, BC7 54.1 MB/s out, per core |
 | zlib inflate, proxy | 244 MB/s out per core (C zlib through Python on 64 MiB of the title's executable, ratio 0.52); `miniz_oxide` is not measured yet (item F14) |
@@ -104,7 +103,7 @@ detiling.
 
 | Sub-area | VIctory (XTP) state | xcl state | Tests: XTP / xcl | Throughput: XTP / xcl |
 |---|---|---|---|---|
-| RPF9 container | not parsed; the title reads it | record scan without TOC, list/extract, bounded probe for >1 GB, TOC called encrypted | 0 / 11 (rpf, probe, e2e) | n/a / not stated |
+| RPF9 container | not parsed; the title reads it | record scan without TOC, list/extract, bounded probe for >1 GB | 0 / 11 (rpf, probe, e2e) | n/a / not stated |
 | Shader records in archives | `sgd5.rs`: marker scan, sizes cross-checked, inflate | `gpu/pack.rs`: same record shape, qualified names fixed (26,503 records) | 2 / 4 | not measured on either side |
 | File path, game folder | virtual drives over host folders; the game drive is the game folder itself (writes reach it) | VFS: read-only game folder, overlay, whiteouts, hooks on KERNELBASE | 5 / 22 | n/a |
 | DirectStorage scheduling | shared pool, weighted round robin over 3 priority classes, staging bound, in-order statuses, auto-submit at half capacity | one thread per queue, requests in order | 13 / 14 | 5 s debug summary (MB/s, busy, reading, BCPack workers) / counters only |
@@ -118,7 +117,7 @@ detiling.
 | Tiling, non-XOR modes | addrlib (`Layout::new`), thin and thick 3D, mip tail, depth/stencil as two planes; copies by contiguous runs | addrlib patterns over GF(2), per-element offsets with column and row tables | 9 / 14 | runs (memcpy per run) / per element |
 | Tiling, XOR modes (`_X`, `_T`) | **not addressable**; `XGSuggestSwizzleMode` gives them only to render targets and depth | all 14 2D modes, with the pipe configuration: Series X 32 pipes / 8 packers, Series S 8 / 4 | 0 / in tiling and oracle tests | |
 | Metadata planes | missing (README: "render-target metadata planes") | CMASK and HTILE placement rules checked on 1,872 descriptions | 0 / in `xg_oracle.rs` | |
-| Checked against the console | no oracle test; no retail texture check | `xg_oracle.rs` loads the user's `xg_xs.dll` (29,700 descriptions); retail texture archive: 909 of 912 textures | | |
+| Checked against the console | no oracle test; no retail texture check | `xg_oracle.rs` compares against the console's layout library (29,700 descriptions); retail texture archive: 909 of 912 textures | | |
 | Ahead-of-time conversion | `Converter` trait and content-addressed cache; only user: shader translation; `xtp translate` warms the shader cache | `xcl shaders --precompile` fills the DXIL cache from `shaders.rpf` | 4 / several | n/a |
 | Caches | BLAKE3-keyed, write then rename, refuses the repo; no size limit or pruning; shader key = BLAKE3 of the executable | DXIL cache: one compile per shader across threads and processes (named mutex), cached blobs validated, key = translator sources + DXC version | 4+2 / several | n/a |
 
@@ -126,7 +125,7 @@ detiling.
 
 | Sub-area | Verdict | Why |
 |---|---|---|
-| RPF9 container | **Keep VIctory** (no parser); a bounded probe is optional new work (F17) | The title decrypts its archives. A parser needs the title's key, which the asset policy keeps out of the repo |
+| RPF9 container | **Keep VIctory** (no parser); a bounded probe is optional new work (F17) | XTP does not read the title's archives; the title reads them itself |
 | Shader records | **Keep VIctory** | Same scan as xcl; the shader report owns warm-up |
 | File path, game folder | **Rewrite after xcl** for the read-only rule; handed to the HLE report | Writes now reach the person's game folder. The policy is right, but the module belongs to the HLE report |
 | DirectStorage scheduling | **Keep VIctory** | Better than xcl's thread per queue |
@@ -138,7 +137,7 @@ detiling.
 | Write tracking | **New work** (F5, F6), with xcl's merged ranges and batching as reference for the GPU report | |
 | Tiling, non-XOR | **Keep VIctory** | Correct, faster copies |
 | Tiling, XOR and planes | **Rewrite after xcl** (F11-F13) | Needed once the title copies render targets or depth through the CPU, or aliases them with textures |
-| Ahead-of-time conversion | **Keep VIctory** | Nothing but shaders can be converted ahead of time (encrypted TOCs) |
+| Ahead-of-time conversion | **Keep VIctory** | Nothing but shaders can be converted ahead of time (XTP does not read the archives) |
 | Caches | **Keep VIctory, add limits** (F15) | Single flight and pruning, after xcl's DXIL cache |
 
 ### 5.3 The BC7 dictionary bug
@@ -441,8 +440,8 @@ the `XTP_` prefix once the rename lands.
 - **Depends on:** F12.
 
 ### F14. Oracle and benchmarks (M)
-- **Goal:** (a) an opt-in test that loads a user-supplied `xg_xs.dll`
-  through the XTP loader (`XTP_SAMPLE_XG`, skipped when unset) and compares
+- **Goal:** (a) an opt-in test that loads the console layout library of the
+  user's configured runtime through the XTP loader (`XTP_SAMPLE_XG`, skipped when unset) and compares
   layouts, offsets and planes over a generated grid of descriptions;
   (b) an ignored benchmark of `miniz_oxide` inflate as `dstorage` calls it.
 - **Files:** `crates/xtp-hle/tests/xg_oracle.rs` (new),
@@ -476,12 +475,12 @@ the `XTP_` prefix once the rename lands.
 - **xcl reference:** `vfs.rs` (`Decision`, overlay, whiteouts).
 - **Acceptance:** a test opens a game file for writing and finds the
   original unchanged and the overlay holding the write.
-- **Depends on:** none. Listed here because a modified dump would make
+- **Depends on:** none. Listed here because a modified title folder would make
   every later measurement on it suspect.
 
 ### F17. Bounded RPF9 probe as a library (S, optional)
 - **Goal:** `xtp-game::rpf::probe(reader)`: counts RPF9 headers at 2 KiB
-  steps, notes truncated ones and whether TOC areas repeat (encrypted),
+  steps, notes truncated ones and whether TOC areas repeat,
   with bounded memory. For diagnostics and for locating shader records in
   large archives without reading them whole.
 - **Files:** `crates/xtp-game/src/rpf.rs` (new), `src/lib.rs` (`mod` line).
@@ -511,8 +510,8 @@ in parallel.
   look at queue depth and unbuffered reads first.
 * **BC7 fix untested on retail data in XTP.** Without the person's
   reference chunks, only synthetic tests cover F1.
-* **XOR modes are only checked against an oracle.** Without a user's
-  `xg_xs.dll` (it is not in the BTP 6 dump), F12-F13 rest on addrlib and
+* **XOR modes are only checked against an oracle.** Without the console
+  layout library, F12-F13 rest on addrlib and
   xcl's described rules. A pipe configuration mistake scrambles CPU copies
   of render targets only.
 * **Clean-room discipline.** Workers who read xcl must not paste from it.
@@ -542,7 +541,7 @@ in parallel.
   derives from MIT data: its generator and layout are GPL-2.0-only work.
 * **Crates.** `miniz_oxide` (MIT/Zlib/Apache-2.0) and `blake3`
   (CC0/Apache-2.0) are compatible with GPL-3.0.
-* **Game data.** Measurements here read the dump in place. Opt-in tests
+* **Game data.** Measurements here read a title folder in place. Opt-in tests
   (`reference_chunks`, F14's oracle) take paths from environment variables
   and assert properties, never snapshots (asset policy rule 4).
 
@@ -552,14 +551,12 @@ in parallel.
    layout (decoder side)? Merge it whole or re-implement F1?
 2. Should the `silicon-rans` MIT notice go into `NOTICE.md` now (the person
    decides on attribution of the table file)?
-3. Where does an `xg_xs.dll` for the oracle come from? It is not in the BTP 6
-   dump. Another title's package, or none (then F14a is skipped)?
-4. Which swizzle modes does the title actually use for CPU-touched
+3. Which swizzle modes does the title actually use for CPU-touched
    textures? A one-off log of modes seen in `XGCreateTextureComputer` and
    placed resources would set F12's priority.
-5. Is `XGSuggestSwizzleMode`'s rule (older library function) still right for
+4. Is `XGSuggestSwizzleMode`'s rule (older library function) still right for
    streamed textures? `xg.rs` flags it as a shortcut.
-6. Does the title ever pass a page array on its stack (F8's risk), or always
+5. Does the title ever pass a page array on its stack (F8's risk), or always
    from its own tables? A debug check of the array address against the
    thread's stack would answer it.
-7. F16 belongs to the HLE report; does its owner take it, or this backlog?
+6. F16 belongs to the HLE report; does its owner take it, or this backlog?

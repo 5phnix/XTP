@@ -1,6 +1,6 @@
 # The world-load stall: VidMm holds every new allocation past ~9.5 GB
 
-Why every session since 13:37Z on 2026-11-24 stalls while loading the world,
+Why every session since 13:37Z stalls while loading the world,
 measured on the person's PC (RTX 4080 SUPER 16 GB, driver 621.01, Windows 11
 26300, an AMD iGPU beside it, 64 GB). GB below are GiB (2^30), as the tools
 print them. Times are UTC unless marked local (UTC+1). Logs and samples are
@@ -118,7 +118,7 @@ was slow to make" 205 ms, 1 MiB, budget 15 277 MiB, usage 8 530 MiB.
 
 `E:\tools\stall-probe\alloc_probe.py`: a fresh D3D12 process on the 4080
 creates committed DEFAULT resources one after the other and times each call
-(under `E:\xtp-data\measure.lock`, no game running, Discord quit):
+(under `E:\xtp-data\measure.lock`, no game running, the application using the video encoder quit):
 
 | probe (UTC) | resources | fast up to | past it, per call |
 |---|---|---|---|
@@ -167,12 +167,12 @@ at about 0.9 MB/s.
 |---|---|---|---|
 | M, N (14:33, 14:38) | `2d0257e`, golden | no frame after the load burst, title kills itself | xtp 8.3 GB dedicated |
 | O (14:43) | main `e1a4d29`, autopilot | same; creations 0.6–3.6 s | xtp 8.39 GB |
-| Q (14:59) | `c7a4220`, Discord quit | same | adapter 9.98 GB |
+| Q (14:59) | `c7a4220`, that application quit | same | adapter 9.98 GB |
 | R (15:11) | dark-world `d6edb00` (NOT_RESIDENT), golden, autopilot | not reached, title killed at +132 s; creations 1.4–1.7 s, no budget or timeout line | local 9.73 GB, 3 086 host textures, 8 141 MiB |
 | S (15:16) | `d6edb00`, **fresh data**, Enter every 2.5 s | not reached, killed at +81 s; 6 717 creations, same profile as R | local 9.75 GB |
 | T (15:37) | main `85e37c3`, `XTP_WATCHDOG_HOOK=1`, golden, autopilot, 6 min allowed | cut at +126 s by the iGPU test (§4.1); 6 792 creations | local 9.81 GB, 5.86 GB free |
 
-The save is not the cause (S starts a new game), nor Discord (Q, probes),
+The save is not the cause (S starts a new game), nor that application (Q, probes),
 nor the pipeline library, audio, TMP, focus or keys (run-world's
 bisection).
 
@@ -199,12 +199,12 @@ admission rate was most likely already at work, and these sessions passed
 narrowly. Since then every load has crossed the watchdog's limit. Past the
 threshold each 100 MB of headroom is worth about 70 throttled 1.4 MB
 creations, about 100 s, so small changes are enough: other processes'
-VRAM (dwm, the Hangar app, Discord's stream from about 13:35Z), and XTP's own
+VRAM (dwm, the Hangar app, another application's video encoding from about 13:35Z), and XTP's own
 allocations between builds.
 
 What was ruled out as a state that appeared at 13:37Z: the RAM lists
 (cleaned, §3), the driver and VidMm's adapter object (device restarted,
-§3), Discord (quit), and WSL (a VM ran 13:30:27–13:31:50Z, before E, which
+§3), that application (quit), and WSL (a VM ran 13:30:27–13:31:50Z, before E, which
 passed). The nvlddmkm 153 errors (13:12, 13:16, 13:22, 13:46Z) were left
 behind by the restart. Only a full reboot remains untested; it would only
 matter if the cause were a global Windows state that survives a device
@@ -233,7 +233,7 @@ restart.
 
 ### 6.2 For the person (machine)
 
-Nothing to change on the machine is known to help: closing Discord, cleaning
+Nothing to change on the machine is known to help: closing that application, cleaning
 RAM, restarting the display device and disabling the iGPU were tried. A full
 reboot remains untested. During a session, no display may be disabled or
 enabled: it closes the game's window and XTP ends the title (session T).
