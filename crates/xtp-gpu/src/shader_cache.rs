@@ -38,7 +38,9 @@ pub(crate) fn counts() -> (u64, u64) {
 
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// diagnostics build can change at run time), and the host's wave lanes
+/// (`device::host_wave_lanes`), so translations made for a 32-lane GPU and
+/// for a 64-lane one stay apart once translations depend on them.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -47,9 +49,11 @@ fn build() -> &'static [u8; 32] {
         if limit != xtp_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(limit, "XTP_SHADER_LOOP_LIMIT: translated loops stop sooner");
         }
+        let lanes = crate::device::host_wave_lanes().unwrap_or_default();
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&key_lanes(lanes));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -62,6 +66,14 @@ fn build() -> &'static [u8; 32] {
             }
         }
     })
+}
+
+/// The host's wave lane range as part of the build key.
+fn key_lanes((min, max): (u32, u32)) -> [u8; 8] {
+    let mut key = [0; 8];
+    key[..4].copy_from_slice(&min.to_le_bytes());
+    key[4..].copy_from_slice(&max.to_le_bytes());
+    key
 }
 
 /// The translation of a console shader container, from the cache when
@@ -343,6 +355,13 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn hosts_with_other_wave_lanes_have_other_keys() {
+        assert_ne!(key_lanes((32, 32)), key_lanes((32, 64)));
+        assert_ne!(key_lanes((32, 64)), key_lanes((64, 32)));
+        assert_eq!(key_lanes((32, 64)), key_lanes((32, 64)));
     }
 
     #[test]
