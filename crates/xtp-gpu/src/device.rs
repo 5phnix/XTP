@@ -597,9 +597,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_hosts_wave_lanes_are_known() {
-        let (Some((min, max)), Some(model)) = (host_wave_lanes(), host_shader_model()) else {
-            eprintln!("SKIPPED the_hosts_wave_lanes_are_known: no host GPU");
+        if crate::testgpu::device("device::tests::the_hosts_wave_lanes_are_known").is_none() {
             return;
+        }
+        let (Some((min, max)), Some(model)) = (host_wave_lanes(), host_shader_model()) else {
+            panic!("a host device without wave lanes or shader model");
         };
         eprintln!("host waves: {min} to {max} lanes, shader model {model:?}");
         assert!(min.is_power_of_two() && max.is_power_of_two() && 4 <= min && min <= max);

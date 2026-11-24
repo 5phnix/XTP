@@ -1691,11 +1691,11 @@ mod tests {
     /// A 4x4 texture of `format` filled from a title buffer (rows 256 bytes
     /// apart, `fill`ed) through our list and queue, then read back from the
     /// host GPU: the host texture's format and its rows (256 bytes apart).
-    /// `None` without a host GPU.
+    /// `None` without a host GPU (the skip reported for `test`).
     #[cfg(windows)]
-    fn through_a_list(format: u32, fill: impl Fn(&mut [u8])) -> Option<(u32, Vec<u8>)> {
+    fn through_a_list(test: &str, format: u32, fill: impl Fn(&mut [u8])) -> Option<(u32, Vec<u8>)> {
         use windows::Win32::Graphics::Direct3D12::*;
-        let host = crate::host::host()?;
+        let host = crate::testgpu::device(test)?;
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -1894,8 +1894,8 @@ mod tests {
                 *b = (i % 251) as u8;
             }
         };
-        let Some((format, read)) = through_a_list(28, pattern) else {
-            eprintln!("SKIPPED buffer_data_reaches_the_host_texture: no host GPU");
+        let test = "resource::tests::buffer_data_reaches_the_host_texture";
+        let Some((format, read)) = through_a_list(test, 28, pattern) else {
             return;
         };
         assert_eq!(format, 28);
@@ -1922,14 +1922,13 @@ mod tests {
                 }
             }
         };
-        let Some((format, read)) = through_a_list(86, fill) else {
-            eprintln!("SKIPPED buffer_data_reaches_a_stand_in_texture_converted: no host GPU");
+        let test = "resource::tests::buffer_data_reaches_a_stand_in_texture_converted";
+        let Some((format, read)) = through_a_list(test, 86, fill) else {
             return;
         };
         if format == 86 {
-            eprintln!(
-                "SKIPPED buffer_data_reaches_a_stand_in_texture_converted: the host has every use of B5G5R5A1"
-            );
+            // Not a missing GPU: nothing to convert on this one (WARP).
+            eprintln!("SKIPPED {test}: the host has every use of B5G5R5A1");
             return;
         }
         assert_eq!(format, 28, "R8G8B8A8_UNORM stands in");
@@ -1967,7 +1966,7 @@ mod tests {
         match device {
             Ok(device) => Some(device),
             Err(e) => {
-                eprintln!("SKIPPED {test}: no WARP device ({e})");
+                crate::testgpu::skip(test, &format!("no WARP device ({e})"));
                 None
             }
         }
@@ -2054,7 +2053,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn host_descriptions_are_ones_warp_creates() {
-        if let Some(device) = warp("host_descriptions_are_ones_warp_creates") {
+        if let Some(device) = warp("resource::tests::host_descriptions_are_ones_warp_creates") {
             host_descriptions_are_ones(&device);
         }
     }
@@ -2063,11 +2062,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn host_descriptions_are_ones_the_host_gpu_creates() {
-        match crate::host::host() {
-            Some(host) => host_descriptions_are_ones(&host.device),
-            None => {
-                eprintln!("SKIPPED host_descriptions_are_ones_the_host_gpu_creates: no host GPU")
-            }
+        let test = "resource::tests::host_descriptions_are_ones_the_host_gpu_creates";
+        if let Some(host) = crate::testgpu::device(test) {
+            host_descriptions_are_ones(&host.device);
         }
     }
     #[test]
