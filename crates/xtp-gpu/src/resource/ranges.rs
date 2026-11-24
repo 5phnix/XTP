@@ -64,7 +64,11 @@ impl Ranges {
     /// Gives back `len` bytes at `offset`, taken before; merged with the
     /// free ranges right before and after it.
     pub(super) fn give(&mut self, offset: u64, len: u64) {
-        debug_assert!(offset + len <= self.size, "{offset} + {len} past {}", self.size);
+        debug_assert!(
+            offset + len <= self.size,
+            "{offset} + {len} past {}",
+            self.size
+        );
         let (mut start, mut end) = (offset, offset + len);
         if let Some((&before, &n)) = self.by_offset.range(..offset).next_back()
             && before + n == offset
@@ -200,7 +204,10 @@ mod tests {
                         .map(|run| run.len() as u64)
                         .max()
                         .unwrap_or(0);
-                    assert!(longest * K < len, "refused {len} with {longest} units free in a row");
+                    assert!(
+                        longest * K < len,
+                        "refused {len} with {longest} units free in a row"
+                    );
                 }
             } else {
                 let i = (next() % held.len() as u64) as usize;
@@ -212,10 +219,7 @@ mod tests {
             }
             let free = used.iter().filter(|&&u| !u).count() as u64 * K;
             assert_eq!(r.free(), free);
-            let runs = used
-                .split(|&u| u)
-                .filter(|run| !run.is_empty())
-                .count();
+            let runs = used.split(|&u| u).filter(|run| !run.is_empty()).count();
             assert_eq!(r.pieces(), runs, "free neighbours merged");
         }
     }

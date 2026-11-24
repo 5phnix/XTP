@@ -80,7 +80,9 @@ pub(crate) struct Residency {
 enum State {
     Ready,
     /// Asked: its own fence reaches 1 once resident.
-    Asked { fence: ID3D12Fence },
+    Asked {
+        fence: ID3D12Fence,
+    },
     /// Refused (past the budget, or an error, logged then): asked again
     /// from `since` + [`RETRY`].
     Refused {
@@ -145,7 +147,9 @@ impl Residency {
             }
             State::Asked { .. } => false,
             State::Refused { since, .. } if since.elapsed() < RETRY => false,
-            State::Refused { device, objects, .. } => {
+            State::Refused {
+                device, objects, ..
+            } => {
                 let (device, objects) = (device.clone(), objects.clone());
                 *state = match enqueue(&device, &objects) {
                     Ok(fence) => State::Asked { fence },
@@ -216,21 +220,28 @@ fn refused(device: &ID3D12Device, objects: Vec<Option<ID3D12Pageable>>, why: Str
 
 /// One request, with a fence of its own, signalled to 1 once `objects`
 /// are resident.
-fn enqueue(device: &ID3D12Device, objects: &[Option<ID3D12Pageable>]) -> Result<ID3D12Fence, String> {
+fn enqueue(
+    device: &ID3D12Device,
+    objects: &[Option<ID3D12Pageable>],
+) -> Result<ID3D12Fence, String> {
     ASKED.fetch_add(1, Ordering::Relaxed);
-    let device3: ID3D12Device3 = device.cast().map_err(|e| format!("no ID3D12Device3 ({e})"))?;
+    let device3: ID3D12Device3 = device
+        .cast()
+        .map_err(|e| format!("no ID3D12Device3 ({e})"))?;
     // SAFETY: plain creation.
     let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }
         .map_err(|e| format!("no fence ({e})"))?;
     // SAFETY: live objects; the fence is ours.
-    unsafe { device3.EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, objects, &fence, 1) }
-        .map_err(|e| {
-            if e.code() == E_OUTOFMEMORY {
-                "past the video memory budget".to_owned()
-            } else {
-                format!("refused ({})", e.code())
-            }
-        })?;
+    unsafe {
+        device3.EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, objects, &fence, 1)
+    }
+    .map_err(|e| {
+        if e.code() == E_OUTOFMEMORY {
+            "past the video memory budget".to_owned()
+        } else {
+            format!("refused ({})", e.code())
+        }
+    })?;
     Ok(fence)
 }
 
@@ -361,7 +372,8 @@ mod tests {
             return;
         };
         // SAFETY: plain creation.
-        let fence: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        let fence: ID3D12Fence =
+            unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
         let r = Residency::asked(fence.clone());
         let started = Instant::now();
         assert!(!r.wait(Duration::from_millis(50)));

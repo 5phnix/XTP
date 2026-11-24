@@ -1064,9 +1064,10 @@ fn host_texture(desc: &ResourceDesc, state: u32, clear: Option<[u32; 5]>) -> Opt
             return None;
         }
     };
-    let start = D3D12_RESOURCE_STATES(
-        crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-    );
+    let start = D3D12_RESOURCE_STATES(crate::host::legal_for(
+        d.flags,
+        crate::host::texture_state(state),
+    ) as i32);
     // SAFETY: the description has the host layout (checked size, same
     // fields).
     let hd = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read() };
@@ -1205,7 +1206,11 @@ fn committed(
         ..Default::default()
     };
     // SAFETY: a host description.
-    let bytes = unsafe { host.device.GetResourceAllocationInfo(0, std::slice::from_ref(hd)) }.SizeInBytes;
+    let bytes = unsafe {
+        host.device
+            .GetResourceAllocationInfo(0, std::slice::from_ref(hd))
+    }
+    .SizeInBytes;
     // All ones: a description the device cannot size (it refuses it below).
     let bytes = if bytes == u64::MAX { 0 } else { bytes };
     let watch = CreationWatch::before(&host.device, d, bytes);
@@ -1241,9 +1246,8 @@ fn committed(
         && let Ok(device1) = host.device.cast::<ID3D12Device1>()
     {
         // SAFETY: one live pageable, one priority.
-        let set = unsafe {
-            device1.SetResidencyPriority(1, &pageable, &D3D12_RESIDENCY_PRIORITY_HIGH)
-        };
+        let set =
+            unsafe { device1.SetResidencyPriority(1, &pageable, &D3D12_RESIDENCY_PRIORITY_HIGH) };
         if let Err(e) = set {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::info!(error = %e, "no residency priority for targets"));
@@ -3309,7 +3313,11 @@ mod tests {
         assert!(same_copy(shown, target));
         let drawn = host_copy(target).unwrap();
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
-        assert_eq!(texture_at(address, &view), Some(shown), "kept while nothing else is there");
+        assert_eq!(
+            texture_at(address, &view),
+            Some(shown),
+            "kept while nothing else is there"
+        );
         // The title puts a texture of its own there.
         let streamed = at(address, &plain);
         let now = texture_at(address, &view).unwrap();
@@ -3350,7 +3358,13 @@ mod tests {
         let r = tests_support::committed(&texture(64, 64, 67, 1));
         let host = resource(r).host.clone().unwrap();
         if pc_format(67) == 10 {
-            assert_eq!(host.extra * 2, host.bytes, "{} of {}", host.extra, host.bytes);
+            assert_eq!(
+                host.extra * 2,
+                host.bytes,
+                "{} of {}",
+                host.extra,
+                host.bytes
+            );
         }
         assert_eq!(slot::<Release>(r, 0x10)(r), 0);
     }

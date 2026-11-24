@@ -579,7 +579,8 @@ pub(crate) fn note_stand_in(title: u32, host: u32) {
 /// Host textures alive: their number and bytes, the bytes stand-in
 /// formats take beyond the title's, and the number and bytes of those in
 /// the texture pool.
-static LIVE: [std::sync::atomic::AtomicI64; 5] = [const { std::sync::atomic::AtomicI64::new(0) }; 5];
+static LIVE: [std::sync::atomic::AtomicI64; 5] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; 5];
 
 /// Counts a host texture of `bytes` made (`alive`) or freed: `extra` of
 /// them for its stand-in format, `pooled` if placed in the texture pool.
@@ -608,7 +609,8 @@ pub(crate) fn report() -> Option<String> {
     #[cfg(windows)]
     let pool = {
         let (asked, refused) = super::residency::counts();
-        let pool = super::pool::global_if_made().map_or_else(String::new, |p| format!("; {}", p.report()));
+        let pool =
+            super::pool::global_if_made().map_or_else(String::new, |p| format!("; {}", p.report()));
         format!("; residency asked {asked} times, refused {refused}{pool}")
     };
     #[cfg(not(windows))]

@@ -41,7 +41,9 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter3, IDXGIFactory4};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter3, IDXGIFactory4,
+};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
 
@@ -345,9 +347,10 @@ impl BudgetEvent {
         // SAFETY: plain DXGI calls; the event is closed if it is not kept.
         unsafe {
             let luid = device.GetAdapterLuid();
-            let adapter: IDXGIAdapter3 = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-                .and_then(|f| f.EnumAdapterByLuid(luid))
-                .ok()?;
+            let adapter: IDXGIAdapter3 =
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid(luid))
+                    .ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
             match adapter.RegisterVideoMemoryBudgetChangeNotificationEvent(event) {
                 Ok(cookie) => Some(BudgetEvent {
@@ -462,7 +465,11 @@ impl Pool {
         let mut texture: Option<ID3D12Resource> = None;
         // SAFETY: a live heap, a range of it no other live resource uses,
         // aligned for the description's placement; the out pointer is ours.
-        let placed = unsafe { inner.device.CreatePlacedResource(&heap, offset, &desc, state, None, &mut texture) };
+        let placed = unsafe {
+            inner
+                .device
+                .CreatePlacedResource(&heap, offset, &desc, state, None, &mut texture)
+        };
         match (placed, texture) {
             (Ok(()), Some(texture)) => {
                 // A heap just made is usually resident within a few
@@ -484,7 +491,13 @@ impl Pool {
             }
             (result, _) => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| tracing::warn!(?result, ?desc, "a placed host texture refused: committed instead"));
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        ?result,
+                        ?desc,
+                        "a placed host texture refused: committed instead"
+                    )
+                });
                 drop(slot);
                 refused("placement refused")
             }
@@ -568,7 +581,10 @@ impl Inner {
     fn class_of(&self, d: &D3D12_RESOURCE_DESC) -> Option<(Class, D3D12_RESOURCE_DESC, u64)> {
         let size = |desc: &D3D12_RESOURCE_DESC| {
             // SAFETY: a host description.
-            let info = unsafe { self.device.GetResourceAllocationInfo(0, std::slice::from_ref(desc)) };
+            let info = unsafe {
+                self.device
+                    .GetResourceAllocationInfo(0, std::slice::from_ref(desc))
+            };
             (info.SizeInBytes != u64::MAX && info.SizeInBytes > 0).then_some(info)
         };
         let mut desc = *d;
@@ -584,12 +600,21 @@ impl Inner {
         desc.Alignment = 0;
         let info = size(&desc)?;
         let normal = Class::Normal.alignment();
-        (info.Alignment <= normal).then(|| (Class::Normal, desc, info.SizeInBytes.next_multiple_of(normal)))
+        (info.Alignment <= normal).then(|| {
+            (
+                Class::Normal,
+                desc,
+                info.SizeInBytes.next_multiple_of(normal),
+            )
+        })
     }
 
     /// Free bytes of `class`.
     fn free(s: &State, class: Class) -> u64 {
-        s.classes[class.index()].iter().map(|h| h.ranges.free()).sum()
+        s.classes[class.index()]
+            .iter()
+            .map(|h| h.ranges.free())
+            .sum()
     }
 
     /// Whether `class` has less than its reserve free.
@@ -600,13 +625,21 @@ impl Inner {
     /// `len` bytes of a heap of `class`: the tightest fit in a resident
     /// heap, else in one still becoming resident. The thread is woken if
     /// the reserve runs short.
-    fn take(&self, class: Class, len: u64) -> Option<(ID3D12Heap, u64, u64, Arc<Residency>, Instant)> {
+    fn take(
+        &self,
+        class: Class,
+        len: u64,
+    ) -> Option<(ID3D12Heap, u64, u64, Arc<Residency>, Instant)> {
         let mut s = self.lock();
         let heaps = &mut s.classes[class.index()];
         let (_, _, at) = heaps
             .iter()
             .enumerate()
-            .filter_map(|(i, h)| h.ranges.fit(len).map(|fit| (!h.residency.is_ready(), fit, i)))
+            .filter_map(|(i, h)| {
+                h.ranges
+                    .fit(len)
+                    .map(|fit| (!h.residency.is_ready(), fit, i))
+            })
             .min()?;
         let h = &mut heaps[at];
         let offset = h.ranges.take(len)?;
@@ -725,8 +758,13 @@ impl Inner {
     /// not resident and (if the runtime can) not zeroed.
     fn make_heap(&self, size: u64) -> Option<ID3D12Heap> {
         let flags = |zeroed: bool| {
-            let base = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT;
-            if zeroed { base } else { base | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED }
+            let base =
+                D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT;
+            if zeroed {
+                base
+            } else {
+                base | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED
+            }
         };
         let desc = |zeroed| D3D12_HEAP_DESC {
             SizeInBytes: size,
@@ -825,14 +863,19 @@ impl Inner {
         let mut s = self.lock();
         let mut gone = Vec::new();
         for heaps in &mut s.classes {
-            let (empty, kept): (Vec<Heap>, Vec<Heap>) = std::mem::take(heaps).into_iter().partition(|h| h.textures == 0);
+            let (empty, kept): (Vec<Heap>, Vec<Heap>) = std::mem::take(heaps)
+                .into_iter()
+                .partition(|h| h.textures == 0);
             *heaps = kept;
             gone.extend(empty.into_iter().map(|h| h.heap));
         }
         s.stats.released += gone.len() as u64;
         drop(s);
         if !gone.is_empty() {
-            tracing::info!(heaps = gone.len(), "empty texture heaps released: past the budget");
+            tracing::info!(
+                heaps = gone.len(),
+                "empty texture heaps released: past the budget"
+            );
         }
     }
 }
@@ -861,12 +904,32 @@ mod tests {
     #[test]
     fn the_small_rule_counts_standard_tiles() {
         // 64x64 RGBA8 is 4 tiles of 32x32; 128x128 is 16; 256x128 is 32.
-        assert!(may_be_small(&texture(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, 1)));
-        assert!(may_be_small(&texture(128, 128, DXGI_FORMAT_R8G8B8A8_UNORM, 1)));
-        assert!(!may_be_small(&texture(256, 128, DXGI_FORMAT_R8G8B8A8_UNORM, 1)));
+        assert!(may_be_small(&texture(
+            64,
+            64,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1
+        )));
+        assert!(may_be_small(&texture(
+            128,
+            128,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1
+        )));
+        assert!(!may_be_small(&texture(
+            256,
+            128,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1
+        )));
         // BC7: 16-byte blocks, 16x16 blocks a tile: 256x256 texels is one.
         assert!(may_be_small(&texture(256, 256, DXGI_FORMAT_BC7_UNORM, 9)));
-        assert!(!may_be_small(&texture(1024, 1024, DXGI_FORMAT_BC7_UNORM, 9)));
+        assert!(!may_be_small(&texture(
+            1024,
+            1024,
+            DXGI_FORMAT_BC7_UNORM,
+            9
+        )));
         // Targets, samples and arrays never.
         let mut rt = texture(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
         rt.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -889,7 +952,10 @@ mod tests {
     /// A pool on the test device with small heaps (1 MiB a 64 KiB heap).
     fn pool(test: &str, budget: Budget) -> Option<(&'static crate::host::Host, Pool)> {
         let host = crate::testgpu::device(test)?;
-        Some((host, Pool::new(host.device.clone(), Config::sized(MIB, MIB), budget)))
+        Some((
+            host,
+            Pool::new(host.device.clone(), Config::sized(MIB, MIB), budget),
+        ))
     }
 
     fn unlimited() -> Budget {
@@ -905,7 +971,10 @@ mod tests {
         let Some((_, pool)) = pool(test, unlimited()) else {
             return;
         };
-        assert!(pool.settle(Duration::from_secs(5)), "the thread fills the reserve");
+        assert!(
+            pool.settle(Duration::from_secs(5)),
+            "the thread fills the reserve"
+        );
         let before = pool.stats();
         assert_eq!(before.emergency, 0);
         let state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -918,13 +987,23 @@ mod tests {
                 let (class, offset, len) = p.slot.place();
                 assert_eq!(offset % class.alignment(), 0);
                 assert_eq!(len % class.alignment(), 0);
-                assert_eq!(class, if std::ptr::eq(d, &small) { Class::Small } else { Class::Normal });
+                assert_eq!(
+                    class,
+                    if std::ptr::eq(d, &small) {
+                        Class::Small
+                    } else {
+                        Class::Normal
+                    }
+                );
                 held.push(p);
             }
         }
         let made = pool.stats();
         assert_eq!(made.placed - before.placed, 48);
-        assert_eq!(made.asked, made.heaps, "one residency request a heap, none a texture");
+        assert_eq!(
+            made.asked, made.heaps,
+            "one residency request a heap, none a texture"
+        );
         assert!(made.heaps < 48, "{made:?}");
         // A range given back is taken again.
         let gone = held.remove(1);
@@ -968,7 +1047,9 @@ mod tests {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(&placed.texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
@@ -1021,14 +1102,22 @@ mod tests {
     /// The process's private bytes (WARP's video memory is the process's
     /// own).
     fn private_bytes() -> u64 {
-        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+        };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         // SAFETY: plain data.
         let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
         counters.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         // SAFETY: the structure and its size are ours.
-        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), counters.cb) };
-        if ok == 0 { 0 } else { counters.PrivateUsage as u64 }
+        let ok = unsafe {
+            K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), counters.cb)
+        };
+        if ok == 0 {
+            0
+        } else {
+            counters.PrivateUsage as u64
+        }
     }
 
     /// One path of the benchmark: `n` textures made by `make` (which says
@@ -1054,7 +1143,10 @@ mod tests {
         }
         let creating = started.elapsed();
         while !ready(&made) {
-            assert!(started.elapsed() < Duration::from_secs(600), "{name}: never resident");
+            assert!(
+                started.elapsed() < Duration::from_secs(600),
+                "{name}: never resident"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         let all = started.elapsed();
@@ -1090,7 +1182,10 @@ mod tests {
         let Some(host) = crate::testgpu::device(test) else {
             return;
         };
-        let n: usize = std::env::var("XTP_POOL_BENCH").ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
+        let n: usize = std::env::var("XTP_POOL_BENCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
         let d = texture(1024, 1024, DXGI_FORMAT_BC7_UNORM, 9);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -1101,7 +1196,14 @@ mod tests {
             // SAFETY: plain creation.
             unsafe {
                 host.device
-                    .CreateCommittedResource(&heap, flags, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut t)
+                    .CreateCommittedResource(
+                        &heap,
+                        flags,
+                        &d,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut t,
+                    )
                     .unwrap();
             }
             t.unwrap()
@@ -1139,7 +1241,11 @@ mod tests {
             |made| made.iter().all(|(_, r)| r.is_ready()),
             |made| made.len() as u64,
         ));
-        let pool = Pool::new(host.device.clone(), Config::sized(256 * MIB, 512 * MIB), Box::new(crate::dxgi::video_memory));
+        let pool = Pool::new(
+            host.device.clone(),
+            Config::sized(256 * MIB, 512 * MIB),
+            Box::new(crate::dxgi::video_memory),
+        );
         assert!(pool.settle(Duration::from_secs(30)));
         let before = pool.stats();
         let at_start = pool.holding().bytes;
@@ -1172,6 +1278,9 @@ mod tests {
             return;
         };
         let big = texture(1024, 1024, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
-        assert_eq!(pool.place(&big, D3D12_RESOURCE_STATE_COPY_DEST).err(), Some("too large for the pool"));
+        assert_eq!(
+            pool.place(&big, D3D12_RESOURCE_STATE_COPY_DEST).err(),
+            Some("too large for the pool")
+        );
     }
 }
