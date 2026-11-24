@@ -5,7 +5,7 @@ runs a group's waves one after the other and, at a group barrier, does not
 wait for a thread that has returned, so a program that hangs a hardware GPU
 can pass there. five-star-recomp found exactly that when it ran its WARP
 cases on an RTX 5070: 21 of 284 differed, two mesh cases hung the GPU
-(watch pass 7, item 143, in [watch.md](../upstream/watch.md); the idea of
+(pass 7, item 143, of the maintainers' private watch notes; the idea of
 running the same tests with a hardware switch is theirs). This page reports
 the same exercise for XTP: `xtp-shader` and `xtp-gpu` on the Google Cloud
 L4, against WARP, on the same machine and commits, on 2026-11-24.
