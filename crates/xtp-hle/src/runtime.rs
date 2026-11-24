@@ -78,6 +78,8 @@ pub struct Title {
     pub id: u32,
     /// The store's product id (empty if the manifest has none).
     pub store_id: String,
+    /// Package-relative executable names in the manifest's executable list.
+    pub executables: Vec<String>,
     /// Persistent local storage: our folder for it and the title's quota.
     /// Game saves live beside it ([`Title::saves`]).
     pub storage: PathBuf,
@@ -85,21 +87,26 @@ pub struct Title {
 }
 
 impl Title {
-    /// Id, store id and storage quota from the manifest (zero or empty
-    /// where it has none); the storage folder is left for the caller.
+    /// Read the title IDs, executable list and storage quota. The caller
+    /// supplies the storage folder.
     pub fn from_manifest(text: &str) -> Title {
         let elements = elements(text);
         let get = |path: &str| {
             elements
                 .iter()
-                .find(|(p, _)| p == path)
-                .map(|(_, text)| text.as_str())
+                .find(|e| e.path == path)
+                .map(|e| e.text.as_str())
         };
         let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
         let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
         Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
+            executables: elements
+                .iter()
+                .filter(|e| e.path == "Game/ExecutableList/Executable")
+                .filter_map(|e| attribute(e.attributes, "Name"))
+                .collect(),
             storage: PathBuf::new(),
             storage_bytes: storage_mb.unwrap_or(0) << 20,
         }
@@ -112,11 +119,40 @@ impl Title {
     }
 }
 
-/// Each element of an XML text as its path from the root (`Game/TitleId`)
-/// and its trimmed text up to the first child, the predefined entities
-/// decoded; comments, CDATA sections, declarations and attributes are
-/// skipped.
-fn elements(text: &str) -> Vec<(String, String)> {
+struct Element<'a> {
+    path: String,
+    text: String,
+    attributes: &'a str,
+}
+
+fn unescape(text: &str) -> String {
+    [
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+        ("&amp;", "&"),
+    ]
+    .iter()
+    .fold(text.to_owned(), |s, (entity, c)| s.replace(entity, c))
+}
+
+fn attribute(mut attributes: &str, key: &str) -> Option<String> {
+    loop {
+        let (name, rest) = attributes.split_once('=')?;
+        let rest = rest.trim_start();
+        let quote = rest.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+        let (value, tail) = rest[1..].split_once(quote)?;
+        if name.trim() == key {
+            return Some(unescape(value));
+        }
+        attributes = tail;
+    }
+}
+
+/// Each element's path from the root, its attributes and its trimmed text
+/// up to the first child. Skip comments, CDATA sections and declarations.
+fn elements(text: &str) -> Vec<Element<'_>> {
     let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
     let mut rest = text;
@@ -127,7 +163,17 @@ fn elements(text: &str) -> Vec<(String, String)> {
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            rest.find('>').map(|e| e + 1)
+            // A quoted attribute may itself contain a '>'.
+            let mut quote = None;
+            rest.char_indices().find_map(|(i, c)| {
+                match quote {
+                    Some(q) if c == q => quote = None,
+                    None if matches!(c, '"' | '\'') => quote = Some(c),
+                    None if c == '>' => return Some(i + 1),
+                    _ => {}
+                }
+                None
+            })
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -142,23 +188,15 @@ fn elements(text: &str) -> Vec<(String, String)> {
             continue;
         }
         let closed = tag.ends_with('/');
-        let name = tag
-            .trim_end_matches('/')
-            .split_whitespace()
-            .next()
-            .unwrap_or("");
+        let tag = tag.trim_end_matches('/');
+        let (name, attributes) = tag.split_once(char::is_whitespace).unwrap_or((tag, ""));
         path.push(name);
         let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-        let body = [
-            ("&lt;", "<"),
-            ("&gt;", ">"),
-            ("&quot;", "\""),
-            ("&apos;", "'"),
-            ("&amp;", "&"),
-        ]
-        .iter()
-        .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
-        out.push((path.join("/"), body));
+        out.push(Element {
+            path: path.join("/"),
+            text: unescape(body),
+            attributes,
+        });
         if closed {
             path.pop();
         }

@@ -805,6 +805,7 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "tempfile",
  "walkdir",
  "xtp-core",
  "xtp-game",

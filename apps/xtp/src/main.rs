@@ -120,7 +120,8 @@ enum Command {
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
-        exe: PathBuf,
+        /// A title executable or the folder containing MicrosoftGame.config.
+        target: PathBuf,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
         unimplemented: Unimplemented,
@@ -223,7 +224,7 @@ fn main() -> Result<()> {
             host_lanes,
         ),
         Command::Run {
-            exe,
+            target,
             unimplemented,
             strict,
             execute,
@@ -233,7 +234,7 @@ fn main() -> Result<()> {
         } => {
             let env = std::env::var("XTP_CONSOLE").ok();
             let console = Console::pick(console, env.as_deref())?;
-            run::run(&exe, unimplemented, strict, execute, console, autopilot)
+            run::run(&target, unimplemented, strict, execute, console, autopilot)
         }
         Command::Config => show_config(),
     }
