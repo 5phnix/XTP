@@ -77,7 +77,7 @@ mod smem;
 mod spin;
 #[cfg(test)]
 mod tests;
-mod uniform;
+pub(crate) mod uniform;
 mod valu;
 mod valu16;
 

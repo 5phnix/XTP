@@ -24,14 +24,16 @@
 //! - the result of an operation of [`UNIFORM_VALU`] that every lane runs
 //!   (no guard in the per-lane form, the EXEC of every lane in the console
 //!   flow), that writes whole dwords from its own lane (no DPP, no SDWA
-//!   destination narrower than a dword: [`keeps_old`]), and whose operands
-//!   are all uniform. The tracer reads such a result from the instruction's
+//!   destination narrower than a dword: the mesh analysis's `keeps_old`),
+//!   and whose operands are all uniform. The tracer reads such a result from
+//!   the instruction's
 //!   operands ([`Tracer::vorigin`], [`Tracer::vadd`]), which is the value
 //!   only in the lanes that ran it, so a write some lane may skip is never
 //!   uniform, not even when every lane runs it or none does (a uniform
 //!   condition, a uniform old value): when none does, the address is the
-//!   old value's. The operands are those of the encoding ([`explicit`]): an
-//!   EXEC named there counts (and is not uniform, above), the EXEC that
+//!   old value's. The operands are those of the encoding (the mesh
+//!   analysis's `source_regs`): an EXEC named there counts (and is not
+//!   uniform, below), the EXEC that
 //!   guards the instruction and the old value of the VGPRs it writes (which
 //!   no lane keeps) do not. A carry-in is read lane by lane: its lane bits
 //!   must be uniform ([`Tracer::mask_uniform`]);
@@ -76,18 +78,19 @@
 //! - DPP operands: a lane reads another lane's value, or keeps its old one
 //!   where it has no source lane.
 //!
-//! Overlap, for later: the mesh lowering's analysis (`emit/lower/uniform.rs`
-//! on the wave64 mesh branch, not on main yet) has its own `Uniformity`,
-//! post-dominators and rules, for its own question (which values the lanes
-//! of a console wave, or of its thread group, share). Once it lands,
-//! [`keeps_old`] and [`explicit`] should be its `keeps_old` and
-//! `source_regs`, and one post-dominator implementation should serve both.
+//! The mesh lowering's analysis (`emit::lower::uniform`, its `Uniformity`)
+//! asks another question (which values the lanes of a console wave, or of
+//! its thread group, share, for `v_readfirstlane_b32` in mesh programs) by
+//! other rules; this one shares its `keeps_old` and `source_regs`. Left for
+//! later: each has its own post-dominators (immediate ones here, sets
+//! there).
 
 use std::cell::{OnceCell, RefCell};
 
 use super::{MAX_ROUNDS, Site, Sum, Term, Tracer};
-use crate::gfx10::{Fields, NULL, Operand, Valu};
-use crate::ir::{EXEC, Exit, Inst, M0, Reg, VCC, Value, reverse_postorder};
+use crate::emit::lower::uniform::{keeps_old, source_regs};
+use crate::gfx10::{Fields, Operand};
+use crate::ir::{EXEC, Exit, Inst, Reg, Value, reverse_postorder};
 use crate::structure::{Atom, Bool, Bools, LaneExit, Structured};
 
 /// VALU operations whose result is uniform when their operands are: the
@@ -141,38 +144,6 @@ impl AddressUniformity {
 
 fn is_exec(reg: Reg) -> bool {
     matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
-}
-
-/// Whether a VALU instruction keeps part of a register it writes even in
-/// the lanes that run it, or reads another lane's: DPP (masked rows, lanes
-/// with no source lane), SDWA destinations narrower than a dword (the other
-/// bits stay or are made from the selected ones; any narrow `dst_sel` is
-/// refused, as the mesh analysis's `keeps_old` does). The other operations
-/// of [`UNIFORM_VALU`] write whole dwords.
-fn keeps_old(f: &Valu) -> bool {
-    f.dpp.is_some() || f.sdwa.is_some_and(|s| s.dst_sel < 6)
-}
-
-/// Whether `reg` is one of the registers the operand `op` names, as
-/// [`crate::ir`] reads them (`vccz`, `execz`, `scc` and `lds_direct` read
-/// the register behind them); `lanes` is the mask's dwords.
-fn explicit(op: &Operand, reg: Reg, lanes: u8) -> bool {
-    let range = |first: u8, n: u8, x: u8| {
-        (0..u16::from(n)).contains(&(u16::from(x).wrapping_sub(first.into())))
-    };
-    let within = |first: u8, n: u8| matches!(reg, Reg::S(c) if range(first, n, c));
-    match *op {
-        Operand::Scalar { code, .. } if code == NULL => false,
-        Operand::Scalar { code, dwords } => within(code, dwords),
-        Operand::Vector { reg: first, dwords } => {
-            matches!(reg, Reg::V(v) if range(first, dwords, v))
-        }
-        Operand::Const(251) => within(VCC, lanes),
-        Operand::Const(252) => within(EXEC, lanes),
-        Operand::Const(253) => reg == Reg::Scc,
-        Operand::Const(254) => within(M0, 1),
-        _ => false,
-    }
 }
 
 /// The lane mask `inst` reads lane by lane as a carry-in (the third operand
@@ -371,7 +342,7 @@ impl Tracer<'_> {
         }
         match &inst.fields {
             Fields::Sop { .. } => inst.reads.iter().all(|&(_, x)| self.uniform(x)),
-            Fields::Valu(f) if !keeps_old(f) && UNIFORM_VALU.contains(&inst.name()) => {
+            Fields::Valu(_) if !keeps_old(inst) && UNIFORM_VALU.contains(&inst.name()) => {
                 self.valu_uniform(site, inst)
             }
             _ => false,
@@ -393,16 +364,16 @@ impl Tracer<'_> {
                 .is_none_or(|cs| cs.execs[b][i] == Some(Bool::TRUE))
     }
 
-    /// Whether the operands `inst` reads ([`explicit`]) are uniform, a
-    /// carry-in by its lane bits. Its other reads, EXEC as its guard and the
-    /// old value of the VGPRs it writes, do not count: the callers take
-    /// instructions every lane runs whole, or lane bits that do not depend
-    /// on them.
+    /// Whether the operands of the VALU instruction `inst` (`source_regs`)
+    /// are uniform, a carry-in by its lane bits. Its other reads, EXEC as its
+    /// guard and the old value of the VGPRs it writes, do not count: the
+    /// callers take instructions every lane runs whole, or lane bits that do
+    /// not depend on them.
     fn reads_uniform(&self, inst: &Inst) -> bool {
-        let Fields::Valu(f) = &inst.fields else {
+        if !matches!(inst.fields, Fields::Valu(_)) {
             return false;
-        };
-        let lanes = if self.p.wave64 { 2 } else { 1 };
+        }
+        let sources = source_regs(inst, if self.p.wave64 { 2 } else { 1 });
         let carry = carry_in(inst);
         if let Some((code, dwords)) = carry {
             let lo = inst.read(Reg::S(code));
@@ -415,9 +386,11 @@ impl Tracer<'_> {
             (Reg::S(c), Some((code, n))) => (code..code + n).contains(&c),
             _ => false,
         };
-        inst.reads.iter().all(|&(reg, x)| {
-            !f.src.iter().any(|op| explicit(op, reg, lanes)) || carried(reg) || self.uniform(x)
-        })
+        // Without a list of operands (`v_movrel*`), every read counts.
+        let operand = |r: Reg| sources.as_ref().is_none_or(|s| s.contains(&r));
+        inst.reads
+            .iter()
+            .all(|&(reg, x)| !operand(reg) || carried(reg) || self.uniform(x))
     }
 
     /// Whether the lane mask `lo` (with `hi` in wave64) has the same bit in
