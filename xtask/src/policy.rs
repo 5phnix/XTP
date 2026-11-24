@@ -35,6 +35,32 @@ const EXCEPTIONS: &[(&str, &str)] = &[(
     "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
 )];
 
+/// Names that never appear in the repository: the title is called "BTP 6"
+/// here (the owner's decision, 2026-11-24). Stored reversed so that this
+/// file does not contain them; matched case-insensitively.
+const FORBIDDEN_NAMES_REVERSED: &[&str] = &[
+    "otua tfeht dnarg",
+    "iv atg",
+    "6 atg",
+    "6atg",
+    "6-atg",
+    "iv-atg",
+    "6_atg",
+    "iv_atg",
+    "ivatg",
+    "ratskcor",
+];
+
+/// The forbidden names found in `content`, lower-case.
+fn forbidden_names(content: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(content).to_lowercase();
+    FORBIDDEN_NAMES_REVERSED
+        .iter()
+        .map(|r| r.chars().rev().collect::<String>())
+        .filter(|name| text.contains(name.as_str()))
+        .collect()
+}
+
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
@@ -174,6 +200,15 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     {
         problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
     }
+    if !content.contains(&0) {
+        let found = forbidden_names(content);
+        if !found.is_empty() {
+            problems.push(format!(
+                "names the title or its publisher ({} match); call the title \"BTP 6\"",
+                found.len()
+            ));
+        }
+    }
     problems
 }
 
@@ -217,6 +252,15 @@ mod tests {
             !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
             "too big"
         );
+    }
+
+    #[test]
+    fn rejects_the_title_name() {
+        let name: String = "otua tfeht dnarg".chars().rev().collect();
+        let text = format!("// as {} does\n", name.to_uppercase());
+        assert!(!check("crates/x/src/lib.rs", text.as_bytes()).is_empty());
+        assert!(check("crates/x/src/lib.rs", b"// as BTP 6 does\n").is_empty());
+        assert!(!check("docs/upstream/watch.md", text.as_bytes()).is_empty());
     }
 
     #[test]
