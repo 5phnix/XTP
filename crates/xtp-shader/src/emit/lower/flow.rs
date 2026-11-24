@@ -137,27 +137,30 @@ impl<'a> Lower<'a> {
     }
 
     /// Console flow: an SCC value as a bit. A mask operation's SCC (result
-    /// not zero) is whether some lane of the console wave has its bit.
+    /// not zero) is whether some lane of the console wave has its result's
+    /// bit: for `s_and_saveexec` and the like, the new EXEC's, which is
+    /// not the first mask the instruction writes (the saved EXEC is).
+    /// Structurisation says which mask it is ([`Structured::sccs`]).
+    ///
+    /// [`Structured::sccs`]: crate::structure::Structured::sccs
     fn scc_bit(&mut self, v: Value) -> Result<V, Why> {
         if let Some(&Val::Bit(x)) = self.vals.get(&v) {
             return Ok(x);
         }
-        let b = *self
-            .def_block
+        let &(mask, negated) = self
+            .x
+            .st
+            .sccs
             .get(&v)
-            .ok_or("an SCC from the program's start")?;
-        let inst = self.x.p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == v))
-            .ok_or("an SCC without its instruction")?;
-        let mask = inst
-            .writes
-            .iter()
-            .filter(|w| matches!(w.0, Reg::S(_)))
-            .find_map(|w| self.x.st.masks.get(&w.1).copied())
             .ok_or("an SCC the emitter did not compute")?;
-        self.any_lane(mask)
+        // (A compare either way, no `xor` of one: see `branch_term`.)
+        let c = self.cur;
+        let bit = self.boolean(mask, c)?;
+        let (lo, hi) = self.console_ballot(c, bit);
+        let or = self.s.m.bin(c, Bin::Or, lo, hi);
+        let z = self.s.m.i32(0);
+        let p = if negated { pred::EQ } else { pred::NE };
+        Ok(self.s.m.cmp(c, p, or, z))
     }
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts

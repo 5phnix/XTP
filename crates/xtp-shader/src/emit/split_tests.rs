@@ -292,6 +292,28 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
+/// A branch on the SCC of `s_and_saveexec` (some lane is left in the new
+/// EXEC), with no lane left: the console skips the block, so the scalar
+/// write inside never happens and every lane stores the 3 from before.
+/// Taking the SCC from the saved (old) EXEC ran the block with EXEC = 0
+/// and stored 7. The lane read at the start puts the program in the
+/// console flow on every host.
+#[test]
+fn a_branch_on_the_scc_of_saveexec_skips_when_no_lane_is_left() {
+    let body = [
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0xBE89_0383, // s_mov_b32 s9, 3
+        0x7D88_0080, // v_cmp_gt_u32 vcc, 0, v0 (no lane)
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF84_0001, // s_cbranch_scc0 +1
+        0xBE89_0387, // s_mov_b32 s9, 7
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("skip on the SCC of saveexec", &body, 64, |_| 3);
+}
+
 /// Groups of several console waves need the halves to meet without a
 /// group barrier: not yet.
 #[test]
