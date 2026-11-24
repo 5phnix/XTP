@@ -66,6 +66,9 @@ fix it yet (§8).
 - **Next step** (§8.1): make XTP release that lock, or give the title an
   audio output, so that every VM run reaches the world without a debugger.
   Once there, the world runs at 2 to 3 fps on the L4, a separate problem.
+  Meanwhile `run-remote.ps1 -Game -AudioLockStopgap` releases it on the VM
+  with cdb, as S8 did (S9 reached the world); the silent output is planned
+  in §8.1.
 
 ## 2. Runs
 
@@ -79,13 +82,16 @@ fix it yet (§8).
 | S6 `20261124-213400-l4world-cdb` | (log not fetched) | `03d52cb` | `cdb -pv` at +200 s: every stack | as S4; §6 |
 | S7 `20261124-224016-l4world-cdb2` | `cloud-runs\20261124-224101-game` | `03d52cb` | `cdb -pv` at +170 s: stacks, registers, the mutex and the counter | as S4; §6 |
 | S8 `20261124-231421-l4lock-fix` | `cloud-runs\20261125-001206-game`, `tmp\l4lock\s8` | `main` `1a4267b` | `cdb` attached at +23 ms; at the leak, its stack, then the return redirected to the unlocking exit and `cdb` detached; `cdb -pv` at +269 s; 300 s | **world reached** at +98 s (autopilot), 2 to 3 fps there; §6.6 |
+| S9 `20261124-234018-stopgap` | `cloud-runs\20261125-003821-game` | `37a35f1`: `main` `0dac909` plus step 0 | `-AudioLockStopgap` (§8.1): the same redirect, made by `vm\audio-lock-stopgap.ps1` at the first audio call (+5.4 s); 300 s | **world reached** at +88 s (autopilot), 2 to 3 fps there; §8.1 |
+| S10 `20261124-235159-stopgap2` | `cloud-runs\20261125-005009-game` | `89523a2`: S9 with the report fixed | as S9, 150 s | the report names the call (thread, 0 streams); **world reached** at +98 s |
 | PC `20261124-195925` | `E:\xtp-data\cache\play\` | `main` of 19:59 | `cargo xtask play`, Series S | world 13 s after `story000.rpf` opens |
 | PC `20261124-163332` | `E:\xtp-data\cache\play\` | `main` of 16:33 | Series S, `XTP_STACKS` every 1 s | world at +38 s; its 14 dumps during the load are the reference of §6 |
 
 Every VM run used `run-remote.ps1 -Game` with `--console series-s`,
 `XTP_SKIP_INTRO=1`, `XTP_WATCHDOG_HOOK=1` and the autopilot
-(`autopilot\gameplay.txt`, or a copy with longer timeouts in S1). The
-commit each one built is in its summary line (`commit …`).
+(`autopilot\gameplay.txt`, or a copy with longer timeouts in S1); S9 and S10
+only the autopilot, `-Local`, Series S being the default by then. The commit
+each one built is in its summary line (`commit …`).
 
 ## 3. Symptoms against the PC
 
@@ -542,6 +548,96 @@ follow-ups:
    person's machine, their decision, and it only helps that machine.
 
 Option 1 unblocks the L4 at once. Option 2 is the lasting one.
+
+What came of them (2026-11-25):
+
+**Step 0, a stopgap on the VM only (in place).** Option 1 done from the VM,
+not in XTP: `tools\cloud\run-remote.ps1 -Game -AudioLockStopgap` (with
+`-Game`'s other options, e.g. `-Autopilot autopilot\gameplay.txt -Seconds
+300`). `vm\run-game.ps1` starts `vm\audio-lock-stopgap.ps1` just before the
+title. It attaches cdb (`C:\xtp\jobs\cdb\cdb.exe`, §6.7) to the run's
+`xtp.exe` as it starts, with every exception left to XTP; at the first call
+of `T+0x5267720` (the image is mapped, its `je` has not run yet) it rewrites
+the displacement at `T+0x5267749` from `0x5ae` to `0x532` if the bytes there
+are the expected ones, and detaches. In memory only, build 1.0.2.1 only
+(read from the title's `MicrosoftGame.Config`; the RVAs live in that script
+only). Without cdb it writes the displacement itself, later. Its report,
+`audio-lock-stopgap.txt` (last line `STOPGAP ...`) and cdb's output
+`audio-lock-cdb.txt`, come back with the run's logs, and the summary prints
+it; nothing of it runs after the run. S9 (`37a35f1`, `-Seconds 300`,
+autopilot `gameplay.txt`): patched at +5.4 s; the autopilot's world
+condition met at +88.4 s (frame 2756), control handed back; 2 to 3 fps in
+the world, as in S8. S10 (`89523a2`, 150 s): the same, world at
++97.7 s. It goes once XTP has option 2.
+
+**Option 2, a silent audio output: the plan for its task.** A draft is on
+the local branch `nullaudio-option2` (`b3822b4`, not built nor reviewed):
+`crates/xtp-hle/src/modules/audio/null.rs` and its tests.
+
+1. *What the title calls* (read in its code, build 1.0.2.1). Its output's
+   open (`T+0x43aea20`): `CoCreateInstance(CLSID_MMDeviceEnumerator, NULL,
+   CLSCTX_ALL, IID_IMMDeviceEnumerator)` through its import from
+   `api-ms-win-core-com-l1-1-0.dll`; the enumerator's
+   `RegisterEndpointNotificationCallback` (slot 6), `EnumAudioEndpoints(eRender,
+   DEVICE_STATE_ACTIVE)` (3) and the collection's `GetCount` (3); with more
+   than one endpoint, for each, `Item` (4), `OpenPropertyStore(STGM_READ)`
+   (4) and `GetValue(PKEY_AudioEndpoint_FormFactor)` (5), headphones or
+   headset noted; `GetDefaultAudioEndpoint(eRender, eConsole)` (4), the
+   device's `GetId` (5). Its streams (`T+0x1e7f580`): `Activate(IAudioClient)`
+   (device slot 3) and only `GetMixFormat` (8), for the channel count;
+   `Activate(ISpatialAudioClient)`; `GetSupportedAudioObjectFormatEnumerator`
+   (6), its `GetCount` (3, 0 fails) and `GetFormat(0)` (4);
+   `IsAudioObjectFormatSupported` (8); an event (`CreateEventA`);
+   `ActivateSpatialAudioStream` (10) with a `VT_BLOB` of the 0x28-byte
+   activation parameters (that format, the static channels its
+   configuration asks for, no dynamic object, category 6, game effects, the
+   event), whose result must be exactly `S_OK` (`T+0x1e7fba6` tests `jne`);
+   then, per static channel, `GetStaticObjectPosition` (3, in
+   `T+0x5f0bd40`). The update passes on the stream
+   (`BeginUpdatingAudioObjects`, the objects' `GetBuffer`,
+   `EndUpdatingAudioObjects`) are deeper in the device loop and its jobs;
+   a run lists them. The image holds no other audio interface id:
+   `IAudioRenderClient` and `IAudioClock` are not used.
+2. *What to build.* `CoCreateInstance` served by the audio module for
+   `api-ms-win-core-com-*` (and `ole32.dll`, for lookups by name), the host's
+   for every other class. For the device enumerator: the host's, untouched,
+   when it has an active render endpoint (`EnumAudioEndpoints(eRender,
+   ACTIVE)` counts one or more); otherwise, or if the host's fails, ours,
+   which lists one render endpoint, a null device: `IMMDevice` (id, state,
+   a property store with the form factor, speakers, and a name);
+   `IAudioClient` 1 to 3 that take any PCM or float format, drain what
+   `IAudioRenderClient` is given in real time, signal their event every
+   10 ms and advance `IAudioClock`; `ISpatialAudioClient` with one object
+   format (48 kHz mono float), every static channel and a few dynamic
+   objects, whose object render stream signals its event every 10 ms and
+   hands out one period's buffer per object per pass (480 frames);
+   `SetEndOfStream` frees the object's channel after the pass. Nothing is
+   played. `XTP_AUDIO_NULL=1` gives the null device whatever the host has,
+   `=0` never. Each method logs its first call. No new `windows-sys`
+   features: hand-written method tables, as `media.rs`, and the host's
+   `CoTaskMemAlloc` and `QueryPerformanceCounter` looked up by name.
+3. *Tests* (Windows, in `xtp-hle`, named so that `cargo test -p xtp-hle
+   audio` runs them): the enumeration as the title makes it (one render
+   endpoint, none for capture, id, form factor); an `IAudioClient` on a
+   format of the title's own (initialize, event, buffer and clock calls,
+   padding falling and position rising in real time, running dry, stop and
+   reset); the spatial stream opened with the title's parameters (exactly
+   `S_OK`), an object per static channel, update passes on the event;
+   `XTP_AUDIO_NULL`'s decision; and through the export, a render endpoint on
+   any host, other classes left to the host.
+4. *Acceptance*: as this task's: on the PC with `XTP_AUDIO_NULL=1`, a
+   Series S session reaches the world with no change in fps; on the L4
+   (`run-remote.ps1 -Game`, without `-AudioLockStopgap`) the autopilot's
+   world condition is met with no patch to the title's code; then step 0's
+   switch and script can go.
+
+**Option 3 was not needed** and nothing was installed. It would take a
+render endpoint driver on the VM image: a signed third-party virtual device
+(a virtual audio cable, installed by its own setup as an administrator,
+which adds an active render endpoint), or Microsoft's SysVAD sample from the
+driver kit, which is not signed for release and needs test signing on the VM
+(`bcdedit /set testsigning on`, Secure Boot off) and a reboot. Both only help
+that VM, and both are the person's decision.
 
 ### 8.2 What XTP does differently from the PC that loads
 
