@@ -66,8 +66,13 @@ Run the title:
 
 ```powershell
 cargo build --release -p xtp
-target\release\xtp.exe run <game dir>\<the title's exe> --execute
+target\release\xtp.exe run "<game dir>" --execute
 ```
+
+With a folder, `xtp run` selects an existing executable named in
+`MicrosoftGame.config`. If none matches, it looks for a single `.exe` in
+the folder and reports why it skipped any named entries. When several match,
+it lists them so you can pass one explicitly.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\xtp\data`), derived
@@ -109,7 +114,7 @@ xtp census [paths...] [--missing] [--strict] [--json]
 xtp lib-exports <import.lib> [--list]
 xtp shader-info [paths...] [--verbose] [--disasm]
 xtp translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-xtp run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+xtp run <exe|folder> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-s|series-x] [-- <title arguments>]
 xtp config
 ```

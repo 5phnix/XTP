@@ -78,7 +78,7 @@ any of it into the repository, and the tools refuse to write below it.
 
    ```powershell
    cargo build --release -p xtp
-   target\release\xtp.exe run <game dir>\<the title's exe> --execute
+   target\release\xtp.exe run "<game dir>" --execute
    ```
 
    For debugging aids, build `--profile diag --features diagnostics`; the
