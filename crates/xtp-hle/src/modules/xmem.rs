@@ -8,8 +8,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -710,6 +711,100 @@ fn views() -> MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Every address of the title's views that shows each physical page, for
+/// the GPU side's write guards (`xtp_gpu::set_alias_lookup`): BTP 6 writes
+/// a page through one view (a pool) while the GPU reads it through another
+/// (its tiled heap, `map_alias`), and a read-only guard on one view does
+/// not see writes through the other. Our own view of each allocation
+/// (`Section`) is not in it: no copy takes it. (Ported from
+/// Marvisak/VIctory#1122 (head 9ed6093) by tightfall.)
+///
+/// Updated with `VIEWS` held: a view is noted before it is reported mapped,
+/// so that the report opens the guards of the page's other views, and
+/// forgotten once it is unmapped, before the report after (see `map` and
+/// `unmap`). Its lock is taken last, after `VIEWS` and the GPU side's
+/// guards (whose fault handler asks it), and nothing is called while it is
+/// held.
+#[derive(Default)]
+struct Aliases {
+    /// (section, page index) to the addresses showing it.
+    by_page: HashMap<(usize, usize), Vec<usize>>,
+    /// Address to (section, page index), for every page of the title's
+    /// views.
+    by_address: HashMap<usize, (usize, usize)>,
+    /// The addresses whose page shows at another address too, in order:
+    /// the GPU side asks about ranges, mostly of pages shown once.
+    shared: BTreeSet<usize>,
+}
+
+static ALIASES: LazyLock<Mutex<Aliases>> = LazyLock::new(Mutex::default);
+
+fn aliases() -> MutexGuard<'static, Aliases> {
+    ALIASES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Aliases {
+    /// `at` shows page `key` no more.
+    fn forget(&mut self, at: usize, key: (usize, usize)) {
+        self.shared.remove(&at);
+        let Some(list) = self.by_page.get_mut(&key) else {
+            return;
+        };
+        list.retain(|&x| x != at);
+        if let [last] = list[..] {
+            self.shared.remove(&last);
+        }
+        if list.is_empty() {
+            self.by_page.remove(&key);
+        }
+    }
+}
+
+/// Notes `[base, base + len)` as showing `slice` and the slices after it
+/// (`shown`), or as no longer showing them.
+fn note_views(base: usize, len: usize, slice: &Slice, shown: bool) {
+    static LOOKUP: std::sync::Once = std::sync::Once::new();
+    LOOKUP.call_once(|| xtp_gpu::set_alias_lookup(other_views));
+    let section = Arc::as_ptr(&slice.section) as usize;
+    let mut a = aliases();
+    let a = &mut *a;
+    for k in 0..len / PAGE {
+        let (at, key) = (base + k * PAGE, (section, slice.index + k));
+        if !shown {
+            if a.by_address.get(&at) == Some(&key) {
+                a.by_address.remove(&at);
+                a.forget(at, key);
+            }
+            continue;
+        }
+        match a.by_address.insert(at, key) {
+            Some(old) if old == key => continue,
+            // Views do not overlap: not expected, but kept exact.
+            Some(old) => a.forget(at, old),
+            None => {}
+        }
+        let list = a.by_page.entry(key).or_default();
+        list.push(at);
+        if list.len() > 1 {
+            a.shared.extend(list.iter().copied());
+        }
+    }
+}
+
+/// For each page of `range` (title addresses) that the title shows at other
+/// addresses too, `(its address, the other's)`, once per other address: the
+/// GPU side's write guards ask it, with their lock held.
+fn other_views(range: Range<usize>, out: &mut Vec<(usize, usize)>) {
+    let a = aliases();
+    for &at in a.shared.range(range) {
+        if let Some(key) = a.by_address.get(&at)
+            && let Some(list) = a.by_page.get(key)
+        {
+            out.extend(list.iter().filter(|&&x| x != at).map(|&x| (at, x)));
+        }
+    }
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -1023,6 +1118,9 @@ fn map(views: &mut Views, base: usize, len: usize, slice: Slice) -> bool {
         UNMAPS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    // Noted first: the report then opens the guards of the pages' other
+    // views, which do not see writes through this one yet.
+    note_views(base, len, &slice, true);
     // New contents, read-write: the GPU side's copies no longer guard it.
     remapped(base, len);
     views.insert(base, (len, slice));
@@ -1108,7 +1206,8 @@ fn unmap(views: &mut Views, base: usize, len: usize) {
             continue;
         };
         // Before: guarded blocks get write access back, for the title's
-        // writes until the view goes.
+        // writes until the view goes, and so do those of the pages' other
+        // views, which do not see these writes.
         remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1120,6 +1219,9 @@ fn unmap(views: &mut Views, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        // Forgotten once gone: until then a copy of another view of its
+        // pages guards this one with it.
+        note_views(at, size, &slice, false);
         // After: a copy may have guarded the view, and noted it one, since
         // the report before.
         remapped(at, size);
@@ -1438,6 +1540,51 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// The index of the title's views (VIctory #1122): a page in a pool view
+    /// that the GPU maps into its heap too is known at both addresses, and
+    /// the index stays exact as one view is mapped again, unmapped in part
+    /// or unmapped while the other stays.
+    #[test]
+    fn the_views_of_each_page_are_known() {
+        let pages = allocate(2);
+        let (pool, heap) = (reserve(2) as usize, reserve(2) as usize);
+        let others = |at: usize| {
+            let mut out = Vec::new();
+            other_views(at..at + 2 * PAGE, &mut out);
+            out.sort_unstable();
+            out
+        };
+        let pool_at = pool as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(pool_at, 2, pages.as_ptr()), pool_at);
+        assert!(others(pool).is_empty(), "each page shown once");
+        // The GPU maps the pool's second page into its heap.
+        assert!(map_alias(heap as u64, (pool + PAGE) as u64, PAGE as u64));
+        assert_eq!(others(pool), [(pool + PAGE, heap)]);
+        assert_eq!(others(heap), [(heap, pool + PAGE)]);
+        // There the first page instead, and the second after it.
+        assert!(map_alias(heap as u64, pool as u64, PAGE as u64));
+        assert_eq!(others(pool), [(pool, heap)]);
+        let second = (pool + PAGE) as u64;
+        assert!(map_alias((heap + PAGE) as u64, second, PAGE as u64));
+        assert_eq!(others(heap), [(heap, pool), (heap + PAGE, pool + PAGE)]);
+        // The pool's first page unmapped: its view goes, and its second
+        // page is mapped again on its own.
+        assert_eq!(XMemMapPhysicalPages(pool_at, 1, std::ptr::null()), pool_at);
+        assert_eq!(others(pool), [(pool + PAGE, heap + PAGE)]);
+        assert_eq!(others(heap), [(heap + PAGE, pool + PAGE)]);
+        // The heap unmapped, the pool's second page staying.
+        assert!(map_alias(heap as u64, 0, 2 * PAGE as u64));
+        assert!(others(pool).is_empty() && others(heap).is_empty());
+        let rest = (pool + PAGE) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(rest, 1, std::ptr::null()), rest);
+        {
+            let a = aliases();
+            let known = |at: usize| (0..2).any(|k| a.by_address.contains_key(&(at + k * PAGE)));
+            assert!(!known(pool) && !known(heap), "nothing kept of them");
+        }
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     #[test]
