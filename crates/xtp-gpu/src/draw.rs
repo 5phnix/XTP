@@ -2062,6 +2062,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             {
                 crate::texture::upload(list, *resource as This, t);
             }
+            crate::resource::alias_copy(list, *resource as This);
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {

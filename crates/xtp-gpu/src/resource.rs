@@ -817,6 +817,11 @@ struct Resource {
     /// Whether `host` is another texture's copy (`alias`).
     #[cfg(windows)]
     shared: bool,
+    /// The alias registry's count of changes (`alias::changes`) when
+    /// [`alias_copy`] last found no GPU-written texture under it to copy
+    /// from (0: not looked yet): it looks again only after a change.
+    #[cfg(windows)]
+    beside: std::sync::atomic::AtomicU64,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1485,6 +1490,8 @@ fn hand_out_resource(
         host,
         #[cfg(windows)]
         shared,
+        #[cfg(windows)]
+        beside: std::sync::atomic::AtomicU64::new(0),
     });
     #[cfg(windows)]
     {
@@ -1950,6 +1957,290 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             usable(out)
         }
     }
+}
+
+/// The buffer a GPU-written texture's texels go through into a texture of
+/// the same shape that reads them in another format ([`alias_copy`]), and
+/// each level's and layer's layout in it, the written texture's first
+/// (the same bytes: the texels are as wide). Made for a pair of host copies.
+#[cfg(windows)]
+struct Through {
+    buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: std::sync::Weak<HostTexture>,
+    to: std::sync::Weak<HostTexture>,
+    parts: Vec<(
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    )>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; lists only record copies with
+// the buffer.
+#[cfg(windows)]
+unsafe impl Send for Through {}
+// SAFETY: as above.
+#[cfg(windows)]
+unsafe impl Sync for Through {}
+
+/// The most levels times layers [`alias_copy`] copies (a cube of nine
+/// levels).
+#[cfg(windows)]
+const ALIAS_PARTS: u32 = 54;
+
+/// The buffers of [`alias_copy`], by the reading texture's resource.
+#[cfg(windows)]
+type Throughs = std::collections::HashMap<usize, Arc<Through>>;
+
+#[cfg(windows)]
+static THROUGH: std::sync::Mutex<Option<Throughs>> = std::sync::Mutex::new(None);
+
+/// The [`Through`] copying `from` into `to`, the host copy of resource
+/// `key`: made the first time, or again for other copies. `None` if their
+/// layouts differ (a stand-in format of another width) or there are too
+/// many parts.
+#[cfg(windows)]
+fn through(
+    host: &crate::host::Host,
+    key: usize,
+    from: &Arc<HostTexture>,
+    to: &Arc<HostTexture>,
+) -> Option<Arc<Through>> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(Throughs::new);
+    if let Some(t) = map.get(&key)
+        && std::ptr::eq(t.from.as_ptr(), Arc::as_ptr(from))
+        && std::ptr::eq(t.to.as_ptr(), Arc::as_ptr(to))
+    {
+        return Some(t.clone());
+    }
+    map.retain(|_, t| t.to.strong_count() > 0 && t.from.strong_count() > 0);
+    // SAFETY: live textures.
+    let (of_from, of_to) = unsafe { (from.texture.GetDesc(), to.texture.GetDesc()) };
+    // Levels times layers (a volume's slices are one part).
+    let parts = |d: &D3D12_RESOURCE_DESC| {
+        let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            1
+        } else {
+            u32::from(d.DepthOrArraySize)
+        };
+        u32::from(d.MipLevels) * layers
+    };
+    let n = parts(&of_from);
+    if n == 0 || n > ALIAS_PARTS || n != parts(&of_to) {
+        return None;
+    }
+    let mut rows =
+        [(); 2].map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize]);
+    let mut bytes = [0u64; 2];
+    // SAFETY: plain queries; the out pointers hold `n` layouts each.
+    unsafe {
+        for (i, d) in [of_from, of_to].iter().enumerate() {
+            host.device.GetCopyableFootprints(
+                d,
+                0,
+                n,
+                0,
+                Some(rows[i].as_mut_ptr()),
+                None,
+                None,
+                Some(&mut bytes[i]),
+            );
+        }
+    }
+    let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
+        let (fa, fb) = (a.Footprint, b.Footprint);
+        a.Offset == b.Offset
+            && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
+                == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
+    });
+    if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
+        return None;
+    }
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes[0],
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; the out pointer is ours.
+    unsafe {
+        host.device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+    }
+    let buffer = buffer?;
+    crate::host::name(&buffer, || {
+        format!(
+            "alias copy {}x{} f{} to f{}",
+            of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+        )
+    });
+    tracing::info!(
+        width = of_from.Width,
+        height = of_from.Height,
+        parts = n,
+        written_as = of_from.Format.0,
+        read_as = of_to.Format.0,
+        "a texture read over a GPU-written one in another format: copied from it on the GPU"
+    );
+    let [of_written, of_read] = rows;
+    let through = Arc::new(Through {
+        buffer,
+        from: Arc::downgrade(from),
+        to: Arc::downgrade(to),
+        parts: of_written.into_iter().zip(of_read).collect(),
+    });
+    map.insert(key, through.clone());
+    Some(through)
+}
+
+/// `placed`, a title texture the GPU does not write, read by a shader in
+/// `list`. If it lies over a GPU-written texture of the same shape whose
+/// texels are as wide, in another format family (`alias::written_beside`:
+/// light packed as R9G9B9E5 into R32_UINT by compute programs and read
+/// through R9G9B9E5 views), that texture's texels are copied into its host
+/// copy, through a buffer (the host copies between two formats in no other
+/// way): the first time the list reads it, and again whenever the list used
+/// the written texture otherwise since. Title memory does not have them: a
+/// copy filled from it is black. Leaves `placed` in the copy destination
+/// state and keeps its host copy from being filled from title memory again
+/// (`texture::host_written`). True if `placed` is such a texture.
+///
+/// Ported from fxceless's VIctory fork (commit 4e17478: `alias_of` in
+/// `resource.rs`, `texture::alias`), reworked onto XTP's alias registry.
+#[cfg(windows)]
+pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    if placed.is_null() {
+        return false;
+    }
+    let r = resource(placed);
+    if r.desc.dimension == BUFFER || r.shared {
+        return false;
+    }
+    // Every shader read of every texture comes here: the registry is
+    // looked at again only once it changed.
+    let changes = alias::changes();
+    if r.beside.load(std::sync::atomic::Ordering::Relaxed) == changes {
+        return false;
+    }
+    let Some((source, from)) = alias::written_beside(r.data() as u64, &r.desc) else {
+        r.beside
+            .store(changes, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    };
+    let (Some(to), Some(host)) = (ready_host(placed).cloned(), crate::host::host()) else {
+        return false;
+    };
+    if !from.ready() {
+        return false;
+    }
+    let Some(through) = through(host, placed as usize, &from, &to) else {
+        return false;
+    };
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
+    let source = source as This;
+    // Resources are 8-byte aligned: a key of the list's own for the copy.
+    let first = list.first_use(placed as usize | 1);
+    // The source's first use in the list records nothing (its prelude
+    // brings it to the state); a use in another way since the last copy
+    // shows as a change of state.
+    let before = list
+        .transition(source, COPY_SOURCE)
+        .map(|(texture, before)| {
+            let state = crate::host::legal_state(texture, COPY_SOURCE);
+            let barrier = crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(state as i32),
+            );
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            before
+        });
+    crate::texture::host_written(placed);
+    if !first && before.is_none() {
+        return true;
+    }
+    crate::list::ensure_state(list, placed, COPY_DEST);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index as u32,
+        },
+    };
+    let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *row,
+        },
+    };
+    let (common, read, written) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    // SAFETY: an open list and live textures (the list holds both host
+    // copies through their states); the buffer is as big as the
+    // footprints and rests in the common state between copies.
+    unsafe {
+        let b = &through.buffer;
+        list.list
+            .ResourceBarrier(&[crate::host::transition(b, common, written)]);
+        for (index, (of_written, _)) in through.parts.iter().enumerate() {
+            let from = part(&from.texture, index);
+            list.list
+                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &from, None);
+        }
+        list.list
+            .ResourceBarrier(&[crate::host::transition(b, written, read)]);
+        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+            let to = part(&to.texture, index);
+            list.list
+                .CopyTextureRegion(&to, 0, 0, 0, &rows(of_read), None);
+        }
+        list.list
+            .ResourceBarrier(&[crate::host::transition(b, read, common)]);
+    }
+    list.keep(&through.buffer);
+    // A draw that also writes the source (a view of it handled before this
+    // one) needs it in that state again; the next read of the alias then
+    // copies once more, as it must after a write.
+    if let Some(before) = before
+        && before & TARGET_OR_UNORDERED != 0
+    {
+        crate::list::ensure_state(list, source, before);
+    }
+    true
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -3207,6 +3498,166 @@ mod tests {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
         assert!(!alias::has_sources(address));
+    }
+
+    /// The 32-bit texels of a title texture's host copy (at most 64 wide),
+    /// in its own format, rows 64 texels apart.
+    #[cfg(windows)]
+    fn read_words(host: &crate::host::Host, resource: This) -> Vec<u32> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let copy = host_copy(resource).unwrap();
+        let texture = &copy.texture;
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        assert!(d.Width <= 64);
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        // SAFETY: a plain query for one subresource.
+        unsafe {
+            host.device
+                .GetCopyableFootprints(&d, 0, 1, 0, Some(&mut footprint), None, None, None);
+        }
+        assert_eq!(footprint.Footprint.RowPitch, 256);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let size = 256 * u64::from(d.Height);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let list = host.new_list().unwrap();
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let state = copy.state.load(std::sync::atomic::Ordering::Relaxed);
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: an open list; both locations name live resources.
+        unsafe {
+            if state != source {
+                list.list
+                    .ResourceBarrier(&[crate::host::transition(texture, state, source)]);
+            }
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            if state != source {
+                list.list
+                    .ResourceBarrier(&[crate::host::transition(texture, source, state)]);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy ran (drained); the buffer is `size` bytes.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), size as usize);
+            let words = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&w| u32::from_le_bytes(w))
+                .collect();
+            readback.Unmap(0, None);
+            words
+        }
+    }
+
+    /// Light packed into an R32 target by the GPU, read through an
+    /// R9G9B9E5 view placed at its address (fxceless's `alias_of`): the
+    /// view's own copy holds title memory's zeros until a list reading it
+    /// copies the target's texels into it; a second read in the list copies
+    /// nothing more.
+    #[cfg(windows)]
+    #[test]
+    fn a_view_in_another_format_reads_what_the_gpu_wrote() {
+        let test = "resource::tests::a_view_in_another_format_reads_what_the_gpu_wrote";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        // R9G9B9E5 (0.5, 0.25, 0.125): mantissas 256, 128, 64, exponent 15.
+        const PACKED: u32 = 256 | 128 << 9 | 64 << 18 | 15 << 27;
+        const R32_FLOAT: u32 = 41;
+        let target = at(
+            address,
+            &ResourceDesc {
+                flags: 1,
+                ..texture(16, 16, R32_FLOAT, 1)
+            },
+        );
+        let rtv = [0u64; 16];
+        let null = std::ptr::null();
+        crate::descriptor::create_rtv(null, target, null.cast(), rtv.as_ptr() as u64);
+        let list = crate::testgpu::TitleList::new();
+        type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
+        let packed = [f32::from_bits(PACKED), 0.0, 0.0, 0.0];
+        let clear = slot::<Clear>(list.this(), 0x1a0);
+        clear(list.this(), rtv.as_ptr() as u64, &packed, 0, null.cast());
+        list.run();
+
+        const R9G9B9E5: u32 = 67;
+        let view = texture_at(address, &words(&texture(16, 16, R9G9B9E5, 1), [1, 2])).unwrap();
+        assert!(!same_copy(view, target), "two formats: two copies");
+        let word = |words: &[u32], x: usize, y: usize| words[y * 64 + x];
+        assert_eq!(word(&read_words(host, view), 3, 5), 0, "title memory");
+
+        let reads = crate::testgpu::TitleList::new();
+        assert!(alias_copy(reads.host(), view));
+        assert!(
+            alias_copy(reads.host(), view),
+            "read again: nothing to copy"
+        );
+        reads.run();
+        let texels = read_words(host, view);
+        for (x, y) in [(0, 0), (15, 15), (7, 9)] {
+            assert_eq!(word(&texels, x, y), PACKED, "texel {x},{y}");
+        }
+        // A texture of the target's own format over it is no such alias.
+        let same = texture_at(address, &words(&texture(16, 16, R32_FLOAT, 1), [3, 4])).unwrap();
+        assert!(!alias_copy(reads.host(), same));
+        assert_eq!(host.log_messages(), None);
+        assert_eq!(slot::<Release>(target, 0x10)(target), 0);
     }
 
     /// A placed view made before the target it aliases is made again, on

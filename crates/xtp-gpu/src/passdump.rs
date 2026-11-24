@@ -97,7 +97,11 @@ fn parse(text: &str) -> Option<Selector> {
             let (pick, program) = match pick.split_once('@') {
                 Some((pick, hash)) => (
                     pick,
-                    Some(u64::from_str_radix(hash.trim(), 16).ok().filter(|_| hash.trim().len() == 16)?),
+                    Some(
+                        u64::from_str_radix(hash.trim(), 16)
+                            .ok()
+                            .filter(|_| hash.trim().len() == 16)?,
+                    ),
                 ),
                 None => (pick, None),
             };
@@ -176,7 +180,10 @@ fn note_output(list: &HostList, resource: This, target: bool) {
         return;
     }
     let mut outputs = lock(&OUTPUTS);
-    let (targets, pending) = outputs.get_or_insert_with(HashMap::new).entry(key(list)).or_default();
+    let (targets, pending) = outputs
+        .get_or_insert_with(HashMap::new)
+        .entry(key(list))
+        .or_default();
     let to = if target { targets } else { pending };
     if !to.contains(&(resource as usize)) {
         to.push(resource as usize);
@@ -187,9 +194,15 @@ fn note_output(list: &HostList, resource: This, target: bool) {
 /// are noted if it runs the program.
 fn note_op_outputs(list: &HostList, text: &str, program: u64) {
     let mut outputs = lock(&OUTPUTS);
-    let (targets, pending) = outputs.get_or_insert_with(HashMap::new).entry(key(list)).or_default();
+    let (targets, pending) = outputs
+        .get_or_insert_with(HashMap::new)
+        .entry(key(list))
+        .or_default();
     let uavs = std::mem::take(pending);
-    if !programs(text).iter().any(|h| u64::from_str_radix(h, 16) == Ok(program)) {
+    if !programs(text)
+        .iter()
+        .any(|h| u64::from_str_radix(h, 16) == Ok(program))
+    {
         return;
     }
     let written: Vec<usize> = match kind_of(text) {
@@ -205,12 +218,13 @@ fn note_op_outputs(list: &HostList, text: &str, program: u64) {
 /// Notes a texture the frame writes, for `XTP_PRESENT_TARGET`.
 fn note_written(resource: This) {
     let Some(Selector {
-        pick: Pick::Written {
-            width,
-            height,
-            format,
-            ..
-        },
+        pick:
+            Pick::Written {
+                width,
+                height,
+                format,
+                ..
+            },
         ..
     }) = selector()
     else {
@@ -251,7 +265,10 @@ fn picked(selector: Selector) -> Option<Arc<HostTexture>> {
             // The texture shown stays while the frames write it: the order
             // of first writes changes from frame to frame.
             let shown = lock(&SHOWN);
-            match shown.as_ref().and_then(|s| matches.iter().find(|m| Arc::ptr_eq(s, m))) {
+            match shown
+                .as_ref()
+                .and_then(|s| matches.iter().find(|m| Arc::ptr_eq(s, m)))
+            {
                 Some(same) => Some(same.clone()),
                 None => matches.into_iter().nth(n),
             }
@@ -293,7 +310,9 @@ pub(crate) fn present(frame: u64) -> bool {
             Ok(s) => *show = Some(s),
             Err(e) => {
                 static SAID: std::sync::Once = std::sync::Once::new();
-                SAID.call_once(|| tracing::warn!(error = %e, "XTP_PRESENT_TARGET: no pass to show targets"));
+                SAID.call_once(
+                    || tracing::warn!(error = %e, "XTP_PRESENT_TARGET: no pass to show targets"),
+                );
                 return false;
             }
         }
@@ -449,7 +468,10 @@ fn compile(entry: PCSTR, target: PCSTR, kind: PCSTR) -> windows::core::Result<ID
                     errors.GetBufferSize(),
                 )
             };
-            tracing::warn!("XTP_PRESENT_TARGET's pass: {}", String::from_utf8_lossy(text));
+            tracing::warn!(
+                "XTP_PRESENT_TARGET's pass: {}",
+                String::from_utf8_lossy(text)
+            );
         }
         return Err(e);
     }
@@ -528,12 +550,13 @@ impl Show {
                 device.CreateGraphicsPipelineState(&desc)
             };
             let pipelines = [pipeline(&pf)?, pipeline(&pu)?, pipeline(&pi)?];
-            let view: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 1,
-                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                NodeMask: 0,
-            })?;
+            let view: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?;
             let target_view: ID3D12DescriptorHeap =
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -613,7 +636,11 @@ impl Show {
             let mut said = lock(&SAID);
             if !said.contains(&(d.Format.0, why)) {
                 said.push((d.Format.0, why));
-                tracing::warn!(format = d.Format.0, why, "XTP_PRESENT_TARGET: a texture not shown");
+                tracing::warn!(
+                    format = d.Format.0,
+                    why,
+                    "XTP_PRESENT_TARGET: a texture not shown"
+                );
             }
             return None;
         };
@@ -947,7 +974,13 @@ impl Dump {
         }
         let buffers = small_buffers(text)
             .into_iter()
-            .map(|(address, len)| (address, len, sample_buffer(readback, device, list, address, len)))
+            .map(|(address, len)| {
+                (
+                    address,
+                    len,
+                    sample_buffer(readback, device, list, address, len),
+                )
+            })
             .collect();
         if let Some(p) = r.passes.last_mut() {
             p.ops.push(Op {
@@ -993,7 +1026,10 @@ impl Dump {
     fn forget(&mut self) {
         let left = self.open.len() + self.closed.len();
         if left > 0 {
-            tracing::info!(lists = left, "XTP_PASS_DUMP: lists recorded and not submitted, forgotten");
+            tracing::info!(
+                lists = left,
+                "XTP_PASS_DUMP: lists recorded and not submitted, forgotten"
+            );
         }
         self.open.clear();
         self.closed.clear();
@@ -1029,7 +1065,8 @@ impl Dump {
                 // SAFETY: a read-back buffer; the copies into it finished.
                 if unsafe { buffer.Map(0, Some(&range), Some(&mut data)) }.is_ok() {
                     // SAFETY: the mapping spans `used` bytes.
-                    let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), used as usize) };
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(data.cast::<u8>(), used as usize) };
                     let text = report_text(frame, &lists, bytes);
                     // SAFETY: mapped above; nothing written.
                     unsafe { buffer.Unmap(0, Some(&D3D12_RANGE::default())) };
@@ -1078,9 +1115,15 @@ fn kind_of(text: &str) -> Kind {
     };
     if text.starts_with("dispatch ") || text.starts_with("indirect kind 2 ") {
         Kind::Compute
-    } else if ["draw ", "indexed ", "mesh ", "indirect kind ", "indirect rectangles "]
-        .iter()
-        .any(|p| text.starts_with(p))
+    } else if [
+        "draw ",
+        "indexed ",
+        "mesh ",
+        "indirect kind ",
+        "indirect rectangles ",
+    ]
+    .iter()
+    .any(|p| text.starts_with(p))
     {
         Kind::Graphics
     } else if text.starts_with("clear UAV ")
@@ -1126,7 +1169,10 @@ fn sample_buffer(
 ) -> Result<u64, &'static str> {
     let shadow = crate::shadow::find(address, len).ok_or("no host copy")?;
     let (buffer, at) = readback.reserve(device, len, 16)?;
-    let (common, source) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    let (common, source) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+    );
     // SAFETY: an open list; the host copy (which the list keeps) and our
     // read-back buffer, the ranges inside both. Host copies are taken as
     // common, as `shadow` takes them.
@@ -1145,7 +1191,13 @@ fn sample_buffer(
 }
 
 /// Samples the outputs of `pass`, in `list` after its ops.
-fn sample_pass(readback: &mut Readback, device: &ID3D12Device, list: &HostList, pass: &mut Pass, width: u64) {
+fn sample_pass(
+    readback: &mut Readback,
+    device: &ID3D12Device,
+    list: &HostList,
+    pass: &mut Pass,
+    width: u64,
+) {
     for &(resource, how) in &pass.outputs {
         let (desc, sample) = sample(readback, device, list, resource as This, width);
         pass.after.push(After {
@@ -1193,7 +1245,16 @@ fn sample(
     let mut total = 0;
     // SAFETY: a live texture's description; outputs for one subresource.
     unsafe {
-        device.GetCopyableFootprints(&d, 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+        device.GetCopyableFootprints(
+            &d,
+            0,
+            1,
+            0,
+            Some(&mut footprint),
+            None,
+            None,
+            Some(&mut total),
+        );
     }
     let f = footprint.Footprint;
     if bytes_per_texel(f.Format.0 as u32).is_none() {
@@ -1204,7 +1265,11 @@ fn sample(
     let pitch = u64::from(f.RowPitch);
     let ys = rows_of(d.Height);
     let row_bytes = pitch.next_multiple_of(512);
-    let bytes = if whole { total } else { ys.len() as u64 * row_bytes };
+    let bytes = if whole {
+        total
+    } else {
+        ys.len() as u64 * row_bytes
+    };
     let (buffer, at) = match readback.reserve(device, bytes, 512) {
         Ok(r) => r,
         Err(why) => return (desc, Err(why)),
@@ -1240,7 +1305,8 @@ fn sample(
                 Offset: at,
                 Footprint: f,
             };
-            list.list.CopyTextureRegion(&to(placed), 0, 0, 0, &from, None);
+            list.list
+                .CopyTextureRegion(&to(placed), 0, 0, 0, &from, None);
             rows.extend(ys.iter().map(|&y| (y, at + u64::from(y) * pitch)));
         } else {
             for (i, &y) in ys.iter().enumerate() {
@@ -1261,7 +1327,8 @@ fn sample(
                     bottom: y + 1,
                     back: 1,
                 };
-                list.list.CopyTextureRegion(&to(placed), 0, 0, 0, &from, Some(&row));
+                list.list
+                    .CopyTextureRegion(&to(placed), 0, 0, 0, &from, Some(&row));
                 rows.push((y, offset));
             }
         }
@@ -1338,14 +1405,20 @@ fn texel(format: u32, b: &[u8]) -> [f32; 4] {
     let float = |i: usize| f32::from_bits(dword(i));
     let snorm8 = |i: usize| (sbyte(i) / 127.0).max(-1.0);
     let snorm16 = |i: usize| (sword(i) / 32767.0).max(-1.0);
-    let bits = |v: u32, at: u32, len: u32| ((v >> at) & ((1 << len) - 1)) as f32 / ((1 << len) - 1) as f32;
+    let bits =
+        |v: u32, at: u32, len: u32| ((v >> at) & ((1 << len) - 1)) as f32 / ((1 << len) - 1) as f32;
     match format {
         1 | 2 => [float(0), float(1), float(2), float(3)],
         3 => [0, 1, 2, 3].map(|i| dword(i) as f32),
         4 => [0, 1, 2, 3].map(|i| dword(i) as i32 as f32),
         5 | 6 => [float(0), float(1), float(2), n],
         7 => [dword(0) as f32, dword(1) as f32, dword(2) as f32, n],
-        8 => [dword(0) as i32 as f32, dword(1) as i32 as f32, dword(2) as i32 as f32, n],
+        8 => [
+            dword(0) as i32 as f32,
+            dword(1) as i32 as f32,
+            dword(2) as i32 as f32,
+            n,
+        ],
         9 | 10 => [0, 1, 2, 3].map(|i| half(word(i))),
         11 => [0, 1, 2, 3].map(|i| f32::from(word(i)) / 65535.0),
         12 => [0, 1, 2, 3].map(|i| f32::from(word(i))),
@@ -1357,7 +1430,12 @@ fn texel(format: u32, b: &[u8]) -> [f32; 4] {
         19..=22 => [float(0), (dword(1) & 0xff) as f32, n, n],
         23 | 24 | 89 => {
             let v = dword(0);
-            [bits(v, 0, 10), bits(v, 10, 10), bits(v, 20, 10), bits(v, 30, 2)]
+            [
+                bits(v, 0, 10),
+                bits(v, 10, 10),
+                bits(v, 20, 10),
+                bits(v, 30, 2),
+            ]
         }
         25 => {
             let v = dword(0);
@@ -1366,14 +1444,24 @@ fn texel(format: u32, b: &[u8]) -> [f32; 4] {
         }
         26 => {
             let v = dword(0);
-            [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5), n]
+            [
+                small_float(v & 0x7ff, 6),
+                small_float(v >> 11 & 0x7ff, 6),
+                small_float(v >> 22, 5),
+                n,
+            ]
         }
         27..=29 => [0, 1, 2, 3].map(|i| byte(i) / 255.0),
         30 => [0, 1, 2, 3].map(byte),
         31 => [0, 1, 2, 3].map(snorm8),
         32 => [0, 1, 2, 3].map(sbyte),
         33 | 34 => [half(word(0)), half(word(1)), n, n],
-        35 => [f32::from(word(0)) / 65535.0, f32::from(word(1)) / 65535.0, n, n],
+        35 => [
+            f32::from(word(0)) / 65535.0,
+            f32::from(word(1)) / 65535.0,
+            n,
+            n,
+        ],
         36 => [f32::from(word(0)), f32::from(word(1)), n, n],
         37 => [snorm16(0), snorm16(1), n, n],
         38 => [sword(0), sword(1), n, n],
@@ -1521,8 +1609,16 @@ fn words(bytes: &[u8], len: u64, at: &Result<u64, &'static str>) -> String {
     let Some(b) = bytes.get(at..at + len as usize) else {
         return "not read back".to_owned();
     };
-    let words: Vec<u32> = b.as_chunks::<4>().0.iter().map(|&w| u32::from_le_bytes(w)).collect();
-    let floats: Vec<String> = words.iter().map(|&w| format!("{}", f32::from_bits(w))).collect();
+    let words: Vec<u32> = b
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&w| u32::from_le_bytes(w))
+        .collect();
+    let floats: Vec<String> = words
+        .iter()
+        .map(|&w| format!("{}", f32::from_bits(w)))
+        .collect();
     let hex: Vec<String> = words.iter().map(|w| format!("{w:08x}")).collect();
     format!("[{}] ({})", floats.join(", "), hex.join(" "))
 }
@@ -1530,7 +1626,11 @@ fn words(bytes: &[u8], len: u64, at: &Result<u64, &'static str>) -> String {
 /// The report of `lists` (in submission order), their samples in `bytes`.
 fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
     let passes: usize = lists.iter().map(|l| l.passes.len()).sum();
-    let ops: usize = lists.iter().flat_map(|l| &l.passes).map(|p| p.ops.len()).sum();
+    let ops: usize = lists
+        .iter()
+        .flat_map(|l| &l.passes)
+        .map(|p| p.ops.len())
+        .sum();
     let dropped: usize = lists
         .iter()
         .flat_map(|l| &l.passes)
@@ -1545,7 +1645,9 @@ fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
         lists.len()
     );
     let after_text = |a: &After| {
-        let desc = a.desc.map_or("?".to_owned(), |(w, h, f)| format!("{w}x{h} f{f}"));
+        let desc = a
+            .desc
+            .map_or("?".to_owned(), |(w, h, f)| format!("{w}x{h} f{f}"));
         let what = match &a.sample {
             Ok(s) => stats(s, bytes).map_or("not read back".to_owned(), |s| s.text()),
             Err(why) => format!("not sampled: {why}"),
@@ -1572,7 +1674,12 @@ fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
             );
             for a in &pass.after {
                 let (desc, what) = after_text(a);
-                let _ = writeln!(out, "    -> {} {:#x} {desc}: {what}", a.how.name(), a.resource);
+                let _ = writeln!(
+                    out,
+                    "    -> {} {:#x} {desc}: {what}",
+                    a.how.name(),
+                    a.resource
+                );
                 let line = format!("P{n} {what}");
                 match timeline.iter_mut().find(|t| t.0 == a.resource) {
                     Some(t) => t.2.push(line),
@@ -1597,7 +1704,11 @@ fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
             for op in &pass.ops {
                 let _ = writeln!(out, "  {}{}", if op.ran { "" } else { "DROPPED " }, op.text);
                 for (address, len, at) in &op.buffers {
-                    let _ = writeln!(out, "    buffer {address:#x}+{len} before it: {}", words(bytes, *len, at));
+                    let _ = writeln!(
+                        out,
+                        "    buffer {address:#x}+{len} before it: {}",
+                        words(bytes, *len, at)
+                    );
                 }
             }
         }
@@ -1731,11 +1842,14 @@ fn report(frame: u64) {
             let path = folder.join(format!("passes-{frame}.txt"));
             match std::fs::write(&path, text) {
                 Ok(()) => tracing::info!(path = %path.display(), "pass dump written"),
-                Err(e) => tracing::warn!(error = %e, path = %path.display(), "pass dump not written"),
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "pass dump not written")
+                }
             }
         }
     }
-    if !crate::capture::listed(frame) && !crate::capture::listed(frame + 1)
+    if !crate::capture::listed(frame)
+        && !crate::capture::listed(frame + 1)
         && let Some(d) = dump().as_mut()
         && d.readback.used > 0
     {
@@ -1826,24 +1940,39 @@ mod tests {
 
     #[test]
     fn ops_are_told_apart_by_what_they_write() {
-        assert_eq!(kind_of("dispatch 40x23x1 compute 1f55c45de66dc2c4 | 1f55c45de66dc2c4: u0=0x0"), Kind::Compute);
+        assert_eq!(
+            kind_of("dispatch 40x23x1 compute 1f55c45de66dc2c4 | 1f55c45de66dc2c4: u0=0x0"),
+            Kind::Compute
+        );
         assert_eq!(kind_of("indirect kind 2 max 1 at 0x1000"), Kind::Compute);
         assert_eq!(kind_of("indirect kind 10 max 4 at 0x1000"), Kind::Graphics);
         assert_eq!(kind_of("mesh 12"), Kind::Graphics);
         assert_eq!(kind_of("draw 3x1 vertex a | b"), Kind::Graphics);
-        assert_eq!(kind_of("clear UAV Float([0.0, 0.0, 0.0, 0.0]) of 0x22a83108070"), Kind::Writes(0x22a83108070));
         assert_eq!(
-            kind_of("FidelityFX bilinear upscale Upscale { list: 0x10, color: 0x20, output: 0x22a8310be50, render: [1280, 720] }"),
+            kind_of("clear UAV Float([0.0, 0.0, 0.0, 0.0]) of 0x22a83108070"),
+            Kind::Writes(0x22a83108070)
+        );
+        assert_eq!(
+            kind_of(
+                "FidelityFX bilinear upscale Upscale { list: 0x10, color: 0x20, output: 0x22a8310be50, render: [1280, 720] }"
+            ),
             Kind::Writes(0x22a8310be50)
         );
         assert_eq!(kind_of("copy resource 0x1 to 0x2"), Kind::Other);
-        assert_eq!(kind_of("write 0x1 (4 bytes) at 0x10 on the GPU"), Kind::Other);
         assert_eq!(
-            programs("dispatch 1x1x1 compute x | 1f55c45de66dc2c4: u0=0x0 [heap 3: a] | 0123456789abcdef: u1=0x4"),
+            kind_of("write 0x1 (4 bytes) at 0x10 on the GPU"),
+            Kind::Other
+        );
+        assert_eq!(
+            programs(
+                "dispatch 1x1x1 compute x | 1f55c45de66dc2c4: u0=0x0 [heap 3: a] | 0123456789abcdef: u1=0x4"
+            ),
             vec!["1f55c45de66dc2c4", "0123456789abcdef"]
         );
         assert_eq!(
-            small_buffers(r#"x tables ["a Srv s0+16: buffer Some((40221212656, 16))", "a Srv s0+40: buffer Some((41111749488, 384))", "a Uav s1+8: uav buffer Some((7, 64))", "b Srv s0+16: buffer Some((40221212656, 16))"]"#),
+            small_buffers(
+                r#"x tables ["a Srv s0+16: buffer Some((40221212656, 16))", "a Srv s0+40: buffer Some((41111749488, 384))", "a Uav s1+8: uav buffer Some((7, 64))", "b Srv s0+16: buffer Some((40221212656, 16))"]"#
+            ),
             vec![(40221212656, 16), (7, 64)]
         );
     }
@@ -1851,7 +1980,9 @@ mod tests {
     #[test]
     fn texels_decode_as_their_formats() {
         // Half floats 1.0, 0.5, -2, 0.
-        let h = [0x3c00u16, 0x3800, 0xc000, 0].map(u16::to_le_bytes).concat();
+        let h = [0x3c00u16, 0x3800, 0xc000, 0]
+            .map(u16::to_le_bytes)
+            .concat();
         assert_eq!(texel(10, &h), [1.0, 0.5, -2.0, 0.0]);
         // R11G11B10: 1.0 in each channel.
         let v: u32 = 0x3c0 | 0x3c0 << 11 | 0x1e0 << 22;
@@ -1862,7 +1993,10 @@ mod tests {
         assert_eq!((t[0], t[1], t[3]), (1.0, 0.0, 1.0));
         assert!((t[2] - 4.0 / 1023.0).abs() < 1e-6);
         assert_eq!(texel(62, &[200])[0], 200.0);
-        assert_eq!(texel(87, &[1, 2, 3, 4])[..3], [3.0 / 255.0, 2.0 / 255.0, 1.0 / 255.0]);
+        assert_eq!(
+            texel(87, &[1, 2, 3, 4])[..3],
+            [3.0 / 255.0, 2.0 / 255.0, 1.0 / 255.0]
+        );
         // R9G9B9E5: 1.0 in red (mantissa 256, exponent 16).
         let v: u32 = 256 | 16 << 27;
         assert_eq!(texel(67, &v.to_le_bytes())[0], 1.0);
@@ -1871,7 +2005,9 @@ mod tests {
     #[test]
     fn stats_count_lit_texels_and_odd_values() {
         // Two rows of two R16_FLOAT texels: 0, 2 | NaN, 0.5.
-        let bytes = [0u16, 0x4000, 0x7e00, 0x3800].map(u16::to_le_bytes).concat();
+        let bytes = [0u16, 0x4000, 0x7e00, 0x3800]
+            .map(u16::to_le_bytes)
+            .concat();
         let sample = Sample {
             width: 2,
             format: 54,
@@ -1881,7 +2017,11 @@ mod tests {
         assert_eq!((s.texels, s.lit, s.odd), (4, 3, 1));
         assert_eq!((s.min[0], s.max[0]), (0.0, 2.0));
         assert!((s.sum[0] / s.finite[0] as f64 - 2.5 / 3.0).abs() < 1e-9);
-        assert!(s.text().starts_with("lit 75.0% max (2.0000)"), "{}", s.text());
+        assert!(
+            s.text().starts_with("lit 75.0% max (2.0000)"),
+            "{}",
+            s.text()
+        );
     }
 
     /// Clears a `width` x `height` render target of host format `format` to
@@ -1915,7 +2055,12 @@ mod tests {
         let hdr = cleared(4, 2, 10, [2.0, 0.5, 0.25, 1.0]);
         let ids = cleared(2, 2, 62, [200.0, 0.0, 0.0, 0.0]);
         let mut show = Show::new(host, 8, 4).unwrap();
-        let near = |texel: &[u8], want: [u8; 3]| texel[..3].iter().zip(want).all(|(&t, w)| t.abs_diff(w) <= 1);
+        let near = |texel: &[u8], want: [u8; 3]| {
+            texel[..3]
+                .iter()
+                .zip(want)
+                .all(|(&t, w)| t.abs_diff(w) <= 1)
+        };
         for (target, scale, want) in [(hdr, 0.5, [255, 64, 32]), (ids, 1.0, [200, 200, 200])] {
             let copy = crate::resource::host_copy(target).unwrap();
             let image = show.draw(host, &copy, scale).unwrap();
@@ -1953,22 +2098,45 @@ mod tests {
             exposure.address()
         );
         dump.op(&host.device, &list, &draw);
-        dump.op(&host.device, &list, "draw 3x1 vertex x | 0123456789abcdef: u0=0x0");
+        dump.op(
+            &host.device,
+            &list,
+            "draw 3x1 vertex x | 0123456789abcdef: u0=0x0",
+        );
         dump.dropped(key(&list), "dispatch: pipeline 0x1 NoPipeline".into());
-        dump.op(&host.device, &list, "dispatch 1x1x1 compute y | fedcba9876543210: u0=0x0");
+        dump.op(
+            &host.device,
+            &list,
+            "dispatch 1x1x1 compute y | fedcba9876543210: u0=0x0",
+        );
         dump.closed(&host.device, &list);
         list.close();
         host.execute(&[&list]);
         dump.submitted(&[&list]);
         host.drain();
         let text = dump.report(7).unwrap();
-        assert!(text.starts_with("XTP pass dump of frame 7: 1 lists, 2 passes, 4 ops (1 dropped)."), "{text}");
+        assert!(
+            text.starts_with("XTP pass dump of frame 7: 1 lists, 2 passes, 4 ops (1 dropped)."),
+            "{text}"
+        );
         // The dropped dispatch is listed in the pass it was recorded in.
-        assert!(text.contains("P1 L1 2/3 ran, programs [0123456789abcdef]"), "{text}");
-        let after = format!("-> rt {:#x} 8x4 f10: lit 100.0% max (0.5000, 0.2500, 0.0000, 1.0000)", target as usize);
+        assert!(
+            text.contains("P1 L1 2/3 ran, programs [0123456789abcdef]"),
+            "{text}"
+        );
+        let after = format!(
+            "-> rt {:#x} 8x4 f10: lit 100.0% max (0.5000, 0.2500, 0.0000, 1.0000)",
+            target as usize
+        );
         assert!(text.contains(&after), "{text}");
-        assert!(text.contains("P2 L1 1/1 ran, programs [fedcba9876543210]"), "{text}");
-        assert!(text.contains("  DROPPED dispatch: pipeline 0x1 NoPipeline"), "{text}");
+        assert!(
+            text.contains("P2 L1 1/1 ran, programs [fedcba9876543210]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  DROPPED dispatch: pipeline 0x1 NoPipeline"),
+            "{text}"
+        );
         let sampled = format!(
             "    buffer {:#x}+16 before it: [1, 2, 0, 0.25] (3f800000 40000000 00000000 3e800000)",
             exposure.address()
