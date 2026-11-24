@@ -1,461 +1,599 @@
-//! The title's Bink movies, seen through its import table (EXPERIMENT).
+//! An opt-in cut of the intro movie, off by default: set `XTP_SKIP_INTRO`
+//! (e.g. `=1`) and the movie the title plays in its start-up front end is
+//! sent to its last frame as soon as it starts.
 //!
-//! `XTP_INTRO_TRACE` (any value) logs every movie the title opens, closes,
-//! seeks or pauses: its path, length, and the title code that asked.
-//! `XTP_INTRO_EXPERIMENT_SKIP=<substring>,...` makes the opens of the
-//! movies whose path holds one of the substrings fail (mode `fail`, the
-//! default) or report a one-frame movie to the title's probe (mode
-//! `frames1`, `XTP_INTRO_EXPERIMENT_MODE`).
+//! Why (docs/analysis/intro-skip.md): the title starts loading the world
+//! only once its intro movie has ended and the profile is accepted. The
+//! movie (4K, 450 frames at 30 per second: 15 s) starts when the start-up
+//! work is done, so in a test session it holds the world back by about 13 s.
 //!
-//! The title (1.0.2.1) opens a movie twice: a probe (`0x442ea70`) opens it,
-//! copies its frame count and rate into the movie object and closes it;
-//! the playback open (`0x442efe0`, from `0x199ef20`) keeps the handle. Its
-//! player (`0x2ef0e0`) decodes while the handle's last decoded frame is
-//! below the frame count the probe copied. A failed playback open puts the
-//! movie object in state 3 (`0x19463d0`).
+//! How the title plays it (1.0.2.1, by RVA). Its movies are Bink 2 files
+//! played through `Bink2Scarlett.dll`, whose functions it calls through its
+//! import slots. A movie is probed first (`0x442ea70`: opened, its size and
+//! rate copied, closed), then opened for playback (`0x442efe0`). The player
+//! (`0x2ef0e0`) calls `BinkNextFrame` before each frame it decodes, and
+//! waits for that decode before the next one; its own seek is a `BinkGoto`
+//! followed by a decode. The front end goes on once the movie has shown its
+//! last frame.
+//!
+//! The cut. Once the imports are bound, three slots are wrapped:
+//! - `BinkOpenWithOptions` (`0x6794210`): a movie opened while the start-up
+//!   front end is up (`0x74e2c1c` = 1) and before any world loading
+//!   (`0x74e007d` = 0) is marked with its frame count;
+//! - `BinkNextFrame` (`0x6794208`): the first one on a marked movie becomes
+//!   a `BinkGoto` (`0x6794200`, read, not wrapped) to its last frame, which
+//!   the player then decodes as after its own seeks: the movie has ended;
+//! - `BinkClose` (`0x67941c0`): forgets the mark (a probe is closed without
+//!   ever being advanced, and Bink may hand the same handle out again).
+//!
+//! Two other ways were tried and refused: failing the playback open (the
+//! front end then waits for ever) and showing the probe a one-frame movie
+//! (the player still plays all 450 frames).
 
 use std::collections::HashMap;
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::Mutex;
 
 use crate::{BUILD_1_0_2_1, KnownBuild};
 
-/// Set (any value) to log the title's movies.
-pub const TRACE_ENV: &str = "XTP_INTRO_TRACE";
-/// Comma-separated path substrings of the movies to skip (experiment).
-pub const SKIP_ENV: &str = "XTP_INTRO_EXPERIMENT_SKIP";
-/// `fail` (default) or `frames1` (experiment).
-pub const MODE_ENV: &str = "XTP_INTRO_EXPERIMENT_MODE";
+/// Set (any value, e.g. `XTP_SKIP_INTRO=1`) to cut the intro movie.
+pub const ENV: &str = "XTP_SKIP_INTRO";
 
-/// Where one build keeps what the hook needs, by RVA.
+/// What one build needs, by RVA.
 #[derive(Debug, Clone, Copy)]
 pub struct Sites {
     pub build: &'static KnownBuild,
-    /// Import slots of `Bink2Scarlett.dll` functions.
+    /// Import slots of `Bink2Scarlett.dll`'s `BinkOpenWithOptions`,
+    /// `BinkNextFrame`, `BinkGoto` and `BinkClose`.
     pub open_slot: usize,
-    pub close_slot: usize,
+    pub next_slot: usize,
     pub goto_slot: usize,
-    pub pause_slot: usize,
-    /// Return addresses of the two `BinkOpenWithOptions` calls.
-    pub probe_return: usize,
-    pub playback_return: usize,
+    pub close_slot: usize,
+    /// `u32`, 1 while the front end is up.
+    pub front_end: usize,
+    /// `u8`, 1 once the title has started loading the world.
+    pub world_loading: usize,
 }
 
+/// Builds the cut knows. Any other build is refused.
 pub const SITES: &[Sites] = &[Sites {
     build: &BUILD_1_0_2_1,
     open_slot: 0x6794210,
-    close_slot: 0x67941c0,
+    next_slot: 0x6794208,
     goto_slot: 0x6794200,
-    pause_slot: 0x6794218,
-    probe_return: 0x442ebec,
-    playback_return: 0x442f05c,
+    close_slot: 0x67941c0,
+    front_end: 0x74e2c1c,
+    world_loading: 0x74e007d,
 }];
 
-/// The open flag that says the "name" is a movie in memory.
-const FROM_MEMORY: u32 = 0x0400_0000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Fail,
-    Frames1,
-}
-
-struct State {
-    base: usize,
-    size: usize,
-    sites: Sites,
-    trace: bool,
-    skip: Vec<String>,
-    mode: Mode,
-    /// Open handles: path, opened when, and the frame count to put back.
-    open: Mutex<HashMap<usize, OpenMovie>>,
-}
-
-/// An open handle's path, when it was opened, and the frame count to put
-/// back.
-type OpenMovie = (String, Instant, Option<u32>);
-
-static STATE: OnceLock<State> = OnceLock::new();
-static REAL_OPEN: AtomicUsize = AtomicUsize::new(0);
-static REAL_CLOSE: AtomicUsize = AtomicUsize::new(0);
-static REAL_GOTO: AtomicUsize = AtomicUsize::new(0);
-static REAL_PAUSE: AtomicUsize = AtomicUsize::new(0);
-
-type OpenFn = unsafe extern "system" fn(*const c_void, *const c_void, u32) -> *mut c_void;
-type CloseFn = unsafe extern "system" fn(*mut c_void);
-type GotoFn = unsafe extern "system" fn(*mut c_void, u32, i32);
-type PauseFn = unsafe extern "system" fn(*mut c_void, i32) -> i32;
-
-/// The public head of a Bink 2 handle (`bink.h`).
-#[repr(C)]
-struct BinkHead {
-    width: u32,
-    height: u32,
-    frames: u32,
-    frame_num: u32,
-    last_frame_num: u32,
-    frame_rate: u32,
-    frame_rate_div: u32,
-}
-
-/// Installs the trace or the experiment when asked. Call once the title's
-/// imports are bound, before any of its code runs.
-///
-/// # Safety
-/// `base..base + size` is the mapped, bound image of the executable whose
-/// original BLAKE3 is `blake3_hex`, and no title code runs yet.
-#[cfg(windows)]
-pub unsafe fn apply_if_asked(blake3_hex: &str, base: usize, size: u32) {
-    let trace = std::env::var_os(TRACE_ENV).is_some();
-    let skip: Vec<String> = std::env::var(SKIP_ENV)
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !trace && skip.is_empty() {
-        return;
+impl Sites {
+    /// The four import slots, as (RVA, `Bink2Scarlett.dll` export).
+    pub fn imports(&self) -> [(usize, &'static str); 4] {
+        [
+            (self.open_slot, "BinkOpenWithOptions"),
+            (self.next_slot, "BinkNextFrame"),
+            (self.goto_slot, "BinkGoto"),
+            (self.close_slot, "BinkClose"),
+        ]
     }
-    let Some(sites) = SITES
+}
+
+/// The sites for the executable whose BLAKE3 is `blake3_hex` (any case).
+pub fn sites_for(blake3_hex: &str) -> Option<&'static Sites> {
+    SITES
         .iter()
         .find(|s| s.build.blake3.eq_ignore_ascii_case(blake3_hex))
-    else {
-        tracing::warn!("intro: no movie sites are known for this build; nothing installed");
-        return;
-    };
-    let mode = match std::env::var(MODE_ENV).as_deref() {
-        Ok("frames1") => Mode::Frames1,
-        _ => Mode::Fail,
-    };
-    let size = size as usize;
-    let slots = [
-        (sites.open_slot, open as *const () as usize, &REAL_OPEN),
-        (sites.close_slot, close as *const () as usize, &REAL_CLOSE),
-        (sites.goto_slot, goto as *const () as usize, &REAL_GOTO),
-        (sites.pause_slot, pause as *const () as usize, &REAL_PAUSE),
-    ];
-    if slots.iter().any(|&(rva, _, _)| rva + 8 > size) {
-        tracing::warn!("intro: an import slot lies outside the image; nothing installed");
-        return;
-    }
-    let _ = STATE.set(State {
-        base,
-        size,
-        sites: *sites,
-        trace,
-        skip,
-        mode,
-        open: Mutex::new(HashMap::new()),
-    });
-    for (rva, ours, real) in slots {
-        let slot = (base + rva) as *mut usize;
-        // SAFETY: inside the image (checked above), bound, no title code runs.
-        let bound = unsafe { slot.read_volatile() };
-        if bound == 0 {
-            tracing::warn!(
-                rva = format_args!("{rva:#x}"),
-                "intro: an import slot is empty"
-            );
-            return;
-        }
-        real.store(bound, Ordering::SeqCst);
-        // SAFETY: as above.
-        if let Err(e) = unsafe { write_slot(slot, ours) } {
-            tracing::warn!("intro: writing the import slot {rva:#x} failed: {e}");
-            return;
+}
+
+/// A movie opened now is the intro: the start-up front end is up and no
+/// world has started loading.
+pub fn in_start_up_front_end(front_end: u32, world_loading: u8) -> bool {
+    front_end == 1 && world_loading == 0
+}
+
+/// Movies to send to their last frame, by Bink handle.
+#[derive(Debug, Default)]
+pub struct Marks(Mutex<HashMap<usize, u32>>);
+
+impl Marks {
+    /// `handle`, a movie of `frames` frames, is to be cut. A movie of one
+    /// frame has nothing to cut.
+    pub fn mark(&self, handle: usize, frames: u32) {
+        if frames > 1 {
+            self.0.lock().unwrap().insert(handle, frames);
         }
     }
-    let state = STATE.get().unwrap();
-    tracing::info!(
-        trace,
-        skip = ?state.skip,
-        mode = ?state.mode,
-        "intro: movie imports wrapped (experiment)"
-    );
-    if trace {
-        watch_states(base, size);
+
+    /// The frame to go to instead of the next one: once per mark.
+    pub fn take(&self, handle: usize) -> Option<u32> {
+        self.0.lock().unwrap().remove(&handle)
+    }
+
+    /// `handle` is closed.
+    pub fn forget(&self, handle: usize) {
+        self.0.lock().unwrap().remove(&handle);
     }
 }
 
-/// The title's state words (docs/analysis/run-keys.md), logged with a
-/// timestamp when they change, polled every 5 ms (experiment).
-#[cfg(windows)]
-fn watch_states(base: usize, size: usize) {
-    const WORDS: [(usize, &str); 4] = [
-        (0x74e2c1c, "front end"),
-        (0xab43664, "loading screen"),
-        (0x74e007c, "start-up flags"),
-        (0x9e58138, "not in game"),
-    ];
-    if WORDS.iter().any(|&(rva, _)| rva + 4 > size) {
-        return;
+/// Why the cut was not installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotInstalled {
+    /// No sites are known for this build.
+    UnknownBuild,
+    /// A site lies outside the image, or an import slot is empty: nothing
+    /// written.
+    Site { rva: usize },
+    /// Already installed in this process: nothing written.
+    Twice,
+    /// Writing an import slot failed after `written` slots.
+    Write {
+        rva: usize,
+        written: usize,
+        os_error: i32,
+    },
+}
+
+impl std::fmt::Display for NotInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::UnknownBuild => write!(f, "no intro sites are known for this build"),
+            Self::Site { rva } => write!(
+                f,
+                "the site at {rva:#x} is outside the image or an empty import slot; nothing written"
+            ),
+            Self::Twice => write!(f, "already installed; nothing written"),
+            Self::Write {
+                rva,
+                written,
+                os_error,
+            } => write!(
+                f,
+                "writing the import slot {rva:#x} failed after {written} slot(s): {}",
+                std::io::Error::from_raw_os_error(os_error)
+            ),
+        }
     }
-    let _ = std::thread::Builder::new()
-        .name("xtp-intro-states".into())
-        .spawn(move || {
-            let mut seen = [None; WORDS.len()];
-            loop {
-                for (&(rva, what), seen) in WORDS.iter().zip(&mut seen) {
-                    // SAFETY: four bytes of the mapped image's .data.
-                    let value = unsafe { ((base + rva) as *const u32).read_volatile() };
-                    if *seen != Some(value) {
-                        tracing::info!(
-                            rva = format_args!("{rva:#x}"),
-                            what,
-                            value = format_args!("{value:#x}"),
-                            "intro: title state"
-                        );
-                        *seen = Some(value);
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
+}
+
+impl std::error::Error for NotInstalled {}
+
+#[cfg(windows)]
+pub use hook::apply_if_asked;
+
+#[cfg(windows)]
+mod hook {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    use super::{ENV, Marks, NotInstalled, Sites, in_start_up_front_end, sites_for};
+
+    pub(super) type OpenFn =
+        unsafe extern "system" fn(*const c_void, *const c_void, u32) -> *mut c_void;
+    pub(super) type NextFn = unsafe extern "system" fn(*mut c_void);
+    pub(super) type GotoFn = unsafe extern "system" fn(*mut c_void, u32, i32);
+    pub(super) type CloseFn = unsafe extern "system" fn(*mut c_void);
+
+    /// The public head of a Bink 2 handle (`bink.h`).
+    #[repr(C)]
+    pub(super) struct BinkHead {
+        pub width: u32,
+        pub height: u32,
+        pub frames: u32,
+    }
+
+    /// The bound functions, and where the title keeps its state words.
+    struct Installed {
+        open: OpenFn,
+        next: NextFn,
+        goto: GotoFn,
+        close: CloseFn,
+        front_end: usize,
+        world_loading: usize,
+        marks: Marks,
+    }
+
+    static INSTALLED: OnceLock<Installed> = OnceLock::new();
+
+    /// Wraps the title's Bink imports when [`ENV`] is set, and logs the
+    /// outcome. Does nothing otherwise.
+    ///
+    /// # Safety
+    /// `base..base + size` is the mapped image of the executable whose
+    /// original BLAKE3 is `blake3_hex`, its imports are bound, and no title
+    /// code runs yet.
+    pub unsafe fn apply_if_asked(blake3_hex: &str, base: usize, size: u32) {
+        if std::env::var_os(ENV).is_none() {
+            return;
+        }
+        let Some(sites) = sites_for(blake3_hex) else {
+            let e = NotInstalled::UnknownBuild;
+            tracing::warn!("intro movie not cut ({ENV}): {e}");
+            return;
+        };
+        // SAFETY: forwarded from this function's contract.
+        match unsafe { install(sites, base, size as usize) } {
+            Ok(()) => tracing::info!(
+                build = sites.build.label,
+                "the intro movie will be cut ({ENV})"
+            ),
+            Err(e) => tracing::warn!("intro movie not cut ({ENV}): {e}"),
+        }
+    }
+
+    /// Checks every site and reads the bound functions, then writes the
+    /// three wrapped slots. Once per process.
+    ///
+    /// # Safety
+    /// `base..base + size` is an image laid out as `sites` says, its import
+    /// slots bound to functions of Bink's signatures, and no code calls
+    /// through them yet.
+    pub(super) unsafe fn install(
+        sites: &Sites,
+        base: usize,
+        size: usize,
+    ) -> Result<(), NotInstalled> {
+        let inside = |rva: usize, len: usize| rva.checked_add(len).is_some_and(|end| end <= size);
+        let bound = |rva: usize| {
+            // SAFETY: an eight-byte slot inside the image (checked first).
+            inside(rva, 8).then(|| unsafe { ((base + rva) as *const usize).read_volatile() })
+        };
+        let mut functions = [0usize; 4];
+        for (f, (rva, _)) in functions.iter_mut().zip(sites.imports()) {
+            *f = bound(rva)
+                .filter(|&a| a != 0)
+                .ok_or(NotInstalled::Site { rva })?;
+        }
+        for (rva, len) in [(sites.front_end, 4), (sites.world_loading, 1)] {
+            if !inside(rva, len) {
+                return Err(NotInstalled::Site { rva });
             }
-        });
-}
+        }
+        let [open_f, next_f, goto_f, close_f] = functions;
+        // SAFETY: each slot holds a bound function of the signature Bink
+        // documents for it (the caller's contract).
+        let installed = unsafe {
+            Installed {
+                open: std::mem::transmute::<usize, OpenFn>(open_f),
+                next: std::mem::transmute::<usize, NextFn>(next_f),
+                goto: std::mem::transmute::<usize, GotoFn>(goto_f),
+                close: std::mem::transmute::<usize, CloseFn>(close_f),
+                front_end: base + sites.front_end,
+                world_loading: base + sites.world_loading,
+                marks: Marks::default(),
+            }
+        };
+        if INSTALLED.set(installed).is_err() {
+            // A second install would wrap our own wrappers.
+            return Err(NotInstalled::Twice);
+        }
+        let wrapped = [
+            (sites.open_slot, open as *const () as usize),
+            (sites.next_slot, next as *const () as usize),
+            (sites.close_slot, close as *const () as usize),
+        ];
+        for (written, (rva, ours)) in wrapped.into_iter().enumerate() {
+            // SAFETY: a bound slot inside the image; nothing calls it yet.
+            unsafe { write_slot(base + rva, ours) }.map_err(|e| NotInstalled::Write {
+                rva,
+                written,
+                os_error: e.raw_os_error().unwrap_or(0),
+            })?;
+        }
+        Ok(())
+    }
 
-#[cfg(windows)]
-unsafe fn write_slot(slot: *mut usize, value: usize) -> std::io::Result<()> {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let mut old = 0;
-    // SAFETY: the caller's slot is mapped; only its protection changes.
-    if unsafe { VirtualProtect(slot as _, 8, PAGE_READWRITE, &mut old) } == 0 {
-        return Err(std::io::Error::last_os_error());
+    /// Writes `value` into the import slot at `at`.
+    ///
+    /// # Safety
+    /// `at` is an eight-byte import slot of a mapped image.
+    unsafe fn write_slot(at: usize, value: usize) -> std::io::Result<()> {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        let mut old = 0;
+        // SAFETY: mapped, per the caller; only these bytes' protection
+        // changes, and it is restored below.
+        if unsafe { VirtualProtect(at as _, 8, PAGE_READWRITE, &mut old) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: writable now, eight-byte aligned (an import slot).
+        unsafe {
+            (at as *mut usize).write_volatile(value);
+            VirtualProtect(at as _, 8, old, &mut old);
+        }
+        Ok(())
     }
-    // SAFETY: writable now; restored right after.
-    unsafe {
-        slot.write_volatile(value);
-        VirtualProtect(slot as _, 8, old, &mut old);
-    }
-    Ok(())
-}
 
-/// The first return address in the title's image, as an RVA, and the next
-/// few.
-#[cfg(windows)]
-fn callers(state: &State) -> Vec<usize> {
-    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
-    let mut frames = [std::ptr::null_mut::<c_void>(); 24];
-    // SAFETY: writes at most 24 entries into `frames`.
-    let n = unsafe { RtlCaptureStackBackTrace(0, 24, frames.as_mut_ptr(), std::ptr::null_mut()) };
-    frames[..n as usize]
-        .iter()
-        .map(|&f| f as usize)
-        .filter(|&f| f >= state.base && f < state.base + state.size)
-        .map(|f| f - state.base)
-        .take(8)
-        .collect()
-}
+    fn installed() -> &'static Installed {
+        INSTALLED
+            .get()
+            .expect("the slots are wrapped only once installed")
+    }
 
-/// `len` bytes at `addr` are committed and readable.
-#[cfg(windows)]
-fn readable(addr: usize, len: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    if addr < 0x10000 {
-        return 0;
-    }
-    // SAFETY: a plain query; `info` is written by the call.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: as above.
-    if unsafe { VirtualQuery(addr as _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
-        return 0;
-    }
-    let ok = info.State == MEM_COMMIT
-        && info.Protect & 0x100 == 0
-        && info.Protect & (0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80) != 0;
-    if !ok {
-        return 0;
-    }
-    let end = info.BaseAddress as usize + info.RegionSize;
-    end.saturating_sub(addr).min(len)
-}
-
-/// The path the title passes, when the "name" is its file descriptor.
-#[cfg(windows)]
-fn movie_path(name: *const c_void, flags: u32) -> Option<String> {
-    if flags & FROM_MEMORY != 0 || readable(name as usize, 8) < 8 {
-        return None;
-    }
-    // SAFETY: eight readable bytes, checked just above.
-    let text = unsafe { (name as *const usize).read_unaligned() };
-    let len = readable(text, 260);
-    if len == 0 {
-        return None;
-    }
-    // SAFETY: `len` readable bytes.
-    let bytes = unsafe { std::slice::from_raw_parts(text as *const u8, len) };
-    let end = bytes.iter().position(|&b| b == 0)?;
-    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
-}
-
-#[cfg(windows)]
-fn head(handle: *mut c_void) -> Option<&'static BinkHead> {
-    if readable(handle as usize, size_of::<BinkHead>()) < size_of::<BinkHead>() {
-        return None;
-    }
-    // SAFETY: readable, and a live handle Bink returned.
-    Some(unsafe { &*(handle as *const BinkHead) })
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn open(
-    name: *const c_void,
-    options: *const c_void,
-    flags: u32,
-) -> *mut c_void {
-    // SAFETY: installed only after REAL_OPEN was stored.
-    let real: OpenFn = unsafe { std::mem::transmute(REAL_OPEN.load(Ordering::SeqCst)) };
-    let Some(state) = STATE.get() else {
+    unsafe extern "system" fn open(
+        name: *const c_void,
+        options: *const c_void,
+        flags: u32,
+    ) -> *mut c_void {
+        let hook = installed();
         // SAFETY: the title's own call, forwarded.
-        return unsafe { real(name, options, flags) };
-    };
-    let path = movie_path(name, flags);
-    let callers = callers(state);
-    let site = match callers.first() {
-        Some(&r) if r == state.sites.probe_return => "probe",
-        Some(&r) if r == state.sites.playback_return => "playback",
-        _ => "other",
-    };
-    let callers_hex: Vec<String> = callers.iter().map(|r| format!("{r:#x}")).collect();
-    let lower = path.as_deref().unwrap_or("").to_ascii_lowercase();
-    // `frontend`: the start-up front end is up (0x74e2c1c = 1) and no world
-    // loading has started yet (byte 0x74e007d = 0).
-    let frontend = {
-        // SAFETY: a u32 and a byte of the mapped image's .data.
-        let (fe, loading) = unsafe {
+        let handle = unsafe { (hook.open)(name, options, flags) };
+        // SAFETY: the image's state words, mapped for the process' life.
+        let (front_end, world_loading) = unsafe {
             (
-                ((state.base + 0x74e2c1c) as *const u32).read_volatile(),
-                ((state.base + 0x74e007d) as *const u8).read_volatile(),
+                (hook.front_end as *const u32).read_volatile(),
+                (hook.world_loading as *const u8).read_volatile(),
             )
         };
-        fe == 1 && loading == 0
-    };
-    let by_path = !lower.is_empty()
-        && state
-            .skip
-            .iter()
-            .filter(|s| *s != "frontend" && !s.starts_with("size="))
-            .any(|s| lower.contains(s.as_str()));
-    let by_frontend = frontend && state.skip.iter().any(|s| s == "frontend");
-    if (by_path || by_frontend) && state.mode == Mode::Fail && site == "playback" {
-        tracing::info!(path = path.as_deref().unwrap_or("?"), site, by_frontend, callers = ?callers_hex, "intro: movie open made to fail (experiment)");
-        return std::ptr::null_mut();
-    }
-    // SAFETY: the title's own call, forwarded.
-    let mut handle = unsafe { real(name, options, flags) };
-    let mut restore = None;
-    if let Some(h) = head(handle) {
-        let seconds = if h.frame_rate != 0 {
-            h.frames as f64 * h.frame_rate_div as f64 / h.frame_rate as f64
-        } else {
-            0.0
-        };
-        if state.trace {
-            tracing::info!(
-                path = path.as_deref().unwrap_or("?"),
-                flags = format_args!("{flags:#x}"),
-                site,
-                frontend,
-                handle = format_args!("{:#x}", handle as usize),
-                width = h.width,
-                height = h.height,
-                frames = h.frames,
-                fps = format_args!("{}/{}", h.frame_rate, h.frame_rate_div),
-                seconds = format_args!("{seconds:.2}"),
-                callers = ?callers_hex,
-                "intro: movie opened"
+        if !handle.is_null() && in_start_up_front_end(front_end, world_loading) {
+            // SAFETY: a handle Bink just returned starts with its public head.
+            let head = unsafe { &*(handle as *const BinkHead) };
+            hook.marks.mark(handle as usize, head.frames);
+            tracing::debug!(
+                width = head.width,
+                height = head.height,
+                frames = head.frames,
+                "a movie opened in the start-up front end"
             );
         }
-        let size = format!("size={}x{}x{}", h.width, h.height, h.frames);
-        let by_size = state.skip.iter().any(|s| *s == size);
-        if (by_path || by_size) && state.mode == Mode::Frames1 && site == "probe" {
-            restore = Some(h.frames);
-            // SAFETY: a live handle; put back before it is closed.
-            unsafe { (*(handle as *mut BinkHead)).frames = 1 };
-            tracing::info!(%size, "intro: probe shown one frame (experiment)");
-        } else if by_size && state.mode == Mode::Fail && site == "playback" {
-            // SAFETY: the handle just opened, closed before anyone saw it.
-            unsafe {
-                let close: CloseFn = std::mem::transmute(REAL_CLOSE.load(Ordering::SeqCst));
-                close(handle);
-            }
-            handle = std::ptr::null_mut();
-            tracing::info!(%size, site, "intro: movie open made to fail (experiment)");
-        }
-    } else if state.trace {
-        tracing::info!(path = path.as_deref().unwrap_or("?"), site, callers = ?callers_hex, "intro: movie open failed");
+        handle
     }
-    if !handle.is_null() {
-        state.open.lock().unwrap().insert(
-            handle as usize,
-            (path.unwrap_or_default(), Instant::now(), restore),
+
+    unsafe extern "system" fn next(handle: *mut c_void) {
+        let hook = installed();
+        match hook.marks.take(handle as usize) {
+            Some(frames) => {
+                tracing::info!(frames, "intro movie cut: sent to its last frame ({ENV})");
+                // SAFETY: the live handle the title advances, between two of
+                // its decodes, as its own seek does.
+                unsafe { (hook.goto)(handle, frames, 0) }
+            }
+            // SAFETY: the title's own call, forwarded.
+            None => unsafe { (hook.next)(handle) },
+        }
+    }
+
+    unsafe extern "system" fn close(handle: *mut c_void) {
+        let hook = installed();
+        hook.marks.forget(handle as usize);
+        // SAFETY: the title's own call, forwarded.
+        unsafe { (hook.close)(handle) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH: &str = BUILD_1_0_2_1.blake3;
+
+    #[test]
+    fn only_the_known_build_has_sites() {
+        assert_eq!(
+            sites_for(HASH).map(|s| s.build.label),
+            Some(BUILD_1_0_2_1.label)
         );
-    }
-    handle
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn close(handle: *mut c_void) {
-    // SAFETY: installed only after REAL_CLOSE was stored.
-    let real: CloseFn = unsafe { std::mem::transmute(REAL_CLOSE.load(Ordering::SeqCst)) };
-    if let Some(state) = STATE.get() {
-        let entry = state.open.lock().unwrap().remove(&(handle as usize));
-        if let Some((path, since, restore)) = entry {
-            if let Some(frames) = restore {
-                // SAFETY: still live; the frame count Bink wrote.
-                unsafe { (*(handle as *mut BinkHead)).frames = frames };
-            }
-            if state.trace {
-                let (frame, last) =
-                    head(handle).map_or((0, 0), |h| (h.frame_num, h.last_frame_num));
-                tracing::info!(
-                    path,
-                    handle = format_args!("{:#x}", handle as usize),
-                    frame,
-                    last,
-                    open_for = format_args!("{:.2}", since.elapsed().as_secs_f64()),
-                    "intro: movie closed"
-                );
-            }
+        assert!(sites_for(&HASH.to_ascii_uppercase()).is_some());
+        for other in [
+            "0".repeat(64),
+            HASH[..16].to_owned(),
+            format!("{}0000", &HASH[..60]),
+            String::new(),
+        ] {
+            assert!(sites_for(&other).is_none(), "{other}");
+        }
+        for s in SITES {
+            assert_eq!(
+                crate::identify(s.build.blake3).map(|b| b.blake3),
+                Some(s.build.blake3)
+            );
         }
     }
-    // SAFETY: the title's own call, forwarded.
-    unsafe { real(handle) }
-}
 
-#[cfg(windows)]
-unsafe extern "system" fn goto(handle: *mut c_void, frame: u32, flags: i32) {
-    // SAFETY: installed only after REAL_GOTO was stored.
-    let real: GotoFn = unsafe { std::mem::transmute(REAL_GOTO.load(Ordering::SeqCst)) };
-    if let Some(state) = STATE.get().filter(|s| s.trace) {
-        let path = state
-            .open
-            .lock()
-            .unwrap()
-            .get(&(handle as usize))
-            .map(|e| e.0.clone())
-            .unwrap_or_default();
-        tracing::info!(path, frame, flags, "intro: movie seek");
+    #[test]
+    fn sites_are_aligned_and_apart() {
+        for s in SITES {
+            let slots = s.imports().map(|(rva, _)| rva);
+            for (i, a) in slots.iter().enumerate() {
+                assert_eq!(a % 8, 0, "import slot {a:#x}");
+                for b in &slots[i + 1..] {
+                    assert!(a.abs_diff(*b) >= 8, "{a:#x} and {b:#x} overlap");
+                }
+            }
+            assert_eq!(s.front_end % 4, 0);
+            assert!(s.world_loading.abs_diff(s.front_end) >= 4);
+        }
     }
-    // SAFETY: the title's own call, forwarded.
-    unsafe { real(handle, frame, flags) }
-}
 
-#[cfg(windows)]
-unsafe extern "system" fn pause(handle: *mut c_void, on: i32) -> i32 {
-    // SAFETY: installed only after REAL_PAUSE was stored.
-    let real: PauseFn = unsafe { std::mem::transmute(REAL_PAUSE.load(Ordering::SeqCst)) };
-    if let Some(state) = STATE.get().filter(|s| s.trace) {
-        let path = state
-            .open
-            .lock()
-            .unwrap()
-            .get(&(handle as usize))
-            .map(|e| e.0.clone())
-            .unwrap_or_default();
-        tracing::info!(path, on, "intro: movie pause");
+    #[test]
+    fn the_intro_is_what_opens_in_the_start_up_front_end() {
+        assert!(in_start_up_front_end(1, 0));
+        // The front end is gone (world loading), or came back after a world
+        // was loaded: nothing is cut.
+        assert!(!in_start_up_front_end(0, 0));
+        assert!(!in_start_up_front_end(1, 1));
+        assert!(!in_start_up_front_end(0, 1));
+        assert!(!in_start_up_front_end(2, 0));
     }
-    // SAFETY: the title's own call, forwarded.
-    unsafe { real(handle, on) }
+
+    #[test]
+    fn a_mark_is_taken_once_and_forgotten_on_close() {
+        let marks = Marks::default();
+        marks.mark(0x10, 450);
+        assert_eq!(marks.take(0x10), Some(450));
+        assert_eq!(marks.take(0x10), None);
+        // A probe: opened, marked, closed without being advanced.
+        marks.mark(0x20, 450);
+        marks.forget(0x20);
+        assert_eq!(marks.take(0x20), None);
+        // One frame: nothing to cut.
+        marks.mark(0x30, 1);
+        assert_eq!(marks.take(0x30), None);
+        // Another handle is not touched.
+        marks.mark(0x40, 90);
+        assert_eq!(marks.take(0x41), None);
+        assert_eq!(marks.take(0x40), Some(90));
+    }
+
+    /// The wrapped slots on a fabricated image, called as the title calls
+    /// them, with stand-ins for Bink's functions.
+    #[cfg(windows)]
+    #[test]
+    fn install_wraps_the_slots_and_cuts_only_the_start_up_movie() {
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
+
+        use hook::{BinkHead, CloseFn, GotoFn, NextFn, OpenFn};
+
+        static HANDLE: AtomicUsize = AtomicUsize::new(0);
+        static NEXTS: AtomicU32 = AtomicU32::new(0);
+        static GOTO_TO: AtomicU32 = AtomicU32::new(0);
+        static CLOSES: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn bink_open(
+            _: *const c_void,
+            _: *const c_void,
+            _: u32,
+        ) -> *mut c_void {
+            HANDLE.load(SeqCst) as *mut c_void
+        }
+        unsafe extern "system" fn bink_next(_: *mut c_void) {
+            NEXTS.fetch_add(1, SeqCst);
+        }
+        unsafe extern "system" fn bink_goto(_: *mut c_void, frame: u32, _: i32) {
+            GOTO_TO.store(frame, SeqCst);
+        }
+        unsafe extern "system" fn bink_close(_: *mut c_void) {
+            CLOSES.fetch_add(1, SeqCst);
+        }
+
+        const TEST_SITES: Sites = Sites {
+            build: &BUILD_1_0_2_1,
+            open_slot: 0x100,
+            next_slot: 0x108,
+            goto_slot: 0x110,
+            close_slot: 0x118,
+            front_end: 0x200,
+            world_loading: 0x204,
+        };
+        let mut image = vec![0u64; 0x300 / 8];
+        let base = image.as_mut_ptr() as usize;
+        let size = image.len() * 8;
+        let slot = |rva: usize| (base + rva) as *mut usize;
+        let set_state = |front_end: u32, world_loading: u8| {
+            // SAFETY: inside `image`.
+            unsafe {
+                ((base + 0x200) as *mut u32).write_volatile(front_end);
+                ((base + 0x204) as *mut u8).write_volatile(world_loading);
+            }
+        };
+        // SAFETY: the slots lie inside `image`.
+        unsafe {
+            slot(0x100).write(bink_open as *const () as usize);
+            slot(0x108).write(bink_next as *const () as usize);
+            slot(0x110).write(bink_goto as *const () as usize);
+            slot(0x118).write(bink_close as *const () as usize);
+        }
+
+        // Refused before anything is written: an empty slot, a site past
+        // the end.
+        let before = image.clone();
+        // SAFETY: as the contract asks, with a slot left empty.
+        unsafe { slot(0x110).write(0) };
+        // SAFETY: `image` is laid out as TEST_SITES says.
+        let empty = unsafe { hook::install(&TEST_SITES, base, size) };
+        assert_eq!(empty, Err(NotInstalled::Site { rva: 0x110 }));
+        // SAFETY: inside `image`.
+        unsafe { slot(0x110).write(bink_goto as *const () as usize) };
+        // SAFETY: as above, cut short before the state words.
+        let short = unsafe { hook::install(&TEST_SITES, base, 0x1ff) };
+        assert_eq!(short, Err(NotInstalled::Site { rva: 0x200 }));
+        assert_eq!(image, before, "a refused install writes nothing");
+
+        // SAFETY: as above.
+        assert_eq!(unsafe { hook::install(&TEST_SITES, base, size) }, Ok(()));
+        // SAFETY: inside `image`.
+        let (open, next, close) = unsafe {
+            (
+                std::mem::transmute::<usize, OpenFn>(slot(0x100).read()),
+                std::mem::transmute::<usize, NextFn>(slot(0x108).read()),
+                std::mem::transmute::<usize, CloseFn>(slot(0x118).read()),
+            )
+        };
+        // SAFETY: inside `image`.
+        let goto_slot = unsafe { slot(0x110).read() };
+        assert_ne!(
+            open as *const () as usize, bink_open as *const () as usize,
+            "open wrapped"
+        );
+        assert_ne!(
+            next as *const () as usize, bink_next as *const () as usize,
+            "next wrapped"
+        );
+        assert_ne!(
+            close as *const () as usize, bink_close as *const () as usize,
+            "close wrapped"
+        );
+        assert_eq!(
+            goto_slot, bink_goto as *const () as usize,
+            "BinkGoto only read"
+        );
+        let _: GotoFn = bink_goto;
+
+        let movie = |frames: u32| {
+            let head = Box::leak(Box::new(BinkHead {
+                width: 3840,
+                height: 2160,
+                frames,
+            }));
+            HANDLE.store(head as *mut BinkHead as usize, SeqCst);
+            head as *mut BinkHead as *mut c_void
+        };
+        let null = std::ptr::null();
+
+        // The intro: opened in the start-up front end, cut at its first
+        // frame, then played on as usual.
+        set_state(1, 0);
+        let intro = movie(450);
+        // SAFETY: the wrappers, called as the title calls Bink.
+        unsafe {
+            assert_eq!(open(null, null, 0), intro);
+            next(intro);
+            assert_eq!((GOTO_TO.load(SeqCst), NEXTS.load(SeqCst)), (450, 0));
+            next(intro);
+            assert_eq!(NEXTS.load(SeqCst), 1);
+            close(intro);
+            assert_eq!(CLOSES.load(SeqCst), 1);
+        }
+
+        // A probe: opened and closed; a later movie that gets the same
+        // handle is not cut.
+        GOTO_TO.store(0, SeqCst);
+        let probe = movie(450);
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(open(null, null, 0), probe);
+            close(probe);
+            set_state(0, 1);
+            assert_eq!(open(null, null, 0), probe);
+            next(probe);
+        }
+        assert_eq!((GOTO_TO.load(SeqCst), NEXTS.load(SeqCst)), (0, 2));
+
+        // Movies of the loading screen and the world are left alone.
+        for (front_end, world_loading) in [(0, 1), (1, 1), (0, 0)] {
+            set_state(front_end, world_loading);
+            let other = movie(217);
+            // SAFETY: as above.
+            unsafe {
+                open(null, null, 0);
+                next(other);
+            }
+            assert_eq!(GOTO_TO.load(SeqCst), 0, "{front_end} {world_loading}");
+        }
+        assert_eq!(NEXTS.load(SeqCst), 5);
+
+        // Once per process.
+        // SAFETY: as above.
+        let twice = unsafe { hook::install(&TEST_SITES, base, size) };
+        assert_eq!(twice, Err(NotInstalled::Twice));
+        // The wrappers stay in `image`'s slots; keep it for the process.
+        std::mem::forget(image);
+    }
 }
