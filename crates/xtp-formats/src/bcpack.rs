@@ -129,8 +129,10 @@ impl Tables {
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
     /// words, then 255 dictionary entries per format in format order: BC1
     /// 6 + 16 B, BC3 8 + 32 B, BC4 2 + 16 B, BC5 4 + 32 B, BC6H (u8 mode,
-    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 32 i16).
-    /// Little-endian, no padding. Every model must tile 65536.
+    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, the two index
+    /// widths as 2 u8, the widths again in 2 bytes, 16 i16 indices of the
+    /// first set, 15 of the second; its 16th is 0). Little-endian, no
+    /// padding. Every model must tile 65536.
     pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
         if bytes.len() != TABLES_SIZE {
             return Err(Error("table file has the wrong size"));
@@ -222,7 +224,14 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                for v in ix.ix.as_flattened_mut() {
+                // The widths again. In the shipped file only entry 0 holds
+                // other values (2, 0 after 4, 0); which pair the hardware
+                // takes there is not known, the first one is used.
+                r.u16();
+                for v in &mut ix.ix[0] {
+                    *v = r.u16() as i16;
+                }
+                for v in &mut ix.ix[1][..15] {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
@@ -1336,6 +1345,127 @@ mod tests {
         w.put(1, 1);
         w.put(1, 1);
         assert_eq!(dst, w.v.to_le_bytes());
+    }
+
+    /// Where the BC7 dictionary starts: it ends the file, 116 bytes an entry.
+    const BC7_DICTIONARY: usize = TABLES_SIZE - DICTIONARY * 116;
+
+    /// One BC7 dictionary entry laid out as in the shipped file: control
+    /// word, 24 endpoint words, the two index widths, the widths again, 16
+    /// indices of the first set and 15 of the second.
+    fn bc7_entry(
+        ctrl: u16,
+        rows: &[u16; 24],
+        bits: [u8; 2],
+        first: &[i16; 16],
+        second: &[i16; 15],
+    ) -> Vec<u8> {
+        let mut e = ctrl.to_le_bytes().to_vec();
+        rows.iter().for_each(|w| e.extend_from_slice(&w.to_le_bytes()));
+        e.extend_from_slice(&bits);
+        e.extend_from_slice(&bits);
+        first
+            .iter()
+            .chain(second)
+            .for_each(|v| e.extend_from_slice(&v.to_le_bytes()));
+        assert_eq!(e.len(), 116);
+        e
+    }
+
+    /// Two blocks whose references both point into the dictionary, with zero
+    /// residuals, decode to the dictionary entries' endpoints and indices:
+    /// block 0 to entry 1 (mode 6), block 1 to entry 2 (mode 5, both index
+    /// sets). The table is written in the shipped file's layout, every field
+    /// distinct, so an entry read one word off decodes to other indices.
+    #[test]
+    fn bc7_blocks_take_the_dictionary_entries_written_in_the_file_layout() {
+        let mut file = tables();
+        // Control code 1: mode 5, one subset, no rotation (code 0 is mode 6).
+        let ctrl7 = MODELS * BUCKETS * 2 + 256 + 64 + 256 + 64 + 64;
+        file[ctrl7 + 2..ctrl7 + 4].copy_from_slice(&0x45u16.to_le_bytes());
+        let rows = |seed: u16| std::array::from_fn(|k| seed.wrapping_add(0x0b17 * k as u16));
+        let first6 = [5, 9, 2, 14, 7, 0, 11, 3, 15, 6, 1, 12, 8, 13, 4, 10];
+        let first5 = [1, 3, 0, 2, 2, 1, 3, 0, 0, 3, 1, 2, 3, 2, 0, 1];
+        let second5 = [1, 0, 3, 2, 3, 1, 2, 0, 2, 1, 0, 3, 3, 0, 2];
+        let entries = [
+            bc7_entry(0x46, &rows(0x0123), [4, 0], &[3; 16], &[1; 15]),
+            bc7_entry(0x46, &rows(0x8a5f), [4, 0], &first6, &[7; 15]),
+            bc7_entry(0x45, &rows(0x3cd1), [2, 2], &first5, &second5),
+        ];
+        for (k, e) in entries.iter().enumerate() {
+            file[BC7_DICTIONARY + 116 * k..][..116].copy_from_slice(e);
+        }
+        let t = Tables::parse(&file).unwrap();
+        // Both references 2 (block 0: entry 2 - 0 - 1 = 1) and 4 (block 1:
+        // entry 4 - 1 - 1 = 2), endpoint delta 0; the index reference's
+        // symbols interleave to it, odd bits from the second.
+        let mut s0 = vec![0u8; 32];
+        s0[3] = 1;
+        let mut s1 = vec![0u8; 32];
+        s1[2] = 2;
+        s1[30] = 1;
+        let src = stream(
+            &t,
+            &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4],
+            2,
+            &[s0, s1],
+        );
+        let mut dst = [0u8; 32];
+        decode(7, &src, &mut dst, &t).unwrap();
+
+        // Mode 6 (public BC7 layout): R0 R1 G0 G1 B0 B1 A0 A1 in 7 bits (red
+        // keeps its low bit for the p-bits), 2 p-bits, 16 indices of 4 bits,
+        // the anchor's 3.
+        let w = rows(0x8a5f);
+        let mut want = Bits::default();
+        want.put(1 << 6, 7);
+        for &v in &w[..8] {
+            want.put(u64::from(v >> 9), 7);
+        }
+        want.put(u64::from(w[0] >> 8 & 1), 1);
+        want.put(u64::from(w[1] >> 8 & 1), 1);
+        for (p, &v) in first6.iter().enumerate() {
+            want.put(v as u64, if p == 0 { 3 } else { 4 });
+        }
+        assert_eq!(dst[..16], want.v.to_le_bytes(), "block 0");
+
+        // Mode 5: rotation, RGB in 7 bits, alpha in 8, then the colour and
+        // alpha index sets of 2 bits, each anchor's 1.
+        let w = rows(0x3cd1);
+        let mut want = Bits::default();
+        want.put(1 << 5, 6);
+        want.put(0, 2);
+        for &v in &w[..6] {
+            want.put(u64::from(v >> 9), 7);
+        }
+        want.put(u64::from(w[6] >> 8), 8);
+        want.put(u64::from(w[7] >> 8), 8);
+        let second = second5.iter().chain(&[0]);
+        for (p, &v) in first5.iter().enumerate().chain(second.enumerate()) {
+            want.put(v as u64, if p == 0 { 1 } else { 2 });
+        }
+        assert_eq!(dst[16..], want.v.to_le_bytes(), "block 1");
+    }
+
+    /// The shipped BC7 dictionary read in its layout: each anchor index (the
+    /// first of a set) fits its width less one bit, every index fits its
+    /// width as a signed value, and a set of width 0 holds nothing. Read one
+    /// word off, set 0's last index lands in set 1, whose width is 0.
+    #[test]
+    fn the_shipped_bc7_dictionary_lines_up() {
+        let t = Tables::builtin().unwrap();
+        for (k, (_, ix)) in t.bc7.iter().enumerate() {
+            for set in 0..2 {
+                let (bits, v) = (ix.bits[set], &ix.ix[set]);
+                if bits == 0 {
+                    assert!(v.iter().all(|&i| i == 0), "entry {k} set {set}: {v:?}");
+                    continue;
+                }
+                let half = 1i16 << (bits - 1);
+                assert!((0..half).contains(&v[0]), "entry {k} set {set}: {v:?}");
+                assert!(v.iter().all(|i| (-half..half).contains(i)), "entry {k}");
+            }
+        }
     }
 
     #[test]
