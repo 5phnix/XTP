@@ -94,6 +94,8 @@ mod mesh_tests;
 // IR to DXIL, one file per encoding or concern: which backlog item of
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
 pub(crate) mod lower;
+#[cfg(all(test, windows))]
+mod raw_tests;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
