@@ -130,7 +130,7 @@ detiling.
 | Shader records | **Keep VIctory** | Same scan as xcl; the shader report owns warm-up |
 | File path, game folder | **Rewrite after xcl** for the read-only rule; handed to the HLE report | Writes now reach the person's game folder. The policy is right, but the module belongs to the HLE report |
 | DirectStorage scheduling | **Keep VIctory** | Better than xcl's thread per queue |
-| DirectStorage API surface | **Rewrite after xcl** (F9, F10) | Robustness for other titles and SDK paths. Grand Theft Auto VI does not call these slots, so low priority |
+| DirectStorage API surface | **Rewrite after xcl** (F9, F10) | Robustness for other titles and SDK paths. BTP 6 does not call these slots, so low priority |
 | Page arrays | **Rewrite after xcl** (F8) | Reading at execution risks stack arrays freed after enqueue |
 | zlib | **Keep VIctory** | Already in place and zero-copy |
 | BCPack | **Keep VIctory, fix BC7** (F1) | It is the original; take upstream VIctory's fix |
@@ -210,7 +210,7 @@ only the permanent address.
 ### 6.3 The fix
 
 1. **One permanent view per allocation** (F3). When
-   `XMemAllocatePhysicalPages` creates a section (Grand Theft Auto VI asks
+   `XMemAllocatePhysicalPages` creates a section (BTP 6 asks
    for 6.1 GiB in one call), map one view of all of it, once, for the
    runtime's own use. Commit each 64 KiB slice the
    first time it is written: a bit per slice, a single `VirtualAlloc` per
@@ -501,7 +501,7 @@ in parallel.
   violations in DirectStorage workers or zero pages in textures.
   Mitigation: F3's aliasing test, and a loading run before delivery.
 * **Address space.** One permanent view per allocation doubles the address
-  space reserved for physical pages (6.1 GiB for Grand Theft Auto VI, per
+  space reserved for physical pages (6.1 GiB for BTP 6, per
   `xmem.rs`). That is trivial in 128 TB of address space, and the commit
   charge is unchanged.
 * **Wine.** `xmem` commits sections whole under Wine (`on_wine`). F3 must
@@ -512,7 +512,7 @@ in parallel.
 * **BC7 fix untested on retail data in XTP.** Without the person's
   reference chunks, only synthetic tests cover F1.
 * **XOR modes are only checked against an oracle.** Without a user's
-  `xg_xs.dll` (it is not in the GTA VI dump), F12-F13 rest on addrlib and
+  `xg_xs.dll` (it is not in the BTP 6 dump), F12-F13 rest on addrlib and
   xcl's described rules. A pipe configuration mistake scrambles CPU copies
   of render targets only.
 * **Clean-room discipline.** Workers who read xcl must not paste from it.
@@ -552,8 +552,8 @@ in parallel.
    layout (decoder side)? Merge it whole or re-implement F1?
 2. Should the `silicon-rans` MIT notice go into `NOTICE.md` now (the person
    decides on attribution of the table file)?
-3. Where does an `xg_xs.dll` for the oracle come from? It is not in the GTA
-   VI dump. Another title's package, or none (then F14a is skipped)?
+3. Where does an `xg_xs.dll` for the oracle come from? It is not in the BTP 6
+   dump. Another title's package, or none (then F14a is skipped)?
 4. Which swizzle modes does the title actually use for CPU-touched
    textures? A one-off log of modes seen in `XGCreateTextureComputer` and
    placed resources would set F12's priority.

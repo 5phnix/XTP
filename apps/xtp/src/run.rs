@@ -206,7 +206,7 @@ fn title_dll(host: &xtp_hle::HostPolicy, dll: &str) -> bool {
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
+/// e.g. BTP 6's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: xtp_hle::HostPolicy,

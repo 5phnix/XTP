@@ -1,4 +1,4 @@
-//! Everything specific to Grand Theft Auto VI: its container formats, build
+//! Everything specific to BTP 6: its container formats, build
 //! identities, and the hooks we place in its code (located by per-build
 //! offsets or byte-pattern signatures). What may and may not be stored here
 //! is defined in docs/asset-policy.md.
@@ -7,7 +7,7 @@ pub mod intro;
 pub mod sgd5;
 pub mod watchdog;
 
-/// A specific build of the Grand Theft Auto VI executable we know how to run.
+/// A specific build of the BTP 6 executable we know how to run.
 #[derive(Debug, Clone, Copy)]
 pub struct KnownBuild {
     /// Our own label, e.g. "1.0.0 retail".

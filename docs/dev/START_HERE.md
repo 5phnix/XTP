@@ -12,7 +12,7 @@ its executable and DLLs and binds their imports; `xtp-hle` implements the
 console APIs those imports name; `xtp-gpu` turns the console's D3D12.X into
 host D3D12, and `xtp-shader` recompiles console shaders to DXIL when the title
 creates a pipeline. Data formats (textures, audio) are decoded by
-`xtp-formats`; what only Grand Theft Auto VI needs lives in `xtp-game`.
+`xtp-formats`; what only BTP 6 needs lives in `xtp-game`.
 Everything works from files the user supplies; nothing from the game is ever
 in the repository ([asset policy](../asset-policy.md)).
 
@@ -28,7 +28,7 @@ in the repository ([asset policy](../asset-policy.md)).
 | `crates/xtp-shader` | console shader containers (DXBC, DXIL with Xbox additions, GFX10 code) to host DXIL | `lib.rs`, `gfx10/`, `emit/` |
 | `crates/xtp-formats` | the GPU's tiled texture layouts, BCPack, XMA and Opus audio; pure functions, bytes in and bytes out | `texture.rs`, `xma.rs` |
 | `crates/xtp-pipeline` | offline conversion of the user's data, content-addressed cache | `cache.rs` |
-| `crates/xtp-game` | Grand Theft Auto VI only: its formats, build identities, hooks | `lib.rs` |
+| `crates/xtp-game` | BTP 6 only: its formats, build identities, hooks | `lib.rs` |
 | `apps/xtp` | the `xtp` command: `inspect`, `census`, `shader-info`, `translate`, `run`, `config` | `main.rs`, `run.rs` |
 | `xtask` | repository tooling: `policy`, `conventions`, `pr-check`, `install-hooks` | `main.rs` |
 | `tests/fixtures/hle-probe` | a stand-in title we wrote, built by the loader's tests | `src/` |

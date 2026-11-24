@@ -4,7 +4,7 @@
 # XTP_CONFIG selects a different config file.
 
 [paths]
-# Your own dump of Grand Theft Auto VI.     env: XTP_GAME_DIR
+# Your own dump of BTP 6.     env: XTP_GAME_DIR
 game_dir = 'D:\xtp-data\game'
 
 # Derived data. Default: %LOCALAPPDATA%\xtp\cache.   env: XTP_CACHE_DIR

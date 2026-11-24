@@ -311,7 +311,7 @@ removes that; importing also removes the bookkeeping.
 - **Opening.** One heap per committed range of title memory, at most
   4 GiB − 64 KiB, opened with `OpenExistingHeapFromAddress1`.
   - A buffer cannot span two heaps, so heaps follow the title's own
-    allocations. Grand Theft Auto VI makes few, large ones (xmem notes 23
+    allocations. BTP 6 makes few, large ones (xmem notes 23
     `XMemVirtualAlloc` calls, and 6.1 GiB of physical pages in one call).
   - Open them on a background thread when the range is committed, or at its
     first GPU use: 0.05–0.55 s a GiB is no per-frame cost.
