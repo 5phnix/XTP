@@ -414,6 +414,7 @@ from a worktree on the PC:
 | A stopped VM started on demand, until the job runs | 29 s |
 | A Spot reclaim during a job, until it runs again on another VM | about 1 minute |
 | A failed job's extra check (is the VM going away?) | about 2 s |
+| An idle VM stopping itself (guest shutdown, then TERMINATED) | at its idle threshold, then 37 s |
 
 ## Limits
 
