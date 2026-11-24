@@ -7,14 +7,14 @@ build b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93
 # intro, logo) is up.
 wait u8 0x74e007c == 1 and u32 0x74e2c1c == 1 timeout 60s
 
-# From the golden save the front end ends by itself once the title has done
-# its start-up work, 17.6 to 116 s after the start by the machine's load:
-# its flag drops to 0 as the world starts loading. Nothing to press.
-wait u32 0x74e2c1c == 0 or time >= 150s
-
-# In case: a save that waits on the profile screen ("PLAYER (A)") takes A.
-# Nothing is pressed when the front end already ended.
-repeat a every 2500ms until u32 0x74e2c1c == 0 timeout 60s
+# About 10 s after the start the profile screen asks for A ("PLAYER (A)").
+# The title accepts it once its start-up work allows (17.6 to 46 s in the
+# runs so far); left alone, the front end ends later (up to 116 s). Every
+# run that reached the world also had presses during the world's loading,
+# and every run without them stalled there (run-world, sessions F to K),
+# so press A every 2.5 s until the world's first frame, then stop: A in the
+# world is a game control.
+repeat a every 2500ms until u32 0xab43664 == 0 and u32 0x9e58138 == 0 and u8 0x74dfa9d == 1 timeout 300s
 
 # The save loads into the world: the loading screen (0xab43664 = 0xe) gives
 # way to the world's first frame, where the start-up flag 0x9e58138 drops
