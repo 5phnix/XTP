@@ -11,7 +11,7 @@ a private bucket. The guide is [docs/dev/cloud-setup.md](../../docs/dev/cloud-se
 | `new-vm.ps1` | your PC | firewall check, the VM (retries zones on stockouts), its data disk, a daily stop |
 | `setup-vm.ps1` | your PC → VM | driver, Git, Build Tools, Rust, the clone, the desktop session, idle shutdown |
 | `sync-game.ps1` | your PC → VM | the bucket to the VM's `D:` |
-| `run-remote.ps1` | your PC → VM | `-Check`, `-Cargo`, `-Game` (with `-Autopilot`), `-DeviceCheck`, on origin or a local commit (`-Local`); logs and GPU samples come back |
+| `run-remote.ps1` | your PC → VM | `-Check`, `-Cargo` (with `-Env`), `-GpuTests` (the GPU tests on the L4, each test alone with a time limit), `-Game` (with `-Autopilot`), `-DeviceCheck`, on origin or a local commit (`-Local`); logs and GPU samples come back |
 | `invoke-vm.ps1` | your PC → VM | a PowerShell command, a script or a shell on the VM |
 | `start-vm.ps1`, `stop-vm.ps1` | your PC | start (retried while the zone has no GPU free), stop, status |
 | `rdp-vm.ps1` | your PC | Remote Desktop through an IAP tunnel |

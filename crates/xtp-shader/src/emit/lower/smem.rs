@@ -17,6 +17,10 @@ use crate::resource::{Address, CODE, Role, Site, Source};
 /// tiling) holds as data: [`Lower::descriptor_data`] rebuilds only sizes.
 pub(super) const DESCRIPTOR_WORD: Why = "a descriptor's address or format read as data";
 
+/// How many scalar ALU operations back [`Lower::same_scalar`] compares two
+/// computed numbers.
+const SAME_SCALAR_DEPTH: u32 = 8;
+
 impl<'a> Lower<'a> {
     pub(super) fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
@@ -80,25 +84,36 @@ impl<'a> Lower<'a> {
         } else {
             None
         };
-        // A raw view where the slot holds one: the entry says SRV or UAV,
-        // or no entry says (a descriptor loaded from the heap at an index
-        // the program read) and the program's vector accesses of the same
-        // descriptor read it raw. A slot holds one view, and a handle of
-        // another kind than the view's is undefined on the GPU: through a
-        // constant-buffer handle, these loads of d3e44e754b3eb6aa and its
-        // batch read raw views, and WARP removes its device on that shape
-        // (docs/analysis/hang.md). The same rules as VIctory #1015
-        // (justrealyme) and, for a UAV entry, #1055 (adamdotpy), reached
-        // independently.
-        // shortcut: with no entry, a constant buffer the program also reads
-        // per lane (a dynamically indexed array) is read raw here too, as
-        // `buffer.rs` reads it per lane: one kind for the slot either way.
+        // The console reads the bytes the descriptor names (its base and
+        // record count), whatever view the title made there. On the host a
+        // slot holds one view, and a handle of another kind than the view's
+        // is undefined: through a constant-buffer handle over a raw view,
+        // d3e44e754b3eb6aa's loads lost the device (docs/analysis/hang.md),
+        // and the meshlet culling (three programs, 3b471c122be79b3e among
+        // them) read its records as nothing, so no meshlet passed (watch
+        // item 147). So
+        // a constant-buffer handle only where the slot is known to hold a
+        // constant buffer: a CBV entry of the table, or a root descriptor
+        // (the host binds what the translation declares there). Anything
+        // else is read raw: an SRV or UAV entry (VIctory #1015 and #1055),
+        // or no entry at all (a descriptor the program loads from the heap
+        // at an index it computed, or from a table past its entries), where
+        // the console compiler reads a raw or structured buffer at uniform
+        // addresses this way. Unordered access where an access of the same
+        // slot writes it (`slot_raw_kind`), as `buffer.rs` names it there.
+        // shortcut: with no entry, a slot that holds a constant buffer view
+        // is read raw too (VIctory #1409's rule), and WARP removes its
+        // device on that, as on a constant-buffer handle over a raw or
+        // structured view (`emit::smem_tests`). The run-time choice by the
+        // slot's kind needs the stride table of task 84451453, as
+        // fxceless's fork does it, or host slots of the title's constant
+        // buffers made as raw views.
         let raw = match kind {
             Some(u) if u.kind == ResourceType::Srv => Some(11),
             Some(u) if u.kind == ResourceType::Uav => Some(11 | 0x1000),
             Some(_) => None,
             None if matches!(src, Source::Built { .. } | Source::Constant(_)) => None,
-            None => self.raw_kind_of_vector_accesses(src),
+            None => Some(self.slot_raw_kind(src)),
         };
         let constant = match addr {
             V::Const(_)
@@ -113,6 +128,19 @@ impl<'a> Lower<'a> {
             let mut xs = Vec::new();
             if let Some(kind) = raw {
                 let h = l.handle(site, src, false, (kind, 0))?;
+                // The console ignores the two low bits of the address. Past
+                // the view's end each dword reads 0 (D3D12's bounds check of
+                // a buffer view, one dword per load), as on the console past
+                // the record count: a host view made from the title's covers
+                // the same bytes (`descriptor/host.rs`).
+                let addr = match constant {
+                    Some(byte) if byte & 3 == 0 => addr,
+                    Some(byte) => l.s.m.i32(byte & !3),
+                    None => {
+                        let dword = l.s.m.i32(!3);
+                        l.s.m.bin(c, Bin::And, addr, dword)
+                    }
+                };
                 for k in 0..count {
                     let off = l.s.m.i32(4 * k);
                     let a = l.s.m.bin(c, Bin::Add, addr, off);
@@ -416,47 +444,64 @@ impl<'a> Lower<'a> {
         ia.name() == ib.name() && oa == ob && same_base && same_soffset
     }
 
-    /// The raw view kind `buffer.rs` gives the vector buffer accesses of
-    /// descriptor `src` (or of a twin load of its dwords): 11, with 0x1000
-    /// where one of them writes. None where the program makes none, or
-    /// one that does not read the slot raw (typed, by index, into LDS),
-    /// or uses the descriptor otherwise (an image).
-    fn raw_kind_of_vector_accesses(&self, src: &Source) -> Option<u32> {
-        let same = |other: &Source| {
-            other == src
-                || matches!(
-                    (other, src),
-                    (
-                        Source::Loaded { load: a, first: fa },
-                        Source::Loaded { load: b, first: fb },
-                    ) if fa == fb && self.twin_loads(*a, *b)
-                )
-        };
-        let mut kind = None;
-        for d in &self.x.res.descriptors {
-            if d.role != Role::Resource || !same(&d.source) {
-                continue;
-            }
+    /// The raw view kind of a slot no entry describes, read by a scalar
+    /// load through descriptor `src`: 11, with 0x1000 (unordered access)
+    /// where a vector access of the same slot writes it (a store or an
+    /// atomic, which `buffer.rs` gives an unordered-access handle).
+    fn slot_raw_kind(&self, src: &Source) -> u32 {
+        let writes = self.x.res.descriptors.iter().any(|d| {
             let inst: &Inst = &self.x.p.blocks[d.site.0].insts[d.site.1];
-            let (idxen, format, lds) = match inst.fields {
-                Fields::Smem { .. } => continue,
-                Fields::Buffer {
-                    idxen, format, lds, ..
-                } => (idxen, format, lds),
-                _ => return None,
-            };
             let name = inst.name();
-            // `buffer_load_format_*` / `buffer_store_format_*` take a typed
-            // view; `tbuffer_*` (a format in the instruction) a raw one.
-            let typed = format.is_none() && name.contains("_format_");
-            if idxen || lds || typed {
-                return None;
+            d.role == Role::Resource
+                && matches!(inst.fields, Fields::Buffer { .. })
+                && (name.contains("store") || name.contains("atomic"))
+                && self.same_slot(&d.source, src)
+        });
+        if writes { 11 | 0x1000 } else { 11 }
+    }
+
+    /// Whether descriptors `a` and `b` can be the same slot: a source one
+    /// of them picks from (a phi or a choice: any of them, since the
+    /// slot's view is what the handles must agree with) is the other's,
+    /// or is loaded from the same address, whatever the width of the loads
+    /// (`same_address`).
+    fn same_slot(&self, a: &Source, b: &Source) -> bool {
+        let others = b.leaves();
+        a.leaves()
+            .into_iter()
+            .any(|x| others.iter().any(|&y| x == y || self.same_address(x, y)))
+    }
+
+    /// Whether two descriptor loads read the same dwords: the same root
+    /// parameter, the same byte offset of their first dword (the load's
+    /// immediate and constant terms, plus 4 per dword the descriptor skips)
+    /// and the same computed term (`same_scalar`).
+    fn same_address(&self, a: &Source, b: &Source) -> bool {
+        let (
+            Source::Loaded {
+                load: la,
+                first: fa,
+            },
+            Source::Loaded {
+                load: lb,
+                first: fb,
+            },
+        ) = (a, b)
+        else {
+            return false;
+        };
+        let (Some(x), Some(y)) = (self.scalar.get(la), self.scalar.get(lb)) else {
+            return false;
+        };
+        let start = |a: &Address, first: u8| a.offset.wrapping_add(4 * u32::from(first));
+        x.param == y.param
+            && x.param != CODE
+            && start(x, *fa) == start(y, *fb)
+            && match (x.dynamic, y.dynamic) {
+                (None, None) => true,
+                (Some(p), Some(q)) => self.same_scalar(p, q),
+                _ => false,
             }
-            let writes = name.contains("store") || name.contains("atomic");
-            let k = if writes { 11 | 0x1000 } else { 11 };
-            kind = Some(kind.map_or(k, |j: u32| j | k));
-        }
-        kind
     }
 
     /// The instruction that writes `v`.
@@ -469,23 +514,67 @@ impl<'a> Lower<'a> {
             .find(|i| i.writes.iter().any(|w| w.1 == v))
     }
 
-    /// The same value, or two `v_readfirstlane_b32` of the same VGPR value
-    /// (each waterfall loop reads the index anew).
+    /// Whether `x` and `y` hold the same number: the same value, two
+    /// `v_readfirstlane_b32` of the same VGPR value (each waterfall loop
+    /// reads the index anew), or the same dword of two scalar ALU results
+    /// of one operation on such numbers (a heap offset the program shifts
+    /// again before each load of the slot).
     fn same_scalar(&self, x: Value, y: Value) -> bool {
+        self.same_scalar_within(x, y, SAME_SCALAR_DEPTH)
+    }
+
+    fn same_scalar_within(&self, x: Value, y: Value, depth: u32) -> bool {
         if x == y {
             return true;
         }
-        let first_lane_of = |v: Value| {
-            self.def_of(v)
-                .filter(|i| i.name() == "v_readfirstlane_b32")
-                .and_then(|i| {
-                    i.reads
-                        .iter()
-                        .find(|r| matches!(r.0, Reg::V(_)))
-                        .map(|r| r.1)
-                })
+        let (Some(a), Some(b)) = (self.def_of(x), self.def_of(y)) else {
+            return false;
         };
-        matches!((first_lane_of(x), first_lane_of(y)), (Some(a), Some(b)) if a == b)
+        if a.name() != b.name() {
+            return false;
+        }
+        if a.name() == "v_readfirstlane_b32" {
+            let lane = |i: &Inst| {
+                i.reads
+                    .iter()
+                    .find(|r| matches!(r.0, Reg::V(_)))
+                    .map(|r| r.1)
+            };
+            return matches!((lane(a), lane(b)), (Some(p), Some(q)) if p == q);
+        }
+        let (
+            Fields::Sop {
+                src: sa, imm: ia, ..
+            },
+            Fields::Sop {
+                src: sb, imm: ib, ..
+            },
+        ) = (&a.fields, &b.fields)
+        else {
+            return false;
+        };
+        let at = |i: &Inst, v: Value| i.writes.iter().position(|w| w.1 == v);
+        if depth == 0 || ia != ib || sa.len() != sb.len() || at(a, x) != at(b, y) {
+            return false;
+        }
+        let same = |p: Option<Value>, q: Option<Value>| match (p, q) {
+            (Some(p), Some(q)) => self.same_scalar_within(p, q, depth - 1),
+            (p, q) => p.is_none() && q.is_none(),
+        };
+        let operands = sa.iter().zip(sb).all(|(p, q)| match (*p, *q) {
+            (Operand::Scalar { code: c, dwords: n }, Operand::Scalar { code: d, dwords: m })
+                if n == m =>
+            {
+                (0..n).all(|k| {
+                    let (u, w) = (a.read(Reg::S(c + k)), b.read(Reg::S(d + k)));
+                    // `null`, which no value stands for, only matches itself.
+                    same(u, w) && (u.is_some() || c == d)
+                })
+            }
+            (Operand::Scalar { .. }, _) | (_, Operand::Scalar { .. }) => false,
+            _ => p == q,
+        });
+        operands && same(a.read(Reg::Scc), b.read(Reg::Scc))
     }
 
     /// Whether the scalar load at `site` reads its base or offset from a
