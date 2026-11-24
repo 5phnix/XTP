@@ -38,6 +38,7 @@ Converting them ahead of time from files is only a warm-up.
 | `xtp-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
 | `xtp-pipeline` | converter trait, content-addressed cache |
 | `xtp-game` | BTP 6-specific formats, build identities, hooks |
+| `xtp-testkit` | dev-dependency only: visible test skips (`skip`, `XTP_REQUIRE`) |
 | `apps/xtp` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |

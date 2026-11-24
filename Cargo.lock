@@ -805,6 +805,7 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "tempfile",
  "walkdir",
  "xtp-core",
  "xtp-game",
@@ -920,3 +921,7 @@ dependencies = [
  "windows",
  "windows-sys",
 ]
+
+[[package]]
+name = "xtp-testkit"
+version = "0.1.0"

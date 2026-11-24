@@ -37,11 +37,14 @@ pub(crate) enum C {
     /// Copy-back: bytes of shader-written ranges compared with their
     /// snapshot; bytes of title memory read where the GPU changed them,
     /// and the copies (or kernel calls) that read them; runs of GPU bytes
-    /// written into title memory.
+    /// written into title memory; bytes the GPU changed that the title
+    /// wrote too since the snapshot, which keep the title's (the copy-back's
+    /// three-way merge).
     BackCompared,
     BackRead,
     BackReads,
     BackRuns,
+    BackKept,
     Runs,
     RunUs,
     Queries,
@@ -71,7 +74,7 @@ pub(crate) enum C {
     TexHashed,
     TexChanged,
 }
-const COUNTERS: usize = 36;
+const COUNTERS: usize = 37;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -137,7 +140,8 @@ pub(crate) fn log(frames: f64) {
          {:.0} updates over {:.1} MB copied {:.1} MB ({:.1} MB plain in {:.2} ms, {:.1} MB unreadable) \
          and skipped \
          {:.1} MB ({:.0} updates whole); copy-back compared {:.1} MB, read {:.1} MB in {:.0} \
-         reads, wrote {:.0} runs; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
+         reads, wrote {:.0} runs, kept {:.0} title bytes; {:.0} runs {:.1} ms; {:.0} queries \
+         {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; guard {:.2} ms, {:.0} view queries, \
          {:.0} protection changes, {:.0} unmapped blocks skipped; textures {:.1} MB watched and \
@@ -159,6 +163,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::BackRead as usize]),
         c[C::BackReads as usize],
         c[C::BackRuns as usize],
+        c[C::BackKept as usize],
         c[C::Runs as usize],
         ms(c[C::RunUs as usize]),
         c[C::Queries as usize],

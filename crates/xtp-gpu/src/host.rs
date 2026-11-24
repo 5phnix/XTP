@@ -437,6 +437,44 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
+    /// Where a list stopped, the device-removed report names the commands
+    /// between the barriers around it by their markers, and the noted
+    /// commands after them: DRED's count may lag the GPU (xcl#1592).
+    #[test]
+    fn a_stopped_list_names_the_commands_around_and_after_it() {
+        let (barrier, marker) = (
+            D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER,
+            D3D12_AUTO_BREADCRUMB_OP_SETMARKER,
+        );
+        let (dispatch, draw) = (
+            D3D12_AUTO_BREADCRUMB_OP_DISPATCH,
+            D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED,
+        );
+        let history = [
+            barrier, marker, dispatch, barrier, marker, dispatch, marker, draw,
+        ];
+        let markers = [
+            (1, "first".to_owned()),
+            (4, "second".to_owned()),
+            (6, "third".to_owned()),
+        ];
+        let text = in_flight(&history, &markers, 2);
+        assert!(
+            text.starts_with(", commands 1..3 between its barriers:"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("; command 2 (op {}): first", dispatch.0)),
+            "{text}"
+        );
+        let after = format!(
+            "; after them (the count may lag the GPU): command 5 (op {}): second; command 7 \
+             (op {}): third",
+            dispatch.0, draw.0
+        );
+        assert!(text.ends_with(&after), "{text}");
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -642,6 +680,11 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     }
 }
 
+/// The name a host list gets for the device-removed report ([`name`]).
+fn list_name(list: &ID3D12GraphicsCommandList) -> String {
+    format!("xtp host list {:#x}", list.as_raw() as usize)
+}
+
 /// Upload chunks handed out front to back: the chunks, the one in use and
 /// the bytes used in it.
 #[derive(Default)]
@@ -820,7 +863,8 @@ struct Pending {
     /// The destinations of its GPU buffer copies (host copy, address,
     /// bytes), merged per host copy.
     copied: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// The ranges its shaders write (host copy, address, bytes), each once.
+    /// The ranges its shaders write (host copy, address, bytes), merged
+    /// per host copy.
     back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Its bottom-of-pipe writes, in list order: address, what, bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -843,11 +887,7 @@ impl Pending {
             let deferred = list.deferred();
             for step in &deferred.copies {
                 match step {
-                    Step::GpuWrite(shadow, address, len)
-                        if !back.iter().any(|(s, a, l)| {
-                            std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                        }) =>
-                    {
+                    Step::GpuWrite(shadow, address, len) => {
                         back.push((shadow.clone(), *address, *len));
                     }
                     Step::GpuCopy(shadow, address, len) => {
@@ -875,6 +915,13 @@ impl Pending {
         // thousands of small copies, often side by side: each write opens
         // the guard of its title memory).
         let copied = merge_ranges(copied, |s| std::sync::Arc::as_ptr(s) as usize);
+        // Shader-written ranges merged per host copy too, those that overlap
+        // or touch into one: each byte is compared and goes back once. The
+        // world's passes declare the same big ranges dozens of times, and
+        // overlapping views of its 174 MB heap; only identical ranges were
+        // merged before, and a second range over bytes the first had put
+        // back wrote older title bytes over newer ones.
+        let back = merge_ranges(back, |s| std::sync::Arc::as_ptr(s) as usize);
         // What the GPU writes through host copies, each range once (later
         // steps look them up one by one).
         let through = |ranges: &Ranges| -> Vec<(usize, usize, usize)> {
@@ -984,6 +1031,12 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            // Named for the device-removed report (with its data on), which
+            // finds a list by name where DRED gives no pointer to it.
+            name(&list, || list_name(&list));
+            name(&prelude, || {
+                format!("xtp host prelude {:#x}", prelude.as_raw() as usize)
+            });
             Ok(HostList {
                 allocator: Mutex::new(allocator),
                 list,
@@ -1169,6 +1222,7 @@ impl Host {
             list.last.store(*submitted, Ordering::Release);
         }
         self.timeline.push(*submitted, touches, pending);
+        crate::timestamps::submitted(&self.queue, runs, *submitted, title);
         // `XTP_SYNC_SUBMIT`, and timed lists: finished before returning,
         // still one submission at a time.
         #[cfg(feature = "diagnostics")]
@@ -1387,9 +1441,9 @@ impl Host {
         // What the GPU wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done. GPU copies first: all of
         // each destination; shader-written ranges then add what differs
-        // from their snapshot, each range once per submission, however
-        // many dispatches declared it (the world's passes declare the same
-        // big ranges dozens of times).
+        // from their snapshot, each byte once per submission, however many
+        // dispatches declared ranges over it (the world's passes declare the
+        // same big ranges dozens of times).
         let copying = std::time::Instant::now();
         for (shadow, address, len) in &p.copied {
             let written = shadow.write_back(p.submission, *address, *len);
@@ -1430,12 +1484,19 @@ impl Host {
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
         unsafe {
-            if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
-                && fault.PageFaultVA != 0
-            {
+            if let Ok(fault) = dred.GetPageFaultAllocationOutput1() {
                 let va = fault.PageFaultVA;
-                fault_va = Some(va);
-                text.push_str(&format!("; page fault at {va:#x}"));
+                if va != 0 {
+                    fault_va = Some(va);
+                    text.push_str(&format!("; page fault at {va:#x}"));
+                } else if dred_on() {
+                    // xcl#1592: a real page fault (at 0x700000000) came back
+                    // as VA 0 on NVIDIA.
+                    text.push_str(
+                        "; page fault VA 0: none, or one the driver did not place (not a null \
+                         address)",
+                    );
+                }
                 for (what, head) in [
                     ("inside", fault.pHeadExistingAllocationNode),
                     ("inside freed", fault.pHeadRecentFreedAllocationNode),
@@ -1457,25 +1518,43 @@ impl Host {
                         text.push_str(&format!("; {what} {names:?}"));
                     }
                 }
-                text.push_str(&crate::shadow::near(va));
-                text.push_str(&crate::descriptor::host::near_heaps(va));
+                if va != 0 {
+                    text.push_str(&crate::shadow::near(va));
+                    text.push_str(&crate::descriptor::host::near_heaps(va));
+                }
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    let why = if dred_on() {
+                        ""
+                    } else {
+                        ": device-removed data is off (XTP_D3D12_DRED=1, diagnostics builds)"
+                    };
+                    text.push_str(&format!("; no breadcrumbs ({e}){why}"));
                     return text;
                 }
+            };
+            // The run a node is about: by its list, or by the name we gave
+            // that (NVIDIA's DRED gave a list's name and no pointer to it,
+            // xcl#1592).
+            let run_of = |p: &D3D12_AUTO_BREADCRUMB_NODE| {
+                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
+                let named = (!p.pCommandListDebugNameW.is_null())
+                    .then(|| p.pCommandListDebugNameW.to_string().unwrap_or_default());
+                runs.iter().position(|r| {
+                    Some(r.list.as_raw()) == ours
+                        || named.as_deref() == Some(list_name(&r.list).as_str())
+                })
             };
             // Every list's progress (done/count), in the runtime's order.
             let mut progress = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
+                let index = run_of(p);
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
             }
@@ -1486,15 +1565,12 @@ impl Host {
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                    let index = run_of(p);
                     text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
+                        "; list {index:?} stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs
-                        .iter()
-                        .position(|r| Some(r.list.as_raw()) == list)
-                        .and_then(|i| recorded.get(i));
+                    let run = index.and_then(|i| recorded.get(i));
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
@@ -1688,6 +1764,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        crate::timestamps::close(self);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -1787,6 +1864,7 @@ impl HostList {
         if let Err(e) = unsafe { self.list.Reset(&allocator, None) } {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        crate::timestamps::open(self);
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -3020,6 +3098,26 @@ fn in_flight(
             .and_then(|m| markers.iter().find(|(at, _)| *at as usize == m))
             .map_or("no marker", |(_, s)| s.as_str());
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
+    }
+    // DRED's count may lag the GPU (xcl#1592: a fault in the second of two
+    // dispatches left the first not done): the next noted commands too.
+    let after: Vec<String> = (to..history.len().saturating_sub(1))
+        .filter(|&m| history[m] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
+        .filter_map(|m| {
+            let (_, note) = markers.iter().find(|(at, _)| *at as usize == m)?;
+            Some(format!(
+                "command {} (op {}): {note}",
+                m + 1,
+                history[m + 1].0
+            ))
+        })
+        .take(3)
+        .collect();
+    if !after.is_empty() {
+        text.push_str(&format!(
+            "; after them (the count may lag the GPU): {}",
+            after.join("; ")
+        ));
     }
     text
 }

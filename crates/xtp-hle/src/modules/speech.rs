@@ -1,11 +1,13 @@
-//! Accessibility: speech synthesis for the title's narration. No voice is
-//! installed here, and every stream is valid WAVE audio of no length, so
+//! Accessibility covers caption preferences, high contrast and speech synthesis.
+//! No voice is installed here. Each stream is a valid, empty WAVE file, so
 //! narration is silent.
 // shortcut: silent speech. The host's engine (SAPI through COM, or WinRT
 // speech synthesis) needs COM bindings this crate has only in diagnostics
 // builds, plus voice enumeration and SSML the title sends (slot 0xa8); the
 // title then plays the empty stream and goes on.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+mod captions;
 
 use std::ffi::{c_char, c_void};
 
@@ -99,25 +101,25 @@ static VTABLE: Methods<22> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),      // 0x18 closed captions
-    missing::<4> as *const (),      // 0x20
-    missing::<5> as *const (),      // 0x28 high contrast
-    missing::<6> as *const (),      // 0x30 speech to text
-    missing::<7> as *const (),      // 0x38
-    enumerate_voices as *const (),  // 0x40
-    create as *const (),            // 0x48
-    close as *const (),             // 0x50
-    set_default_voice as *const (), // 0x58
-    set_custom_voice as *const (),  // 0x60
-    create_stream as *const (),     // 0x68 from text
-    close as *const (),             // 0x70 a stream
-    stream_size as *const (),       // 0x78
-    stream_data as *const (),       // 0x80
-    missing::<17> as *const (),     // 0x88 speech to text
-    missing::<18> as *const (),     // 0x90
-    missing::<19> as *const (),     // 0x98
-    missing::<20> as *const (),     // 0xa0
-    create_stream as *const (),     // 0xa8 from SSML
+    captions::properties as *const (),    // 0x18 closed captions
+    captions::set_enabled as *const (),   // 0x20
+    captions::high_contrast as *const (), // 0x28 high contrast
+    missing::<6> as *const (),            // 0x30 speech to text
+    missing::<7> as *const (),            // 0x38
+    enumerate_voices as *const (),        // 0x40
+    create as *const (),                  // 0x48
+    close as *const (),                   // 0x50
+    set_default_voice as *const (),       // 0x58
+    set_custom_voice as *const (),        // 0x60
+    create_stream as *const (),           // 0x68 from text
+    close as *const (),                   // 0x70 a stream
+    stream_size as *const (),             // 0x78
+    stream_data as *const (),             // 0x80
+    missing::<17> as *const (),           // 0x88 speech to text
+    missing::<18> as *const (),           // 0x90
+    missing::<19> as *const (),           // 0x98
+    missing::<20> as *const (),           // 0xa0
+    create_stream as *const (),           // 0xa8 from SSML
 ]);
 
 #[cfg(test)]

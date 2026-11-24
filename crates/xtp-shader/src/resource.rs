@@ -18,6 +18,8 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Structured};
 
+mod uniform;
+
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
@@ -299,6 +301,8 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// Which values every lane holds alike ([`uniform`]).
+    uniformity: uniform::AddressUniformity,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -360,6 +364,7 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            uniformity: uniform::AddressUniformity::new(n),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -504,6 +509,12 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
+        if let Some(src) = self.uniform_first_lane(v) {
+            return self.sum(self.vorigin(src));
+        }
+        if let Some(s) = self.first_lane_folded(v) {
+            return s;
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
@@ -627,6 +638,7 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        let (lo, hi) = (self.unlaned(lo), self.unlaned_high(hi));
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
@@ -686,7 +698,9 @@ impl<'a> Tracer<'a> {
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
     /// `v_add_co_ci_u32` with `high` as an operand.
     fn carried(&self, hi: Term, high: Value) -> bool {
-        let Term::Value(v) = hi else { return false };
+        let Term::Value(v) = self.unlaned_high(hi) else {
+            return false;
+        };
         if v == high {
             return true;
         }
@@ -719,6 +733,9 @@ impl<'a> Tracer<'a> {
             return "an address relative to the program counter";
         }
         match self.def(v).map(|i| i.name()) {
+            Some("v_readfirstlane_b32") => {
+                "an address read from the first lane of a per-lane value"
+            }
             Some(n) if n.starts_with("s_load_") => "an address loaded from memory",
             None => "an address from a phi",
             _ => "an address not from a root parameter",
@@ -2016,6 +2033,413 @@ pub(crate) mod tests {
                 what: "an address in an SGPR that is no root parameter"
             }
         );
+    }
+
+    /// A scalar load of a table in the code, at an address a VGPR sum builds
+    /// from `s_getpc_b64` and a uniform index, read back to SGPRs with
+    /// `v_readfirstlane_b32` (the console compiler's form). Assembled with
+    /// llvm-mc for gfx1030, wave32.
+    const CODE_TABLE_FIRST_LANE: &[u32] = &[
+        0xBE80_1F00, // s_getpc_b64 s[0:1]
+        0x8000_FF00,
+        0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+        0x8201_8001, // s_addc_u32 s1, s1, 0
+        0x7E00_0283, // v_mov_b32 v0, 3
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD70F_6A01,
+        0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+        0xD528_6A02,
+        0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+        0x7E04_0501, // v_readfirstlane_b32 s2, v1
+        0x7E06_0502, // v_readfirstlane_b32 s3, v2
+        0xF400_0181,
+        0xFA00_0000, // s_load_dword s6, s[2:3], null
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn a_first_lane_read_of_a_uniform_code_table_address_is_traced() {
+        let r = track_words(CODE_TABLE_FIRST_LANE, &[], HwStage::Cs);
+        let (_, a) = r
+            .scalar
+            .iter()
+            .find(|s| s.1.param == CODE)
+            .expect("the code table load is traced");
+        // s_getpc_b64 is the first instruction: its next one is at 4.
+        assert_eq!(a.offset, 4 + 0xDDC);
+        assert!(a.dynamic.is_some(), "the index stays a computed term");
+    }
+
+    #[test]
+    fn a_first_lane_read_of_a_per_lane_code_table_address_is_refused_by_name() {
+        // Same, but the index is lane 0's own input (v0 is never set).
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                // the s_load_dword, at byte 44
+                offset: 44,
+                what: "an address read from the first lane of a per-lane value"
+            }
+        );
+    }
+
+    /// A table in the code read in a loop whose counter (v7) the exit test
+    /// compares with `limit`: the console compiler's form for a lookup table
+    /// walked at a uniform index. Assembled with llvm-mc for gfx1030, wave32.
+    fn code_table_loop(compare: u32) -> Vec<u32> {
+        vec![
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x3402_0E82, // loop: v_lshlrev_b32 v1, 2, v7
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7
+            compare,
+            0xBF87_FFF3, // s_cbranch_vccnz loop
+            S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn a_loop_counter_with_a_uniform_exit_indexes_a_code_table() {
+        // v_cmp_gt_i32 vcc_lo, 5, v7
+        let r = track_words(&code_table_loop(0x7D08_0E85), &[], HwStage::Cs);
+        let (_, a) = r
+            .scalar
+            .iter()
+            .find(|s| s.1.param == CODE)
+            .expect("the code table load is traced");
+        assert_eq!(a.offset, 4 + 0xDDC);
+        assert!(a.dynamic.is_some(), "the counter stays a computed term");
+    }
+
+    #[test]
+    fn a_loop_counter_with_a_per_lane_exit_is_refused_by_name() {
+        // v_cmp_gt_u32 vcc_lo, v0, v7: lanes leave at their own count.
+        let code: Vec<u8> = code_table_loop(0x7D88_0F00)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                // the s_load_dword, at byte 48
+                offset: 48,
+                what: "an address read from the first lane of a per-lane value"
+            }
+        );
+    }
+
+    const PER_LANE_FIRST_LANE: &str = "an address read from the first lane of a per-lane value";
+
+    /// A table in the code at `s_getpc_b64` + 0xddc, read at index v7 through
+    /// first-lane reads of the VGPR address (as [`CODE_TABLE_FIRST_LANE`]),
+    /// after `setup`, which sets v7. Wave32, hand-assembled for gfx1030 (the
+    /// encodings of the tests above; opcodes from `gfx10/opcodes.rs`). The
+    /// `s_load_dword` is at byte `4 * (11 + setup.len())`.
+    fn code_table_at_v7(setup: &[u32]) -> Vec<u32> {
+        let mut w = vec![
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+        ];
+        w.extend(setup);
+        w.extend([
+            0x3402_0E82, // v_lshlrev_b32 v1, 2, v7
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ]);
+        w
+    }
+
+    /// The tracing of `words` (wave32 compute, no layout), which must
+    /// structure: the rules under test need the per-lane form.
+    fn code_table_trace(words: &[u32]) -> Result<Resources, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = lanes(&p).expect("the program structures");
+        track(&p, &[], HwStage::Cs, Some(&st))
+    }
+
+    fn per_lane_refusal(offset: usize) -> ShaderError {
+        ShaderError::Unsupported {
+            offset,
+            what: PER_LANE_FIRST_LANE,
+        }
+    }
+
+    #[test]
+    fn a_code_table_index_every_lane_sets_alike_is_traced() {
+        // v_mov_b32 v7, 3
+        let r = code_table_trace(&code_table_at_v7(&[0x7E0E_0283])).unwrap();
+        let (_, a) = r.scalar.iter().find(|s| s.1.param == CODE).unwrap();
+        assert_eq!(a.offset, 4 + 0xDDC);
+        assert!(a.dynamic.is_some());
+    }
+
+    /// `s_cbranch_execz` is a branch on each lane's own EXEC bit in the
+    /// per-lane form: the lanes the `s_and_saveexec` left out skip the write
+    /// and reach the join with the old v7. (VIctory#1231 took the branch as
+    /// uniform. The write runs under a narrowed EXEC in the console flow,
+    /// which refuses it too: the execz rule alone is pinned by
+    /// `a_scalar_set_on_one_side_of_an_execz_skip_is_per_lane`.)
+    #[test]
+    fn a_value_joined_after_an_execz_skip_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0: lanes 0 to 4
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_0001, // s_cbranch_execz over the next instruction
+            0x7E0E_0283, // v_mov_b32 v7, 3
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8 (the join)
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(68));
+    }
+
+    /// The same with a scalar: s9 is 3 in the lanes the `s_and_saveexec`
+    /// let in and 0 in the others, which skip the block on their own EXEC
+    /// bit. In the console flow the wave skips the block or not as one and
+    /// s9 is uniform, so only the per-lane rule for execz refuses this.
+    /// (VIctory#1231 took the branch as uniform and traced it.)
+    #[test]
+    fn a_scalar_set_on_one_side_of_an_execz_skip_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0: lanes 0 to 4
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_0001, // s_cbranch_execz over the next instruction
+            0xBE89_0383, // s_mov_b32 s9, 3
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8 (the join)
+            0x7E0E_0209, // v_mov_b32 v7, s9
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(72));
+    }
+
+    /// A write under EXEC narrowed by a per-lane compare, without a branch:
+    /// lanes 0 to 4 hold 3, the others 0. (VIctory#1231 took it as uniform
+    /// because its old value is. The console flow refuses it too; the
+    /// per-lane rule alone is pinned by `uniform::tests`.)
+    #[test]
+    fn a_guarded_write_of_a_uniform_value_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0x7E0E_0283, // v_mov_b32 v7, 3
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(64));
+    }
+
+    /// The review's program: s5 decides whether every lane runs the write
+    /// of 12 to v7 or none does, so v7 is the same in every lane, but the
+    /// address is read from the operands of the instructions that compute
+    /// it, which is 12 only where the lanes ran it: for s5 != 0 the console
+    /// reads entry 0. b8714dd took the write as uniform (its condition and
+    /// its old value are) and traced code + 4 + 0xddc + 12.
+    #[test]
+    fn a_write_no_lane_runs_is_not_read_from_its_operands() {
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7E12_0205, // v_mov_b32 v9, s5
+            0x7D84_1280, // v_cmp_eq_u32 vcc_lo, 0, v9
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0x7E0E_028C, // v_mov_b32 v7, 12
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+            0xD70F_6A01,
+            0x0000_0107, // v_add_co_u32 v1, vcc_lo, v7, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ];
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(64));
+    }
+
+    /// An SDWA move of a word keeps the high half of v7, each lane's own
+    /// input. b8714dd took v7 as uniform (its operand is) and traced the
+    /// address, whose computed term the lanes then compute apart.
+    #[test]
+    fn an_sdwa_write_of_a_word_keeps_per_lane_bits() {
+        let words = code_table_at_v7(&[
+            0x7E10_0283, // v_mov_b32 v8, 3
+            0x7E0E_02F9,
+            0x0006_1408, // v_mov_b32_sdwa v7, v8 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(56));
+    }
+
+    /// EXEC named as an operand is a lane mask read as a number, which the
+    /// per-lane form builds with a ballot of the lanes there: no value of
+    /// EXEC is uniform. b8714dd skipped every read of EXEC, this one too,
+    /// and took v7 as uniform.
+    #[test]
+    fn an_exec_operand_is_not_uniform() {
+        let words = code_table_at_v7(&[
+            0x7E0E_027E, // v_mov_b32 v7, exec_lo
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(48));
+    }
+
+    /// A carry-in is read lane by lane: from a mask copied out of an SGPR,
+    /// each lane adds its own bit of s5. (VIctory#1225 took the carry as
+    /// uniform because the SGPR value is.)
+    #[test]
+    fn a_carry_in_from_an_sgpr_mask_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0xBEEA_0305, // s_mov_b32 vcc_lo, s5
+            0xD528_6A07,
+            0x01AA_0E80, // v_add_co_ci_u32 v7, vcc_lo, 0, v7, vcc_lo
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+    }
+
+    /// The other half of that rule: a branch on VCC copied from an SGPR.
+    /// The loop of `code_table_loop`, with the exit test VCC = s5 shifted
+    /// right once per pass: per lane, each lane leaves when its own bit is
+    /// clear, so the counter v7 differs between lanes. (VIctory#1231 took
+    /// the branch as uniform because the SGPR value is.)
+    #[test]
+    fn a_loop_left_on_the_lane_bits_of_an_sgpr_is_per_lane() {
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x3402_0E82, // loop: v_lshlrev_b32 v1, 2, v7
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7
+            0x9005_8105, // s_lshr_b32 s5, s5, 1
+            0xBEEA_0305, // s_mov_b32 vcc_lo, s5
+            0xBF87_FFF2, // s_cbranch_vccnz loop
+            S_ENDPGM,
+        ];
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(48));
+    }
+
+    /// A DPP move reads another lane's v8; the first lane of each row has
+    /// none and keeps its old v7 (5, where the others get 3).
+    #[test]
+    fn a_dpp_move_of_a_uniform_value_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0x7E0E_0285, // v_mov_b32 v7, 5
+            0x7E10_0283, // v_mov_b32 v8, 3
+            0x7E0E_02FA,
+            0xFF01_1108, // v_mov_b32_dpp v7, v8 row_shr:1 row_mask:0xf bank_mask:0xf
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+    }
+
+    /// A code table read in a block only lanes 0 to 4 enter, at index v7:
+    /// `set` sets v7 there, then the address is built and read from the
+    /// first lane, and s6 is read after the join.
+    fn narrowed_code_table(set: u32) -> [u32; 20] {
+        [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_000A, // s_cbranch_execz end
+            set,
+            0x3402_0E82, // v_lshlrev_b32 v1, 2, v7
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0x887E_087E, // end: s_or_b32 exec_lo, exec_lo, s8
+            0x7E12_0206, // v_mov_b32 v9, s6
+            S_ENDPGM,
+        ]
+    }
+
+    /// Per lane, only lanes 0 to 4 enter the block and all of them set v7
+    /// alike (to s9). In the console flow every lane runs it, and lanes 5 to
+    /// 31 keep their own v7, load other dwords into s6 and read them after
+    /// the join: the claim must hold in both lowerings, so it is refused.
+    #[test]
+    fn a_code_table_index_set_under_a_narrowed_exec_is_per_lane_in_the_console_flow() {
+        // v_mov_b32 v7, s9
+        let words = narrowed_code_table(0x7E0E_0209);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(crate::structure::structure_console(&p).is_ok());
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+    }
+
+    /// The same with a constant index: the first active lane computed the
+    /// address from constants in the read's block, under the EXEC the read
+    /// runs with, so it is entry 3 whatever the other lanes hold, and the
+    /// load needs no lane's VGPR in either lowering (the console compiler's
+    /// form in the exposure and irradiance passes).
+    #[test]
+    fn a_constant_code_table_index_under_a_narrowed_exec_is_folded() {
+        // v_mov_b32 v7, 3
+        let r = code_table_trace(&narrowed_code_table(0x7E0E_0283)).unwrap();
+        let (_, a) = r.scalar.iter().find(|s| s.1.param == CODE).unwrap();
+        assert_eq!(a.offset, 4 + 0xDDC + 3 * 4);
+        assert_eq!(a.dynamic, None);
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the

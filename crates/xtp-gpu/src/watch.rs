@@ -43,11 +43,17 @@
 //! of memory they unmap or free stays until a report there. Report them
 //! from xmem if a title makes them on GPU memory.
 //!
-//! shortcut: writes into physical pages through the runtime's own view of
-//! them (xmem's `write_physical`, DirectStorage's page destinations), which
-//! is not in its index of views, are not seen at the guarded addresses;
-//! they go to the texture pool, whose textures are hashed, not guarded. A
-//! system call writing into a guarded block fails (none is known to).
+//! The runtime writes physical pages through its own view of them too
+//! (xmem's `write_physical` and page windows: DirectStorage's page
+//! destinations, which carry texture and buffer data, docs/analysis/
+//! formats.md §6.1). That view is not in its index and no copy guards it,
+//! so such a write does not fault: after it the runtime looks up the
+//! title's views of the pages written and opens their guards ([`writing`]),
+//! before the request's status says it completed, which is when the title
+//! may read them. While nothing is guarded ([`guarding`]) it does not look.
+//!
+//! shortcut: a system call writing into a guarded block fails (none is
+//! known to).
 //!
 //! Costs (the review of the VIctory #464 and #490 ports; gpu-measure.md
 //! §4, run1's world frames): the 4.6 to 9.9 GB a world frame checks is not
@@ -59,7 +65,10 @@
 //! runtime's index once per run it guards, and a write only for the blocks
 //! a guard linked to other views (`Guards::aliased`), so a write where no
 //! page shows twice costs what it did. Each other view guarded adds a
-//! protection change to the guard and to the write that opens it.
+//! protection change to the guard and to the write that opens it. A runtime
+//! write into physical pages while something is guarded costs a look in
+//! the index per page written and a [`writing`] per run of the addresses
+//! showing them; a protection change only where one is guarded.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -516,15 +525,39 @@ fn blocks(at: usize, len: usize) -> Range<usize> {
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
+/// reads into its own memory, and after its own writes into physical pages
+/// for each title address showing them (xmem).
 pub fn writing(at: usize, len: usize) {
     // Without the lock when nothing is guarded (no copy of view memory
     // taken yet, or all of it remapped since), which DirectStorage's
     // workers would contend for; with blocks guarded, the lock as before.
-    if GUARDED.load(SeqCst) == 0 {
+    if !guarding() {
         return;
     }
     open(&mut guards(), blocks(at, len));
+}
+
+/// Whether some block of view memory is guarded now, without the guards'
+/// lock (see `GUARDED`): if not, a write needs no [`writing`], and the
+/// runtime need not look up where the physical pages it wrote show.
+pub fn guarding() -> bool {
+    GUARDED.load(SeqCst) != 0
+}
+
+/// What a host copy of title memory `[start, end)` asks before it copies,
+/// for the runtime's tests (xmem's): the pages found written since the last
+/// asking, view memory guarded again. `None` if the memory is neither
+/// write-watched nor a view.
+#[doc(hidden)]
+pub fn copy_asks(start: usize, end: usize) -> Option<Vec<usize>> {
+    let (now, pages) = writes(start, end, true)?;
+    Some(
+        pages
+            .into_iter()
+            .filter(|&(_, asking)| asking == now)
+            .map(|(page, _)| page)
+            .collect(),
+    )
 }
 
 /// Title memory `[at, at + len)` changed: the runtime mapped or unmapped a
@@ -640,7 +673,7 @@ fn writable(at: usize) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -667,7 +700,7 @@ mod tests {
     /// is the process's, and some tests need it at 0. Each test gives its
     /// guards back before it ends; what one that failed left guarded is
     /// given back here, so that none depends on the others.
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: Mutex<()> = Mutex::new(());
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         title_memory_remapped(0, usize::MAX);
@@ -1197,15 +1230,18 @@ mod tests {
             })
         };
         assert_eq!(GUARDED.load(SeqCst), 0, "`serial` gave every guard back");
+        assert!(!guarding());
         assert!(returns(Duration::from_secs(10)), "it waited for the lock");
         let view = mapped(1);
         assert!(guard(view, view + BLOCK).is_some());
         assert_eq!(GUARDED.load(SeqCst), 1);
+        assert!(guarding(), "the runtime looks up the views it writes");
         assert!(
             !returns(Duration::from_millis(200)),
             "it did not take the lock"
         );
         unmapped(view, 1);
+        assert!(!guarding());
     }
 
     /// A view is asked about once per block an asking starts in, again
