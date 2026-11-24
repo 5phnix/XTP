@@ -35,12 +35,17 @@
 //! decide whether, and how often, a lane runs it: a group barrier needs
 //! every lane of the group there ([`Uniformity::control`]).
 //!
+//! Memory is read alike only where the program writes none: in two host
+//! waves, two halves of one console load read at different times, so a
+//! store between them (this group's or another's) would part them. A
+//! program with a store or an atomic has every load per lane. (None of
+//! BTP 6's mesh programs writes memory.)
+//!
 //! What it assumes: the per-lane form itself (a lane in EXEC at a vector
-//! instruction has reached it, holding the console's registers), memory a
-//! dispatch reads but does not change (two lanes loading one address get
-//! one value), and values used in their own console instance (lanes that
-//! skip a block do not read the scalars it sets, as structurisation already
-//! assumes).
+//! instruction has reached it, holding the console's registers), memory no
+//! other dispatch changes meanwhile, and values used in their own console
+//! instance (lanes that skip a block do not read the scalars it sets, as
+//! structurisation already assumes).
 
 use std::collections::{HashMap, HashSet};
 
@@ -135,6 +140,8 @@ struct Run<'a> {
     bit: Vec<Level>,
     has_bit: Vec<bool>,
     first_lane: HashMap<Value, Level>,
+    /// The program stores to memory or runs atomics on it: loads differ.
+    writes_memory: bool,
     loops: Vec<Loop>,
     /// By block: the loops containing it.
     loops_of: Vec<Vec<usize>>,
@@ -189,6 +196,13 @@ impl<'a> Run<'a> {
                 }
             }
         }
+        let writes_memory = p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            let n = i.name();
+            matches!(
+                i.fields,
+                Fields::Smem { .. } | Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. }
+            ) && (n.contains("store") || n.contains("atomic"))
+        });
         let mut run = Run {
             p,
             st: x.st,
@@ -200,6 +214,7 @@ impl<'a> Run<'a> {
             bit: vec![Level::Group; values],
             has_bit: vec![false; values],
             first_lane: HashMap::new(),
+            writes_memory,
             loops: Vec::new(),
             loops_of: vec![Vec::new(); n],
             header_of: vec![None; n],
@@ -614,6 +629,7 @@ impl<'a> Run<'a> {
                 let l = match name {
                     "s_memtime" | "s_memrealtime" => Level::Lane,
                     "s_get_waveid_in_workgroup" => Level::Wave,
+                    _ if self.writes_memory => Level::Lane,
                     _ => self.reads(inst, b, |_| true),
                 };
                 all(self, l);
@@ -638,7 +654,7 @@ impl<'a> Run<'a> {
                 }
             }
             Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. } => {
-                if name.contains("atomic") {
+                if name.contains("atomic") || self.writes_memory {
                     all(self, Level::Lane);
                 } else {
                     let l = self.computed(inst, b, i);
