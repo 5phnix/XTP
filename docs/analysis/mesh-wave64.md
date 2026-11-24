@@ -449,3 +449,131 @@ captures at `E:\xtp-data\runs\frames-mesh*`. All three ran the same binary
   below 64. That costs two or four group barriers per first-lane read
   that is not proven, on hosts that may not need them; measure it on AMD
   hardware first (none here).
+
+## 9. Also in this task: two ports
+
+The orchestrator added two ports to the review task (a5ce0d66). Each is
+reviewed against the console's semantics, with credit, tests and a
+mutation that each test catches.
+
+### 9.1 Mesh primitive indices are 9 bits (VIctory #1718)
+
+Ported from Marvisak/VIctory#1718 (head `c0228d9`) by
+tjthebigbearcat-hub; watch item 177.
+
+- **The format.** `exp prim` packs three corners of ten bits each: a 9-bit
+  vertex index and, above it, the corner's edge flag (bits 9, 19 and 29).
+  Bit 31 culls the primitive.
+- **The fault.** `emit_indices` (`emit/lower/export.rs`) masked ten bits,
+  so a flagged corner read as vertex 512 or more, past any mesh program's
+  vertices: D3D12 drops or corrupts such a primitive. The mask is now
+  `0x1FF`. The edge flags only matter to the console's edge-flag
+  rasterisation, which the host has no use for.
+- **The test** (`emit::mesh_tests::edge_flagged_triangles_draw_as_unflagged_ones`,
+  the PR's, on XTP's draw helper): a 32-lane mesh program whose triangle
+  (0, 1, 2) covers 16 x 16 texels. Plain and edge-flagged, all 256 texels
+  are lit with the attribute; culled, none. dxil.dll takes each module.
+  With the old 10-bit mask (a mutation, not committed), the edge-flagged
+  triangle lights 0 of 256 texels on WARP, as the PR reports.
+- **Not measured:** how many of BTP 6's triangles carry edge flags (the
+  indices are computed at run time).
+
+### 9.2 Tables in the code through joins and first lanes (fork pick 4)
+
+Ported from fxceless's VIctory fork (commit `578d459`, its `code_join`,
+`first_lane`, the `s_getpc_b64` lowering and two tests), with one change
+from the review below. Resource tracking (`resource.rs`) refused two
+shapes of address into a table the compiler appends to the code:
+
+- **A join** ("an address from a phi", 8 compute programs:
+  098fc28e44347a00, 21d27f785da6d2b1, 77a7af30c430cd16, 982f3cccd5c04294,
+  9aa4a785e0800cda, b3e7781d53ff8326, d9978c76c746d809,
+  f7c4f227a2a4c4b2): paths that each add an index to an `s_getpc_b64`
+  (one table, or a table of their own) and meet before one load. BTP 6's
+  fog reconstruction reads its sample offsets this way; the fork reports
+  that, refused, "the lit frame was multiplied by a fog transmittance
+  nothing had written". In the programs read, the joined addresses are
+  VGPR pairs read by `global_load`, each lane at its own address, as on
+  the console.
+- **A first-lane read** ("an address read from the first lane of a
+  per-lane value", 5ed77e9e8f084dea and 0a5d4f9047b3dce4, the
+  average-luminance downsample that feeds the exposure): an address
+  computed in VGPRs, read back with `v_readfirstlane_b32` before a scalar
+  load. In 5ed77e9e8f084dea the index is a loop counter every lane steps
+  alike, but the tracer's uniformity proof cannot show it: the loop is
+  left on `vccz`, whose per-lane condition tests the lane's EXEC bit.
+
+What XTP does now:
+
+- the join, or the first-lane read, is the address's computed term, and
+  counts the table's base itself: the emitter gives each `s_getpc_b64` its
+  offset in the code (that of the next instruction, high dword 0;
+  `emit/lower/salu.rs`), so the term is the byte in the code whichever
+  table a path took (`Tracer::code_join`, `code_lane`, `counts_code`);
+- each path of a join must add to exactly one `s_getpc_b64` and to no
+  root parameter (`code_base`: the fork's looked for a table in any term);
+  the high half must have the shape of a table's, joined or read from the
+  first lane too (`code_high`; no lowering uses it).
+
+**The review's change.** The fork took the first-lane read's *source* as
+the address: each lane's own index. The console reads the table at the
+first lane's index for every lane, so that is wrong wherever the index
+differs between lanes. Here the computed term is the read itself, which
+the emitter already lowers as the console's first lane, and it is taken
+only where no guard narrows the read in the per-lane form: there the
+host's first lane may be one the console's EXEC leaves out
+(`a_first_lane_read_under_a_guard_of_a_per_lane_address_is_refused`).
+
+**Shortcut** (`salu.rs`): a program that uses `s_getpc_b64` for anything
+but a table address computes with the code offset where the console has
+the address. A jump through it (`s_setpc_b64`, `s_swappc_b64`) is refused
+as before.
+
+Tests (`resource::tests`, `emit::lower::salu::tests`):
+
+- the fork's two tests: two paths into one table give the join as the
+  computed term at offset 0; the first-lane form gives the read itself
+  (the fork's test asserted each lane's index);
+- the fog's form, two tables, each with its own `s_getpc_b64`; with one
+  path's address not in the code, the join is refused as before;
+- the ten earlier tests of the uniformity rules (b03d6089) that expected
+  "an address read from the first lane of a per-lane value" now see the
+  address read from the first lane: a rule that wrongly proved the index
+  uniform would make the index the computed term again;
+- a dispatch on the test adapter (WARP here): lanes 0-15 read table 1 and
+  lanes 16-31 table 2 through a join, every lane its own entry. With the
+  counter's offset 4 bytes short (a mutation), every lane reads the dword
+  before its own;
+- a dispatch on 32-lane hardware (`--ignored`, the cloud L4): every lane
+  computes its own entry's address and the scalar load reads the first
+  lane's, so every lane stores entry 0 (the fork's form would store each
+  lane's own); translation and validation for 32-32 and 32-64 run
+  everywhere.
+
+**Survey** (`xtp shader-survey --host-lanes 32-32`, run on the cloud L4
+with the pack of its game folder; before: `7a3a318`, this task before both
+ports; after: `e1b75d7`):
+
+| | before | after |
+|---|---|---|
+| translations | 24,202 | 24,238 |
+| compute translated (of 2,689) | 2,212 | 2,244 |
+| pixel translated (of 12,101) | 11,083 | 11,087 |
+| mesh translated (of 9,282) | 8,725 | 8,725 |
+| refused: an address from a phi | 28 (compute) | 0 |
+| refused: an address read from the first lane of a per-lane value | 5 (3 compute, 2 pixel) | 0 |
+| refused at emit: `s_getpc_b64` | 3 (1 compute, 2 pixel) | 0 |
+
+No other count moved: the 36 programs gained are those three rows, and no
+program lost its translation. The session's census named 8 programs
+for the join; the pack has 28.
+
+**Follow-up: the three programs that stopped at `s_getpc_b64` in the
+emitter** (187f053719d2206e and 17761234145ad256, pixel; b2711644ca5566cc,
+compute) translate now that the counter has a value. Each takes it only
+as a table address in the code (`s_add_u32` of a literal, `s_addc_u32` of
+0, then an index added in VGPRs or SGPRs). The compute program also
+parks those addresses in VGPR lanes (`v_writelane_b32`), which is
+probably what reached an effect before. Not yet checked: that no address
+it parks is read back as data, where the code offset stands for the
+console's address (the shortcut in `salu.rs`).
