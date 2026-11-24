@@ -512,15 +512,12 @@ impl Shadow {
         let (mut written, mut opened) = (0, false);
         let mut i = 0;
         while i < host.len() {
-            if host[i] == old[i] {
-                host[i] = title[i];
-                i += 1;
-                continue;
+            let run = first_change(host, old, i);
+            host[i..run].copy_from_slice(&title[i..run]);
+            if run == host.len() {
+                break;
             }
-            let run = i;
-            while i < host.len() && host[i] != old[i] {
-                i += 1;
-            }
+            i = first_same(host, old, run);
             if host[run..i] != title[run..i] {
                 if !opened {
                     // The piece's guard, once.
@@ -596,6 +593,7 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
+            add(C::Updates, 1);
             add(C::Updated, (to - from) as u64);
             add(C::Refreshed, copied as u64);
             add(C::SkippedBytes, (to - from).saturating_sub(copied) as u64);
@@ -804,6 +802,57 @@ impl Shadow {
         let _ = zeros;
         to - from
     }
+}
+
+/// The first offset from `at` where `a` and `b` differ (their length if
+/// none), 8 bytes at a time: the copy-back's byte loop cost about 1 ns a
+/// byte, 8 ms for each 8 MiB range the GPU wrote here and there
+/// (`world_frame_copies_cost`). A byte at a time as before W1
+/// (`XTP_SHADOW_ONCE=0`).
+fn first_change(a: &[u8], b: &[u8], mut at: usize) -> usize {
+    if once() {
+        while at + 8 <= a.len() {
+            let x = word(a, at) ^ word(b, at);
+            if x != 0 {
+                return at + (x.trailing_zeros() / 8) as usize;
+            }
+            at += 8;
+        }
+    }
+    while at < a.len() && a[at] == b[at] {
+        at += 1;
+    }
+    at
+}
+
+/// The first offset from `at` where `a` and `b` are the same (their length
+/// if none), 8 bytes at a time as [`first_change`].
+fn first_same(a: &[u8], b: &[u8], mut at: usize) -> usize {
+    const ONES: u64 = u64::from_le_bytes([1; 8]);
+    const HIGHS: u64 = u64::from_le_bytes([0x80; 8]);
+    if once() {
+        while at + 8 <= a.len() {
+            let x = word(a, at) ^ word(b, at);
+            // The high bit of each zero byte of `x` (bytes above the first
+            // may be marked wrongly, not the first).
+            let zero = x.wrapping_sub(ONES) & !x & HIGHS;
+            if zero != 0 {
+                return at + (zero.trailing_zeros() / 8) as usize;
+            }
+            at += 8;
+        }
+    }
+    while at < a.len() && a[at] != b[at] {
+        at += 1;
+    }
+    at
+}
+
+/// The 8 bytes of `bytes` at `at`, the first lowest.
+fn word(bytes: &[u8], at: usize) -> u64 {
+    let mut w = [0; 8];
+    w.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_le_bytes(w)
 }
 
 /// The copy-back's unit: title memory is compared, read and written back
@@ -1771,6 +1820,30 @@ mod tests {
         );
     }
 
+    /// The copy-back's scans by 8 bytes find what the byte loop found: the
+    /// first byte that differs, and the first that does not.
+    #[test]
+    fn the_copy_backs_scans_find_what_the_byte_loop_found() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200 {
+            let len = (next() % 100) as usize;
+            let a: Vec<u8> = (0..len).map(|_| (next() % 3) as u8).collect();
+            let b: Vec<u8> = (0..len).map(|_| (next() % 3) as u8).collect();
+            for at in 0..=len {
+                let change = (at..len).find(|&i| a[i] != b[i]).unwrap_or(len);
+                let same = (at..len).find(|&i| a[i] == b[i]).unwrap_or(len);
+                assert_eq!(first_change(&a, &b, at), change, "{a:?} {b:?} from {at}");
+                assert_eq!(first_same(&a, &b, at), same, "{a:?} {b:?} from {at}");
+            }
+        }
+    }
+
     /// A copy-back reads a run of pieces the GPU changed with one copy and
     /// keeps the readable pieces of a run that crosses an unmapped page; a
     /// range shorter than a piece across a piece boundary puts back both
@@ -1856,6 +1929,105 @@ mod tests {
                 .host_bytes(second + 0x100, 8)
                 .iter()
                 .all(|&b| b == 0x5d)
+        );
+    }
+
+    /// Benchmark (`--ignored --nocapture`; `XTP_SHADOW_ONCE=0` times the
+    /// path before W1, `XTP_COPY_MODE=kernel` W1 with the kernel's
+    /// copies): a world-like frame of 39 submissions on one 64 MiB host
+    /// copy, as in world-frame session C (copies 17.9 MB, copy-back 1.1 MB
+    /// a frame). Each submission refreshes the range as its views merge
+    /// (from and to inside pages) and 30 constant views of 600 bytes on
+    /// their own (as after steps that write title memory), while the
+    /// previous one's shaders write 8 MiB of it, after the title wrote 8
+    /// scattered pages and a ring of 200 constant blocks of 600 bytes; then
+    /// the previous one is copied back, its shaders having written 200 runs
+    /// of 16 bytes over the 8 MiB and a 16 KiB block.
+    #[test]
+    #[ignore = "benchmark"]
+    fn world_frame_copies_cost() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let test = "shadow::tests::world_frame_copies_cost";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        const LEN: usize = 64 << 20;
+        const SUBMISSIONS: usize = 39;
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let window = WINDOW as usize;
+        // SAFETY: a fresh reservation of our own, never freed.
+        let reserved = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN + window,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(reserved, 0);
+        let base = reserved.next_multiple_of(window);
+        set_title(base, LEN, 0);
+        let shadow = find(base as u64, LEN as u64).expect("a host copy");
+        shadow.update(base, LEN);
+        let busy = (base + (16 << 20), 8 << 20);
+        let pages = LEN / PAGE;
+        let mut ring = 0;
+        let (mut refresh, mut back) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let (mut copied, mut written) = (0, 0);
+        let mut previous = None;
+        for s in 0..SUBMISSIONS {
+            let byte = (s % 250) as u8 + 1;
+            if s == 0 {
+                // Once, the pages the merged range takes only part of.
+                set_title(base + 0x200, 16, byte);
+                set_title(base + LEN - 0x400, 16, byte);
+            }
+            for p in 0..8 {
+                set_title(
+                    base + (s * 8 + p) * 7_919 % pages * PAGE + 0x40,
+                    0x100,
+                    byte,
+                );
+            }
+            for _ in 0..200 {
+                set_title(base + (48 << 20) + ring, 600, byte);
+                ring = (ring + 600) % (8 << 20);
+            }
+            let started = std::time::Instant::now();
+            copied += shadow.update(base + 0x100, LEN - 0x200);
+            for v in 0..30 {
+                copied += shadow.update(base + (48 << 20) + v * 262_144 + 0x40, 600);
+            }
+            refresh += started.elapsed();
+            if let Some(gpu) = previous.take() {
+                let started = std::time::Instant::now();
+                written += shadow.copy_back(gpu, busy.0, busy.1);
+                back += started.elapsed();
+            }
+            let gpu = submission();
+            shadow.writing(gpu, busy.0, busy.1);
+            for r in 0..200 {
+                shadow.set_host(busy.0 + r * 40_960 + s % 64, 16, byte);
+            }
+            shadow.set_host(busy.0 + (4 << 20), 16 << 10, byte);
+            previous = Some(gpu);
+        }
+        if let Some(gpu) = previous {
+            let started = std::time::Instant::now();
+            written += shadow.copy_back(gpu, busy.0, busy.1);
+            back += started.elapsed();
+        }
+        println!(
+            "BENCH once={} plain={}: per frame of {SUBMISSIONS} submissions, refreshes {:.2} ms \
+             ({:.1} MB copied), copy-back {:.2} ms ({:.2} MB written)",
+            once(),
+            plain(),
+            refresh.as_secs_f64() * 1e3,
+            copied as f64 / 1e6,
+            back.as_secs_f64() * 1e3,
+            written as f64 / 1e6
         );
     }
 

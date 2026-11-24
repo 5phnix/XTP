@@ -23,8 +23,9 @@ pub(crate) enum C {
     /// or written by GPU work in flight.
     Skipped,
     SkippedBytes,
-    /// Bytes of the ranges host copy updates covered; of those, the bytes
-    /// copied from title memory.
+    /// Host copy updates; the bytes of the ranges they covered; of those,
+    /// the bytes copied from title memory.
+    Updates,
     Updated,
     Refreshed,
     /// Of those, bytes read with plain loads, and bytes that could not be
@@ -70,7 +71,7 @@ pub(crate) enum C {
     TexHashed,
     TexChanged,
 }
-const COUNTERS: usize = 35;
+const COUNTERS: usize = 36;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -133,7 +134,7 @@ pub(crate) fn log(frames: f64) {
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
-         updates over {:.1} MB copied {:.1} MB ({:.1} MB plain in {:.2} ms, {:.1} MB unreadable) \
+         {:.0} updates over {:.1} MB copied {:.1} MB ({:.1} MB plain in {:.2} ms, {:.1} MB unreadable) \
          and skipped \
          {:.1} MB ({:.0} updates whole); copy-back compared {:.1} MB, read {:.1} MB in {:.0} \
          reads, wrote {:.0} runs; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
@@ -146,6 +147,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::CopyBytes as usize]),
         c[C::Refreshes as usize],
         mb(c[C::RefreshBytes as usize]),
+        c[C::Updates as usize],
         mb(c[C::Updated as usize]),
         mb(c[C::Refreshed as usize]),
         mb(c[C::Plain as usize]),
