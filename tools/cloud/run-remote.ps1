@@ -35,6 +35,16 @@
   every 2 s during the run (gpu.csv from nvidia-smi, vidmm.csv from
   Windows' GPU Adapter Memory counters).
 
+  -AudioLockStopgap (with -Game): a stopgap until XTP gives titles a silent
+  audio output. The VM has no audio output, and the title then keeps its
+  audio device's lock and never loads the world (docs/analysis/l4-world.md,
+  stall B). vm\audio-lock-stopgap.ps1 attaches cdb to the run's xtp.exe as
+  it starts and, at the title's first audio call, redirects the jump that
+  leaves the lock taken to the exit that releases it, then detaches: in
+  memory only, build 1.0.2.1 only. Its report (audio-lock-stopgap.txt)
+  comes back with the logs. Needs cdb in C:\xtp\jobs\cdb on the VM (see
+  l4-world.md section 6.7); without it the script patches later, itself.
+
   The VM is started if needed and stops by itself once idle. One build and
   one game run at a time: a second caller waits. Logs go to
   <localLogDir>\<date-time>-<what>\ (default %LOCALAPPDATA%\xtp\cloud-runs).
@@ -48,6 +58,7 @@
   tools\cloud\run-remote.ps1 -Game -Seconds 240 -Local
   tools\cloud\run-remote.ps1 -Game -NoBuild -Env @{ XTP_LOG = 'xtp_gpu=debug,info' }
   tools\cloud\run-remote.ps1 -Game -Local -Repo E:\XTP -LocalRev main -Autopilot autopilot\gameplay.txt -Seconds 300
+  tools\cloud\run-remote.ps1 -Game -Autopilot autopilot\gameplay.txt -Seconds 300 -AudioLockStopgap
 #>
 [CmdletBinding(DefaultParameterSetName = 'Check')]
 param(
@@ -74,6 +85,7 @@ param(
     [Parameter(ParameterSetName = 'Game')] [switch]$NoBuild,
     [Parameter(ParameterSetName = 'Game')] [switch]$NoGolden,
     [Parameter(ParameterSetName = 'Game')] [switch]$NoCapture,
+    [Parameter(ParameterSetName = 'Game')] [switch]$AudioLockStopgap,
     # Fail at once when another session holds the VM, instead of waiting.
     [switch]$NoWait,
     [string]$Config
@@ -171,6 +183,7 @@ switch ($what) {
         $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'run-game.ps1' -AllowFail -Arguments ($source + @{
                 TitleExe = $cfg.titleExe; Seconds = $Seconds; Keys = $Keys; Env = $envText; Name = $Name; XtpArgs = $XtpArgs
                 Build = -not $NoBuild; NoGolden = $NoGolden.IsPresent; NoCapture = $NoCapture.IsPresent; SessionUser = $cfg.sessionUser
+                AudioLockStopgap = $AudioLockStopgap.IsPresent
             })
         $code = $LASTEXITCODE
         if ($lines -match '^build FAILED') { Get-RemoteLog $lines }
@@ -179,7 +192,7 @@ switch ($what) {
         if ($run) {
             # The log, the frames and the crash log; not the data folder (saves).
             $zip = "C:\xtp\jobs\$(Split-Path -Leaf $run).zip"
-            $pack = "`$r = '$run'; `$items = @('run.log', 'env.txt', 'result.json', 'xtp.toml', 'gpu.csv', 'vidmm.csv', 'capture') | ForEach-Object { Join-Path `$r `$_ } | Where-Object { Test-Path `$_ }; " +
+            $pack = "`$r = '$run'; `$items = @('run.log', 'env.txt', 'result.json', 'xtp.toml', 'gpu.csv', 'vidmm.csv', 'audio-lock-stopgap.txt', 'audio-lock-cdb.txt', 'capture') | ForEach-Object { Join-Path `$r `$_ } | Where-Object { Test-Path `$_ }; " +
                 "`$crash = Get-ChildItem -LiteralPath (Join-Path `$r 'data') -Recurse -Filter 'crashes.log' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; " +
                 "if (`$crash) { Copy-Item -LiteralPath `$crash -Destination (Join-Path `$r 'crashes.log'); `$items += (Join-Path `$r 'crashes.log') }; " +
                 "Compress-Archive -Path `$items -DestinationPath '$zip' -Force"
