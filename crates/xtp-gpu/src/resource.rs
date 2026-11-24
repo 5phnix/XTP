@@ -2154,8 +2154,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 struct Decode {
     root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
     pso: windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
-    /// The list it records into, run at once.
+    /// The list it records into, run before the next title submission
+    /// ([`run_decodes`]), and whether it is open with work in it.
     list: crate::host::HostList,
+    open: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the pass is used under its lock.
@@ -2220,7 +2222,12 @@ fn make_decode(host: &crate::host::Host) -> windows::core::Result<Decode> {
             })?;
         let list = host.new_list()?;
         list.close();
-        Ok(Decode { root, pso, list })
+        Ok(Decode {
+            root,
+            pso,
+            list,
+            open: false,
+        })
     }
 }
 
@@ -2316,9 +2323,10 @@ fn decodes(title: u32, from: &HostTexture, to: &HostTexture) -> bool {
 
 /// Writes the R9G9B9E5 texels `from` holds (as words: a GPU-written
 /// R32 texture) into `to`, the RGBA16F stand-in of a texture that reads
-/// them as R9G9B9E5, decoded on the GPU: in a list of ours run now, after
-/// the submissions made so far, so it sees what they wrote (what lists not
-/// yet submitted write shows a frame later). Once a frame per texture
+/// them as R9G9B9E5, decoded on the GPU: in a list of ours, run before the
+/// next title submission ([`run_decodes`]), so it sees what the lists
+/// submitted before it wrote (what lists not yet submitted write shows a
+/// frame later); every decoding of the moment shares the one submission. Once a frame per texture
 /// (`placed`, the title resource of `to`; `source`, that of `from`).
 /// False if the decoding cannot be made (shapes or layouts that differ).
 #[cfg(windows)]
@@ -2359,14 +2367,17 @@ fn decode_now(
                 None
             }
         })
-        .as_ref()
+        .as_mut()
     else {
         return false;
     };
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     let list = &pass.list;
-    list.reset();
+    if !pass.open {
+        list.reset();
+        pass.open = true;
+    }
     crate::list::ensure_state(list, source, COPY_SOURCE);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
@@ -2452,10 +2463,23 @@ fn decode_now(
         }
         l.ResourceBarrier(&[t(&d.texels, copy_source, common)]);
     }
-    list.close();
-    host.execute(&[list]);
     d.frame = frame + 1;
     true
+}
+
+/// Runs the decodings [`decode_now`] recorded since the last call, if any:
+/// before a title submission (`Host::submit`), so that lists recorded
+/// after them see what they wrote.
+#[cfg(windows)]
+pub(crate) fn run_decodes(host: &crate::host::Host) {
+    let mut pass = DECODE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(pass)) = pass.as_mut()
+        && pass.open
+    {
+        pass.list.close();
+        host.execute(&[&pass.list]);
+        pass.open = false;
+    }
 }
 
 /// The buffers and layouts [`decode_now`] needs for `from` and `to`, if
@@ -4130,6 +4154,7 @@ mod tests {
             decode_now(host, stand_in, target, &from, &to),
             "once a frame"
         );
+        run_decodes(host);
         host.drain();
         let words = read_words(host, stand_in);
         for (x, y) in [(0, 0), (15, 15), (7, 9)] {
