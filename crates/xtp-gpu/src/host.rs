@@ -3048,9 +3048,14 @@ impl Host {
             p.copy.close();
             self.execute(&[&p.copy]);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // A captured frame is finished, to be read back; its probe is
+            // still read at the next present, as every probe with frames
+            // in flight (each frame reported once, one present late).
             #[cfg(feature = "diagnostics")]
-            let ahead = ahead && capture.is_none();
-            self.presented(&p.copy, ahead);
+            let runs_on = ahead && capture.is_none();
+            #[cfg(not(feature = "diagnostics"))]
+            let runs_on = ahead;
+            self.presented(&p.copy, runs_on);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);

@@ -33,9 +33,10 @@ pub(crate) enum Asked {
     Ab { phase: Duration, settle: Duration },
 }
 
-/// Without `XTP_FRAMES_IN_FLIGHT`: on, once a Series S world session of
-/// 2 minutes or more ran with it without corruption, crash or GPU reset
-/// (docs/analysis/frames-in-flight.md).
+/// Without `XTP_FRAMES_IN_FLIGHT`: off. It held 150 s of the Series S
+/// world, but gains nothing while a frame's waits are inside its
+/// submissions rather than at its present (docs/analysis/frames-in-flight.md
+/// §5).
 const DEFAULT: Asked = Asked::Off;
 
 /// `XTP_FRAMES_IN_FLIGHT`'s value read: `0`, `1`, `ab`, `ab:<phase>` or

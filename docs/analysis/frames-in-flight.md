@@ -9,6 +9,13 @@ which only 25–75 ms overlapped CPU work (session
 frame may run on: the title prepares frame N+1 while the GPU runs frame N,
 and is never more than one frame ahead. Behind `XTP_FRAMES_IN_FLIGHT`.
 
+**Result** (§5): it works and held 150 s of the Series S world, but it
+gains nothing today. Of the 120–140 ms a world frame waits for its
+submissions, 0.0–0.6 ms is at the present (and flip): the present's drain
+always found the GPU done, because the frame's waits happen inside its
+submissions. The default stays off; a new diagnostics line says where
+those waits are asked (§1, §7).
+
 Times are UTC. Logs are under `E:\xtp-data\` (not in the repository).
 Title code is named by RVA; no title bytes or listings are quoted.
 
@@ -22,6 +29,7 @@ Title code is named by RVA; no title bytes or listings are quoted.
 | Submissions in flight at most | 16 | 16 off, 128 on (a world frame makes 20 to 40) |
 | Black-frame probe (diagnostics) | read at its own present | with frames in flight, read at the next present, once its copy has run: reported one present late |
 | Frame-rate line | waiting, overlapped | also: of the waiting, the part at flips and presents; whether frames run in flight; the longest frame of the second |
+| Diagnostics builds | — | a line `waiting for submissions, by where it was asked`: the eight places (file:line of the caller of `Host::settle`, `drain` or a step's check, by `#[track_caller]`) the title's threads waited at longest, ms and waits per frame |
 
 `XTP_FRAMES_IN_FLIGHT`:
 
@@ -30,7 +38,7 @@ Title code is named by RVA; no title bytes or listings are quoted.
 - `ab[:<phase s>[:<settle s>]]`: off and on in turn within one run, phases
   of 20 s by default, the first 3 s of each not measured, a line per phase
   (`frames in flight A/B: phase …`). For measurements on the same scene.
-- Unset: off, until the session of §5 shows it safe (then on).
+- Unset: off (§5.3).
 
 `XTP_SYNC_SUBMIT=1` still waits for every submission; frames in flight
 change nothing there.
@@ -166,8 +174,12 @@ title's lists and now submit them as the title does (`Host::submit`).
 - **The black-frame probe** (diagnostics, every frame): its readback buffer
   is reused, so it is read at the next present, after `Host::flip` and
   before the next probe records into it. With frames in flight a black frame
-  is reported one present late, with the next frame's draws; set
-  `XTP_FRAMES_IN_FLIGHT=0` for exact black-frame reports.
+  is reported one present late, with the next frame's draws, a captured
+  frame too (each frame once); set `XTP_FRAMES_IN_FLIGHT=0` for exact
+  black-frame reports. (The build of session fif-on read a captured frame's
+  probe at once and left the next frame none: its log has spurious "black
+  frame after a frame that was not" lines at the power-of-two frames. Fixed
+  after it.)
 - **Readbacks of XTP's own** (`resource.rs`, `pool.rs`, tests) drain after
   their submission, as before.
 
@@ -193,10 +205,93 @@ second's line may hold part of the frame before's GPU time.
 | `the_next_frame_leaves_what_the_frame_in_flight_writes` | the in-flight checks of host copies across a present |
 | `a_list_of_ours_waits_for_its_submission_when_reset` | the compositor's case |
 | `frames::tests::*` | the switch's values; the A/B's phases, settling and lines |
+| `host::tests::waits_are_counted_by_where_they_were_asked` | the waits-by-place line's sums, order and reset |
 
 ## 5. Series S sessions
 
-(filled in from the sessions below)
+On the person's PC, through `E:\tools\stall-probe\session.ps1`, Series S,
+`XTP_SKIP_INTRO=1`, autopilot and golden data, the diagnostics build of
+`4144257` from the build farm, `XTP_FRAME_LINE=1` (a frame-rate line every
+second). Logs in `E:\xtp-data\cache\play\<stamp>\run.log`, samplers in
+`E:\xtp-data\runs\stall-<name>`.
+
+| Session | Run | Setting | Gameplay | End |
+|---|---|---|---|---|
+| fif-ab | `20261124-203132`, 20:31:07–20:33:30 | `XTP_FRAMES_IN_FLIGHT=ab:20:3` | from +25 s, about 90 s | device removed at 20:33:25, in an "on" phase (below) |
+| fif-on | `20261124-203524`, 20:35:21–20:38:19 | `XTP_FRAMES_IN_FLIGHT=1`, 3 world frames captured | from +21 s, 150 s | the measured exit, title exit code 0 |
+
+### 5.1 Before and after on the same scene (fif-ab)
+
+The run's phase lines (17–18 s measured each; phase 0 is the menus):
+
+| Phase | Frames in flight | fps | ms/frame | Longest frame | GPU ms/frame | Waiting ms/frame | of which at flips and presents | Overlapped ms/frame |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 0 | off (menus) | 28.51 | 35.1 | 333 | 1.8 | 0.2 | 0.2 | 1.6 |
+| 1 | on (world starts) | 4.33 | 231.2 | 436 | 74.5 | 91.5 | 0.0 | 53.2 |
+| 2 | off | 4.65 | 215.2 | 334 | 85.2 | 98.0 | 0.2 | 45.3 |
+| 3 | on | 3.33 | 300.0 | 466 | 128.7 | 166.7 | 0.0 | 46.5 |
+| 4 | off | 4.01 | 249.7 | 467 | 111.4 | 135.9 | 0.9 | 44.3 |
+
+The world seconds (150 draws a frame or more) of each mode, from the
+frame-rate lines:
+
+| | Seconds | fps | ms/frame | Preparing | GPU | Copying back | Waiting | at flips and presents | Overlapped |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| off | 32 | 4.34 | 244.9 | 120.7 | 104.4 | 67.5 | 124.6 | 0.56 | 47.2 |
+| on | 30 | 3.86 | 276.8 | 138.8 | 106.6 | 78.5 | 138.1 | 0.00 | 47.0 |
+| fif-on, on | 125 | 4.70 | 223.3 | 101.4 | 104.9 | 59.1 | 120.5 | 0.01 | 43.6 |
+
+What it shows:
+
+- **The present was not where the frame waits.** With frames in flight
+  off, the present's drain waited 0.2–0.9 ms a frame: by the time the
+  title presents, the GPU has run the frame and it is written back. The
+  120–140 ms of waiting a frame are inside the frame's submissions, and
+  they also make the overlap what it is (about 45 ms) in both modes.
+  gpu-prof measured the same independently, by cause (docs/analysis/
+  gpu-frame.md §6, sessions A and A2 of 19:14 and later, its local patch):
+  of 109 ms of waiting a frame, 87 ms are steps waiting for an earlier
+  submission that writes or reads the same title memory (`Batch::settle*`,
+  78 %), 14 ms the title's page-mapping copies draining every submission
+  (`queue::copy_page_mappings`, 17 %), 1.3 ms finishing at submission, and
+  **0.1 ms the present's drain** (0.3 %).
+- **So one frame in flight gains nothing today.** The phases differ by
+  the scene more than by the mode (the off phases 4.65 and 4.01 fps, the
+  on phases 4.33 and 3.33, the GPU time 74 to 129 ms); the world seconds
+  give on 3.86 against off 4.34 fps over 30 s each, the same overlap
+  (47 ms). Nothing says it costs either: fif-on ran 4.70 fps over 125 s.
+- **The brief's premise was wrong.** "The world frame waits 159–242 ms for
+  its submissions" (run 181140) is the waiting in all, which the old frame
+  line did not split; it was read as the present's drain.
+
+### 5.2 Stability (fif-on, and fif-ab's end)
+
+- **fif-on**: 150 s of gameplay with frames in flight on, 125 of them in
+  the world, then the autopilot's exit (title exit code 0). No device
+  removal, no XTP error, no slow submission line.
+- **Captures** (`XTP_CAPTURE_WORLD=150:30:3:60`, frames 644, 704, 764, and
+  1024 as a power of two): black, or the title card over the dark
+  background, drawn clean (no torn or garbage pixels). The presented world
+  is black in the sessions before this change too (task c19d640b): the 3D
+  image cannot show corruption either way; the 2D and present path does
+  not show any.
+- **fif-ab ended by a device removal** in phase 5 (on), about 90 s into
+  the world: `0x887A0004`, "after a submission of 0 lists (31 lists in
+  flight)", no breadcrumbs (DRED off). The same signature ended the
+  baseline run `20261124-181140` (frames in flight did not exist); 9 of the
+  25 runs in `E:\xtp-data\cache\play` from 17:32 to 19:41 log a device
+  removal (`device removed` in `run.log`; their signatures not compared);
+  task 873bbb7a is on that hang. It cannot be pinned on frames
+  in flight, nor cleared of it, from one run.
+
+### 5.3 Default
+
+Off. fif-on meets the brief's condition (2 minutes of the Series S world
+without crash or device removal, no corruption visible), but the condition
+is a minimum, and with no gain to weigh against the risk of a change in
+ordering, turning it on buys nothing yet. It is worth trying again once the
+waits inside submissions are gone: then the present's drain becomes the
+wait, and the overlap is what one frame in flight adds.
 
 ## 6. Critical review
 
@@ -250,10 +345,31 @@ Of AnyPS5's mechanism, of the brief, and of this change.
   log. Documented instead, and `XTP_FRAMES_IN_FLIGHT=0` gives exact reports.
 - **gpu.md question 7 stays open.** The safety argument is the console's
   semantics plus BTP 6's flip waits, not a proof that BTP 6 reads no GPU
-  result without a wait. The sessions of §5 are the evidence for its world.
+  result without a wait. The sessions of §5 are the evidence for its world,
+  and they are weak on corruption: the presented world is black.
+- **The task rested on a misreading, which only measurement showed.**
+  The brief took the frame's waiting for the present's drain; the new
+  split of the frame line shows the drain costs under 1 ms a frame, as
+  gpu-frame.md §6 found by another route while this task ran. The
+  change is kept (behind its switch, off) because it is correct, tested,
+  and becomes useful once the waits inside submissions are removed; the
+  `ab` mode and the waits-by-place line are there to measure that day.
+- **Two sessions are few.** One A/B run gives 30 world seconds a mode,
+  across a scene that changes (GPU time 74 to 129 ms a phase). A small
+  difference either way would not show; a large gain would have.
 
 ## 7. Open questions
 
+- **Which steps wait, line by line?** gpu-frame.md §6 splits the waiting
+  by kind of caller (78 % `Batch::settle*`, 17 % page-mapping drains). The
+  diagnostics line `waiting for submissions, by where it was asked` added
+  here is the delivered, finer form of gpu-prof's local patch
+  (`E:\xtp-data\runs\gpu-prof\waits.patch`, not delivered): it names the
+  caller's file and line, so a refresh, a CPU copy, a GPU write snapshot
+  and a texture check come apart. It was added after the two sessions and
+  has not run in the world yet. What to do about those waits is
+  gpu-frame.md §8's first item (copy back on demand, wait only for what
+  conflicts); one frame in flight comes after it.
 - Does BTP 6 read a GPU result at a fixed frame latency without any wait
   (gpu.md question 7)? A stack sample cannot tell; a watch of the fence
   methods' callers (`GetCompletedValue`, `SetEventOnCompletion`, at the
