@@ -57,6 +57,8 @@ mod testgpu;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod timestamps;
+#[cfg(windows)]
 pub mod uma;
 #[cfg(windows)]
 mod watch;

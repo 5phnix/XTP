@@ -1224,6 +1224,7 @@ impl Host {
             list.last.store(*submitted, Ordering::Release);
         }
         self.timeline.push(*submitted, touches, pending);
+        crate::timestamps::submitted(&self.queue, runs, *submitted, title);
         // `XTP_SYNC_SUBMIT`, and timed lists: finished before returning,
         // still one submission at a time.
         #[cfg(feature = "diagnostics")]
@@ -1765,6 +1766,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        crate::timestamps::close(self);
         #[cfg(feature = "diagnostics")]
         crate::passdump::closed(self);
         #[cfg(feature = "diagnostics")]
@@ -1866,6 +1868,7 @@ impl HostList {
         if let Err(e) = unsafe { self.list.Reset(&allocator, None) } {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        crate::timestamps::open(self);
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this

@@ -1240,6 +1240,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        let _timed = crate::timestamps::command(list, crate::timestamps::What::Dispatch, Some(p));
         // SAFETY: an open list with everything set; the barrier names no
         // resource.
         unsafe {
@@ -1318,6 +1319,11 @@ impl State {
                 .map_err(|_| "no mesh dispatch on the host list")?;
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("mesh {x}"), false));
+            let _timed = crate::timestamps::command(
+                list,
+                crate::timestamps::What::Mesh,
+                crate::pipeline::host_pipeline(self.pipeline as This),
+            );
             // SAFETY: an open list with everything set.
             unsafe { l6.DispatchMesh(x, 1, 1) };
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1580,6 +1586,11 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            let _timed = crate::timestamps::command(
+                list,
+                crate::timestamps::What::Draw,
+                crate::pipeline::host_pipeline(self.pipeline as This),
+            );
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1671,6 +1682,11 @@ impl State {
             Ok(()) => {
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+                let _timed = crate::timestamps::command(
+                    list,
+                    crate::timestamps::What::Indexed,
+                    crate::pipeline::host_pipeline(self.pipeline as This),
+                );
                 // SAFETY: an open list with everything set.
                 unsafe {
                     list.list
@@ -1782,9 +1798,11 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
+        let clamping = crate::timestamps::command(list, crate::timestamps::What::Clamp, None);
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             return fail("not bounded (no clamp, or arguments not 4-byte aligned)".into());
         }
+        drop(clamping);
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -1808,6 +1826,11 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        let _timed = crate::timestamps::command(
+            list,
+            crate::timestamps::What::Indirect(kind),
+            crate::pipeline::host_pipeline(self.pipeline as This),
+        );
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached;
         // the barrier names no resource.
@@ -1890,8 +1913,11 @@ impl State {
     ) -> Result<(), Unready> {
         // The rewritten records: draw arguments, 16 bytes apart.
         let signature = host_signature(0, 16).ok_or("no host signature")?;
+        let expanding =
+            crate::timestamps::command(list, crate::timestamps::What::RectangleExpansion, None);
         let prepared =
             self.expand_rectangles(list, inputs, (stride, max), (args, arguments), counter)?;
+        drop(expanding);
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         bind(self, list)?;
@@ -1903,6 +1929,11 @@ impl State {
                 false,
             )
         });
+        let _timed = crate::timestamps::command(
+            list,
+            crate::timestamps::What::Rectangles,
+            crate::pipeline::host_pipeline(self.pipeline as This),
+        );
         // SAFETY: an open list with everything set; the arguments and their
         // count are the list's own, in the indirect argument state (records
         // past the title's count do not run); the signature is cached.
