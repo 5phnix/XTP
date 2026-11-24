@@ -222,17 +222,20 @@ region than where it is stored is billed as network transfer. Check the new
 VM (`run-remote.ps1 -DeviceCheck`, a game run), then `move-vm.ps1
 -DeleteOld` removes the old one and the snapshots.
 
-When every zone is full, even for `move-vm.ps1`, `grab-vm.ps1 -Minutes 240`
-takes the first GPU that frees up anywhere. It loops over every region that
-offers the accelerator, one regional request at a time (Google picks a free
-zone of the region), standard then **Spot**, g2-standard-16 then -12 then
--8, and logs every attempt. Its VMs boot the public Windows image, which is
-quick to create or refuse, so the GPU is held seconds after it frees up; the
-game disk is then made from the snapshot and attached, and `new-vm.ps1` and
-`setup-vm.ps1` set the new Windows up (30 to 45 minutes). Attempts must not
-run in parallel: with a quota of one GPU, an attempt in flight holds the
-quota and the others are refused by it instead of being answered on
-capacity. On 2026-11-24, after three hours without an L4 anywhere, a Spot
+When every zone is full, even for `move-vm.ps1`, `grab-vm.ps1 -NoSpot
+-Minutes 240` takes the first GPU that frees up anywhere. It alternates two
+attempts in a loop: starting the stopped VM in its own zone, and creating
+it in the next region that offers the accelerator (one regional request;
+Google picks a free zone of the region), g2-standard-16 then -12 then -8,
+standard (and Spot without `-NoSpot`). Every attempt is logged. New VMs
+boot the public Windows image, which is quick to create or refuse (about
+18 s an attempt, so the whole world in about ten minutes); a custom image of
+the set-up boot disk (`-Image`) would be ready at once but takes minutes per
+attempt. On a win elsewhere the stopped VM is deleted, the game disk is made
+from the snapshot and attached, and `new-vm.ps1` and `setup-vm.ps1` set the
+new Windows up (30 to 45 minutes). Attempts must not run in parallel: with a
+quota of one GPU, an attempt in flight holds the quota and the others are
+refused by it instead of being answered on capacity. On 2026-11-24, after three hours without an L4 anywhere, a Spot
 g2-standard-16 came up in asia-east1-b. A Spot VM costs much less, and
 Google can stop it at any time: ours was taken back after 19 minutes, in the
 middle of its setup. It keeps its disks; start it again later, and once it
