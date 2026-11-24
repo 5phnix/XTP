@@ -273,6 +273,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    // A queue holding the list behind a fence runs it first.
+    #[cfg(windows)]
+    crate::queue::list_reset(this);
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     let mut uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());

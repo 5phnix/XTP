@@ -14,9 +14,30 @@
 //! hash. Every writer of such memory opens the guards: the title's CPU by
 //! faulting, our copies and the kernel's reads (`watch::writing`), and
 //! DirectStorage's page destinations (xmem's report after its writes).
-//! `XTP_TEXTURE_GUARDS=0` hashes at every check, as before: a world frame
-//! checked the same textures about a hundred times
+//! `XTP_TEXTURE_GUARDS=0` (or `off`, `false`) hashes at every check, as
+//! before: a world frame checked the same textures about a hundred times
 //! (`docs/analysis/gpu-frame.md`).
+//!
+//! A writer that opens no guard would leave such a texture stale for good,
+//! later lists' copies predicated off: the title's own views of sections,
+//! its memory calls that bypass xmem, GPU writes through UMA heaps
+//! (`watch`'s shortcuts). A safety net covers them: at each check it hashes
+//! guarded textures checked since it last hashed them, round-robin by
+//! resource, within a budget a frame (`XTP_TEXTURE_NET`, 2 MiB by default,
+//! taken from a texture a slice at a time; a budget a second where frames
+//! do not advance), a lap every 2 s at most (a few textures are not hashed
+//! again at every frame: 0.86 ms a frame of an L4 VM's CPU for six of them,
+//! the whole budget, before). A texture whose memory no longer hashes as
+//! what was detiled is hashed at its next check whatever its guards say,
+//! refreshed if it changed, and logged once (with the count of such changes
+//! so far). Its budget costs at most 0.65 ms a frame on a build-farm CPU
+//! (`tests::net_costs`), 0.86 ms on the L4 VM's; not measured in the world
+//! yet.
+//!
+//! A check hashes and detiles one snapshot of the memory: hashed in place
+//! and detiled after the wait for an earlier copy, a title write during the
+//! wait was detiled under the hash of the memory before it, which the
+//! title writing those bytes back then matched.
 //!
 //! A texture whose host format stands in for the title's
 //! (`resource::format`) has its texels converted on the way.
@@ -34,10 +55,14 @@
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
+//!
+//! shortcut: the safety net covers guarded textures only, not those in
+//! write-watched memory.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -76,6 +101,18 @@ pub(crate) struct Staging {
     /// count of writes then and the host copy (held weakly: its address is
     /// not reused meanwhile).
     copied: Mutex<Option<(u64, Weak<crate::resource::HostTexture>)>>,
+    /// Checked through its guards since the safety net last hashed it.
+    sampled: AtomicBool,
+    /// The safety net found its memory differ from what was detiled: its
+    /// next check hashes it whatever its guards say.
+    suspect: AtomicBool,
+    /// Changes its guards missed.
+    missed: AtomicU64,
+    /// Tells it apart in tests from a staging state of another test freed
+    /// at the same address (whose copies and hashes the address would
+    /// count).
+    #[cfg(test)]
+    id: u64,
     /// Its checks since the last summary (diagnostics).
     #[cfg(feature = "diagnostics")]
     seen: Seen,
@@ -114,7 +151,12 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+/// Staging states by title resource, in the order the safety net walks.
+static STAGING: Mutex<Option<BTreeMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+/// Room for a check's snapshot of texture memory, kept at the largest
+/// changed so far.
+static SNAPSHOT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
@@ -258,48 +300,324 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         DECIDED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((Arc::as_ptr(&staging) as usize, runs));
+            .push((staging.id, runs));
     });
 }
 
-/// Each copy decided in tests: its staging buffer and whether it ran.
+/// Each copy decided in tests: its staging state's [`Staging::id`] and
+/// whether it ran.
 #[cfg(test)]
-static DECIDED: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+static DECIDED: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
 
-/// Each hash taken in tests: its staging buffer.
+/// Each hash a check took in tests: its staging state's [`Staging::id`].
 #[cfg(test)]
-static HASHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static HASHED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The ids of staging states in tests.
+#[cfg(test)]
+static IDS: AtomicU64 = AtomicU64::new(0);
 
 /// GPU copies of staging buffers recorded, by whether they ran: count and
 /// bytes (staging sizes), since the last summary.
 static COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static COPIED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// An environment variable's value, if set.
+fn env(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+}
+
+/// Whether `value` turns off a switch that is on by default: `0`, `off`
+/// or `false`, in any case.
+fn off(value: &str) -> bool {
+    let v = value.trim();
+    v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false")
+}
+
+/// What `XTP_TEXTURE_GUARDS` asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardMode {
+    /// `0`, `off`, `false`: every check hashes.
+    Off,
+    /// Unset or anything else: a check hashes only after a write (or when
+    /// the safety net suspects the texture).
+    On,
+    /// `verify`, in a diagnostics build: every check the guards find clean
+    /// is hashed too, a change counted as missed (a writer that opens no
+    /// guard). Other builds take it as on.
+    Verify,
+}
+
+/// The mode `value` asks for, in a diagnostics build or not.
+fn guard_mode_of(value: Option<&str>, diagnostics: bool) -> GuardMode {
+    match value.map(str::trim) {
+        Some(v) if off(v) => GuardMode::Off,
+        Some(v) if diagnostics && v.eq_ignore_ascii_case("verify") => GuardMode::Verify,
+        _ => GuardMode::On,
+    }
+}
+
+fn guard_mode() -> GuardMode {
+    static MODE: OnceLock<GuardMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = env("XTP_TEXTURE_GUARDS");
+        let diagnostics = cfg!(feature = "diagnostics");
+        let mode = guard_mode_of(value.as_deref(), diagnostics);
+        if !diagnostics && value.is_some_and(|v| v.trim().eq_ignore_ascii_case("verify")) {
+            tracing::warn!(
+                "XTP_TEXTURE_GUARDS=verify needs a diagnostics build: the guards are on, \
+                 checked only by the safety net"
+            );
+        }
+        mode
+    })
+}
+
 /// Whether texture memory in views is guarded, a hash taken only after a
-/// write (`XTP_TEXTURE_GUARDS`, on unless `0`).
+/// write (`XTP_TEXTURE_GUARDS`).
 fn guards() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XTP_TEXTURE_GUARDS").is_none_or(|v| v != "0"))
+    guard_mode() != GuardMode::Off
 }
 
-/// Whether a check the guards find clean is hashed too, and a change they
-/// missed counted and logged (`XTP_TEXTURE_GUARDS=verify`, diagnostics): a
-/// writer that opens no guard.
-#[cfg(feature = "diagnostics")]
+/// Whether every check the guards find clean is hashed too
+/// (`XTP_TEXTURE_GUARDS=verify`, diagnostics).
 fn verify_guards() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XTP_TEXTURE_GUARDS").is_some_and(|v| v == "verify"))
+    guard_mode() == GuardMode::Verify
 }
 
-/// Changes the guards missed (`verify_guards`), since the start.
-#[cfg(feature = "diagnostics")]
+/// Changes the guards missed, found by the safety net or by `verify`,
+/// since the start.
 static MISSED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether texture copies run under a predicate (`XTP_TEXTURE_PREDICATION`,
-/// on unless `0`).
+/// on unless `0`, `off` or `false`).
 fn predication() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XTP_TEXTURE_PREDICATION").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| env("XTP_TEXTURE_PREDICATION").is_none_or(|v| !off(&v)))
+}
+
+/// The safety net's budget in bytes a frame, as `value` (of
+/// `XTP_TEXTURE_NET`) asks: MiB, 2 by default; `0`, `off` or `false` turn
+/// the net off.
+fn net_budget_of(value: Option<&str>) -> u64 {
+    const DEFAULT_MIB: u64 = 2;
+    let mib = match value.map(str::trim) {
+        None => DEFAULT_MIB,
+        Some(v) if off(v) => 0,
+        Some(v) => v.parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(value = v, "XTP_TEXTURE_NET is not a number of MiB: 2 MiB");
+            DEFAULT_MIB
+        }),
+    };
+    mib.min(1 << 20) << 20
+}
+
+/// The safety net's budget a frame (`XTP_TEXTURE_NET`), 0 when it is off or
+/// the guards are (every check then hashes).
+fn net_budget() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let budget = net_budget_of(env("XTP_TEXTURE_NET").as_deref());
+        if guards() { budget } else { 0 }
+    })
+}
+
+/// What the safety net may still hash: a budget a frame, or a second where
+/// frames do not advance (a title that does not wait for them).
+#[derive(Debug, Default)]
+struct Allowance {
+    left: u64,
+    frame: u64,
+    given: Option<Instant>,
+}
+
+impl Allowance {
+    /// A new budget once the frame changed or a second went by since the
+    /// last one; what was left of that one is not carried over.
+    fn renew(&mut self, budget: u64, frame: u64, now: Instant) {
+        let due = self.given.is_none_or(|at| {
+            frame != self.frame || now.saturating_duration_since(at) >= Duration::from_secs(1)
+        });
+        if due {
+            *self = Allowance {
+                left: budget,
+                frame,
+                given: Some(now),
+            };
+        }
+    }
+}
+
+/// What the safety net reads and hashes at a time: a texture bigger than
+/// what is left of a budget is hashed over several.
+const NET_SLICE: usize = 256 << 10;
+
+/// The shortest time from one lap of the safety net to the next: textures
+/// that take less than its budget are not hashed again at every frame.
+const NET_LAP: Duration = Duration::from_secs(2);
+
+/// Whether the safety net may begin a lap at `now`, the last one begun at
+/// `last`.
+fn lap_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= NET_LAP)
+}
+
+/// The safety net (module doc): its budget, where its walk is, the texture
+/// it is hashing.
+#[derive(Default)]
+struct Net {
+    allowance: Allowance,
+    /// The resource it last looked at: the walk goes on after it.
+    cursor: usize,
+    /// When it last went round from the last resource to the first.
+    lap: Option<Instant>,
+    hashing: Option<Hashing>,
+    /// Room for what it reads.
+    read: Vec<u8>,
+}
+
+/// A texture the safety net is hashing: how far it got, the hash so far,
+/// and its staging buffer's writes when it began.
+struct Hashing {
+    staging: Arc<Staging>,
+    at: usize,
+    hasher: blake3::Hasher,
+    written: u64,
+}
+
+impl Hashing {
+    /// The whole memory hashed: the texture is suspect if the hash is not
+    /// that of what was detiled, unless it was detiled again meanwhile
+    /// (from a snapshot newer than some of what was hashed here).
+    fn finish(self) {
+        let hash = self.hasher.finalize();
+        let last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        if self.staging.written.load(Ordering::Acquire) == self.written && last.hash != Some(hash) {
+            self.staging.suspect.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+static NET: Mutex<Option<Net>> = Mutex::new(None);
+
+/// The safety net's bytes hashed, microseconds and laps since the last
+/// summary (diagnostics).
+static NET_SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Frames and time for the safety net's budget and laps: the title's
+/// frames and the clock, and in tests what a test adds ([`NET_LATER`]).
+fn net_clock() -> (u64, Instant) {
+    let (frame, now) = (crate::frame::current(), Instant::now());
+    #[cfg(test)]
+    let (frame, now) = {
+        let [frames, ms] = NET_LATER.each_ref().map(|a| a.load(Ordering::Relaxed));
+        (frame + frames, now + Duration::from_millis(ms))
+    };
+    (frame, now)
+}
+
+/// Frames and milliseconds tests add for the safety net: the title's frame
+/// counter is `frame`'s tests' to advance, and tests do not wait for laps.
+#[cfg(test)]
+static NET_LATER: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The safety net's turn, at a check (module doc): hashes what its budget
+/// allows of the guarded textures checked since it last hashed them, in
+/// resource order from where it stopped, a lap every [`NET_LAP`] at most,
+/// and marks suspect those whose memory no longer hashes as what was
+/// detiled.
+fn net_walk() {
+    let budget = net_budget();
+    if budget == 0 {
+        return;
+    }
+    let started = Instant::now();
+    let (frame, now) = net_clock();
+    let mut net = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let Net {
+        allowance,
+        cursor,
+        lap,
+        hashing,
+        read,
+    } = net.get_or_insert_with(Net::default);
+    allowance.renew(budget, frame, now);
+    // Textures looked at in this walk: a lap at most.
+    let mut looked = 0;
+    let mut hashed = 0;
+    while allowance.left > 0 {
+        let Some(h) = hashing else {
+            *hashing = next_sampled(cursor, &mut looked, lap, now);
+            if hashing.is_none() {
+                // Nothing left to hash, or the next lap is not due: the
+                // rest waits for the next budget.
+                allowance.left = 0;
+            }
+            continue;
+        };
+        let size = h.staging.layout.size as usize;
+        if h.at < size {
+            let n = (size - h.at).min(NET_SLICE).min(allowance.left as usize);
+            read.resize(NET_SLICE, 0);
+            // Through the kernel: the title may unmap the memory meanwhile.
+            if !crate::host::read_into(h.staging.memory.wrapping_add(h.at), &mut read[..n]) {
+                // Not all mapped: its check sees to it.
+                *hashing = None;
+                continue;
+            }
+            h.hasher.update(&read[..n]);
+            h.at += n;
+            allowance.left -= n as u64;
+            hashed += n as u64;
+        }
+        if h.at >= size
+            && let Some(done) = hashing.take()
+        {
+            done.finish();
+        }
+    }
+    NET_SEEN[0].fetch_add(hashed, Ordering::Relaxed);
+    NET_SEEN[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// The next texture after `cursor` checked through its guards since the
+/// safety net last hashed it, going round to the first resource if a lap is
+/// due (`lap`: when the last one began); `looked` counts the textures looked
+/// at, a lap at most.
+fn next_sampled(
+    cursor: &mut usize,
+    looked: &mut usize,
+    lap: &mut Option<Instant>,
+    now: Instant,
+) -> Option<Hashing> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.as_ref()?;
+    let after = map.range((Excluded(*cursor), Unbounded));
+    for (&resource, s) in after.chain(map.range(..=*cursor)) {
+        if *looked >= map.len() {
+            return None;
+        }
+        if resource <= *cursor {
+            // Round again.
+            if !lap_due(*lap, now) {
+                return None;
+            }
+            *lap = Some(now);
+            NET_SEEN[2].fetch_add(1, Ordering::Relaxed);
+        }
+        *looked += 1;
+        *cursor = resource;
+        if s.sampled.swap(false, Ordering::Relaxed) {
+            return Some(Hashing {
+                staging: s.clone(),
+                at: 0,
+                hasher: blake3::Hasher::new(),
+                written: s.written.load(Ordering::Acquire),
+            });
+        }
+    }
+    None
 }
 
 /// Predicates for texture copies: 8-byte words of one upload buffer (in a
@@ -543,10 +861,12 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all). `before_write` runs
     /// just before the staging buffer is overwritten: an earlier
-    /// submission's GPU copy may still read it.
+    /// submission's GPU copy may still read it. The safety net takes its
+    /// turn first (counted with the check).
     pub(crate) fn refresh(&self, before_write: impl FnOnce()) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
+        net_walk();
         let read = self.refresh_now(before_write);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
@@ -588,40 +908,31 @@ impl Staging {
         }
         // View memory: guarded, and hashed only after a write (or where a
         // block cannot be guarded, which every asking reports written).
+        // Whether the guards reported a write (the memory most likely
+        // changed), or found the memory clean though the safety net suspects
+        // it or `verify` asks (a change is then one they missed).
+        let (mut reported, mut unseen) = (false, false);
         if guards()
             && let Some((now, written)) = crate::watch::writes(start, start + size, true)
         {
             let clean = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
+            // A write they report is hashed below anyway.
+            let suspect = self.suspect.swap(false, Ordering::Relaxed);
             if clean {
                 #[cfg(feature = "diagnostics")]
                 self.seen.clean.fetch_add(1, Ordering::Relaxed);
-                #[cfg(feature = "diagnostics")]
-                let verify = verify_guards();
-                #[cfg(not(feature = "diagnostics"))]
-                let verify = false;
-                if !verify {
+                if !suspect && !verify_guards() {
+                    // Answered by the guards: the safety net's to hash.
+                    self.sampled.store(true, Ordering::Relaxed);
                     return 0;
                 }
-                // Verified: hashed below like an unguarded check, a change
-                // counted as missed.
-                #[cfg(feature = "diagnostics")]
-                if committed(self.memory, size) {
-                    // SAFETY: committed memory of the texture's layout size.
-                    let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-                    if last.hash.is_some_and(|h| h != blake3::hash(tiled)) {
-                        let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_power_of_two() {
-                            tracing::warn!(
-                                memory = ?self.memory,
-                                size,
-                                missed = n,
-                                "a texture changed that its guards found clean"
-                            );
-                        }
-                    }
-                }
+                unseen = true;
+            } else {
+                reported = true;
             }
+            // Hashed below: nothing for the safety net until the next check.
+            self.sampled.store(false, Ordering::Relaxed);
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -633,34 +944,72 @@ impl Staging {
             );
             return 0;
         }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        // Memory the guards report written most likely changed: its
+        // snapshot is taken at once. Otherwise it is hashed in place first,
+        // and copied only if that tells a change.
+        if !reported {
+            // SAFETY: committed memory of the texture's layout size.
+            let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+            if last.hash == Some(self.hash(tiled)) {
+                return size;
+            }
+        }
+        // Hashed and detiled from one snapshot (module doc), taken through
+        // the copy, which stands pages unmapped since the check above. The
+        // room is shared, and not held during the wait.
+        let mut snapshot = std::mem::take(&mut *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()));
+        snapshot.resize(size, 0);
+        crate::host::copy_mapped(snapshot.as_mut_ptr(), self.memory, size, false);
+        let hash = self.hash(&snapshot);
+        if last.hash != Some(hash) {
+            last.hash = Some(hash);
+            if unseen {
+                self.missed(size);
+            }
+            before_write();
+            self.detile(&snapshot);
+            self.written.fetch_add(1, Ordering::Release);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                self.seen.changed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+        size
+    }
+
+    /// The hash of `bytes`, this texture's memory or its snapshot.
+    fn hash(&self, bytes: &[u8]) -> blake3::Hash {
         #[cfg(test)]
         HASHED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(std::ptr::from_ref(self) as usize);
+            .push(self.id);
         #[cfg(feature = "diagnostics")]
         {
-            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            self.seen.hashed.fetch_add(size as u64, Ordering::Relaxed);
+            crate::copystat::add(crate::copystat::C::TexHashed, bytes.len() as u64);
+            self.seen
+                .hashed
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         }
-        if last.hash == Some(hash) {
-            return size;
+        blake3::hash(bytes)
+    }
+
+    /// A change its guards missed, found by the safety net or by `verify`:
+    /// counted, and logged the first time for this texture.
+    fn missed(&self, size: usize) {
+        let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.missed.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::warn!(
+                memory = ?self.memory,
+                size,
+                desc = ?self.layout.desc,
+                missed = n,
+                "a texture changed that its guards found clean (a writer that opens no guard): \
+                 refreshed"
+            );
         }
-        last.hash = Some(hash);
-        // A title write during the wait is detiled too; the next check sees
-        // the memory differ from the hash and detiles it again.
-        before_write();
-        self.detile(tiled);
-        self.written.fetch_add(1, Ordering::Release);
-        #[cfg(feature = "diagnostics")]
-        {
-            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-            self.seen.changed.fetch_add(1, Ordering::Relaxed);
-        }
-        size
     }
 
     /// At submission, once the staging buffer is up to date: whether a copy
@@ -769,7 +1118,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
+    let map = map.get_or_insert_with(BTreeMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }
@@ -842,6 +1191,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
         written: AtomicU64::new(0),
         copied: Mutex::new(None),
+        sampled: AtomicBool::new(false),
+        suspect: AtomicBool::new(false),
+        missed: AtomicU64::new(0),
+        #[cfg(test)]
+        id: IDS.fetch_add(1, Ordering::Relaxed),
         #[cfg(feature = "diagnostics")]
         seen: Seen::default(),
     });
@@ -851,23 +1205,27 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 /// Every few seconds (diagnostics): per frame, the textures checked, how
 /// often, the bytes hashed and the changes, the staging copies recorded and
-/// those that ran, and the textures that took most hashing.
+/// those that ran, the safety net's work, and the textures that took most
+/// hashing.
 #[cfg(feature = "diagnostics")]
 fn summary_due() {
-    static NEXT: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
-    let frames = {
+    static NEXT: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+    let (frames, seconds) = {
         let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let frame = crate::frame::current();
         match *next {
             None => {
                 *next = Some((now, frame));
                 return;
             }
-            Some((at, _)) if now.duration_since(at) < std::time::Duration::from_secs(5) => return,
-            Some((_, from)) => {
+            Some((at, _)) if now.duration_since(at) < Duration::from_secs(5) => return,
+            Some((at, from)) => {
                 *next = Some((now, frame));
-                frame.saturating_sub(from).max(1) as f64
+                (
+                    frame.saturating_sub(from).max(1) as f64,
+                    now.duration_since(at).as_secs_f64(),
+                )
             }
         }
     };
@@ -897,7 +1255,8 @@ fn summary_due() {
                 staging: s.size,
                 memory: s.memory as usize,
                 desc: format!(
-                    "{}x{}x{}, {} mips, {}-byte elements of {} texels square, {:?}, {:.2} MB in                      title memory",
+                    "{}x{}x{}, {} mips, {}-byte elements of {} texels square, {:?}, {:.2} MB in \
+                     title memory",
                     s.layout.desc.width,
                     s.layout.desc.height,
                     s.layout.desc.depth,
@@ -915,7 +1274,9 @@ fn summary_due() {
     let missed = MISSED.load(Ordering::Relaxed);
     let sum = |f: fn(&Row) -> f64| -> f64 { rows.iter().map(f).sum() };
     tracing::info!(
-        "texture checks per frame: {} textures checked {:.0} times ({:.0} again in a submission          that had checked them, {:.0} clean by their guards), {:.1} MB hashed, {:.1} changes;          staging copies {:.0} ran ({:.1} MB), {:.0} skipped ({:.1} MB); changes the guards          missed so far {missed} (verified only with XTP_TEXTURE_GUARDS=verify)",
+        "texture checks per frame: {} textures checked {:.0} times ({:.0} again in a submission \
+         that had checked them, {:.0} clean by their guards), {:.1} MB hashed, {:.1} changes; \
+         staging copies {:.0} ran ({:.1} MB), {:.0} skipped ({:.1} MB)",
         rows.len(),
         sum(|r| r.checks),
         sum(|r| r.again),
@@ -927,6 +1288,14 @@ fn summary_due() {
         skipped.0,
         skipped.1
     );
+    let [net_mb, net_ms] = [mb(take(&NET_SEEN[0])), take(&NET_SEEN[1]) / 1e3];
+    let laps = NET_SEEN[2].swap(0, Ordering::Relaxed);
+    tracing::info!(
+        "texture safety net per frame: {net_mb:.2} MB hashed in {net_ms:.2} ms (budget {:.1} MB); \
+         {laps} laps of the textures in {seconds:.1} s; changes the guards missed so far \
+         {missed}",
+        mb(net_budget() as f64)
+    );
     rows.sort_by(|a, b| {
         b.hashed_mb
             .total_cmp(&a.hashed_mb)
@@ -934,7 +1303,8 @@ fn summary_due() {
     });
     for r in rows.iter().take(12) {
         tracing::info!(
-            "  texture at {:#x} ({}, staging {:.2} MB): {:.1} checks/frame ({:.1} again, {:.1}              clean), {:.1} MB hashed, {:.2} changes",
+            "  texture at {:#x} ({}, staging {:.2} MB): {:.1} checks/frame ({:.1} again, {:.1} \
+             clean), {:.1} MB hashed, {:.2} changes",
             r.memory,
             r.desc,
             r.staging as f64 / 1e6,
@@ -956,7 +1326,7 @@ mod tests {
 
     /// The decisions made for `staging` so far, in order.
     fn decided(staging: &Arc<Staging>) -> Vec<bool> {
-        let key = Arc::as_ptr(staging) as usize;
+        let key = staging.id;
         DECIDED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1085,7 +1455,7 @@ mod tests {
 
     /// The times `staging` was hashed so far.
     fn hashes(staging: &Arc<Staging>) -> usize {
-        let key = Arc::as_ptr(staging) as usize;
+        let key = staging.id;
         HASHED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1196,7 +1566,9 @@ mod tests {
     }
 
     /// A list named twice in one submission runs its copy in both runs if
-    /// the first needs it: both read its one predicate word.
+    /// the first needs it: both read its one predicate word. Submitted
+    /// again in a later submission, nothing changed, it does not: the
+    /// submissions are counted with timestamps off too (the default here).
     #[test]
     fn a_list_named_twice_in_a_submission_copies() {
         let test = "texture::tests::a_list_named_twice_in_a_submission_copies";
@@ -1235,7 +1607,307 @@ mod tests {
             .flat_map(|y| read[y * 256..y * 256 + 64].to_vec())
             .collect();
         assert!(texels.iter().all(|&b| b == 0x77), "{:x?}", &texels[..16]);
+        // The same recording in a submission of its own, the memory as it
+        // was: told from a second run of the last one by the count.
+        host.execute(&[&list]);
+        host.drain();
+        assert_eq!(decided(&staging), [true, true, true, false]);
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+    }
+
+    #[test]
+    fn switches_turn_off_with_0_off_or_false() {
+        for v in ["0", "off", "OFF", "false", "False", " 0 "] {
+            assert!(off(v), "{v:?}");
+            assert_eq!(guard_mode_of(Some(v), true), GuardMode::Off, "{v:?}");
+            assert_eq!(net_budget_of(Some(v)), 0, "{v:?}");
+        }
+        for v in ["1", "on", "yes", "", "verify"] {
+            assert!(!off(v), "{v:?}");
+        }
+        assert_eq!(guard_mode_of(None, true), GuardMode::On);
+        assert_eq!(guard_mode_of(Some("1"), false), GuardMode::On);
+        // `verify` only where its counters are: on otherwise (and warned).
+        assert_eq!(guard_mode_of(Some("verify"), true), GuardMode::Verify);
+        assert_eq!(guard_mode_of(Some("Verify"), true), GuardMode::Verify);
+        assert_eq!(guard_mode_of(Some("verify"), false), GuardMode::On);
+        assert_eq!(net_budget_of(None), 2 << 20);
+        assert_eq!(net_budget_of(Some("8")), 8 << 20);
+        assert_eq!(net_budget_of(Some("lots")), 2 << 20);
+    }
+
+    /// The safety net's budget comes once a frame, whatever is spent of it,
+    /// and once a second where frames do not advance; its laps come two
+    /// seconds apart at least.
+    #[test]
+    fn the_net_is_given_its_budget_once_a_frame() {
+        let t0 = Instant::now();
+        let mut a = Allowance::default();
+        a.renew(100, 7, t0);
+        assert_eq!(a.left, 100);
+        a.left = 30;
+        // The same frame: what is left stays.
+        a.renew(100, 7, t0 + Duration::from_millis(500));
+        assert_eq!(a.left, 30);
+        // The next frame: a budget, not what was left on top.
+        a.renew(100, 8, t0 + Duration::from_millis(600));
+        assert_eq!(a.left, 100);
+        a.left = 0;
+        // No frame for a second: a budget all the same.
+        a.renew(100, 8, t0 + Duration::from_millis(1_500));
+        assert_eq!(a.left, 0);
+        a.renew(100, 8, t0 + Duration::from_millis(1_600));
+        assert_eq!(a.left, 100);
+        // Laps: the first at once, the next one not before `NET_LAP`.
+        assert!(lap_due(None, t0));
+        assert!(!lap_due(Some(t0), t0 + NET_LAP / 2));
+        assert!(lap_due(Some(t0), t0 + NET_LAP));
+    }
+
+    /// The next frame for the safety net, a lap after the last.
+    fn net_next_frame() {
+        NET_LATER[0].fetch_add(1, Ordering::Relaxed);
+        NET_LATER[1].fetch_add(NET_LAP.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Two read-write views of one fresh pagefile section of `len` bytes:
+    /// the title's and a writer's own (as xmem's is).
+    fn section_views(len: usize) -> (usize, usize) {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+        };
+        // SAFETY: a fresh pagefile section mapped twice, read-write.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            let other = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            assert!(view != 0 && other != 0);
+            (view, other)
+        }
+    }
+
+    /// What the safety net's work costs a frame, out of the game: its
+    /// budget read through the kernel a slice at a time and hashed, over a
+    /// 64 MiB view (more than the CPU's caches, as the title's texture pool
+    /// is), against hashing it in place; and a check's snapshot (copied,
+    /// then hashed) against the hash in place it replaces where the guards
+    /// report a write. Best of three passes. Run with
+    /// `cargo test --release -p xtp-gpu -- --ignored --nocapture net_costs`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn net_costs() {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        const LEN: usize = 64 << 20;
+        let (view, other) = section_views(LEN);
+        // SAFETY: the view, `LEN` bytes, ours alone.
+        let memory = unsafe { std::slice::from_raw_parts_mut(view as *mut u8, LEN) };
+        for (i, b) in memory.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(2_654_435_761) >> 13) as u8;
+        }
+        let budget = net_budget_of(None) as usize;
+        let rounds = LEN / budget;
+        // Milliseconds per budget's bytes, the best of three passes over
+        // the view.
+        let time = |f: &mut dyn FnMut(usize)| -> f64 {
+            (0..3)
+                .map(|_| {
+                    let started = Instant::now();
+                    for r in 0..rounds {
+                        f(view + r * budget);
+                    }
+                    started.elapsed().as_secs_f64() * 1e3 / rounds as f64
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let mut read = vec![0u8; NET_SLICE];
+        let net = time(&mut |at| {
+            let mut hasher = blake3::Hasher::new();
+            for off in (0..budget).step_by(NET_SLICE) {
+                assert!(crate::host::read_into((at + off) as *const u8, &mut read));
+                hasher.update(&read);
+            }
+            std::hint::black_box(hasher.finalize());
+        });
+        let in_place = time(&mut |at| {
+            // SAFETY: inside the view.
+            let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, budget) };
+            std::hint::black_box(blake3::hash(bytes));
+        });
+        let mut snapshot = vec![0u8; budget];
+        let snap = time(&mut |at| {
+            crate::host::copy_mapped(snapshot.as_mut_ptr(), at as *const u8, budget, false);
+            std::hint::black_box(blake3::hash(&snapshot));
+        });
+        eprintln!(
+            "texture safety net, per {} MiB (its budget a frame): {net:.3} ms read through the \
+             kernel and hashed ({:.0} MB/s), {in_place:.3} ms hashed in place; a check's \
+             snapshot, copied and hashed: {snap:.3} ms",
+            budget >> 20,
+            budget as f64 / 1e3 / net
+        );
+        for at in [view, other] {
+            // SAFETY: views mapped above, not used after.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut _,
+                })
+            };
+        }
+    }
+
+    /// A title texture over the title's view `view`, once its host copy is
+    /// resident.
+    fn texture_in(view: usize) -> (This, &'static ID3D12Resource) {
+        let resource =
+            crate::resource::tests_support::at_address(view as u64, &sampled(16, 16, 28));
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                return (resource, texture);
+            }
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "the host copy never became resident"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// The first rows of `texture` (16x16, 4 bytes a texel), as the host
+    /// copy holds them.
+    fn texels_of(host: &crate::host::Host, texture: &ID3D12Resource) -> Vec<u8> {
+        let read = read_back(host, texture, COPY_DEST);
+        (0..16)
+            .flat_map(|y| read[y * 256..y * 256 + 64].to_vec())
+            .collect()
+    }
+
+    /// A check hashes the memory it detiles: the title writing during the
+    /// wait for an earlier copy, then writing back the bytes that were
+    /// there, leaves the host copy with what the memory holds (the hash
+    /// taken before the wait matched the bytes written back, and the
+    /// staging buffer kept the write made during it).
+    #[test]
+    fn a_texture_is_hashed_as_it_is_detiled() {
+        let test = "texture::tests::a_texture_is_hashed_as_it_is_detiled";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !guards() || !predication() {
+            return;
+        }
+        let _serial = crate::watch::tests::serial();
+        const LEN: usize = 64 << 10;
+        let (view, other) = section_views(LEN);
+        let (resource, texture) = texture_in(view);
+        let staging = staging(resource, texture).unwrap();
+        let size = staging.layout.size as usize;
+        assert!(size <= LEN);
+        // SAFETY: bytes of the title's view, as its CPU writes them (a
+        // fault into the guards' handler where guarded).
+        let fill = |byte: u8| unsafe { (view as *mut u8).write_bytes(byte, size) };
+
+        fill(0x11);
+        sample_in(host, resource, 1);
+        assert!(texels_of(host, texture).iter().all(|&b| b == 0x11));
+
+        // Written: the next check hashes and detiles, and while it waits
+        // for an earlier copy the title writes again.
+        fill(0x22);
+        staging.refresh(|| fill(0x33));
+        // Then writes back what the check took.
+        fill(0x22);
+        sample_in(host, resource, 1);
+        let texels = texels_of(host, texture);
+        assert!(texels.iter().all(|&b| b == 0x22), "{:x?}", &texels[..16]);
+        assert_eq!(host.log_messages(), None);
+
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+        // As in `a_texture_in_a_view_is_hashed_only_after_a_write`.
+        crate::watch::title_memory_remapped(view, LEN);
+        let _ = other;
+    }
+
+    /// A write no guard sees (through another view of the title's pages,
+    /// which nothing guards nor reports) is found by the safety net within
+    /// a frame's budget: the texture is refreshed at the check after its
+    /// walk, the change counted and logged as missed, and found clean again
+    /// after.
+    #[test]
+    fn a_write_no_guard_saw_is_found_by_the_safety_net() {
+        let test = "texture::tests::a_write_no_guard_saw_is_found_by_the_safety_net";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !guards() || !predication() || net_budget() == 0 {
+            return;
+        }
+        let _serial = crate::watch::tests::serial();
+        const LEN: usize = 64 << 10;
+        let (view, other) = section_views(LEN);
+        let (resource, texture) = texture_in(view);
+        let staging = staging(resource, texture).unwrap();
+        let size = staging.layout.size as usize;
+        // The budget covers it: what it hashes is the guarded textures
+        // checked since, and the other tests' that guard textures take the
+        // same lock as this one.
+        assert!(size as u64 <= net_budget());
+        // SAFETY: bytes of the title's view, or the other one, `size` of
+        // them.
+        let fill = |at: usize, byte: u8| unsafe { (at as *mut u8).write_bytes(byte, size) };
+
+        fill(view, 0x44);
+        sample_in(host, resource, 1);
+        assert!(texels_of(host, texture).iter().all(|&b| b == 0x44));
+        // Clean: no hash at the check.
+        let hashed = hashes(&staging);
+        sample_in(host, resource, 1);
+        assert_eq!(hashes(&staging), hashed);
+
+        // Through the other view, reported to no one.
+        fill(other, 0x99);
+        let missed = MISSED.load(Ordering::Relaxed);
+        // Each check in a frame of its own a lap after the last, the net's
+        // budget given anew. The walk at a check hashes the texture if a
+        // check found it clean
+        // since the net last hashed it: the last one did, unless another
+        // test's walk (every check walks) hashed it before the write; then
+        // this check finds it clean and the next walk hashes it. Changed,
+        // it is refreshed by the check that walk comes before.
+        let mut frames = 0;
+        while !texels_of(host, texture).iter().all(|&b| b == 0x99) {
+            frames += 1;
+            assert!(frames <= 2, "not refreshed in {} frames", frames - 1);
+            net_next_frame();
+            sample_in(host, resource, 1);
+        }
+        assert_eq!(staging.missed.load(Ordering::Relaxed), 1);
+        assert!(MISSED.load(Ordering::Relaxed) > missed);
+        assert_eq!(decided(&staging).last(), Some(&true));
+
+        // Hashed again by the net, it is not suspect: its checks stay clean.
+        let hashed = hashes(&staging);
+        for _ in 0..2 {
+            net_next_frame();
+            sample_in(host, resource, 1);
+        }
+        assert_eq!(hashes(&staging), hashed);
+        assert_eq!(staging.missed.load(Ordering::Relaxed), 1);
+        assert_eq!(host.log_messages(), None);
+
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+        crate::watch::title_memory_remapped(view, LEN);
     }
 }
