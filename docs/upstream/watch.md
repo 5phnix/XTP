@@ -74,7 +74,7 @@ the findings of today it bears on:
 |---|---|
 | STALL | The world-load stall. Past about 9.5 GB resident on this PC, VidMm admits one resident allocation per 0.5–2 s, and XTP makes one per host texture ([stall.md](../analysis/stall.md)). The fix in progress is pooled heaps made ahead of need: task tex-pool (450ec9ba), with `docs/analysis/vram.md` on its branch. |
 | VRAM | XTP holds 8.1 GB of host textures by the stall; the PC's VidMm threshold is about 9.5 GB. |
-| W64 | NVIDIA and wave64. Wave64 mesh programs hang NVIDIA and are refused by default (#578, `XTP_WAVE64_MESH=allow`). The GPU half of the stack's wiring was reverted at 16:18 UTC (`4394656`). |
+| W64 | NVIDIA and wave64. Wave64 mesh programs hang NVIDIA and are refused by default (#578, `XTP_WAVE64_MESH=allow`). The GPU half of the stack's wiring was reverted at 16:18 UTC (`4394656`), then reapplied (`5eb9213`). |
 | DRAWS | The world frame runs at 0.2–0.4 fps with only 1–7 draws per frame. |
 | SS | Series S mode (`--console series-s`). #211's planes are in XTP. |
 
@@ -152,7 +152,7 @@ Ideas only, unless the licence column says otherwise.
 
 - **Landed in XTP since pass 1:**
   - the wave64 stack, item 1 (`2d978f7`, `0b85474`, `d01bc62`). Its GPU
-    wiring was reverted at 16:18 UTC (`4394656`);
+    wiring was reverted at 16:18 UTC (`4394656`), then reapplied (`5eb9213`);
   - #578, item 2 (`575d721`). Wave64 mesh programs are refused by default
     again since `2c65877`;
   - #493, item 3 (`bdd0091`);
