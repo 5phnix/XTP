@@ -2,8 +2,9 @@
 
 How to read where a world frame goes, from the frame-rate line the GPU layer
 logs (backlog G2 in [gpu.md](gpu.md) §7), and what the first ordering fixes
-(G3, G4) change in it. The run-analysis worker fills in section 6 from world
-runs; everything else here is what each number means.
+(G3, G4) and asynchronous submission (G8) change in it. The run-analysis
+worker fills in section 6 from world runs; everything else here is what each
+number means.
 
 ## 1. The frame-rate line
 
@@ -11,8 +12,9 @@ runs; everything else here is what each number means.
 
 ```
 1.2 fps, 866.8 ms/frame (505.0 preparing: copies 340.2 ms 273.9 MB, textures
-23.9 ms 133.6 MB; 193.2 on the GPU; 156.7 copying back 7.8 MB; {outside}
-outside submissions), {submissions} submissions/frame of {lists} lists, the
+23.9 ms 133.6 MB; 193.2 on the GPU; 156.7 copying back 7.8 MB; {waiting}
+waiting for them, {overlap} overlapped; {outside} outside submissions),
+{submissions} submissions/frame of {lists} lists, the
 longest {ms} ms ({gpu ms} on the GPU, {lists} lists), buffer copies {n} on the
 GPU {MB} MB and {n} on the CPU {MB} MB, {n} in-list writes on the GPU, 2644
 draws/frame, dropped 2215 without a host pipeline (0 being made) and 3046
@@ -29,21 +31,31 @@ averages.
 | Field | What it counts | Where |
 |---|---|---|
 | `fps`, `ms/frame` | Presented frames per second, and wall time per frame. | `Meter::frame` |
-| `preparing` | CPU time from the start of each submission until its lists go to the host queue: the submission-time steps of every list (title memory copied into host copies, copies made on the CPU, texture refreshes, snapshots of shader-written ranges) and the state preludes. | `Host::execute` |
+| `preparing` | CPU time from the start of each submission until its lists go to the host queue: the submission-time steps of every list (title memory copies into host copies, copies made on the CPU, texture refreshes, snapshots of shader-written ranges) and the state preludes. Since G8, without the waits for earlier submissions inside it (those count in `waiting`). | `Host::run_as` |
 | `copies … ms … MB` | Of `preparing`: copies of title memory, meaning refreshes of host copies (merged per submission), buffer copies left on the CPU, and fills of upload memory. Time and bytes actually copied. | `run_deferred`, `Batch::flush` |
 | `textures … ms … MB` | Of `preparing`: texture refreshes (bytes hashed or detiled). | `texture.rs` |
-| `on the GPU` | From handing the lists to the queue until the fence completes. Every submission is waited for, so this is the GPU's whole time, idle gaps between submissions included. | `Host::execute` |
-| `copying back … MB` | After the GPU: GPU copy destinations written back whole (G3), then shader-written ranges compared with their snapshot and written back where they differ. Time, and bytes written into title memory. | `Shadow::write_back`, `Shadow::copy_back` |
-| `outside submissions` | `ms/frame` minus `preparing`, `on the GPU` and `copying back`, never below 0. It is the time no submission is in progress: the title's own CPU work, the recording of lists (including pipeline waits, up to 500 ms per title frame), and presentation. | `outside` |
-| `submissions/frame of … lists` | Title submissions (one per `ExecuteCommandLists`) per frame, and lists per submission on average. The present copy, ours, is not counted. Each submission runs alone and is waited for. | `Host::submit` |
-| `the longest … ms (… on the GPU, … lists)` | The title submission that took longest in all (preparing, GPU, copying back) in the window, with its GPU part and its lists. Windows resets the device at about 2 s of GPU time in one submission. | `Submissions` |
+| `on the GPU` | Per submission, from its submission (or the end of the one before it, if later) until it was seen done: the GPU's busy time, idle gaps left out. Seen done means its fence value was found reached when finishing started, so a completion thread busy copying back the one before makes it a little longer. | `Host::complete` |
+| `copying back … MB` | After the GPU: GPU copy destinations written back whole (G3), then shader-written ranges compared with their snapshot and written back where they differ. Time, and bytes written into title memory. Since G8 mostly on the completion thread (`xtp-gpu-finisher`), beside the title. | `Shadow::write_back`, `Shadow::copy_back` |
+| `waiting for them` | Time the title's threads spent held by submissions they did not prepare: waiting for the host GPU, or for a submission to be finished (by the completion thread or themselves: copying back, bottom-of-pipe writes). A step that touches memory an earlier submission's GPU work writes waits for it; so do the present (it drains the frame), a list submitted again while it runs, page mappings and more than 16 submissions in flight. | `Host::waiting` |
+| `overlapped` | `on the GPU` plus `copying back` minus `waiting`, never below 0: the GPU's work and the copying back that ran while the title's threads did something else. About 0 when every submission is waited for (`XTP_SYNC_SUBMIT=1`). | `overlapped` |
+| `outside submissions` | `ms/frame` minus `preparing` and `waiting`, never below 0. It is the time the title's threads spend outside submissions: the title's own CPU work, the recording of lists (including pipeline waits, up to 500 ms per title frame), and presentation. | `outside` |
+| `submissions/frame of … lists` | Title submissions (one per `ExecuteCommandLists`) per frame, and lists per submission on average. The present copy, ours, is not counted. | `Host::submit` |
+| `the longest … ms (… on the GPU, … lists)` | The title submission that took longest in all (preparing, GPU, copying back) in the window, with its GPU part and its lists. Windows resets the device at about 2 s of GPU time in one submission. Counted when it finishes. | `Submissions` |
 | `buffer copies … on the GPU … MB` | `CopyBufferRegion`, buffer `CopyResource` and `CopyMemoryToMemoryX` recorded as host GPU copies, in list order (G3). They are counted per submission they run in. | `shadow::copy` |
 | `… on the CPU … MB` | The buffer copies left on the CPU, made at submission because neither side had a host copy. | `Step::Copy`, `copy_memory` |
 | `in-list writes on the GPU` | Bottom-of-pipe writes (`Write32/64BitValueBottomOfPipeX`, query results) also written into their host copy on the GPU at their place in the list (G4). The CPU still writes title memory once the list has run. | `shadow::write` |
 | `draws/frame`, `dropped …`, `indirect` | As before: draws recorded, draws without a host pipeline (pipelines still being made in brackets), indirect executions not run. | `draw.rs`, `list.rs` |
 
-`preparing`, `on the GPU` and `copying back` include our present copy (one
-small submission per frame).
+`preparing`, `on the GPU`, `copying back` and `waiting` include our present
+copy (one small submission per frame).
+
+Two sums hold: `preparing` + `waiting` + `outside` = `ms/frame` (what the
+title's threads do), and `on the GPU` + `copying back` = `waiting` +
+`overlapped` (where the GPU's work and the copying back went). With
+`XTP_SYNC_SUBMIT=1` every submission is waited for, as before G8: `waiting`
+is then `on the GPU` plus `copying back` and `overlapped` about 0, and the
+line reads as it did. A run with and one without it compares the two
+models.
 
 ## 2. Reading it: which cause of gpu.md §6.2 dominates
 
@@ -51,17 +63,19 @@ small submission per frame).
    title's own work. If `outside` is large while `being made` is not 0, the
    waits are likely. A second run with a warm pipeline library separates them.
    The line has no column of its own (section 7).
-2. **Serial submission.** `submissions/frame` multiplied by the fixed cost of a
-   submission (one full GPU drain and one CPU preparation each). Many
-   submissions with few lists and a small `longest` point to G8
-   (asynchronous submission).
+2. **Serial submission.** Since G8 the GPU and the copying back run beside
+   the title's threads; what is still serial is `waiting`. A large `waiting`
+   against a small `overlapped` means steps wait for the submissions before
+   them (diagnostics builds name none yet), or the present drains a frame
+   whose GPU work is long.
 3. **CPU work around each submission.** `preparing` plus `copying back`. Where
    `copies` dominates `preparing`, the diagnostics copy line (section 4) says
    whether refreshes, watches or small copies take it.
 4. **GPU time.** `on the GPU`, and `longest` for the danger of a device reset.
    `XTP_GPU_TIMING` (diagnostics builds) names the slowest commands.
 
-The four parts add up to `ms/frame`. The largest one is the cause to fix first.
+`preparing`, `waiting` and `outside` add up to `ms/frame`. The largest one is
+the cause to fix first.
 
 ## 3. What G3 and G4 change
 
@@ -77,6 +91,25 @@ The four parts add up to `ms/frame`. The largest one is the cause to fix first.
   list, so later commands of the same list read it.
 - Before this change there was no counter of copies or writes. Earlier runs
   show none of these fields.
+
+### What G8 changes (asynchronous submission, VIctory #595)
+
+- A submission no longer waits for the GPU: it signals the host fence and
+  returns. The completion thread `xtp-gpu-finisher` finishes submissions in
+  order once the GPU has run them: write-back, then bottom-of-pipe writes,
+  then the title fence signals queued behind them. So `on the GPU` and
+  `copying back` no longer add to the frame; `waiting` and `overlapped` say
+  how much of them the title still waits for.
+- Lines before G8 have no `waiting` or `overlapped`. There, `on the GPU` was
+  the time waited for the GPU and `outside` was `ms/frame` minus `preparing`,
+  `on the GPU` and `copying back`. Since G8 `preparing` leaves out the waits
+  inside it, which VIctory's own numbers for #595 (241 ms preparing per world
+  frame) did not.
+- The present still drains the frame, so the GPU's work overlaps the title's
+  CPU work within a frame only.
+- `XTP_SYNC_SUBMIT=1` brings back the old model (every submission waited for
+  and finished in `execute`, no completion thread), to bisect a failure the
+  asynchronous one may cause (gpu.md, risk 2).
 
 ## 4. The diagnostics copy line
 
