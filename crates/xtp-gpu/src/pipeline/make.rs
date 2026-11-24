@@ -416,8 +416,8 @@ const MAX_WORKERS: usize = 16;
 fn workers() -> usize {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     *WORKERS.get_or_init(|| {
-        let wanted = std::thread::available_parallelism()
-            .map_or(2, |n| (n.get() / 2).clamp(2, MAX_WORKERS));
+        let wanted =
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, MAX_WORKERS));
         tracing::info!(workers = wanted, "pipeline workers");
         (0..wanted)
             .filter(|&i| {
