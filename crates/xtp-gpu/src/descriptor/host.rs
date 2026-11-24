@@ -1455,8 +1455,13 @@ impl HostHeap {
     /// it reads when it runs (no used-resource entry names them, so no
     /// draw's table made their views: they were null views, read as zeros;
     /// VIctory #71, watch.md item 170). `start` is the title heap's first
-    /// descriptor. Made at most once a frame per heap: views the title
-    /// writes later in the frame wait for the next one.
+    /// descriptor. Made at most once a frame per heap, by the first list of
+    /// the frame that asks (none for the others: `None`): views the title
+    /// writes later in the frame, and what it writes in their memory, wait
+    /// for the next one. Title memory that is not write-watched is copied
+    /// whole by each refresh, which per list made the pass cost seconds a
+    /// frame (fxceless's VIctory fork, 578d459: 18 s a frame per list,
+    /// some 30 ms once a frame).
     ///
     /// The approach of Marvisak/VIctory#1544 (n-romanovich): views written
     /// by the title made before a draw that reads the heap directly, their
@@ -1465,13 +1470,11 @@ impl HostHeap {
     /// the heap), the spans are merged per host copy, and the views go
     /// through the checks a host view must pass (`fit_view`), so that a bad
     /// record makes a null view rather than remove the device.
-    pub(crate) fn picked_spans(&self, start: u64) -> Arc<Picked> {
+    pub(crate) fn picked_spans(&self, start: u64) -> Option<Arc<Picked>> {
         let frame = crate::frame::current();
         let mut picked = self.picked.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, p)) = &*picked
-            && *at == frame
-        {
-            return p.clone();
+        if picked.as_ref().is_some_and(|(at, _)| *at == frame) {
+            return None;
         }
         let started = std::time::Instant::now();
         let waiting = {
@@ -1555,7 +1558,7 @@ impl HostHeap {
             );
         }
         *picked = Some((frame, p.clone()));
-        p
+        Some(p)
     }
 
     /// Title slots whose buffer view waits for a pass (tests).
@@ -1688,6 +1691,20 @@ fn fit_view(
         );
         return None;
     }
+    if raw && !first.is_multiple_of(4) {
+        // shortcut: the host wants raw views on 16 bytes; such a view is
+        // made as before, counted (fxceless's VIctory fork's buffer_view_ok
+        // refuses it).
+        static OFF: AtomicU64 = AtomicU64::new(0);
+        let n = OFF.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(
+                count = n,
+                first,
+                "a raw buffer view off 16 bytes of its host copy"
+            );
+        }
+    }
     let typeless = crate::resource::family_members(format).is_some();
     if stride == 0 && !raw && typeless {
         once!(format, "a typeless buffer view without the raw flag: null");
@@ -1751,6 +1768,7 @@ fn buffer_srv(
             unordered: false,
         });
     }
+    repair_format(&mut desc.Format, shape);
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1758,6 +1776,19 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
+}
+
+/// The format the host wants for a buffer view of `shape` (stride, format,
+/// raw): R32 typeless for a raw view, none for a structured one; the
+/// title's otherwise. The console reads the same bytes whatever format a
+/// raw or structured view names; the host refuses another (the checks of
+/// fxceless's VIctory fork's buffer_view_ok, 578d459).
+fn repair_format(format: &mut DXGI_FORMAT, (stride, _, raw): (u32, u32, bool)) {
+    if raw {
+        *format = DXGI_FORMAT_R32_TYPELESS;
+    } else if stride > 0 {
+        *format = DXGI_FORMAT_UNKNOWN;
+    }
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1815,6 +1846,7 @@ fn buffer_uav(
             unordered: true,
         });
     }
+    repair_format(&mut desc.Format, shape);
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {

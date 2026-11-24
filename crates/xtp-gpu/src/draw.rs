@@ -1072,11 +1072,12 @@ impl State {
 
     /// For shaders that pick buffer slots of the view heap when they run
     /// (`name`: the pipeline's): every buffer view the title wrote in the
-    /// heap set on the host list made (once a frame, within a budget:
-    /// [`crate::descriptor::host::HostHeap::picked_spans`]) and, once a
-    /// recording, the title memory they read brought up to date at its
-    /// submission. Ported from Marvisak/VIctory#1544 (head 78fd990) by
-    /// n-romanovich; see `picked_spans` for what changed.
+    /// heap set on the host list made and the title memory they read
+    /// brought up to date at the submission of the frame's first list that
+    /// asks (within a budget: [`crate::descriptor::host::HostHeap::picked_spans`]).
+    /// Ported from Marvisak/VIctory#1544 (head 78fd990) by n-romanovich, and
+    /// once a frame from fxceless's VIctory fork's heap_buffers (578d459);
+    /// see `picked_spans` for what changed.
     /// shortcut: what shaders write through such views stays in the host
     /// copies (as for every directly indexed view): declaring every
     /// unordered view of the heap written, once a recording, copied tens of
@@ -1099,8 +1100,11 @@ impl State {
         let Some(host) = title.host() else {
             return;
         };
-        for (copy, from, to) in &host.picked_spans(title.start).reads {
-            copy.refresh(list, *from, to - from);
+        // Once a frame, by the first list that asks (`picked_spans`).
+        if let Some(picked) = host.picked_spans(title.start) {
+            for (copy, from, to) in &picked.reads {
+                copy.refresh(list, *from, to - from);
+            }
         }
     }
 
