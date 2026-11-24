@@ -605,6 +605,47 @@ fn wave64_mesh_reads_draw_the_console_waves_values() {
     );
 }
 
+/// The loop limit's drain (`lower/flow.rs`: lanes the limit ends keep
+/// passing group barriers) on mesh programs. Its counts of ended threads
+/// are group-shared memory of their own, which the mesh PSV must count
+/// with the program's LDS (dxil.dll checks it, [`translate`]): with
+/// 64-lane waves the program below drains. A wave64 mesh program in halves
+/// on a host without 64-lane waves does not: its first-lane exchanges add
+/// barriers that no block counts (a debug assertion of the drain). The
+/// program reads a lane's value from the first lane (an exchange on 32-lane
+/// hosts), then runs the loop of [`lds_order_within_a_console_wave`]:
+/// write, barrier, read, barrier.
+#[test]
+fn the_loop_limit_drain_of_mesh_programs() {
+    let words = [
+        LANE[0],
+        LANE[1],
+        0x7E0A_0500, // v_readfirstlane_b32 s5, v0
+        0xBE84_0380, // s_mov_b32 s4, 0
+        DS_WRITE[0], // loop: ds_write_b32 v0, v1
+        DS_WRITE[1],
+        S_BARRIER,
+        DS_READ[0], // ds_read_b32 v2, v0
+        DS_READ[1],
+        S_BARRIER,
+        0x8104_8104, // s_add_i32 s4, s4, 1
+        0xBF0A_8404, // s_cmp_lt_u32 s4, 4
+        0xBF85_FFF7, // s_cbranch_scc1 loop
+        V_MOV_V9_S5,
+    ];
+    let p = mesh(&words, 128, 256);
+    let text: Vec<String> = crate::gfx10::decode(&p.code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect();
+    assert_eq!(text[9], "s_cbranch_scc1 label_0010", "{text:#?}");
+    let (_, ops) = translate(&p, &empty(), NVIDIA).unwrap();
+    assert!(!ops.contains("waveReadLaneFirst"), "an exchange: {ops}");
+    let (_, ops) = translate(&p, &empty(), RDNA).unwrap();
+    assert!(ops.contains("waveReadLaneFirst"), "{ops}");
+}
+
 /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
 const TRIANGLE: u32 = 1 << 10 | 2 << 20;
 /// The corners' edge flags (bits 9, 19 and 29).

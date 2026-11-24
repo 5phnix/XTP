@@ -53,7 +53,7 @@ pub(super) const MESH_FIRST_LANE: Why = "a first-lane read of a value lanes may 
 pub(super) const MESH_NO_ROOM: Why = "LDS that leaves no room for the first-lane reads of a wave64 mesh program, on a host without 64-lane waves";
 
 /// D3D12's limit on a mesh shader's group-shared memory (28 KiB).
-const MESH_LDS_DWORDS: u32 = 28 * 1024 / 4;
+pub(super) const MESH_LDS_DWORDS: u32 = 28 * 1024 / 4;
 
 /// A wave64 mesh program's group barrier in a block that lanes of the group
 /// reach differently (or a different number of times), on a host without
