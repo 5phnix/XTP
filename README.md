@@ -156,7 +156,10 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_SKIP_INTRO=1` | every build: cuts the intro movie of the start-up front end (sent to its last frame when it starts), so the world starts loading about 13 s sooner (docs/analysis/intro-skip.md); known builds only (1.0.2.1), otherwise a warning and nothing changed |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+title's data folder. The loader also prints the first 16 title C++ throws
+(decorated type name, readable MSVC `std::exception` message and title
+`module+rva`) to stderr,
+and maps legacy debugger thread names to Windows thread descriptions.
 
 ## Contributing
 
