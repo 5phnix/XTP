@@ -2538,8 +2538,23 @@ struct Presenter {
     meter: Meter,
 }
 
+/// How often the frame-rate line is logged: every 5 s, or every
+/// `XTP_FRAME_LINE` seconds (1 to 60). Each line gives the last second or
+/// so; with 1, every second of a short world is in the log (a Series S
+/// world lasts a few seconds before the title's crash, task 36f1e12d).
+fn line_every() -> std::time::Duration {
+    static EVERY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let seconds = std::env::var("XTP_FRAME_LINE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(5, |s| s.clamp(1, 60));
+        std::time::Duration::from_secs(seconds)
+    })
+}
+
 /// The frame rate, shown in the window's caption every second and logged
-/// every few seconds.
+/// every few seconds ([`line_every`]).
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -2616,7 +2631,7 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
