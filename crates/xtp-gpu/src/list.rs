@@ -2420,5 +2420,79 @@ mod tests {
                 .collect();
             assert_eq!(buffer.words(), want);
         }
+
+        /// Clears of typed buffer views whose channels are narrower than
+        /// the values. An integer clear keeps the low bits of each value
+        /// (D3D's rule, which WARP follows; the L4's driver saturated them,
+        /// docs/analysis/hardware-tests.md). A float clear converts as
+        /// D3D's float-to-normalized rules say: NaN gives 0, the rest is
+        /// clamped, then rounded.
+        #[test]
+        fn uav_clears_of_typed_buffers_write_the_documented_bits() {
+            let test = "list::tests::gpu::uav_clears_of_typed_buffers_write_the_documented_bits";
+            if device(test).is_none() {
+                return;
+            }
+            const BUFFER: u32 = 1;
+            // (view format, values, the word each of the 4 elements holds)
+            let uint: [(u32, [u32; 4], u32); 7] = [
+                // R8G8B8A8_UNORM
+                (28, [1, 2, 3, 0x104], 0x0403_0201),
+                // R8G8B8A8_UINT
+                (30, [0x1ff, 0x80, 0x1234_5678, 7], 0x0778_80ff),
+                // R8G8B8A8_SINT: -128, 383, 128, -1
+                (32, [0xffff_ff80, 0x17f, 0x80, u32::MAX], 0xff80_7f80),
+                // R16G16_UINT
+                (36, [0x1_2345, 0xffff_0001, 0, 0], 0x0001_2345),
+                // R16G16_SINT
+                (38, [0x1_8000, 0xffff_fffe, 0, 0], 0xfffe_8000),
+                // R10G10B10A2_UINT
+                (25, [0x401, 0x3ff, 0x7ff, 5], 0x7fff_fc01),
+                // R32_UINT
+                (42, [0xc1ea_0000, 0, 0, 0], 0xc1ea_0000),
+            ];
+            let float: [(u32, [f32; 4], u32); 2] = [
+                // R8G8B8A8_UNORM: 0, 255, 0, 63.75 rounded
+                (28, [-0.5, 1.5, f32::NAN, 0.25], 0x4000_ff00),
+                // R8G8B8A8_SNORM: -127, 127, 0, -31.75 rounded
+                (31, [-2.0, 2.0, f32::NAN, -0.25], 0xe000_7f81),
+            ];
+            let buffer = TitleBuffer::new(256);
+            let heap = crate::descriptor::TestHeap::views(4);
+            let list = TitleList::new();
+            // Case i clears elements 4i to 4i + 3, through a view of its own.
+            let mut slots = vec![[0u64; 4]; uint.len() + float.len()];
+            let mut cases = slots.iter_mut().enumerate();
+            let mut handles = |format: u32| {
+                let (i, slot) = cases.next().expect("a slot per case");
+                let view = [format, BUFFER, 4 * i as u32, 0, 4, 0, 0, 0, 0, 0];
+                console_handles(buffer.resource(), Some(&view), slot, &heap)
+            };
+            let null = std::ptr::null();
+            for (format, values, _) in &uint {
+                let (gpu, cpu) = handles(*format);
+                clear_uav_uint(list.this(), gpu, cpu, buffer.resource(), values, 0, null);
+            }
+            for (format, values, _) in &float {
+                let (gpu, cpu) = handles(*format);
+                clear_uav_float(list.this(), gpu, cpu, buffer.resource(), values, 0, null);
+            }
+            list.run();
+            let words = buffer.words();
+            let cases = uint
+                .iter()
+                .map(|&(f, _, w)| (f, "uint", w))
+                .chain(float.iter().map(|&(f, _, w)| (f, "float", w)));
+            let wrong: Vec<String> = cases
+                .enumerate()
+                .filter_map(|(i, (format, kind, want))| {
+                    let got = &words[4 * i..4 * i + 4];
+                    (got != [want; 4]).then(|| {
+                        format!("format {format} ({kind}): {got:08x?}, want {want:08x}")
+                    })
+                })
+                .collect();
+            assert!(wrong.is_empty(), "{}", wrong.join("; "));
+        }
     }
 }
