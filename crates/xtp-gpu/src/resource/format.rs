@@ -18,11 +18,24 @@
 //!    ([`refusal`]); otherwise no driver call is made, and the refusal is
 //!    counted by reason for the frame log.
 //!
+//! A stand-in with an alpha channel the title's format lacks (R9G9B9E5 as
+//! RGBA16F, B5G6R5 as RGBA8, [`alpha_one`]) reads alpha as one, as the
+//! console does: shader views force it to one.
+//!
+//! shortcut: pipelines rendering to such a target still write its alpha and
+//! blend with it (the console's destination alpha reads one); the fix,
+//! moved out of the dark-world delivery, belongs to `pipeline/host.rs`.
+//!
 //! shortcut: a stand-in has more precision than the console's format, so
 //! what a pass renders keeps bits the console would round away (B5G5R5A1's
-//! one-bit alpha keeps its fraction; B5G6R5, which has no alpha, keeps the
-//! alpha written). Typed buffer views of a replaced format are replaced too,
-//! with the stand-in's element size.
+//! one-bit alpha keeps its fraction). R9G9B9E5 holds no negative, infinite
+//! or NaN value and its writes clamp them; RGBA16F keeps them, so a pass
+//! writing one passes it on (to bloom or temporal passes, say) where the
+//! console reads 0: clamping needs the pixel and compute programs to clamp
+//! their outputs to such targets (a shader translation change). Unordered
+//! access views cannot remap alpha: a typed load of such a texture reads
+//! the stored alpha. Typed buffer views of a replaced format are replaced
+//! too, with the stand-in's element size.
 
 /// `D3D12_FORMAT_SUPPORT1` bits.
 pub(crate) mod uses {
@@ -262,6 +275,26 @@ pub(crate) const TABLE: [Entry; 9] = [
         stand_in: None,
     },
 ];
+
+/// Whether title format `title` has no alpha while the host's format for
+/// it does: R9G9B9E5 and B5G6R5 where they stand in. The console reads such
+/// a format's alpha as one.
+pub(crate) fn alpha_one(title: u32) -> bool {
+    matches!(title, 67 | 85) && matches!(HostCaps.choice(title), Some(Choice::StandIn(..)))
+}
+
+/// A view's `Shader4ComponentMapping` with every component that reads the
+/// texture's alpha reading one instead (D3D12's encoding: three bits per
+/// component, 3 the source alpha, 5 the value one).
+pub(crate) fn mapping_alpha_one(mapping: u32) -> u32 {
+    const ALWAYS: u32 = 1 << 12;
+    const SOURCE_ALPHA: u32 = 3;
+    const ONE: u32 = 5;
+    (0..4).fold(ALWAYS, |out, i| {
+        let from = mapping >> (3 * i) & 7;
+        out | (if from == SOURCE_ALPHA { ONE } else { from }) << (3 * i)
+    })
+}
 
 /// What the host uses for a format of the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,11 +576,27 @@ pub(crate) fn note_stand_in(title: u32, host: u32) {
     *counts().stood_in.entry((title, host)).or_default() += 1;
 }
 
-/// The frame log's texture part: textures made in a stand-in and refused,
-/// since the start (`None` if neither happened).
+/// Host textures alive: their number and bytes.
+static LIVE: [std::sync::atomic::AtomicI64; 2] = [
+    std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0),
+];
+
+/// Counts a host texture of `bytes` made (`alive`) or freed.
+pub(crate) fn note_texture(alive: bool, bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let sign = if alive { 1 } else { -1 };
+    LIVE[0].fetch_add(sign, Relaxed);
+    LIVE[1].fetch_add(sign * bytes as i64, Relaxed);
+}
+
+/// The frame log's texture part: host textures alive, and textures made in
+/// a stand-in and refused since the start (`None` if none of them).
 pub(crate) fn report() -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (live, bytes) = (LIVE[0].load(Relaxed), LIVE[1].load(Relaxed));
     let counts = counts();
-    if counts.refused.is_empty() && counts.stood_in.is_empty() {
+    if counts.refused.is_empty() && counts.stood_in.is_empty() && live == 0 {
         return None;
     }
     let stood_in: Vec<String> = counts
@@ -561,7 +610,8 @@ pub(crate) fn report() -> Option<String> {
         .map(|(why, n)| format!("{n} {why}"))
         .collect();
     Some(format!(
-        "host textures so far: stand-in formats [{}], refused [{}]",
+        "host textures: {live} alive, {} MiB; so far: stand-in formats [{}], refused [{}]",
+        bytes >> 20,
         stood_in.join(", "),
         refused.join("; ")
     ))
@@ -823,6 +873,22 @@ mod tests {
             .map(|w| u16::from_le_bytes(*w))
             .collect();
         assert_eq!(halves, [0x3c00, 0x3800, 0, HALF_ONE]);
+    }
+
+    /// Components reading the source alpha read one; the others stay.
+    #[test]
+    fn views_of_formats_without_alpha_read_one() {
+        const DEFAULT: u32 = 0x1688; // R, G, B, A
+        assert_eq!(mapping_alpha_one(DEFAULT), 0x1688 & !(7 << 9) | 5 << 9);
+        // A, A, A, R: every alpha becomes one, red stays.
+        let swizzled = 3 | 3 << 3 | 3 << 6 | 1 << 12;
+        assert_eq!(mapping_alpha_one(swizzled), 5 | 5 << 3 | 5 << 6 | 1 << 12);
+        // Forced values stay.
+        let forced = 4 | 5 << 3 | 2 << 6 | 1 << 9 | 1 << 12;
+        assert_eq!(mapping_alpha_one(forced), forced);
+        // Formats with an alpha of their own keep it.
+        assert!(!alpha_one(28));
+        assert!(!alpha_one(86));
     }
 
     #[test]
