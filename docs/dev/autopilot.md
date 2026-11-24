@@ -110,10 +110,10 @@ repeat when it ends, with how long it took, the frame count and the values
 its condition reads:
 
 ```text
-INFO xtp_hle::modules::autopilot: line 14: wait u32 0x74e2c1c == 0 or time >= 150s
-INFO xtp_hle::modules::autopilot: line 14: met after 34.1 s (frame 1022, u32 0x74e2c1c = 0x0)
-INFO xtp_hle::modules::autopilot: line 27: control handed back to the player
-ERROR xtp_hle::modules::autopilot: line 22: timed out after 180.0 s (frame 2140, u32 0x9e58138 = 0x1, u32 0xab43664 = 0xe, u8 0x74dfa9d = 0x0); the script stops here and presses nothing more: the title is yours
+INFO xtp_hle::modules::autopilot: line 13: wait u32 0x74e2c1c == 0 or time >= 150s
+INFO xtp_hle::modules::autopilot: line 13: met after 34.1 s (frame 1022, u32 0x74e2c1c = 0x0)
+INFO xtp_hle::modules::autopilot: line 24: control handed back to the player
+ERROR xtp_hle::modules::autopilot: line 22: timed out after 180.0 s (frame 2140, u8 0x74dfa9d = 0x0, u32 0x9e58138 = 0x1, u32 0xab43664 = 0xe); the script stops here and presses nothing more: the title is yours
 ```
 
 `cargo xtask play` looks for "control handed back to the player" and "the
