@@ -166,10 +166,18 @@ pub(super) fn barrier_after_loop(
 /// the same constant to, compared with a constant or a loop-invariant
 /// value by a test the lane passes every iteration (at the header, or at
 /// the loop's only latch), and staying in the loop only while the variable
-/// has not passed that value (`i < n` going up, `i > n` going down, `i != n`
-/// by steps of 1, the form compilers give `i < n`). Their iteration count
-/// is the program's own, not data the host may not have mirrored, so they
-/// keep the higher limit ([`crate::emit::counted_loop_limit`]).
+/// has not passed that value (`i < n` going up, `i > n` going down). Their
+/// iteration count is the program's own, not data the host may not have
+/// mirrored, so they keep the higher limit
+/// ([`crate::emit::counted_loop_limit`]).
+///
+/// A loop that leaves only once the variable *equals* its bound (`i != n`,
+/// even by steps of 1, the form compilers give `i < n`) is not one: where
+/// the variable starts past the bound (a bound of 0 read from a buffer the
+/// host has not written, or the console's own guard left out), it never
+/// equals it before wrapping around, so the loop runs to its limit in every
+/// lane (watch item 134, VIctory #71's pixel loop). It keeps the general
+/// limit.
 // shortcut: the bound itself may come from such data (a count in a buffer
 // the host has not written), and then the loop runs to the higher limit.
 pub(super) fn counted_loops(p: &Program, st: &Structured) -> HashSet<usize> {
@@ -498,8 +506,8 @@ impl<'a> Counted<'a> {
                 match if holds { test } else { test.negated() } {
                     Test::Lt | Test::Le => step > 0,
                     Test::Gt | Test::Ge => step < 0,
-                    Test::Ne => step.abs() == 1,
-                    Test::Eq => false,
+                    // Leaving only on equality (see `counted_loops`).
+                    Test::Ne | Test::Eq => false,
                 }
             })
     }
@@ -1233,9 +1241,6 @@ mod tests {
         // s1 > i, the operands the other way round.
         let gt = 0xBF08_0201; // s_cmp_gt_u32 s1, s2
         assert_eq!(limits(&uniform_loop(0x81, gt)), [counted_loop_limit()]);
-        // i != s1 by steps of 1: the form compilers give `i < n`.
-        let ne = 0xBF07_0102; // s_cmp_lg_u32 s2, s1
-        assert_eq!(limits(&uniform_loop(0x81, ne)), [counted_loop_limit()]);
         // A divergent loop: each lane counts to its own v0 and leaves once
         // v1 >= v0 (an exit mask, EXEC narrowed each round).
         let lanes = [
@@ -1357,13 +1362,18 @@ mod tests {
     }
 
     /// Loops with no induction variable bounded by a loop-invariant value
-    /// keep 2^14: one stepping over its bound (`!=` by 2), one counting
-    /// away from it, one whose bound moves, one that walks a buffer until
-    /// it reads 0.
+    /// keep 2^14: one leaving only on equality with its bound (`!=`, by
+    /// steps of 1 or 2: a variable that starts past the bound never meets
+    /// it), one counting away from it, one whose bound moves, one that
+    /// walks a buffer until it reads 0.
     #[test]
     fn other_loops_keep_the_general_limit() {
         let ne = 0xBF07_0102; // s_cmp_lg_u32 s2, s1
+        assert_eq!(limits(&uniform_loop(0x81, ne)), [loop_limit()]);
         assert_eq!(limits(&uniform_loop(0x82, ne)), [loop_limit()]);
+        // The same going down, from the other operand: s1 != i by -1.
+        let ne_swapped = 0xBF07_0201; // s_cmp_lg_u32 s1, s2
+        assert_eq!(limits(&uniform_loop(0xC1, ne_swapped)), [loop_limit()]);
         let lt = 0xBF0A_0102; // s_cmp_lt_u32 s2, s1
         assert_eq!(limits(&uniform_loop(0xC1, lt)), [loop_limit()]);
         let moving = [
