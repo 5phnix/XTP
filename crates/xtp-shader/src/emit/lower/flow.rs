@@ -139,10 +139,6 @@ thread_local! {
     pub(super) static DRAINS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// [`Drain`]'s counts do not fit next to the program's LDS.
-pub(super) const NO_ROOM_TO_DRAIN: Why =
-    "a program whose LDS leaves no room for the loop limit's count of ended threads";
-
 /// Whether a group barrier (a block where `barrier` holds) is reachable from
 /// one of the loop `headers`: a lane the limit stops in that loop leaves
 /// before it, or before the next pass through it.
@@ -549,9 +545,6 @@ impl<'a> Lower<'a> {
         let passed = if self.drains() {
             let mut cleared = 0;
             if self.rpo[b] == 0 {
-                if self.s.lds_dwords + 2 > 8192 {
-                    return Err(unsupported(offset, NO_ROOM_TO_DRAIN));
-                }
                 let ended = self.ended_counts();
                 let c = self.cur;
                 let z = self.s.m.i32(0);
@@ -834,6 +827,10 @@ impl<'a> Lower<'a> {
     /// flow in halves: there both halves of the group's one console wave
     /// follow one flow (the limit stops them together), and their
     /// exchanges add barriers that no block counts.
+    // shortcut: nor a program whose LDS leaves no room in DXIL's 32 KiB for
+    // the two counts (6 compute programs of the pack, of 32 KiB): a lane the
+    // limit stops there returns, as before, rather than the program being
+    // refused.
     fn drains(&mut self) -> bool {
         if let Some(on) = self.drain.on {
             return on;
@@ -841,6 +838,7 @@ impl<'a> Lower<'a> {
         let on = self.s.threads.is_some()
             && !self.s.pixel
             && !(self.console_cf && self.split)
+            && self.s.lds_dwords + 2 <= 8192
             && barrier_after_loop(self.x.p, self.counters.keys().copied(), |b| {
                 self.barriers_in(b) > 0
             });
@@ -1153,6 +1151,11 @@ mod tests {
     /// structured buffers of dwords and s1 a root constant, with 512 bytes
     /// of LDS.
     fn limits(words: &[u32]) -> Vec<u32> {
+        limits_with_lds(words, 1)
+    }
+
+    /// [`limits`] with `granules` of 512 bytes of LDS.
+    fn limits_with_lds(words: &[u32], granules: u32) -> Vec<u32> {
         let param = |root, user_data| RootParam {
             root,
             table_offset_dwords: 0,
@@ -1174,7 +1177,7 @@ mod tests {
             slot: 0,
         }];
         native.io = StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 15 | 2 << 1,
+            rsrc2: granules << 15 | 2 << 1,
             threads: [32, 1, 1],
         });
         let p = ir::build(&native.code, false, native.vgprs).unwrap();
@@ -1346,6 +1349,11 @@ mod tests {
         assert!(!drains(&l));
         // A barrier and no loop.
         assert!(!drains(&[0xBE82_0380, S_BARRIER, S_ENDPGM]));
+        // 32 KiB of LDS leaves no room for the counts: the program still
+        // translates, its lanes return at the limit.
+        super::DRAINS.set(None);
+        assert_eq!(limits_with_lds(&after, 64).len(), 1);
+        assert_eq!(super::DRAINS.get(), Some(false));
     }
 
     /// Loops with no induction variable bounded by a loop-invariant value
