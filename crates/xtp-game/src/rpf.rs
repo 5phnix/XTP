@@ -1,9 +1,11 @@
 //! Bounded-memory structural probe for RPF9 archives.
 //!
-//! Scans an archive stream in 2 KiB (`SECTOR_SIZE`) steps without loading the
-//! file into memory and without decrypting anything. It counts `9FPR` headers
-//! (root and nested), detects truncated headers at EOF, and checks whether the
-//! 32-byte TOC area (`0x40..0x60`) repeats across headers.
+//! Scans an archive stream in 2 KiB (`SECTOR_SIZE`) steps using a fixed 64 KiB
+//! read buffer (`CHUNK_SIZE`), without loading the file into memory and without
+//! decrypting anything. It counts `9FPR` headers (root and nested), detects
+//! truncated headers at EOF, records a capped list of header offsets, and
+//! checks whether non-zero 32-byte TOC areas (`0x40..0x60`) repeat across
+//! headers.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read};
@@ -14,6 +16,10 @@ pub const RPF9_MAGIC: [u8; 4] = *b"9FPR";
 /// Alignment step between RPF9 headers (2 KiB).
 pub const SECTOR_SIZE: usize = 2048;
 
+/// Fixed read buffer size (64 KiB = 32 sectors) so scanning large files does
+/// not issue one syscall per 2 KiB while keeping memory strictly bounded.
+pub const CHUNK_SIZE: usize = 64 * 1024;
+
 /// Offset of the 32-byte TOC sample region inside an RPF9 header.
 pub const TOC_OFFSET: usize = 0x40;
 
@@ -23,8 +29,12 @@ pub const TOC_SAMPLE_LEN: usize = 32;
 /// Minimum bytes needed in a sector for a complete header + TOC sample.
 pub const MIN_HEADER_LEN: usize = TOC_OFFSET + TOC_SAMPLE_LEN;
 
-/// Maximum number of distinct 32-byte TOC samples retained in memory (128 KiB).
+/// Maximum number of distinct non-zero 32-byte TOC samples retained in memory
+/// (about 128 KiB of sample bytes, plus `BTreeSet` node overhead).
 const MAX_TRACKED_TOCS: usize = 4096;
+
+/// Maximum number of header byte offsets recorded in [`ProbeReport::header_offsets`].
+const MAX_RECORDED_OFFSETS: usize = 256;
 
 /// Summary produced by [`probe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +43,8 @@ pub struct ProbeReport {
     pub bytes_scanned: u64,
     /// Whether offset 0 starts with [`RPF9_MAGIC`].
     pub has_root_header: bool,
-    /// Total `9FPR` headers seen on 2 KiB boundaries (root + nested + truncated).
+    /// Total `9FPR` headers seen on 2 KiB boundaries (root + nested; truncated
+    /// ones are included in those).
     pub headers: u64,
     /// Complete headers (at least [`MIN_HEADER_LEN`] bytes available).
     pub complete_headers: u64,
@@ -43,24 +54,29 @@ pub struct ProbeReport {
     pub truncated_headers: u64,
     /// Complete headers whose `0x40..0x60` TOC sample contains at least one non-zero byte.
     pub nonzero_toc_headers: u64,
-    /// Number of complete headers whose TOC sample matched a previously seen sample.
+    /// Number of complete headers whose non-zero TOC sample matched a previously seen sample.
     pub repeated_toc_count: u64,
-    /// `true` if at least two complete headers shared an identical TOC sample.
+    /// `true` if at least two complete headers shared an identical non-zero TOC sample.
     pub toc_areas_repeat: bool,
-    /// `true` if at least two complete headers were seen and all had the exact same TOC sample.
+    /// `true` if at least two complete headers with non-zero TOCs were seen and
+    /// all of them had the exact same TOC sample.
     pub all_tocs_identical: bool,
-    /// `true` if more than `MAX_TRACKED_TOCS` distinct TOC samples were seen and
-    /// later distinct samples were not inserted to keep memory bounded.
+    /// `true` if more than `MAX_TRACKED_TOCS` distinct non-zero TOC samples were
+    /// seen and later distinct samples were not inserted to keep memory bounded.
     pub toc_tracking_capped: bool,
+    /// Byte offsets of up to `MAX_RECORDED_OFFSETS` detected headers, in stream order.
+    pub header_offsets: Vec<u64>,
+    /// `true` if more than `MAX_RECORDED_OFFSETS` headers were seen.
+    pub header_offsets_capped: bool,
 }
 
 /// Scan `reader` in 2 KiB steps with bounded memory and summarise RPF9 headers.
 ///
-/// Never decrypts any data and holds at most one 2 KiB sector buffer plus a
-/// bounded set of 32-byte TOC samples.
+/// Never decrypts any data and holds at most one [`CHUNK_SIZE`] read buffer
+/// plus bounded sets of 32-byte TOC samples and header offsets.
 pub fn probe<R: Read>(mut reader: R) -> io::Result<ProbeReport> {
-    let mut buf = [0u8; SECTOR_SIZE];
-    let mut offset: u64 = 0;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut chunk_offset: u64 = 0;
 
     let mut has_root_header = false;
     let mut headers: u64 = 0;
@@ -70,56 +86,70 @@ pub fn probe<R: Read>(mut reader: R) -> io::Result<ProbeReport> {
     let mut nonzero_toc_headers: u64 = 0;
     let mut repeated_toc_count: u64 = 0;
 
-    let mut first_toc: Option<[u8; TOC_SAMPLE_LEN]> = None;
-    let mut all_match_first = true;
+    let mut first_nonzero_toc: Option<[u8; TOC_SAMPLE_LEN]> = None;
+    let mut all_nonzero_match_first = true;
     let mut seen_tocs: BTreeSet<[u8; TOC_SAMPLE_LEN]> = BTreeSet::new();
     let mut toc_tracking_capped = false;
 
+    let mut header_offsets = Vec::new();
+    let mut header_offsets_capped = false;
+
     loop {
-        let n = read_sector(&mut reader, &mut buf)?;
+        let n = read_chunk(&mut reader, &mut buf)?;
         if n == 0 {
             break;
         }
-        let sector = &buf[..n];
-        if sector.len() >= RPF9_MAGIC.len() && sector[..4] == RPF9_MAGIC {
-            headers += 1;
-            if offset == 0 {
-                has_root_header = true;
-            } else {
-                nested_headers += 1;
-            }
-
-            if sector.len() < MIN_HEADER_LEN {
-                truncated_headers += 1;
-            } else {
-                complete_headers += 1;
-                let mut sample = [0u8; TOC_SAMPLE_LEN];
-                sample.copy_from_slice(&sector[TOC_OFFSET..MIN_HEADER_LEN]);
-                if sample.iter().any(|&b| b != 0) {
-                    nonzero_toc_headers += 1;
-                }
-                match first_toc {
-                    None => first_toc = Some(sample),
-                    Some(first) if first != sample => all_match_first = false,
-                    Some(_) => {}
-                }
-                if seen_tocs.contains(&sample) {
-                    repeated_toc_count += 1;
-                } else if seen_tocs.len() < MAX_TRACKED_TOCS {
-                    seen_tocs.insert(sample);
+        let mut pos = 0;
+        while pos < n {
+            let end = (pos + SECTOR_SIZE).min(n);
+            let sector = &buf[pos..end];
+            let offset = chunk_offset + pos as u64;
+            if sector.starts_with(&RPF9_MAGIC) {
+                headers += 1;
+                if offset == 0 {
+                    has_root_header = true;
                 } else {
-                    toc_tracking_capped = true;
+                    nested_headers += 1;
+                }
+                if header_offsets.len() < MAX_RECORDED_OFFSETS {
+                    header_offsets.push(offset);
+                } else {
+                    header_offsets_capped = true;
+                }
+
+                if sector.len() < MIN_HEADER_LEN {
+                    truncated_headers += 1;
+                } else {
+                    complete_headers += 1;
+                    let mut sample = [0u8; TOC_SAMPLE_LEN];
+                    sample.copy_from_slice(&sector[TOC_OFFSET..MIN_HEADER_LEN]);
+                    if sample.iter().any(|&b| b != 0) {
+                        nonzero_toc_headers += 1;
+                        match first_nonzero_toc {
+                            None => first_nonzero_toc = Some(sample),
+                            Some(first) if first != sample => all_nonzero_match_first = false,
+                            Some(_) => {}
+                        }
+                        if seen_tocs.contains(&sample) {
+                            repeated_toc_count += 1;
+                        } else if seen_tocs.len() < MAX_TRACKED_TOCS {
+                            seen_tocs.insert(sample);
+                        } else {
+                            toc_tracking_capped = true;
+                        }
+                    }
                 }
             }
+            pos = end;
         }
-        offset += n as u64;
-        if n < SECTOR_SIZE {
+        chunk_offset += n as u64;
+        if n < CHUNK_SIZE {
             break;
         }
     }
 
     Ok(ProbeReport {
-        bytes_scanned: offset,
+        bytes_scanned: chunk_offset,
         has_root_header,
         headers,
         complete_headers,
@@ -128,13 +158,15 @@ pub fn probe<R: Read>(mut reader: R) -> io::Result<ProbeReport> {
         nonzero_toc_headers,
         repeated_toc_count,
         toc_areas_repeat: repeated_toc_count > 0,
-        all_tocs_identical: complete_headers >= 2 && all_match_first,
+        all_tocs_identical: nonzero_toc_headers >= 2 && all_nonzero_match_first,
         toc_tracking_capped,
+        header_offsets,
+        header_offsets_capped,
     })
 }
 
 /// Read up to `buf.len()` bytes, looping over short reads until full or EOF.
-fn read_sector<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+fn read_chunk<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
@@ -171,6 +203,7 @@ mod tests {
         assert_eq!(report.nested_headers, 0);
         assert_eq!(report.truncated_headers, 0);
         assert_eq!(report.nonzero_toc_headers, 1);
+        assert_eq!(report.header_offsets, [0]);
         assert!(!report.toc_areas_repeat);
         assert!(!report.all_tocs_identical);
     }
@@ -189,8 +222,24 @@ mod tests {
         assert_eq!(report.complete_headers, 3);
         assert_eq!(report.nested_headers, 2);
         assert_eq!(report.truncated_headers, 0);
+        assert_eq!(report.header_offsets, [0, 0x1000, 0x1800]);
         assert!(!report.toc_areas_repeat);
         assert!(!report.all_tocs_identical);
+    }
+
+    #[test]
+    fn stream_without_root_header_and_unaligned_magic_ignored() {
+        let mut data = vec![0u8; SECTOR_SIZE];
+        // Unaligned magic inside sector 0 must be ignored.
+        data[128..132].copy_from_slice(&RPF9_MAGIC);
+        // Valid nested header at 0x0800.
+        data.extend_from_slice(&make_sector([0x33; TOC_SAMPLE_LEN]));
+
+        let report = probe(Cursor::new(data)).unwrap();
+        assert!(!report.has_root_header);
+        assert_eq!(report.headers, 1);
+        assert_eq!(report.nested_headers, 1);
+        assert_eq!(report.header_offsets, [0x0800]);
     }
 
     #[test]
@@ -227,6 +276,21 @@ mod tests {
     }
 
     #[test]
+    fn zeroed_toc_areas_do_not_count_as_encrypted_repeats() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&make_sector([0u8; TOC_SAMPLE_LEN]));
+        data.extend_from_slice(&make_sector([0u8; TOC_SAMPLE_LEN]));
+
+        let report = probe(Cursor::new(data)).unwrap();
+        assert_eq!(report.headers, 2);
+        assert_eq!(report.complete_headers, 2);
+        assert_eq!(report.nonzero_toc_headers, 0);
+        assert_eq!(report.repeated_toc_count, 0);
+        assert!(!report.toc_areas_repeat);
+        assert!(!report.all_tocs_identical);
+    }
+
+    #[test]
     fn different_toc_areas_do_not_repeat() {
         let mut data = Vec::new();
         for i in 1u8..=4 {
@@ -239,6 +303,64 @@ mod tests {
         assert_eq!(report.repeated_toc_count, 0);
         assert!(!report.toc_areas_repeat);
         assert!(!report.all_tocs_identical);
+    }
+
+    #[test]
+    fn toc_tracking_and_offsets_cap_with_bounded_reads() {
+        struct SyntheticStream {
+            total_sectors: u64,
+            next_sector: u64,
+            sector_pos: usize,
+            current: [u8; SECTOR_SIZE],
+            max_read_req: usize,
+        }
+
+        impl SyntheticStream {
+            fn new(total_sectors: u64) -> Self {
+                Self {
+                    total_sectors,
+                    next_sector: 0,
+                    sector_pos: SECTOR_SIZE,
+                    current: [0u8; SECTOR_SIZE],
+                    max_read_req: 0,
+                }
+            }
+        }
+
+        impl Read for SyntheticStream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.max_read_req = self.max_read_req.max(buf.len());
+                if self.sector_pos == SECTOR_SIZE {
+                    if self.next_sector >= self.total_sectors {
+                        return Ok(0);
+                    }
+                    let mut toc = [0u8; TOC_SAMPLE_LEN];
+                    let id = self.next_sector + 1;
+                    toc[..8].copy_from_slice(&id.to_le_bytes());
+                    self.current = make_sector(toc);
+                    self.next_sector += 1;
+                    self.sector_pos = 0;
+                }
+                let avail = SECTOR_SIZE - self.sector_pos;
+                let n = avail.min(buf.len());
+                buf[..n].copy_from_slice(&self.current[self.sector_pos..self.sector_pos + n]);
+                self.sector_pos += n;
+                Ok(n)
+            }
+        }
+
+        let mut stream = SyntheticStream::new(MAX_TRACKED_TOCS as u64 + 1);
+        let report = probe(&mut stream).unwrap();
+        assert!(
+            stream.max_read_req <= CHUNK_SIZE,
+            "reader was asked for {} bytes (> CHUNK_SIZE {CHUNK_SIZE})",
+            stream.max_read_req
+        );
+        assert_eq!(report.headers, MAX_TRACKED_TOCS as u64 + 1);
+        assert!(report.toc_tracking_capped);
+        assert!(report.header_offsets_capped);
+        assert_eq!(report.header_offsets.len(), MAX_RECORDED_OFFSETS);
+        assert!(!report.toc_areas_repeat);
     }
 
     #[test]
