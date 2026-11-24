@@ -946,10 +946,12 @@ mod tests {
         }
     }
 
+    /// A title write while a copy-back runs, given the piece's address.
+    type TitleWrite = Box<dyn FnMut(usize)>;
+
     thread_local! {
-        /// What [`after_reading`] does on this thread: a title write while
-        /// a copy-back runs.
-        static AFTER_READING: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> =
+        /// What [`after_reading`] does on this thread.
+        static AFTER_READING: std::cell::RefCell<Option<TitleWrite>> =
             const { std::cell::RefCell::new(None) };
     }
 
