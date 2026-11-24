@@ -874,6 +874,7 @@ dependencies = [
  "xtp-gpu",
  "xtp-loader",
  "xtp-pe",
+ "xtp-testkit",
 ]
 
 [[package]]

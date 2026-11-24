@@ -34,14 +34,18 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Input_XboxController",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Trigger motors (`modules::gameinput::triggers`) and Windows accessibility
-# settings (`modules::speech::captions`). Diagnostics adds `modules::audio::capture`.
-windows = { workspace = true, features = ["Gaming_Input", "Media_ClosedCaptioning", "UI_ViewManagement"] }
+# Trigger motors, accessibility settings and in-memory speech synthesis.
+windows = { workspace = true, features = [
+    "Gaming_Input", "Media_ClosedCaptioning", "UI_ViewManagement",
+    "Media_Core", "Media_MediaProperties", "Media_SpeechSynthesis",
+    "Media_Transcoding", "Storage_Streams", "Win32_Foundation",
+] }
 # `#[implement]` names it.
 windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+xtp-testkit.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
