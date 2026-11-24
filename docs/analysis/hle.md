@@ -174,7 +174,7 @@ Legend: ✔ implemented and tested, ◐ partial, ✘ missing, — not needed.
 | XNetworking: stack up, reaches nothing | ✔ | ✔ real hints, CryptoAPI certificate checks | 1 / 7 | Keep XTP (offline by design) |
 | XGameUi: profile card, text entry (host dialog) | ✔ | → PC runtime | 1 / — | Keep XTP |
 | XGameUi message and error dialogs | ✘ | → PC runtime | — / — | **New work** (R5) |
-| Speech synthesis | ◐ valid empty WAVE | → PC runtime | 1 / — | **New work** (R6) |
+| Speech synthesis | ✔ Windows voices, text and SSML to 48 kHz PCM | → PC runtime | 4 / — | Done (R6) |
 | Closed captions, high contrast | ✔ Windows settings and title override | ✔ `accessibility.rs` | 5 / 3 | Done (R7) |
 | XError callback and options | ✘ class absent | ✔ | — / — | After xcl, if the title asks (R9) |
 | Relaunch (`XLaunchNewGame`), restart on crash | ◐ relaunch untested live | ✔ both | 4 (lifecycle) / — | Verify (R10) |
@@ -395,15 +395,13 @@ shows the title calls them.
   defaults when the host has no setting; set-enabled is read back.
 - **Depends on:** —
 
-### R6. Speech synthesis through the host — M
+### R6. Speech synthesis through the host — M (done)
 - **Goal:** narration speaks: voices enumerated from the host's speech
   synthesizer, text and SSML streams rendered to 48 kHz WAVE in memory.
-- **Files:** `crates/xtp-hle/src/modules/speech.rs`, `crates/xtp-hle/Cargo.toml`
-  (WinRT speech or SAPI features).
+- **Files:** `crates/xtp-hle/src/modules/speech.rs` and `speech/narrator.rs`.
 - **xcl ref:** none (xcl forwards speech to the PC runtime). New work.
-- **Acceptance:** Windows test: a stream for "test" is a valid WAVE file
-  with non-zero length; with no voice installed the current empty-stream
-  behaviour remains.
+- **Acceptance:** Windows tests check PCM output for text and SSML, and the
+  empty WAVE for blank text, an unavailable voice, or a failed host engine.
 - **Depends on:** —
 
 ### I3. Trigger rumble — M
@@ -513,7 +511,7 @@ shows the title calls them.
 | 10 | R5 message/error dialogs | M | (R1) |
 | 11 | R10 relaunch, restart on crash | S | — |
 | 12 | R7 closed captions, high contrast (done) | S | — |
-| 13 | R6 speech synthesis | M | — |
+| 13 | R6 speech synthesis (done) | M | — |
 | 14 | I3 trigger rumble | M | — |
 | 15 | K1 commit measurement | S | — |
 | 16 | K2 lazy commit | M | K1 |
