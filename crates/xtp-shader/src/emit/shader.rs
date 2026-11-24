@@ -645,7 +645,9 @@ impl Shader {
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4 + self.shared_extra)),
+            mesh: self
+                .mesh
+                .map(|m| (m, self.lds_dwords * 4 + self.shared_extra)),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
