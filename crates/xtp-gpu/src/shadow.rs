@@ -72,7 +72,7 @@ pub(crate) struct Shadow {
     /// Per submission not finished yet whose shaders write the copy: the
     /// copy's bytes before it ran, over the ranges they write. What the GPU
     /// wrote differs.
-    before: Mutex<Vec<Before>>,
+    before: Mutex<Snapshots>,
     /// For the first-touch census ([`census`]): whether the title memory
     /// copied back is a view of physical pages, asked once: unknown, a
     /// view, other memory.
@@ -125,15 +125,57 @@ struct Busy {
     shaders: bool,
 }
 
+/// A copy's snapshots: those of submissions not finished yet, and the
+/// mirrors that served earlier ones.
+#[derive(Default)]
+struct Snapshots {
+    live: Vec<Before>,
+    /// Mirrors kept for good, for the next snapshots of the copy: their
+    /// pages are touched already, so a snapshot there takes no page fault.
+    /// Before, each snapshot took fresh memory from a pool of 16 buffers
+    /// that freed the rest, and merged its pieces into new buffers as later
+    /// ranges overlapped them: 76.5 ms and about 74 000 page faults a world
+    /// frame (docs/analysis/30fps.md §4.1).
+    spare: Vec<Mirror>,
+}
+
+/// Memory of a copy's size that holds a snapshot's bytes at their offsets in
+/// the copy, kept for good.
+struct Mirror(Box<[u8]>);
+
+impl Mirror {
+    fn new(len: usize) -> Mirror {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Mirrors, 1);
+            add(C::MirrorBytes, len as u64);
+        }
+        MIRRORS.fetch_add(len as u64, Ordering::Relaxed);
+        Mirror(vec![0; len].into_boxed_slice())
+    }
+}
+
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        MIRRORS.fetch_sub(self.0.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// The bytes of all snapshot mirrors held (for the copystat line).
+pub(crate) static MIRRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A submission's snapshot of a copy ([`Shadow::writing`]).
 struct Before {
     submission: u64,
-    /// Sorted pieces that neither overlap nor touch: offset in the copy,
-    /// bytes. Each covers ranges the submission declared, not the gaps
-    /// between them (a refresh may change a gap before a later declaration
-    /// covers it). A copy-back makes what it put back equal to the copy
+    /// The snapshot's bytes, each at its offset in the copy.
+    mirror: Mirror,
+    /// The offsets taken, as sorted ranges that neither overlap nor touch.
+    /// They cover the ranges the submission declared, not the gaps between
+    /// them (a refresh may change a gap before a later declaration covers
+    /// it). A copy-back makes what it put back equal to the copy
     /// ([`Shadow::put_back`]).
-    parts: Vec<(usize, Vec<u8>)>,
+    taken: Vec<(usize, usize)>,
     /// Title pages a copy-back of the submission put back only in part
     /// (its range did not cover them whole), for a later one that covers
     /// them whole to note current ([`Shadow::mark_current`]).
@@ -143,54 +185,49 @@ struct Before {
 impl Before {
     /// Covers the copy's `[from, to)` (offsets): bytes this submission took
     /// already keep their value (the copy is unchanged there since, nothing
-    /// refreshes a busy range), the rest is taken from `host` now.
-    fn cover<'a>(&mut self, from: usize, to: usize, host: impl Fn(usize, usize) -> &'a [u8]) {
-        // The pieces that overlap or touch the range.
-        let first = self.parts.partition_point(|(at, b)| at + b.len() < from);
+    /// refreshes a busy range), the rest is taken from `host` now, each
+    /// byte once. Returns the bytes taken now.
+    fn cover<'a>(
+        &mut self,
+        from: usize,
+        to: usize,
+        host: impl Fn(usize, usize) -> &'a [u8],
+    ) -> usize {
+        // The ranges taken that overlap or touch `[from, to)`.
+        let first = self.taken.partition_point(|&(_, end)| end < from);
         let last = first
-            + self.parts[first..]
+            + self.taken[first..]
                 .iter()
-                .take_while(|(at, _)| *at <= to)
+                .take_while(|&&(at, _)| at <= to)
                 .count();
-        if last == first + 1 {
-            let (at, bytes) = &self.parts[first];
-            if *at <= from && to <= at + bytes.len() {
-                return;
+        let (mut at, mut took) = (from, 0);
+        for &(a, end) in &self.taken[first..last] {
+            if at < a {
+                self.mirror.0[at..a].copy_from_slice(host(at, a));
+                took += a - at;
             }
+            at = at.max(end);
         }
-        let start = self
-            .parts
-            .get(first)
-            .filter(|_| first < last)
-            .map_or(from, |p| p.0.min(from));
-        let end = self.parts[first..last]
+        if at < to {
+            self.mirror.0[at..to].copy_from_slice(host(at, to));
+            took += to - at;
+        }
+        let start = match self.taken.get(first) {
+            Some(&(a, _)) if first < last => a.min(from),
+            _ => from,
+        };
+        let end = self.taken[first..last]
             .last()
-            .map_or(to, |(at, b)| (at + b.len()).max(to));
-        let mut merged = pooled(end - start);
-        let mut at = start;
-        for (part, bytes) in self.parts.drain(first..last) {
-            if at < part {
-                merged.extend_from_slice(host(at, part));
-            }
-            merged.extend_from_slice(&bytes);
-            at = part + bytes.len();
-            give_back(bytes);
-        }
-        if at < end {
-            merged.extend_from_slice(host(at, end));
-        }
-        self.parts.insert(first, (start, merged));
+            .map_or(to, |&(_, end)| end.max(to));
+        self.taken.splice(first..last, [(start, end)]);
+        took
     }
 
     /// The snapshot's bytes of `[from, to)` (offsets), if it took them.
     fn bytes(&mut self, from: usize, to: usize) -> Option<&mut [u8]> {
-        let i = self.parts.partition_point(|(at, b)| at + b.len() < to);
-        let (at, bytes) = self.parts.get_mut(i)?;
-        (*at <= from && to <= *at + bytes.len()).then(|| &mut bytes[from - *at..to - *at])
-    }
-
-    fn release(self) {
-        self.parts.into_iter().for_each(|(_, b)| give_back(b));
+        let i = self.taken.partition_point(|&(_, end)| end < to);
+        let &(at, end) = self.taken.get(i)?;
+        (at <= from && to <= end).then(|| &mut self.mirror.0[from..to])
     }
 }
 
@@ -202,37 +239,6 @@ static SUBMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// preparation starts.
 pub(crate) fn submission() -> u64 {
     SUBMISSIONS.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
-fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
-}
-
-/// Returns a snapshot buffer to the pool (at most 16 kept, the largest:
-/// each submission in flight has its own).
-fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    if pool.len() > 16 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(16);
-    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -345,9 +351,9 @@ impl Shadow {
     /// snapshot shared by them gave a later one bytes from before an
     /// earlier one, which lost GPU writes and undid title writes), grown to
     /// cover every range the submission declares (the world declares
-    /// overlapping views of its 174 MB heap dozens of times), in reused
-    /// memory (fresh snapshots cost ~2.3 million page faults per world
-    /// frame).
+    /// overlapping views of its 174 MB heap dozens of times), each byte
+    /// taken once, in a mirror of the copy kept for good ([`Snapshots`]: no
+    /// fresh memory, so no page faults once the mirrors are warm).
     pub(crate) fn writing(&self, submission: u64, address: usize, len: usize) {
         self.busy().push(Busy {
             submission,
@@ -359,24 +365,38 @@ impl Shadow {
         if from >= to {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         // SAFETY: inside the mapping; GPU work in flight does not write it
         // (a step declaring a range first finishes the submissions whose
         // GPU work writes it).
         let host =
             |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let i = match before.iter().position(|b| b.submission == submission) {
+        let mut snapshots = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Snapshots { live, spare } = &mut *snapshots;
+        let i = match live.iter().position(|b| b.submission == submission) {
             Some(i) => i,
             None => {
-                before.push(Before {
+                let mirror = spare
+                    .pop()
+                    .unwrap_or_else(|| Mirror::new(self.len as usize));
+                live.push(Before {
                     submission,
-                    parts: Vec::new(),
+                    mirror,
+                    taken: Vec::new(),
                     partial: Vec::new(),
                 });
-                before.len() - 1
+                live.len() - 1
             }
         };
-        before[i].cover(from, to, host);
+        let _took = live[i].cover(from, to, host);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Snapshots, 1);
+            add(C::SnapshotBytes, _took as u64);
+            add(C::SnapshotUs, started.elapsed().as_micros() as u64);
+        }
     }
 
     /// At the preparation of `submission`: a buffer copy it records on the
@@ -415,7 +435,10 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some(snapshot) = snapshots.iter_mut().find(|b| b.submission == submission)
+        if let Some(snapshot) = snapshots
+            .live
+            .iter_mut()
+            .find(|b| b.submission == submission)
             && from < to
             && let Some(before) = snapshot.bytes(from, to)
         {
@@ -485,9 +508,14 @@ impl Shadow {
             !(b.shaders && b.submission == submission && address <= b.from && b.to <= end)
         });
         if !busy.iter().any(|b| b.shaders && b.submission == submission)
-            && let Some(i) = snapshots.iter().position(|b| b.submission == submission)
+            && let Some(i) = snapshots
+                .live
+                .iter()
+                .position(|b| b.submission == submission)
         {
-            snapshots.swap_remove(i).release();
+            // Its mirror serves the copy's next snapshots.
+            let done = snapshots.live.swap_remove(i);
+            snapshots.spare.push(done.mirror);
         }
         written
     }
@@ -2558,37 +2586,82 @@ mod tests {
     }
 
     /// A submission's snapshot takes the bytes of each range it declares
-    /// once, when first declared, and not the gaps between ranges.
+    /// once, when first declared, and not the gaps between ranges. A range
+    /// over what it took already takes only the rest: each byte is copied
+    /// once (before, a range overlapping a piece merged both into a new
+    /// buffer, copying the piece again).
     #[test]
     fn a_snapshot_keeps_what_it_took_first_and_skips_the_gaps() {
         let mut host = vec![1u8; 64];
         let mut before = Before {
             submission: 1,
-            parts: Vec::new(),
+            mirror: Mirror::new(64),
+            taken: Vec::new(),
             partial: Vec::new(),
         };
-        let mut cover = |host: &Vec<u8>, from: usize, to: usize| {
-            before.cover(from, to, |a, b| &host[a..b]);
+        let cover = |before: &mut Before, host: &[u8], from: usize, to: usize| {
+            before.cover(from, to, |a, b| &host[a..b])
         };
-        cover(&host, 8, 16);
-        cover(&host, 32, 40);
+        assert_eq!(cover(&mut before, &host, 8, 16), 8);
+        assert_eq!(cover(&mut before, &host, 32, 40), 8);
         host.fill(2);
         // Overlapping the first and touching the second: merged; what was
         // taken stays 1, the gap between them is taken now.
-        cover(&host, 12, 32);
+        assert_eq!(cover(&mut before, &host, 12, 32), 16, "the gap only");
         host.fill(3);
-        cover(&host, 48, 50);
-        cover(&host, 10, 14);
-        let parts: Vec<(usize, Vec<u8>)> = before.parts.clone();
+        assert_eq!(cover(&mut before, &host, 48, 50), 2);
+        assert_eq!(cover(&mut before, &host, 10, 14), 0, "taken already");
+        assert_eq!(cover(&mut before, &host, 8, 40), 0, "taken already");
+        assert_eq!(before.taken, [(8, 40), (48, 50)]);
         let mut want = vec![1u8; 8];
         want.extend([2u8; 16]);
         want.extend([1u8; 8]);
-        assert_eq!(parts, [(8, want), (48, vec![3, 3])]);
+        assert_eq!(before.bytes(8, 40).as_deref(), Some(&want[..]));
         assert_eq!(before.bytes(14, 18).as_deref(), Some(&[1, 1, 2, 2][..]));
         assert_eq!(before.bytes(40, 41), None, "past what it took");
         assert_eq!(before.bytes(47, 49), None);
         assert_eq!(before.bytes(48, 50).as_deref(), Some(&[3, 3][..]));
-        before.release();
+        // A range over both and the gap between them: one range.
+        assert_eq!(cover(&mut before, &host, 30, 60), 18);
+        assert_eq!(before.taken, [(8, 60)]);
+        assert_eq!(before.bytes(39, 49).as_deref(), Some(&[1, 3, 3, 3, 3, 3, 3, 3, 3, 3][..]));
+    }
+
+    /// A copy's snapshot mirror outlives its submission: the next
+    /// submission's snapshot takes it again (its pages touched already, no
+    /// fresh memory), and two submissions in flight each have their own.
+    #[test]
+    fn snapshot_mirrors_are_kept_for_the_next_submissions() {
+        let test = "shadow::tests::snapshot_mirrors_are_kept_for_the_next_submissions";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let window = watched(2 * PAGE);
+        let shadow = find(window as u64, (2 * PAGE) as u64).expect("a host copy");
+        shadow.update(window, 2 * PAGE);
+        let counts = |s: &Shadow| {
+            let snapshots = s.before.lock().unwrap();
+            (snapshots.live.len(), snapshots.spare.len())
+        };
+        let (a, b) = (submission(), submission());
+        shadow.writing(a, window, PAGE);
+        shadow.writing(b, window + PAGE, PAGE);
+        assert_eq!(counts(&shadow), (2, 0), "one mirror each");
+        let held = shadow.before.lock().unwrap().live[0].mirror.0.as_ptr();
+        shadow.set_host(window + 0x10, 4, 0x61);
+        assert_eq!(shadow.copy_back(a, window, PAGE), 4);
+        assert_eq!(counts(&shadow), (1, 1), "a's mirror kept");
+        let next = submission();
+        shadow.writing(next, window, PAGE);
+        assert_eq!(counts(&shadow), (2, 0));
+        let snapshots = shadow.before.lock().unwrap();
+        let taken = snapshots.live.iter().find(|s| s.submission == next).unwrap();
+        assert_eq!(taken.mirror.0.as_ptr(), held, "the same memory");
+        assert_eq!(&taken.mirror.0[0x10..0x14], &[0x61; 4], "today's bytes");
+        drop(snapshots);
+        assert_eq!(shadow.copy_back(b, window + PAGE, PAGE), 0);
+        assert_eq!(shadow.copy_back(next, window, PAGE), 0);
+        assert_eq!(counts(&shadow), (0, 2));
     }
 
     /// A refresh leaves alone what a GPU buffer copy in flight writes into

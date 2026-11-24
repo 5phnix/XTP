@@ -74,8 +74,17 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Snapshots of shader-written ranges before their submission
+    /// (`Shadow::writing`): declarations, bytes copied, their time in
+    /// microseconds; snapshot mirrors made (each of a host copy's size,
+    /// kept for good), and their bytes.
+    Snapshots,
+    SnapshotBytes,
+    SnapshotUs,
+    Mirrors,
+    MirrorBytes,
 }
-const COUNTERS: usize = 37;
+const COUNTERS: usize = 42;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -146,7 +155,8 @@ pub(crate) fn log(frames: f64) {
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; guard {:.2} ms, {:.0} view queries, \
          {:.0} protection changes, {:.0} unmapped blocks skipped; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed",
+         changed, {:.1} MB hashed, {:.1} MB of them changed; snapshots {:.0} over {:.1} MB in \
+         {:.2} ms, {:.1} mirrors made ({:.1} MB; {:.0} MB held)",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -185,6 +195,12 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+        c[C::Snapshots as usize],
+        mb(c[C::SnapshotBytes as usize]),
+        ms(c[C::SnapshotUs as usize]),
+        c[C::Mirrors as usize],
+        mb(c[C::MirrorBytes as usize]),
+        crate::shadow::MIRRORS.load(Relaxed) as f64 / 1e6,
     );
     // With `XTP_COPYBACK_CENSUS`: what the CPU touches of what came back.
     crate::shadow::census::log(frames);
