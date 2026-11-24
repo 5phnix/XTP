@@ -9,8 +9,105 @@ use crate::emit::shader::flags;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Reg};
 use crate::native::ResourceType;
+use crate::resource::{Site, Source};
+
+/// A 64-bit image atomic, as [`Lower::image`] decoded it.
+struct Atomic64<'s> {
+    site: Site,
+    src: &'s Source,
+    /// The DXIL resource kind of the view.
+    kind: u32,
+    /// The first data VGPR: each value a pair, low dword first.
+    reg: u8,
+    guard: Option<V>,
+    /// `image_atomic_sub`: the add of the negation.
+    sub: bool,
+    /// The DXIL binary operation, `u32::MAX` a compare-exchange.
+    code: u32,
+    /// The old value returns to the data VGPRs.
+    glc: bool,
+}
 
 impl<'a> Lower<'a> {
+    /// A 64-bit image atomic: DXIL's i64 `atomicBinOp` or
+    /// `atomicCompareExchange` on the view as a 64-bit integer texture UAV
+    /// (the console's R32G32 view; the host's must be R32G32_UINT, as for
+    /// `RWTexture2D<uint64_t>`). Its handle is annotated U32, one channel,
+    /// as DXC annotates one.
+    fn image_atomic64(&mut self, inst: &Inst, at: &Atomic64, cs: Vec<V>) -> Result<(), Why> {
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED;
+        // Every source but a root view is a heap handle (see `handle`); a
+        // root view is refused there.
+        if !matches!(at.src, Source::Built { .. }) {
+            self.s.flags |= flags::ATOMIC_INT64_HEAP;
+        }
+        let pair = |l: &mut Self, r: u8| -> Result<V, Why> {
+            let c = l.cur;
+            let lo = l.i32_of(inst.read(Reg::V(r)).ok_or("image atomic data")?)?;
+            let hi = l.i32_of(inst.read(Reg::V(r + 1)).ok_or("image atomic data")?)?;
+            let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
+            let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
+            let k32 = l.s.m.int_const(i64t, 32);
+            let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
+            Ok(l.s.m.bin(c, Bin::Or, lo, hi))
+        };
+        // Lanes the guard skips keep their registers: the data pair is the
+        // value outside the guard. The compare (cmpswap: data is (new,
+        // compare), a pair each) is built before the guard too.
+        let old = pair(self, at.reg)?;
+        let mut value = old;
+        if at.sub {
+            let z = self.s.m.int_const(i64t, 0);
+            value = self.s.m.bin(self.cur, Bin::Sub, z, value);
+        }
+        let cmp = if at.code == u32::MAX {
+            Some(pair(self, at.reg + 2)?)
+        } else {
+            None
+        };
+        // A heap handle of its own: `handle` caches by the annotation's first
+        // word only, so a float4 handle of the same view (a size query, say)
+        // would come back with the wrong element type.
+        let props = (at.kind | 0x1000, 0x105);
+        let h = match at.src {
+            Source::Loaded { load, first } => {
+                let index = self.heap_index(*load, *first, false)?;
+                // Per lane in a waterfall loop, as `handle` makes it.
+                let per_lane = self.x.res.waterfall.loads.contains(load);
+                self.s.heap_handle(self.cur, index, false, per_lane, props)
+            }
+            _ => self.handle(at.site, at.src, false, props)?,
+        };
+        let guarded = self.begin_guarded(at.guard);
+        let mut args = vec![h];
+        let r = if let Some(cmp) = cmp {
+            args.extend(cs);
+            args.extend([cmp, value]);
+            self.s.op(
+                self.cur,
+                "atomicCompareExchange.i64",
+                Attr::NoUnwind,
+                i64t,
+                79,
+                &args,
+            )
+        } else {
+            args.push(self.s.m.i32(at.code));
+            args.extend(cs);
+            args.push(value);
+            self.s
+                .op(self.cur, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78, &args)
+        };
+        let r = self.end_guarded(guarded, &[(r, old)])[0];
+        if at.glc {
+            let (lo, hi) = self.split64(r);
+            self.write(inst, Reg::V(at.reg), lo, None);
+            self.write(inst, Reg::V(at.reg + 1), hi, None);
+        }
+        Ok(())
+    }
+
     pub(super) fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
@@ -110,12 +207,13 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // dmask: the data dwords (cmpswap: twice the value's). Two
+            // dwords per value are a 64-bit atomic on an R32G32 view.
+            let wide = match (*dmask, code == u32::MAX) {
+                (1, false) | (3, true) => false,
+                (3, false) | (0xF, true) => true,
+                _ => return Err("an image atomic's data mask"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -124,6 +222,19 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
+            if wide {
+                let at = Atomic64 {
+                    site,
+                    src,
+                    kind,
+                    reg,
+                    guard,
+                    sub: op == "sub",
+                    code,
+                    glc: cache.glc,
+                };
+                return self.image_atomic64(inst, &at, cs);
+            }
             let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
             let mut value = vals[0];
             if op == "sub" {
