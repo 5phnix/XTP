@@ -342,7 +342,7 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             // (handle, coordinates); none: through the runtime stride table.
             let static_view = match index {
-                Some(_) if self.runtime_stride(used)? => None,
+                _ if self.through_table(index, used, src)? => None,
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     let h = self.handle(site, src, false, (12 | u, stride))?;
@@ -381,12 +381,12 @@ impl<'a> Lower<'a> {
                 }
             };
             let at = self.begin_guarded(guard);
-            let r = match (static_view, index) {
-                (Some((h, coords)), _) => atomic_op(self, h, coords),
-                (None, Some(index)) => {
+            let r = match static_view {
+                Some((h, coords)) => atomic_op(self, h, coords),
+                None => {
                     // Out of range the console returns 0.
                     let done = self.runtime_access(src, index, off, 4, 11 | u, |l, h, byte| {
-                        vec![atomic_op(l, h, [byte, iu, iu])]
+                        Ok(vec![atomic_op(l, h, [byte, iu, iu])])
                     });
                     match done {
                         Ok(r) => r[0],
@@ -396,7 +396,6 @@ impl<'a> Lower<'a> {
                         }
                     }
                 }
-                (None, None) => unreachable!("runtime strides are for accesses by element"),
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
@@ -441,7 +440,7 @@ impl<'a> Lower<'a> {
                 (69, "bufferStore.f32")
             } else {
                 match index {
-                    Some(index) if self.runtime_stride(used)? => {
+                    _ if self.through_table(index, used, src)? => {
                         // The store in a block of its own under the guard:
                         // made only where the table's range checks pass.
                         let mask = (1u8 << count) - 1;
@@ -467,7 +466,7 @@ impl<'a> Lower<'a> {
                                     140,
                                     &args,
                                 );
-                                Vec::new()
+                                Ok(Vec::new())
                             },
                         );
                         self.end_guarded(at, &[]);
@@ -514,11 +513,19 @@ impl<'a> Lower<'a> {
                     self.s.flags |= flags::TYPED_UAV_LOADS;
                 }
             }
-            None if index.is_some() => runtime = self.runtime_stride(used)?,
-            None => {}
+            None => runtime = self.through_table(index, used, src)?,
         }
         let xs = self.guarded_load(lane_guard, |l| {
             if let Some(f) = *format {
+                if l.raw_through_table(src) {
+                    // The format's bytes (a byte or a half is read in its
+                    // dword, which the view's bytes hold whole).
+                    let width = buffer_format(f)
+                        .map_or(4, |(bits, _)| (bits.iter().sum::<u32>() / 8).max(1));
+                    return l.runtime_access(src, None, off, width, 11 | u, |l, h, byte| {
+                        l.format_load(h, byte, f, count)
+                    });
+                }
                 let h = l.handle(site, src, false, (11 | u, 0))?;
                 return l.format_load(h, off, f, count);
             }
@@ -538,7 +545,7 @@ impl<'a> Lower<'a> {
                 let mask = l.s.m.i8((1u8 << count) - 1);
                 let align = l.s.m.i32(4);
                 let (h, coords) = match index {
-                    Some(index) if runtime => {
+                    _ if runtime => {
                         // Loads where the table's range checks fail read 0.
                         return l.runtime_access(
                             src,
@@ -556,12 +563,12 @@ impl<'a> Lower<'a> {
                                     139,
                                     &[h, byte, iu, mask, align],
                                 );
-                                (0..count)
+                                Ok((0..count)
                                     .map(|k| {
                                         let x = l.s.m.extract(c, r, k);
                                         l.as_int(x)
                                     })
-                                    .collect()
+                                    .collect())
                             },
                         );
                     }
@@ -624,28 +631,52 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether a raw access of `src`'s buffer (an untyped load, store or
+    /// atomic, a format load) goes through the runtime stride table: by
+    /// element (`index`) when its stride is not known here
+    /// ([`Self::runtime_stride`]), by offset alone for a view-heap
+    /// descriptor on a target with the table ([`Self::raw_through_table`]).
+    fn through_table(
+        &self,
+        index: Option<V>,
+        used: Option<&UsedResource>,
+        src: &Source,
+    ) -> Result<bool, Why> {
+        match index {
+            Some(_) => self.runtime_stride(used),
+            None => Ok(self.raw_through_table(src)),
+        }
+    }
+
     /// Runs `access` (with the raw handle and the byte in its view) on the
     /// view the runtime stride table names for `src`'s slot, in the lanes
-    /// where an access of `width` bytes at byte `off` of element `index`
-    /// passes the table's range checks ([`Self::runtime_view`]); what it
-    /// gives is 0 in the others. `props` are the raw handle's (11, with
-    /// the UAV bit for unordered access). The caller's guard, if any, is
-    /// around it: nothing is read for a lane that must not access.
+    /// where an access of `width` bytes at byte `off` (of element `index`,
+    /// or by offset alone) passes the table's range checks
+    /// ([`Self::runtime_view`]); what it gives is 0 in the others. `props`
+    /// are the raw handle's (11, with the UAV bit for unordered access). The
+    /// caller's guard, if any, is around it: nothing is read for a lane
+    /// that must not access.
     pub(super) fn runtime_access(
         &mut self,
         src: &Source,
-        index: V,
+        index: Option<V>,
         off: V,
         width: u32,
         props: u32,
-        access: impl FnOnce(&mut Self, V, V) -> Vec<V>,
+        access: impl FnOnce(&mut Self, V, V) -> Result<Vec<V>, Why>,
     ) -> Result<Vec<V>, Why> {
         let (e, byte, valid) = self.runtime_view(src, index, off, width)?;
         let at = self.begin_guarded(Some(valid));
         let h = self
             .s
             .heap_handle(self.cur, e.raw, false, e.nonuniform, (props, 0));
-        let xs = access(self, h, byte);
+        let xs = match access(self, h, byte) {
+            Ok(xs) => xs,
+            Err(why) => {
+                self.end_guarded(at, &[]);
+                return Err(why);
+            }
+        };
         let zero = self.s.m.i32(0);
         let pairs: Vec<(V, V)> = xs.iter().map(|&x| (x, zero)).collect();
         Ok(self.end_guarded(at, &pairs))

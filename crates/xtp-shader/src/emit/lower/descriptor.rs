@@ -319,49 +319,75 @@ impl<'a> Lower<'a> {
     }
 
     /// Where an access of `width` bytes at byte `off` of element `index` of
-    /// `src`'s buffer goes when its stride was not known at translation:
-    /// the runtime stride table's entry for its slot, the byte in the raw
-    /// view that entry names (`index * stride + off`, past its bias; `off`
-    /// alone for a raw view, as the console reads a descriptor of no
-    /// stride), and whether the access is made at all.
+    /// `src`'s buffer goes through the runtime stride table: the entry for
+    /// its slot, the byte in the raw view that entry names, and whether the
+    /// access is made at all. The byte is `index * stride + off` past the
+    /// raw view's bias; `off` alone for a raw view (as the console reads a
+    /// descriptor of no stride) and for an access by offset alone (no
+    /// `index`: the view's bytes from its start).
     ///
     /// It is made with the console's range checks, and only then: through
-    /// a buffer view (an entry of zeros names none), at an element below
-    /// the view's count, inside the element (`off + width <= stride`; for
-    /// a raw view, inside its bytes). Where they fail the console reads 0
-    /// and drops writes; here the access is not made, so neither the
-    /// bytes the raw view holds before the view (its bias) nor the next
-    /// element are reached, and `index * stride` cannot wrap (the count
-    /// times the stride fits the view).
+    /// a buffer view (an entry of zeros names none), and by element at an
+    /// element below the view's count and inside the element (`off + width
+    /// <= stride`), by offset inside the view's bytes. Where they fail the
+    /// console reads 0 and drops writes; here the access is not made, so
+    /// neither the bytes the raw view holds before the view (its bias) nor
+    /// the next element are reached, and `index * stride` cannot wrap (the
+    /// count times the stride fits the view).
     pub(super) fn runtime_view(
         &mut self,
         src: &Source,
-        index: V,
+        index: Option<V>,
         off: V,
         width: u32,
     ) -> Result<(Entry, V, V), Why> {
         let e = self.stride_entry(src)?;
         let c = self.cur;
-        let (zero, width, k2) = (self.s.m.i32(0), self.s.m.i32(width), self.s.m.i32(2));
+        let (zero, four, width) = (self.s.m.i32(0), self.s.m.i32(4), self.s.m.i32(width));
         let end = self.s.m.bin(c, Bin::Add, off, width);
-        // Structured or typed: the element, then the bytes in it (`off`
-        // below the stride first, so `off + width` cannot wrap).
-        let element = self.s.m.cmp(c, pred::IULT, index, e.count);
-        let starts = self.s.m.cmp(c, pred::IULT, off, e.stride);
-        let ends = self.s.m.cmp(c, pred::IULE, end, e.stride);
-        let inside = self.s.m.bin(c, Bin::And, starts, ends);
-        let by_element = self.s.m.bin(c, Bin::And, element, inside);
-        // Raw: the bytes of its count of dwords.
-        let size = self.s.m.bin(c, Bin::Shl, e.count, k2);
+        let raw = self.s.m.cmp(c, pred::EQ, e.stride, zero);
+        // The view's bytes: its count of elements (of dwords for a raw view;
+        // the host keeps the product inside the raw view, under 2^30). `off`
+        // below them first, so `off + width` cannot wrap.
+        let element = self.s.m.select(c, raw, four, e.stride);
+        let size = self.s.m.bin(c, Bin::Mul, e.count, element);
         let starts = self.s.m.cmp(c, pred::IULT, off, size);
         let ends = self.s.m.cmp(c, pred::IULE, end, size);
         let by_byte = self.s.m.bin(c, Bin::And, starts, ends);
-        let raw = self.s.m.cmp(c, pred::EQ, e.stride, zero);
+        let Some(index) = index else {
+            let byte = self.s.m.bin(c, Bin::Add, off, e.bias);
+            return Ok((e, byte, by_byte));
+        };
+        // Structured or typed: the element, then the bytes in it.
+        let in_count = self.s.m.cmp(c, pred::IULT, index, e.count);
+        let starts = self.s.m.cmp(c, pred::IULT, off, e.stride);
+        let ends = self.s.m.cmp(c, pred::IULE, end, e.stride);
+        let inside = self.s.m.bin(c, Bin::And, starts, ends);
+        let by_element = self.s.m.bin(c, Bin::And, in_count, inside);
         let valid = self.s.m.select(c, raw, by_byte, by_element);
         let at = self.s.m.bin(c, Bin::Mul, index, e.stride);
         let at = self.s.m.bin(c, Bin::Add, at, off);
         let byte = self.s.m.bin(c, Bin::Add, at, e.bias);
         Ok((e, byte, valid))
+    }
+
+    /// Whether accesses of `src`'s buffer by offset alone go through the
+    /// runtime stride table's raw view: on a target that has the table,
+    /// for a descriptor of the view heap. The handle is then raw over a
+    /// raw view whatever view the title made; read raw, a structured view
+    /// returns other dwords or zeros on NVIDIA (watch.md items 148 and 160),
+    /// and a texture or null slot is not accessed at all.
+    pub(super) fn raw_through_table(&self, src: &Source) -> bool {
+        self.x.target.stride_table
+            && matches!(
+                src,
+                Source::Loaded { .. }
+                    | Source::Phi { .. }
+                    | Source::Select { .. }
+                    | Source::Fetched { .. }
+                    | Source::Lanes { .. }
+                    | Source::LanePhi { .. }
+            )
     }
 
     /// The heap index of a descriptor that may differ between lanes,

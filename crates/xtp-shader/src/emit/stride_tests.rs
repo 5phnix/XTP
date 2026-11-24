@@ -271,7 +271,8 @@ fn unknown_strides_translate_only_for_a_target_with_the_table() {
     );
     let l = lowered(LOAD_STORE_ATOMICS, 8, ONE_THREAD, TABLE).unwrap();
     assert!(l.stride_table);
-    // A program with no access by element of unknown stride reads none.
+    // An access by offset alone of a view-heap slot reads the table too
+    // on a target with it (the raw view it names), and none without.
     let raw_only = &[
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0302,
@@ -282,10 +283,77 @@ fn unknown_strides_translate_only_for_a_target_with_the_table() {
         0xBF81_0000, // s_endpgm
     ];
     assert!(
-        !lowered(raw_only, 8, ONE_THREAD, TABLE)
+        lowered(raw_only, 8, ONE_THREAD, TABLE)
             .unwrap()
             .stride_table
     );
+    assert!(
+        !lowered(raw_only, 8, ONE_THREAD, Target::ANY)
+            .unwrap()
+            .stride_table
+    );
+}
+
+/// Loads the dword at byte `s1` of the view in table slot 0 by offset
+/// alone and stores it at dword 0 of the raw view in slot 1, both through
+/// the table.
+const LOAD_BY_OFFSET: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xF408_0302,
+    0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+    0x7E02_0201, // v_mov_b32 v1, s1
+    0xE030_1000,
+    0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen
+    0x7E0A_0280, // v_mov_b32 v5, 0
+    0xE070_1000,
+    0x8003_0205, // buffer_store_dword v2, v5, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// A structured view read by offset alone, as raw (byte addressing over
+/// the view): through the raw view of the same bytes the table names, so
+/// the handle and the view are of one kind (NVIDIA reads other dwords or
+/// zeros raw through a structured view: watch.md items 148, 160); zeros
+/// past the view's bytes and through an entry of zeros, where a texture,
+/// constant or null slot would otherwise be read through a raw handle.
+#[test]
+fn accesses_by_offset_go_through_the_raw_view_too() {
+    let cs = shader(LOAD_BY_OFFSET, 8, ONE_THREAD);
+    let data: Vec<u32> = (100..164).collect();
+    // Four elements of 16 bytes from element 1 (byte 16): 64 bytes.
+    let (raw, entry) = raw_view_of(0, 2, (1, 4, 16));
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(4),
+        raw,
+    ];
+    let out_entry = StrideEntry {
+        stride: 0,
+        raw_slot: Some(1),
+        bias: 0,
+        count: 4,
+    };
+    let (_one, hosts) = hosts();
+    for (name, host) in &hosts {
+        for (off, want) in [(0, 104), (4, 105), (60, 119), (64, 0), (u32::MAX - 1, 0)] {
+            let out = run(host, &cs, [0, off, 0, 0], &views, &[entry, out_entry], 1);
+            assert_eq!(out[0][0], want, "byte {off} on {name}");
+        }
+        let none = run(
+            host,
+            &cs,
+            [0, 4, 0, 0],
+            &views,
+            &[StrideEntry::NONE, out_entry],
+            1,
+        );
+        assert_eq!(none[0][0], 0, "an entry of zeros on {name}");
+    }
 }
 
 /// Every kind of view the title can put in the slot reads and writes the
@@ -386,7 +454,13 @@ fn reads_past_the_view_or_its_element_read_zero() {
         View::RawUav(4),
         raw,
     ];
-    let unused = StrideEntry::NONE;
+    // The raw view the results are stored in, by offset: its own slot.
+    let results = StrideEntry {
+        stride: 0,
+        raw_slot: Some(1),
+        bias: 0,
+        count: 4,
+    };
     let (_one, hosts) = hosts();
     for (name, host) in &hosts {
         // [index, offset] → the dword, then the two dwords.
@@ -405,7 +479,7 @@ fn reads_past_the_view_or_its_element_read_zero() {
             (1 << 30, 4, [0, 0, 0]),
             (u32::MAX, 0, [0, 0, 0]),
         ] {
-            let out = run(host, &cs, [index, off, 0, 0], &views, &[entry, unused], 1);
+            let out = run(host, &cs, [index, off, 0, 0], &views, &[entry, results], 1);
             assert_eq!(out[0][..3], want, "[{index}, {off}] on {name}");
         }
     }
