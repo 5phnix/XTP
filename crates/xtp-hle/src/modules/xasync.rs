@@ -647,9 +647,17 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+    if wait {
+        while status(block) == E_PENDING {
+            if let Some(call) = call(block) {
+                let done = lock(&call.done);
+                drop(call.finished.wait_while(done, |d| !*d));
+            } else {
+                // Cleanup removes the call before publishing its result. A
+                // waiter arriving in between must not return that stale pending status.
+                std::thread::yield_now();
+            }
+        }
     }
     status(block)
 }
@@ -1269,6 +1277,63 @@ mod tests {
             S_OK
         );
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+    }
+
+    #[test]
+    fn a_status_wait_outlasts_provider_cleanup() {
+        static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
+        static CLEANUP_RELEASE: AtomicBool = AtomicBool::new(false);
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data.
+            let data = unsafe { &*data };
+            match op {
+                OP_BEGIN => XAsyncSchedule(data.block, 0),
+                OP_DO_WORK => E_ABORT,
+                OP_CLEANUP => {
+                    CLEANUP_STARTED.store(true, Ordering::SeqCst);
+                    while !CLEANUP_RELEASE.load(Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+        CLEANUP_STARTED.store(false, Ordering::SeqCst);
+        CLEANUP_RELEASE.store(false, Ordering::SeqCst);
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                std::ptr::null_mut(),
+                0x88 as *const c_void,
+                std::ptr::null(),
+                Some(provider)
+            ),
+            S_OK
+        );
+        let queue = q as usize;
+        let work = std::thread::spawn(move || XTaskQueueDispatch(queue as *const Queue, WORK, 0));
+        while !CLEANUP_STARTED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let release = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            CLEANUP_RELEASE.store(true, Ordering::SeqCst);
+        });
+        let result = XAsyncGetStatus(&mut block, true);
+        CLEANUP_RELEASE.store(true, Ordering::SeqCst);
+        release.join().unwrap();
+        assert!(work.join().unwrap());
+        XTaskQueueCloseHandle(q);
+        assert_eq!(result, E_ABORT);
     }
 
     #[test]
