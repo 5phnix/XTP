@@ -103,7 +103,7 @@ Outside the crate: `crates/xtp-hle/src/modules/xmem.rs` (title GPU memory),
 | `scripts/gen_tiling.py` | 110 | GFX10 swizzle tables from Mesa addrlib (formats report) |
 
 Docs: `README.md`, `AGENTS.md`, `HANDOFF.md` (GPU findings, around lines
-560–700 and 1600–1700) and `docs/specs/2026-11-20-xcl-design.md` §5.5a, §5.7, §9.
+560–700 and 1600–1700) and xcl's design notes (`docs/specs/`) §5.5a, §5.7, §9.
 
 ## 3. The two designs in one page
 
@@ -621,7 +621,7 @@ staleness; one after G12 does the same for speed and hangs.
    reason (no translation, budget, signature)? The log exists; the numbers
    are not recorded.
 3. Does BTP 6 present more than one plane (for example HUD and world), given
-   that only plane 0 is shown? The title card renders and the scene after it
+   that only plane 0 is shown? The opening credits render and the scene after them
    does not.
 4. Which resources does BTP 6's world read through directly indexed heaps
    versus tables? This decides how much G5 and G6 alone recover.

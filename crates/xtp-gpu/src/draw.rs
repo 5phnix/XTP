@@ -1253,8 +1253,8 @@ impl State {
     /// runs, direct or indirect, starts with a global UAV barrier. From Marvisak/VIctory#1392 by
     /// kunalkhude99, for issue #1347: an RTX 4060 lost its device on a
     /// dispatch of `4c0ac499ad613809` right after three dropped ones, and
-    /// an RTX 3060 Ti named the same program (docs/upstream/watch.md, items
-    /// 99 and 108).
+    /// an RTX 3060 Ti named the same program (the maintainers' private
+    /// watch notes).
     /// The PR's reason does not hold here as such: XTP records the title's
     /// own barriers (`list::barrier`, `list::barrier_groups`) and a dropped
     /// dispatch records nothing, so no barrier the title asked for goes

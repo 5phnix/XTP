@@ -32,13 +32,15 @@ const ALLOWED_NAMES: &[&str] = &[
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
     "crates/xtp-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision; docs/asset-policy.md)",
 )];
 
-/// Names that never appear in the repository: the title is called "BTP 6"
-/// here (the owner's decision, 2026-11-24). Stored reversed so that this
-/// file does not contain them; matched case-insensitively.
+/// Commercial titles and their publishers are not named in this repository
+/// (CONTRIBUTING.md, "Writing about titles"). Neither are a title's setting
+/// or a local game folder. Stored reversed so that this file does not
+/// contain them; matched case-insensitively, in every file.
 const FORBIDDEN_NAMES_REVERSED: &[&str] = &[
+    // a title
     "otua tfeht dnarg",
     "iv atg",
     "6 atg",
@@ -48,17 +50,36 @@ const FORBIDDEN_NAMES_REVERSED: &[&str] = &[
     "6_atg",
     "iv_atg",
     "ivatg",
+    // its publisher and the publisher's parent company
     "ratskcor",
+    "owt-ekat",
+    "owtekat",
+    "owt_ekat",
+    "evitcaretni owt ekat",
+    // its setting: the state and the city
+    "adinoel",
+    "ytic eciv",
+    "yticeciv",
+    "ytic-eciv",
+    "ytic_eciv",
+    // a local game folder
+    "uwu\\:e",
+    "uwu/:e",
 ];
 
-/// The forbidden names found in `content`, lower-case.
-fn forbidden_names(content: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(content).to_lowercase();
-    FORBIDDEN_NAMES_REVERSED
+/// A title's file names, stored reversed like the names above. They may
+/// appear only under `TITLE_FILE_PATHS`, where that title's build identity,
+/// hooks, launch defaults and autopilot script live.
+const TITLE_FILE_NAMES_REVERSED: &[&str] = &["retsam_ttelracs_emag"];
+const TITLE_FILE_PATHS: &[&str] = &["crates/xtp-game/", "xtask/", "autopilot/gameplay.txt"];
+
+/// The names of `reversed` found in `text` (already lower-case).
+fn found(text: &str, reversed: &[&str]) -> usize {
+    reversed
         .iter()
         .map(|r| r.chars().rev().collect::<String>())
         .filter(|name| text.contains(name.as_str()))
-        .collect()
+        .count()
 }
 
 /// Signatures of formats that must never be committed.
@@ -201,12 +222,24 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
         problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
     }
     if !content.contains(&0) {
-        let found = forbidden_names(content);
-        if !found.is_empty() {
+        let text = String::from_utf8_lossy(content).to_lowercase();
+        let names = found(&text, FORBIDDEN_NAMES_REVERSED);
+        if names > 0 {
             problems.push(format!(
-                "names the title or its publisher ({} match); call the title \"BTP 6\"",
-                found.len()
+                "names a commercial title, its publisher or its setting, or a local game \
+                 folder ({names} match); describe the platform behaviour instead \
+                 (CONTRIBUTING.md, \"Writing about titles\")"
             ));
+        }
+        if !TITLE_FILE_PATHS.iter().any(|p| path.starts_with(p)) {
+            let files = found(&text, TITLE_FILE_NAMES_REVERSED);
+            if files > 0 {
+                problems.push(format!(
+                    "names a title's file ({files} match); outside {} say \"the title \
+                     executable\"",
+                    TITLE_FILE_PATHS.join(", ")
+                ));
+            }
         }
     }
     problems
@@ -254,13 +287,66 @@ mod tests {
         );
     }
 
+    fn unreversed(reversed: &str) -> String {
+        reversed.chars().rev().collect()
+    }
+
     #[test]
     fn rejects_the_title_name() {
-        let name: String = "otua tfeht dnarg".chars().rev().collect();
+        let name = unreversed("otua tfeht dnarg");
         let text = format!("// as {} does\n", name.to_uppercase());
         assert!(!check("crates/x/src/lib.rs", text.as_bytes()).is_empty());
         assert!(check("crates/x/src/lib.rs", b"// as BTP 6 does\n").is_empty());
-        assert!(!check("docs/upstream/watch.md", text.as_bytes()).is_empty());
+        assert!(!check("docs/analysis/notes.md", text.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn rejects_the_parent_company_the_setting_and_the_game_folder() {
+        for reversed in [
+            "evitcaretni owt ekat",
+            "owt-ekat",
+            "adinoel",
+            "ytic eciv",
+            "uwu\\:e",
+        ] {
+            let name = unreversed(reversed);
+            for text in [
+                format!("seen in {name}\n"),
+                format!("SEEN IN {}\n", name.to_uppercase()),
+            ] {
+                for path in ["docs/analysis/notes.md", "crates/xtp-game/src/lib.rs"] {
+                    assert!(
+                        !check(path, text.as_bytes()).is_empty(),
+                        "{reversed} in {path}"
+                    );
+                }
+            }
+        }
+        assert!(check("docs/a.md", b"read `<title folder>\\shaders.rpf`\n").is_empty());
+        assert!(
+            check("crates/x/src/lib.rs", b"// take two arguments\n").is_empty(),
+            "plain English stays allowed"
+        );
+    }
+
+    #[test]
+    fn names_the_title_executable_only_where_its_build_lives() {
+        let text = format!("run `{}.exe`\n", unreversed("retsam_ttelracs_emag"));
+        for path in [
+            "crates/xtp-game/src/lib.rs",
+            "xtask/src/play.rs",
+            "autopilot/gameplay.txt",
+        ] {
+            assert!(check(path, text.as_bytes()).is_empty(), "{path}");
+        }
+        for path in [
+            "docs/dev/autopilot.md",
+            "apps/xtp/src/main.rs",
+            "autopilot/other.txt",
+            "crates/xtp-gpu/src/lib.rs",
+        ] {
+            assert!(!check(path, text.as_bytes()).is_empty(), "{path}");
+        }
     }
 
     #[test]

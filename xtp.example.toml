@@ -1,10 +1,10 @@
-# Copy to `xtp.toml` (git-ignored) and point it at YOUR files.
+# Copy to `xtp.toml` (git-ignored) and set the paths below.
 # Every path must be OUTSIDE the repository; the tools refuse otherwise.
 # Environment variables (shown below) take precedence over this file.
 # XTP_CONFIG selects a different config file.
 
 [paths]
-# Your own dump of BTP 6.     env: XTP_GAME_DIR
+# Title folder to run (outside the repository).   env: XTP_GAME_DIR
 game_dir = 'D:\xtp-data\game'
 
 # Derived data. Default: %LOCALAPPDATA%\xtp\cache.   env: XTP_CACHE_DIR

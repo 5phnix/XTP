@@ -176,7 +176,7 @@ pub(super) fn barrier_after_loop(
 /// the variable starts past the bound (a bound of 0 read from a buffer the
 /// host has not written, or the console's own guard left out), it never
 /// equals it before wrapping around, so the loop runs to its limit in every
-/// lane (watch item 134, VIctory #71's pixel loop). It keeps the general
+/// lane (VIctory #71's pixel loop). It keeps the general
 /// limit.
 // shortcut: the bound itself may come from such data (a count in a buffer
 // the host has not written), and then the loop runs to the higher limit.
