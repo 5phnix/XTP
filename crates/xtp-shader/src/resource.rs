@@ -301,34 +301,9 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    /// Memo of [`Tracer::uniform`] per value.
-    uniform_memo: std::cell::RefCell<Vec<Option<bool>>>,
-    /// Per value: whether a phi is uniform, settled on first use
-    /// ([`uniform`] module).
-    phi_ok: std::cell::RefCell<Option<Vec<bool>>>,
-    regions: std::cell::OnceCell<uniform::Regions>,
+    /// Which values every lane holds alike ([`uniform`]).
+    uniformity: uniform::Uniformity,
 }
-
-/// VALU operations whose result is uniform when their operands are: the
-/// address arithmetic a compiler moves into VGPRs and then reads back with
-/// `v_readfirstlane_b32`.
-const UNIFORM_VALU: &[&str] = &[
-    "v_mov_b32",
-    "v_add_co_u32",
-    "v_add_nc_u32",
-    "v_add_co_ci_u32",
-    "v_sub_co_u32",
-    "v_sub_nc_u32",
-    "v_lshlrev_b32",
-    "v_lshlrev_b64",
-    "v_lshl_add_u32",
-    "v_add3_u32",
-    "v_ashrrev_i32",
-    "v_med3_i32",
-    "v_and_b32",
-    "v_or_b32",
-    "v_mul_lo_u32",
-];
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
 /// its negation where not.
@@ -389,9 +364,7 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
-            uniform_memo: std::cell::RefCell::new(vec![None; n]),
-            phi_ok: std::cell::RefCell::new(None),
-            regions: std::cell::OnceCell::new(),
+            uniformity: uniform::Uniformity::new(n),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -1060,66 +1033,6 @@ impl<'a> Tracer<'a> {
             return None;
         };
         inst.read(Reg::V(reg))
-    }
-
-    /// The VGPR a `v_readfirstlane_b32` writing `v` reads, when that value
-    /// is uniform: the first lane's is then every lane's.
-    fn uniform_first_lane(&self, v: Value) -> Option<Value> {
-        self.first_lane_source(v).filter(|&s| self.uniform(s))
-    }
-
-    /// `t`, with a first-lane read of a uniform value replaced by its source.
-    fn unlaned(&self, t: Term) -> Term {
-        match t {
-            Term::Value(v) => self
-                .uniform_first_lane(v)
-                .map_or(t, |src| self.vorigin(src)),
-            Term::Const(_) => t,
-        }
-    }
-
-    /// Whether every lane holds the same value of `v`: built from scalars,
-    /// constants and first-lane reads, through [`UNIFORM_VALU`].
-    fn uniform(&self, v: Value) -> bool {
-        let memo = self.uniform_memo.borrow()[v.0 as usize];
-        if let Some(known) = memo {
-            return known;
-        }
-        let known = self.uniform_now(v);
-        self.uniform_memo.borrow_mut()[v.0 as usize] = Some(known);
-        known
-    }
-
-    fn uniform_now(&self, v: Value) -> bool {
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return matches!(reg, Reg::S(_));
-        }
-        if self.phis[v.0 as usize].is_some() {
-            return self.phi_uniform(v);
-        }
-        let Some(inst) = self.def(v) else {
-            return false;
-        };
-        if matches!(inst.name(), "v_readfirstlane_b32" | "v_readlane_b32") {
-            return true;
-        }
-        let uniform_op = |op: &Operand| match *op {
-            Operand::Vector { reg, dwords } => {
-                (0..dwords).all(|k| inst.read(Reg::V(reg + k)).is_some_and(|x| self.uniform(x)))
-            }
-            Operand::Scalar { code, dwords } if code != NULL => {
-                (0..dwords).all(|k| inst.read(Reg::S(code + k)).is_some_and(|x| self.uniform(x)))
-            }
-            _ => true,
-        };
-        match &inst.fields {
-            Fields::Sop { src, .. } => src.iter().all(uniform_op),
-            Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => {
-                f.src.iter().all(uniform_op)
-                    && self.valu_reads_uniform(inst, self.guarded(v))
-            }
-            _ => false,
-        }
     }
 
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
@@ -2243,6 +2156,154 @@ pub(crate) mod tests {
                 what: "an address read from the first lane of a per-lane value"
             }
         );
+    }
+
+    const PER_LANE_FIRST_LANE: &str = "an address read from the first lane of a per-lane value";
+
+    /// A table in the code at `s_getpc_b64` + 0xddc, read at index v7 through
+    /// first-lane reads of the VGPR address (as [`CODE_TABLE_FIRST_LANE`]),
+    /// after `setup`, which sets v7. Wave32, hand-assembled for gfx1030 (the
+    /// encodings of the tests above; opcodes from `gfx10/opcodes.rs`). The
+    /// `s_load_dword` is at byte `4 * (11 + setup.len())`.
+    fn code_table_at_v7(setup: &[u32]) -> Vec<u32> {
+        let mut w = vec![
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+        ];
+        w.extend(setup);
+        w.extend([
+            0x3402_0E82, // v_lshlrev_b32 v1, 2, v7
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ]);
+        w
+    }
+
+    /// The tracing of `words` (wave32 compute, no layout), which must
+    /// structure: the rules under test need the per-lane form.
+    fn code_table_trace(words: &[u32]) -> Result<Resources, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = lanes(&p).expect("the program structures");
+        track(&p, &[], HwStage::Cs, Some(&st))
+    }
+
+    fn per_lane_refusal(offset: usize) -> ShaderError {
+        ShaderError::Unsupported {
+            offset,
+            what: PER_LANE_FIRST_LANE,
+        }
+    }
+
+    #[test]
+    fn a_code_table_index_every_lane_sets_alike_is_traced() {
+        // v_mov_b32 v7, 3
+        let r = code_table_trace(&code_table_at_v7(&[0x7E0E_0283])).unwrap();
+        let (_, a) = r.scalar.iter().find(|s| s.1.param == CODE).unwrap();
+        assert_eq!(a.offset, 4 + 0xDDC);
+        assert!(a.dynamic.is_some());
+    }
+
+    /// `s_cbranch_execz` is a branch on each lane's own EXEC bit in the
+    /// per-lane form: the lanes the `s_and_saveexec` left out skip the write
+    /// and reach the join with the old v7. (VIctory#1231 took the branch as
+    /// uniform and traced this.)
+    #[test]
+    fn a_value_joined_after_an_execz_skip_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0: lanes 0 to 4
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_0001, // s_cbranch_execz over the next instruction
+            0x7E0E_0283, // v_mov_b32 v7, 3
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8 (the join)
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(68));
+    }
+
+    /// A write under EXEC narrowed by a per-lane compare, without a branch:
+    /// lanes 0 to 4 hold 3, the others 0. (VIctory#1231 took it as uniform
+    /// because its old value is.)
+    #[test]
+    fn a_guarded_write_of_a_uniform_value_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0x7E0E_0283, // v_mov_b32 v7, 3
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(64));
+    }
+
+    /// A carry-in is read lane by lane: from a mask copied out of an SGPR,
+    /// each lane adds its own bit of s5. (VIctory#1225 took the carry as
+    /// uniform because the SGPR value is.)
+    #[test]
+    fn a_carry_in_from_an_sgpr_mask_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0xBEEA_0305, // s_mov_b32 vcc_lo, s5
+            0xD528_6A07,
+            0x01AA_0E80, // v_add_co_ci_u32 v7, vcc_lo, 0, v7, vcc_lo
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+    }
+
+    /// A DPP move reads another lane's v8; the first lane of each row has
+    /// none and keeps its old v7 (5, where the others get 3).
+    #[test]
+    fn a_dpp_move_of_a_uniform_value_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0x7E0E_0285, // v_mov_b32 v7, 5
+            0x7E10_0283, // v_mov_b32 v8, 3
+            0x7E0E_02FA,
+            0xFF01_1108, // v_mov_b32_dpp v7, v8 row_shr:1 row_mask:0xf bank_mask:0xf
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+    }
+
+    /// Per lane, only lanes 0 to 4 enter the block and all of them set v7
+    /// alike. In the console flow every lane runs it, and lanes 5 to 31 keep
+    /// their own v7, load other dwords into s6 and read them after the join:
+    /// the claim must hold in both lowerings, so it is refused.
+    #[test]
+    fn a_code_table_index_set_under_a_narrowed_exec_is_per_lane_in_the_console_flow() {
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_000A, // s_cbranch_execz end
+            0x7E0E_0283, // v_mov_b32 v7, 3
+            0x3402_0E82, // v_lshlrev_b32 v1, 2, v7
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0x887E_087E, // end: s_or_b32 exec_lo, exec_lo, s8
+            0x7E12_0206, // v_mov_b32 v9, s6
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(crate::structure::structure_console(&p).is_ok());
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the
