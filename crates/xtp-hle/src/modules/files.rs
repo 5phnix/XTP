@@ -2354,22 +2354,31 @@ mod tests {
         close(h);
         assert_eq!(contents(&path).unwrap(), b"changed bytes");
 
+        // The CRT opens below ask for `N` and `_O_NOINHERIT`. A CRT handle
+        // is inheritable by default, and other tests in this binary start
+        // child processes (xgamesave, xmem): a child started while one is
+        // open keeps a duplicate, without FILE_SHARE_DELETE, until it
+        // exits, and the reads, renames and deletes below then fail with
+        // ERROR_SHARING_VIOLATION. The flag changes nothing the overlay
+        // does: the mode and the flags reach the host CRT as they are.
+
         // So does `fopen`, and a new file lives in the overlay only.
-        let f = fopen(m.narrow("data/level.dat").as_ptr().cast(), c"ab".as_ptr());
+        let f = fopen(m.narrow("data/level.dat").as_ptr().cast(), c"abN".as_ptr());
         assert!(!f.is_null());
         assert_eq!(fwrite(b"+more".as_ptr(), 1, 5, f), 5);
         fclose(f);
         assert_eq!(contents(&m.path("data\\level.dat")).unwrap(), b"level+more");
         assert!(m.overlay.join("files\\data\\level.dat").is_file());
-        let f = _wfopen(m.path("new.txt").as_ptr(), w("w").as_ptr());
+        let f = _wfopen(m.path("new.txt").as_ptr(), w("wN").as_ptr());
         assert!(!f.is_null());
         fclose(f);
         assert!(m.overlay.join("files\\new.txt").is_file());
         const O_WRONLY: i32 = 1;
+        const O_NOINHERIT: i32 = 0x80;
         const O_TRUNC: i32 = 0x200;
         let fd = _wopen(
             m.path("data\\sub\\deep.txt").as_ptr(),
-            O_WRONLY | O_TRUNC,
+            O_WRONLY | O_TRUNC | O_NOINHERIT,
             0,
         );
         assert!(fd >= 0);
