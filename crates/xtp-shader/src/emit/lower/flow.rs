@@ -1,14 +1,99 @@
 //! Control flow: each block's exit (branches, loops and their iteration
 //! limit, the end of the program), the blocks that split edges, and the
 //! phis, filled once every block is lowered.
+//!
+//! A lane stopped by the iteration limit leaves the program as killed,
+//! through a conditional back edge as through an unconditional one: each
+//! back edge goes through a latch of its own that sends a lane at the limit
+//! to the abort block (Marvisak/VIctory#1483). Where a group barrier can
+//! follow a loop, the lanes that end keep passing group barriers until
+//! every thread of the group has ended ([`Drain`]).
 
 use std::collections::{HashMap, HashSet};
 
 use super::{Lower, Stop, Val, Why, unsupported};
-use crate::emit::bitcode::{Attr, Bin, Term, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Rmw, Term, V, pred};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
+
+/// Lanes that end and keep passing group barriers.
+///
+/// A lane stopped by the iteration limit returns. A group barrier that the
+/// other lanes reach later would wait for it: D3D12 does not define a
+/// group sync once some threads have returned, and VItoriaBr `808a209`
+/// reports it hanging. So in a program where a group barrier can follow a
+/// loop ([`barrier_after_loop`]), every lane that ends, stopped by the limit
+/// or at the program's end, counts itself ended and passes group barriers
+/// until every thread of the group has ended; then all of them return after
+/// the same barrier (item 94's form, VIctory #1433, for any flow).
+///
+/// The decision is exact. Every barrier is one that all threads pass, so
+/// between two barriers all threads have passed the same number of them;
+/// each lane carries that number (an SSA value, from each block's
+/// `s_barrier`s). A lane that ends having passed `c` barriers adds 1 to the
+/// count of parity `c % 2`; after each later barrier it reads only the
+/// count of the other parity, which no thread writes before the next
+/// barrier. The two counts it read on either side of a barrier sum to the
+/// threads that ended before it, the same in every thread.
+// shortcut: where a barrier is the wave's (AMD), a lane that ended waits,
+// masked, while the rest of its wave goes on through barriers, so it counts
+// fewer barriers than its wave passed, and its count can land in the parity
+// others are reading. Threads may then return a barrier apart; there a wave
+// that has ended leaves the barrier, so none is waited for, and every count
+// still reaches the group's size.
+#[derive(Default)]
+pub(super) struct Drain {
+    /// Whether the program's lanes drain (none: not decided yet; decided at
+    /// the entry block's exit).
+    on: Option<bool>,
+    /// Per IR block: the barriers a lane has passed when it enters it (a
+    /// phi, filled by [`Lower::fill_phis`]).
+    entry: Vec<(usize, V)>,
+    /// Per IR block: the barriers a lane has passed when it leaves it.
+    exit: HashMap<usize, V>,
+    /// The two group-shared counts of the threads that ended, by the parity
+    /// of the barriers they had passed.
+    ended: Option<V>,
+    /// The block an ending lane enters, and the phi of its barrier count.
+    block: Option<(usize, V)>,
+    /// That phi's incoming.
+    incoming: Vec<(V, usize)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether the program this thread lowered last drains (none: not
+    /// decided). WARP does not wait at a group barrier for a thread that has
+    /// returned, so no dispatch there shows what draining is for.
+    pub(super) static DRAINS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`Drain`]'s counts do not fit next to the program's LDS.
+pub(super) const NO_ROOM_TO_DRAIN: Why =
+    "a program whose LDS leaves no room for the loop limit's count of ended threads";
+
+/// Whether a group barrier (a block where `barrier` holds) is reachable from
+/// one of the loop `headers`: a lane the limit stops in that loop leaves
+/// before it, or before the next pass through it.
+pub(super) fn barrier_after_loop(
+    p: &Program,
+    headers: impl IntoIterator<Item = usize>,
+    barrier: impl Fn(usize) -> bool,
+) -> bool {
+    let mut seen = vec![false; p.blocks.len()];
+    let mut work: Vec<usize> = headers.into_iter().collect();
+    while let Some(b) = work.pop() {
+        if std::mem::replace(&mut seen[b], true) {
+            continue;
+        }
+        if barrier(b) {
+            return true;
+        }
+        work.extend(p.blocks[b].exit.successors());
+    }
+    false
+}
 
 /// Headers of the loops a lane leaves once an induction variable passes a
 /// value the loop does not change: a header phi that every iteration adds
@@ -387,10 +472,35 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        // Where lanes that end drain: the barriers a lane has passed when
+        // it leaves this block. The entry block first clears the counts of
+        // ended threads, behind a barrier every thread passes before any
+        // can end.
+        let passed = if self.drains() {
+            let mut cleared = 0;
+            if self.rpo[b] == 0 {
+                if self.s.lds_dwords + 2 > 8192 {
+                    return Err(unsupported(offset, NO_ROOM_TO_DRAIN));
+                }
+                let ended = self.ended_counts();
+                let c = self.cur;
+                let z = self.s.m.i32(0);
+                for k in [0, 1] {
+                    let at = self.s.m.i32(k);
+                    let count = self.s.m.element(c, ended, at);
+                    self.s.m.store(c, count, z);
+                }
+                self.group_barrier(c);
+                cleared = 1;
+            }
+            Some(self.passed(b, cleared))
+        } else {
+            None
+        };
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let ok = self.count_iteration(t, self.cur);
+                let abort = self.abort_block(self.cur, passed);
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -401,7 +511,7 @@ impl<'a> Lower<'a> {
                 taken, not_taken, ..
             } if self.console_cf => {
                 let cond = self.console_branch(b).map_err(|w| unsupported(offset, w))?;
-                self.branch_term(b, cond, taken, not_taken)
+                self.branch_term(b, cond, taken, not_taken, passed)
             }
             LaneExit::Branch {
                 when,
@@ -423,7 +533,7 @@ impl<'a> Lower<'a> {
                         (c, taken, not_taken)
                     }
                 };
-                self.branch_term(b, cond, taken, not_taken)
+                self.branch_term(b, cond, taken, not_taken, passed)
             }
             LaneExit::End => {
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
@@ -432,7 +542,10 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
-                Term::Ret
+                match passed {
+                    Some(n) => Term::Br(self.drain_from(self.cur, n)),
+                    None => Term::Ret,
+                }
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
@@ -441,24 +554,36 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// The terminator of block `b` branching to `taken` where `cond` holds.
-    fn branch_term(&mut self, b: usize, cond: V, taken: usize, not_taken: usize) -> Term {
-        // A back edge is taken only below the iteration limit.
+    /// The terminator of block `b` branching to `taken` where `cond` holds
+    /// (`passed`: the barriers a lane has passed there, where lanes drain).
+    fn branch_term(
+        &mut self,
+        b: usize,
+        cond: V,
+        taken: usize,
+        not_taken: usize,
+        passed: Option<V>,
+    ) -> Term {
         let back = |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
-        // (No `xor` of a compare: a loop exit testing one hung the
-        // AMD driver.)
-        let cond = if back(self, taken) {
-            let ok = self.count_iteration(taken, pred::IULT);
-            self.s.m.bin(self.cur, Bin::And, cond, ok)
-        } else if back(self, not_taken) {
-            let stop = self.count_iteration(not_taken, pred::IUGE);
-            self.s.m.bin(self.cur, Bin::Or, cond, stop)
-        } else {
-            cond
-        };
         // Critical edges get a block of their own, so loops have
         // dedicated exits and preheaders as DXC emits them.
-        let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+        let (mut t, mut f) = (self.edge(b, taken), self.edge(b, not_taken));
+        // A back edge goes through a latch of its own, which goes on below
+        // the iteration limit and leaves through the abort block at it.
+        // (Folding the limit into the branch condition sent a lane at the
+        // limit down the loop's exit, on through the program with the
+        // loop's values unfinished: it stored them.)
+        // Ported from Marvisak/VIctory#1483 (head 0daabcc) by spy0eye-beep.
+        if back(self, taken) {
+            t = self.limited_latch(b, taken, passed);
+        }
+        if back(self, not_taken) {
+            f = if not_taken == taken {
+                t
+            } else {
+                self.limited_latch(b, not_taken, passed)
+            };
+        }
         for (to, via) in [(taken, t), (not_taken, f)] {
             if !back(self, to) {
                 // From an edge block, or from here.
@@ -546,13 +671,13 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`](super::LOOP_LIMIT) by `p` (below: go on; at or above:
-    /// stop), with the spin-wait limit for a loop that only waits for
-    /// memory to change (`spin.rs`), or with the higher limit of a counted
-    /// loop ([`counted_loops`]).
-    pub(super) fn count_iteration(&mut self, to: usize, p: u8) -> V {
+    /// A back edge to header `to`, entering it from DXIL block `from`: the
+    /// count goes up (computed here); the result is whether it is below
+    /// [`LOOP_LIMIT`](super::LOOP_LIMIT) (go on; at it: stop), the
+    /// spin-wait limit for a loop that only waits for memory to change
+    /// (`spin.rs`), or the higher limit of a counted loop
+    /// ([`counted_loops`]).
+    pub(super) fn count_iteration(&mut self, to: usize, from: usize) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
@@ -571,13 +696,33 @@ impl<'a> Lower<'a> {
             .get_mut(&to)
             .expect("header")
             .1
-            .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+            .push((next, from));
+        self.s.m.cmp(c, pred::IULT, next, limit)
     }
 
-    /// The block a lane stopped by [`LOOP_LIMIT`](super::LOOP_LIMIT) leaves through.
+    /// The latch of a conditional back edge from IR block `from` to header
+    /// `to`: back to the header below the iteration limit, to the abort
+    /// block at it. The header's phis take this edge's values from it.
+    // Ported from Marvisak/VIctory#1483 (head 0daabcc) by spy0eye-beep.
+    fn limited_latch(&mut self, from: usize, to: usize, passed: Option<V>) -> usize {
+        let latch = self.s.m.new_block();
+        let ok = self.count_iteration(to, latch);
+        let abort = self.abort_block(latch, passed);
+        let header = self.block[to].expect("reachable");
+        self.s.m.terminate(latch, Term::CondBr(ok, header, abort));
+        self.edges.insert((from, to), latch);
+        latch
+    }
+
+    /// The block a lane stopped by [`LOOP_LIMIT`](super::LOOP_LIMIT) leaves
+    /// through, from DXIL block `from`: where lanes drain (`passed`, the
+    /// barriers it has passed), [`Self::drain_from`]; elsewhere the end of
+    /// the program (a pixel discards).
     // shortcut: limit hits are not reported to the host.
-    pub(super) fn abort_block(&mut self) -> usize {
+    pub(super) fn abort_block(&mut self, from: usize, passed: Option<V>) -> usize {
+        if let Some(n) = passed {
+            return self.drain_from(from, n);
+        }
         if let Some(a) = self.abort {
             return a;
         }
@@ -590,6 +735,153 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(a, Term::Ret);
         self.abort = Some(a);
         a
+    }
+
+    /// Whether the program's lanes drain ([`Drain`]): a compute or mesh
+    /// program where a group barrier can follow a loop. Not the console
+    /// flow in halves: there both halves of the group's one console wave
+    /// follow one flow (the limit stops them together), and their
+    /// exchanges add barriers that no block counts.
+    fn drains(&mut self) -> bool {
+        if let Some(on) = self.drain.on {
+            return on;
+        }
+        let on = self.s.threads.is_some()
+            && !self.s.pixel
+            && !(self.console_cf && self.split)
+            && barrier_after_loop(self.x.p, self.counters.keys().copied(), |b| {
+                self.barriers_in(b) > 0
+            });
+        self.drain.on = Some(on);
+        #[cfg(test)]
+        DRAINS.set(Some(on));
+        on
+    }
+
+    /// The group barriers IR block `b` passes: its `s_barrier`s, none in a
+    /// mesh block that leaves them out, nor inside a whole-wave section
+    /// (whose simulation stands for its instructions).
+    fn barriers_in(&self, b: usize) -> u32 {
+        if self.no_barrier.contains(&b) {
+            return 0;
+        }
+        let insts = &self.x.p.blocks[b].insts;
+        let (mut n, mut i) = (0, 0);
+        while i < insts.len() {
+            n += u32::from(insts[i].name() == "s_barrier");
+            i = self
+                .sections
+                .get(&b)
+                .and_then(|s| s.get(&i))
+                .map_or(i + 1, |s| s.end);
+        }
+        n
+    }
+
+    /// The barriers a lane has passed when it leaves IR block `b`
+    /// ([`Drain`]; `extra`: those its exit adds): what it entered with (a
+    /// phi; 0 in the entry block), plus the block's.
+    fn passed(&mut self, b: usize, extra: u32) -> V {
+        let start = if self.rpo[b] == 0 {
+            self.s.m.i32(0)
+        } else {
+            let at = self.block[b].expect("reachable");
+            let phi = self.s.m.phi(at, self.s.t.i32);
+            self.drain.entry.push((b, phi));
+            phi
+        };
+        let n = self.barriers_in(b) + extra;
+        let v = if n == 0 {
+            start
+        } else {
+            let k = self.s.m.i32(n);
+            self.s.m.bin(self.cur, Bin::Add, start, k)
+        };
+        self.drain.exit.insert(b, v);
+        v
+    }
+
+    /// [`Drain`]'s two group-shared counts of ended threads.
+    fn ended_counts(&mut self) -> V {
+        if let Some(g) = self.drain.ended {
+            return g;
+        }
+        let arr = self.s.m.array(2, self.s.t.i32);
+        let g = self.s.m.global("ended", arr, 3);
+        self.drain.ended = Some(g);
+        g
+    }
+
+    /// A group barrier in DXIL block `at`, with the fences of the
+    /// program's own (`s_barrier`).
+    fn group_barrier(&mut self, at: usize) {
+        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+        let mode = self.s.m.i32(mode);
+        let void = self.s.t.void;
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// The block a lane that ends enters from DXIL block `from`, having
+    /// passed `passed` barriers ([`Drain`]).
+    fn drain_from(&mut self, from: usize, passed: V) -> usize {
+        let (block, _) = self.drain_block();
+        self.drain.incoming.push((passed, from));
+        block
+    }
+
+    /// [`Drain`]'s blocks: the lane counts itself ended, by the parity of
+    /// the barriers it has passed, then passes barriers until the counts it
+    /// reads on either side of one say that every thread has ended.
+    fn drain_block(&mut self) -> (usize, V) {
+        if let Some(d) = self.drain.block {
+            return d;
+        }
+        let threads: u32 = self.s.threads.expect("a group").iter().product();
+        let ended = self.ended_counts();
+        let i32t = self.s.t.i32;
+        let (entry, wait, done) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        let passed = self.s.m.phi(entry, i32t);
+        let one = self.s.m.i32(1);
+        // Every thread that ends before the next barrier has passed as many
+        // barriers as this one, so it counts in this parity too.
+        let own = self.s.m.bin(entry, Bin::And, passed, one);
+        let at = self.s.m.element(entry, ended, own);
+        let _ = self.s.m.atomic(entry, Rmw::Add, at, one);
+        // The other parity: no thread writes it before the next barrier.
+        let other = self.s.m.bin(entry, Bin::Xor, own, one);
+        let at = self.s.m.element(entry, ended, other);
+        let first = self.s.m.load(entry, at);
+        self.s.m.terminate(entry, Term::Br(wait));
+        // Before the barrier: `n` barriers passed, and `before` threads
+        // ended with a count of parity n + 1 (all of them, up to the next
+        // barrier).
+        let n = self.s.m.phi(wait, i32t);
+        let before = self.s.m.phi(wait, i32t);
+        self.group_barrier(wait);
+        let next = self.s.m.bin(wait, Bin::Add, n, one);
+        // Parity n: the last thread to count in it did so before this
+        // barrier. Together, every thread that ended before it.
+        let own = self.s.m.bin(wait, Bin::And, n, one);
+        let at = self.s.m.element(wait, ended, own);
+        let after = self.s.m.load(wait, at);
+        let sum = self.s.m.bin(wait, Bin::Add, before, after);
+        let all = self.s.m.i32(threads);
+        let all_ended = self.s.m.cmp(wait, pred::EQ, sum, all);
+        self.s
+            .m
+            .terminate(wait, Term::CondBr(all_ended, done, wait));
+        self.s.m.set_phi(n, vec![(passed, entry), (next, wait)]);
+        self.s
+            .m
+            .set_phi(before, vec![(first, entry), (after, wait)]);
+        self.s.m.terminate(done, Term::Ret);
+        self.drain.block = Some((entry, passed));
+        (entry, passed)
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
@@ -612,6 +904,25 @@ impl<'a> Lower<'a> {
 
     pub(super) fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        // Where lanes drain: the barriers passed when entering each block,
+        // and by each lane that ends.
+        for (b, phi) in std::mem::take(&mut self.drain.entry) {
+            let mut incoming = Vec::new();
+            for &q in &p.blocks[b].preds {
+                let (Some(qb), Some(&n)) = (self.tail[q], self.drain.exit.get(&q)) else {
+                    continue;
+                };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                incoming.push((n, qb));
+            }
+            self.s.m.set_phi(phi, incoming);
+        }
+        if let Some((_, phi)) = self.drain.block {
+            let incoming = std::mem::take(&mut self.drain.incoming);
+            self.s.m.set_phi(phi, incoming);
+        }
+        // The halves' exchanges would add barriers no block counts.
+        debug_assert!(self.drain.on != Some(true) || self.xchg.is_none());
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
         // lowering accepts what it refuses when the same value is read directly.
@@ -809,6 +1120,58 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(limits(&lanes), [counted_loop_limit()]);
+    }
+
+    /// Whether [`super::barrier_after_loop`] finds an `s_barrier` reachable
+    /// from a loop header of `words` (a block a later block branches back
+    /// to).
+    fn barrier_after(words: &[u32]) -> bool {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 8).unwrap();
+        let order = ir::reverse_postorder(&p.blocks);
+        let mut rpo = vec![usize::MAX; p.blocks.len()];
+        for (n, &b) in order.iter().enumerate() {
+            rpo[b] = n;
+        }
+        let headers = order.iter().copied().filter(|&h| {
+            p.blocks[h]
+                .preds
+                .iter()
+                .any(|&q| rpo[q] != usize::MAX && rpo[h] <= rpo[q])
+        });
+        super::barrier_after_loop(&p, headers, |b| {
+            p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier")
+        })
+    }
+
+    /// A group barrier after a loop or inside it is one a lane the limit
+    /// stops would miss; one before the loop, or none, is not. The lowering
+    /// drains the lanes of the first two only (the rest keep their form).
+    #[test]
+    fn barriers_a_stopped_lane_would_miss_are_found() {
+        const S_BARRIER: u32 = 0xBF8A_0000;
+        let lt = 0xBF0A_0102; // s_cmp_lt_u32 s2, s1
+        let l = uniform_loop(0x81, lt);
+        assert!(!barrier_after(&l));
+        let after = [&l[..7], &[S_BARRIER, S_ENDPGM]].concat();
+        assert!(barrier_after(&after));
+        let before = [&l[..1], &[S_BARRIER], &l[1..]].concat();
+        assert!(!barrier_after(&before));
+        // In the body: the back edge one dword further.
+        let inside = [&l[..4], &[S_BARRIER], &l[4..6], &[0xBF85_FFF9, S_ENDPGM]].concat();
+        assert!(barrier_after(&inside));
+        // The lowering drains the lanes of those two only.
+        let drains = |words: &[u32]| {
+            super::DRAINS.set(None);
+            limits(words);
+            super::DRAINS.get().expect("decided")
+        };
+        assert!(drains(&after));
+        assert!(drains(&inside));
+        assert!(!drains(&before));
+        assert!(!drains(&l));
+        // A barrier and no loop.
+        assert!(!drains(&[0xBE82_0380, S_BARRIER, S_ENDPGM]));
     }
 
     /// Loops with no induction variable bounded by a loop-invariant value

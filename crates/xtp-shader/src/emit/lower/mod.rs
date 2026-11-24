@@ -315,6 +315,8 @@ struct Lower<'a> {
     /// Headers of counted loops: they stop at [`super::counted_loop_limit`]
     /// instead ([`flow::counted_loops`]).
     counted: HashSet<usize>,
+    /// Lanes that end keep passing group barriers ([`flow::Drain`]).
+    drain: flow::Drain,
     /// See [`Lowered::loop_limits`].
     #[cfg(test)]
     limits: Vec<u32>,
@@ -668,6 +670,7 @@ impl<'a> Lower<'a> {
             abort: None,
             spin: HashSet::new(),
             counted: HashSet::new(),
+            drain: flow::Drain::default(),
             #[cfg(test)]
             limits: Vec::new(),
             #[cfg(test)]
