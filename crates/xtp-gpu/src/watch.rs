@@ -765,9 +765,13 @@ pub fn copy_asks(start: usize, end: usize) -> Option<Vec<usize>> {
 /// gone, before the report after.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::resource::memory_remapped(at, len);
+    let range = blocks(at, len);
+    {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.written.retain(|page, _| !range.contains(page));
+    }
     let mut g = guards();
     let g = &mut *g;
-    let range = blocks(at, len);
     for known in [
         &mut g.absent,
         &mut g.views,
@@ -1498,6 +1502,29 @@ pub(crate) mod tests {
             )
             .is_none()
         );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn remapping_forgets_write_watch_pages() {
+        let _serial = serial();
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
+        let (start, end) = (p, p + 4 * PAGE);
+        assert!(!writes(start, end, false).expect("watched").1.is_empty());
+        title_memory_remapped(start, 4 * PAGE);
+        assert!(writes(start, end, false).expect("watched").1.is_empty());
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
