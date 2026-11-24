@@ -18,6 +18,8 @@
 //!   encoding or a stage adds an arm there and nothing more.
 //! * `operand.rs`: operands, results and the lane guards of writes.
 //! * `flow.rs`: block exits, loops and their iteration limit, phis.
+//! * `spin.rs`: loops that only wait for memory to change, which stop
+//!   sooner.
 //! * `mask.rs`: lane masks as booleans and as numbers. **M1**, **M2**.
 //! * `compare.rs`: `v_cmp_*`, `v_cmpx_*`. **M1**.
 //! * `lanes.rs`: whole-wave sections, DPP, lane reads, thread ids and
@@ -72,6 +74,7 @@ mod mesh;
 mod operand;
 mod salu;
 mod smem;
+mod spin;
 #[cfg(test)]
 mod tests;
 mod valu;
@@ -116,6 +119,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Loops given the spin-wait limit.
+    #[cfg(test)]
+    pub spin_loops: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -291,6 +297,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Headers of loops that only wait for memory to change: they stop at
+    /// [`super::spin_limit`] instead ([`spin`]).
+    spin: HashSet<usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -299,8 +308,17 @@ struct Lower<'a> {
 /// zeros) can make that four billion iterations, which hangs the host GPU
 /// until the driver resets it. A lane that reaches the limit leaves the
 /// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+///
+/// 2^14 (16,384) because the host's GPU watchdog (TDR) removes the device
+/// once a submission runs for about 2 s. In VIctory #452's world runs on an
+/// RTX 5070, with 2^20 submissions took up to 10.6 s and the device was
+/// removed; with 2^16 the longest was 1.1 s; with 2^14, 371 ms with no
+/// device removal and the same frame rate. Loops that only wait for memory
+/// stop sooner ([`spin`]).
+// shortcut: a legitimate loop of more than 16,384 iterations per lane is
+// cut short, so its result is wrong there; raising `XTP_SHADER_LOOP_LIMIT`
+// shows whether a wrong result comes from it.
+pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
@@ -613,6 +631,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            spin: HashSet::new(),
         }
     }
 
@@ -640,6 +659,7 @@ impl<'a> Lower<'a> {
                 },
             ));
         }
+        self.exchange_fits().map_err(|w| unsupported(0, w))?;
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -652,7 +672,8 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`LOOP_LIMIT`; spin waits less).
+        self.spin = spin::spin_loops(p);
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -728,6 +749,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & super::shader::flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            spin_loops: self.spin.len(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,

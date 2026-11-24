@@ -137,27 +137,30 @@ impl<'a> Lower<'a> {
     }
 
     /// Console flow: an SCC value as a bit. A mask operation's SCC (result
-    /// not zero) is whether some lane of the console wave has its bit.
+    /// not zero) is whether some lane of the console wave has its result's
+    /// bit: for `s_and_saveexec` and the like, the new EXEC's, which is
+    /// not the first mask the instruction writes (the saved EXEC is).
+    /// Structurisation says which mask it is ([`Structured::sccs`]).
+    ///
+    /// [`Structured::sccs`]: crate::structure::Structured::sccs
     fn scc_bit(&mut self, v: Value) -> Result<V, Why> {
         if let Some(&Val::Bit(x)) = self.vals.get(&v) {
             return Ok(x);
         }
-        let b = *self
-            .def_block
+        let &(mask, negated) = self
+            .x
+            .st
+            .sccs
             .get(&v)
-            .ok_or("an SCC from the program's start")?;
-        let inst = self.x.p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == v))
-            .ok_or("an SCC without its instruction")?;
-        let mask = inst
-            .writes
-            .iter()
-            .filter(|w| matches!(w.0, Reg::S(_)))
-            .find_map(|w| self.x.st.masks.get(&w.1).copied())
             .ok_or("an SCC the emitter did not compute")?;
-        self.any_lane(mask)
+        // (A compare either way, no `xor` of one: see `branch_term`.)
+        let c = self.cur;
+        let bit = self.boolean(mask, c)?;
+        let (lo, hi) = self.console_ballot(c, bit);
+        let or = self.s.m.bin(c, Bin::Or, lo, hi);
+        let z = self.s.m.i32(0);
+        let p = if negated { pred::EQ } else { pred::NE };
+        Ok(self.s.m.cmp(c, p, or, z))
     }
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
@@ -171,13 +174,20 @@ impl<'a> Lower<'a> {
 
     /// A back edge to header `to` (a back edge keeps its block, no
     /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`](super::LOOP_LIMIT) by `p` (below: go on; at or above: stop).
+    /// [`LOOP_LIMIT`](super::LOOP_LIMIT) by `p` (below: go on; at or above:
+    /// stop), or with the spin-wait limit for a loop that only waits for
+    /// memory to change (`spin.rs`).
     pub(super) fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(crate::emit::loop_limit());
+        let limit = if self.spin.contains(&to) {
+            crate::emit::spin_limit()
+        } else {
+            crate::emit::loop_limit()
+        };
+        let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -249,6 +259,16 @@ impl<'a> Lower<'a> {
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
+                    // A descriptor's dwords reaching a join that also takes
+                    // data: the registers are reused after the descriptor's
+                    // last access, so the program reads the joined value
+                    // only after the data edge (the console compiler's phi
+                    // of a value defined on one edge only).
+                    // shortcut: undefined on the descriptor edge; wrong if
+                    // the program read the descriptor's dwords as data there.
+                    (Some(Val::Missing(_)), false) if self.descriptor_dword(arg) => {
+                        self.s.m.undef(self.s.t.i32)
+                    }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
@@ -286,5 +306,67 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::emit::tests::{compute, emit_for};
+    use crate::native::{ComputeIo, ResourceType, RootParam, RootType, StageIo, UsedResource};
+
+    /// s8 holds a buffer descriptor's first dword on one edge (a root
+    /// constant chose the load) and 5 on the other, and the program reads
+    /// the joined s8 only where the constant chose the data edge: the
+    /// descriptor edge brings an undefined dword instead of stopping the
+    /// program ("a descriptor's address or format read as data").
+    #[test]
+    fn descriptor_dwords_join_data_as_undefined_on_their_edge() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0009, // s_cbranch_scc1 -> 52
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_2000,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            0xBF82_0001, // s_branch -> 56
+            0xBE88_0385, // 52: s_mov_b32 s8, 5
+            0xBF06_8001, // 56: s_cmp_eq_u32 s1, 0
+            0xBF84_0003, // s_cbranch_scc0 -> 76
+            0x7E06_0208, // v_mov_b32 v3, s8
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            0xBF81_0000, // 76: s_endpgm
+        ];
+        let mut p = compute(&words, false);
+        let param = |root, user_data| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: user_data,
+        };
+        p.layout = vec![param(RootType::Table, 0), param(RootType::Constants, 1)];
+        p.used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        p.io = StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15 | 2 << 1,
+            threads: [64, 1, 1],
+        });
+        emit_for(&p, crate::emit::Target::ANY).unwrap();
     }
 }
