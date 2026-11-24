@@ -1018,9 +1018,10 @@ pub(crate) fn to_json(s: &Survey) -> String {
 mod tests {
     use super::*;
 
-    /// The translated count of the person's pack (2026-11-24): the opt-in
-    /// test fails below it. Raise it when an item lands.
-    const TRANSLATED_FLOOR: usize = 22_485;
+    /// The translated count of the person's pack for any host (2026-11-24,
+    /// with the wave64 stack: 22,485 before it): the opt-in test fails
+    /// below it. Raise it when an item lands.
+    const TRANSLATED_FLOOR: usize = 22_508;
 
     /// An SGD5 record (see `xtp_game::sgd5`) holding `payload` as two
     /// stored deflate blocks, split after its second byte so that a
