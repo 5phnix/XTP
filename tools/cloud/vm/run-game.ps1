@@ -16,6 +16,10 @@
   4. the title in the desktop session, stopped after -Seconds;
   5. the log without colour codes in <run>\run.log, and a summary. The last
      line names the run folder ("RUN DIR ...").
+  With -AudioLockStopgap, audio-lock-stopgap.ps1 watches the run and releases
+  the title's audio lock as S8 did (docs/analysis/l4-world.md section 8.1),
+  a stopgap for this VM, which has no audio output; its report goes to
+  <run>\audio-lock-stopgap.txt.
   The diagnostics build (target\diag\xtp.exe) is needed for XTP_KEYS and XTP_CAPTURE.
 #>
 param(
@@ -35,6 +39,8 @@ param(
     [string]$XtpArgs = '',
     [switch]$NoGolden,
     [switch]$NoCapture,
+    # Releases the title's audio lock in memory (audio-lock-stopgap.ps1).
+    [switch]$AudioLockStopgap,
     [string]$SessionUser = 'xtp',
     # Who runs it (shown to whoever waits for the VM), and fail at once when busy.
     [string]$Owner = '',
@@ -107,10 +113,26 @@ try {
     $vidmmCsv = Join-Path $run 'vidmm.csv'
     $typeperf = Start-Process -FilePath "$env:SystemRoot\System32\typeperf.exe" -PassThru -WindowStyle Hidden -ArgumentList @(
         '"\GPU Adapter Memory(*)\Dedicated Usage"', '"\GPU Adapter Memory(*)\Shared Usage"', '-si', '2', '-f', 'CSV', '-o', "`"$vidmmCsv`"", '-y')
+    # Started before the title, which it waits for (it attaches within milliseconds).
+    $stopgap = $null
+    $stopgapLog = Join-Path $run 'audio-lock-stopgap.txt'
+    if ($AudioLockStopgap) {
+        $stopgap = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$PSScriptRoot\audio-lock-stopgap.ps1",
+            '-Log', "`"$stopgapLog`"", '-After', (Get-Date).ToString('o'))
+    }
     try {
         $code = Invoke-XtpSessionJob -Exe $Exe -Arguments "run `"$title`" --execute $XtpArgs" -Log $raw -Seconds $Seconds -Environment $envs -User $SessionUser -Quiet
     } finally {
         foreach ($p in $sampler, $typeperf) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
+        if ($stopgap) {
+            # It ends with the run; nothing of it stays behind (its cdb included).
+            if (-not $stopgap.WaitForExit(30000)) {
+                Get-CimInstance Win32_Process -Filter "ParentProcessId=$($stopgap.Id)" -ErrorAction SilentlyContinue |
+                    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                Stop-Process -Id $stopgap.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
     $result = $script:XtpLastJob
     $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding ASCII
@@ -131,6 +153,11 @@ try {
     if ($fail.Count) { Write-Output 'errors:'; $fail | ForEach-Object { "  $($_.Substring(0, [Math]::Min(300, $_.Length)))" } }
     $crash = Get-ChildItem -LiteralPath $data -Recurse -Filter 'crashes.log' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($crash) { Write-Output "crashes.log ($($crash.FullName)):"; Get-Content -LiteralPath $crash.FullName -Tail 15 | ForEach-Object { "  $_" } }
+    if ($AudioLockStopgap) {
+        $said = @(Get-Content -LiteralPath $stopgapLog -ErrorAction SilentlyContinue)
+        Write-Output 'audio lock stopgap:'
+        if ($said.Count) { $said | Select-Object -Last 6 | ForEach-Object { "  $_" } } else { '  no report (it did not run?)' }
+    }
     $auto = @($lines | Where-Object { $_ -match 'autopilot' } | Select-Object -Last 8)
     if ($auto.Count) { Write-Output 'autopilot:'; $auto | ForEach-Object { "  $($_.Substring(0, [Math]::Min(300, $_.Length)))" } }
     if (Test-Path -LiteralPath $gpuCsv) {
