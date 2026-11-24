@@ -794,6 +794,7 @@ dependencies = [
  "anyhow",
  "clap",
  "walkdir",
+ "xtp-core",
 ]
 
 [[package]]
@@ -833,8 +834,12 @@ version = "0.1.0"
 name = "xtp-game"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "memchr",
  "miniz_oxide",
+ "tracing",
+ "windows-sys",
+ "xtp-pe",
 ]
 
 [[package]]

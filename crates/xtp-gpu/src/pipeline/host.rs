@@ -291,6 +291,16 @@ pub(crate) struct Input {
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
+/// Whether root SRVs are bound as one-view tables of the buffer's host
+/// copy (reads past its end return zeros) rather than root descriptors
+/// (unbounded: a mesh shader's vertex fetch, which has no record limit,
+/// read past the copy into memory the host had freed). Set
+/// `XTP_ROOT_SRV_DIRECT=1` to go back.
+pub(crate) fn bounded_root_srvs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XTP_ROOT_SRV_DIRECT").is_none())
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -365,15 +375,32 @@ pub(crate) fn refusals() -> Option<String> {
 }
 
 /// What a translated shader asks of the host: the wave lanes it runs in
-/// (`PSV0`'s expected lane counts; 0 and `u32::MAX`: any) and its shader
-/// model (the `DXIL` program header's version).
+/// (`PSV0`'s expected lane counts; 0 and `u32::MAX`: any), its shader
+/// model (the `DXIL` program header's version), and whether it is a mesh
+/// program written for the console's 64-lane waves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Needs {
     pub(crate) lanes: (u32, u32),
     pub(crate) model: (u32, u32),
+    /// A console mesh program that runs in 64-lane waves: its lane masks
+    /// and lane numbers are a wave64's, and its translation declares no
+    /// wave size (only compute translations do), so `lanes` does not say
+    /// so. Run in 32-lane waves, such programs hung the GPU in the world
+    /// (VIctory #578, RTX 5090: the device removed as hung at one of their
+    /// dispatches, every run).
+    pub(crate) wave64_mesh: bool,
 }
 
 impl Needs {
+    /// What a translated `stage` shader needs; `None` if its container does
+    /// not say.
+    pub(crate) fn of_translated(stage: &str, shader: &Translated) -> Option<Needs> {
+        Some(Needs {
+            wave64_mesh: stage == "mesh" && shader.wave64,
+            ..Needs::of(&shader.host.dxil)?
+        })
+    }
+
     /// What the shader in a DXIL container needs; `None` if the container
     /// does not say.
     pub(crate) fn of(dxil: &[u8]) -> Option<Needs> {
@@ -394,11 +421,16 @@ impl Needs {
         Some(Needs {
             lanes,
             model: (version >> 4 & 0xf, version & 0xf),
+            wave64_mesh: false,
         })
     }
 
     /// Why a host with waves of `host` lanes (min, max) and shader model
-    /// `model` cannot run it; `None` if it can.
+    /// `model` cannot run it; `None` if it can. One reason, the first of:
+    /// the wave size its translation declares (a wave64 program the
+    /// translator made 32-lane declares `WaveSize(32)` and runs on a 32-lane
+    /// host); a wave64 mesh program, which declares none, on a host without
+    /// 64-lane waves; its shader model.
     pub(crate) fn refusal(&self, host: (u32, u32), model: (u32, u32)) -> Option<String> {
         let (min, max) = self.lanes;
         if min != 0 && (max < host.0 || min > host.1) {
@@ -412,6 +444,15 @@ impl Needs {
                 host.0, host.1
             ));
         }
+        // shortcut: a wave64 mesh program that never looks at other lanes
+        // would run; telling it apart is the translator's (it does so for
+        // compute programs only).
+        if min == 0 && self.wave64_mesh && host.1 < 64 {
+            return Some(format!(
+                "is a mesh program written for 64-lane waves; the host has {} to {}",
+                host.0, host.1
+            ));
+        }
         (self.model > model).then(|| {
             format!(
                 "needs shader model {}.{}; the host has {}.{}",
@@ -421,10 +462,10 @@ impl Needs {
     }
 }
 
-/// Why the host cannot run `shader`'s translation; `None` if it can (or the
-/// host's lanes are unknown).
-fn shader_refusal(shader: &Translated) -> Option<String> {
-    let needs = Needs::of(&shader.host.dxil)?;
+/// Why the host cannot run the translation of a `stage` shader; `None` if
+/// it can (or the host's lanes are unknown).
+fn shader_refusal(stage: &str, shader: &Translated) -> Option<String> {
+    let needs = Needs::of_translated(stage, shader)?;
     let lanes = crate::device::host_wave_lanes()?;
     let model = crate::device::host_shader_model()?;
     needs.refusal(lanes, model)
@@ -469,7 +510,7 @@ impl HostPipeline {
             );
         }
         for (s, _) in &stages {
-            if let Some(why) = shader_refusal(s.translated()?) {
+            if let Some(why) = shader_refusal(s.stage, s.translated()?) {
                 return refuse(format!("{} shader {why}", s.stage), shaders);
             }
         }
@@ -477,6 +518,9 @@ impl HostPipeline {
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        // Ranges the table parameters point at, alive until the root
+        // signature is made.
+        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
@@ -515,6 +559,32 @@ impl HostPipeline {
                 ),
             ] {
                 for &slot in slots {
+                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+                        // A one-view table: the view's size bounds the reads,
+                        // which a root descriptor leaves unbounded.
+                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                            NumDescriptors: 1,
+                            BaseShaderRegister: u32::from(slot),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                            OffsetInDescriptorsFromTableStart: 0,
+                        }));
+                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                        out.push((slot, params.len() as u32));
+                        params.push(D3D12_ROOT_PARAMETER1 {
+                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                    NumDescriptorRanges: 1,
+                                    pDescriptorRanges: range,
+                                },
+                            },
+                            ShaderVisibility: visibility,
+                        });
+                        continue;
+                    }
                     out.push((slot, params.len() as u32));
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,
@@ -886,7 +956,8 @@ mod tests {
             wave64,
             Needs {
                 lanes: (64, 64),
-                model: (6, 6)
+                model: (6, 6),
+                wave64_mesh: false,
             }
         );
         let nvidia = (32, 32);
@@ -902,6 +973,71 @@ mod tests {
         // Older runtime information has no lane counts.
         let old = Needs::of(&container(16, (64, 64), CS_6_6)).unwrap();
         assert_eq!(old.lanes, (0, u32::MAX));
+    }
+
+    /// What the wave64 port emits for a 32-lane host, `WaveSize(32)`, runs
+    /// there; WARP's 4-lane waves run neither (VIctory #578's PSV0 check,
+    /// which fb3db31's [`Needs`] already made).
+    #[test]
+    fn wave32_translations_run_on_32_lane_hosts() {
+        let wave32 = Needs::of(&container(48, (32, 32), CS_6_6)).unwrap();
+        assert_eq!(wave32.refusal((32, 32), (6, 8)), None);
+        assert_eq!(wave32.refusal((32, 64), (6, 8)), None);
+        assert_eq!(
+            wave32.refusal((4, 4), (6, 8)).as_deref(),
+            Some("needs 32-lane waves; the host has 4 to 4")
+        );
+        // An SM 6.8 range overlapping the host's runs.
+        let range = Needs::of(&container(48, (32, 64), CS_6_6)).unwrap();
+        assert_eq!(range.refusal((32, 32), (6, 8)), None);
+    }
+
+    /// A mesh program written for 64-lane waves declares no wave size, and
+    /// is refused where the host has none (VIctory #578); one reason only.
+    #[test]
+    fn wave64_mesh_programs_need_64_lane_hosts() {
+        let any = Needs::of(&container(48, (0, u32::MAX), CS_6_6)).unwrap();
+        let mesh = Needs {
+            wave64_mesh: true,
+            ..any
+        };
+        assert_eq!(
+            mesh.refusal((32, 32), (6, 8)).as_deref(),
+            Some("is a mesh program written for 64-lane waves; the host has 32 to 32")
+        );
+        assert_eq!(
+            mesh.refusal((4, 4), (6, 5)).as_deref(),
+            Some("is a mesh program written for 64-lane waves; the host has 4 to 4"),
+            "the lanes are the reason, not the shader model too"
+        );
+        assert_eq!(mesh.refusal((32, 64), (6, 8)), None);
+        assert_eq!(any.refusal((32, 32), (6, 8)), None, "a wave32 mesh program");
+        // A translation that declares its wave size is judged by it.
+        let declared = Needs {
+            lanes: (32, 32),
+            ..mesh
+        };
+        assert_eq!(declared.refusal((32, 32), (6, 8)), None);
+
+        // Only mesh programs: a wave64 compute translation says what it
+        // needs in its PSV0.
+        let translated = |wave64| Translated {
+            host: xtp_shader::emit::HostShader {
+                stage: xtp_shader::HwStage::Ms,
+                dxil: container(48, (0, u32::MAX), CS_6_6),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+            },
+            used: Vec::new(),
+            wave64,
+        };
+        let of = |stage, wave64| Needs::of_translated(stage, &translated(wave64)).unwrap();
+        assert!(of("mesh", true).wave64_mesh);
+        assert!(!of("mesh", false).wave64_mesh);
+        assert!(!of("compute", true).wave64_mesh);
     }
 
     #[test]
