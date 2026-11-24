@@ -4,6 +4,7 @@
 //! is defined in docs/asset-policy.md.
 
 pub mod intro;
+pub mod rpf;
 pub mod sgd5;
 pub mod watchdog;
 
