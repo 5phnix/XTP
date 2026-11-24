@@ -36,6 +36,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        target: super::super::Target::ANY,
     })
     .map(|_| ())
 }
@@ -86,6 +87,7 @@ fn lower_wave(
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        target: super::super::Target::ANY,
     })
 }
 
@@ -190,6 +192,7 @@ fn perm_features(selector: u32) -> u64 {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        target: super::super::Target::ANY,
     })
     .unwrap();
 
