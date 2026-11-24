@@ -304,8 +304,10 @@ impl Shadow {
     /// title's threads write the same buffers while the GPU runs (its
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
-    /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
+    /// records (a fence list read as -1, title+0x4e9b54a). The title keeps
+    /// writing while this runs (on the completion thread), so only the runs
+    /// of bytes the GPU changed are written, not the pieces around them.
+    /// Returns the bytes written.
     pub(crate) fn copy_back(&self, submission: u64, address: usize, len: usize) -> usize {
         let mut snapshots = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
@@ -331,40 +333,19 @@ impl Shadow {
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
+                    #[cfg(test)]
+                    tests::after_reading(start + at);
+                    written += self.write_gpu_runs(start + at, host, old, title);
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
-            // Pages made equal to title memory are current in the copy, so
+            // Pages now equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
-                }
-            }
+            synced.retain(|p| (first..last).contains(p));
+            self.mark_current(&synced);
         }
         // Every step of the submission that declared the range is done with
         // it, and the submission's snapshot with its last range.
@@ -414,21 +395,78 @@ impl Shadow {
         // range alone until this submission has finished.
         let host = unsafe { self.data.add(from) };
         crate::host::write_mapped((start + from) as *mut u8, host, to - from);
-        // Whole pages written are now as the copy has them: our own write
-        // is not taken for the title's (a title write after it shows at
-        // the next refresh).
+        // Whole pages written are now as the copy has them, unless the
+        // title wrote them meanwhile: our own write is not taken for the
+        // title's.
         let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-        if first < last
-            && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-            && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-        {
-            let base = start / PAGE;
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            for page in first..last {
-                copied[page - base] = now;
+        self.mark_current(&(first..last).collect::<Vec<_>>());
+        to - from
+    }
+
+    /// Writes into title memory at `at` the runs of bytes the GPU changed
+    /// in a piece of the copy (`host`; `old`, its bytes before the
+    /// submission; `title`, title memory as just read) where they differ
+    /// from the title's; the copy takes the title's bytes everywhere else.
+    /// Returns the bytes written.
+    fn write_gpu_runs(&self, at: usize, host: &mut [u8], old: &[u8], title: &[u8]) -> usize {
+        let (mut written, mut opened) = (0, false);
+        let mut i = 0;
+        while i < host.len() {
+            if host[i] == old[i] {
+                host[i] = title[i];
+                i += 1;
+                continue;
+            }
+            let run = i;
+            while i < host.len() && host[i] != old[i] {
+                i += 1;
+            }
+            if host[run..i] != title[run..i] {
+                if !opened {
+                    // The piece's guard, once.
+                    crate::watch::writing(at, host.len());
+                    opened = true;
+                }
+                crate::host::write_mapped((at + run) as *mut u8, host[run..].as_ptr(), i - run);
+                written += i - run;
             }
         }
-        to - from
+        written
+    }
+
+    /// After our own write into title memory: notes `pages` (title page
+    /// numbers, all in the copy) current where title memory still equals
+    /// the copy. The write watch is asked first, so that it does not report
+    /// our write later; a title write before that asking is in title memory
+    /// when it is compared (the page is not current then), one after it
+    /// shows at a later asking.
+    fn mark_current(&self, pages: &[usize]) {
+        let (Some(&first), Some(&last)) = (pages.iter().min(), pages.iter().max()) else {
+            return;
+        };
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return;
+        }
+        let Some((now, _)) = crate::watch::writes(first * PAGE, (last + 1) * PAGE, true) else {
+            return;
+        };
+        let start = self.start as usize;
+        let mut title = vec![0u8; PAGE];
+        let current: Vec<usize> = pages
+            .iter()
+            .copied()
+            .filter(|&page| {
+                let from = page * PAGE - start;
+                // SAFETY: a whole page inside the mapping.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(from), PAGE) };
+                crate::host::read_into((page * PAGE) as *const u8, &mut title) && *host == *title
+            })
+            .collect();
+        let base = start / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for page in current {
+            copied[page - base] = now;
+        }
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -908,6 +946,23 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// What [`after_reading`] does on this thread: a title write while
+        /// a copy-back runs.
+        static AFTER_READING: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called by [`Shadow::copy_back`] between its read of a piece of title
+    /// memory at `at` and its write.
+    pub(super) fn after_reading(at: usize) {
+        AFTER_READING.with_borrow_mut(|f| {
+            if let Some(f) = f {
+                f(at);
+            }
+        });
+    }
+
     impl Shadow {
         /// The copy's bytes at title addresses `[at, at + len)`.
         pub(super) fn host_bytes(&self, at: usize, len: usize) -> Vec<u8> {
@@ -994,5 +1049,61 @@ mod tests {
         set_title(dst, len, 0x33);
         shadow.update(window, PAGE);
         assert!(shadow.host_bytes(dst, len).iter().all(|&b| b == 0x33));
+    }
+
+    /// The title writes a piece of title memory while it is copied back,
+    /// between the copy-back's read and its write: its bytes stay (only
+    /// the runs the GPU changed are written), and the page is not taken
+    /// for current, so the next refresh brings the title's write.
+    #[test]
+    fn a_copy_back_keeps_title_writes_made_while_it_runs() {
+        let test = "shadow::tests::a_copy_back_keeps_title_writes_made_while_it_runs";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let window = watched(2 * PAGE);
+        let shadow = find(window as u64, PAGE as u64).expect("a host copy");
+        let page = window + PAGE;
+        shadow.update(window, 2 * PAGE);
+        assert!(!shadow.stale(page, page + PAGE));
+        let gpu = submission();
+        shadow.writing(gpu, page, PAGE);
+        // The GPU writes 16 bytes; the title 16 others meanwhile.
+        shadow.set_host(page, 16, 0xab);
+        AFTER_READING.set(Some(Box::new(move |at| {
+            if at == page {
+                set_title(page + 0x100, 16, 0x5c);
+            }
+        })));
+        let written = shadow.copy_back(gpu, page, PAGE);
+        AFTER_READING.set(None);
+        assert_eq!(written, 16, "only the GPU's bytes");
+        assert!(title(page, 16).iter().all(|&b| b == 0xab));
+        assert!(
+            title(page + 0x100, 16).iter().all(|&b| b == 0x5c),
+            "the title's write is kept"
+        );
+        assert!(
+            shadow.stale(page, page + PAGE),
+            "not current: the title wrote it"
+        );
+        shadow.update(page, PAGE);
+        assert!(
+            shadow
+                .host_bytes(page + 0x100, 16)
+                .iter()
+                .all(|&b| b == 0x5c)
+        );
+        assert!(shadow.host_bytes(page, 16).iter().all(|&b| b == 0xab));
+        // Without a title write meanwhile, the page is current after it.
+        let gpu = submission();
+        shadow.writing(gpu, page, PAGE);
+        shadow.set_host(page + 0x200, 8, 0xcd);
+        assert_eq!(shadow.copy_back(gpu, page, PAGE), 8);
+        assert!(title(page + 0x200, 8).iter().all(|&b| b == 0xcd));
+        assert!(
+            !shadow.stale(page, page + PAGE),
+            "current after our own write"
+        );
     }
 }
