@@ -739,18 +739,37 @@ impl<'a> Lower<'a> {
     }
 
     /// The median of three. With a NaN among them the hardware gives the
-    /// minimum of the three instead (the host's minimum skips NaNs, so that
-    /// is the smallest number among them).
+    /// minimum of the non-NaN operands. Select those operands explicitly:
+    /// host `FMin` does not treat NaNs consistently across drivers.
     pub(super) fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
         let hi = self.binary(35, a, b);
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
-        let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
+        let is_nan = |l: &mut Self, value: V| {
+            let bits = l.as_int(value);
+            let exponent = l.s.m.i32(0x7F80_0000);
+            let mantissa = l.s.m.i32(0x007F_FFFF);
+            let zero = l.s.m.i32(0);
+            let e = l.s.m.bin(c, Bin::And, bits, exponent);
+            let m = l.s.m.bin(c, Bin::And, bits, mantissa);
+            let e = l.s.m.cmp(c, pred::EQ, e, exponent);
+            let m = l.s.m.cmp(c, pred::NE, m, zero);
+            l.s.m.bin(c, Bin::And, e, m)
+        };
+        let nan_a = is_nan(self, a);
+        let nan_b = is_nan(self, b);
+        let nan3 = is_nan(self, third);
+        let ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
         let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        let min_ab = self.binary(36, a, b);
+        let least_ab = self.s.m.select(c, nan_b, a, min_ab);
+        let least_ab = self.s.m.select(c, nan_a, b, least_ab);
+        let both = self.s.m.bin(c, Bin::And, nan_a, nan_b);
+        let min_abc = self.binary(36, least_ab, third);
+        let least_abc = self.s.m.select(c, nan3, least_ab, min_abc);
+        let least = self.s.m.select(c, both, third, least_abc);
         self.s.m.select(c, nan, least, median)
     }
 
