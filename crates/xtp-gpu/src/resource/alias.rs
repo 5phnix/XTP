@@ -53,7 +53,10 @@ fn shape(desc: &ResourceDesc) -> Shape {
         depth_or_array: desc.depth_or_array_size,
         mips: super::mip_count(desc),
         samples: desc.sample_count.max(1),
-        family: super::family(super::pc_format(desc.format)),
+        // The title's format family: a stand-in is shared by title formats
+        // of other families (R9G9B9E5 and R16G16B16A16_FLOAT both as
+        // RGBA16F), whose texels the title reads differently.
+        family: super::family(desc.format),
     }
 }
 

@@ -574,29 +574,52 @@ pub(crate) fn note_stand_in(title: u32, host: u32) {
     *counts().stood_in.entry((title, host)).or_default() += 1;
 }
 
-/// Host textures alive: their number and bytes.
-static LIVE: [std::sync::atomic::AtomicI64; 2] = [
-    std::sync::atomic::AtomicI64::new(0),
-    std::sync::atomic::AtomicI64::new(0),
-];
+/// Host textures alive: their number and bytes, the bytes stand-in
+/// formats take beyond the title's, and the number and bytes of those in
+/// the texture pool.
+static LIVE: [std::sync::atomic::AtomicI64; 5] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; 5];
 
-/// Counts a host texture of `bytes` made (`alive`) or freed.
-pub(crate) fn note_texture(alive: bool, bytes: u64) {
+/// Counts a host texture of `bytes` made (`alive`) or freed: `extra` of
+/// them for its stand-in format, `pooled` if placed in the texture pool.
+pub(crate) fn note_texture(alive: bool, bytes: u64, extra: u64, pooled: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     let sign = if alive { 1 } else { -1 };
     LIVE[0].fetch_add(sign, Relaxed);
     LIVE[1].fetch_add(sign * bytes as i64, Relaxed);
+    LIVE[2].fetch_add(sign * extra as i64, Relaxed);
+    if pooled {
+        LIVE[3].fetch_add(sign, Relaxed);
+        LIVE[4].fetch_add(sign * bytes as i64, Relaxed);
+    }
 }
 
-/// The frame log's texture part: host textures alive, and textures made in
-/// a stand-in and refused since the start (`None` if none of them).
+/// The frame log's texture part: host textures alive (in the pool or
+/// committed, and what stand-ins add), the pool's heaps, and textures made
+/// in a stand-in and refused since the start (`None` if none of them).
 pub(crate) fn report() -> Option<String> {
     use std::sync::atomic::Ordering::Relaxed;
-    let (live, bytes) = (LIVE[0].load(Relaxed), LIVE[1].load(Relaxed));
+    let [live, bytes, extra, pooled, pooled_bytes] = [0, 1, 2, 3, 4].map(|i| LIVE[i].load(Relaxed));
     let counts = counts();
     if counts.refused.is_empty() && counts.stood_in.is_empty() && live == 0 {
         return None;
     }
+    #[cfg(windows)]
+    let pool = {
+        let (asked, refused) = super::residency::counts();
+        let pool =
+            super::pool::global_if_made().map_or_else(String::new, |p| format!("; {}", p.report()));
+        format!("; residency asked {asked} times, refused {refused}{pool}")
+    };
+    #[cfg(not(windows))]
+    let pool = String::new();
+    let pool = format!(
+        " ({pooled} pooled, {} MiB; {} committed, {} MiB; stand-in formats +{} MiB){pool}",
+        pooled_bytes >> 20,
+        live - pooled,
+        (bytes - pooled_bytes) >> 20,
+        extra >> 20
+    );
     let stood_in: Vec<String> = counts
         .stood_in
         .iter()
@@ -608,7 +631,7 @@ pub(crate) fn report() -> Option<String> {
         .map(|(why, n)| format!("{n} {why}"))
         .collect();
     Some(format!(
-        "host textures: {live} alive, {} MiB; so far: stand-in formats [{}], refused [{}]",
+        "host textures: {live} alive, {} MiB{pool}; so far: stand-in formats [{}], refused [{}]",
         bytes >> 20,
         stood_in.join(", "),
         refused.join("; ")

@@ -10,6 +10,10 @@
 mod alias;
 pub(crate) mod format;
 #[cfg(windows)]
+mod pool;
+#[cfg(windows)]
+mod ranges;
+#[cfg(windows)]
 mod residency;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
@@ -810,6 +814,9 @@ struct Resource {
     /// yet.
     #[cfg(windows)]
     host: Option<std::sync::Arc<HostTexture>>,
+    /// Whether `host` is another texture's copy (`alias`).
+    #[cfg(windows)]
+    shared: bool,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -817,20 +824,47 @@ struct Resource {
 /// one. Lists that use the texture hold it until they are reset: the title
 /// may release a resource whose commands it recorded but not yet submitted
 /// (console memory outlives the object; a host texture must outlive the
-/// lists that name it).
+/// lists that name it). That also keeps a pooled texture's range (`pool`)
+/// from going to another texture while lists still name it.
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// Bytes of video memory it takes (counted in [`format::report`]).
     pub(crate) bytes: u64,
+    /// Of them, what its stand-in format takes beyond the title's.
+    extra: u64,
+    /// Whether its memory is resident yet (its own, or its pool heap's):
+    /// until then nothing hands it to the GPU ([`HostTexture::ready`]).
+    residency: Arc<residency::Residency>,
+    /// Its range of a pool heap, given back when it is dropped (after the
+    /// texture, which is released first).
+    slot: Option<pool::Slot>,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    /// Whether the GPU may use it: its memory is resident. A texture is
+    /// made without waiting for that (`residency`); until it is, lookups
+    /// answer as if it had no host copy (null views, no draws through it).
+    pub(crate) fn ready(&self) -> bool {
+        self.residency.is_ready()
+    }
 }
 
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
-        format::note_texture(false, self.bytes);
+        format::note_texture(false, self.bytes, self.extra, self.slot.is_some());
     }
+}
+
+/// The host copy of `this`, if it has one the GPU may use now.
+#[cfg(windows)]
+fn ready_host(this: This) -> Option<&'static std::sync::Arc<HostTexture>> {
+    // SAFETY: called from resource methods only, while the title holds it.
+    let r = unsafe { &*this.cast::<Resource>() };
+    r.host.as_ref().filter(|h| h.ready())
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -838,7 +872,7 @@ impl Drop for HostTexture {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = ready_host(this)?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -922,7 +956,8 @@ fn whole_view(
     view
 }
 
-/// The host GPU's copy of a title resource, if it has one.
+/// The host GPU's copy of a title resource, if it has one the GPU may use
+/// now (resident: [`HostTexture::ready`]).
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
     this: This,
@@ -930,16 +965,17 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    ready_host(this).map(|h| &h.texture)
 }
 
-/// A title texture's host copy, shared, for a list to hold.
+/// A title texture's host copy, shared, for a list to hold (once the GPU
+/// may use it, as [`host_resource`]).
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    ready_host(this).cloned()
 }
 
 /// The host's resource flags for the title's: render target, depth,
@@ -1000,22 +1036,23 @@ pub(crate) fn host_desc(
     Ok(d)
 }
 
-/// A host texture like the title's ([`host_desc`]), in GPU memory, and the
-/// bytes it takes.
+/// A host texture like the title's ([`host_desc`]), in GPU memory: placed
+/// in the texture pool if it is one the title fills itself (`pool`), else
+/// a committed resource. `clear` is the title's clear value (format, then
+/// color or depth and stencil), read when the title made the resource: the
+/// one entry point to make a host texture from a recorded description,
+/// later than the title's call if need be.
 ///
-/// Creation can wait in the kernel: a session stalled for good in
+/// The title's thread never waits on VidMm: a session stalled for good in
 /// `CreateCommittedResource` (in `D3DKMTWaitForSynchronizationObjectFromCpu`,
-/// the GPU idle) on the way into the world, 2026-11-24. Big, slow or
-/// over-budget creations are logged before and after the call with their
-/// size and the video memory budget, so a stall names its texture.
+/// the GPU idle) on the way into the world, 2026-11-24. Memory is asked to
+/// become resident and the texture handed out at once; the GPU gets it once
+/// it is resident (`residency`). Big, slow or over-budget committed
+/// creations are logged before and after the call with their size and the
+/// video memory budget, so a stall names its texture.
 #[cfg(windows)]
-fn host_texture(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
+fn host_texture(desc: &ResourceDesc, state: u32, clear: Option<[u32; 5]>) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
-    const PC_FLAGS: u32 = 0xf;
     if desc.dimension == BUFFER {
         return None;
     }
@@ -1027,11 +1064,140 @@ fn host_texture(
             return None;
         }
     };
+    let start = D3D12_RESOURCE_STATES(crate::host::legal_for(
+        d.flags,
+        crate::host::texture_state(state),
+    ) as i32);
+    // SAFETY: the description has the host layout (checked size, same
+    // fields).
+    let hd = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read() };
+    let placed = match pooled(desc, &d).then(pool::global).flatten() {
+        Some(pool) => {
+            let started = std::time::Instant::now();
+            let placed = pool.place(&hd, start);
+            let took = started.elapsed();
+            if took >= CreationWatch::SLOW {
+                tracing::warn!(
+                    ms = took.as_secs_f64() * 1000.0,
+                    desc = ?d,
+                    "a host texture was slow to place in the pool"
+                );
+            }
+            match placed {
+                Ok(p) => Some(p),
+                Err(why) => {
+                    note_not_placed(desc, why);
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let (texture, bytes, residency, slot) = match placed {
+        Some(p) => (p.texture, p.bytes, p.residency, Some(p.slot)),
+        None => {
+            let (texture, bytes, residency) = committed(host, desc, &d, &hd, start, clear)?;
+            (texture, bytes, residency, None)
+        }
+    };
+    let stand_in = pc_format(desc.format);
+    let mut extra = 0;
+    if stand_in != pc_vertex_format(desc.format) {
+        format::note_stand_in(desc.format, stand_in);
+        // The stand-in's bytes beyond the title format's (twice as many
+        // for every stand-in of the table).
+        if let (Some((title, _)), Some((own, _))) = (element(desc.format), element(stand_in))
+            && own > title
+        {
+            extra = bytes / own * (own - title);
+        }
+    }
+    crate::host::name(&texture, || {
+        format!(
+            "texture {}x{} f{} flags {:#x}{}",
+            d.width,
+            d.height,
+            d.format,
+            d.flags,
+            if slot.is_some() { " pooled" } else { "" }
+        )
+    });
+    format::note_texture(true, bytes, extra, slot.is_some());
+    let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+    Some(HostTexture {
+        texture,
+        state: state.into(),
+        bytes,
+        extra,
+        residency,
+        slot,
+    })
+}
+
+/// Whether the host texture `d` of the title's `desc` goes to the pool: a
+/// texture the title fills itself (no target, depth or unordered access:
+/// `texture::upload` writes every texel from title memory before a shader
+/// reads it, so its pool memory needs no zeroing), with one sample, not a
+/// planar video format, not one whose contents are not uploaded (its
+/// committed memory stays zero, as before). Targets, depth, unordered
+/// access and MSAA textures stay committed resources.
+#[cfg(windows)]
+fn pooled(desc: &ResourceDesc, d: &ResourceDesc) -> bool {
+    const PLANAR: [u32; 8] = [103, 104, 105, 106, 110, 130, 131, 132];
+    matches!(d.dimension, 2..=4)
+        && d.flags & alias::WRITABLE == 0
+        && d.sample_count <= 1
+        && !PLANAR.contains(&d.format)
+        && format::conversion(desc.format, d.format) != Some(None)
+}
+
+/// Counts a texture the pool did not place (committed instead), by why;
+/// the first of each reason is logged.
+#[cfg(windows)]
+fn note_not_placed(desc: &ResourceDesc, why: &'static str) {
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&why) {
+        seen.push(why);
+        drop(seen);
+        tracing::info!(
+            ?desc,
+            why,
+            "a host texture not placed in the pool: committed (first of this reason)"
+        );
+    }
+}
+
+/// How long a committed texture's creation waits for its residency: below
+/// VidMm's ceiling it takes well under a millisecond, past it the texture
+/// is handed out not resident (the GPU gets it once it is).
+#[cfg(windows)]
+const COMMITTED_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// A committed host texture of the title's `desc` (made as `d`, `hd`, in
+/// `start`), the bytes it takes and its residency, asked for and not
+/// waited for beyond [`COMMITTED_WAIT`]; targets and depth get a high
+/// residency priority. `None`, logged and counted, if the driver refuses
+/// it.
+#[cfg(windows)]
+fn committed(
+    host: &crate::host::Host,
+    desc: &ResourceDesc,
+    d: &ResourceDesc,
+    hd: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    start: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES,
+    clear: Option<[u32; 5]>,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    u64,
+    Arc<residency::Residency>,
+)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    const PC_FLAGS: u32 = 0xf;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
-        // SAFETY: the title passes a whole clear value.
-        let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
+    let clear_value = clear.map(|mut value| {
         value[0] = pc_format(value[0]);
         value
     });
@@ -1039,41 +1205,30 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields).
+    // SAFETY: a host description.
     let bytes = unsafe {
-        host.device.GetResourceAllocationInfo(
-            0,
-            &[std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read()],
-        )
+        host.device
+            .GetResourceAllocationInfo(0, std::slice::from_ref(hd))
     }
     .SizeInBytes;
     // All ones: a description the device cannot size (it refuses it below).
     let bytes = if bytes == u64::MAX { 0 } else { bytes };
-    let watch = CreationWatch::before(&host.device, &d, bytes);
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
+    let watch = CreationWatch::before(&host.device, d, bytes);
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: the description has the host layout; the out pointer is
+    // ours.
     let made = unsafe {
         host.device.CreateCommittedResource(
             &heap,
             residency::heap_flags(),
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
+            hd,
+            start,
             // The same layout: format, then color or depth and stencil.
             clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
         )
     };
-    watch.after(&host.device, &d, bytes, made.is_ok());
-    if made.is_ok()
-        && !residency::direct()
-        && let Some(t) = texture.take()
-    {
-        texture = resident(&host.device, t, desc, &d, bytes);
-    }
+    watch.after(&host.device, d, bytes, made.is_ok());
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
         let reason = format!("as {}: the driver refused it ({})", d.format, e.code());
@@ -1082,81 +1237,45 @@ fn host_texture(
             desc.format,
             desc.flags & PC_FLAGS
         ));
+        return None;
     }
-    let stand_in = pc_format(desc.format);
-    if texture.is_some() && stand_in != pc_vertex_format(desc.format) {
-        format::note_stand_in(desc.format, stand_in);
+    let texture = texture?;
+    let pageable: Option<ID3D12Pageable> = texture.cast().ok();
+    const TARGETS: u32 = 0x1 | 0x2;
+    if d.flags & TARGETS != 0
+        && let Ok(device1) = host.device.cast::<ID3D12Device1>()
+    {
+        // SAFETY: one live pageable, one priority.
+        let set =
+            unsafe { device1.SetResidencyPriority(1, &pageable, &D3D12_RESIDENCY_PRIORITY_HIGH) };
+        if let Err(e) = set {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!(error = %e, "no residency priority for targets"));
+        }
     }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!(
-                "texture {}x{} f{} flags {:#x}",
-                d.width, d.height, d.format, d.flags
-            )
-        });
-        format::note_texture(true, bytes);
-    }
-    texture.map(|t| (t, bytes))
-}
-
-/// `texture` (of the title's `desc`, made as `d`, `bytes` long) made
-/// resident (`residency`); `None`, logged and counted, if it cannot be in
-/// time.
-#[cfg(windows)]
-fn resident(
-    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
-    texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    desc: &ResourceDesc,
-    d: &ResourceDesc,
-    bytes: u64,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static OVER: AtomicU64 = AtomicU64::new(0);
-    const PC_FLAGS: u32 = 0xf;
-    let started = std::time::Instant::now();
-    let result = residency::make_resident(device, &texture);
-    let ms = started.elapsed().as_secs_f64() * 1000.0;
-    let (budget, usage) = crate::dxgi::video_memory(device).unwrap_or_default();
-    match result {
-        Ok(false) => Some(texture),
-        Ok(true) => {
-            let n = OVER.fetch_add(1, Relaxed) + 1;
-            if n.is_power_of_two() {
+    let residency = if residency::direct() {
+        residency::Residency::resident()
+    } else {
+        let r = residency::Residency::ask(&host.device, vec![pageable]);
+        if !r.wait(COMMITTED_WAIT) {
+            static PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                let (budget, usage) = crate::dxgi::video_memory(&host.device).unwrap_or_default();
                 tracing::warn!(
                     n,
-                    ms,
                     mib = bytes >> 20,
                     budget_mib = budget >> 20,
                     usage_mib = usage >> 20,
+                    refused = r.refused(),
                     desc = ?d,
-                    "a host texture made resident past the video memory budget"
+                    "a committed host texture handed out before it is resident: unused by the GPU until it is"
                 );
             }
-            Some(texture)
         }
-        Err(why) => {
-            tracing::warn!(
-                ?why,
-                ms,
-                mib = bytes >> 20,
-                budget_mib = budget >> 20,
-                usage_mib = usage >> 20,
-                desc = ?d,
-                "a host texture not made resident: refused (XTP_TEXTURE_RESIDENCY=direct waits instead)"
-            );
-            format::note_refused(format!(
-                "format {} flags {:#x}: not made resident ({})",
-                desc.format,
-                desc.flags & PC_FLAGS,
-                match why {
-                    residency::Failed::Refused(e) => format!("{}", e.code()),
-                    residency::Failed::TimedOut =>
-                        format!("not in {} s", residency::TIMEOUT.as_secs()),
-                }
-            ));
-            None
-        }
-    }
+        r
+    };
+    Some((texture, bytes, Arc::new(residency)))
 }
 
 /// What is logged around a host texture's creation: whether it is big or
@@ -1337,19 +1456,24 @@ fn hand_out_resource(
     #[cfg(windows)]
     let address = backing.address();
     #[cfg(windows)]
-    let host = if desc.dimension == BUFFER {
+    let shared = if desc.dimension == BUFFER {
         None
     } else {
-        alias::shared(address, &desc, how).or_else(|| {
-            host_texture(&desc, state, clear).map(|(texture, bytes)| {
-                let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-                std::sync::Arc::new(HostTexture {
-                    texture,
-                    state: state.into(),
-                    bytes,
-                })
-            })
-        })
+        alias::shared(address, &desc, how)
+    };
+    #[cfg(windows)]
+    let (host, shared) = match shared {
+        Some(copy) => (Some(copy), true),
+        None if desc.dimension == BUFFER => (None, false),
+        None => {
+            // The clear value, read now: format, then color or depth and
+            // stencil (5 words).
+            let clear = (!clear.is_null()).then(|| {
+                // SAFETY: the title passes a whole clear value.
+                unsafe { clear.cast::<[u32; 5]>().read_unaligned() }
+            });
+            (host_texture(&desc, state, clear).map(Arc::new), false)
+        }
     };
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
@@ -1359,14 +1483,24 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        shared,
     });
     #[cfg(windows)]
     {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         if desc.dimension == BUFFER {
             crate::shadow::register(at, resource.data() as u64, desc.width);
-        } else if let Some(host) = &resource.host {
-            alias::register(address, at, &desc, host);
+        } else {
+            if let Some(host) = &resource.host {
+                alias::register(address, at, &desc, host);
+            }
+            // A texture the GPU does not write, made at the address by the
+            // title: the memory is used anew, and views there that showed
+            // a released target's copy are stale.
+            if how != PLACED_VIEW && host_flags(desc.flags) & alias::WRITABLE == 0 {
+                forget_shared_views(address);
+            }
         }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
@@ -1589,19 +1723,42 @@ fn at_address(
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description (padding zeroed): a
-/// resource at that address, made the first time a draw reads one, and the
-/// alias count (`alias::changes`) it was last matched at. They are released
-/// when the runtime maps or unmaps their memory ([`memory_remapped`]), and
-/// when a new one replaces them.
-/// shortcut: memory the title reuses without remapping it keeps the
-/// textures of its earlier descriptions until then.
+/// resource at that address, made the first time a draw reads one, the
+/// alias count (`alias::changes`) it was last matched at and the bytes it
+/// covers. They are released when the runtime maps or unmaps memory they
+/// overlap ([`memory_remapped`]), when a new one replaces them, and, when
+/// they show a released target's copy, when the title makes another
+/// texture at their address ([`forget_shared_views`]).
+/// shortcut: memory the title rewrites itself, without remapping it or
+/// making a resource there, keeps the textures of its earlier descriptions
+/// (and a released target's copy) until then.
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<PlacedTextures> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Resource and alias count by address and description.
+/// Placed views' resources by address and description.
 #[cfg(windows)]
-type PlacedTextures = std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64)>;
+type PlacedTextures = std::collections::BTreeMap<(u64, [u32; 14]), PlacedView>;
+
+/// A placed view's resource, the alias count it was last matched at and
+/// the bytes it covers.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct PlacedView {
+    resource: usize,
+    changes: u64,
+    len: u64,
+}
+
+/// The most bytes a placed view's texture has covered: how far before a
+/// remapped range one may start and still overlap it.
+#[cfg(windows)]
+static LONGEST_PLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How [`texture_at`] names itself to [`hand_out_resource`] (and the alias
+/// log).
+#[cfg(windows)]
+const PLACED_VIEW: &str = "placed view";
 
 /// Resources of placed views no longer in [`PLACED_TEXTURES`], with when
 /// they left it: released [`GRACE`] later, as a caller of `texture_at` may
@@ -1642,22 +1799,30 @@ fn release_waiting(grace: std::time::Duration) {
     }
 }
 
+#[cfg(windows)]
+fn placed_textures() -> std::sync::MutexGuard<'static, PlacedTextures> {
+    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: the
-/// textures of placed views there no longer show it, and are released
-/// (memory streamed in and out would otherwise keep a host texture per
-/// page and description viewed for the run).
+/// textures of placed views over any of it (starting there or before) no
+/// longer show it, and are released (memory streamed in and out would
+/// otherwise keep a host texture per page and description viewed for the
+/// run).
 #[cfg(windows)]
 pub(crate) fn memory_remapped(at: usize, len: usize) {
     let (start, end) = (at as u64, (at as u64).saturating_add(len as u64));
+    let from = start.saturating_sub(LONGEST_PLACED.load(std::sync::atomic::Ordering::Relaxed));
     let gone: Vec<usize> = {
-        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = placed_textures();
         let keys: Vec<_> = map
-            .range((start, [0; 14])..(end, [0; 14]))
+            .range((from, [0; 14])..(end, [0; 14]))
+            .filter(|((address, _), view)| address.saturating_add(view.len.max(1)) > start)
             .map(|(k, _)| *k)
             .collect();
         keys.iter()
             .filter_map(|k| map.remove(k))
-            .map(|(r, _)| r)
+            .map(|view| view.resource)
             .collect()
     };
     if !gone.is_empty() {
@@ -1671,14 +1836,49 @@ pub(crate) fn memory_remapped(at: usize, len: usize) {
     release_later(gone);
 }
 
+/// The title made a texture the GPU does not write at `address`: placed
+/// views there that show the copy of a target no longer there (`alias`)
+/// are stale, and released. Without a new texture there, they keep it:
+/// the title may read a target through a view after releasing its object
+/// (title memory still holds what was drawn, on the console).
+#[cfg(windows)]
+fn forget_shared_views(address: u64) {
+    let gone: Vec<usize> = {
+        let mut map = placed_textures();
+        let keys: Vec<_> = map
+            .range((address, [0; 14])..=(address, [u32::MAX; 14]))
+            .filter(|(_, view)| {
+                let r = resource(view.resource as This);
+                r.shared && alias::current(address, &r.desc).is_none()
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        keys.iter()
+            .filter_map(|k| map.remove(k))
+            .map(|view| view.resource)
+            .collect()
+    };
+    if !gone.is_empty() {
+        tracing::debug!(
+            address = format_args!("{address:#x}"),
+            textures = gone.len(),
+            "placed views of a released target dropped: a new texture at its address"
+        );
+        release_later(gone);
+    }
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use. When a texture the
 /// GPU writes comes to that address after it (or another one replaces it),
 /// the next use makes a new resource, which shares that texture's host
 /// copy (`alias`), and the one it replaces is released ([`release_later`]).
 /// The resource is made outside the map's lock: making a host texture can
-/// wait in the kernel, and every draw reading a placed view would wait
-/// behind it.
+/// take time, and every draw reading a placed view would wait behind it.
+/// Only a resource in the map, looked at under its lock, is handed out:
+/// one replaced or remapped meanwhile may be released [`GRACE`] later.
+/// `None` while the host copy is not resident yet (the next use looks
+/// again).
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let desc = canonical_resource_desc(*desc);
@@ -1688,22 +1888,21 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     let key = (address, desc);
-    let lock = || PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    let usable = |r: This| resource(r).host.is_some().then_some(r);
+    let usable = |r: This| ready_host(r).is_some().then_some(r);
     let changes = alias::changes();
     // The resource made so far, if it is still the one to use.
     let before = {
-        let mut map = lock();
+        let mut map = placed_textures();
         match map.get_mut(&key) {
-            Some(entry) => {
-                let made = entry.0 as This;
+            Some(view) => {
+                let made = view.resource as This;
                 let current = resource(made).host.clone();
-                let stale = entry.1 != changes
+                let stale = view.changes != changes
                     && alias::current(address, &d)
                         .is_some_and(|now| !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &now)));
-                entry.1 = changes;
+                view.changes = changes;
                 if !stale {
-                    return current.is_some().then_some(made);
+                    return usable(made);
                 }
                 Some(made)
             }
@@ -1712,27 +1911,42 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     };
     let mut out = std::ptr::null();
     let iid = &RESOURCE_IIDS[0];
-    if at_address(address, d, std::ptr::null(), iid, &mut out, "placed view") != S_OK {
-        return before.and_then(usable);
+    let made = at_address(address, d, std::ptr::null(), iid, &mut out, PLACED_VIEW) == S_OK;
+    let mut map = placed_textures();
+    if !made {
+        // `before` may be released by now (its memory remapped while this
+        // one was made): only what the map holds now is handed out.
+        return map.get(&key).and_then(|view| usable(view.resource as This));
     }
-    let mut map = lock();
+    let len = footprint(&d).map_or(0, |info| info.size);
+    LONGEST_PLACED.fetch_max(len, std::sync::atomic::Ordering::Relaxed);
     match map.get_mut(&key) {
         // Another thread made or replaced it meanwhile: theirs stays, ours
         // was never handed out.
-        Some(entry) if Some(entry.0 as This) != before => {
-            let theirs = entry.0 as This;
+        Some(view) if Some(view.resource as This) != before => {
+            let theirs = usable(view.resource as This);
             drop(map);
             resource_release(out);
-            usable(theirs)
+            theirs
         }
-        Some(entry) => {
-            let replaced = std::mem::replace(&mut entry.0, out as usize);
+        Some(view) => {
+            let replaced = std::mem::replace(&mut view.resource, out as usize);
+            view.changes = changes;
+            view.len = len;
+            let ours = usable(out);
             drop(map);
             release_later(vec![replaced]);
-            usable(out)
+            ours
         }
         None => {
-            map.insert(key, (out as usize, changes));
+            map.insert(
+                key,
+                PlacedView {
+                    resource: out as usize,
+                    changes,
+                    len,
+                },
+            );
             usable(out)
         }
     }
@@ -3045,5 +3259,113 @@ mod tests {
         assert!(!Arc::ptr_eq(&host_copy(again).unwrap(), &copy));
         memory_remapped(address as usize, KIB_64 as usize);
         release_waiting(std::time::Duration::ZERO);
+    }
+
+    /// A remapped range that starts inside a placed view's texture takes it
+    /// too (it shows that memory), not only those starting in the range.
+    #[cfg(windows)]
+    #[test]
+    fn a_remapping_takes_the_views_it_overlaps() {
+        let test = "resource::tests::a_remapping_takes_the_views_it_overlaps";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        // 64x64 RGBA8: 16 KiB.
+        let desc = texture(64, 64, 28, 1);
+        let len = footprint(&desc).unwrap().size;
+        assert!(len >= 8192, "{len}");
+        let view = words(&desc, [0, 0]);
+        let first = texture_at(address, &view).unwrap();
+        // Past its end: kept.
+        memory_remapped((address + len) as usize, 4096);
+        assert_eq!(texture_at(address, &view), Some(first));
+        // Starting in its middle: taken.
+        memory_remapped((address + len / 2) as usize, 4096);
+        let gone = PLACED_TEXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .all(|&(a, _)| a != address);
+        assert!(gone, "a texture over the remapped memory stays");
+        release_waiting(std::time::Duration::ZERO);
+    }
+
+    /// A view that shows a released target's copy keeps it until the title
+    /// makes another texture at that address: then the view's next use
+    /// makes a texture of its own (from title memory).
+    #[cfg(windows)]
+    #[test]
+    fn a_released_targets_copy_goes_when_its_memory_is_used_again() {
+        let test = "resource::tests::a_released_targets_copy_goes_when_its_memory_is_used_again";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        let plain = texture(16, 16, 28, 1);
+        let target = at(address, &ResourceDesc { flags: 1, ..plain });
+        let view = words(&plain, [0, 0]);
+        let shown = texture_at(address, &view).unwrap();
+        assert!(same_copy(shown, target));
+        let drawn = host_copy(target).unwrap();
+        assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+        assert_eq!(
+            texture_at(address, &view),
+            Some(shown),
+            "kept while nothing else is there"
+        );
+        // The title puts a texture of its own there.
+        let streamed = at(address, &plain);
+        let now = texture_at(address, &view).unwrap();
+        assert_ne!(now, shown);
+        assert!(!Arc::ptr_eq(&host_copy(now).unwrap(), &drawn));
+        assert!(crate::texture::title_written(host_resource(now).unwrap()));
+        assert_eq!(slot::<Release>(streamed, 0x10)(streamed), 0);
+        memory_remapped(address as usize, KIB_64 as usize);
+        release_waiting(std::time::Duration::ZERO);
+    }
+
+    /// Textures the title fills itself are placed in the texture pool;
+    /// targets, depth and unordered access stay committed, and every one
+    /// is resident before it is handed to the GPU.
+    #[cfg(windows)]
+    #[test]
+    fn title_filled_textures_go_to_the_pool_and_targets_do_not() {
+        let test = "resource::tests::title_filled_textures_go_to_the_pool_and_targets_do_not";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let pooled = |flags: u32| {
+            let r = tests_support::committed(&ResourceDesc {
+                flags,
+                ..texture(64, 64, 28, 1)
+            });
+            let host = resource(r).host.clone().expect("a host copy");
+            let placed = host.slot.is_some();
+            assert!(host.residency.wait(std::time::Duration::from_secs(5)));
+            assert!(host_resource(r).is_some());
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+            placed
+        };
+        assert_eq!(pooled(0), pool::enabled(), "a texture the title fills");
+        assert!(!pooled(1), "a render target");
+        assert!(!pooled(4), "unordered access");
+        // A stand-in's extra bytes are counted: R9G9B9E5 as RGBA16F doubles.
+        let r = tests_support::committed(&texture(64, 64, 67, 1));
+        let host = resource(r).host.clone().unwrap();
+        if pc_format(67) == 10 {
+            assert_eq!(
+                host.extra * 2,
+                host.bytes,
+                "{} of {}",
+                host.extra,
+                host.bytes
+            );
+        }
+        assert_eq!(slot::<Release>(r, 0x10)(r), 0);
     }
 }
