@@ -270,7 +270,7 @@ task. CI is covered in 5.6.
 
 ### 4.14 The game-specific layer: keep the separation, build it out (new work)
 
-`xtp-game` is the one crate that knows Grand Theft Auto VI. Today it holds the SGD5 shader-file
+`xtp-game` is the one crate that knows BTP 6. Today it holds the SGD5 shader-file
 reader (with tests on synthetic records) and an empty table of known builds looked up by BLAKE3;
 `xtp run` prints the build. `docs/asset-policy.md` already says what may live there: build
 identities, per-build offsets of the functions we hook under names we choose, byte signatures,

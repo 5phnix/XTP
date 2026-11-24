@@ -479,7 +479,7 @@ pub(crate) struct Needs {
     /// and the RTX 5090 was removed as hung while they ran. VIctory's
     /// translator then (XTP's base) already refused cross-lane operations,
     /// lane masks read as data and whole-wave reductions in mesh code: what
-    /// hung is not known. In Grand Theft Auto VI's pack every mesh program
+    /// hung is not known. In BTP 6's pack every mesh program
     /// is wave64 (8,726 translate for 32-lane hosts): refused, the world
     /// loses that geometry on NVIDIA.
     ///

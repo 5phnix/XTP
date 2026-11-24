@@ -37,7 +37,7 @@ Converting them ahead of time from files is only a warm-up.
 | `xtp-shader` | Xbox shader containers → host shaders |
 | `xtp-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
 | `xtp-pipeline` | converter trait, content-addressed cache |
-| `xtp-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
+| `xtp-game` | BTP 6-specific formats, build identities, hooks |
 | `apps/xtp` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
