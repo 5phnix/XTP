@@ -5,6 +5,12 @@
 //! controls to the player once it hands them back. With `--measure`, ends
 //! the title after that many seconds of gameplay and prints a summary of
 //! its frame-rate lines.
+//!
+//! Before the title, under the session lock it holds, it runs `xtp
+//! precook` on the title's shader pack ([`precook`]), unless
+//! `--no-precook`: a session after a translator change then finds its
+//! translations and compute pipelines made, and one after none pays a few
+//! seconds for the check.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +37,8 @@ pub struct Options {
     pub script: Option<PathBuf>,
     pub exe: Option<PathBuf>,
     pub no_build: bool,
+    /// Start the title without `xtp precook` first.
+    pub no_precook: bool,
 }
 
 pub fn run(root: &Path, options: &Options) -> Result<()> {
@@ -75,6 +83,11 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
     let console = console(std::env::var("XTP_CONSOLE").ok().as_deref())?;
     let _session = Session::take()?;
     refuse_a_second_title()?;
+    if options.no_precook {
+        println!("play: no precook (--no-precook)");
+    } else {
+        precook(&xtp, &game)?;
+    }
     let run = cfg.cache_subdir("play")?.join(stamp(SystemTime::now()));
     let data = run.join("data");
     copy_dir(&golden, &data)?;
@@ -143,6 +156,58 @@ fn build(root: &Path) -> Result<()> {
         .status()
         .context("running cargo build")?;
     ensure!(status.success(), "cargo build failed ({status})");
+    Ok(())
+}
+
+/// The name the precook runs under, beside `xtp.exe` ([`precook`]).
+const PRECOOK_EXE: &str = "xtp-precook";
+
+/// `xtp precook` on the title's shader pack (`shaders.rpf` beside `game`),
+/// before the title and under the session lock this run holds (it passes
+/// `--lock-holder`), with this run's environment: the switches that change
+/// translation are read as the title will read them. It runs as a copy of
+/// `xtp` named [`PRECOOK_EXE`]: the same bytes, so the same translator and
+/// cache key, but no `xtp.exe` that session tools watching for the title
+/// would take for it (session.ps1 times its hard stop from the title's
+/// start). A precook that fails is reported, and the title starts with the
+/// cache as it is.
+fn precook(xtp: &Path, game: &Path) -> Result<()> {
+    let pack = game.with_file_name("shaders.rpf");
+    if !pack.is_file() {
+        println!("play: no {} to precook", pack.display());
+        return Ok(());
+    }
+    let exe = xtp.with_file_name(format!("{PRECOOK_EXE}{}", std::env::consts::EXE_SUFFIX));
+    if let Err(e) = std::fs::copy(xtp, &exe) {
+        println!(
+            "play: no precook: copying {} to {}: {e}; the title starts with the cache as it is",
+            xtp.display(),
+            exe.display()
+        );
+        return Ok(());
+    }
+    println!(
+        "play: precook of {} (--no-precook skips it)",
+        pack.display()
+    );
+    let started = Instant::now();
+    let status = Command::new(&exe)
+        .arg("precook")
+        .arg(&pack)
+        .args(["--lock-holder", &std::process::id().to_string()])
+        .stdin(Stdio::null())
+        .status();
+    let seconds = started.elapsed().as_secs_f64();
+    match status {
+        Ok(status) if status.success() => println!("play: precook done in {seconds:.0} s"),
+        Ok(status) => println!(
+            "play: precook failed ({status}) after {seconds:.0} s; the title starts with the \
+             cache as it is"
+        ),
+        Err(e) => println!(
+            "play: precook did not start ({e}); the title starts with the cache as it is"
+        ),
+    }
     Ok(())
 }
 

@@ -12,6 +12,7 @@ xtp-core.workspace = true
 xtp-pe.workspace = true
 xtp-loader.workspace = true
 xtp-hle.workspace = true
+xtp-gpu.workspace = true
 xtp-shader = { workspace = true, features = ["host"] }
 xtp-game.workspace = true
 anyhow.workspace = true
@@ -20,8 +21,15 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# `precook` lowers its own priority.
+windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+
 [dev-dependencies]
 tempfile.workspace = true
+# The precook test's synthetic console program (its zlib-packed code).
+miniz_oxide.workspace = true
+xtp-testkit.workspace = true
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

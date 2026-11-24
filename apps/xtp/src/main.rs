@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod precook;
 mod preflight;
 mod run;
 mod shader;
@@ -125,6 +126,41 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Fill the shader cache before a session: every program of the pack
+    /// translated as the title would translate it, into the cache it reads,
+    /// and every compute program's host pipeline made into the pipeline
+    /// library. Waits while a game session runs (the session lock, another
+    /// xtp.exe), then holds the lock and runs at below-normal priority; a
+    /// pass already made for this translator, its switches and this pack
+    /// is not made again. The pack as shader-survey takes it.
+    Precook {
+        pack: Option<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Translations only, no compute host pipelines.
+        #[arg(long)]
+        no_pipelines: bool,
+        /// Pass again even when the cache is up to date (after a driver
+        /// update, which makes the host drop the pipeline library).
+        #[arg(long)]
+        force: bool,
+        /// Also write one line per record: its container's hash as the
+        /// pipeline log prints it, its stage and what became of it.
+        #[arg(long, value_name = "FILE")]
+        list: Option<PathBuf>,
+        /// The session lock to wait for and hold (default: XTP_SESSION_LOCK).
+        #[arg(long, value_name = "FILE")]
+        lock: Option<PathBuf>,
+        /// The process that holds the session lock for this precook
+        /// (`cargo xtask play` passes its own).
+        #[arg(long, value_name = "PID")]
+        lock_holder: Option<u32>,
+        /// Start at once, without waiting for the machine or taking the
+        /// lock (tests, or when you know no session runs).
+        #[arg(long)]
+        no_wait: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         /// A title executable or a package folder with a manifest or a single .exe.
@@ -184,8 +220,18 @@ impl Console {
     }
 }
 
+/// The default log filter: `precook` makes thousands of shaders and
+/// pipelines, and says itself what became of them (a refusal reason is
+/// still logged once).
+fn log_filter(command: Option<&str>) -> &'static str {
+    match command {
+        Some("precook") => "warn,xtp_gpu::pipeline=error,xtp_gpu::pipeline::host=warn",
+        _ => "info",
+    }
+}
+
 fn main() -> Result<()> {
-    xtp_core::logging::init("info");
+    xtp_core::logging::init(log_filter(std::env::args().nth(1).as_deref()));
     // The audio recorder `run` starts for `XTP_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if xtp_hle::modules::audio::capture::child() {
@@ -233,6 +279,25 @@ fn main() -> Result<()> {
             jobs,
             host_lanes,
         ),
+        Command::Precook {
+            pack,
+            jobs,
+            no_pipelines,
+            force,
+            list,
+            lock,
+            lock_holder,
+            no_wait,
+        } => precook::run(precook::Options {
+            pack,
+            jobs,
+            pipelines: !no_pipelines,
+            force,
+            list,
+            lock,
+            lock_holder,
+            wait: !no_wait,
+        }),
         Command::Run {
             target,
             unimplemented,
@@ -323,6 +388,38 @@ mod tests {
             panic!("not run");
         };
         console
+    }
+
+    #[test]
+    fn precook_takes_its_options() {
+        let cli = Cli::try_parse_from([
+            "xtp",
+            "precook",
+            "shaders.rpf",
+            "--jobs",
+            "4",
+            "--no-pipelines",
+            "--lock-holder",
+            "12",
+        ])
+        .unwrap();
+        let Command::Precook {
+            pack,
+            jobs,
+            no_pipelines,
+            force,
+            lock_holder,
+            no_wait,
+            ..
+        } = cli.command
+        else {
+            panic!("not precook");
+        };
+        assert_eq!(pack, Some(PathBuf::from("shaders.rpf")));
+        assert_eq!((jobs, no_pipelines, force), (Some(4), true, false));
+        assert_eq!((lock_holder, no_wait), (Some(12), false));
+        assert_eq!(log_filter(Some("run")), "info");
+        assert!(log_filter(Some("precook")).starts_with("warn"));
     }
 
     #[test]
