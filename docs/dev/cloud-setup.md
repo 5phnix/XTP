@@ -383,7 +383,11 @@ the same VM, not against the PC.
 
 **Which code.** By default the VM's clone is put on `origin/main` (fetched
 first) or on `-Ref`. With `-Local` your current commit is sent as a git bundle
-(only committed work: the script warns about local changes). The VM keeps one
+(only committed work: the script warns about local changes), under a name of
+its own, and the VM stops unless the commit it checked out is the one sent:
+the log's `commit` line names it (before, callers waiting for the VM in turn
+read one shared bundle, and a run could build another worker's commit,
+[hardware-tests](../analysis/hardware-tests.md)). The VM keeps one
 clone and one `target` folder, so builds are incremental; one build runs at a
 time and a second caller waits.
 
