@@ -314,6 +314,63 @@ fn a_branch_on_the_scc_of_saveexec_skips_when_no_lane_is_left() {
     console_flow_case("skip on the SCC of saveexec", &body, 64, |_| 3);
 }
 
+/// A select on a mask with a part held as a number: `vcc` (all lanes) and
+/// s[12:13] built dword by dword (lanes 0-15 and 48-63). The swizzle makes
+/// it a program whose lanes read only their half, which ran in two halves;
+/// `lane_bit` then tested the host lane's bit, so console lanes 32-63
+/// took lanes 0-31's (a debug assertion; wrong in release). It now takes
+/// the console flow: lane t selects 2 where t < 16 or t >= 48, else 1.
+const HELD_SELECT: &[u32] = &[
+    0xD8D4_401F,
+    0x0100_0000, // ds_swizzle_b32 v1, v0 (xor 0x10, unused)
+    0x7D88_00C0, // v_cmp_gt_u32 vcc, 64, v0
+    0xBE8C_03FF,
+    0x0000_FFFF, // s_mov_b32 s12, 0xffff
+    0xBE8D_03FF,
+    0xFFFF_0000, // s_mov_b32 s13, 0xffff0000
+    0x878A_0C6A, // s_and_b64 s[10:11], vcc, s[12:13]
+    0xD501_0002,
+    0x0029_0481, // v_cndmask_b32 v2, 1, 2, s[10:11]
+];
+
+fn held_select(t: u32) -> u32 {
+    if !(16..48).contains(&t) { 2 } else { 1 }
+}
+
+#[test]
+fn a_select_on_a_mask_held_as_a_number_translates_for_every_host() {
+    // No device needed: the lowering itself asserted before.
+    for target in [
+        super::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        },
+        super::Target {
+            lanes_min: 64,
+            lanes_max: 64,
+        },
+    ] {
+        let cs = emit_for(&program(HELD_SELECT, 64), target)
+            .unwrap_or_else(|e| panic!("{target:?}: {e}"));
+        assert_eq!(
+            wave_size(&cs.dxil),
+            Some(if target.runs(64) { 64 } else { 32 })
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a hardware adapter with 32- or 64-lane waves (XTP_TEST_ADAPTER=warp keeps \
+            this PC's tests off hardware)"]
+fn a_select_on_a_mask_held_as_a_number_runs_as_the_console() {
+    console_flow_case(
+        "select on a mask held as a number",
+        HELD_SELECT,
+        64,
+        held_select,
+    );
+}
+
 /// Groups of several console waves need the halves to meet without a
 /// group barrier: not yet.
 #[test]

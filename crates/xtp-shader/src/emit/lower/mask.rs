@@ -189,6 +189,18 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            // Split in halves, a host lane is not its console lane (the
+            // upper half's lanes 0-31 are console lanes 32-63), so the
+            // per-lane form has no bit of a mask held as a number to test
+            // (a select or carry on one, which the split test does not
+            // see): the console flow has.
+            Atom::Opaque(_) | Atom::Constant(_) if self.split && !self.console_cf => {
+                Err(if self.x.per_lane_only {
+                    "a lane mask held as a number in a wave64 program split in halves"
+                } else {
+                    super::CONSOLE_FLOW
+                })
+            }
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
@@ -225,7 +237,8 @@ impl<'a> Lower<'a> {
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64; host lane = console
-    /// lane, so not in a program split in halves).
+    /// lane, so not in a program split in halves: [`Self::atom`] sends
+    /// those to the console flow first).
     pub(super) fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         debug_assert!(!self.split || self.console_cf);
         if self.console_cf {

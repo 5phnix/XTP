@@ -73,8 +73,12 @@ the host has no 64-lane waves and the program:
 - uses no LDS (the console compiler may have left out barriers between
   lanes of one wave).
 
-Anything else still stops with the step 1 reason. `mask_dword`, the wave
-reduction lowering and `lane_bit` refuse the split form as a safety net.
+Anything else still stops with the step 1 reason. `mask_dword` and the wave
+reduction lowering refuse the split form as a safety net. A select or a
+carry on a mask with a part held as a number (a constant, dwords built from
+scalars) is not among the tests above; `atom` sends such a program to the
+console flow rather than test the host lane's bit (in the upper half, host
+lane n is console lane 32 + n). `lane_bit` only asserts it in debug builds.
 (A wave64 program that declares no wave size at all still runs in whatever
 waves the host forms, as on `main`: its `v_readfirstlane` reads the host
 wave's first lane.)
