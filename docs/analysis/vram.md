@@ -50,7 +50,7 @@ Per-texture residency gives about 0.9 MB/s past the threshold; heaps of
 | more than a quarter heap (64 MiB) | committed | one heap each anyway |
 | over the budget, or a placement the driver refuses | committed, logged | see 2.4 |
 
-`XTP_TEXTURE_POOL=0` makes every host texture committed, as before.
+**The pool is off by default** (§3.3): `XTP_TEXTURE_POOL=1` turns it on; unset or `0`, every host texture is committed, as before.
 
 ### 2.2 The pool (`resource/pool.rs`)
 
@@ -68,7 +68,10 @@ Per-texture residency gives about 0.9 MB/s past the threshold; heaps of
   lost); TLSF fits as well as best fit at these counts (hundreds of ranges a
   heap, a few hundred placements a second) and is more code.
 - A thread (`xtp-texture-heaps`) keeps a **reserve** of free bytes in each
-  class: 512 MiB and 64 MiB by default (`XTP_TEXTURE_RESERVE_MIB`). Heaps
+  class: one heap, 256 MiB and 32 MiB by default (`XTP_TEXTURE_RESERVE_MIB`;
+  session A3 ran with 512 MiB, see 3.2: making a heap not resident takes
+  0.1–1.9 ms, so one heap ahead is enough, and every MiB of reserve is
+  resident memory the title does not use). Heaps
   still becoming resident count in it: the title's thread places textures
   in them and the GPU gets those once the heap is resident. Each heap is one
   residency request (`EnqueueMakeResident`, its own fence, within the
@@ -127,14 +130,89 @@ is that half.
 
 `resource::pool::tests::bench_5000_bc7_textures` (ignored; `cargo test -p
 xtp-gpu --release -- --ignored --nocapture pool::tests::bench`): 5,000 BC7
-1024² textures of 9 mips made three ways.
+1024² textures of 9 mips made three ways. Run 2026-11-24 on WARP, on a
+build-farm VM (c2d-highcpu-16, no GPU), release build, tree e17e4f8 plus
+this delivery:
 
-TO BE FILLED.
+| path | textures | µs/texture (mean) | p50 µs | p99 µs | max µs | ms until all resident | VRAM KiB/texture | private KiB/texture | residency requests |
+|---|---|---|---|---|---|---|---|---|---|
+| committed, resident at creation (before 2026-11-24) | 5000 | 51.2 | 49.5 | 87.2 | 144 | 256 | 1408 | 1414 | 5000 |
+| committed, not resident + EnqueueMakeResident each, waited (dark-world) | 5000 | 61.7 | 53.9 | 226.5 | 304 | 309 | 1408 | 1366 | 5000 |
+| pooled (256 MiB heaps, 512 MiB reserve) | 5000 | **7.9** | 5.8 | 49.3 | 340 | **39** | 1416 | 1421 | **27** |
 
-### 3.2 In game
+D3D12 sizes the texture at 1,408 KiB, 64 KiB aligned. Pool: 27 heaps made
+for the run, none by the creating thread; 576 MiB held before it (the
+reserve); 4 empty heaps kept after (the reserve).
 
-TO BE FILLED (session before/after with `E:\tools\stall-probe\session.ps1`,
-`XTP_WATCHDOG_HOOK=1`, autopilot, golden).
+Reading:
+- A creation costs 6 to 8 times less, and residency requests drop from one
+  a texture to one a heap (185 times fewer). That is the cost the pool
+  removes; on the 4080 past VidMm's ceiling each request costs about a
+  second (stall), which WARP does not show.
+- **No video memory is saved for these textures**: a 1024² BC7 texture is
+  a multiple of 64 KiB either way (VRAM per texture 1,408 KiB committed,
+  1,416 KiB pooled, the difference being the reserve heaps made during the
+  run). The pool saves memory only on textures the small rule lets take
+  4 KiB (a 16x16 texture: 4 KiB instead of 64 KiB); in A3, 2,374 pooled
+  textures took 4,607 MiB, about 1.9 MiB each, so the world's textures are
+  mostly not small ones.
+- WARP's "video memory" is the process's own (private bytes follow it).
+
+### 3.2 In game (Series X, this PC, 2026-11-24)
+
+`E:\tools\stall-probe\session.ps1` (autopilot, golden data,
+`XTP_WATCHDOG_HOOK=1`, under `measure.lock`, one session at a time); the
+loading is timed from the intro cut (`XTP_SKIP_INTRO`, "intro movie cut")
+to the autopilot's world condition ("line 17: met"). Logs in
+`E:\xtp-data\cache\play\<UTC time>\run.log`, GPU and VidMm samples in
+`E:\xtp-data\runs\stall-tex-pool-*`.
+
+| session | binary, switch | world | loading | host textures at the world | residency requests | xtp dedicated VRAM, max |
+|---|---|---|---|---|---|---|
+| A (16:44Z) | f991283, pool | **not reached**: 0.2 fps from the first frames, the title stops at 32 textures, the autopilot times out in the front end | — | 32 (8 pooled) | 30 | 1.25 GB |
+| B (16:51Z) | f991283, `XTP_TEXTURE_POOL=0`, intro played | +240.1 s | ≈ 223 s (no cut marker; intro ≈ 17 s) | 3,587, 8,884 MiB, all committed | 3,655 | 9.15 GB |
+| A2 (17:02Z) | f991283, pool, stopped at 150 s by mistake | not reached in 150 s | — | 3,528 at +145 s, 8,861 MiB | — | — |
+| A3 (17:07Z) | e17e4f8 (main merged), pool, 512 MiB reserve | +239.0 s | **230.4 s** | 3,561, 8,837 MiB: 2,374 pooled (4,607 MiB in 24 heaps of 5,472 MiB), 1,187 committed (4,230 MiB) | 1,219 | 9.90 GB (nvidia-smi 11.15 GB) |
+
+What they show:
+- The pool works in game: the world is reached, every texture the title
+  fills goes to the pool (none refused, none placed by the title's thread
+  after the first heap), and residency requests drop to a third (the
+  committed textures and the heaps).
+- **Loading is not faster.** In A3 as in B, submissions take 0.5 to 30 s
+  on the GPU during the load (54 and 33 "still waiting for the host GPU"),
+  and the frame time is mostly that. With main's code the per-texture wait
+  had already left the creation call (T2: two slow creations); what is left
+  is GPU-side, most likely VidMm paging the allocations still made one by
+  one: the 1,187 committed textures (targets, depth, unordered access),
+  `texture.rs`'s committed upload buffer per detiled texture, `shadow.rs`'s
+  buffer per host copy.
+- A's front-end stall did not come back in A2 (same binary, same switch) or
+  A3. Its cause is not known: thread stacks were only taken in A2, where
+  the title threads waited for the GPU (`queue::present`,
+  `copy_page_mappings` → `Host::settle` → `wait_gpu`), as in a normal load.
+- The 512 MiB reserve left 865 MiB of heap unused at the world (5,472 MiB
+  for 4,607 placed), which is why the default is now one heap.
+
+### 3.3 Decision: off by default
+
+The person's decision (relayed by Samuel, 2026-11-24): XTP works in Series S
+mode, where the world loads in about 10 s under VidMm's ceiling (series-s,
+frame-prof's session C), and no more Series X session is run. B3 (the same
+binary as A3, pool off) was therefore not run, and A3 is not shown to be at
+least as good as committed textures: 230.4 s against about 223 s for B (an
+earlier binary, the intro played, another moment), 0.75 GB more video memory
+resident, and one unexplained front-end stall (A) with the pool on. So the
+pool is **off by default** (`XTP_TEXTURE_POOL=1` turns it on). What stays on
+for every texture: the residency path of 2.3 (one fence a request, no wait
+beyond 10 ms on the title's thread, no texture refused for good) and the
+review fixes of §4; session B ran on it.
+
+To turn it on by default later, the Series S measure that decides it: a
+session with and one without `XTP_TEXTURE_POOL=1`, same binary, loading
+time, VidMm peak (the reserve must not push Series S past the ceiling), and
+"handed out before their heap was resident" in the frame line (textures that
+may have got null views).
 
 ## 4. Review items of dark-world's delivery (Samuel's relay)
 
@@ -157,7 +235,33 @@ TO BE FILLED (session before/after with `E:\tools\stall-probe\session.ps1`,
 
 ## 5. Critical review
 
-TO BE COMPLETED with the measurements. Known limits so far:
+What the brief asked and what came out of it:
+
+- **The design rested on a cause that main had already moved.** The brief
+  (from stall's first measurements) put the stall in each committed
+  texture's synchronous `MakeResident`. By the time the pool ran in game,
+  dark-world's NOT_RESIDENT path was on main and the creation call no longer
+  waited (T2: two slow creations). The pool removes what was left of it from
+  the title's thread, and cuts residency requests to a third, but the load is
+  as slow: the remaining cost is on the GPU, in allocations the pool does not
+  touch. I did not measure that before writing the pool; a session counting
+  where the GPU time goes (`XTP_GPU_TIMING`) would have said it first.
+- **The micro-benchmark measures WARP** (§3.1), whose "video memory" is the
+  process's own and which has no VidMm ceiling: it shows the cost of the
+  calls and the bytes per texture, not the stall. Only a session on the
+  4080 shows the stall, and Series X sessions are over.
+- **What the pool does not cover:** targets, depth and unordered access
+  textures (1,187, 4.2 GiB in A3) stay committed, one residency request
+  each. Placing them needs their first use initialised (a clear or discard,
+  D3D12's rule for placed RT/DS) in a list, which is `list.rs`/`host.rs`
+  work, and their contents to start at zero as today.
+- **Below the threshold, nothing is gained or lost in time; the reserve
+  costs memory.** With 512 MiB it left 865 MiB unused (now one heap).
+- **The A stall is unexplained.** It happened once in three sessions with the
+  pool on (A; A2 and A3 passed). A pool bug is possible; the default
+  being off keeps it out of the way until a Series S session with stacks.
+
+Known limits:
 
 - A view made while its texture is not resident is a null view, and stays
   one until the title writes that descriptor again (descriptor/host.rs makes
@@ -171,4 +275,4 @@ TO BE COMPLETED with the measurements. Known limits so far:
 - texture.rs makes a committed upload buffer per texture it detiles (its
   staging buffer): one allocation and residency operation each, in system
   memory. Not measured against the threshold yet.
-- The reserve keeps up to 512 MiB + 64 MiB unused.
+- The reserve keeps up to one heap per class unused (256 MiB + 32 MiB by default; 865 MiB in A3 with 512 MiB).

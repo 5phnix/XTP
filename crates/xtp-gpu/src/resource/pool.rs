@@ -31,9 +31,10 @@
 //!   the reserve needs it, and all empty ones go when usage passes the
 //!   budget.
 //!
-//! `XTP_TEXTURE_POOL=0` makes every host texture a committed resource, as
-//! before. `XTP_TEXTURE_HEAP_MIB` sets the heap size (the small class gets
-//! an eighth), `XTP_TEXTURE_RESERVE_MIB` the reserve (twice a heap).
+//! The pool is off by default: `XTP_TEXTURE_POOL=1` turns it on (unset or
+//! `0`: every host texture a committed resource, as before; measured in
+//! game in docs/analysis/vram.md §3.2). `XTP_TEXTURE_HEAP_MIB` sets the heap size (the small class gets
+//! an eighth), `XTP_TEXTURE_RESERVE_MIB` the reserve (one heap).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -61,16 +62,23 @@ const MIB: u64 = 1 << 20;
 const HEAP_WAIT: Duration = Duration::from_millis(100);
 const PLACE_WAIT: Duration = Duration::from_millis(10);
 
-/// Whether host textures go to the pool (`XTP_TEXTURE_POOL=0`: never).
+/// Whether host textures go to the pool: only with `XTP_TEXTURE_POOL` set
+/// (and not `0`). Off by default: in game (Series X, docs/analysis/vram.md
+/// §3.2) it reached the world without loading faster than committed
+/// textures, with more video memory resident (its reserve).
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("XTP_TEXTURE_POOL").map_or(true, |v| v != "0");
-        if !on {
-            tracing::info!("XTP_TEXTURE_POOL=0: every host texture is a committed resource");
+        let on = asks_pool(std::env::var("XTP_TEXTURE_POOL").ok().as_deref());
+        if on {
+            tracing::info!("XTP_TEXTURE_POOL: host textures the title fills go to pooled heaps");
         }
         on
     })
+}
+
+fn asks_pool(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 static POOL: OnceLock<Option<Pool>> = OnceLock::new();
@@ -152,7 +160,7 @@ pub(crate) struct Config {
 
 impl Config {
     /// From `XTP_TEXTURE_HEAP_MIB` (256) and `XTP_TEXTURE_RESERVE_MIB`
-    /// (twice a heap).
+    /// (one heap: making a heap not resident takes about a millisecond).
     pub(crate) fn from_env() -> Config {
         let mib = |name: &str| {
             std::env::var(name)
@@ -161,7 +169,7 @@ impl Config {
                 .filter(|&v| v > 0)
         };
         let heap = mib("XTP_TEXTURE_HEAP_MIB").unwrap_or(256).clamp(8, 4096) * MIB;
-        let reserve = mib("XTP_TEXTURE_RESERVE_MIB").map_or(2 * heap, |v| v * MIB);
+        let reserve = mib("XTP_TEXTURE_RESERVE_MIB").map_or(heap, |v| v * MIB);
         Config::sized(heap, reserve)
     }
 
@@ -276,6 +284,9 @@ pub(crate) struct Stats {
     /// instead).
     pub(crate) placed: u64,
     pub(crate) not_placed: u64,
+    /// Textures handed out before their heap was resident (views made of
+    /// them meanwhile are null).
+    pub(crate) early: u64,
     /// Heaps not made because of the budget.
     pub(crate) over_budget: u64,
 }
@@ -478,8 +489,8 @@ impl Pool {
                 // are handed out not resident, without waiting.
                 if !residency.is_ready() {
                     let left = (made + HEAP_WAIT).saturating_duration_since(Instant::now());
-                    if !left.is_zero() {
-                        residency.wait(left.min(PLACE_WAIT));
+                    if left.is_zero() || !residency.wait(left.min(PLACE_WAIT)) {
+                        inner.lock().stats.early += 1;
                     }
                 }
                 Ok(Placed {
@@ -520,7 +531,7 @@ impl Pool {
         format!(
             "texture pool: {} heaps ({} not resident yet), {} MiB, {} MiB placed in {} textures; \
              so far {} heaps made ({} by the title's thread), {} released, {} textures not placed, \
-             {} heaps held back by the budget",
+             {} handed out before their heap was resident, {} heaps held back by the budget",
             h.heaps,
             h.pending,
             h.bytes / MIB,
@@ -530,6 +541,7 @@ impl Pool {
             s.emergency,
             s.released,
             s.not_placed,
+            s.early,
             s.over_budget
         )
     }
@@ -939,6 +951,14 @@ mod tests {
         assert!(!may_be_small(&array));
         // Formats without a known element size: no.
         assert!(!may_be_small(&texture(16, 16, DXGI_FORMAT_NV12, 1)));
+    }
+
+    #[test]
+    fn the_pool_is_asked_for_by_its_variable() {
+        assert!(asks_pool(Some("1")));
+        assert!(!asks_pool(Some("0")));
+        assert!(!asks_pool(Some("")));
+        assert!(!asks_pool(None), "off by default");
     }
 
     #[test]
