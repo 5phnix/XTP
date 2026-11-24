@@ -129,10 +129,9 @@ fn devices() -> Vec<(String, Host)> {
 /// installed, takes them. No device needed.
 #[test]
 fn the_programs_translate_and_validate_without_a_device() {
-    let mut validator = super::validator::Validator::load(
-        super::validator::Validator::default_path().as_deref(),
-    )
-    .ok();
+    let mut validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+            .ok();
     for (wave, lane, joined) in [(32, 20, false), (64, 40, false), (64, 40, true)] {
         for (lanes_min, lanes_max) in [(32, 32), (32, 64)] {
             let target = super::Target {

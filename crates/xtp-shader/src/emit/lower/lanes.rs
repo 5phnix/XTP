@@ -621,7 +621,8 @@ impl<'a> Lower<'a> {
             .flat_map(|b| &b.insts)
             .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
         if self.x.native.wave64 && !self.x.target.runs(64) {
-            let sections = (0..p.blocks.len()).any(|b| !crate::emit::wave::sections(p, b).is_empty());
+            let sections =
+                (0..p.blocks.len()).any(|b| !crate::emit::wave::sections(p, b).is_empty());
             self.x.target.runs(32) && threads <= 64 && !permute && (threads == 64 || !sections)
         } else {
             self.x.target.runs(self.wave()) && !permute

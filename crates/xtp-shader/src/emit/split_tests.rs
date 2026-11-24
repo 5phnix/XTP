@@ -1354,7 +1354,10 @@ fn lds_in_a_group_of_48_threads_takes_the_console_flow_on_32_lane_hosts() {
     let cs = emit_for(&program_lds(LDS_48, 48), nvidia).unwrap();
     assert_eq!(wave_size(&cs.dxil), Some(32));
     let summary = super::last_module_summary();
-    assert!(summary.starts_with("threads 48x1x1, wave size 32;"), "{summary}");
+    assert!(
+        summary.starts_with("threads 48x1x1, wave size 32;"),
+        "{summary}"
+    );
     assert!(summary.contains("barrier"), "{summary}");
 }
 
