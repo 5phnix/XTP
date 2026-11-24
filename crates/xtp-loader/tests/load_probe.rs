@@ -10,8 +10,8 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 use windows_sys::Win32::System::Threading::{CreateThread, INFINITE, WaitForSingleObject};
 use xtp_loader::{
-    ImportResolver, Provenance, Resolution, UnimplementedPolicy, WithTitleDlls, prepare,
-    unimplemented_call_count,
+    Census, ImportResolver, Provenance, Resolution, StubDb, UnimplementedPolicy, WithTitleDlls,
+    prepare, unimplemented_call_count,
 };
 use xtp_pe::ImportSymbol;
 
@@ -158,6 +158,28 @@ fn loads_binds_and_calls_probe() {
     assert!(report.host > 0);
     assert_eq!(report.missing.len(), 1);
     assert_eq!(report.missing[0].symbol, "XtpProbeNotImplemented");
+    assert_eq!(report.missing[0].returns, Some(0), "ReturnZero");
+
+    // The census, a dry run of binding over the title's folder, agrees.
+    std::fs::copy(&dll, title_dir.path().join("hle_probe.dll")).unwrap();
+    let census = Census::of_folder(
+        title_dir.path(),
+        &TestResolver,
+        &|_| true,
+        StubDb::builtin(),
+    )
+    .unwrap();
+    let counts = census.counts_of("hle_probe.dll");
+    assert_eq!(
+        (counts.hle, counts.host, counts.title),
+        (report.hle, report.host, report.title)
+    );
+    assert_eq!(counts.stubbed + counts.missing, report.missing.len());
+    let missing = census.missing();
+    assert!(
+        missing.contains("xtp-probe-missing.dll!XtpProbeNotImplemented"),
+        "{missing:?}"
+    );
 
     let call = |name: &str| -> usize { image.export(name).unwrap_or_else(|| panic!("{name}")) };
     // SAFETY: the exports have the signatures declared in the fixture and
@@ -259,6 +281,8 @@ fn maps_a_title_dll_the_title_loads_itself() {
     let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["late.dll"]);
     assert!(dlls[0].1.export("GetFileVersionInfoW").is_some());
+    // Built with MSVC's stack cookies: its failure report now reports.
+    assert_eq!(dlls[0].1.guarded_cookie_checks(), 1);
     assert!(load("absent.dll", &|_| true).is_empty());
     assert!(load("late.dll", &|_| false).is_empty());
 }

@@ -876,11 +876,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "memchr",
  "tempfile",
  "thiserror",
+ "toml",
  "tracing",
  "windows-sys",
  "xtp-core",
+ "xtp-hle",
  "xtp-pe",
 ]
 

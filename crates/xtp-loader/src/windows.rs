@@ -5,7 +5,6 @@ use std::ffi::{CString, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
@@ -13,10 +12,10 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 use xtp_pe::{ImageInfo, ImportSymbol};
 
-use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
+use crate::thunks::{ImportSite, Stub, ThunkBlock, UnimplementedPolicy};
 use crate::{
     DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, PreparedImage, Provenance, Resolution,
-    prepare,
+    StubDb, WithOrdinalNames, prepare,
 };
 
 /// A title image mapped into this process. A clone names the same mapping
@@ -26,6 +25,8 @@ pub struct LoadedImage {
     module: HMODULE,
     path: PathBuf,
     info: ImageInfo,
+    /// `__report_gsfailure`s redirected to our report.
+    guarded: usize,
 }
 
 // SAFETY: HMODULE is a process-wide handle (the base address); using it from
@@ -38,6 +39,8 @@ unsafe impl Sync for LoadedImage {}
 pub struct MissingImport {
     pub dll: String,
     pub symbol: String,
+    /// What its stub returns; `None` if it traps.
+    pub returns: Option<u64>,
 }
 
 /// Outcome of [`LoadedImage::bind_imports`].
@@ -74,20 +77,28 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             }
         );
     }
-    let loaded = LoadedImage {
+    let mut loaded = LoadedImage {
         module,
         path,
         info: prepared.info.clone(),
+        guarded: 0,
     };
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
+    // A stack cookie failure fast-fails, past every handler: report it.
+    // SAFETY: as above.
+    match unsafe { crate::fastfail::guard_stack_cookies(loaded.base(), &loaded.info) } {
+        Ok(guarded) => loaded.guarded = guarded,
+        Err(e) => tracing::warn!("stack cookie failures will not be reported: {e:#}"),
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
         path = %loaded.path.display(),
+        cookie_checks = loaded.guarded,
         "image mapped"
     );
     crate::threads::mapped(&loaded);
@@ -202,6 +213,12 @@ impl LoadedImage {
         &self.info
     }
 
+    /// How many of the image's stack-cookie failure reports
+    /// (`__report_gsfailure`) report to the crash log before failing fast.
+    pub fn guarded_cookie_checks(&self) -> usize {
+        self.guarded
+    }
+
     /// Address of an export of the image, if it has one by that name.
     pub fn export(&self, name: &str) -> Option<usize> {
         let name = CString::new(name).ok()?;
@@ -222,13 +239,19 @@ impl LoadedImage {
 
     /// Fills every IAT slot of the image.
     ///
-    /// Each import goes to `resolver`; whatever it cannot resolve gets an
-    /// unimplemented-import stub that behaves according to `policy`.
+    /// Each import goes to `resolver`, an ordinal import it cannot resolve
+    /// a second time by the name the stub table gives it
+    /// ([`WithOrdinalNames`]); whatever is left gets an unimplemented-import
+    /// stub that behaves according to `policy`.
     pub fn bind_imports(
         &self,
         resolver: &dyn ImportResolver,
         policy: UnimplementedPolicy,
     ) -> Result<BindReport> {
+        let resolver = WithOrdinalNames {
+            inner: resolver,
+            names: StubDb::builtin(),
+        };
         let mut report = BindReport::default();
         let mut slots: Vec<(u32, usize)> = Vec::with_capacity(self.info.import_count());
         let mut unresolved: Vec<(u32, &str, &ImportSymbol)> = Vec::new();
@@ -259,16 +282,16 @@ impl LoadedImage {
         if !unresolved.is_empty() {
             let mut block = ThunkBlock::new(unresolved.len())?;
             for (slot, dll, symbol) in unresolved {
-                let site: &'static ImportSite = Box::leak(Box::new(ImportSite {
-                    dll: dll.to_owned(),
-                    symbol: symbol.to_string(),
-                    policy,
-                    calls: AtomicU64::new(0),
-                }));
+                let stub = policy.stub_for(dll, symbol);
+                let site = ImportSite::leak(dll, &symbol.to_string(), stub);
                 slots.push((slot, block.emit(site)?));
                 report.missing.push(MissingImport {
                     dll: site.dll.clone(),
                     symbol: site.symbol.clone(),
+                    returns: match stub {
+                        Stub::Trap => None,
+                        Stub::Return(value) => Some(value),
+                    },
                 });
             }
             block.seal()?;

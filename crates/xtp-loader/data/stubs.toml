@@ -1,0 +1,49 @@
+# What an import nobody implements returns under `UnimplementedPolicy::Table`
+# (crates/xtp-loader/src/stubdb.rs). An import this table does not list
+# traps, as under `UnimplementedPolicy::Trap`: list a function once a value
+# is known to be safe for it, and give a DLL a `default` only when its
+# functions return one kind of value (HRESULT, for the console's own DLLs).
+#
+# Our own values, chosen from the return types in the public Windows and
+# GDK headers. Values: an integer, or S_OK, S_FALSE, E_NOTIMPL, E_FAIL,
+# E_ABORT, E_INVALIDARG, E_OUTOFMEMORY, E_ACCESSDENIED, TRUE, FALSE, NULL,
+# INVALID_HANDLE_VALUE.
+
+# Ordinal imports by name, so a resolver that serves the name serves them.
+# oleaut32's ordinals are fixed by its export table on every Windows.
+[ordinals."oleaut32.dll"]
+2 = "SysAllocString"
+4 = "SysAllocStringLen"
+6 = "SysFreeString"
+7 = "SysStringLen"
+
+# BSTR functions: vccorlib140 imports #4 and #6, and nothing serves
+# oleaut32 yet. NULL is the allocation failure their callers handle.
+[modules."oleaut32.dll"]
+functions = { SysAllocString = "NULL", SysAllocStringLen = "NULL", SysFreeString = 0, SysStringLen = 0 }
+
+# Console system DLLs whose exports return HRESULT: what is not implemented
+# says so. Functions that return something else are listed with a value of
+# their own type.
+[modules."xgameruntime.dll"]
+default = "E_NOTIMPL"
+# bool, bool, XSystemDeviceType::Unknown
+functions = { XGameRuntimeIsFeatureAvailable = "FALSE", XThreadIsTimeSensitive = "FALSE", XSystemGetDeviceType = 0 }
+
+[modules."gameinput.dll"]
+default = "E_NOTIMPL"
+
+[modules."d3d12_xs.dll"]
+default = "E_NOTIMPL"
+
+[modules."xg_xs.dll"]
+default = "E_NOTIMPL"
+
+[modules."xapu.dll"]
+default = "E_NOTIMPL"
+
+[modules."acphal.dll"]
+default = "E_NOTIMPL"
+
+[modules."xcrdapi.dll"]
+default = "E_NOTIMPL"
