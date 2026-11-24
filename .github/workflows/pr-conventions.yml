@@ -1,0 +1,59 @@
+# The PR title and every commit follow CONTRIBUTING.md ("Commits and pull
+# request titles"), and the description states the provenance of the code.
+# A required status check, apart from CI so that editing the title or the
+# description re-runs only this.
+#
+# `pull_request`, not `pull_request_target`: the checker is the PR's own
+# xtask, run with a read-only token and no secrets. The title and the body
+# reach the script through the environment, never through `${{ }}` in `run:`.
+name: PR conventions
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  # The queue requires the same checks; there is nothing to check on its
+  # merge commits, and a skipped job counts as passed.
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: pr-conventions-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  conventions:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The PR's commits, to check each of them.
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: xtask-linux
+          save-if: false
+      - name: Title and commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: cargo xtask conventions --base "$BASE" --head "$HEAD" --title "$TITLE"
+      # Dependabot's descriptions are not written from the template.
+      - name: Provenance statement
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s' "$BODY" > "$RUNNER_TEMP/pr-body.md"
+          cargo xtask conventions --body-file "$RUNNER_TEMP/pr-body.md"
