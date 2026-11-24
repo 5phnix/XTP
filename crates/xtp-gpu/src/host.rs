@@ -1307,12 +1307,28 @@ impl Host {
     /// The completion thread: finishes each submission as soon as the GPU
     /// has run it, so that title fences and bottom-of-pipe writes move on
     /// their own (the title waits for its events and reads its memory).
+    ///
+    /// A panic in it ends the run: the thread would be gone, and the title
+    /// would wait for its fences for ever.
     fn finish_loop(&self) {
         FINISHER.set(true);
         loop {
-            let value = self.timeline.next();
-            self.wait_gpu(value);
-            self.finish_reached();
+            let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let value = self.timeline.next();
+                self.wait_gpu(value);
+                self.finish_reached();
+            }));
+            if let Err(panic) = finished {
+                let what = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                fail(format_args!(
+                    "the host GPU's completion thread panicked ({what}): no submission would \
+                     finish any more"
+                ));
+            }
         }
     }
 
@@ -1320,6 +1336,10 @@ impl Host {
     /// GPU copies and shaders wrote goes back into title memory, then its
     /// bottom-of-pipe writes, which tell the title the GPU is done.
     fn complete(&self, p: Pending, seen: std::time::Instant) {
+        #[cfg(test)]
+        if submissions::PANIC_IN_COMPLETE.swap(false, Ordering::SeqCst) {
+            panic!("a panic a test asked for");
+        }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             self.removed(Some(&p));

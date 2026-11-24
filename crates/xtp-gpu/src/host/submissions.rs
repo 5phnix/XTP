@@ -581,3 +581,55 @@ fn a_synchronous_submission_is_finished_when_it_returns() {
     assert_eq!(word(&label), 5);
     assert_eq!(out.words(), (0..64).map(pattern).collect::<Vec<u32>>());
 }
+
+/// Set by a test: the next submission finished panics.
+pub(super) static PANIC_IN_COMPLETE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A panic on the completion thread ends the run with a failure report
+/// instead of leaving the title waiting for ever: run in a child process,
+/// which must end through the failure hook, not by its own time limit.
+#[test]
+fn a_panic_on_the_completion_thread_ends_the_run() {
+    const CHILD: &str = "XTP_TEST_COMPLETION_PANIC";
+    const REPORTED: i32 = 77;
+    let test = "host::submissions::a_panic_on_the_completion_thread_ends_the_run";
+    if std::env::var_os(CHILD).is_some() {
+        on_failure(|text| {
+            eprintln!("failure reported: {text}");
+            std::process::exit(REPORTED)
+        });
+        let host = device(test).expect("a device, as in the parent");
+        let label: &'static u64 = Box::leak(Box::new(0u64));
+        let list = host.new_list().unwrap();
+        list.defer_write(ptr(label), Written::Value(1), 8);
+        list.close();
+        PANIC_IN_COMPLETE.store(true, Ordering::SeqCst);
+        host.execute(&[&list]);
+        // As the title waits: for its label, which only the completion
+        // thread writes.
+        let started = std::time::Instant::now();
+        while word(label) == 0 && started.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        eprintln!("no failure reported (label {})", word(label));
+        std::process::exit(1);
+    }
+    let _serial = serial();
+    if device(test).is_none() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        // Asynchronous submission: a completion thread to panic.
+        .env_remove("XTP_SYNC_SUBMIT")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(REPORTED), "the child: {stderr}");
+    assert!(
+        stderr.contains("completion thread panicked (a panic a test asked for)"),
+        "{stderr}"
+    );
+}
