@@ -238,7 +238,8 @@ pub(crate) fn copy_converted(
     };
     // At submission, when the title has written the buffer.
     let (title, mapped) = (data as usize + footprint.offset as usize, mapped as usize);
-    list.defer_host(move || {
+    let read = title_pitch as usize * lines.saturating_sub(1) + width as usize * from;
+    list.defer_host((title, read), move || {
         let mut texels = vec![0u8; width as usize * from];
         for line in 0..lines {
             let row = (title + line * title_pitch as usize) as *const u8;

@@ -577,7 +577,7 @@ impl State {
                     crate::pipeline::note_why("no dynamic slot for a root SRV".into());
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                list.keep_dynamic(key.0, index, 1);
                 self.root_srv_slots.insert(key, index);
                 match &shadow {
                     Some((a, s)) => {
