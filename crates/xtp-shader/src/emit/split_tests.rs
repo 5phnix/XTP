@@ -1395,5 +1395,47 @@ fn every_hardware_case_translates_and_validates_without_a_device() {
     lane_reads_in_branches_beside_a_whole_wave_section();
     a_lane_read_past_the_wave_reads_its_low_bits();
     lds_in_a_group_of_48_threads_reads_both_halves();
+    a_loop_exit_mask_read_inside_the_loop_counts_the_lanes_that_left();
     DRY.with(|d| d.set(false));
+}
+
+/// A mask with no lane read as data, in a block where structurisation
+/// does not know EXEC yet (no vector instruction before it): 0, whatever
+/// the lanes. It stopped as a mask holding lanes elsewhere. (No device.)
+#[test]
+fn an_empty_mask_read_as_data_is_zero() {
+    let body = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8A_046A, // s_mov_b64 s[10:11], vcc
+        0xBF82_0000, // s_branch +0 (a block of its own)
+        0x878C_800A, // s_and_b64 s[12:13], s[10:11], 0
+        0xBE89_100C, // s_bcnt1_i32_b64 s9, s[12:13]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    translates_everywhere("an empty mask read as data", &program(&body, 64));
+}
+
+/// The exit mask of a loop lanes leave at different iterations, counted
+/// inside the loop: it holds lanes that are no longer in the loop, which
+/// no ballot there sees. Lane t runs the loop t + 1 times; at the last
+/// iteration (lane 63's 64th) all 64 lanes have left, so every lane ends
+/// with 64. The per-lane form stopped ("a lane mask holding lanes
+/// elsewhere read as data"); the console flow counts them.
+const LOOP_EXIT_COUNT: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xBE8A_0480, // s_mov_b64 s[10:11], 0
+    0x4A02_0281, // 8: v_add_nc_u32 v1, 1, v1
+    0x7D88_0101, // v_cmp_gt_u32 vcc, v1, v0
+    0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+    0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+    0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+    0xBF89_FFFA, // s_cbranch_execnz -> 8
+    0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    0x7E04_0209, // v_mov_b32 v2, s9
+];
+
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn a_loop_exit_mask_read_inside_the_loop_counts_the_lanes_that_left() {
+    console_flow_case("loop exit mask counted inside", LOOP_EXIT_COUNT, 64, |_| 64);
 }

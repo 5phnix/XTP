@@ -70,6 +70,10 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if m == Bool::FALSE {
+            // No lane anywhere: 0 whoever holds the mask.
+            return Ok(self.s.m.i32(0));
+        }
         if self.console_cf {
             // Every lane runs every block: the mask's bits are the lanes'
             // own, both halves' words exchanged.
@@ -90,7 +94,14 @@ impl<'a> Lower<'a> {
             return Err("a lane mask read whole in a wave64 program split in halves");
         }
         if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
+            // Lanes of the mask are in other blocks (lanes that left a
+            // loop, say), so no ballot here holds them. In compute the
+            // console flow has the mask: every lane runs every block there.
+            return Err(if self.console_flow_runs() && !self.x.per_lane_only {
+                super::CONSOLE_FLOW
+            } else {
+                "a lane mask holding lanes elsewhere read as data"
+            });
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
