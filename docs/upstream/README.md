@@ -126,7 +126,7 @@ Triage by title prefix:
 still merges onto upstream `main`, head and last update:
 
 ```sh
-for n in 223 233 320 439 578 579 493 483 595 546 275 464 490 497 180 298 539 89 492 469 206 643 24 583 346 334 453 592 621 571 160 563 158 159 331 211 431 454 452 509 130 638 658 234 703 603 644 463 208 185 413 693 704 193; do
+for n in 689 223 233 320 439 578 579 493 483 595 546 275 464 490 497 180 298 539 89 492 469 206 643 24 583 346 334 453 592 621 571 160 563 158 159 331 211 431 454 452 509 130 638 658 234 703 603 644 463 208 185 413 693 704 193; do
   gh pr view $n -R Marvisak/VIctory \
     --json number,state,isDraft,mergeable,headRefOid,updatedAt \
     --jq '[.number, .state, (if .isDraft then "draft" else "-" end), .mergeable, .headRefOid[0:9], .updatedAt] | @tsv'

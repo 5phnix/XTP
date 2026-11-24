@@ -128,6 +128,20 @@ Numbers are VIctory PRs (`https://github.com/Marvisak/VIctory/pull/N`).
 The measurements are the PR authors' or testers' own, on their machines.
 They are not XTP measurements.
 
+**Before the list, for XTP's own check:**
+[#689](https://github.com/Marvisak/VIctory/pull/689) (iurysf; open, clean,
+head `e1c3557`, +6/−3, test only). `frame::tests::waits_end_on_ticks_and_count_frames`
+fails under CPU load: 15 of 20 runs failed with 16 busy cores, against 20 of
+20 passing with the change. It loosens two timing assertions:
+- the second wait's wall-clock bound goes from 50 ms to 500 ms, still far
+  below the 1 s time-out;
+- flip ticks must rise strictly, instead of being exactly consecutive.
+
+XTP's workspace check failed on this test on 2026-11-24 (ticks
+`[7, 8, 10, 12]`), on a docs-only change. Alone, the test passed 10 of 10.
+**Take with credit, first** (gpu · `frame.rs`, tooling · B1): every
+delivery's check depends on it.
+
 | # | Item | State | Author | What it does | XTP area · backlog | Sym. | Action and why |
 |---|---|---|---|---|---|---|---|
 | 1 | [#223](https://github.com/Marvisak/VIctory/pull/223) → [#233](https://github.com/Marvisak/VIctory/pull/233) → [#320](https://github.com/Marvisak/VIctory/pull/320) → [#439](https://github.com/Marvisak/VIctory/pull/439) | open, clean (stacked) | r4tedx | **The wave64 stack.** It translates for the host's wave size. A wave64 compute program becomes two 32-lane halves in the console's control flow, with lane reads and writes, ballots and LDS exchanged through group memory. It emits `WaveSize(32)`. Includes `docs/wave64-on-wave32.md`. | shader · L1, L2, M2 (and the GPU side of L1) | W D | **Take, first.** On a 32-lane host: +98 compute pipelines in a whole-title translate, 0 lost. Compute refusals 103 → 1 on an RTX 3080. On an RTX 5080, 6 min in the world without device removal; 958 draws dropped per frame against 1,470; the richest G-buffer target 67.9 % covered against 10.5 %. CI green; exact on hand-assembled programs on RTX 5070, 4070 SUPER, 5080 and 5090. The shader report planned this late, after xcl. This GPL-3.0 code removes that wait. Port the four in order. |
