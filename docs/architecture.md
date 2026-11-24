@@ -40,18 +40,24 @@ Converting them ahead of time from files is only a warm-up.
 | `xtp-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
 | `apps/xtp` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
-
-The pipeline cache limits committed payloads to 1 GiB by default.
-`Cache::open_with_limit` accepts a byte budget. When a conversion needs
-space, the cache removes the oldest stored outputs first and skips entries
-being read. A result that cannot fit is still returned to the caller.
-Threads using the same cache directory in one process share conversions
-for each key. `Cache::stats` reports committed entries, payload bytes and
-successful lookups that reused a cached or in-flight result.
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
 
 Everything except `xtp-game` is platform-level and can be tested with
 any Xbox Series title.
+
+The pipeline cache uses a 1 GiB payload budget by default. Pass a byte
+budget to `Cache::open_with_limit`, or zero to disable disk access. When
+space is needed, the cache evicts entries in write-time order and skips
+active readers and files it cannot remove. Disk errors still let the caller
+use a successful conversion. Each disk read verifies the payload length
+and BLAKE3 checksum. Older entries without a header are rebuilt on demand.
+
+Threads sharing a cache directory in one process share a budget, reader
+pins and in-flight conversions. A converter or decoder must not look up its
+own in-flight key, because it would wait for itself. Another process can
+publish a valid entry that this process discovers on lookup. Each process
+tracks its own pins and budget. `Cache::stats` reports indexed entries,
+payload bytes and successful reuses; legacy files count at their full size.
 
 ## Import resolution
 
