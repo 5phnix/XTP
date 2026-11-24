@@ -105,18 +105,9 @@ pub(crate) struct Translated {
     pub(crate) host: xtp_shader::emit::HostShader,
     pub(crate) used: Vec<xtp_shader::UsedResource>,
     /// Whether the console program runs in 64-lane waves (its lane masks
-    /// and lane numbers are a wave64's).
+    /// and lane numbers are a wave64's). Of a mesh program, the translator
+    /// says whether it runs on the host's waves (`host::Needs`).
     pub(crate) wave64: bool,
-    /// Whether it is a mesh program whose thread group is one console
-    /// wave of more than 32 lanes, with LDS: inside one wave the console
-    /// compiler leaves out the barriers between lanes, which a host that
-    /// runs the wave as two 32-lane waves needs (see `host::Needs`).
-    pub(crate) mesh_lds_in_one_wave: bool,
-    /// Whether it is a wave64 mesh program that reads its console wave's
-    /// first lane ([`mesh_first_lane_reads`]); looked at only with
-    /// `XTP_WAVE64_MESH=allow` (`None` otherwise: every such program is
-    /// refused on hosts without 64-lane waves then).
-    pub(crate) mesh_first_lane_reads: Option<bool>,
 }
 
 /// What a console program says of itself: what [`Translated`] holds besides
@@ -126,8 +117,6 @@ pub(crate) struct Translated {
 pub(crate) struct Native {
     pub(crate) used: Vec<xtp_shader::UsedResource>,
     pub(crate) wave64: bool,
-    pub(crate) mesh_lds_in_one_wave: bool,
-    pub(crate) mesh_first_lane_reads: Option<bool>,
 }
 
 #[cfg(windows)]
@@ -185,8 +174,6 @@ fn translate(container: &[u8], native: Result<&Native, String>) -> Result<Transl
         host,
         used: native.used,
         wave64: native.wave64,
-        mesh_lds_in_one_wave: native.mesh_lds_in_one_wave,
-        mesh_first_lane_reads: native.mesh_first_lane_reads,
     })
 }
 
@@ -211,74 +198,13 @@ fn native(container: &[u8]) -> Result<Native, String> {
     Ok(match native {
         Some(p) => Native {
             wave64: p.wave64,
-            mesh_lds_in_one_wave: mesh_lds_in_one_wave(&p),
-            mesh_first_lane_reads: (p.stage == HwStage::Ms
-                && p.wave64
-                && host::wave64_mesh_allowed())
-            .then(|| mesh_first_lane_reads(&p)),
             used: p.used,
         },
         None => Native {
             used: Vec::new(),
             wave64: false,
-            mesh_lds_in_one_wave: false,
-            mesh_first_lane_reads: None,
         },
     })
-}
-
-/// Whether `p` reads a console lane other than its own with
-/// `v_readfirstlane_b32`. In mesh code the translator makes it the host
-/// wave's first lane, without the wave-size check compute code gets
-/// (`xtp-shader` `emit/lower/valu.rs`): in the upper 32-lane half of a
-/// console wave64 that is lane 32's value, not lane 0's. Two reads are the
-/// same in every lane and do not count: the mesh group id (`v5` on entry,
-/// the only way mesh code may read it) and the waterfall reads of
-/// descriptors (each lane's own, `resource::Waterfall`). A program the
-/// front end does not take counts as reading.
-#[cfg(windows)]
-fn mesh_first_lane_reads(p: &xtp_shader::NativeProgram) -> bool {
-    use xtp_shader::ir::Reg;
-    let Ok(ir) = xtp_shader::ir::build(&p.patched_code(), p.wave64, p.vgprs) else {
-        return true;
-    };
-    let st = xtp_shader::structure::structure(&ir);
-    let Ok(res) = xtp_shader::resource::track(&ir, &p.layout, p.stage, st.as_ref().ok()) else {
-        return true;
-    };
-    let group = ir
-        .inputs
-        .iter()
-        .find(|(r, _)| *r == Reg::V(5))
-        .map(|&(_, v)| v);
-    ir.blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .filter(|i| i.name() == "v_readfirstlane_b32")
-        .any(|i| {
-            let waterfall = i
-                .writes
-                .first()
-                .is_some_and(|w| res.waterfall.reads.contains(&w.1));
-            let group_id = group.is_some_and(|g| i.reads.contains(&(Reg::V(5), g)));
-            !waterfall && !group_id
-        })
-}
-
-/// Whether `p` is a mesh program whose group is one console wave of more
-/// than 32 lanes and that has LDS ([`Translated::mesh_lds_in_one_wave`]).
-/// The group's lane count is the HLSL group rounded up to waves; a group
-/// of several console waves has its barriers (the console needs them
-/// between its waves).
-// shortcut: the LDS a program allocates, not whether one half of a wave
-// reads what the other wrote; telling those apart is the translator's
-// (it does so for compute programs, which take WaveSize(64) or the
-// console flow instead).
-#[cfg(windows)]
-fn mesh_lds_in_one_wave(p: &xtp_shader::NativeProgram) -> bool {
-    let wave = if p.wave64 { 64 } else { 32 };
-    matches!(&p.io, xtp_shader::native::StageIo::Ms(ms)
-        if ms.lds_bytes > 0 && ms.threads > 32 && ms.threads <= wave)
 }
 
 #[repr(C)]
@@ -731,39 +657,6 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
-
-    /// A mesh program shares LDS within one console wave when its group is
-    /// one wave64 of more than 32 lanes with LDS: BTP 6's
-    /// mesh programs are all 128-lane groups (two waves, with barriers).
-    #[cfg(windows)]
-    #[test]
-    fn mesh_lds_in_one_wave_is_a_one_wave_group_with_lds() {
-        use xtp_shader::native::{MeshIo, StageIo};
-        let mesh = |wave64, threads, lds_bytes| xtp_shader::NativeProgram {
-            stage: xtp_shader::HwStage::Ms,
-            wave64,
-            vgprs: 8,
-            layout: Vec::new(),
-            used: Vec::new(),
-            io: StageIo::Ms(MeshIo {
-                outputs: Vec::new(),
-                clip_cntl: 0,
-                threads,
-                max_vertices: 64,
-                max_primitives: 64,
-                topology: 2,
-                lds_bytes,
-            }),
-            code: Vec::new(),
-        };
-        assert!(mesh_lds_in_one_wave(&mesh(true, 64, 16)));
-        assert!(!mesh_lds_in_one_wave(&mesh(true, 64, 0)), "no LDS");
-        assert!(!mesh_lds_in_one_wave(&mesh(true, 128, 16)), "two waves");
-        assert!(!mesh_lds_in_one_wave(&mesh(true, 32, 16)), "one host wave");
-        assert!(!mesh_lds_in_one_wave(&mesh(false, 32, 16)), "wave32");
-        let (_, compute) = crate::shader_cache::wave64_in_half_program();
-        assert!(!mesh_lds_in_one_wave(&compute), "compute");
-    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
