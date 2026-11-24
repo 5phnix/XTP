@@ -145,7 +145,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `XTP_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `XTP_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-| `XTP_WATCHDOG_HOOK=1` | every build: keeps the title's own watchdog from ending it after about 30 s without progress (slow world frames); known builds only (1.0.2.1), otherwise a warning and nothing patched |
+| `XTP_WATCHDOG_HOOK=1` | every build: keeps the title's own watchdog from ending it after about 30 s without progress (slow world frames), and logs a warning (at most every 30 s) when it would have; a real deadlock then hangs for ever, with no `crashes.log` entry; known builds only (1.0.2.1), otherwise a warning and nothing patched |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
