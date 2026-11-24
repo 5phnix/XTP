@@ -758,6 +758,18 @@ mod tests {
     }
 
     #[test]
+    fn lds_half_writes_keep_the_halves_other_lanes_write() {
+        // Side by side: two lanes write each dword, aligned (2l), or two
+        // and three in turn with every other half straddling at byte 3
+        // (2l + 1, where lanes 31 and 32, of the two console waves, share
+        // a dword).
+        for name in ["ds_write_b16", "ds_write_b16_d16_hi"] {
+            check(Some(name), Some("ds_read_u16"), &lanes(|l| 2 * l));
+            check(Some(name), Some("ds_read_u16"), &lanes(|l| 2 * l + 1));
+        }
+    }
+
+    #[test]
     fn lds_byte_and_half_reads_extend_and_place_their_value() {
         for name in [
             "ds_read_u8",
