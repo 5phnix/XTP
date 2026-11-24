@@ -510,7 +510,7 @@ no GitHub credentials and should not get any.
 
 A Hangar worker is a Claude Code session in a worktree of its own on your PC.
 To keep your PC free for game sessions, workers build and test elsewhere:
-everyday `cargo` and the delivery check on the build farm (`tools/buildfarm/`, `docs/dev/build-farm.md`),
+everyday `cargo` and the delivery check on the [build farm](build-farm.md),
 and on this VM what needs the L4 or the game:
 
 - each worker runs `tools\cloud\run-remote.ps1 -Game -Local` (or `-Check`,
@@ -530,7 +530,7 @@ and on this VM what needs the L4 or the game:
   stranger's pull request.
 
 **Builds and tests without game files** belong on the
-build farm (`tools/buildfarm/`, `docs/dev/build-farm.md`): Spot VMs without a GPU that run every worker's
+[build farm](build-farm.md): Spot VMs without a GPU that run every worker's
 `cargo` and the delivery check, and never receive game files. The L4 VM is
 for what needs the real GPU or the game: GPU tests on hardware, game runs,
 measurements. A single build machine of your own can also come from these
