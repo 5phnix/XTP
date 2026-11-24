@@ -71,8 +71,27 @@ fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
     d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !basic_render_driver
 }
 
-/// The hardware adapters, in DXGI's order: each one's description.
+/// The adapter this crate's GPU tests may use, as `XTP_TEST_ADAPTER` says
+/// for xtp-gpu's (`crate::testgpu` there): `warp` the software adapter
+/// only, `none` no device, `hardware` or unset the hardware ones. Outside
+/// this crate's tests it is not read. On the person's PC the cargo wrapper
+/// sets `warp`: the RTX 4080 is kept for game sessions.
+fn test_adapter() -> Option<String> {
+    if cfg!(test) {
+        std::env::var("XTP_TEST_ADAPTER")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "hardware")
+    } else {
+        None
+    }
+}
+
+/// The hardware adapters, in DXGI's order: each one's description. None in
+/// tests where `XTP_TEST_ADAPTER` keeps them out (see [`test_adapter`]).
 pub fn adapters() -> Result<Vec<String>, String> {
+    if test_adapter().is_some() {
+        return Ok(Vec::new());
+    }
     // SAFETY: plain DXGI calls.
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
@@ -97,8 +116,15 @@ fn description(wide: &[u16]) -> String {
 impl Host {
     /// The default adapter, or WARP with `warp` (or `XTP_WARP=1`), or
     /// the first hardware adapter whose description holds
-    /// `XTP_ADAPTER` (ignoring case: `nvidia`, `radeon`...).
+    /// `XTP_ADAPTER` (ignoring case: `nvidia`, `radeon`...). In this
+    /// crate's tests, `XTP_TEST_ADAPTER=warp` makes it WARP and `none` no
+    /// device.
     pub fn new(warp: bool) -> Result<Self, String> {
+        match test_adapter().as_deref() {
+            None => {}
+            Some("warp") => return Self::create(true, None),
+            Some(other) => return Err(format!("no device in tests (XTP_TEST_ADAPTER={other})")),
+        }
         let warp = warp || std::env::var("XTP_WARP").is_ok_and(|v| v == "1");
         match std::env::var("XTP_ADAPTER") {
             Ok(name) if !warp && !name.is_empty() => Self::on(&name),
@@ -107,8 +133,13 @@ impl Host {
     }
 
     /// The first hardware adapter whose description holds `name`,
-    /// ignoring case.
+    /// ignoring case (none in tests `XTP_TEST_ADAPTER` keeps off hardware).
     pub fn on(name: &str) -> Result<Self, String> {
+        if let Some(t) = test_adapter() {
+            return Err(format!(
+                "no hardware adapter in tests (XTP_TEST_ADAPTER={t})"
+            ));
+        }
         let want = name.to_lowercase();
         // SAFETY: plain DXGI calls.
         let adapter = unsafe {
