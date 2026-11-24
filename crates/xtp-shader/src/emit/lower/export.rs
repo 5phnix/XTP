@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::{Lower, Why, packed_half};
+use super::{Lower, Why, packed_half, packed_partners};
 use crate::emit::bitcode::{Attr, Bin, V, pred};
 use crate::emit::container::SigElement;
 use crate::io::{Export, Target};
@@ -11,7 +11,8 @@ use crate::native::{StageIo, Usage};
 
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
 /// a packed row's partner is the next 16-bit row of the signature that no
-/// output entry names, taken in row order.
+/// output entry names, taken in row order ([`packed_partners`], the rule
+/// pixel inputs follow too).
 pub(super) fn half_outputs(
     io: &StageIo,
     outputs: &[SigElement],
@@ -22,24 +23,16 @@ pub(super) fn half_outputs(
         _ => return HashMap::new(),
     };
     let per_vertex = || entries.iter().filter(|o| o.param & 0x80 == 0);
-    let mut free: Vec<u8> = outputs
-        .iter()
-        .filter(|e| e.half && e.kind == 0)
-        .filter_map(|e| u8::try_from(e.row?).ok())
-        .filter(|&r| !per_vertex().any(|o| o.row == r))
-        .collect();
-    free.sort_unstable();
-    free.dedup();
-    let mut halves: Vec<_> = per_vertex().filter(|o| o.fp16).collect();
-    halves.sort_by_key(|o| o.row);
-    halves
-        .into_iter()
+    let partners = packed_partners(
+        outputs,
+        |r| per_vertex().any(|o| o.row == r),
+        per_vertex().filter(|o| o.fp16 && o.pack2).map(|o| o.row),
+    );
+    per_vertex()
+        .filter(|o| o.fp16)
         .map(|o| {
-            let b = o
-                .pack2
-                .then(|| free.iter().position(|&r| r > o.row))
-                .flatten();
-            (o.row, (o.pack2, b.map(|i| free.remove(i))))
+            let b = o.pack2.then(|| partners.get(&o.row).copied()).flatten();
+            (o.row, (o.pack2, b))
         })
         .collect()
 }

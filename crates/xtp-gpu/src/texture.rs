@@ -1102,8 +1102,7 @@ mod tests {
     #[test]
     fn a_texture_in_a_view_is_hashed_only_after_a_write() {
         use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-            PAGE_READWRITE, UnmapViewOfFile,
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
         };
         let test = "texture::tests::a_texture_in_a_view_is_hashed_only_after_a_write";
         let Some(host) = crate::testgpu::device(test) else {
@@ -1185,17 +1184,10 @@ mod tests {
 
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
-        crate::watch::title_memory_remapped(view, LEN);
-        // SAFETY: our views, no longer used.
-        unsafe {
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: view as *mut _,
-            });
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: other as *mut _,
-            });
-        }
-        crate::watch::title_memory_remapped(view, LEN);
+        // The views stay mapped until the tests end: the watch's journal
+        // keeps the pages these checks found written, which a test that
+        // allocates fresh memory at the same address would read as its own.
+        let _ = other;
     }
 
     /// A list named twice in one submission runs its copy in both runs if
