@@ -83,13 +83,14 @@ fix it yet (§8).
 | S7 `20261124-224016-l4world-cdb2` | `cloud-runs\20261124-224101-game` | `03d52cb` | `cdb -pv` at +170 s: stacks, registers, the mutex and the counter | as S4; §6 |
 | S8 `20261124-231421-l4lock-fix` | `cloud-runs\20261125-001206-game`, `tmp\l4lock\s8` | `main` `1a4267b` | `cdb` attached at +23 ms; at the leak, its stack, then the return redirected to the unlocking exit and `cdb` detached; `cdb -pv` at +269 s; 300 s | **world reached** at +98 s (autopilot), 2 to 3 fps there; §6.6 |
 | S9 `20261124-234018-stopgap` | `cloud-runs\20261125-003821-game` | `37a35f1`: `main` `0dac909` plus step 0 | `-AudioLockStopgap` (§8.1): the same redirect, made by `vm\audio-lock-stopgap.ps1` at the first audio call (+5.4 s); 300 s | **world reached** at +88 s (autopilot), 2 to 3 fps there; §8.1 |
+| S10 `20261124-235159-stopgap2` | `cloud-runs\20261125-005009-game` | `89523a2`: S9 with the report fixed | as S9, 150 s | the report names the call (thread, 0 streams); **world reached** at +98 s |
 | PC `20261124-195925` | `E:\xtp-data\cache\play\` | `main` of 19:59 | `cargo xtask play`, Series S | world 13 s after `story000.rpf` opens |
 | PC `20261124-163332` | `E:\xtp-data\cache\play\` | `main` of 16:33 | Series S, `XTP_STACKS` every 1 s | world at +38 s; its 14 dumps during the load are the reference of §6 |
 
 Every VM run used `run-remote.ps1 -Game` with `--console series-s`,
 `XTP_SKIP_INTRO=1`, `XTP_WATCHDOG_HOOK=1` and the autopilot
-(`autopilot\gameplay.txt`, or a copy with longer timeouts in S1); S9 only
-the autopilot, `-Local`, Series S being the default by then. The commit
+(`autopilot\gameplay.txt`, or a copy with longer timeouts in S1); S9 and S10
+only the autopilot, `-Local`, Series S being the default by then. The commit
 each one built is in its summary line (`commit …`).
 
 ## 3. Symptoms against the PC
@@ -566,7 +567,8 @@ only). Without cdb it writes the displacement itself, later. Its report,
 it; nothing of it runs after the run. S9 (`37a35f1`, `-Seconds 300`,
 autopilot `gameplay.txt`): patched at +5.4 s; the autopilot's world
 condition met at +88.4 s (frame 2756), control handed back; 2 to 3 fps in
-the world, as in S8. It goes once XTP has option 2.
+the world, as in S8. S10 (`89523a2`, 150 s): the same, world at
++97.7 s. It goes once XTP has option 2.
 
 **Option 2, a silent audio output: the plan for its task.** A draft is on
 the local branch `nullaudio-option2` (`b3822b4`, not built nor reviewed):
