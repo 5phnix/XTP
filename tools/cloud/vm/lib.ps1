@@ -55,8 +55,11 @@ function Invoke-XtpGit([string[]]$ArgList) {
     if ($LASTEXITCODE -ne 0) { throw "git $($ArgList -join ' ') failed ($LASTEXITCODE)" }
 }
 
-# Puts C:\xtp\src on -Ref (default: the bundle's head, or origin/main).
-function Set-XtpSource([string]$Bundle, [string]$Ref) {
+# Puts C:\xtp\src on -Ref (default: the bundle's head, or origin/main). With
+# -Commit, fails unless that is the commit checked out: callers wait for the
+# lock in turn, and each must build what it sent, not another caller's code.
+# The bundle is removed once fetched (run-remote.ps1 names each one apart).
+function Set-XtpSource([string]$Bundle, [string]$Ref, [string]$Commit = '') {
     if ($Bundle) {
         # The bundle's first ref (HEAD, or the branch run-remote.ps1 -LocalRev named).
         $ErrorActionPreference = 'Continue'
@@ -65,6 +68,7 @@ function Set-XtpSource([string]$Bundle, [string]$Ref) {
         if (-not $heads.Count) { throw "No ref in the bundle $Bundle." }
         $name = ("$($heads[0])" -split '\s+')[1]
         Invoke-XtpGit @('fetch', '--quiet', '--force', $Bundle, "+$($name):refs/xtp/local")
+        if ((Split-Path -Leaf $Bundle) -ne 'src.bundle') { Remove-Item -LiteralPath $Bundle -Force -ErrorAction SilentlyContinue }
         if (-not $Ref) { $Ref = 'refs/xtp/local' }
     } else {
         Invoke-XtpGit @('fetch', '--quiet', '--prune', 'origin')
@@ -73,6 +77,10 @@ function Set-XtpSource([string]$Bundle, [string]$Ref) {
     Invoke-XtpGit @('checkout', '--quiet', '--force', '--detach', $Ref)
     Invoke-XtpGit @('clean', '-fdq', '-e', 'target/')
     Invoke-XtpGit @('log', '-1', '--format=commit %h %s (%cr)')
+    if ($Commit) {
+        $head = (& $script:XtpGit -C 'C:\xtp\src' rev-parse HEAD) | Select-Object -First 1
+        if (-not "$head".StartsWith($Commit)) { throw "C:\xtp\src is on $head, not on $Commit, the commit sent." }
+    }
 }
 
 function Test-XtpSession([string]$User) {

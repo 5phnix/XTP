@@ -2,17 +2,16 @@
 
 For the task "Series S: HLE of the FidelityFX calls (port VIctory #1284)
 and ClearUnorderedAccessView Uint/Float (port VIctory #948), plus the
-Series S method gaps", 2026-11-24, build 1.0.2.1 of BTP 6. RVAs are
-relative to `game_scarlett_master.exe`. The title's code was read for
-interoperability (cdb on the image, no title bytes or listings quoted);
-AMD's DLLs were not disassembled: their licence forbids it, and nothing
-here needs it.
+Series S method gaps", build 1.0.2.1 of BTP 6. Offsets are kept in the
+maintainers' private notes; no title bytes or listings are quoted. AMD's
+DLLs were not disassembled: their licence forbids it, and nothing here
+needs it.
 
 **Answer.** In Series S the title runs AMD's FidelityFX upscaler (FSR4,
 `amd_fidelityfx_upscaler_xbox.dll`, loaded by
 `amd_fidelityfx_loader_xbox.dll`). XTP cannot translate its 20 console
-compute programs, and without the DLLs the title divides by zero at
-title+0x28f03e8. XTP now answers the title's five FidelityFX calls itself
+compute programs, and without the DLLs the title divides by zero.
+XTP now answers the title's five FidelityFX calls itself
 (`crates/xtp-hle/src/modules/ffx.rs`): the queries as AMD's open FSR 2/3
 code answers them, and each dispatch with a bilinear upscale of XTP's own
 on the host GPU (`xtp_gpu::list::upscale`). No AMD code runs.
@@ -23,22 +22,20 @@ the console handles translated into host ones.
 ## 1. What the title asks of FidelityFX
 
 The title imports `ffxCreateContext`, `ffxDestroyContext`, `ffxQuery` and
-`ffxDispatch` from the loader (import thunks title+0x5f3ff90..+0x5f3ffc0);
-the loader loads the upscaler, and both export the same five calls
-(`ffxConfigure` too). Six call sites:
+`ffxDispatch` from the loader; the loader loads the upscaler, and both
+export the same five calls (`ffxConfigure` too). Six call sites:
 
-| Site | Call | Description (PC `ffx_api` layouts) | What the title does with it |
-|---|---|---|---|
-| +0x28ef2cc | create | 0x10000 upscale (flags, largest render 1280×720 and output 1920×1080), chained to 0x1000002 (console backend, the device at +0x10) and 0x1000b (version 0x1001001) | result not read |
-| +0x28ef30f | query 0x10004 | jitter phase count: render width, display width, out | out is the object's +0x10c, the divisor at title+0x28f03e8; a title setting at +0x22c (-1: none) may replace it |
-| +0x28ef625 | query 0x10005 | jitter offset: index, phase count, out x, out y | out are stack locals the title does not initialise; it would move the camera by them and keep them for the dispatch. Never reached in XTP's sessions: the title jitters by a sequence of its own (section 7) |
-| +0x28f03db | dispatch 0x10001 | `ffxDispatchDescUpscale`, 432 bytes | result not read; then the frame index advances modulo the phase count |
-| +0x28f0651 | query 0x10008 | upscaler GPU memory: out | out is an uninitialised local; the title adds its first word to a memory total |
-| +0x28ef512 | destroy | the context | |
+| Call | Description (PC `ffx_api` layouts) | What the title does with it |
+|---|---|---|
+| create | 0x10000 upscale (flags, largest render 1280×720 and output 1920×1080), chained to 0x1000002 (console backend, the device at +0x10) and 0x1000b (version 0x1001001) | result not read |
+| query 0x10004 | jitter phase count: render width, display width, out | out is a field of the title's object, the divisor of the division above; a title setting (-1: none) may replace it |
+| query 0x10005 | jitter offset: index, phase count, out x, out y | out are stack locals the title does not initialise; it would move the camera by them and keep them for the dispatch. Never reached in XTP's sessions: the title jitters by a sequence of its own (section 7) |
+| dispatch 0x10001 | `ffxDispatchDescUpscale`, 432 bytes | result not read; then the frame index advances modulo the phase count |
+| query 0x10008 | upscaler GPU memory: out | out is an uninitialised local; the title adds its first word to a memory total |
+| destroy | the context | |
 
-Each description has `next` = 0 (title+0xdfe240 clears it) except the
-create chain. The dispatch description, as title+0x28f016e..+0x28f03cc
-fills it: the command list at +0x10 (the title's own list, ours), seven
+Each description has `next` = 0 except the create chain. The dispatch
+description, as the title fills it: the command list at +0x10 (the title's own list, ours), seven
 48-byte resources from +0x18 (colour, depth, motion vectors with state
 0xc, exposure, reactive and transparency masks, the output at +0x138
 with state 2, unordered access), the jitter at +0x168 (the query's
@@ -88,7 +85,7 @@ resource without a host texture slot=6").
 
 ## 3. UAV clears (list 0x1a8, 0x1b0)
 
-FSR4 calls `ClearUnorderedAccessViewUint` from its +0x72f4 (session C, the
+FSR4 calls `ClearUnorderedAccessViewUint` (session C, the
 only caller in XTP's Series S logs; the title itself does not). Both
 handles are console ones: slots of title memory holding XTP's view
 records (the GPU one in the bound shader-visible heap, the CPU one in a
@@ -105,7 +102,7 @@ as the host refuses them.
 With the stand-in on, FSR4 does not run, so these clears matter for
 `XTP_FSR4=1` and for any title that clears a UAV.
 
-## 4. Series S method gaps (watch item 85)
+## 4. Series S method gaps
 
 xcl #1337 lists the methods xcl stubs on Series S just before the
 title's assert: list #75, #101, #126, #131, #132, #142, queue #31 (newer
@@ -113,7 +110,7 @@ layout), allocator #9. In XTP's newer tables:
 
 | xcl | Slot | XTP |
 |---|---|---|
-| list #75 | 0x258 | old slot 73, "pixel shader depth order": ignored (the title's state flush passes a byte and reads nothing back, title+0x3281a) |
+| list #75 | 0x258 | old slot 73, "pixel shader depth order": ignored (the title's state flush passes a byte and reads nothing back) |
 | list #101 | 0x328 | old slot 99, `DriverHintX`: returns 0 |
 | list #126, #131, #132, #142 | 0x3f0, 0x418, 0x420, 0x470 | shading rate, both syncs, 0x470: present before this task |
 | queue #31 | 0xf8 | old slot 29, `CopyPageMappingsBatchX` |
@@ -121,11 +118,11 @@ layout), allocator #9. In XTP's newer tables:
 
 Nothing was missing there. XTP's own Series S logs name four other
 methods not implemented: list 0x1a8 (done here), pipeline state 0x58
-(FSR4's, from its +0x5870; no longer called), and device 0x218 and 0x1c8,
-which the title calls itself (title+0x24800db and +0x247757e) and which
+(FSR4's; no longer called), and device 0x218 and 0x1c8, which the title
+calls itself and which
 fail with `E_NOTIMPL` as before; the title goes on after both.
 
-## 5. Page scatters in runs (watch item 86, VIctory #1264)
+## 5. Page scatters in runs (VIctory #1264)
 
 Session 5 of the series-s task (`20261124-173913`, diagnostic build)
 logged every page mapping: 220,974 single-page maps, 127,695 of them
@@ -147,8 +144,8 @@ baseline.
 
 BTP 6's shader-visible view heap has 1,245,184 slots. The RTX 4080 SUPER
 (resource binding tier 3) makes shader-visible view heaps of at most
-1,000,000 descriptors, not one more (measured with a D3D12 probe,
-2026-11-24). XTP capped the host heap there and kept 65,536 slots
+1,000,000 descriptors, not one more (measured with a D3D12 probe).
+XTP capped the host heap there and kept 65,536 slots
 dynamic: the Series S world of 18:11 reached a peak of 57,364, and session
 5 dropped draws for want of slots. As #1349 does for capped heaps, XTP now
 keeps 2^18 (262,144) slots dynamic and mirrors 737,856 title slots.
@@ -314,7 +311,7 @@ is not taken: neither the title nor FSR4 called it in XTP's logs.
 - The upscale on the title's own frames: consecutive captures of a
   world whose scene reaches the screen (after the mesh64 task), to see
   that the jitter is taken back and how soft the bilinear output is.
-- Picture quality: FSR4's own network (route B, watch item 81) or an
+- Picture quality: FSR4's own network (route B) or an
   edge-aware spatial upscale, if the bilinear output is too soft.
 - Device 0x218 and 0x1c8, which the title calls itself.
 - VIctory #1264 for `xmem.rs` (section 5).

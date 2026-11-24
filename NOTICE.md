@@ -1,7 +1,6 @@
 # Notice
 
-XTP is a modified version of **VIctory** by Marvisak
-(<https://github.com/Marvisak/VIctory>), imported from commit
+XTP is a modified version of **VIctory** by Marvisak, imported from commit
 `ffe310eb2098e52169f4c44db5ffdabf43a72622` (2026-11-24) and modified from
 2026-11-24 onward. VIctory and XTP are distributed under the GNU General
 Public License, version 3 or (at your option) any later version; see

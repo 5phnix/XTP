@@ -1,6 +1,6 @@
 # GPU-visible title memory on the RTX 4080: feasibility (G15)
 
-Measured on 2026-11-24 for `docs/analysis/gpu.md` phase 3 (G15–G18). The
+Measured for `docs/analysis/gpu.md` phase 3 (G15–G18). The
 question: can the title memory that `xtp-hle`'s xmem allocates be opened as
 D3D12 heaps that shaders and copies use in place, so that a world frame stops
 copying 220–285 MB into shadow buffers and back? And at what cost in commit,
@@ -394,7 +394,7 @@ removes that; importing also removes the bookkeeping.
   interior range of a virtual allocation both open.
 - The second sizes run was cut after 256 MiB and 1 GiB.
 
-**Incident.** At 14:45 on 2026-11-24, the 4 GiB run of 16-byte stores into
+**Incident.** At 14:45, the 4 GiB run of 16-byte stores into
 imported memory hung the RTX 4080 (`DXGI_ERROR_DEVICE_HUNG`) while the
 machine was in use. The benchmarks were stopped. The test no longer issues
 those stores in bulk. Long GPU benchmarks now go to the cloud L4.

@@ -1,7 +1,7 @@
 # Loader layer: VIctory (XTP's base) against xcl
 
 What XTP keeps of VIctory's loader layer, what it rewrites after xcl's
-approach, and in what order. Written 2026-11-24 from VIctory as imported at
+approach, and in what order. Written from VIctory as imported at
 `ffe310e` (XTP's first commit) and the xcl snapshot in `E:/xtp-refs/xcl`.
 
 xcl is GPL-2.0-only and XTP is GPL-3.0-or-later: xcl is a reference for
@@ -71,7 +71,7 @@ shaders, data formats and tooling.
 | `preflight.rs`, `inspect.rs`, `manifest.rs` | 566 | CPU/GPU checks, static import report, `MicrosoftGame.Config` |
 
 Also read: `README.md`, `AGENTS.md`, `HANDOFF.md` ("What works"),
-`docs/specs/2026-11-20-xcl-design.md` §5.1–5.4, 5.6 and the e2e title
+xcl's design notes (`docs/specs/`) §5.1–5.4, 5.6 and the e2e title
 `tests/testtitle`.
 
 ## 2. Two designs
@@ -100,19 +100,18 @@ foundation.** xcl is ahead in what surrounds the mapping: stub policy,
 fast-fail visibility, the command line, the VFS overlay, and the memory and
 thread overrides. Those are the rewrites.
 
-## 3. What the game dump shows
+## 3. What a title folder shows
 
-Read-only inspection of `E:\uwu` (headers and import tables only). Per
+Read-only inspection of `<title folder>` (headers and import tables only). Per
 `docs/asset-policy.md` only header facts, counts and public Windows / GDK API
 names are recorded here, never an extracted table:
 
-- `game_scarlett_master.exe`: preferred base `0x140000000`, relocations
+- The title executable: preferred base `0x140000000`, relocations
   present (`0x12a350` bytes), `DYNAMIC_BASE | HIGH_ENTROPY_VA | NX_COMPAT`,
   a TLS directory, no delay imports, 68 import descriptors.
-- 16 DLLs ship beside it, none with export forwarders. Three have static
-  TLS: `XboxBvhBuilder.dll`, `amd_fidelityfx_upscaler_xbox.dll`,
-  `libHttpClient.GDK.dll`. The console builds of `msvcp140*`,
-  `vcruntime140*`, `concrt140`, `vcomp140`, `vccorlib140` ship too.
+- 16 DLLs ship beside it, none with export forwarders; three have static
+  TLS. The console builds of the MSVC runtime (`msvcp140*`,
+  `vcruntime140*`, `concrt140`, `vcomp140`, `vccorlib140`) ship too.
 - Loader-layer imports of the exe, all through API sets (no `kernelx.dll`):
   `processthreads` (`CreateThread`, `SuspendThread`, `ResumeThread`,
   `SetThreadPriority`, `TerminateProcess`, `GetCurrentThreadStackLimits`,
@@ -156,7 +155,7 @@ XTP should not take it).
 | Resolution order | HLE → host (`HostPolicy` allow list) → title DLL → stub | routing table (aliases, `@system`, `@stub`) → HLE (+ same name in another HLE module, + system fallback) → game DLL → system → any HLE module of that name → stub | 2 (registry) / 5 | **keep**; **no** to "any HLE module of that name" (same name, other semantics) |
 | Ordinal imports | `#n` names in the HLE table | per-module ordinals + ordinal → name map in data | – / – | **extend** (L-04) |
 | Unresolved imports | 32-byte stub: trap (log, break, abort) or return 0, one global policy | stub returns a per-DLL / per-function value from a data file (`E_NOTIMPL` for HRESULT modules), records caller and count | 2 / 3 | **rewrite** after xcl (L-04) |
-| Export lookup, forwarders | `GetProcAddress` on the real module (forwarders go to host DLLs) | own table, forwarders through the resolver | e2e / – | **keep** (the dump has no forwarders; risk R-6) |
+| Export lookup, forwarders | `GetProcAddress` on the real module (forwarders go to host DLLs) | own table, forwarders through the resolver | e2e / – | **keep** (the title folder has no forwarders; risk R-6) |
 | Title DLLs at start | recursive over imports, dependencies first, `wanted` filter | recursive during binding | e2e / 2 | **keep** |
 | Runtime `LoadLibrary`, `GetProcAddress`, `GetModuleHandle` | HLE overrides; title DLLs mapped late by `LateDlls` in `apps/xtp/src/run.rs`; pseudo handles for HLE modules | same shape in `resolver::load_library` / `get_proc_address` | 3 / 5 | **extend**: move `LateDlls` and `LoaderLock` into `xtp-loader` with tests (L-03) |
 | Failed `DllMain`, concurrent loads | re-entrant loader lock; failed attach detaches and unmaps the batch (in the app, untested) | `LoadGuard`; failed DLL unregistered, a second load retries | – / 2 | **extend** (L-03) |
@@ -219,15 +218,15 @@ behaviour to read, never at code to copy. Items are in the recommended order;
 an item may start once its dependencies have landed.
 
 ### L-01 Import census as a repeatable check — S
-- **Goal:** know, before and after each item, which imports of the dump bind
+- **Goal:** know, before and after each item, which imports of the title folder bind
   to HLE, host, title DLLs or stubs, without running the title.
 - **Touches:** `apps/xtp/src/census.rs` (a `--json` output), a new opt-in
   test `apps/xtp/tests/census_sample.rs`.
 - **xcl ref:** `inspect.rs` `run`, `resolver.rs` `classify` (dry-run per
   import, ordinals listed apart).
-- **Acceptance:** with `XTP_SAMPLE_GAME=<dump>` the test classifies every
+- **Acceptance:** with `XTP_SAMPLE_GAME=<title folder>` the test classifies every
   image of the folder and prints the missing list; without the variable it
-  passes doing nothing. The list for `E:\uwu` is pasted in the PR.
+  passes doing nothing. The list for the title folder is pasted in the PR.
 - **Depends on:** –
 
 ### L-02 Copy-on-write overlay: logic — L
@@ -445,7 +444,7 @@ an item may start once its dependencies have landed.
   probe), `docs/analysis/loader.md` (findings).
 - **xcl ref:** `vfs_hooks.rs` `install` (the hooked set and its re-entrancy
   guard), `hooks.rs` `hook`.
-- **Acceptance:** a diagnostics run on the dump through the menus lists every
+- **Acceptance:** a diagnostics run on the title folder through the menus lists every
   escaping path (or none); the decision is written down with that list.
 - **Depends on:** L-13
 
@@ -460,7 +459,7 @@ an item may start once its dependencies have landed.
   `take_slot_zero`); its approach is the fallback if verification ever
   rejects real sites.
 - **Acceptance:** unit test: the pattern placed in data or across an
-  instruction boundary is not patched; real loads are; on the dump the count
+  instruction boundary is not patched; real loads are; on the title folder the count
   stays 53,246 (opt-in test).
 - **Depends on:** L-06
 
@@ -469,7 +468,7 @@ an item may start once its dependencies have landed.
   Windows error 1455): zero physical pages are mapped as reserved address
   space and committed when the CPU first touches them; buffers handed to
   kernel calls (file reads, DirectStorage) are committed first. Only if a
-  measurement on the dump shows the current "commit when mapped or written"
+  measurement on the title folder shows the current "commit when mapped or written"
   path still commits pages nothing touches.
 - **Touches:** `crates/xtp-hle/src/modules/xmem.rs`,
   `crates/xtp-loader/src/crash.rs` (the fault is served before the crash
@@ -547,13 +546,13 @@ files are never modified.
   could hide the pattern in data. L-17 closes this.
 - **R-4 Overlay migration.** VIctory mounted `G:` writable. If earlier runs
   wrote into the game folder, those files are now indistinguishable from
-  package files. Check the dump against its package before L-13 lands.
+  package files. Check the title folder against its package before L-13 lands.
 - **R-5 `PEB.ImageBaseAddress`.** Rust std, the host CRT and XTP itself may
   take the PEB's image for theirs (resources, module path). L-10 audits our
   own uses first; a regression shows as wrong paths or a missing icon.
 - **R-6 Forwarded exports.** Title DLL exports are looked up with
   `GetProcAddress`, which sends forwarders to host DLLs, not to HLE. The
-  dump has none; a new title could.
+  title folder has none; a new title could.
 - **R-7 Fault-driven commit.** L-18 adds a first-chance access-violation
   path ahead of the crash reporter, which prints access violations as they
   happen. Ordering mistakes make every lazy page look like a crash, or hide

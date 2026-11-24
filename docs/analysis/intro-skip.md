@@ -1,9 +1,9 @@
 # The intro movie: is it on the way to the world, and can tests skip it?
 
-Measured on 2026-11-24 on the person's PC (RTX 4080 SUPER) with build
+Measured on the person's PC (RTX 4080 SUPER) with build
 1.0.2.1 (BLAKE3 `b99f876b…e93`), from the golden save, for the task
 "Skip the intro videos when they only cost time". RVAs are relative to the
-base of `game_scarlett_master.exe`. Nothing of the title (bytes, names of
+base of the title executable. Nothing of the title (bytes, names of
 its files) is quoted here.
 
 **Answer: yes, it is on the way, and cutting it saves about 13 s per test

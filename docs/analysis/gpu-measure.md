@@ -152,7 +152,7 @@ cargo test --release -p xtp-gpu -- --ignored --nocapture watch_and_copy_costs gu
 ```
 
 They ran on the person's PC (Ryzen 9 7950X3D) at below-normal priority,
-through `cargo-slot`, on 2026-11-24. The case is 30 submissions of 200 copies
+through `cargo-slot`. The case is 30 submissions of 200 copies
 of 600 bytes into a guarded 174 MB view, with the guards reset before each
 submission as a refresh resets them:
 

@@ -6,7 +6,7 @@ the five questions of the task, whether it beats XTP, how XTP would reuse
 it, the XTP task it maps to, and who wrote it.
 
 - **Read:** the read-only copy `E:\xtp-refs\AnyPS5` at `7de61e3451`
-  (2026-11-22, branch `AnyKyty`; a shallow clone of one commit). Nothing of
+  (branch `AnyKyty`; a shallow clone of one commit). Nothing of
   it was built or run.
 - **History:** a blobless clone of `github.com/simnJS/AnyPS5`, branch
   `AnyKyty` (49,975 commits), made in the session's scratchpad for

@@ -828,7 +828,7 @@ impl<'a> Run<'a> {
 /// The registers `inst` reads as its operands (not EXEC, nor the old value
 /// of a VGPR it writes, which [`crate::ir`] adds); `None` where every read
 /// counts.
-fn source_regs(inst: &Inst, lanes: u8) -> Option<Vec<Reg>> {
+pub(crate) fn source_regs(inst: &Inst, lanes: u8) -> Option<Vec<Reg>> {
     let mut out = Vec::new();
     let mut add = |op: &Operand| match *op {
         Operand::Scalar { code, .. } if code == NULL => {}
@@ -900,7 +900,7 @@ fn source_regs(inst: &Inst, lanes: u8) -> Option<Vec<Reg>> {
 /// that run it (accumulators, half writes, DPP's masked rows, SDWA's
 /// partial destinations, `tfe` status dwords): its result then depends on
 /// the old value.
-fn keeps_old(inst: &Inst) -> bool {
+pub(crate) fn keeps_old(inst: &Inst) -> bool {
     let n = inst.name();
     match &inst.fields {
         Fields::Valu(v) => {

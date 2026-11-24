@@ -3,6 +3,7 @@
 //! offsets or byte-pattern signatures). What may and may not be stored here
 //! is defined in docs/asset-policy.md.
 
+pub mod asserts;
 pub mod intro;
 pub mod rpf;
 pub mod sgd5;

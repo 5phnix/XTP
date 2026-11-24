@@ -17,6 +17,8 @@ param(
     [ValidateSet('check', 'build', 'cargo')] [string]$Mode = 'check',
     [string]$Ref = '',
     [string]$Bundle = '',
+    # The commit sent (run-remote.ps1 -Local): fails unless it is the one checked out.
+    [string]$Commit = '',
     [string]$CargoArgs = '',
     [string]$SessionUser = 'xtp',
     [string]$Owner = '',
@@ -31,7 +33,7 @@ $log = Join-Path 'C:\xtp\logs' ("{0}-{1}.log" -f (Get-Date -Format 'yyyyMMdd-HHm
 
 Enter-XtpLock 'src' -NoWait:$NoWait
 try {
-    Set-XtpSource $Bundle $Ref
+    Set-XtpSource $Bundle $Ref $Commit
     $t0 = Get-Date
     $arguments = "-NoProfile -ExecutionPolicy Bypass -File C:\xtp\tools\vm\cargo-steps.ps1 -Mode $Mode"
     if ($CargoArgs) { $arguments += " -CargoArgs `"$CargoArgs`"" }
