@@ -14,6 +14,7 @@
 //! failure (gpu.md, risk 2): each submission is waited for and finished
 //! before `execute` returns, and there is no completion thread.
 
+pub(crate) mod buffers;
 #[cfg(test)]
 mod submissions;
 mod timeline;
@@ -387,6 +388,8 @@ fn create(software: bool) -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        // Heaps for buffers, made from now on by threads of their own.
+        buffers::start(&device);
         tracing::info!(synchronous = sync_submit(), "host D3D12 device ready");
         Ok(Host {
             device,
@@ -555,8 +558,9 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
     prelude: Mutex<Prelude>,
-    /// The pipelines the list binds, for reports of slow submissions.
-    pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The pipelines the list binds, for reports of slow submissions:
+    /// shared with its submissions ([`Recorded`]), a reset starts a new set.
+    pipelines: Mutex<std::sync::Arc<std::collections::BTreeSet<String>>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
@@ -567,9 +571,10 @@ pub(crate) struct HostList {
     /// timeline by a reset: its recording since uses none of theirs.
     fresh_after: AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
-    /// data without marker texts), with the host GPU range a copy reads.
+    /// data without marker texts), with the host GPU range a copy reads:
+    /// shared like `pipelines`.
     #[cfg(feature = "diagnostics")]
-    notes: Mutex<Vec<Note>>,
+    notes: Mutex<std::sync::Arc<Vec<Note>>>,
     /// With `XTP_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -586,6 +591,16 @@ impl Drop for HostList {
 
 /// A closed prelude list and its allocator.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// What a submission keeps of a list's recording for its reports (slow
+/// submissions, device removal): a reset while it runs starts the list's
+/// next recording afresh without taking them from it.
+#[derive(Clone, Default)]
+struct Recorded {
+    pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
+    #[cfg(feature = "diagnostics")]
+    notes: std::sync::Arc<Vec<Note>>,
+}
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -798,6 +813,10 @@ impl ListRef {
 /// What is left of a submission once the GPU has run it.
 struct Pending {
     lists: Vec<ListRef>,
+    /// Each list's recording as submitted.
+    recorded: Vec<Recorded>,
+    /// Its number in the host copies (`shadow::submission`).
+    submission: u64,
     /// The destinations of its GPU buffer copies (host copy, address,
     /// bytes), merged per host copy.
     copied: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -815,7 +834,7 @@ impl Pending {
     /// A submission's, after its steps ran, with the title memory its GPU
     /// work writes (written back, written at the bottom of the pipe) and
     /// reads (host copies and textures brought up to date for it).
-    fn of(runs: &[&HostList]) -> (Pending, Touches) {
+    fn of(runs: &[&HostList], submission: u64) -> (Pending, Touches) {
         type Ranges = Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>;
         let (mut back, mut copied): (Ranges, Ranges) = (Vec::new(), Vec::new());
         let (mut writes, mut touches) = (Vec::new(), Touches::default());
@@ -867,6 +886,8 @@ impl Pending {
         (touches.shaders, touches.copies) = (through(&back), through(&copied));
         let pending = Pending {
             lists: runs.iter().map(|&l| ListRef(l)).collect(),
+            recorded: runs.iter().map(|l| l.recorded()).collect(),
+            submission,
             copied,
             back,
             writes,
@@ -1043,8 +1064,8 @@ impl Host {
             });
         }
         // One submission at a time from preparation to submission (to
-        // copy-back with `XTP_SYNC_SUBMIT`): snapshots and the ranges
-        // shaders write are per host copy, not per submission.
+        // copy-back with `XTP_SYNC_SUBMIT`): what a step waits for is
+        // decided against the submissions before it.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         let waited_before = waited_here();
@@ -1070,6 +1091,7 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch {
             host: Some(self),
+            submission: crate::shadow::submission(),
             ..Batch::default()
         };
         for list in runs {
@@ -1081,7 +1103,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        let (mut pending, touches) = Pending::of(runs);
+        let (mut pending, touches) = Pending::of(runs, batch.submission);
         // Preparing, without the waits for earlier submissions (counted as
         // waiting).
         let waited = std::time::Duration::from_micros(waited_here() - waited_before);
@@ -1112,10 +1134,11 @@ impl Host {
             };
             if let Err(e) = signalled {
                 // Nothing would finish it.
+                let recorded: Vec<Recorded> = runs.iter().map(|l| l.recorded()).collect();
                 fail(format_args!(
                     "a host submission of {} lists was not signalled ({e}){}",
                     runs.len(),
-                    self.removal_data(runs)
+                    self.removal_data(runs, &recorded)
                 ));
             }
             #[cfg(feature = "diagnostics")]
@@ -1284,31 +1307,48 @@ impl Host {
     fn removed(&self, finishing: Option<&Pending>) -> ! {
         static REPORTING: Mutex<()> = Mutex::new(());
         let _once = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
-        let mut runs: Vec<&HostList> = finishing
-            .iter()
-            .flat_map(|p| p.lists.iter().map(|l| l.get()))
-            .collect();
-        let first = runs.len();
-        self.timeline
-            .each_work(|w| runs.extend(w.lists.iter().map(|l| l.get())));
+        let (mut runs, mut recorded): (Vec<&HostList>, Vec<Recorded>) = (Vec::new(), Vec::new());
+        let mut add = |p: &Pending| {
+            runs.extend(p.lists.iter().map(|l| l.get()));
+            recorded.extend(p.recorded.iter().cloned());
+        };
+        finishing.into_iter().for_each(&mut add);
+        let first = finishing.map_or(0, |p| p.lists.len());
+        self.timeline.each_work(add);
         fail(format_args!(
             "host GPU device removed after a submission of {first} lists ({} lists in \
              flight){}{}",
             runs.len(),
-            self.removal_data(&runs),
-            last_notes(&runs)
+            self.removal_data(&runs, &recorded),
+            last_notes(&recorded)
         ));
     }
 
     /// The completion thread: finishes each submission as soon as the GPU
     /// has run it, so that title fences and bottom-of-pipe writes move on
     /// their own (the title waits for its events and reads its memory).
+    ///
+    /// A panic in it ends the run: the thread would be gone, and the title
+    /// would wait for its fences for ever.
     fn finish_loop(&self) {
         FINISHER.set(true);
         loop {
-            let value = self.timeline.next();
-            self.wait_gpu(value);
-            self.finish_reached();
+            let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let value = self.timeline.next();
+                self.wait_gpu(value);
+                self.finish_reached();
+            }));
+            if let Err(panic) = finished {
+                let what = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                fail(format_args!(
+                    "the host GPU's completion thread panicked ({what}): no submission would \
+                     finish any more"
+                ));
+            }
         }
     }
 
@@ -1316,6 +1356,10 @@ impl Host {
     /// GPU copies and shaders wrote goes back into title memory, then its
     /// bottom-of-pipe writes, which tell the title the GPU is done.
     fn complete(&self, p: Pending, seen: std::time::Instant) {
+        #[cfg(test)]
+        if submissions::PANIC_IN_COMPLETE.swap(false, Ordering::SeqCst) {
+            panic!("a panic a test asked for");
+        }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             self.removed(Some(&p));
@@ -1331,17 +1375,8 @@ impl Host {
         SUBMISSION_US[GPU_US].fetch_add(ran.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if ran > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = p
-                .lists
-                .iter()
-                .flat_map(|l| {
-                    l.get()
-                        .pipelines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
-                .collect();
+            let pipelines: std::collections::BTreeSet<&String> =
+                p.recorded.iter().flat_map(|r| r.pipelines.iter()).collect();
             tracing::warn!(
                 ms = ran.as_millis(),
                 lists = p.lists.len(),
@@ -1357,11 +1392,11 @@ impl Host {
         // big ranges dozens of times).
         let copying = std::time::Instant::now();
         for (shadow, address, len) in &p.copied {
-            let written = shadow.write_back(*address, *len);
+            let written = shadow.write_back(p.submission, *address, *len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         for (shadow, address, len) in &p.back {
-            let written = shadow.copy_back(*address, *len);
+            let written = shadow.copy_back(p.submission, *address, *len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         let back = copying.elapsed();
@@ -1386,7 +1421,7 @@ impl Host {
     /// below it; for each list that did not finish, the command it stopped
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
-    fn removal_data(&self, runs: &[&HostList]) -> String {
+    fn removal_data(&self, runs: &[&HostList], recorded: &[Recorded]) -> String {
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
             return String::new();
         };
@@ -1456,11 +1491,14 @@ impl Host {
                         p.BreadcrumbCount, history[done as usize].0
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = runs
+                        .iter()
+                        .position(|r| Some(r.list.as_raw()) == list)
+                        .and_then(|i| recorded.get(i));
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
-                        let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+                        let notes = &r.notes;
                         history
                             .iter()
                             .enumerate()
@@ -1479,8 +1517,7 @@ impl Host {
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
                     } else if let Some(r) = run {
-                        let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-                        text.push_str(&format!(", its pipelines {pipelines:?}"));
+                        text.push_str(&format!(", its pipelines {:?}", r.pipelines));
                     }
                 }
                 plain = p.pNext;
@@ -1739,12 +1776,12 @@ impl HostList {
             }
             allocator.clone()
         };
-        self.pipelines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        // New ones: a submission in flight keeps its own (`Recorded`).
+        *self.pipelines.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            *self.notes.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        }
         // SAFETY: a closed list (D3D12 allows resetting one that still
         // runs) and an allocator nothing running uses.
         if let Err(e) = unsafe { self.list.Reset(&allocator, None) } {
@@ -1850,10 +1887,8 @@ impl HostList {
                 self.list
                     .SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            std::sync::Arc::make_mut(&mut notes).push((what, range));
         }
     }
 
@@ -1861,7 +1896,20 @@ impl HostList {
     pub(crate) fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+            std::sync::Arc::make_mut(&mut pipelines).insert(name.to_owned());
+        }
+    }
+
+    /// What a submission of the list keeps of its recording.
+    fn recorded(&self) -> Recorded {
+        Recorded {
+            pipelines: self
+                .pipelines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            #[cfg(feature = "diagnostics")]
+            notes: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
     }
 
@@ -1957,7 +2005,6 @@ impl HostList {
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
@@ -1967,6 +2014,7 @@ impl HostList {
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
@@ -1975,14 +2023,19 @@ impl HostList {
             let chunk = match spare {
                 Some(chunk) => chunk,
                 None => {
+                    // Made without the lock held (it may wait for a heap);
+                    // a list records on one thread at a time.
+                    drop(s);
                     let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
                     name(&buffer, || "list scratch".into());
                     // SAFETY: a live buffer.
                     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                    s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
                     (buffer, data as usize, gpu)
                 }
             };
             s.chunks.push(chunk);
+            s.current = s.chunks.len() - 1;
             s.used = 0;
         }
         let (_, data, gpu) = s.chunks[s.current];
@@ -1994,13 +2047,19 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = {
-            let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
-            if budget.is_none() {
+        let made = self
+            .budget
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (buffer, data) = match made {
+            Some(made) => made,
+            None => {
+                // Made without the lock held (it may wait for a heap).
                 let (b, d) = host()?.shared_buffer(256)?;
-                *budget = Some((b, d as usize));
+                let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+                budget.get_or_insert((b, d as usize)).clone()
             }
-            budget.clone()?
         };
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
@@ -2135,7 +2194,7 @@ impl HostList {
                     // the shaders start from the title's data.
                     batch.settle(*address, *len, false);
                     batch.flush();
-                    shadow.writing(*address, *len);
+                    shadow.writing(batch.submission, *address, *len);
                     continue;
                 }
                 // The copy reads host copies on the GPU, written back after.
@@ -2144,6 +2203,7 @@ impl HostList {
                 // wrote is told from the copy's bytes, which it would change.
                 Step::GpuCopy(shadow, address, len) => {
                     batch.settle_shaders(shadow, *address, *len);
+                    shadow.copying(batch.submission, *address, *len);
                     moved(Moved::GpuCopy, *len);
                     continue;
                 }
@@ -2181,6 +2241,8 @@ struct Batch<'a> {
     textures: std::collections::HashSet<usize>,
     /// The host, whose earlier submissions may still be in flight.
     host: Option<&'a Host>,
+    /// The submission's number in the host copies (`shadow::submission`).
+    submission: u64,
 }
 
 impl Batch<'_> {
@@ -2401,8 +2463,12 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
-    /// A buffer in the upload heap, mapped for writing.
+    /// A buffer in the upload heap, mapped for writing: placed in a heap
+    /// reserved ahead ([`buffers`]), else committed.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(placed) = buffers::buffer(buffers::Kind::Upload, size) {
+            return Some(placed);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -2571,6 +2637,9 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             crate::device::log_frame();
+            if let Some(pools) = buffers::summary() {
+                tracing::info!("buffer heaps: {pools}");
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -2809,8 +2878,12 @@ impl Host {
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
-    /// the common state (buffers move out of it implicitly).
+    /// the common state (buffers move out of it implicitly), zeroed. Placed
+    /// in a heap reserved ahead ([`buffers`]), else committed.
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(placed) = buffers::buffer(buffers::Kind::System, size) {
+            return Some(placed);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
@@ -2862,12 +2935,12 @@ impl Host {
 /// For adapters without device-removed data (the software one): the last
 /// commands each list of the failed submission noted (diagnostics, with
 /// `XTP_D3D12_DRED`).
-fn last_notes(runs: &[&HostList]) -> String {
+fn last_notes(runs: &[Recorded]) -> String {
     #[cfg(feature = "diagnostics")]
     {
         let mut text = String::new();
         for (i, r) in runs.iter().enumerate() {
-            let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+            let notes = &r.notes;
             for (n, _) in notes.iter().rev().take(6).rev() {
                 text.push_str(&format!(
                     "; list {i} of {}, of its {}: {n}",
