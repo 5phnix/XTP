@@ -2759,6 +2759,8 @@ impl Meter {
         let outside_ms = outside(ms, cpu + waited);
         let overlap_ms = overlapped(gpu, back_ms, waited);
         let longest_frame = std::mem::take(&mut self.longest).as_secs_f64() * 1000.0;
+        // The second's mode, before an A/B run switches it for the next.
+        let ahead = if frames::ahead() { "on" } else { "off" };
         frames::measured(
             std::time::Instant::now(),
             frames::Second {
@@ -2771,7 +2773,6 @@ impl Meter {
                 longest: longest_frame,
             },
         );
-        let ahead = if frames::ahead() { "on" } else { "off" };
         let title = std::mem::replace(
             &mut *TITLE.lock().unwrap_or_else(|e| e.into_inner()),
             Submissions::new(),
