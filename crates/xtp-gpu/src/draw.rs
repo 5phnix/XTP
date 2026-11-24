@@ -1790,6 +1790,20 @@ impl State {
         if max == 0 {
             return Ok(());
         }
+        if !p.inputs.iter().any(|e| !e.per_instance) {
+            // Corners from the vertex id: drawn as a direct rectangle draw
+            // of such a pipeline is (see `crate::rectangles`); which
+            // pipelines, once each.
+            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&p.name) {
+                seen.push(p.name.clone());
+                tracing::info!(
+                    pipeline = %p.name,
+                    "indirect rectangles without vertex inputs: 6 vertices a rectangle from vertex 0"
+                );
+            }
+        }
         // The rewritten records: draw arguments, 16 bytes apart.
         let signature = host_signature(0, 16).ok_or("no host signature")?;
         let vertices = self.vertex.map(|v| (v.address, v.size, v.stride));
