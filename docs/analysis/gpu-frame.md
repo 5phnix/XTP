@@ -543,7 +543,7 @@ DXIL clean-up passes), so the pair is also dxilopt's A/B (§10.6).
 
 | Session | Play (UTC) | World | Binary | Switches | End |
 |---|---|---|---|---|---|
-| **A** | 22:43:46–22:45:24 | from +32 s, 60 s | diag of dc4bb11 (`main` 99b6376 with worldlight and dxilopt, plus this task's branch), sha256 `369987b8…` | `XTP_DXIL_OPT=0` | exit 0, no device removal |
+| **A** | 22:43:46–22:45:24 | from +32 s, 60 s | diag of `main` 99b6376 (worldlight and dxilopt in) with this task's pipeline statistics, the tree of 54a1b76; sha256 `369987b8…` | `XTP_DXIL_OPT=0` | exit 0, no device removal |
 | **B** | 22:46:00–22:47:46 | from +39 s, 60 s | the same | `XTP_DXIL_OPT=1` (all passes, `passes=31` on the log) | exit 0, no device removal |
 
 - Both: Series S, `XTP_SKIP_INTRO=1`, `XTP_WATCHDOG_HOOK=1`, autopilot
