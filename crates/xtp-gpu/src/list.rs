@@ -119,6 +119,10 @@ struct List {
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// The pipeline the title set last (`SetPipelineState`, or the one its
+    /// reset passed): the program whose thread group `DispatchX` reads.
+    #[cfg(windows)]
+    pipeline: std::sync::atomic::AtomicUsize,
 }
 #[cfg(windows)]
 impl Drop for List {
@@ -236,8 +240,33 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         }),
         #[cfg(windows)]
         state: Default::default(),
+        #[cfg(windows)]
+        pipeline: Default::default(),
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+}
+
+/// Keeps `pipeline` as the one the title set last on `this` (see
+/// [`List::pipeline`]).
+#[cfg(windows)]
+fn keep_pipeline(this: This, pipeline: This) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let kept = unsafe { &(*this.cast::<List>()).pipeline };
+    kept.store(pipeline as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The pipeline the title set last on `this`.
+#[cfg(windows)]
+fn kept_pipeline(this: This) -> This {
+    if this.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: the title passes one of our lists.
+    let kept = unsafe { &(*this.cast::<List>()).pipeline };
+    kept.load(std::sync::atomic::Ordering::Relaxed) as This
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -291,6 +320,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     uploads.clear();
     drop(uploads);
+    #[cfg(windows)]
+    keep_pipeline(this, pipeline);
     #[cfg(windows)]
     with_state(this, |host, state| {
         host.reset();
@@ -1400,16 +1431,52 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags (the
+/// ray-tracing builder dispatches this way). Each pair of flags and program
+/// is logged the first time, with its counts and the program's thread
+/// group ([`note_dispatch_x`]).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    {
+        note_dispatch_x(kept_pipeline(this), [x, y, z], flags);
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
+}
+
+/// Logs a `DispatchX` the first time its flags come with its program (the
+/// bound pipeline's compute shader, or no host pipeline yet): the flags,
+/// the counts and the program's console thread group, which tell whether
+/// the counts are groups or threads.
+#[cfg(windows)]
+fn note_dispatch_x(pipeline: This, counts: [u32; 3], flags: u32) {
+    use std::collections::HashSet;
+    static SEEN: std::sync::Mutex<Option<HashSet<(u32, usize)>>> = std::sync::Mutex::new(None);
+    let host = crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
+    let stage = host.and_then(|p| p.stages.first());
+    // Shaders stay interned for the run: the address names the program.
+    let program = stage.map_or(0, |s| std::sync::Arc::as_ptr(&s.shader) as usize);
+    let new = SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert((flags, program));
+    if !new {
+        return;
+    }
+    let group = stage.and_then(|s| s.shader.native().ok()?.threads);
+    tracing::info!(
+        flags = format_args!("{flags:#x}"),
+        pipeline = ?pipeline,
+        program = host.map_or("no host pipeline", |p| p.name.as_str()),
+        ?counts,
+        ?group,
+        "DispatchX: first dispatch of these flags with this program"
+    );
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
@@ -1473,6 +1540,8 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
+    #[cfg(windows)]
+    keep_pipeline(this, pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]

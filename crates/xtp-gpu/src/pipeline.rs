@@ -117,6 +117,9 @@ pub(crate) struct Translated {
 pub(crate) struct Native {
     pub(crate) used: Vec<xtp_shader::UsedResource>,
     pub(crate) wave64: bool,
+    /// A compute program's thread group (`numthreads`), as the console
+    /// runs it: `DispatchX` turns thread counts into groups with it.
+    pub(crate) threads: Option<[u32; 3]>,
 }
 
 #[cfg(windows)]
@@ -198,11 +201,16 @@ fn native(container: &[u8]) -> Result<Native, String> {
     Ok(match native {
         Some(p) => Native {
             wave64: p.wave64,
+            threads: match p.io {
+                xtp_shader::native::StageIo::Cs(cs) => Some(cs.threads),
+                _ => None,
+            },
             used: p.used,
         },
         None => Native {
             used: Vec::new(),
             wave64: false,
+            threads: None,
         },
     })
 }
