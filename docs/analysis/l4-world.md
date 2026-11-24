@@ -7,7 +7,7 @@ world in 20 to 27 s. Measured on 2026-11-24. Times are UTC. Logs, captures,
 stack dumps and debugger output stay outside the repository, under
 `E:\xtp-data\cloud-runs\` and `E:\xtp-data\tmp\l4world\` (local copies) and
 `D:\xtp-data\runs\` (on the VM). Title code is named by RVA in
-`game_scarlett_master.exe` (build blake3 `b99f876b74d4a77f…`). No title
+the title executable (build blake3 `b99f876b74d4a77f…`). No title
 bytes or listings are quoted.
 
 ## 1. Summary
