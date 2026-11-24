@@ -941,6 +941,7 @@ fn clear_uav(
                 return;
             };
             let Some(slot) = heap.dynamic(1) else {
+                warn_once!("a UAV clear without a dynamic slot of XTP's view heap: not done");
                 return;
             };
             list.keep_dynamic(crate::descriptor::OWN_VIEW_HEAP, slot, 1);
@@ -956,6 +957,10 @@ fn clear_uav(
                 return;
             };
             if !heap.make_at(slot, &view) {
+                warn_once!(
+                    ?view,
+                    "a UAV clear of a view the host cannot place in its heap: not done"
+                );
                 return;
             }
             if let Some((address, len)) = range
@@ -1277,6 +1282,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             return false;
         }
         let Some(first) = heap.dynamic(2) else {
+            warn_once!(
+                "FidelityFX dispatch without dynamic slots of XTP's view heap, nothing upscaled"
+            );
             return false;
         };
         list.keep_dynamic(crate::descriptor::OWN_VIEW_HEAP, first, 2);
