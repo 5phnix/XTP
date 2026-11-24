@@ -112,10 +112,16 @@ function Invoke-Gcloud {
 
 function Get-XtpBaseArgList($Cfg) { return @("--project=$($Cfg.project)", '--quiet') }
 
+# The zones of the instances named exactly $Name (gcloud's name= filter is
+# a pattern match, which is changing: compare here).
+function Get-XtpInstanceZone($Cfg, [string]$Name) {
+    $rows = Invoke-Gcloud -Arguments (@('compute', 'instances', 'list', "--filter=name~^$([regex]::Escape($Name))", '--format=value(name,zone.basename())') + (Get-XtpBaseArgList $Cfg))
+    return @($rows | Where-Object { $_ } | ForEach-Object { $n, $z = $_ -split '\s+'; if ($n -eq $Name) { $z } })
+}
+
 # The zone the VM lives in (it may be any of the configured zones), or $null.
 function Get-XtpVmZone($Cfg) {
-    $z = Invoke-Gcloud -Arguments (@('compute', 'instances', 'list', "--filter=name=$($Cfg.vm)", '--format=value(zone.basename())') + (Get-XtpBaseArgList $Cfg))
-    $z = @($z | Where-Object { $_ })
+    $z = @(Get-XtpInstanceZone $Cfg $Cfg.vm)
     if ($z.Count -gt 1) { throw "Several VMs named $($Cfg.vm): $($z -join ', ')" }
     if ($z.Count -eq 0) { return $null }
     return $z[0]

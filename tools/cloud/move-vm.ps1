@@ -44,7 +44,7 @@ $bootSnap = "$($cfg.vm)-boot-move"
 $dataSnap = "$($cfg.vm)-data-move"
 
 function Get-Zone([string]$Name) {
-    $z = @(Invoke-Gcloud -Arguments (@('compute', 'instances', 'list', "--filter=name=$Name", '--format=value(zone.basename())') + $base) | Where-Object { $_ })
+    $z = @(Get-XtpInstanceZone $cfg $Name)
     if ($z.Count) { return $z[0] } else { return $null }
 }
 

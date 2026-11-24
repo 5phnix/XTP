@@ -48,10 +48,12 @@ You end up with:
   budget alert (Billing → Budgets & alerts) before you start; see
   [Costs](#7-costs-and-keeping-them-down).
 - **The gcloud CLI** ([install](https://cloud.google.com/sdk/docs/install)),
-  logged in: `gcloud auth login`. Run the scripts from PowerShell (7, or the
-  Windows PowerShell 5.1 that comes with Windows). Git Bash's environment
-  often does not find gcloud's credentials or Python: use PowerShell (or set
-  `CLOUDSDK_PYTHON` to the SDK's bundled Python).
+  logged in: `gcloud auth login`. Run the scripts from PowerShell 7
+  (`pwsh`). Windows PowerShell 5.1 refuses to run scripts by default: use
+  `powershell -ExecutionPolicy Bypass -File tools\cloud\<script>.ps1`, or
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once. Git Bash's
+  environment often does not find gcloud's credentials or Python: use
+  PowerShell (or set `CLOUDSDK_PYTHON` to the SDK's bundled Python).
 - **Upstream bandwidth** for one upload of the game files (about 210 GB):
   about 5 hours at 100 Mbit/s. On a fibre line we measured 1.19 Gbit/s at
   the start and 40 minutes for the whole 208.6 GiB (88 MiB/s on average:
@@ -190,7 +192,8 @@ Even with quota, creating the VM can fail with `ZONE_RESOURCE_POOL_EXHAUSTED`:
 the zone has no L4 free at that moment. This is common. On 2026-11-24 every L4
 zone of europe-west1, -west2, -west3, -west4, -west6 and us-central1 was
 stocked out for about twenty minutes; `us-central1-a` had one at the third
-round of retries. `new-vm.ps1` tries the configured zones in order, and with
+round of retries, and later that day no zone in the world had one for three
+hours. `new-vm.ps1` tries the configured zones in order, and with
 `-RetryMinutes <n>` tries them again every four minutes. List several regions'
 zones in `zones`, your preferred ones first.
 
@@ -218,6 +221,20 @@ throughput (`dataDiskThroughput`, 400 MiB/s by default; see
 region than where it is stored is billed as network transfer. Check the new
 VM (`run-remote.ps1 -DeviceCheck`, a game run), then `move-vm.ps1
 -DeleteOld` removes the old one and the snapshots.
+
+When every zone is full, even for `move-vm.ps1`, `grab-vm.ps1 -Minutes 240`
+takes the first GPU that frees up anywhere. It loops over every region that
+offers the accelerator, one regional request at a time (Google picks a free
+zone of the region), standard then **Spot**, g2-standard-16 then -12 then
+-8, and logs every attempt. Its VMs boot the public Windows image, which is
+quick to create or refuse, so the GPU is held seconds after it frees up; the
+game disk is then made from the snapshot and attached, and `new-vm.ps1` and
+`setup-vm.ps1` set the new Windows up (30 to 45 minutes). Attempts must not
+run in parallel: with a quota of one GPU, an attempt in flight holds the
+quota and the others are refused by it instead of being answered on
+capacity. On 2026-11-24, after three hours without an L4 anywhere, a Spot
+g2-standard-16 came up in asia-east1-b. A Spot VM costs much less, and
+Google can stop it at any time (it keeps its disks; start it again later).
 
 ## 3. Configuration file
 
@@ -329,12 +346,22 @@ All of these start the VM if it is stopped and bring the logs back to
 tools\cloud\run-remote.ps1 -Check -Local                    # your current commit
 tools\cloud\run-remote.ps1 -Check -Ref origin/some-branch   # a branch of the VM's clone
 tools\cloud\run-remote.ps1 -Cargo 'test -p xtp-gpu --locked' -Local
-tools\cloud\run-remote.ps1 -Game -Local -Seconds 240
-tools\cloud\run-remote.ps1 -Game -NoBuild -Env @{ XTP_LOG = 'xtp_gpu=debug,info'; XTP_GPU_TIMING = '1' }
-tools\cloud\run-remote.ps1 -Game -Local -Repo E:\XTP -LocalRev main -Autopilot autopilot\gameplay.txt -Seconds 420
 tools\cloud\invoke-vm.ps1 'nvidia-smi'                       # any short PowerShell on the VM
 tools\cloud\invoke-vm.ps1 -Shell                             # a shell on the VM
+
+# A game session, the recommended way: Series S mode, the autopilot from the
+# golden save, the intro movie cut, the title's watchdog kept quiet
+tools\cloud\run-remote.ps1 -Game -Local -Autopilot autopilot\gameplay.txt -Seconds 360 `
+    -XtpArgs '--console series-s' -Env @{ XTP_SKIP_INTRO = '1'; XTP_WATCHDOG_HOOK = '1' }
+# the same on an unpushed main, with more logging
+tools\cloud\run-remote.ps1 -Game -Local -Repo E:\XTP -LocalRev main -Autopilot autopilot\gameplay.txt -Seconds 360 `
+    -XtpArgs '--console series-s' -Env @{ XTP_SKIP_INTRO = '1'; XTP_WATCHDOG_HOOK = '1'; XTP_LOG = 'xtp_gpu=debug,info' }
 ```
+
+XTP develops and tests in **Series S mode** first (`--console series-s`):
+sessions on the VM use it unless you are comparing modes on purpose. In
+Series S mode the title also loads its FidelityFX upscaler (the log names
+`amd_fidelityfx_upscaler_xbox.dll`).
 
 **Which code.** By default the VM's clone is put on `origin/main` (fetched
 first) or on `-Ref`. With `-Local` your current commit is sent as a git bundle
@@ -453,7 +480,7 @@ on them.
 
 What to ask for, typically: "run the workspace check on the cloud VM for my
 current commit" (`run-remote.ps1 -Check -Local`), "run the game for 4 minutes
-on the VM and tell me how far it got" (`run-remote.ps1 -Game -Local -Seconds 240`,
+on the VM in Series S mode and tell me how far it got" (`run-remote.ps1 -Game -Local -Autopilot autopilot\gameplay.txt -XtpArgs '--console series-s'`,
 then reading `summary.txt`, `run.log` and the captured frames).
 
 ### Claude Code installed on the VM
