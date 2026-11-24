@@ -293,16 +293,10 @@ struct Made {
 pub(crate) struct Picked {
     /// Per host copy, the span of title memory its views read.
     pub(crate) reads: Vec<(Arc<Shadow>, u64, u64)>,
-    /// The ranges of unordered access views, each up to [`PICKED_WRITES`].
-    pub(crate) writes: Vec<(Arc<Shadow>, u64, u64)>,
 }
 
-/// The largest unordered access view whose range a shader that picks
-/// slots at run time is taken to write (copied back after its submission).
-/// shortcut: larger ones reached only that way are not copied back (as
-/// r4tedx's gpu/run-time-indexed-views); what shaders write stays in the
-/// host copy, where later submissions read it.
-const PICKED_WRITES: u64 = 16 << 20;
+/// How long a [`HostHeap::picked_spans`] pass makes waiting views for.
+const PICKED_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
 
 /// Dynamic slot bookkeeping.
 struct Slots {
@@ -460,8 +454,11 @@ impl HostHeap {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping ("title
                     // slot past the host heap" says so). The raw views of
-                    // the stride table come out of the title's part.
-                    let (mirrored, dynamic) = capped_split(PORTABLE_VIEWS - aliases);
+                    // the stride table come out of the dynamic part (2^18
+                    // less 2^16 left; the Series S world's peak in use was
+                    // 98,312), not the title's.
+                    let (mirrored, dynamic) = capped_split(PORTABLE_VIEWS);
+                    let dynamic = dynamic.saturating_sub(aliases);
                     tracing::warn!(
                         error = %e,
                         count,
@@ -1114,13 +1111,18 @@ impl HostHeap {
             let view = placed.as_ref().and_then(Option::as_ref).unwrap_or(&view);
             let later = !for_draw && view.is_buffer();
             made.keys[index as usize] = if later { 0 } else { key };
-            if later && let Some(queued) = made.queued.get_mut(index as usize) {
-                // Made null until a draw names it, or a shader that picks
-                // slots at run time is bound (`picked_spans`).
-                if !*queued {
-                    *queued = true;
-                    made.waiting.push(index);
-                }
+            // Made null until a draw names it, or a shader that picks slots
+            // at run time is bound (`picked_spans`): buffer views only. A
+            // view of a texture the title placed itself would make a host
+            // texture over memory the title may be drawing a target in, and
+            // constant buffer views are no buffer a raw read can take.
+            let waits = later && buffer_range(view).is_some();
+            if waits
+                && let Some(queued) = made.queued.get_mut(index as usize)
+                && !*queued
+            {
+                *queued = true;
+                made.waiting.push(index);
             }
             match texture {
                 Some(t) if !later => made.placed.insert(index, t),
@@ -1482,13 +1484,33 @@ impl HostHeap {
             }
             waiting
         };
+        // Within a budget a pass: each view may need a host copy made (a
+        // resource, which can wait in the kernel), and the world's loading
+        // leaves tens of thousands waiting. Those past it wait for the next
+        // frames' passes, in the order the title wrote them.
         let mut made_now = 0u32;
-        for &index in &waiting {
+        let mut left = Vec::new();
+        for (n, &index) in waiting.iter().enumerate() {
+            if started.elapsed() > PICKED_BUDGET {
+                left.extend_from_slice(&waiting[n..]);
+                break;
+            }
             if self
                 .mirror(index, start + u64::from(index) * 32, true)
                 .is_some()
             {
                 made_now += 1;
+            }
+        }
+        if !left.is_empty() {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for &index in &left {
+                if let Some(queued) = made.queued.get_mut(index as usize)
+                    && !*queued
+                {
+                    *queued = true;
+                    made.waiting.push(index);
+                }
             }
         }
         let ranges: Vec<(u64, u64, bool)> = self
@@ -1500,7 +1522,7 @@ impl HostHeap {
             .copied()
             .collect();
         let mut spans: HashMap<usize, (Arc<Shadow>, u64, u64)> = HashMap::new();
-        let mut writes = Vec::new();
+        let mut unordered_views = 0usize;
         for (address, len, unordered) in ranges.iter().copied() {
             let Some(copy) = crate::shadow::existing(address, len) else {
                 continue;
@@ -1510,13 +1532,10 @@ impl HostHeap {
                 .or_insert_with(|| (copy.clone(), address, address + len));
             span.1 = span.1.min(address);
             span.2 = span.2.max(address + len);
-            if unordered && len <= PICKED_WRITES {
-                writes.push((copy, address, len));
-            }
+            unordered_views += usize::from(unordered);
         }
         let p = Arc::new(Picked {
             reads: spans.into_values().collect(),
-            writes,
         });
         static PASSES: AtomicU64 = AtomicU64::new(0);
         let passes = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1526,16 +1545,27 @@ impl HostHeap {
                 passes,
                 waited = waiting.len(),
                 made = made_now,
+                left = left.len(),
                 views = ranges.len(),
                 copies = p.reads.len(),
                 mib = bytes >> 20,
-                writes = p.writes.len(),
+                unordered = unordered_views,
                 us = started.elapsed().as_micros() as u64,
                 "buffer views of slots picked at run time: made and listed"
             );
         }
         *picked = Some((frame, p.clone()));
         p
+    }
+
+    /// Title slots whose buffer view waits for a pass (tests).
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiting
+            .len()
     }
 
     /// Slot `index`'s table entry (tests).

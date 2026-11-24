@@ -102,9 +102,8 @@ pub(crate) struct State {
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// View heaps whose buffer views of slots picked at run time this
-    /// recording brought up to date, and whether their unordered access
-    /// views were declared written ([`State::picked_buffers`]).
-    picked: Vec<(usize, bool)>,
+    /// recording brought up to date ([`State::picked_buffers`]).
+    picked: Vec<usize>,
     /// Root SRVs bound as one-view tables in this list: (view heap, title
     /// address, host copy, 0 for a view in place or [`State::writes`] + 1
     /// for a copy of the list's own) → slot.
@@ -949,7 +948,7 @@ impl State {
             .iter()
             .fold(0, |bits, s| bits | s.translated().host.run_time_buffers);
         if picked != 0 && crate::device::run_time_views_on() {
-            self.picked_buffers(list, picked & xtp_shader::emit::RUN_TIME_WRITES != 0);
+            self.picked_buffers(list, &p.name);
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1071,43 +1070,37 @@ impl State {
         Ok(gpu)
     }
 
-    /// For shaders that pick buffer slots of the view heap when they run:
-    /// every buffer view the title wrote in the heap set on the host list
-    /// made (once a frame, [`crate::descriptor::host::HostHeap::picked_spans`])
-    /// and, once a recording, the title memory they read brought up to date
-    /// at its submission; with `writes`, the unordered access views' ranges
-    /// declared written, so they go back to title memory after it and no
-    /// later refresh takes them from title memory. Ported from
-    /// Marvisak/VIctory#1544 (head 78fd990) by n-romanovich; see
-    /// `picked_spans` for what changed. Buffers only: textures picked at
-    /// run time are another matter (`texture.rs`).
-    fn picked_buffers(&mut self, list: &HostList, writes: bool) {
+    /// For shaders that pick buffer slots of the view heap when they run
+    /// (`name`: the pipeline's): every buffer view the title wrote in the
+    /// heap set on the host list made (once a frame, within a budget:
+    /// [`crate::descriptor::host::HostHeap::picked_spans`]) and, once a
+    /// recording, the title memory they read brought up to date at its
+    /// submission. Ported from Marvisak/VIctory#1544 (head 78fd990) by
+    /// n-romanovich; see `picked_spans` for what changed.
+    /// shortcut: what shaders write through such views stays in the host
+    /// copies (as for every directly indexed view): declaring every
+    /// unordered view of the heap written, once a recording, copied tens of
+    /// thousands of ranges back after each submission, and the first world
+    /// frame never ended (worldlight-16). Views the shader's tables name
+    /// are declared written as before (`readable`). Buffers only: textures
+    /// picked at run time are another matter (`texture.rs`).
+    fn picked_buffers(&mut self, list: &HostList, name: &str) {
         let heap = self.host_heaps[0];
-        if heap == 0 || heap == crate::descriptor::OWN_VIEW_HEAP {
+        if heap == 0 || heap == crate::descriptor::OWN_VIEW_HEAP || self.picked.contains(&heap) {
             return;
         }
-        let done = self.picked.iter().position(|&(h, _)| h == heap);
-        if done.is_some_and(|i| self.picked[i].1 || !writes) {
-            return;
-        }
+        self.picked.push(heap);
+        counted!(
+            info,
+            pipeline = name,
+            "a draw or dispatch reads buffer views of slots picked at run time"
+        );
         let title = crate::descriptor::heap(heap as This);
         let Some(host) = title.host() else {
             return;
         };
-        let picked = host.picked_spans(title.start);
-        if done.is_none() {
-            for (copy, from, to) in &picked.reads {
-                copy.refresh(list, *from, to - from);
-            }
-        }
-        if writes {
-            for (copy, address, len) in &picked.writes {
-                copy.gpu_writes(list, *address, *len);
-            }
-        }
-        match done {
-            Some(i) => self.picked[i].1 = true,
-            None => self.picked.push((heap, writes)),
+        for (copy, from, to) in &host.picked_spans(title.start).reads {
+            copy.refresh(list, *from, to - from);
         }
     }
 
@@ -2623,6 +2616,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::descriptor::create_uav(null, out.resource(), null, &uav, at(1));
         crate::descriptor::create_srv(null, a.resource(), &srv(0, 64, 16, 0), at(2));
         crate::descriptor::create_srv(null, b.resource(), &srv(0, 64, 16, 0), at(3));
+        // A constant buffer view waits for no pass: buffer views only.
+        let cbv = [a.address() as u32, (a.address() >> 32) as u32, 256, 0];
+        crate::descriptor::create_cbv(null, &cbv, at(4));
+        assert_eq!(
+            title.host().unwrap().waiting(),
+            4,
+            "the four buffer views wait"
+        );
         let run = |pick: bool| -> Vec<u32> {
             out.set_words(|_| 0);
             let list = TitleList::new();
@@ -2630,8 +2631,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             let mut state = state(heap.0);
             heaps(&mut state, l);
             if pick {
-                state.picked_buffers(l, true);
+                state.picked_buffers(l, "test");
             }
+            // The output is named by the program's table: declared written
+            // as `readable` does for it.
+            out.shadow().gpu_writes(l, out.address(), 1 << 12);
             l.keep(&root);
             l.keep(&pso);
             let zeros = vec![0u32; cs.user_data_dwords() as usize];
