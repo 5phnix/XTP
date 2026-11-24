@@ -449,11 +449,20 @@ fn a_select_on_a_mask_held_as_a_number_translates_for_every_host() {
             Some(if target.runs(64) { 64 } else { 32 })
         );
     }
+    // Two console waves per group: the console flow's halves meet at
+    // group barriers, so it runs one console wave per group only, and the
+    // program stops with the split form's reason.
+    match emit_for(&program(HELD_SELECT, 128), HOSTS[0]) {
+        Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(
+            what,
+            "a lane mask held as a number in a wave64 program split in halves"
+        ),
+        r => panic!("{r:?}"),
+    }
 }
 
 #[test]
-#[ignore = "needs a hardware adapter with 32- or 64-lane waves (XTP_TEST_ADAPTER=warp keeps \
-            this PC's tests off hardware)"]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn a_select_on_a_mask_held_as_a_number_runs_as_the_console() {
     console_flow_case(
         "select on a mask held as a number",

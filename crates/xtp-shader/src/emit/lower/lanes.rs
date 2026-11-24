@@ -600,6 +600,34 @@ impl<'a> Lower<'a> {
         (lane, half)
     }
 
+    /// Whether the console flow can run this compute program on the host:
+    /// what `Lower::new` requires before it asks for it. In two 32-lane
+    /// halves, one console wave per group (the halves meet at group
+    /// barriers), no `ds_permute` across the halves, and whole-wave
+    /// sections only in a group of exactly 64 threads; on a host that runs
+    /// the console's waves, no `ds_permute`.
+    pub(super) fn console_flow_runs(&self) -> bool {
+        if self.mask_data != MaskData::Console {
+            return false;
+        }
+        let Some(t) = self.s.threads else {
+            return false;
+        };
+        let threads: u32 = t.iter().product();
+        let p = self.x.p;
+        let permute = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
+        if self.x.native.wave64 && !self.x.target.runs(64) {
+            let sections = (0..p.blocks.len()).any(|b| !crate::emit::wave::sections(p, b).is_empty());
+            self.x.target.runs(32) && threads <= 64 && !permute && (threads == 64 || !sections)
+        } else {
+            self.x.target.runs(self.wave()) && !permute
+        }
+    }
+
     /// Console flow in halves: whether the two group-shared dwords the
     /// halves exchange through ([`Self::exchange`]) fit next to the
     /// program's own LDS in DXIL's 32 KiB of group-shared memory. (A group

@@ -195,7 +195,7 @@ impl<'a> Lower<'a> {
             // (a select or carry on one, which the split test does not
             // see): the console flow has.
             Atom::Opaque(_) | Atom::Constant(_) if self.split && !self.console_cf => {
-                Err(if self.x.per_lane_only {
+                Err(if self.x.per_lane_only || !self.console_flow_runs() {
                     "a lane mask held as a number in a wave64 program split in halves"
                 } else {
                     super::CONSOLE_FLOW
