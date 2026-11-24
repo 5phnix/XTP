@@ -894,6 +894,18 @@ impl Dump {
         self.closed.insert(key(list), r);
     }
 
+    /// Forgets what lists recorded and did not submit, and every sample.
+    fn forget(&mut self) {
+        let left = self.open.len() + self.closed.len();
+        if left > 0 {
+            tracing::info!(lists = left, "XTP_PASS_DUMP: lists recorded and not submitted, forgotten");
+        }
+        self.open.clear();
+        self.closed.clear();
+        self.submitted.clear();
+        self.readback.used = 0;
+    }
+
     fn submitted(&mut self, runs: &[&HostList]) {
         for run in runs {
             if let Some(r) = self.closed.remove(&key(run)) {
@@ -1524,22 +1536,30 @@ pub(crate) fn submitted(runs: &[&HostList]) {
 }
 
 /// Writes the report of the lists submitted since the last one, at the
-/// present of frame `frame`.
+/// present of frame `frame`. Once neither this frame nor the next is
+/// listed, what lists recorded but never submitted is forgotten and the
+/// read-back memory starts again.
 fn report(frame: u64) {
-    if !dump_on() || dump().as_ref().is_none_or(|d| d.submitted.is_empty()) {
+    if !dump_on() {
         return;
     }
-    let (Some(host), Some(folder)) = (crate::host::host(), crate::capture::folder()) else {
-        return;
-    };
-    host.drain();
-    let Some(text) = dump().as_mut().and_then(|d| d.report(frame)) else {
-        return;
-    };
-    let path = folder.join(format!("passes-{frame}.txt"));
-    match std::fs::write(&path, text) {
-        Ok(()) => tracing::info!(path = %path.display(), "pass dump written"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "pass dump not written"),
+    if dump().as_ref().is_some_and(|d| !d.submitted.is_empty())
+        && let (Some(host), Some(folder)) = (crate::host::host(), crate::capture::folder())
+    {
+        host.drain();
+        if let Some(text) = dump().as_mut().and_then(|d| d.report(frame)) {
+            let path = folder.join(format!("passes-{frame}.txt"));
+            match std::fs::write(&path, text) {
+                Ok(()) => tracing::info!(path = %path.display(), "pass dump written"),
+                Err(e) => tracing::warn!(error = %e, path = %path.display(), "pass dump not written"),
+            }
+        }
+    }
+    if !crate::capture::listed(frame) && !crate::capture::listed(frame + 1)
+        && let Some(d) = dump().as_mut()
+        && d.readback.used > 0
+    {
+        d.forget();
     }
 }
 
