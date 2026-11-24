@@ -244,6 +244,9 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
+                    let _ = self.lazy_barycentric(arg);
+                }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
