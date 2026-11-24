@@ -384,6 +384,185 @@ mod tests {
         title_memory_remapped(view, 2 * BLOCK);
     }
 
+    /// What refreshing a buffer the size of the world's 174 MB heap costs:
+    /// asking the kernel for its written pages (a few written, or 200 MB of
+    /// them as in a world frame), and copying 200 MB of pages through the
+    /// kernel (`host::copy_mapped`, as refreshes do) or plainly. Run with
+    /// `cargo test --release -p xtp-gpu -- --ignored --nocapture watch_and_copy_costs`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn watch_and_copy_costs() {
+        const LEN: usize = 174 << 20;
+        const WRITTEN: usize = 200 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        // SAFETY: our committed pages.
+        let title = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, LEN) };
+        title.iter_mut().enumerate().for_each(|(i, b)| *b = i as u8);
+        let mut copy = vec![0u8; LEN];
+        let ask = || {
+            let started = std::time::Instant::now();
+            let (_, pages) = writes(p, p + LEN, false).expect("watched");
+            (started.elapsed(), pages.len())
+        };
+        ask();
+        let few: Vec<_> = (0..20)
+            .map(|k| {
+                // A few scattered kernel pages written by the title.
+                for i in 0..50 {
+                    title[(k * 7919 + i * 104_729) * 4096 % LEN] ^= 1;
+                }
+                ask().0
+            })
+            .collect();
+        let many: Vec<_> = (0..5)
+            .map(|_| {
+                for page in (0..LEN).step_by(4096) {
+                    title[page] ^= 1;
+                }
+                ask().0
+            })
+            .collect();
+        let per_call =
+            |t: &[std::time::Duration]| t.iter().sum::<std::time::Duration>() / t.len() as u32;
+        println!(
+            "174 MB write-watched: asking the kernel takes {:?} with a few pages written, {:?} \
+             with all written",
+            per_call(&few),
+            per_call(&many)
+        );
+        // 200 MB in runs of stale 64 KiB pages, through the kernel as
+        // refreshes copy, or plainly.
+        for run in [PAGE, 64 * PAGE] {
+            let timed = |copy_run: &mut dyn FnMut(usize)| {
+                let started = std::time::Instant::now();
+                for r in 0..WRITTEN / run {
+                    copy_run(r * run % (LEN - run + 1));
+                }
+                WRITTEN as f64 / started.elapsed().as_secs_f64() / 1e9
+            };
+            let kernel = timed(&mut |at| {
+                let (to, from) = (copy[at..].as_mut_ptr(), title[at..].as_ptr());
+                crate::host::copy_mapped(to, from, run, false)
+            });
+            let plain = timed(&mut |at| copy[at..at + run].copy_from_slice(&title[at..at + run]));
+            println!(
+                "200 MB in {} KiB runs: {kernel:.2} GB/s through the kernel, {plain:.2} GB/s plainly",
+                run >> 10
+            );
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// What a world frame's small buffer copies into guarded view memory
+    /// cost (run1: 30 to 37 submissions and about 6 000 copies of about
+    /// 600 bytes per frame, into the 174 MB heap, a view): each copied on
+    /// the CPU at submission (`copy_mapped` into title memory, which opens
+    /// the guard per copy) with the mapping asked first as before or only
+    /// when the copy fails, or written back after the GPU copied them,
+    /// range by range or merged per submission; the refresh that guards the
+    /// blocks again counted too. Run with
+    /// `cargo test --release -p xtp-gpu -- --ignored --nocapture guarded_copy_costs`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn guarded_copy_costs() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        const LEN: usize = 174 << 20;
+        const SUBMISSIONS: usize = 30;
+        const COPIES: usize = 200;
+        const BYTES: usize = 600;
+        // SAFETY: a pagefile section mapped read-write, unmapped at the end.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value as usize
+        };
+        assert_ne!(view, 0);
+        let source = vec![7u8; BYTES];
+        // Where the copies of submission `s` go: a ring the title fills in
+        // order, or scattered over the heap.
+        let ring = |s: usize, c: usize| ((s * COPIES + c) * BYTES) % (LEN - BYTES);
+        let scattered =
+            |s: usize, c: usize| ((s * COPIES + c) * 7_919 * 4_096 + c * 64) % (LEN - BYTES);
+        let frame = |place: &dyn Fn(usize, usize) -> usize, how: &str| {
+            let started = std::time::Instant::now();
+            for s in 0..SUBMISSIONS {
+                // The submission's refresh guards the heap's blocks again.
+                writes(view, view + LEN, true).expect("a view");
+                let ranges: Vec<(usize, usize)> =
+                    (0..COPIES).map(|c| (view + place(s, c), BYTES)).collect();
+                match how {
+                    "asked first" => {
+                        for &(at, n) in &ranges {
+                            if crate::texture::committed(at as *const u8, n) {
+                                crate::host::copy_mapped(at as *mut u8, source.as_ptr(), n, true);
+                            }
+                        }
+                    }
+                    "cpu" => {
+                        for &(at, n) in &ranges {
+                            crate::host::copy_mapped(at as *mut u8, source.as_ptr(), n, true);
+                        }
+                    }
+                    "back" => {
+                        for &(at, n) in &ranges {
+                            writing(at, n);
+                            crate::host::write_mapped(at as *mut u8, source.as_ptr(), n);
+                        }
+                    }
+                    _ => {
+                        let ranges = ranges.into_iter().map(|(at, n)| ((), at, n)).collect();
+                        let merged = crate::host::merge_ranges(ranges, |_| 0);
+                        let block = vec![7u8; merged.iter().map(|r| r.2).max().unwrap_or(0)];
+                        for ((), at, n) in merged {
+                            writing(at, n);
+                            crate::host::write_mapped(at as *mut u8, block.as_ptr(), n);
+                        }
+                    }
+                }
+            }
+            started.elapsed()
+        };
+        for (layout, place) in [
+            ("in a ring", &ring as &dyn Fn(usize, usize) -> usize),
+            ("scattered", &scattered),
+        ] {
+            let [first, cpu, back, merged] =
+                ["asked first", "cpu", "back", "merged"].map(|how| frame(place, how));
+            println!(
+                "a frame of {SUBMISSIONS} x {COPIES} copies of {BYTES} bytes {layout}: on the \
+                 CPU at submission {first:?} with the mapping asked first, {cpu:?} asked on \
+                 failure only; {back:?} written back range by range, {merged:?} merged"
+            );
+        }
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        };
+        title_memory_remapped(view, LEN);
+    }
+
     /// A write or mapping that runs past the end of the address space (a
     /// title's `fread` with a huge count) covers up to the end; the sum used
     /// to overflow. Up there no test has guarded blocks.

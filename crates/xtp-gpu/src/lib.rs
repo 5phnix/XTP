@@ -13,7 +13,8 @@
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
 //! share, [`console`] which console model the title sees. Planned:
-//! `present` (swap chain).
+//! `present` (swap chain). In tests, `testgpu` gives GPU tests the host
+//! device (hardware, or WARP with `XTP_TEST_ADAPTER=warp`).
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -47,6 +48,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(all(windows, test))]
+mod testgpu;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
