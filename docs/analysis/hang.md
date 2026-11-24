@@ -319,6 +319,14 @@ How much the sessions prove, read with the others:
   taken: XTP's host heap makes a real CBV for a constant buffer view of the
   title (`make`), so a heap constant buffer that only scalar loads read
   would get the wrong kind instead.
+- **VIctory issue #1595** (watch item 132): compute 0e45e59e93b736e4, of
+  the same family as the three programs (the same table layout), read a
+  heap slot holding a null raw view through a constant-buffer handle; WARP
+  with GPU-based validation reported "Descriptor type doesn't match shader
+  register type", then removed the device. Translated before this change,
+  its slot at a run-time index is annotated both ways; after it, as a raw
+  buffer only. (GPU-based validation does not load on the person's PC, so
+  that check was not run here.)
 - VIctory #1322 (the "downsample" that looped 4 billion times on 0 sizes)
   does not apply: these programs' bounds come from data the host has.
 - VIctory #1483 (the loop limit's conditional back edges) does not apply:
