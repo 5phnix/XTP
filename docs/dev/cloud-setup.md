@@ -265,7 +265,7 @@ names your project, bucket and paths.
 | `vm`, `machineType`, `accelerator`, `bootDiskGb`, `dataDiskGb`, `diskType` | the VM (defaults: `xtp-l4`, `g2-standard-16`, `nvidia-l4-vws`, 100, 300, `pd-balanced`) |
 | `idleMinutes` | the VM shuts itself down after this long without activity (default 30; 0: never) |
 | `startRetryMinutes` | how long the scripts keep trying to start a stopped VM whose zone has no GPU free (default 20) |
-| `stopSchedule`, `timeZone` | a daily stop, as a backstop (default `0 3 * * *`, `Europe/Paris`) |
+| `stopSchedule`, `timeZone` | a daily stop, as a backstop (default `0 3 * * *`, `Europe/Paris`; `""`: none, see [Keeping it always on](#keeping-it-always-on)) |
 | `sshUser` | your account on the VM (default: your Windows user name in lowercase) |
 | `sessionUser` | the local account whose desktop runs the game (default `xtp`) |
 | `localLogDir` | where logs come back (default `%LOCALAPPDATA%\xtp\cloud-runs`) |
@@ -527,8 +527,9 @@ and on this VM what needs the L4 or the game:
   the VM (`-Repo <path> -LocalRev <branch>` sends another one, such as an
   unpushed `main`), builds are serialized by a lock on the VM, and each
   worker gets its logs in its own folder;
-- workers do not stop the VM (another may be using it): it stops itself after
-  `idleMinutes` without activity, and the orchestrator or you can run
+- workers never stop the VM (another may be using it, and a stopped VM may
+  not get a GPU back): it stops itself after `idleMinutes` without activity
+  unless it is [kept always on](#keeping-it-always-on), and only you run
   `stop-vm.ps1`;
 - **one session at a time**: a build, test or game run holds the VM's
   clone from the build to the end of the run, and its desktop session runs
@@ -573,6 +574,40 @@ Examples (us-central1): 40 hours of use a month ≈ 40 × 2.09 + 44 ≈ **128 US
 left running all month ≈ **1,570 USD**. Network: bucket to VM in the same
 region is free; uploads to the bucket are free; downloads to your PC (logs)
 are tiny.
+
+### Keeping it always on
+
+When GPUs are this hard to get, a stopped VM may not start again for hours
+(see [Capacity](#capacity-when-no-zone-has-a-gpu-free)). If you need the
+GPU at any moment, keep the VM running and pay for it: set `idleMinutes` to
+0 and `stopSchedule` to `""` in the configuration and run `new-vm.ps1`
+(it sets the VM's `xtp-idle-minutes` metadata to 0, which turns the idle
+shutdown off, and removes the daily stop), or directly:
+
+```powershell
+gcloud compute instances add-metadata <vm> --zone=<zone> --metadata=xtp-idle-minutes=0
+gcloud compute instances remove-resource-policies <vm> --zone=<zone> --resource-policies=<vm>-daily-stop
+```
+
+Then only you stop it (`stop-vm.ps1`); agents and workers never do. What
+that costs, for the VM we keep running this way (standard g2-standard-16
+with an L4 in asia-northeast3, Seoul, a Hyperdisk ML data disk; catalogue
+prices, November 2026):
+
+| Item | Per hour |
+|------|----------|
+| 16 vCPUs × 0.03209 + 64 GB × 0.00376 | 0.754 |
+| NVIDIA L4 | 0.719 |
+| RTX Virtual Workstation licence | 0.200 |
+| Windows Server licence (16 × 0.046) | 0.736 |
+| External IPv4 address | 0.005 |
+| Boot disk 100 GB pd-balanced (0.13 /GB-month) | 0.018 |
+| Data disk 300 GB Hyperdisk ML (0.091 /GB-month) + 400 MiB/s (0.137 /MiB/s-month) | 0.112 |
+| Bucket (us-central1) | 0.006 |
+| **Total** | **≈ 2.55 /hour, ≈ 61 /day, ≈ 1,860 /month** |
+
+In us-central1 with pd-balanced disks the same VM costs about 2.15 /hour
+(≈ 52 /day).
 
 Keeping them down:
 

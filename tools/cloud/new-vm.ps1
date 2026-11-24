@@ -164,6 +164,15 @@ if (($attached -join ';') -notmatch "(^|;)$([regex]::Escape($cfg.dataDisk))(;|$)
 }
 
 # --- 3. The daily stop schedule --------------------------------------------
+if (-not $cfg.stopSchedule) {
+    # Kept running on purpose (stopSchedule empty): no daily stop attached.
+    $attachedPolicies = Invoke-Gcloud -Arguments (@('compute', 'instances', 'describe', $cfg.vm, "--zone=$zone", '--format=value(resourcePolicies.basename())') + $base)
+    $policy = "$($cfg.vm)-daily-stop"
+    if (($attachedPolicies -join ';') -match [regex]::Escape($policy)) {
+        Write-Step "Removing the daily stop $policy (stopSchedule is empty)"
+        $null = Invoke-Gcloud -Arguments (@('compute', 'instances', 'remove-resource-policies', $cfg.vm, "--zone=$zone", "--resource-policies=$policy") + $base)
+    }
+}
 if ($cfg.stopSchedule) {
     $policy = "$($cfg.vm)-daily-stop"
     Write-Step "Instance schedule $policy ($($cfg.stopSchedule), $($cfg.timeZone))"
