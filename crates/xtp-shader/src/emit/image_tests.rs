@@ -1072,6 +1072,64 @@ fn compute_samples_take_their_quads_gradients() {
     }
 }
 
+/// A pixel program's level query (`image_get_lod`) of a 2D array: the
+/// slice is no coordinate of the level, so DXIL's calculateLOD takes it
+/// undef (it was passed, and the validator refused "out of bound coord
+/// must be undef" in 3 programs of the pack).
+#[test]
+fn a_level_query_of_an_array_leaves_the_slice_out() {
+    use crate::emit::container::{self, SigElement};
+    let mut get_lod = mimg("image_get_lod", 0x3).words();
+    get_lod[0] = get_lod[0] & !(7 << 3) | 5 << 3; // dim: 2D array
+    let (half, one) = (0xF0, 0xF2); // inline 0.5, 1.0
+    let mut w = vec![s_mov(4, 0), s_mov(5, ZERO), s_mov(6, 1), s_mov(7, ZERO)];
+    w.extend(s_load(3, 8, 4, 0));
+    w.extend(s_load(2, 16, 6, 0));
+    w.push(S_WAITCNT_0);
+    w.extend([v_mov(2, half), v_mov(3, half), v_mov(4, one)]);
+    w.extend(get_lod);
+    w.push(S_WAITCNT_0);
+    w.extend([0xF800_180F, 0x1514_1514]); // exp mrt0 v20, v21, v20, v21 done vm
+    w.push(S_ENDPGM);
+    let mut n = native(&w);
+    n.stage = HwStage::Ps;
+    n.layout.truncate(2);
+    n.used.truncate(2);
+    n.io = StageIo::Ps {
+        inputs: vec![],
+        input_addr: 1 << 1,
+        db_shader_control: 0,
+        patches: vec![],
+    };
+    let target = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    };
+    let osg1 = container::signature(&[target], false);
+    let bytes = dxbc::build(&[(crate::FourCC::OSG1, &osg1)]);
+    let c = Container::parse(&bytes).unwrap();
+    let p = ir::build(&n.patched_code(), n.wave64, n.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &n.layout, n.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &n).unwrap();
+    let s = emit(&c, &n, &p, &st, &io, &res).unwrap();
+    assert!(super::last_module_summary().contains("calculateLOD"));
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut s.dxil.clone())
+            .unwrap_or_else(|e| panic!("validation: {e}"));
+    }
+}
+
 #[test]
 fn sample_and_gather_forms_lower_to_valid_dxil() {
     let forms = [
