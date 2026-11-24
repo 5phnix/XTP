@@ -224,7 +224,63 @@ a 40 % green interface corner gives 153, 102, 0 there and red elsewhere).
   are ignored; premultiplied alpha is the PR's assumption, confirmed only by
   its Series S menu captures.
 
-### 5.3 Diagnostics (`capture.rs`)
+### 5.3 Host textures: creation without an unbounded wait, and release
+
+The sessions that stalled on the loading screen (run-world's F to N) had a
+title thread stuck in `CreateCommittedResource` for a host texture, inside
+`D3DKMTWaitForSynchronizationObjectFromCpu` (the stub at `win32u+0x60e4`
+on this Windows build), the GPU idle. The runtime was waiting, with no
+time limit, for the kernel to finish a paging operation for the new
+texture. XTP itself never makes a GPU-side wait. The task `stall` owns the
+root cause; GPU tests on the RTX 4080 alongside sessions are the leading
+suspect, and the shared PC's scripts now run them on WARP. Changes here:
+- `resource/residency.rs`: host textures are created not resident
+  (`D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT`), then made resident with
+  `EnqueueMakeResident`, first with `DENY_OVERBUDGET` (it fails at once
+  past the budget instead of waiting), past the budget again without it
+  (logged), each time waiting at most 5 s on our fence. A texture not
+  resident by then is refused and counted, not waited for.
+  `XTP_TEXTURE_RESIDENCY=direct` keeps the old path. A test makes a texture
+  this way and renders to it.
+- Every big (64 MiB and up), slow (over 100 ms) or over-budget creation is
+  logged before and after the call, with its size
+  (`GetResourceAllocationInfo`) and the video memory budget and use
+  (`dxgi::video_memory`, `QueryVideoMemoryInfo`): a stall names its
+  texture. The frame log's texture part counts host textures alive and
+  their MiB.
+- `texture_at` makes its resource outside its map's lock: a creation that
+  waits no longer stops every draw that reads a placed view.
+- Placed views' textures were never released. They now go when the runtime
+  maps or unmaps their memory (`watch::title_memory_remapped`, one line) and
+  when a newer one replaces them, after a 2 s grace (a caller of
+  `texture_at` may still hold the one it was given; lists keep only host
+  copies and addresses). A test checks the host copy is let go.
+
+### 5.4 Stand-ins without the title's alpha (review of the #492 port)
+
+nvidia2's port of VIctory #492 makes R9G9B9E5_SHAREDEXP (67) RGBA16F where
+the GPU cannot render to it; the conversion is exact. The independent review
+found what the stand-in changes: the console reads 67's alpha as one and
+clamps negative values to 0 on writes, while RGBA16F keeps the alpha
+written or cleared, negatives, infinities and NaN. B5G6R5 (85) as RGBA8 has
+the same alpha difference. Changes (`resource/format.rs` `alpha_one`,
+`mapping_alpha_one`, `blend_without_alpha`; `resource.rs` `view_alpha`):
+- Shader views of such textures read alpha as one: every component the
+  view's mapping takes from the texture's alpha takes one instead; a view
+  without a description gets D3D12's whole view with that mapping. One line
+  in `descriptor/host.rs` calls it.
+- Pipelines rendering to such a target do not write its alpha, and blend
+  as if it were one: destination alpha becomes one, its inverse zero,
+  saturated source alpha zero (blending becomes per target where needed).
+  Three lines in `pipeline/host.rs` apply it as the stream is read, so the
+  pipeline's name in the library changes with it.
+- Not done: clamping negative, infinite and NaN values on writes. Only the
+  pixel and compute programs writing such a target can do it (a shader
+  translation change: clamp outputs to 67 targets); written down as a
+  shortcut in `format.rs`. Typed unordered-access loads of such a texture
+  still read the stored alpha (UAVs have no component mapping).
+
+### 5.5 Diagnostics (`capture.rs`)
 
 - `XTP_CAPTURE_WORLD=<draws>[:<after>[:<count>[:<every>]]]` lists frames by
   what they draw: the first frame that ran at least `draws` draws arms it,
@@ -244,7 +300,8 @@ Pending: see section 7.
 
 - **Reaching the world.** Since 14:40 every session stalls on the loading
   screen (no frame for ~30 s, then the title's watchdog ends it), with the
-  same binary that reached the world earlier; run-world is bisecting it
-  (pipeline library ruled out, the audio mute and the cache under test).
+  same binary that reached the world earlier: a host texture's creation
+  waits in the kernel (section 5.3). The task `stall` is finding why;
+  section 5.3's changes bound the wait and log it.
 - **NVIDIA wave64 refusals** (section 4.2): until the wave64 port lands, a
   refused pass in the final chain keeps it black on this GPU.
