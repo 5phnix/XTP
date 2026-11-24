@@ -55,6 +55,7 @@ $cmds = Join-Path (Split-Path -Parent $Log) 'audio-lock-cdb-cmds.txt'
 $cdbOut = Join-Path (Split-Path -Parent $Log) 'audio-lock-cdb.txt'
 if ($haveCdb) {
     # The breakpoint has no `gc`: cdb stops after it and reads the next line, `qd` (detach).
+    # Its `u` comes first: it loads the image's symbols, whose warning would cut a line.
     @"
 .symopt+0x40
 sxi ii
@@ -66,7 +67,7 @@ sxi dz
 sxi out
 sxi sov
 sxi *
-bu $module+0x5267740 ".printf \"@@HIT tid %x streams %d\\n\", @`$tid, dwo(@rdi+0x52c); .if ((dwo($module+0x5267747) == 0x05ae840f) & (dwo($module+0x5267749) == 0x5ae)) { ed $module+0x5267749 0x532; .printf \"@@PATCHED\\n\" } .elsif (dwo($module+0x5267749) == 0x532) { .printf \"@@ALREADY\\n\" } .else { .printf \"@@UNEXPECTED\\n\" }; u $module+0x5267740 L3; bc *"
+bu $module+0x5267740 "u $module+0x5267740 L3; .printf \"@@HIT tid %x streams %d\\n\", @`$tid, dwo(@rdi+0x52c); .if ((dwo($module+0x5267747) == 0x05ae840f) & (dwo($module+0x5267749) == 0x5ae)) { ed $module+0x5267749 0x532; .printf \"@@PATCHED\\n\" } .elsif (dwo($module+0x5267749) == 0x532) { .printf \"@@ALREADY\\n\" } .else { .printf \"@@UNEXPECTED\\n\" }; bc *"
 g
 qd
 "@ | Set-Content -LiteralPath $cmds -Encoding ASCII
