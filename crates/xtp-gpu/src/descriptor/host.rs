@@ -1769,6 +1769,18 @@ fn buffer_srv(
         });
     }
     repair_format(&mut desc.Format, shape);
+    if shape.0 > 0 && xtp_shader::emit::raw_structured() {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { &mut desc.Anonymous.Buffer };
+        if let Some((first, dwords)) =
+            raw_window_of(b.FirstElement * element, u64::from(b.NumElements) * element)
+        {
+            (b.FirstElement, b.NumElements) = (first, dwords);
+            b.StructureByteStride = 0;
+            b.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        }
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1776,6 +1788,26 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
+}
+
+/// With `XTP_RAW_STRUCTURED=1` ([`xtp_shader::emit::raw_structured`]), a
+/// structured view's bytes (`bytes` from byte `start` of its host copy) as
+/// a raw view of the same bytes: its first dword and its dwords, when they
+/// start on 16 bytes (a raw view's alignment), are whole dwords and at most
+/// 2^27. On NVIDIA a raw read through a structured view returns other
+/// dwords or zeros (watch.md items 148, 160, 190: the lighting's
+/// pre-exposure read 0), and the translator then reads every buffer by
+/// element through raw handles too. A view that cannot be made raw stays
+/// structured (its raw reads keep the mismatch). The stride table still
+/// gives such a view its own raw view and stride.
+/// Ported from fxceless's VIctory fork (commit 578d459) by fxceless; see
+/// also VIctory#1762.
+fn raw_window_of(start: u64, bytes: u64) -> Option<(u64, u32)> {
+    if !start.is_multiple_of(16) || !bytes.is_multiple_of(4) {
+        return None;
+    }
+    let dwords = u32::try_from(bytes / 4).ok().filter(|&d| d <= 1 << 27)?;
+    Some((start / 4, dwords))
 }
 
 /// The format the host wants for a buffer view of `shape` (stride, format,
@@ -1847,6 +1879,18 @@ fn buffer_uav(
         });
     }
     repair_format(&mut desc.Format, shape);
+    if shape.0 > 0 && xtp_shader::emit::raw_structured() {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { &mut desc.Anonymous.Buffer };
+        if let Some((first, dwords)) =
+            raw_window_of(b.FirstElement * element, u64::from(b.NumElements) * element)
+        {
+            (b.FirstElement, b.NumElements) = (first, dwords);
+            b.StructureByteStride = 0;
+            b.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        }
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -2253,6 +2297,18 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A structured view is made raw only where its bytes start on 16
+    /// bytes, are whole dwords and fit one view.
+    #[test]
+    fn structured_views_go_raw_on_16_bytes() {
+        assert_eq!(raw_window_of(32, 64), Some((8, 16)));
+        assert_eq!(raw_window_of(0, 16 * 456), Some((0, 4 * 456)));
+        assert_eq!(raw_window_of(36, 64), None, "off 16 bytes");
+        assert_eq!(raw_window_of(32, 62), None, "not whole dwords");
+        assert_eq!(raw_window_of(0, 4 << 27), Some((0, 1 << 27)));
+        assert_eq!(raw_window_of(0, (4 << 27) + 4), None, "too many dwords");
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

@@ -83,6 +83,10 @@ fn build() -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.extend_from_slice(&budget.to_le_bytes());
+                // Structured reads through raw handles (none: the key stays).
+                if xtp_shader::emit::raw_structured() {
+                    bytes.extend_from_slice(b"raw structured");
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

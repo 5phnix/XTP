@@ -260,6 +260,33 @@ pub struct HostShader {
     pub run_time_buffers: u8,
 }
 
+/// Whether buffers read by element with a stride known at translation are
+/// read through raw handles (`index * stride + offset`) instead of
+/// structured ones: `XTP_RAW_STRUCTURED=1`, read once. `xtp-gpu` then makes
+/// the title's structured views raw views of the same bytes where it can
+/// (Marvisak/VIctory#1762, after fxceless's VIctory fork's `raw_window`):
+/// on NVIDIA a raw read through a structured view returns other dwords or
+/// zeros (the lighting's pre-exposure, byte 4 of a 16-byte structured view,
+/// read 0: a black world; watch.md items 148, 160, 190), and a structured
+/// handle over a raw view reads zeros too, so both sides change together.
+/// With the runtime stride table such reads go through its raw views. Part
+/// of the translation: the shader cache keys on it.
+pub fn raw_structured() -> bool {
+    #[cfg(test)]
+    if let Some(on) = RAW_STRUCTURED_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`raw_structured`] for this thread's tests.
+    pub(crate) static RAW_STRUCTURED_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// [`HostShader::run_time_buffers`]: buffers read through slots picked at
 /// run time.
 pub const RUN_TIME_READS: u8 = 1;

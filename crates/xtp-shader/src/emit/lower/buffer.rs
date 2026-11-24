@@ -343,6 +343,10 @@ impl<'a> Lower<'a> {
             // (handle, coordinates); none: through the runtime stride table.
             let static_view = match index {
                 _ if self.through_table(index, used, src)? => None,
+                Some(index) if crate::emit::raw_structured() => {
+                    let byte = self.element_byte(index, off, used);
+                    Some((self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu]))
+                }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     let h = self.handle(site, src, false, (12 | u, stride))?;
@@ -472,6 +476,11 @@ impl<'a> Lower<'a> {
                         self.end_guarded(at, &[]);
                         return done.map(|_| ());
                     }
+                    Some(index) if crate::emit::raw_structured() => {
+                        let byte = self.element_byte(index, off, used);
+                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+                        args.extend([byte, iu]);
+                    }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
@@ -572,6 +581,10 @@ impl<'a> Lower<'a> {
                             },
                         );
                     }
+                    Some(index) if crate::emit::raw_structured() => {
+                        let byte = l.element_byte(index, off, used);
+                        (l.handle(site, src, false, (11 | u, 0))?, [byte, iu])
+                    }
                     Some(index) => (l.handle(site, src, false, (12 | u, stride))?, [index, off]),
                     None => (l.handle(site, src, false, (11 | u, 0))?, [off, iu]),
                 };
@@ -623,12 +636,32 @@ impl<'a> Lower<'a> {
     /// whose stride is not known here (0), on a target that has the table
     /// ([`crate::emit::Target::stride_table`]). A known stride below 4 or
     /// off a multiple of 4, or an unknown one without the table, is refused.
+    ///
+    /// With `XTP_RAW_STRUCTURED=1` ([`crate::emit::raw_structured`]) a known
+    /// stride goes through the table too, on a target that has it: the
+    /// host makes structured views raw then, and a structured handle over
+    /// a raw view reads zeros on NVIDIA (watch.md item 160); the table's
+    /// raw views are raw over raw whatever the slot holds.
     fn runtime_stride(&self, used: Option<&UsedResource>) -> Result<bool, Why> {
         match used.map_or(0, |u| u.stride) {
-            s if s >= 4 && s.is_multiple_of(4) => Ok(false),
+            s if s >= 4 && s.is_multiple_of(4) => {
+                Ok(self.x.target.stride_table && crate::emit::raw_structured())
+            }
             0 if self.x.target.stride_table => Ok(true),
             _ => Err(UNKNOWN_STRIDE),
         }
+    }
+
+    /// The byte of `off` in element `index` of a buffer of the known stride
+    /// of `used`, for a raw handle ([`crate::emit::raw_structured`]).
+    /// shortcut: a structured handle checks the element against the view's
+    /// count; a raw one only the byte against its size, so an `index *
+    /// stride` that wraps reads a byte inside the view.
+    fn element_byte(&mut self, index: V, off: V, used: Option<&UsedResource>) -> V {
+        let c = self.cur;
+        let stride = self.s.m.i32(used.map_or(0, |u| u.stride));
+        let at = self.s.m.bin(c, Bin::Mul, index, stride);
+        self.s.m.bin(c, Bin::Add, at, off)
     }
 
     /// Whether a raw access of `src`'s buffer (an untyped load, store or

@@ -34,12 +34,23 @@ fn lowered(
     io: ComputeIo,
     target: Target,
 ) -> Result<super::lower::Lowered, crate::ShaderError> {
+    lowered_with(words, uav, io, target, 0)
+}
+
+/// [`lowered`] with both views of `stride` bytes known at translation.
+fn lowered_with(
+    words: &[u32],
+    uav: u32,
+    io: ComputeIo,
+    target: Target,
+    stride: u32,
+) -> Result<super::lower::Lowered, crate::ShaderError> {
     let used = |kind, table_offset_dwords| UsedResource {
         kind,
         root: RootType::Table,
         table_offset_dwords,
         lower_bound: 0,
-        stride: 0,
+        stride,
         dwords: 4,
         user_data: 4,
         slot: 1,
@@ -684,4 +695,93 @@ fn raw_windows_cover_the_views_bytes() {
     assert_eq!(big.elements(16), ((1u64 << 29) - 4) as u32 / 16);
     // Elements that lie wholly in the window: 4 of 12 bytes from byte 4.
     assert_eq!(RawWindow::covering(36, 48).unwrap().elements(12), 4);
+}
+
+/// With `XTP_RAW_STRUCTURED=1` the host makes structured views raw views of
+/// the same bytes (VIctory#1762), so a program that reads by element with a
+/// stride known at translation reads raw too: at `index * stride + off`
+/// through a raw handle, or through the table's raw view where there is a
+/// table. A structured handle over a raw view reads zeros on NVIDIA
+/// (watch.md item 160). Here the views are raw, as the host makes them.
+#[test]
+fn known_strides_read_raw_views_with_xtp_raw_structured() {
+    super::RAW_STRUCTURED_TEST.set(Some(true));
+    let data: Vec<u32> = (100..164).collect();
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::BufferUav(64, Stride::Raw),
+    ];
+    // Stride 16: the load of [2, 4] is dword 9, stored at [1, 8] (dword
+    // 6); 10 added twice at [2, 0] (dword 8).
+    let mut want = vec![0; 64];
+    (want[6], want[8]) = (data[9], 20);
+    let (_one, hosts) = hosts();
+    // Without the table: raw handles.
+    let mut plain = lowered_with(LOAD_STORE_ATOMICS, 8, ONE_THREAD, Target::ANY, 16).unwrap();
+    assert!(!plain.stride_table);
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut plain.dxil).expect("DXIL validation");
+    }
+    let cs = HostShader {
+        stage: HwStage::Cs,
+        dxil: plain.dxil,
+        user_data: plain.user_data,
+        samplers: plain.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: plain.root_cbvs,
+        root_srvs: plain.root_srvs,
+        stride_table: false,
+        run_time_buffers: plain.run_time_buffers,
+    };
+    // With the table: its raw views (each slot's own here), stride 16.
+    let table = {
+        let mut l = lowered_with(LOAD_STORE_ATOMICS, 8, ONE_THREAD, TABLE, 16).unwrap();
+        assert!(l.stride_table, "known strides through the table");
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil).expect("DXIL validation");
+        }
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            samplers: l.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            stride_table: true,
+            run_time_buffers: l.run_time_buffers,
+        }
+    };
+    let own = |slot| StrideEntry {
+        stride: 16,
+        raw_slot: Some(slot),
+        bias: 0,
+        count: 16,
+    };
+    for (name, host) in &hosts {
+        let (root, pso) = host.compute_pipeline(&cs).expect("a pipeline");
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 5]))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("a dispatch");
+        assert_eq!(out[0], want, "raw handles on {name}");
+        let out = run(host, &table, [0; 4], &views, &[own(0), own(1)], 1);
+        assert_eq!(out[0], want, "through the table on {name}");
+    }
+    super::RAW_STRUCTURED_TEST.set(None);
 }
