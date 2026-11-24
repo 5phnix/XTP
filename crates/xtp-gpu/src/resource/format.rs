@@ -20,9 +20,11 @@
 //!
 //! A stand-in with an alpha channel the title's format lacks (R9G9B9E5 as
 //! RGBA16F, B5G6R5 as RGBA8, [`alpha_one`]) reads alpha as one, as the
-//! console does: shader views force it to one, and pipelines rendering to
-//! such a target neither write alpha nor blend with the target's alpha
-//! (which reads one on the console).
+//! console does: shader views force it to one.
+//!
+//! shortcut: pipelines rendering to such a target still write its alpha and
+//! blend with it (the console's destination alpha reads one); the fix,
+//! moved out of the dark-world delivery, belongs to `pipeline/host.rs`.
 //!
 //! shortcut: a stand-in has more precision than the console's format, so
 //! what a pass renders keeps bits the console would round away (B5G5R5A1's
@@ -292,54 +294,6 @@ pub(crate) fn mapping_alpha_one(mapping: u32) -> u32 {
         let from = mapping >> (3 * i) & 7;
         out | (if from == SOURCE_ALPHA { ONE } else { from }) << (3 * i)
     })
-}
-
-/// A pipeline's blending for render targets of title formats `targets`
-/// (the first `count`), with those of a format whose alpha reads one
-/// ([`alpha_one`]) neither writing alpha nor blending with the target's
-/// alpha: as the console, where it is one (destination alpha one, its
-/// inverse zero, saturated source alpha `min(As, 1 - Ad)` zero). Blending
-/// of a single description becomes per target where it must.
-#[cfg(windows)]
-pub(crate) fn blend_without_alpha(
-    blend: &mut windows::Win32::Graphics::Direct3D12::D3D12_BLEND_DESC,
-    targets: &windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY,
-) {
-    blend_without(blend, targets, alpha_one);
-}
-
-/// [`blend_without_alpha`] for the title formats `lacks_alpha` names.
-#[cfg(windows)]
-fn blend_without(
-    blend: &mut windows::Win32::Graphics::Direct3D12::D3D12_BLEND_DESC,
-    targets: &windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY,
-    lacks_alpha: impl Fn(u32) -> bool,
-) {
-    use windows::Win32::Graphics::Direct3D12::*;
-    let count = (targets.NumRenderTargets as usize).min(8);
-    let slots: Vec<usize> = (0..count)
-        .filter(|&i| lacks_alpha(targets.RTFormats[i].0 as u32))
-        .collect();
-    if slots.is_empty() {
-        return;
-    }
-    if !blend.IndependentBlendEnable.as_bool() {
-        blend.IndependentBlendEnable = true.into();
-        blend.RenderTarget = [blend.RenderTarget[0]; 8];
-    }
-    let factor = |f: D3D12_BLEND| match f {
-        D3D12_BLEND_DEST_ALPHA => D3D12_BLEND_ONE,
-        D3D12_BLEND_INV_DEST_ALPHA | D3D12_BLEND_SRC_ALPHA_SAT => D3D12_BLEND_ZERO,
-        other => other,
-    };
-    for i in slots {
-        let t = &mut blend.RenderTarget[i];
-        t.SrcBlend = factor(t.SrcBlend);
-        t.DestBlend = factor(t.DestBlend);
-        t.SrcBlendAlpha = factor(t.SrcBlendAlpha);
-        t.DestBlendAlpha = factor(t.DestBlendAlpha);
-        t.RenderTargetWriteMask &= !(D3D12_COLOR_WRITE_ENABLE_ALPHA.0 as u8);
-    }
 }
 
 /// What the host uses for a format of the table.
@@ -935,50 +889,6 @@ mod tests {
         // Formats with an alpha of their own keep it.
         assert!(!alpha_one(28));
         assert!(!alpha_one(86));
-    }
-
-    /// A target without alpha neither writes alpha nor blends with it; the
-    /// others keep their blending, now per target.
-    #[cfg(windows)]
-    #[test]
-    fn targets_without_alpha_blend_with_alpha_one() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-        let target = D3D12_RENDER_TARGET_BLEND_DESC {
-            BlendEnable: true.into(),
-            SrcBlend: D3D12_BLEND_INV_DEST_ALPHA,
-            DestBlend: D3D12_BLEND_DEST_ALPHA,
-            BlendOp: D3D12_BLEND_OP_ADD,
-            SrcBlendAlpha: D3D12_BLEND_SRC_ALPHA_SAT,
-            DestBlendAlpha: D3D12_BLEND_SRC_ALPHA,
-            BlendOpAlpha: D3D12_BLEND_OP_ADD,
-            RenderTargetWriteMask: 0xf,
-            ..Default::default()
-        };
-        let mut blend = D3D12_BLEND_DESC {
-            RenderTarget: [target; 8],
-            ..Default::default()
-        };
-        let mut formats = [DXGI_FORMAT(0); 8];
-        (formats[0], formats[1]) = (DXGI_FORMAT(28), DXGI_FORMAT(67));
-        let targets = D3D12_RT_FORMAT_ARRAY {
-            RTFormats: formats,
-            NumRenderTargets: 2,
-        };
-        // Nothing to change for formats with their own alpha.
-        let mut same = blend;
-        blend_without(&mut same, &targets, |_| false);
-        assert!(!same.IndependentBlendEnable.as_bool());
-        blend_without(&mut blend, &targets, |f| f == 67);
-        assert!(blend.IndependentBlendEnable.as_bool());
-        let (kept, changed) = (blend.RenderTarget[0], blend.RenderTarget[1]);
-        assert_eq!(kept.SrcBlend, D3D12_BLEND_INV_DEST_ALPHA);
-        assert_eq!(kept.RenderTargetWriteMask, 0xf);
-        assert_eq!(changed.SrcBlend, D3D12_BLEND_ZERO);
-        assert_eq!(changed.DestBlend, D3D12_BLEND_ONE);
-        assert_eq!(changed.SrcBlendAlpha, D3D12_BLEND_ZERO);
-        assert_eq!(changed.DestBlendAlpha, D3D12_BLEND_SRC_ALPHA);
-        assert_eq!(changed.RenderTargetWriteMask, 0x7);
     }
 
     #[test]
