@@ -18,15 +18,16 @@ quoted). It answers `gpu.md` §6.1 in part and open question 3.
 - The step between them is the title's **own upscaler**, not FidelityFX:
   the title picks FidelityFX (FSR) only on a Series S, and XTP's runs never
   load the FSR provider DLL (section 3).
-- That upscaler, like the rest of the frame, reads the scene through views
-  of render-target memory. Before this change, a texture made at the address
-  of a render target (a placed view of its memory, a resource placed at the
-  same heap offset) got a **host copy of its own filled from title memory**,
-  which the GPU never writes: zeros. A pass reading the scene that way writes
-  black (#841's 4K output: a full-screen write of 0 to 1). This is fixed
-  (VIctory #643, reworked, section 5.1).
+- Before this change, a texture made at the address of a render target (a
+  placed view of its memory, a resource placed at the same heap offset) got
+  a **host copy of its own filled from title memory**, which the GPU never
+  writes: zeros. A pass reading the scene that way writes black, which fits
+  #841's 4K output (0 to 1 of 255 everywhere). This is fixed (VIctory #643,
+  reworked, section 5.1). **Not proven yet:** that the upscaler reads the
+  scene that way; no world capture has shown its views (section 6).
 - `PresentX` with several planes now composes them (VIctory #211, section
-  5.2). Series X presents one plane; Series S presents two.
+  5.2). Series S presents two (#211's report); how many Series X presents is
+  logged now and not seen in a run yet.
 - Still blocking on this machine, outside this task's files: compute
   programs refused on NVIDIA for their 64-lane waves (118 in the first runs,
   shader L1, being ported), and, at the time of writing, a stall on the
@@ -41,11 +42,12 @@ quoted). It answers `gpu.md` §6.1 in part and open question 3.
 | 3 | The interface (title card, subtitles, HUD) drawn into the 4K output. | Front-end dumps of run `play-F`: the 4K target `0x19cff9472b0` holds the profile screen and its button prompts |
 | 4 | `PresentX`: plane 0's first resource, one of two 4K back buffers in turn (`0x19bec6a0340`, `0x19bec69f3a0` in `play-F`), copied to the swap chain. | `queue::present`; the presented frames match the 4K target in the front end |
 
-In the world the chain breaks between steps 1 and 2: the 4K output is
-written (a full-screen pass leaves 0 to 1 of 255 in it, not the cleared 0)
-but from black input; the interface of step 3 then draws over black, which
-is the README's "the title card shows, and the scene after it stays black"
-on AMD.
+#841's dumps (another tree, an RTX 3090) place the break between steps 1
+and 2: the 1440p targets hold the scene, the 4K output 0 to 1 of 255. A
+dense 0-to-1 image rather than the cleared 0 suggests a full-screen pass that
+ran on black input; the interface of step 3 then draws over black, which is
+the README's "the title card shows, and the scene after it stays black" on
+AMD. Why the input reads black is section 4's question.
 
 ## 3. Which upscaler runs (code reading)
 
@@ -72,7 +74,7 @@ on AMD.
 
 ## 4. Where it breaks in XTP
 
-### 4.1 Aliases of render targets read zeros (fixed)
+### 4.1 Aliases of render targets read zeros (fixed; share of the black output not measured)
 
 - XTP gives each title texture a host copy. What the GPU renders or writes
   stays in that copy; title memory keeps its old bytes (zeros for a target).
@@ -86,8 +88,9 @@ on AMD.
   from title memory (`texture::title_written`: a texture without
   render-target, depth or unordered-access use is filled from memory), so
   a view of a render target read zeros. A pass reading the scene that way
-  writes black with whatever it adds (dither, film grain): #841's 0-to-1
-  output.
+  writes black with whatever it adds (dither, film grain), which fits #841's
+  0-to-1 output; whether the upscaler reads it that way is what section 6's
+  capture must show.
 - Testers with VIctory #643 on an RX 9070 XT saw the "Rockstar Games
   presents" card for the first time, and cutscene subtitles stopped piling
   up on each other: aliases had been resolving to the wrong copy.
@@ -109,8 +112,9 @@ on AMD.
   its host copy becomes a raw view): the runs log each case once
   (`view the host does not allow unordered=true format=53`,
   `buffer view not on an element of its host copy`), and both make null
-  views. #841's scene renders fully at 1440p on a tree with neither, and
-  nothing in the captures ties them to the black output. They are
+  views. The 1440p scene renders on #841's tree (whether that tree holds
+  them is not known: the testers' set does), and nothing in the captures
+  ties them to the 4K output. They are
   stability fixes (watch §4.1 item 9, the NVIDIA world set); their files
   (`host.rs`, `list.rs`, `descriptor/host.rs`) belong to other tasks. Not
   ported here.
@@ -139,50 +143,14 @@ on AMD.
   with what became of them, and `XTP_ALIAS_SHARING=0` turns sharing off for
   A/B runs.
 
-Tests (GPU, on the RTX 4080; skipped without a device): a render target
+Tests (GPU, green on the RTX 4080 and on WARP; skipped without a device): a render target
 cleared by a title list, then read through a placed view (twice, with
 different padding: one resource) and through a resource at its address,
 returns the cleared texels; aliases of another shape, family or format, or
 asking for writes the copy lacks, keep their own copy, and a read-only
 alias is no source once the target is released; a placed view made before
-its target follows it. Plus padding canonicalization (no GPU).
-
-**Critical review of #643.**
-- *Kept:* the mechanism (look up a live GPU-written copy by address), the
-  compatibility rules, canonical resource descriptions, the re-check in
-  `texture_at`, the tests' scenario.
-- *Changed: what is a source.* The PR registers every resource that ends up
-  with a writable host copy, including read-only aliases that merely share
-  one. `texture_at` never releases its resources, so such an alias stays a
-  source for the run: after the target is released and the memory reused
-  (a streamed texture of the same shape, say), the new texture would read
-  the old target instead of its own data. Here only resources whose own
-  description asks for GPU writes are sources.
-- *Changed: no sharing between title-written textures.* The PR falls back
-  to sharing a read-only copy. That brings nothing (each fills from the same
-  memory) and is wrong when two descriptions at one address have different
-  console layouts: both would detile into one copy. Removed.
-- *Changed: cost of the re-check.* The PR calls the registry (a lock and a
-  map lookup, plus `GetDesc`) on every `texture_at` hit whose copy is not
-  writable, which is every streamed texture on every draw. Here it runs
-  only after the registry changed.
-- *Changed: a released target's alias.* The PR's re-check upgrades only a
-  view whose copy is not writable; a view over a released target whose
-  address now holds a new target kept the old copy. Here a view follows
-  whatever copy the registry gives.
-- *Not taken: canonical view descriptions* (`descriptor.rs`: padding and
-  unused union words of SRV and UAV descriptions zeroed). They only remove
-  duplicate entries from the view table, a memory matter, not an image one;
-  `descriptor.rs` belongs to another task (nvidia2). The rules themselves
-  checked out against the D3D12 layouts.
-- *Doubtful claim:* "`texture::title_written` overwrites the separate host
-  copy with CPU zeros". The separate copy is filled from title memory, which
-  is zero where only the GPU drew; nothing is overwritten. Same effect.
-- *Limits:* aliases of another shape or format family (an R32_UINT view of
-  a colour target, a half-size alias) still get their own copy; that needs
-  shared memory (G19), not a lookup by address. A writable alias the copy
-  cannot serve (an unordered-access alias of a render target) gets its own
-  copy, and the two do not see each other's writes.
+its target follows it. Plus padding canonicalization (no GPU). With sharing
+off (`XTP_ALIAS_SHARING=0`), the first and the last fail, as they should.
 
 ### 5.2 Planes of a present composed (VIctory #211, Yaekai)
 
@@ -200,29 +168,6 @@ its target follows it. Plus padding canonicalization (no GPU).
 Tests: plane formats, planes that name no resource of ours (or cannot be
 read) left out, and two planes composed on the GPU (a red scene plane under
 a 40 % green interface corner gives 153, 102, 0 there and red elsewhere).
-
-**Critical review of #211.**
-- *Kept:* the composition (full-screen triangle per plane, plane 0 opaque,
-  the others premultiplied) and the plane stride, 0x48.
-- *Changed: the stride is not trusted.* The PR reads planes 1 and after at
-  0x48 bytes and dereferences their resource list blindly; a wrong stride
-  (it is not checked against the SDK's headers, and xcl does not know it
-  either) would crash the present. Here an unreadable plane or one whose
-  resource is not ours is left out and logged with its raw words.
-- *Changed: where it lives.* The PR rewrites `Host::present` (355 lines in
-  `host.rs`, which the asynchronous-submission port is rewriting). Here the
-  composition is a module of its own that hands `Host::present` one image;
-  the cost is one more full-screen copy per frame with several planes.
-- *Same effect, other means: plane states.* The PR's own barriers (each
-  plane to the pixel-shader state and back) are right; here the planes go
-  through the host list's state tracking (`ensure_state`), as title lists
-  do, and stay in the pixel-shader state until the title moves them.
-- *Not taken:* the swap chain sized to the largest plane inside
-  `Host::present`; the composed image has that size and `Host::present`
-  resizes for it.
-- *Shortcut kept and said:* rectangles, colour space and flags of each plane
-  are ignored; premultiplied alpha is the PR's assumption, confirmed only by
-  its Series S menu captures.
 
 ### 5.3 Host textures: creation without an unbounded wait, and release
 
@@ -292,9 +237,58 @@ the same alpha difference. Changes (`resource/format.rs` `alpha_one`,
   target of a dumped frame is logged in first-use order with its size,
   format and flags.
 
-## 6. World capture after the fixes
+## 6. What remains to prove in game
 
-Pending: see section 7.
+No session reached the world with these changes: since 14:40 every session
+stalls on the loading screen (section 7). What a world capture must show,
+for the session that comes:
+
+1. **Which pass writes the 3840×2160 output (#841), and what it reads.**
+   The draws of the captured frames are traced: the last ones before the
+   interface that write the 4K target, their pipeline and what each view
+   reads (`placed uav=false dim 3 2560x1440 f28 … at 0x…` for a placed view,
+   `2560x1440 f28 flags 0x…` for a resource). A compute upscaler's dispatches
+   are not traced: then the target list says where the 4K target is first
+   written (as an unordered-access view) and the drop lines whether a
+   refused compute pipeline is in the way (shader L1, NVIDIA).
+2. **That aliases now share.** `a texture over a GPU-written one shares its
+   host copy` lines, with `how` (`placed view`, `placed in a heap`, `at an
+   address`) and the 2560×1440 shapes among them; `gets a copy of its own`
+   lines say which aliases still do not, and why.
+3. **The image.** The 1440p dumps rendered, the 4K output and `frame-N.png`
+   no longer 0 to 1 of 255 (minimum, maximum and mean of the PNGs, sampled
+   every 8 pixels, as #841 measured them).
+4. **Planes.** `the title presents planes count=1` in Series X mode (gpu.md
+   open question 3); a Series S run (`xtp run <title> --execute --console
+   series-s`; `play.ps1` has no option for it) should log two planes and
+   `composing present planes`.
+5. **Host textures.** No `not made resident` line; `making a host texture`
+   and `a host texture was slow to make` lines and the frame line's
+   `host textures: N alive, M MiB` give the video memory story of the
+   loading screen (task `stall`).
+
+The command (through run-world, who runs the game; under 3 minutes):
+
+```
+E:\xtp-data\play.ps1 -Repo E:\XTP -NoBuild -WorldSeconds 75 -Name dark-world -Env @{
+  XTP_CAPTURE = 'E:\xtp-data\runs\dark-world-1-capture';
+  XTP_CAPTURE_WORLD = '600:10:3:10';
+  XTP_DUMP_TARGETS = '1280';
+  XTP_LOG = 'info,xtp_gpu::draw=debug' }
+```
+
+- `XTP_CAPTURE_WORLD=600:10:3:10`: the first frame running 600 draws or
+  more (the world; the front end and loading screens run a few dozen) arms
+  it; frames 10, 20 and 30 after it are saved, their targets dumped and
+  their draws traced. Each costs a few seconds (read-back and PNG of the
+  1440p and 4K targets), well under the title's watchdog.
+- `XTP_DUMP_TARGETS=1280`: only targets at least 1280 wide are written as
+  PNG; every target is logged in first-use order.
+- An A/B on the same binary: the same command with
+  `XTP_ALIAS_SHARING = '0'` and another capture folder, ten minutes later,
+  gives the old behaviour (aliases with copies of their own).
+- `-Repo` names the checkout holding a diagnostics build with these changes
+  (`cargo build --profile diag -p xtp --features diagnostics`).
 
 ## 7. What still blocks it
 
@@ -303,5 +297,104 @@ Pending: see section 7.
   same binary that reached the world earlier: a host texture's creation
   waits in the kernel (section 5.3). The task `stall` is finding why;
   section 5.3's changes bound the wait and log it.
-- **NVIDIA wave64 refusals** (section 4.2): until the wave64 port lands, a
-  refused pass in the final chain keeps it black on this GPU.
+- **NVIDIA wave64 refusals** (section 4.2): the wave64 stack has landed in
+  the translator; until its GPU wiring (nvidia2's branch
+  `hangar/wave64-wiring`) lands too, a refused pass in the final chain
+  keeps it black on this GPU.
+
+## 8. Relecture critique (critical review)
+
+The VIctory PRs are unreviewed upstream and several say they are
+AI-assisted; each hunk was read as new code, and only what XTP's evidence
+supports was kept.
+
+### 8.1 VIctory #643 (nathanbzrr, head `e7b2182`)
+- *Kept:* the mechanism (look up a live GPU-written copy by address), the
+  compatibility rules, canonical resource descriptions, the re-check in
+  `texture_at`, the tests' scenario.
+- *Changed: what is a source.* The PR registers every resource that ends up
+  with a writable host copy, including read-only aliases that merely share
+  one. `texture_at` never releases its resources, so such an alias stays a
+  source for the run: after the target is released and the memory reused
+  (a streamed texture of the same shape, say), the new texture would read
+  the old target instead of its own data. Here only resources whose own
+  description asks for GPU writes are sources.
+- *Changed: no sharing between title-written textures.* The PR falls back
+  to sharing a read-only copy. That brings nothing (each fills from the same
+  memory) and is wrong when two descriptions at one address have different
+  console layouts: both would detile into one copy. Removed.
+- *Changed: cost of the re-check.* The PR calls the registry (a lock and a
+  map lookup, plus `GetDesc`) on every `texture_at` hit whose copy is not
+  writable, which is every streamed texture on every draw. Here it runs
+  only after the registry changed.
+- *Changed: a released target's alias.* The PR's re-check upgrades only a
+  view whose copy is not writable; a view over a released target whose
+  address now holds a new target kept the old copy. Here a view follows
+  whatever copy the registry gives.
+- *Not taken: canonical view descriptions* (`descriptor.rs`: padding and
+  unused union words of SRV and UAV descriptions zeroed). They only remove
+  duplicate entries from the view table, a memory matter, not an image one;
+  `descriptor.rs` belongs to another task (nvidia2). The rules themselves
+  checked out against the D3D12 layouts.
+- *Doubtful claim:* "`texture::title_written` overwrites the separate host
+  copy with CPU zeros". The separate copy is filled from title memory, which
+  is zero where only the GPU drew; nothing is overwritten. Same effect.
+- *Limits:* aliases of another shape or format family (an R32_UINT view of
+  a colour target, a half-size alias) still get their own copy; that needs
+  shared memory (G19), not a lookup by address. A writable alias the copy
+  cannot serve (an unordered-access alias of a render target) gets its own
+  copy, and the two do not see each other's writes.
+
+### 8.2 VIctory #211 (Yaekai, head `24a387d`)
+- *Kept:* the composition (full-screen triangle per plane, plane 0 opaque,
+  the others premultiplied) and the plane stride, 0x48.
+- *Changed: the stride is not trusted.* The PR reads planes 1 and after at
+  0x48 bytes and dereferences their resource list blindly; a wrong stride
+  (it is not checked against the SDK's headers, and xcl does not know it
+  either) would crash the present. Here an unreadable plane or one whose
+  resource is not ours is left out and logged with its raw words.
+- *Changed: where it lives.* The PR rewrites `Host::present` (355 lines in
+  `host.rs`, which the asynchronous-submission port is rewriting). Here the
+  composition is a module of its own that hands `Host::present` one image;
+  the cost is one more full-screen copy per frame with several planes.
+- *Same effect, other means: plane states.* The PR's own barriers (each
+  plane to the pixel-shader state and back) are right; here the planes go
+  through the host list's state tracking (`ensure_state`), as title lists
+  do, and stay in the pixel-shader state until the title moves them.
+- *Not taken:* the swap chain sized to the largest plane inside
+  `Host::present`; the composed image has that size and `Host::present`
+  resizes for it.
+- *Shortcut kept and said:* rectangles, colour space and flags of each plane
+  are ignored; premultiplied alpha is the PR's assumption, confirmed only by
+  its Series S menu captures.
+
+### 8.3 VIctory #469 and #206 (AnoHunted): not ported
+
+- Neither is tied to the image by the evidence: the break #841 shows is
+  after the 1440p scene, and XTP's runs log each case once (a null view
+  each). They are stability fixes from the NVIDIA world set.
+- #469 copies its twin texture both ways in every list that uses it
+  (`host.rs`, `list.rs`), a cost per list to measure first; #206 makes raw
+  views that shaders declaring a structured view then read (D3D12 leaves
+  that undefined, as the PR says). Both live in other tasks' files and need
+  their own review there.
+
+### 8.4 The #492 port (nvidia2), as the review asked
+
+- The conversion of R9G9B9E5 to half floats is exact (checked again: every
+  mantissa and exponent, tested).
+- What it missed is what the console reads back: alpha one, negatives
+  clamped. Alpha is now one on reads and targets (section 5.4); the clamp is
+  not, and is written down as a shortcut with the change it needs.
+- B5G6R5 (85) as RGBA8 had the same alpha difference since gpu-nvidia's
+  table; it gets the same treatment.
+
+### 8.5 Claims of this report that rest on reading the title's code
+
+- The upscaler choice (section 3) comes from reading the code statically,
+  not from a run: a run with `XTP_WATCH=0x7b9846c` and a breakpoint or log
+  at `0x7e93f0` would confirm it. The facts it explains (no FSR provider
+  loaded in any run) are measured.
+- The stall's syscall (section 5.3) is identified by the export table of
+  this machine's `win32u.dll`; another Windows build may place it
+  elsewhere.

@@ -2039,8 +2039,9 @@ pub(crate) mod tests_support {
         }
         list.close();
         host.execute(&[&list]);
+        host.drain();
         let mut mapped = std::ptr::null_mut();
-        // SAFETY: the copy ran (execute waits); the buffer is `size` bytes.
+        // SAFETY: the copy ran (drained); the buffer is `size` bytes.
         unsafe {
             readback.Map(0, None, Some(&mut mapped)).unwrap();
             let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), size as usize).to_vec();
