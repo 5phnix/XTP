@@ -408,7 +408,7 @@ fn worker(i: usize) -> std::thread::Builder {
 /// them (lane masks read as data; docs/analysis/drops.md), and with eight
 /// workers a few of them held most of the pool while cheap pipelines
 /// waited, with 8 to 10 of the process's threads running on 32 logical
-/// processors. The workers run below the title's threads.
+/// processors. The workers run at the title's own priority.
 const MAX_WORKERS: usize = 16;
 
 /// The workers (half the logical processors, 2 to [`MAX_WORKERS`]),
@@ -431,14 +431,12 @@ fn workers() -> usize {
     })
 }
 
-/// A worker: makes pipelines, first uses first, below the title's own
-/// threads (loading, recording).
+/// A worker: makes pipelines, first uses first, at the title's own
+/// priority. Below it, the world's busy threads starved the workers
+/// (VIctory #1505: 236 pipelines a minute at the start screen, 7 a minute
+/// in the world), and XTP's Series S world dropped 571 to 747 draws a
+/// frame waiting for a pipeline "being made".
 fn work() {
-    // SAFETY: a plain call on our own thread.
-    unsafe {
-        use windows::Win32::System::Threading::*;
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
     let (lock, ready) = &QUEUES;
     loop {
         let next = {

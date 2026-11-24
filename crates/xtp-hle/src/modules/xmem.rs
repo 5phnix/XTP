@@ -716,7 +716,8 @@ fn views() -> MutexGuard<'static, Views> {
 /// a page through one view (a pool) while the GPU reads it through another
 /// (its tiled heap, `map_alias`), and a read-only guard on one view does
 /// not see writes through the other. Our own view of each allocation
-/// (`Section`) is not in it: no copy takes it. (Ported from
+/// (`Section`) is not in it: no copy takes it, and our writes through it
+/// open the guards of the title's views from here (`opened`). (Ported from
 /// Marvisak/VIctory#1122 (head 9ed6093) by tightfall.)
 ///
 /// Updated with `VIEWS` held: a view is noted before it is reported mapped,
@@ -802,6 +803,39 @@ fn other_views(range: Range<usize>, out: &mut Vec<(usize, usize)>) {
         {
             out.extend(list.iter().filter(|&&x| x != at).map(|&x| (at, x)));
         }
+    }
+}
+
+/// After our write into pages `[index, index + n)` of `section` through
+/// our view of it: the GPU side's guards on the title's views of them are
+/// opened, as by a kernel write. A copy of a title view (a buffer the GPU
+/// reads) leaves its blocks read-only, but our view is not one of them and
+/// does not fault: without this the copy kept the page's old bytes, a
+/// stale mesh once DirectStorage streams a model into a page the title
+/// reused (the #1122 review). After the write is enough: the title reads
+/// the bytes once the request has completed, and its status is written
+/// after this. Nothing is looked up while nothing is guarded.
+fn opened(section: &Section, index: usize, n: usize) {
+    // Our writes before the look at the guards' count: a copy that guards
+    // after it takes what they wrote.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if !xtp_gpu::guarding() {
+        return;
+    }
+    let key = std::ptr::from_ref(section) as usize;
+    let mut at: Vec<usize> = {
+        let a = aliases();
+        (index..index + n)
+            .filter_map(|i| a.by_page.get(&(key, i)))
+            .flatten()
+            .copied()
+            .collect()
+    };
+    // Out of the index's lock, which the guards' handler takes after theirs
+    // (see `Aliases`). An address shows one page: no repeats.
+    at.sort_unstable();
+    for run in at.chunk_by(|a, b| a + PAGE == *b) {
+        xtp_gpu::kernel_will_write(run[0], run.len() * PAGE);
     }
 }
 
@@ -918,8 +952,9 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations):
 /// a copy per run of consecutive pages into our view of their allocation,
-/// committing pages written for the first time. False if a page is unknown
-/// or the host fails.
+/// committing pages written for the first time, and the guards of the
+/// title's views of each run opened after it (`opened`). False if a page
+/// is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
@@ -937,6 +972,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
             let to = slice.section.at(slice.index).add(within);
             std::ptr::copy_nonoverlapping(data[done..].as_ptr(), to, k);
         }
+        // The bytes reach every page of the run (`runs`).
+        opened(&slice.section, slice.index, *n);
         (within, done) = (0, done + k);
     }
     true
@@ -944,10 +981,11 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
-/// would then copy.
+/// would then copy. Dropping it opens the guards of the title's views of
+/// its pages (`opened`).
 pub(crate) struct PageWindow {
     /// Keeps our view mapped, should the title free the pages meanwhile.
-    _section: Arc<Section>,
+    section: Arc<Section>,
     at: *mut u8,
     len: usize,
 }
@@ -958,6 +996,14 @@ impl PageWindow {
         // while `self` lives (other views of the pages only alias them, as
         // the console's do).
         unsafe { std::slice::from_raw_parts_mut(self.at, self.len) }
+    }
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        let from = self.at as usize - self.section.base;
+        let (first, end) = (from / PAGE, (from + self.len).div_ceil(PAGE));
+        opened(&self.section, first, end - first);
     }
 }
 
@@ -978,7 +1024,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     // SAFETY: the run's pages hold `offset % PAGE + len` bytes of our view.
     let at = unsafe { slice.section.at(slice.index).add(offset % PAGE) };
     Some(PageWindow {
-        _section: slice.section,
+        section: slice.section,
         at,
         len,
     })
@@ -1585,6 +1631,98 @@ mod tests {
             assert!(!known(pool) && !known(heap), "nothing kept of them");
         }
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// What a host copy of `blocks` pages of title memory at `at` asks
+    /// before it copies (the GPU side's guards): the pages written since its
+    /// last asking, by address.
+    fn copy_asks(at: usize, blocks: usize) -> Vec<usize> {
+        let pages = xtp_gpu::copy_asks(at, at + blocks * PAGE).expect("view memory");
+        pages.into_iter().map(|p| p * PAGE).collect()
+    }
+
+    /// Whether a copy's guard leaves `at` read-only.
+    fn guarded(at: usize) -> bool {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        query(at as *const c_void).host.Protect == PAGE_READONLY
+    }
+
+    /// DirectStorage's writes into physical pages (the #1122 review): they
+    /// go through our view of them, which no copy guards and which does not
+    /// fault, so each write opens the guards of every title view of the
+    /// pages it wrote: as a copy, after each run, and in place, when the
+    /// window drops. The pages it did not write stay guarded.
+    #[test]
+    fn runtime_writes_open_the_guards_of_every_view() {
+        let pages = allocate(2);
+        let (pool, heap) = (reserve(2) as usize, reserve(1) as usize);
+        let pool_at = pool as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(pool_at, 2, pages.as_ptr()), pool_at);
+        // The second page in the GPU's heap too.
+        assert!(map_alias(heap as u64, (pool + PAGE) as u64, PAGE as u64));
+        // A copy of the pool takes both pages and guards them, and the heap
+        // with the second; then a copy of the heap takes it.
+        assert_eq!(copy_asks(pool, 2), [pool, pool + PAGE]);
+        assert_eq!(copy_asks(heap, 1), [heap]);
+        assert!(copy_asks(pool, 2).is_empty() && copy_asks(heap, 1).is_empty());
+        assert!(guarded(pool) && guarded(pool + PAGE) && guarded(heap));
+        assert!(xtp_gpu::guarding());
+
+        // A copy into the second page: opened in both views.
+        assert!(write_physical(&pages[1..], 8, &[7]));
+        assert!(!guarded(pool + PAGE) && !guarded(heap));
+        assert!(guarded(pool), "the first page was not written");
+        assert_eq!(copy_asks(pool, 2), [pool + PAGE]);
+        assert_eq!(copy_asks(heap, 1), [heap]);
+        // SAFETY: mapped, readable.
+        assert_eq!(unsafe { ((heap + 8) as *const u8).read() }, 7);
+
+        // In place, over both pages: opened when the window drops.
+        let mut window = page_window(&pages, PAGE - 4, 8).expect("one run");
+        window.bytes().fill(9);
+        assert!(guarded(pool) && guarded(pool + PAGE) && guarded(heap));
+        drop(window);
+        assert!(!guarded(pool) && !guarded(pool + PAGE) && !guarded(heap));
+        assert_eq!(copy_asks(pool, 2), [pool, pool + PAGE]);
+        assert_eq!(copy_asks(heap, 1), [heap]);
+        // SAFETY: mapped, readable.
+        assert_eq!(unsafe { ((heap + 3) as *const u8).read() }, 9);
+
+        assert!(map_alias(heap as u64, 0, PAGE as u64));
+        assert_eq!(XMemMapPhysicalPages(pool_at, 2, std::ptr::null()), pool_at);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// The late view aycow found on VIctory #1122, with xmem's own ordering
+    /// (the #1122 review): a copy guards a pool view, then the GPU maps the
+    /// page into its heap. xmem notes the heap's view before it reports it,
+    /// so the report opens the pool's guard, and the title's write through
+    /// the heap is seen by the pool's copy. From then on the heap is guarded
+    /// with the pool, and a write through it faults and opens both.
+    #[test]
+    fn a_late_view_opens_the_guard_of_the_first() {
+        let pages = allocate(1);
+        let (pool, heap) = (reserve(1) as usize, reserve(1) as usize);
+        let pool_at = pool as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(pool_at, 1, pages.as_ptr()), pool_at);
+        assert_eq!(copy_asks(pool, 1), [pool]);
+        assert!(copy_asks(pool, 1).is_empty(), "clean");
+        assert!(guarded(pool));
+        assert!(map_alias(heap as u64, pool as u64, PAGE as u64));
+        assert!(!guarded(pool), "the late view's report opened the guard");
+        // SAFETY: mapped read-write.
+        unsafe { ((heap + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(copy_asks(pool, 1), [pool], "the write through the heap");
+        assert!(guarded(pool) && guarded(heap), "guarded together now");
+        // SAFETY: mapped; the guards' handler opens the write.
+        unsafe { ((heap + 8) as *mut u8).write_volatile(2) };
+        assert!(!guarded(pool) && !guarded(heap));
+        assert_eq!(copy_asks(pool, 1), [pool]);
+        // SAFETY: mapped, readable.
+        assert_eq!(unsafe { ((pool + 8) as *const u8).read_volatile() }, 2);
+        assert!(map_alias(heap as u64, 0, PAGE as u64));
+        assert_eq!(XMemMapPhysicalPages(pool_at, 1, std::ptr::null()), pool_at);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
     #[test]

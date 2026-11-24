@@ -204,6 +204,7 @@ pub(crate) const ROWS: &[Row] = &[
         texts: &[
             "an address not from a root parameter",
             "an address from a phi",
+            "an address read from the first lane of a per-lane value",
         ],
     },
     Row {
@@ -853,7 +854,7 @@ fn stage_name(s: HwStage) -> &'static str {
 }
 
 /// A JSON string.
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
     for c in s.chars() {

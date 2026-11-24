@@ -22,6 +22,7 @@ xtp-shader = { path = "crates/xtp-shader" }
 xtp-formats = { path = "crates/xtp-formats" }
 xtp-pipeline = { path = "crates/xtp-pipeline" }
 xtp-game = { path = "crates/xtp-game" }
+xtp-testkit = { path = "crates/xtp-testkit" }
 
 # External crates
 anyhow = "1.0.104"

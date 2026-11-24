@@ -140,15 +140,18 @@ failure. CI also runs `actionlint` on the workflows.
   #[test]
   fn decodes_real_streams() {
       let Some(dir) = std::env::var_os("XTP_XMA_STREAMS") else {
-          eprintln!("skipped: set XTP_XMA_STREAMS to a folder of your own streams");
+          xtp_testkit::skip("no-sample XTP_XMA_STREAMS");
           return;
       };
       // ...
   }
   ```
 
-  Run the ignored ones with `cargo test -p <crate> -- --ignored`. Document a
-  new variable in the test's doc comment and in the pull request.
+  `xtp_testkit::skip` writes `SKIPPED <test>: <reason>` directly to stderr so
+  skips stay visible under default `cargo test` capture; setting
+  `XTP_REQUIRE=<reason,...>` turns matching skips into a panic. Run the ignored
+  ones with `cargo test -p <crate> -- --ignored`. Document a new variable in
+  the test's doc comment and in the pull request.
 - Such tests assert on properties (it decodes, sizes match, the hash of our
   output is stable for your input), never on snapshots of game content, and
   they write nothing below the repository (`xtp_core::ensure_outside_repo`).
@@ -162,9 +165,9 @@ Every commit message and every pull request title starts with a header:
 ```
 
 - `<area>` is one of: `core`, `pe`, `loader`, `hle`, `gpu`, `shader`,
-  `formats`, `pipeline`, `game` (the crates `crates/xtp-<area>`), `app`
-  (`apps/xtp`), `xtask`, `tests`, `ci` (`.github/`, `.githooks/`), `docs`,
-  `deps` (dependency updates), `build` (workspace manifest, toolchain,
+  `formats`, `pipeline`, `game`, `testkit` (the crates `crates/xtp-<area>`),
+  `app` (`apps/xtp`), `xtask`, `tests`, `ci` (`.github/`, `.githooks/`),
+  `docs`, `deps` (dependency updates), `build` (workspace manifest, toolchain,
   `.cargo/`, repository settings). A topic may follow (`hle/audio`), and a
   change that spans areas names them all (`gpu, shader: ...`).
 - `<summary>` says what the change does, in the imperative ("clamp indirect

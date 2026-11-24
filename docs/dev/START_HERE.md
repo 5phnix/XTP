@@ -29,6 +29,7 @@ in the repository ([asset policy](../asset-policy.md)).
 | `crates/xtp-formats` | the GPU's tiled texture layouts, BCPack, XMA and Opus audio; pure functions, bytes in and bytes out | `texture.rs`, `xma.rs` |
 | `crates/xtp-pipeline` | offline conversion of the user's data, content-addressed cache | `cache.rs` |
 | `crates/xtp-game` | BTP 6 only: its formats, build identities, hooks | `lib.rs` |
+| `crates/xtp-testkit` | dev-dependency only: visible, countable test skips (`xtp_testkit::skip`, `XTP_REQUIRE`) | `lib.rs` |
 | `apps/xtp` | the `xtp` command: `inspect`, `census`, `shader-info`, `translate`, `run`, `config` | `main.rs`, `run.rs` |
 | `xtask` | repository tooling: `policy`, `conventions`, `pr-check`, `install-hooks` | `main.rs` |
 | `tests/fixtures/hle-probe` | a stand-in title we wrote, built by the loader's tests | `src/` |
@@ -77,7 +78,7 @@ any of it into the repository, and the tools refuse to write below it.
 
    ```powershell
    cargo build --release -p xtp
-   target\release\xtp.exe run <game dir>\<the title's exe> --execute
+   target\release\xtp.exe run "<game dir>" --execute
    ```
 
    For debugging aids, build `--profile diag --features diagnostics`; the

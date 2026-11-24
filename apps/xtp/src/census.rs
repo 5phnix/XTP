@@ -1,6 +1,7 @@
 //! Which imports do titles need, and which do we cover?
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +9,8 @@ use anyhow::Result;
 use xtp_hle::{HleResolver, HostPolicy};
 use xtp_loader::Provenance;
 use xtp_pe::{ImageInfo, ImportSymbol};
+
+use crate::survey::quote;
 
 #[derive(Default)]
 struct DllStats {
@@ -18,7 +21,7 @@ struct DllStats {
     images: BTreeSet<PathBuf>,
 }
 
-pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> {
+pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool, json: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
@@ -77,6 +80,22 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
         }
     }
 
+    let (mut f, mut h, mut o, mut m) = (0, 0, 0, 0);
+    for s in dlls.values() {
+        f += s.functions.len();
+        h += s.hle;
+        o += s.host;
+        m += s.missing;
+    }
+
+    if json {
+        print!(
+            "{}",
+            to_json(images, failed.len(), (f, h, o, m), &dlls, &missing)
+        );
+        return Ok(());
+    }
+
     println!("{images} images scanned, {} unreadable", failed.len());
     for (p, e) in &failed {
         println!("  skipped {}: {e}", p.display());
@@ -85,7 +104,6 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
         "\n{:<56} {:>6} {:>6} {:>6} {:>8} {:>7}",
         "dll", "funcs", "hle", "host", "missing", "images"
     );
-    let (mut f, mut h, mut o, mut m) = (0, 0, 0, 0);
     for (dll, s) in &dlls {
         println!(
             "{dll:<56} {:>6} {:>6} {:>6} {:>8} {:>7}",
@@ -95,10 +113,6 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
             s.missing,
             s.images.len()
         );
-        f += s.functions.len();
-        h += s.hle;
-        o += s.host;
-        m += s.missing;
     }
     println!("{:<56} {f:>6} {h:>6} {o:>6} {m:>8}", "TOTAL");
 
@@ -113,6 +127,67 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
     Ok(())
 }
 
+/// Stable JSON census report: totals, per-DLL counts, and missing pairs.
+fn to_json(
+    images: usize,
+    unreadable: usize,
+    totals: (usize, usize, usize, usize),
+    dlls: &BTreeMap<String, DllStats>,
+    missing: &BTreeMap<(String, String), BTreeSet<PathBuf>>,
+) -> String {
+    let (functions, hle, host, missing_total) = totals;
+    let mut o = String::new();
+    let _ = writeln!(o, "{{");
+    let _ = writeln!(o, "  \"format\": \"xtp-census 1\",");
+    let _ = writeln!(o, "  \"images\": {images},");
+    let _ = writeln!(o, "  \"unreadable\": {unreadable},");
+    let _ = writeln!(
+        o,
+        "  \"totals\": {{\"functions\": {functions}, \"hle\": {hle}, \"host\": {host}, \"missing\": {missing_total}}},"
+    );
+
+    if dlls.is_empty() {
+        let _ = writeln!(o, "  \"dlls\": [],");
+    } else {
+        let _ = writeln!(o, "  \"dlls\": [");
+        for (i, (dll, s)) in dlls.iter().enumerate() {
+            let comma = if i + 1 < dlls.len() { "," } else { "" };
+            let _ = writeln!(
+                o,
+                "    {{\"dll\": {}, \"functions\": {}, \"hle\": {}, \"host\": {}, \"missing\": {}, \"images\": {}}}{comma}",
+                quote(dll),
+                s.functions.len(),
+                s.hle,
+                s.host,
+                s.missing,
+                s.images.len(),
+            );
+        }
+        let _ = writeln!(o, "  ],");
+    }
+
+    let mut rows: Vec<_> = missing.iter().collect();
+    rows.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    if rows.is_empty() {
+        let _ = writeln!(o, "  \"missing\": []");
+    } else {
+        let _ = writeln!(o, "  \"missing\": [");
+        for (i, ((dll, sym), users)) in rows.iter().enumerate() {
+            let comma = if i + 1 < rows.len() { "," } else { "" };
+            let _ = writeln!(
+                o,
+                "    {{\"dll\": {}, \"symbol\": {}, \"images\": {}}}{comma}",
+                quote(dll),
+                quote(sym),
+                users.len(),
+            );
+        }
+        let _ = writeln!(o, "  ]");
+    }
+    let _ = writeln!(o, "}}");
+    o
+}
+
 /// Cheap pre-filter: an `MZ` header, regardless of extension (console
 /// packages do not always use .exe/.dll).
 fn looks_like_pe(path: &Path) -> bool {
@@ -121,4 +196,17 @@ fn looks_like_pe(path: &Path) -> bool {
         .and_then(|mut f| f.read_exact(&mut magic))
         .is_ok()
         && &magic == b"MZ"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_census_json_emits_empty_arrays() {
+        let out = to_json(0, 0, (0, 0, 0, 0), &BTreeMap::new(), &BTreeMap::new());
+        assert!(out.contains(r#""format": "xtp-census 1""#));
+        assert!(out.contains(r#""dlls": []"#));
+        assert!(out.contains(r#""missing": []"#));
+    }
 }

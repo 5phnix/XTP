@@ -25,6 +25,7 @@ pub const AREAS: &[(&str, &str)] = &[
     ("formats", "crates/xtp-formats"),
     ("pipeline", "crates/xtp-pipeline"),
     ("game", "crates/xtp-game"),
+    ("testkit", "crates/xtp-testkit"),
     ("app", "apps/xtp"),
     ("xtask", "xtask"),
     ("tests", "tests/"),

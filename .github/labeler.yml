@@ -40,6 +40,10 @@ area/game:
   - changed-files:
       - any-glob-to-any-file: 'crates/xtp-game/**'
 
+area/testkit:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-testkit/**'
+
 area/app:
   - changed-files:
       - any-glob-to-any-file: 'apps/**'

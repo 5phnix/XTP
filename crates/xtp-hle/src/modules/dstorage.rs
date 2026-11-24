@@ -1170,6 +1170,9 @@ impl Destination<'_> {
             return fill(out).map(drop);
         }
         let offset = (request.page_offset & 0xffff) as usize;
+        // xmem's view of the pages does not fault into the guards on the
+        // title's views of them either: xmem opens those after each write
+        // (the window's when it drops), before the request's status.
         // Consecutive pages of one allocation (the usual case): written in
         // place in xmem's view of it.
         if let Some(mut window) = xmem::page_window(self.pages, offset, len) {

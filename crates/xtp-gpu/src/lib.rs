@@ -62,4 +62,6 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{set_alias_lookup, title_memory_remapped, writing as kernel_will_write};
+pub use watch::{
+    copy_asks, guarding, set_alias_lookup, title_memory_remapped, writing as kernel_will_write,
+};
