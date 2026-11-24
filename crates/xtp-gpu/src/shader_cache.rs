@@ -47,9 +47,18 @@ pub fn use_shader_cache(dir: PathBuf) {
     }
 }
 
-/// Shaders found in the cache and translated since the start.
+/// Shaders found in the cache and translated since the start. Refusals,
+/// fresh or kept, are neither: the frame line counts shaders.
 pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
+}
+
+/// Counts `result` in `counter` if it is a shader (not a refusal).
+fn count<T, E>(counter: &AtomicU64, result: Result<T, E>) -> Result<T, E> {
+    if result.is_ok() {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
@@ -168,9 +177,8 @@ fn cached(
     } else {
         (&HITS, "from the cache")
     };
-    counter.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(ok = result.is_ok(), "shader {what}");
-    result
+    count(counter, result)
 }
 
 /// For tests: [`wave64_program`] with its lane reads.
@@ -435,9 +443,55 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     })
 }
 
+/// For tests: held by every test that goes through [`cached`] (here and in
+/// `pipeline::host`), so that one reading the process-wide hit and miss
+/// counters sees only its own.
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static CACHE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CACHE_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frame line counts shaders ("from the cache and translated so
+    /// far"): a refusal, fresh or served from its entry, is neither and
+    /// moves no counter; a shader is counted translated once, then from
+    /// the cache. Ported from Marvisak/VIctory#1094 (commit e090242) by
+    /// adamdotpy.
+    #[test]
+    fn refusals_are_not_counted_as_translated() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [9u8; 32];
+        let container = b"yet another container that does not translate".as_slice();
+        let fail = |_: &[u8]| Err::<HostShader, _>("a scalar memory read as data".to_owned());
+        let error = Err("a scalar memory read as data".to_owned());
+
+        let (h0, m0) = counts();
+        assert_eq!(cached(&cache, &build, container, fail), error);
+        assert_eq!(cached(&cache, &build, container, fail), error, "from disk");
+        let (h1, m1) = counts();
+        assert_eq!(
+            (h1 - h0, m1 - m0),
+            (0, 0),
+            "a refusal, fresh or kept, is neither a hit nor a translation"
+        );
+
+        // Another build, so the kept refusal is not in the way.
+        let ok = |_: &[u8]| Ok(shader());
+        assert_eq!(cached(&cache, &[10u8; 32], container, ok), Ok(shader()));
+        let (h2, m2) = counts();
+        assert_eq!((h2 - h1, m2 - m1), (0, 1), "translated once");
+        assert_eq!(cached(&cache, &[10u8; 32], container, ok), Ok(shader()));
+        let (h3, m3) = counts();
+        assert_eq!((h3 - h2, m3 - m2), (1, 0), "then from the cache");
+    }
 
     fn shader() -> HostShader {
         HostShader {
@@ -463,6 +517,7 @@ mod tests {
 
     #[test]
     fn translations_come_back_from_the_cache() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
@@ -492,6 +547,7 @@ mod tests {
 
     #[test]
     fn failures_come_back_from_the_cache_too() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
@@ -558,9 +614,15 @@ mod tests {
             decode_failure(&full).as_deref(),
             Some("a scalar memory read as data")
         );
-        // Truncated after the marker, and after a valid UTF-8 prefix: both
-        // are damaged, not an entry with a shorter error, so both are retried.
-        for n in [FAILED.len(), FAILED.len() + 4, full.len() - 1] {
+        // Truncated after the marker, inside and right after the header
+        // (no text at all), and after a valid UTF-8 prefix: all damaged,
+        // not an entry with a shorter error, so all are retried.
+        for n in [
+            FAILED.len(),
+            FAILED.len() + 4,
+            FAILED.len() + LENGTH + CHECK,
+            full.len() - 1,
+        ] {
             assert_eq!(decode_failure(&full[..n]), None, "cut to {n} bytes");
         }
         // A byte changed in the text with the length left intact: damage,
@@ -591,6 +653,7 @@ mod tests {
     /// the translation already made, not a second one.
     #[test]
     fn a_cache_that_cannot_be_written_still_says_why() {
+        let _serial = serial();
         use xtp_pipeline::CacheKey;
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
@@ -631,6 +694,7 @@ mod tests {
     /// take it: a 64-lane host runs what a 32-lane one refuses).
     #[test]
     fn refusals_are_kept_by_build_and_target() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let container = b"a wave64 program that reads across its halves".as_slice();
@@ -675,6 +739,7 @@ mod tests {
     /// text, translated once.
     #[test]
     fn the_translators_refusal_is_kept_with_its_text() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let runs = AtomicU64::new(0);
@@ -710,6 +775,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn translations_are_kept_by_target() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];

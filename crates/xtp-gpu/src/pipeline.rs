@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// What its console program says of itself, read on first use without
+    /// translating it.
+    #[cfg(windows)]
+    native: OnceLock<Result<Native, String>>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -86,6 +90,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                native: OnceLock::new(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -113,26 +119,52 @@ pub(crate) struct Translated {
     pub(crate) mesh_first_lane_reads: Option<bool>,
 }
 
+/// What a console program says of itself: what [`Translated`] holds besides
+/// the host shader, read from the container without translating it.
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct Native {
+    pub(crate) used: Vec<xtp_shader::UsedResource>,
+    pub(crate) wave64: bool,
+    pub(crate) mesh_lds_in_one_wave: bool,
+    pub(crate) mesh_first_lane_reads: Option<bool>,
+}
+
 #[cfg(windows)]
 impl Shader {
+    /// What its console program says of itself (cheap next to a
+    /// translation: no structuring), read once; an error is the
+    /// translation's error too.
+    pub(crate) fn native(&self) -> Result<&Native, &str> {
+        self.native
+            .get_or_init(|| native(&self.container))
+            .as_ref()
+            .map_err(String::as_str)
+    }
+
     /// The translation, made on first use; a shader that does not
-    /// translate is logged once.
+    /// translate is logged once. Both say how long the translation took
+    /// (or the cache took to answer): a pipeline worker's time.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let started = std::time::Instant::now();
+                let done = translate(&self.container, self.native().map_err(str::to_owned));
+                let ms = started.elapsed().as_millis() as u64;
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
+                        ms,
                         "shader translated"
                     ),
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
                         error = %e,
+                        ms,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
@@ -143,11 +175,26 @@ impl Shader {
 }
 
 /// The translation of `container` for the host's wave sizes
-/// ([`crate::device::host_target`]).
+/// ([`crate::device::host_target`]), with what its console program says
+/// of itself (`native`, [`native`]'s).
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
-    use xtp_shader::{Container, FourCC, HwStage};
+fn translate(container: &[u8], native: Result<&Native, String>) -> Result<Translated, String> {
     let host = crate::shader_cache::host_shader(container, crate::device::host_target())?;
+    let native = native?.clone();
+    Ok(Translated {
+        host,
+        used: native.used,
+        wave64: native.wave64,
+        mesh_lds_in_one_wave: native.mesh_lds_in_one_wave,
+        mesh_first_lane_reads: native.mesh_first_lane_reads,
+    })
+}
+
+/// What the console program in `container` says of itself; a container
+/// without one says nothing (no lanes, no resources).
+#[cfg(windows)]
+fn native(container: &[u8]) -> Result<Native, String> {
+    use xtp_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let native = match c.part(FourCC::DXIL) {
         Some(part) => xtp_shader::native_programs(part.data)
@@ -162,8 +209,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => None,
     };
     Ok(match native {
-        Some(p) => Translated {
-            host,
+        Some(p) => Native {
             wave64: p.wave64,
             mesh_lds_in_one_wave: mesh_lds_in_one_wave(&p),
             mesh_first_lane_reads: (p.stage == HwStage::Ms
@@ -172,8 +218,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             .then(|| mesh_first_lane_reads(&p)),
             used: p.used,
         },
-        None => Translated {
-            host,
+        None => Native {
             used: Vec::new(),
             wave64: false,
             mesh_lds_in_one_wave: false,
@@ -305,10 +350,15 @@ pub(crate) fn refusals() -> Option<String> {
     host::refusals()
 }
 
-/// Draws and dispatches dropped since the last [`take_drops`], by reason
-/// (diagnostics).
+/// A drop's cause (where in the list and why: "indirect kind 10 (mesh
+/// dispatch): being made") and detail (the pipeline's shaders, or none).
 #[cfg(all(windows, feature = "diagnostics"))]
-static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+type DropKey = (String, Option<String>);
+
+/// Draws and dispatches dropped since the last [`take_drops`], by
+/// [`DropKey`] (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+static DROPS: Mutex<Option<HashMap<DropKey, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -349,42 +399,75 @@ pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
 
-/// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
+/// Counts a draw or dispatch of `this`, recorded at `path` ("draw",
+/// "indirect kind 0 (draw)", ...), intentionally skipped or dropped for
+/// want of a host pipeline: why, with the pipeline's shaders as the
+/// detail (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_drop(this: This) {
-    let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
+pub(crate) fn note_drop(path: &str, this: This) {
+    let (why, detail) = if this.is_null() {
+        ("no pipeline set".to_owned(), None)
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+        match skipped_shader(p) {
+            Some(hash) => (format!("skipped shader {hash}"), None),
+            None => match make::missing(&p.host) {
+                Some(missing) => missing,
+                // It has one now (made since the draw looked).
+                None => ("made meanwhile".to_owned(), None),
+            },
+        }
     };
-    if let Some(why) = why {
-        note_why(why);
-    }
+    note(format!("{path}: {why}"), detail);
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
+    note(why, None);
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note(cause: String, detail: Option<String>) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops
         .get_or_insert_with(HashMap::new)
-        .entry(why)
+        .entry((cause, detail))
         .or_default() += 1;
 }
 
-/// The drops counted since the last call, most first (diagnostics).
+/// The drops counted since the last call (diagnostics): first each cause's
+/// total ("by cause: <cause>"), most first, so that the frame report's
+/// first lines add up to every drop; then the causes that have details
+/// (shaders), one entry per detail ("<cause>: <detail>"), most first. An
+/// entry of the second kind is part of one of the first.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
-    // Frame reports only show the first 40 reasons. Keep ties ordered so
-    // a HashMap iteration order change cannot change which reasons appear.
-    drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    drops
+    by_cause(drops.into_iter().flatten())
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn by_cause(drops: impl Iterator<Item = (DropKey, u64)>) -> Vec<(String, u64)> {
+    let mut causes: HashMap<String, u64> = HashMap::new();
+    let mut details = Vec::new();
+    for ((cause, detail), n) in drops {
+        *causes.entry(cause.clone()).or_default() += n;
+        if let Some(detail) = detail {
+            details.push((format!("{cause}: {detail}"), n));
+        }
+    }
+    let mut causes: Vec<(String, u64)> = causes
+        .into_iter()
+        .map(|(cause, n)| (format!("by cause: {cause}"), n))
+        .collect();
+    // Frame reports only show the first 40 lines. Keep ties ordered so a
+    // HashMap iteration order change cannot change which ones appear.
+    let order = |a: &(String, u64), b: &(String, u64)| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+    causes.sort_unstable_by(order);
+    details.sort_unstable_by(order);
+    causes.extend(details);
+    causes
 }
 
 /// The stage's container, if it has one.
@@ -610,6 +693,39 @@ mod tests {
         assert_eq!(
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
+        );
+    }
+
+    /// The frame report's drops: each cause's total first (they add up to
+    /// every drop), then the details of the causes that have some.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn drops_come_by_cause_then_by_detail() {
+        let entry = |cause: &str, detail: Option<&str>, n| {
+            ((cause.to_owned(), detail.map(str::to_owned)), n)
+        };
+        let drops = super::by_cause(
+            [
+                entry("mesh dispatch: refused, wave64", Some("[mesh a]"), 3),
+                entry("mesh dispatch: refused, wave64", Some("[mesh b]"), 5),
+                entry("indirect kind 0 (draw): rectangles", None, 6),
+                entry("dispatch: being made", None, 1),
+                entry("dispatch: does not translate", Some("compute c"), 2),
+            ]
+            .into_iter(),
+        );
+        let lines: Vec<(&str, u64)> = drops.iter().map(|(w, n)| (w.as_str(), *n)).collect();
+        assert_eq!(
+            lines,
+            [
+                ("by cause: mesh dispatch: refused, wave64", 8),
+                ("by cause: indirect kind 0 (draw): rectangles", 6),
+                ("by cause: dispatch: does not translate", 2),
+                ("by cause: dispatch: being made", 1),
+                ("mesh dispatch: refused, wave64: [mesh b]", 5),
+                ("mesh dispatch: refused, wave64: [mesh a]", 3),
+                ("dispatch: does not translate: compute c", 2),
+            ]
         );
     }
 

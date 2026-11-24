@@ -11,6 +11,9 @@
 //! so a list of thousands of garbage records cannot run for seconds
 //! either.
 //!
+//! Indirect rectangle-list draws follow the clamp with an expansion on the
+//! GPU ([`crate::rectangles`]).
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
@@ -152,6 +155,28 @@ pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
     gpu: u64,
+    spec: (u32, u32, u32),
+) -> bool {
+    if !clamp_uav(list, gpu, spec) {
+        return false;
+    }
+    // SAFETY: an open list and a live buffer the caller's list holds.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(
+            buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )])
+    };
+    true
+}
+
+/// As [`bound`], leaving the records in unordered access, their writes
+/// done (a barrier): for a pass of ours that reads them next
+/// ([`crate::rectangles`]).
+pub(crate) fn clamp_uav(
+    list: &HostList,
+    gpu: u64,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
@@ -173,14 +198,7 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.ResourceBarrier(&[uav_barrier()]);
     }
     true
 }
