@@ -110,6 +110,10 @@ enum Command {
         /// Validate the translations of every Nth record only.
         #[arg(long, value_name = "N")]
         validate_every: Option<usize>,
+        /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
+        /// NVIDIA, 32-64 for AMD RDNA). Default: any wave size.
+        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
+        host_lanes: Option<(u32, u32)>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -188,8 +192,15 @@ fn main() -> Result<()> {
             json,
             validate,
             validate_every,
+            host_lanes,
             jobs,
-        } => survey::run(pack, json, validate_every.or(validate.then_some(1)), jobs),
+        } => survey::run(
+            pack,
+            json,
+            validate_every.or(validate.then_some(1)),
+            jobs,
+            host_lanes,
+        ),
         Command::Run {
             exe,
             unimplemented,

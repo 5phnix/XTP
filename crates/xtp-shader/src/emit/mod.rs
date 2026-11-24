@@ -178,6 +178,16 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+
+    /// The wave size the shader requires (`WaveSize`), as its `PSV0`
+    /// says; `None` when it runs in waves of any size.
+    pub fn wave_size(&self) -> Option<u32> {
+        let c = Container::parse(&self.dxil).ok()?;
+        let psv = c.part(FourCC::PSV0)?.data;
+        let at = |o: usize| crate::dxbc::u32_at(psv, o).ok();
+        let (min, max) = (at(4 + 16)?, at(4 + 20)?);
+        (min == max).then_some(min)
+    }
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -979,6 +989,23 @@ mod tests {
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());
         assert!(emit_for(&wave32, RDNA).is_ok());
+    }
+
+    #[test]
+    fn the_wave_size_a_translation_requires_is_read_from_its_psv0() {
+        let lane_read = [0xD760_0000, 0x0001_0B00, 0x7E02_0200, 0xBF81_0000];
+        let wave = |words: &[u32], wave64: bool, target: Target| {
+            emit_for(&compute(words, wave64), target)
+                .unwrap()
+                .wave_size()
+        };
+        assert_eq!(wave(&lane_read, true, RDNA), Some(64));
+        // The console wave as two 32-lane halves.
+        assert_eq!(wave(&lane_read, true, NVIDIA), Some(32));
+        assert_eq!(wave(&lane_read, false, NVIDIA), Some(32));
+        // Code reading no other lane runs in waves of any size.
+        let own = [0x7E02_0300, 0xBF81_0000];
+        assert_eq!(wave(&own, true, NVIDIA), None);
     }
 
     #[test]
