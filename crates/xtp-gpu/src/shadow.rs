@@ -165,6 +165,62 @@ impl Drop for Mirror {
 /// The bytes of all snapshot mirrors held (for the copystat line).
 pub(crate) static MIRRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether a finished snapshot leaves its mirror to the copy's next ones:
+/// unless `XTP_SNAPSHOT_MIRRORS=0`, which gives each snapshot fresh memory
+/// as before (without the old pool's merges), to time the two.
+/// `XTP_SNAPSHOT_MIRRORS=ab[:<lines>]` (diagnostics) alternates them within
+/// one run, switching every `<lines>` copystat lines (3 by default; kept
+/// first), each line measuring one way ([`mirror_phase`]).
+pub(crate) fn mirrors_kept() -> bool {
+    mirror_setting();
+    !FRESH.load(Ordering::Relaxed)
+}
+
+/// Each snapshot in fresh memory (`XTP_SNAPSHOT_MIRRORS=0`, or this phase
+/// of an A/B run).
+static FRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `XTP_SNAPSHOT_MIRRORS`, read once: the lines of an A/B phase (0: no A/B).
+fn mirror_setting() -> usize {
+    static SETTING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let value = std::env::var("XTP_SNAPSHOT_MIRRORS").unwrap_or_default();
+        let value = value.trim();
+        let lines = match value.split_once(':') {
+            _ if value == "0" => {
+                FRESH.store(true, Ordering::Relaxed);
+                0
+            }
+            Some(("ab", n)) => n.trim().parse().unwrap_or(3).max(1),
+            None if value == "ab" => 3,
+            _ => 0,
+        };
+        if lines > 0 || value == "0" {
+            tracing::info!(value, "snapshot mirrors");
+        }
+        lines
+    })
+}
+
+/// For the copystat line, once per line: how the line's snapshots were
+/// made (`kept`, `fresh`, the line's place in its A/B phase), then the next
+/// line's way.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn mirror_phase() -> String {
+    static LINE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let lines = mirror_setting();
+    let way = if mirrors_kept() { "kept" } else { "fresh" };
+    if lines == 0 {
+        return way.into();
+    }
+    let line = LINE.fetch_add(1, Ordering::Relaxed);
+    let place = line % lines;
+    if place + 1 == lines {
+        FRESH.store((line / lines).is_multiple_of(2), Ordering::Relaxed);
+    }
+    format!("{way}, A/B line {} of {lines}", place + 1)
+}
+
 /// A submission's snapshot of a copy ([`Shadow::writing`]).
 struct Before {
     submission: u64,
@@ -513,9 +569,14 @@ impl Shadow {
                 .iter()
                 .position(|b| b.submission == submission)
         {
-            // Its mirror serves the copy's next snapshots.
+            // Its mirror serves the copy's next snapshots (unless each is to
+            // have fresh memory).
             let done = snapshots.live.swap_remove(i);
-            snapshots.spare.push(done.mirror);
+            if mirrors_kept() {
+                snapshots.spare.push(done.mirror);
+            } else {
+                snapshots.spare.clear();
+            }
         }
         written
     }

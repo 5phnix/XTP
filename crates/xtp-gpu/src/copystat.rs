@@ -156,7 +156,7 @@ pub(crate) fn log(frames: f64) {
          unchanged; {:.1} fallbacks; {:.0} guard faults; guard {:.2} ms, {:.0} view queries, \
          {:.0} protection changes, {:.0} unmapped blocks skipped; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed; snapshots {:.0} over {:.1} MB in \
-         {:.2} ms, {:.1} mirrors made ({:.1} MB; {:.0} MB held)",
+         {:.2} ms, {:.1} mirrors made ({:.1} MB; {:.0} MB held; mirrors {})",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -201,6 +201,7 @@ pub(crate) fn log(frames: f64) {
         c[C::Mirrors as usize],
         mb(c[C::MirrorBytes as usize]),
         crate::shadow::MIRRORS.load(Relaxed) as f64 / 1e6,
+        crate::shadow::mirror_phase(),
     );
     // With `XTP_COPYBACK_CENSUS`: what the CPU touches of what came back.
     crate::shadow::census::log(frames);
