@@ -27,7 +27,7 @@ What each part does today and what it still needs:
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
 | Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
+| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog, text and SSML narration with installed Windows voices | Narration returns an empty WAVE for blank text or when Windows cannot produce audio. The dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads with trigger rumble, keyboard, keyboard and mouse as a pad (keys by place, mouse as the right stick) | Trigger rumble and the mouse are untested in play |
