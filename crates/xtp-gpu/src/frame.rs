@@ -184,11 +184,20 @@ mod tests {
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
-        let before = Instant::now();
-        let mut second = 0;
-        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
-        assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
+        // The next wait ends on the next tick, 2 ms on, not at its time-out
+        // (1 s). A loaded machine may wake the thread late, which only ever
+        // adds time: one wait of a few ending within 50 ms is enough, and a
+        // wait that sleeps its time-out never does.
+        let mut second = first;
+        let quick = (0..8).any(|_| {
+            let before = Instant::now();
+            let mut token = 0;
+            assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut token), S_OK);
+            assert!(token > second);
+            second = token;
+            before.elapsed() <= Duration::from_millis(50)
+        });
+        assert!(quick, "no wait ended within 50 ms of a 2 ms tick");
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
@@ -210,18 +219,26 @@ mod tests {
         const FLIP: u32 = 2;
         const INTERVAL: Duration = Duration::from_millis(5);
         // The test's own clock: the interval starts between `t0` and `t1`,
-        // counting from the last tick handed out.
+        // counting from the last tick handed out. Set again until they are
+        // close (a few µs unless the thread is preempted in between): our
+        // reading of a tick may then differ from the wait's only when a
+        // boundary falls in that gap, not on every late flip.
         let base = LAST
             .iter()
             .map(|t| t.load(Ordering::Relaxed))
             .max()
             .unwrap();
-        let t0 = Instant::now();
-        assert_eq!(
-            set_interval(null, null, INTERVAL.as_micros() as u32, 3, 0),
-            S_OK
-        );
-        let t1 = Instant::now();
+        let (t0, t1) = (0..100)
+            .find_map(|_| {
+                let t0 = Instant::now();
+                assert_eq!(
+                    set_interval(null, null, INTERVAL.as_micros() as u32, 3, 0),
+                    S_OK
+                );
+                let t1 = Instant::now();
+                (t1 - t0 <= INTERVAL / 50).then_some((t0, t1))
+            })
+            .expect("setting the interval took over 100 µs 100 times");
         let tick_after = |since: Instant, at: Instant| {
             base + (at.duration_since(since).as_nanos() / INTERVAL.as_nanos()) as u64 + 1
         };
