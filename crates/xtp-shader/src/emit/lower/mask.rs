@@ -70,7 +70,11 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if m == Bool::FALSE {
+        // Per lane, a mask from a join resolved to a constant is that
+        // constant only in the lanes here: a loop's exit mask is "no lane"
+        // in every lane still in the loop, and holds the lanes that left.
+        let resolved = !self.console_cf && self.x.st.resolved.contains(&lo);
+        if m == Bool::FALSE && !resolved {
             // No lane anywhere: 0 whoever holds the mask.
             return Ok(self.s.m.i32(0));
         }
@@ -93,7 +97,7 @@ impl<'a> Lower<'a> {
         if self.split {
             return Err("a lane mask read whole in a wave64 program split in halves");
         }
-        if !self.x.st.active.contains(&lo) {
+        if resolved || !self.x.st.active.contains(&lo) {
             // Lanes of the mask are in other blocks (lanes that left a
             // loop, say), so no ballot here holds them. In compute the
             // console flow has the mask: every lane runs every block there.

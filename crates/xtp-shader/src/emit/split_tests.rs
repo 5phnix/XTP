@@ -1434,8 +1434,100 @@ const LOOP_EXIT_COUNT: &[u32] = &[
     0x7E04_0209, // v_mov_b32 v2, s9
 ];
 
+/// [`LOOP_EXIT_COUNT`] in wave32, for groups of 32: every lane ends with
+/// 32. Per lane, each lane counted the lanes of its own last iteration,
+/// itself alone (1), on every host: the exit mask's join at the loop header
+/// is "no lane" in every lane still in the loop, so the mask looked like
+/// one the lanes there hold whole.
+const LOOP_EXIT_COUNT_32: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xBE8A_0380, // s_mov_b32 s10, 0
+    0x4A02_0281, // 8: v_add_nc_u32 v1, 1, v1
+    0x7D88_0101, // v_cmp_gt_u32 vcc_lo, v1, v0
+    0x880A_0A6A, // s_or_b32 s10, vcc_lo, s10
+    0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
+    0x8A7E_0A7E, // s_andn2_b32 exec_lo, exec_lo, s10
+    0xBF89_FFFA, // s_cbranch_execnz -> 8
+    0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+    0x7E04_0209, // v_mov_b32 v2, s9
+];
+
+/// [`program`] in wave32.
+fn program_wave32(body: &[u32], threads: u32) -> crate::NativeProgram {
+    let mut p = program(body, threads);
+    p.wave64 = false;
+    p
+}
+
+/// The form `p` is lowered in for each of [`HOSTS`] (what
+/// [`super::last_module_summary`] ends with): `flows[n]` for `HOSTS[n]`.
+fn assert_flows(label: &str, p: &crate::NativeProgram, flows: [&str; 2]) {
+    for (target, flow) in HOSTS.into_iter().zip(flows) {
+        emit_for(p, target).unwrap_or_else(|e| panic!("{label}, {target:?}: {e}"));
+        let summary = super::last_module_summary();
+        assert!(
+            summary.ends_with(&format!("; {flow}")),
+            "{label}, {target:?}: {flow} wanted: {summary}"
+        );
+    }
+}
+
+/// Without a device: the exit mask read inside the loop takes the console
+/// flow on every host, in wave64 (in halves without 64-lane waves) and in
+/// wave32. A host with 64-lane waves lowered the wave64 form per lane, and
+/// every host the wave32 one.
+#[test]
+fn a_loop_exit_mask_read_as_data_takes_the_console_flow_on_every_host() {
+    let halves = ["console flow in halves", "console flow"];
+    assert_flows("wave64", &program(LOOP_EXIT_COUNT, 64), halves);
+    let whole = ["console flow", "console flow"];
+    assert_flows("wave32", &program_wave32(LOOP_EXIT_COUNT_32, 32), whole);
+    // A mask read as data that no join feeds stays per lane where the host
+    // runs the console's wave.
+    let body = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let split = ["console flow in halves", "per lane"];
+    assert_flows("vcc counted", &program(&body, 64), split);
+}
+
+/// The exit mask's join read itself, before the loop adds this iteration's
+/// lanes (the mask starts as EXEC and 0, so it is a lane mask from the
+/// start): per lane it is "no lane", the constant the join resolves to,
+/// which was read as 0 without asking whether the lanes that left are in
+/// it. Lane t runs t + 1 iterations; at the last one, lanes 0 to 62 have
+/// left, so every lane ends with 63. It takes the console flow too.
+const LOOP_EXIT_JOIN_COUNT: &[u32] = &[
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x878A_807E, // s_and_b64 s[10:11], exec, 0
+    0xBE89_100A, // 8: s_bcnt1_i32_b64 s9, s[10:11]
+    0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+    0x7D88_0101, // v_cmp_gt_u32 vcc, v1, v0
+    0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+    0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+    0xBF89_FFFA, // s_cbranch_execnz -> 8
+    0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    0x7E04_0209, // v_mov_b32 v2, s9
+];
+
+#[test]
+fn a_loop_exit_join_read_as_data_is_not_taken_for_no_lane() {
+    let halves = ["console flow in halves", "console flow"];
+    assert_flows("join counted", &program(LOOP_EXIT_JOIN_COUNT, 64), halves);
+}
+
 #[test]
 #[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn a_loop_exit_mask_read_inside_the_loop_counts_the_lanes_that_left() {
+    let halves = ["console flow in halves", "console flow"];
+    assert_flows("wave64", &program(LOOP_EXIT_COUNT, 64), halves);
     console_flow_case("loop exit mask counted inside", LOOP_EXIT_COUNT, 64, |_| 64);
+    assert_flows("join", &program(LOOP_EXIT_JOIN_COUNT, 64), halves);
+    console_flow_case("loop exit join counted", LOOP_EXIT_JOIN_COUNT, 64, |_| 63);
+    let whole = ["console flow", "console flow"];
+    let p = program_wave32(LOOP_EXIT_COUNT_32, 32);
+    assert_flows("wave32", &p, whole);
+    program_case("wave32 loop exit mask counted inside", &p, |_| 32, true);
 }

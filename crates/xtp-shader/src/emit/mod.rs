@@ -122,14 +122,34 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// every lane of a full-screen pass still costs (2^14 times a 4K screen is
 /// about 10^11 iterations); a lower value shows whether such loops are what
 /// makes a frame slow. The default cuts short a legitimate loop of more
-/// than 16,384 iterations per lane, which then gives a wrong result; a
-/// higher value (the old default was `0x100000`) shows whether a wrong
-/// result comes from that, at the risk of the watchdog removing the device.
-/// The value is part of the translation, so the shader cache must key on it
-/// (`xtp-gpu`'s does).
+/// than 16,384 iterations per lane that is no counted loop (counted loops
+/// have [`counted_loop_limit`]), which then gives a wrong result; a higher
+/// value (the old default was `0x100000`) shows whether a wrong result
+/// comes from that, at the risk of the watchdog removing the device. The
+/// switch sets the counted loops' limit too. The value is part of the
+/// translation, so the shader cache must key on it (`xtp-gpu`'s does).
 pub fn loop_limit() -> u32 {
-    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| parse_loop_limit(std::env::var("XTP_SHADER_LOOP_LIMIT").ok().as_deref()))
+    limit_override().unwrap_or(lower::LOOP_LIMIT)
+}
+
+/// The counted loops' limit without an override: 2^20 (see
+/// `lower::COUNTED_LOOP_LIMIT`).
+pub const DEFAULT_COUNTED_LOOP_LIMIT: u32 = lower::COUNTED_LOOP_LIMIT;
+
+/// The iteration count after which a counted loop (an induction variable
+/// compared with a bound the loop does not change, see `lower/flow.rs`) is
+/// left: [`DEFAULT_COUNTED_LOOP_LIMIT`], or `XTP_SHADER_LOOP_LIMIT` when
+/// set, like [`loop_limit`] (so the shader cache's key on that covers it).
+pub(crate) fn counted_loop_limit() -> u32 {
+    limit_override().unwrap_or(DEFAULT_COUNTED_LOOP_LIMIT)
+}
+
+/// `XTP_SHADER_LOOP_LIMIT`'s value, read once.
+fn limit_override() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_limit_override(std::env::var("XTP_SHADER_LOOP_LIMIT").ok().as_deref())
+    })
 }
 
 /// The spin-wait limit under the default loop limit: 4096.
@@ -148,19 +168,23 @@ pub(crate) fn spin_limit() -> u32 {
     DEFAULT_SPIN_LIMIT.min(loop_limit())
 }
 
-/// `XTP_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
-/// unreadable or 0. Pure, for testing.
-fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
+/// `XTP_SHADER_LOOP_LIMIT`'s value; none when it is unset, unreadable or
+/// 0. Pure, for testing.
+fn parse_limit_override(value: Option<&str>) -> Option<u32> {
+    value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
-        });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
-    }
+        })
+        .filter(|&n| n > 0)
+}
+
+/// The loop limit `XTP_SHADER_LOOP_LIMIT`'s value gives (see
+/// [`parse_limit_override`]).
+#[cfg(test)]
+fn parse_loop_limit(value: Option<&str>) -> u32 {
+    parse_limit_override(value).unwrap_or(lower::LOOP_LIMIT)
 }
 
 /// A translated shader and what the host binds for it.
@@ -262,9 +286,23 @@ impl Default for Target {
 
 /// A diagnostic: what the module this thread emitted last declares and
 /// calls (thread-group size, wave size, `dx.op` operations), for reports of
-/// a module the validator refuses. Nothing of the console program is in it.
+/// a module the validator refuses, and the form its program was lowered in
+/// (`; per lane`, `; console flow`, with ` in halves` where a console wave64
+/// runs as two host waves of 32). Nothing of the console program is in it.
 pub fn last_module_summary() -> String {
-    shader::last_summary()
+    let flow = LAST_FLOW.get();
+    let summary = shader::last_summary();
+    if flow.is_empty() {
+        summary
+    } else {
+        format!("{summary}; {flow}")
+    }
+}
+
+thread_local! {
+    /// The form of the program [`emit_for`] translated last on this thread
+    /// (see [`last_module_summary`]); empty after a failure.
+    static LAST_FLOW: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -375,6 +413,7 @@ pub fn emit_for(
     res: &resource::Resources,
     target: Target,
 ) -> Result<HostShader, ShaderError> {
+    LAST_FLOW.set("");
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -482,6 +521,7 @@ pub fn emit_for(
         }
         l => l?,
     };
+    LAST_FLOW.set(l.flow);
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -606,15 +646,21 @@ mod tests {
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
         assert_eq!(LOOP_LIMIT, 16_384);
-        // Spin waits never get more than the general limit.
+        // Spin waits never get more than the general limit, counted loops
+        // the old one.
         const { assert!(super::DEFAULT_SPIN_LIMIT <= LOOP_LIMIT) };
+        assert_eq!(super::DEFAULT_COUNTED_LOOP_LIMIT, 1 << 20);
         assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
         assert_eq!(parse_loop_limit(Some("4096")), 4096);
         assert_eq!(parse_loop_limit(Some(" 0x1000 ")), 4096);
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+            assert_eq!(super::parse_limit_override(Some(bad)), None, "{bad:?}");
         }
+        // Without the switch the counted loops keep their own limit.
+        assert_eq!(super::parse_limit_override(None), None);
+        assert_eq!(super::parse_limit_override(Some("0x10")), Some(16));
     }
     use super::container::SigElement;
     use super::shader::Shader;

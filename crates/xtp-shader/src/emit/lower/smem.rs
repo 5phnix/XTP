@@ -13,6 +13,10 @@ use crate::ir::{Inst, Reg, Value};
 use crate::native::ResourceType;
 use crate::resource::{Address, CODE, Role, Site, Source};
 
+/// What a descriptor dword with no host value (an address, a format,
+/// tiling) holds as data: [`Lower::descriptor_data`] rebuilds only sizes.
+pub(super) const DESCRIPTOR_WORD: Why = "a descriptor's address or format read as data";
+
 impl<'a> Lower<'a> {
     pub(super) fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
@@ -69,28 +73,14 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
-            }
-            return Ok(());
-        }
-        let h = self.handle(site, src, false, (13, 0x1_0000))?;
+        // Through a descriptor that differs between lanes, lanes outside
+        // EXEC skip the load (see `scalar_guard`) and read 0.
+        let guard = if self.lane_descriptor(src) {
+            self.scalar_guard(site.0, site.1)?
+        } else {
+            None
+        };
+        let srv = matches!(kind, Some(u) if u.kind == ResourceType::Srv);
         let constant = match addr {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
@@ -99,35 +89,64 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
-        let mut rows: HashMap<u32, V> = HashMap::new();
-        for k in 0..count {
-            let x = match constant {
-                Some(base) => {
-                    let byte = base + 4 * k;
-                    let row = match rows.get(&(byte >> 4)) {
-                        Some(&r) => r,
-                        None => {
-                            let ri = self.s.m.i32(byte >> 4);
-                            let r = self.s.op(
-                                c,
-                                "cbufferLoadLegacy.i32",
-                                Attr::ReadOnly,
-                                self.s.t.cbuf_ret,
-                                59,
-                                &[h, ri],
-                            );
-                            rows.insert(byte >> 4, r);
-                            r
-                        }
-                    };
-                    self.s.m.extract(c, row, (byte >> 2) & 3)
+        let xs = self.guarded_load(guard, |l| {
+            let c = l.cur;
+            let mut xs = Vec::new();
+            if srv {
+                let h = l.handle(site, src, false, (11, 0))?;
+                for k in 0..count {
+                    let off = l.s.m.i32(4 * k);
+                    let a = l.s.m.bin(c, Bin::Add, addr, off);
+                    let mask = l.s.m.i8(1);
+                    let (u, al) = (l.s.m.undef(l.s.t.i32), l.s.m.i32(4));
+                    let r = l.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        l.s.t.res_ret,
+                        139,
+                        &[h, a, u, mask, al],
+                    );
+                    let x = l.s.m.extract(c, r, 0);
+                    xs.push(l.as_int(x));
                 }
-                None => {
-                    let off = self.s.m.i32(4 * k);
-                    let a = self.s.m.bin(c, Bin::Add, addr, off);
-                    self.cbuffer_dword(h, a)
-                }
-            };
+                return Ok(xs);
+            }
+            let h = l.handle(site, src, false, (13, 0x1_0000))?;
+            let mut rows: HashMap<u32, V> = HashMap::new();
+            for k in 0..count {
+                let x = match constant {
+                    Some(base) => {
+                        let byte = base + 4 * k;
+                        let row = match rows.get(&(byte >> 4)) {
+                            Some(&r) => r,
+                            None => {
+                                let ri = l.s.m.i32(byte >> 4);
+                                let r = l.s.op(
+                                    c,
+                                    "cbufferLoadLegacy.i32",
+                                    Attr::ReadOnly,
+                                    l.s.t.cbuf_ret,
+                                    59,
+                                    &[h, ri],
+                                );
+                                rows.insert(byte >> 4, r);
+                                r
+                            }
+                        };
+                        l.s.m.extract(c, row, (byte >> 2) & 3)
+                    }
+                    None => {
+                        let off = l.s.m.i32(4 * k);
+                        let a = l.s.m.bin(c, Bin::Add, addr, off);
+                        l.cbuffer_dword(h, a)
+                    }
+                };
+                xs.push(x);
+            }
+            Ok(xs)
+        })?;
+        for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -146,7 +165,7 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     pub(super) fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
+        const OTHER: Why = DESCRIPTOR_WORD;
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -162,6 +181,17 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
+        // Dwords only accesses through the descriptor read: nothing to
+        // rebuild, no query (through a per-lane index it would need a guard).
+        let dwords: Vec<Option<Value>> = (0..count)
+            .map(|k| inst.write(Reg::S(code + k as u8)))
+            .collect();
+        if !dwords.iter().flatten().any(|v| self.data_reads.contains(v)) {
+            for v in dwords.into_iter().flatten() {
+                self.vals.insert(v, Val::Missing(OTHER));
+            }
+            return Ok(());
+        }
         // How the program uses the descriptor tells the view's kind: its
         // own uses, else those of a twin load of the same dwords (a
         // non-uniform index reloads the descriptor in each waterfall loop,
@@ -229,9 +259,11 @@ impl<'a> Lower<'a> {
             }
             None => {
                 // An image the program only measures (it reads the size
-                // bits; other programs sample it): eight dwords are an image
-                // descriptor, taken here as a 2D texture. Not where the
-                // table's resource entry says another kind or a four-dword
+                // bits; other programs sample it): an eight-dword SRV entry
+                // of the table is an image descriptor, taken here as a 2D
+                // texture. Not where no entry says what the descriptor is
+                // (the handle would declare a texture over a view of any
+                // kind), nor where it says another kind or a four-dword
                 // descriptor (two buffers loaded at once).
                 // shortcut: a 3D or array image reads depth or layers 1, and
                 // the heap holds a view of another dimension than the 2D one
@@ -240,74 +272,73 @@ impl<'a> Lower<'a> {
                     load: site,
                     first: 0,
                 };
-                let other = self
+                let image = self
                     .used_kind(&src)
-                    .is_some_and(|u| u.kind != ResourceType::Srv || u.dwords != 8);
-                if count != 8 || other {
+                    .is_some_and(|u| u.kind == ResourceType::Srv && u.dwords == 8);
+                if count != 8 || !image {
                     return Err("a descriptor read only as data");
                 }
                 (0, src, (2, 0x409), Some(2), false)
             }
         };
-        let h = if !self.x.res.waterfall.loads.contains(&site) && self.reads_lane_own(site) {
-            // Its offset is a waterfall loop's first-lane read, which is each
-            // lane's own value: a heap index per lane.
-            let index = self.heap_index(site, first, false)?;
-            self.s.heap_handle(self.cur, index, false, true, props)
+        // A heap index per lane where the load's offset is a waterfall
+        // loop's first-lane read (each lane's own value) or the load is
+        // the loop's own: lanes outside EXEC skip the query then (see
+        // `scalar_guard`).
+        let own = !self.x.res.waterfall.loads.contains(&site) && self.reads_lane_own(site);
+        let guard = if own || self.lane_descriptor(&src) {
+            self.scalar_guard(site.0, site.1)?
         } else {
-            self.handle(site, &src, false, props)?
+            None
         };
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
-            self.s.m.i32(0)
-        } else {
-            self.s.m.undef(i32t)
-        };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
-        let words: Vec<(u32, V)> = match image {
-            Some(kind) => {
-                let one = self.s.m.i32(1);
-                let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
-                };
-                let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
-                let (w, height, depth, levels) = (
-                    less(self, w),
-                    less(self, height),
-                    less(self, depth),
-                    less(self, levels),
-                );
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k30, k2, k14, k16, mask) = (
-                    k(self, 30),
-                    k(self, 2),
-                    k(self, 14),
-                    k(self, 16),
-                    k(self, 0x3FFF),
-                );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
-                let hi = self.s.m.bin(c, Bin::LShr, w, k2);
-                let hi = self.s.m.bin(c, Bin::And, hi, mask);
-                let ht = self.s.m.bin(c, Bin::Shl, height, k14);
-                let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
-                let base = k(self, 0xFAC | ty << 28);
-                let last = self.s.m.bin(c, Bin::Shl, levels, k16);
-                let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
-            }
-            None => vec![(2, field(self, 0))],
-        };
+        let rels: &[u32] = if image.is_some() { &[1, 2, 3, 4] } else { &[2] };
+        let xs = self.guarded_load(guard, |l| {
+            let h = if own {
+                let index = l.heap_index(site, first, false)?;
+                l.s.heap_handle(l.cur, index, false, true, props)
+            } else {
+                l.handle(site, &src, false, props)?
+            };
+            let c = l.cur;
+            let i32t = l.s.t.i32;
+            let dims = l.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let mip = if image.is_some() && !uav {
+                l.s.m.i32(0)
+            } else {
+                l.s.m.undef(i32t)
+            };
+            let d =
+                l.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
+            let Some(kind) = image else {
+                return Ok(vec![field(l, 0)]);
+            };
+            let one = l.s.m.i32(1);
+            let w = field(l, 0);
+            let (height, depth) = match kind {
+                1 => (one, one),
+                2 => (field(l, 1), one),
+                6 => (one, field(l, 1)),
+                _ => (field(l, 1), field(l, 2)),
+            };
+            let levels = if uav { one } else { field(l, 3) };
+            let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+            let (w, height, depth, levels) =
+                (less(l, w), less(l, height), less(l, depth), less(l, levels));
+            let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+            let (k30, k2, k14, k16, mask) = (k(l, 30), k(l, 2), k(l, 14), k(l, 16), k(l, 0x3FFF));
+            let d1 = l.s.m.bin(c, Bin::Shl, w, k30);
+            let hi = l.s.m.bin(c, Bin::LShr, w, k2);
+            let hi = l.s.m.bin(c, Bin::And, hi, mask);
+            let ht = l.s.m.bin(c, Bin::Shl, height, k14);
+            let d2 = l.s.m.bin(c, Bin::Or, hi, ht);
+            let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+            let base = k(l, 0xFAC | ty << 28);
+            let last = l.s.m.bin(c, Bin::Shl, levels, k16);
+            let d3 = l.s.m.bin(c, Bin::Or, base, last);
+            Ok(vec![d1, d2, d3, depth])
+        })?;
+        let words: Vec<(u32, V)> = rels.iter().copied().zip(xs).collect();
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
@@ -549,20 +580,34 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Lowered, Parts, lower};
     use crate::emit::tests::{compute, emit_for};
     use crate::native::{ComputeIo, ResourceType, RootParam, RootType, StageIo, UsedResource};
+    use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
-    /// A wave32 compute program with a table at s0 whose entries are
-    /// `kind` descriptors of `dwords` dwords (`stride` for buffers), and
-    /// 512 bytes of LDS.
-    fn translate(
-        words: &[u32],
+    fn entry(
         kind: ResourceType,
+        table_offset_dwords: u32,
         dwords: u8,
         stride: u32,
-    ) -> Result<(), crate::ShaderError> {
+    ) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride,
+            dwords,
+            user_data: 0,
+            slot: 0,
+        }
+    }
+
+    /// A wave32 compute program with a table at s0 holding the entries
+    /// `used`, and 512 bytes of LDS.
+    fn program(words: &[u32], used: Vec<UsedResource>) -> crate::NativeProgram {
         let mut p = compute(words, false);
         p.layout = vec![RootParam {
             root: RootType::Table,
@@ -572,21 +617,51 @@ mod tests {
             user_data: 0,
             slot: 0,
         }];
-        p.used = vec![UsedResource {
-            kind,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride,
-            dwords,
-            user_data: 0,
-            slot: 0,
-        }];
+        p.used = used;
         p.io = StageIo::Cs(ComputeIo {
             rsrc2: 1 << 15 | 1 << 1,
             threads: [64, 1, 1],
         });
+        p
+    }
+
+    /// [`program`] with one entry: `kind` descriptors of `dwords` dwords
+    /// (`stride` for buffers).
+    fn translate(
+        words: &[u32],
+        kind: ResourceType,
+        dwords: u8,
+        stride: u32,
+    ) -> Result<(), crate::ShaderError> {
+        let p = program(words, vec![entry(kind, 0, dwords, stride)]);
         emit_for(&p, crate::emit::Target::ANY).map(|_| ())
+    }
+
+    /// The lowering (per lane, for any host) of [`program`] in groups of 32.
+    fn lowered(words: &[u32], used: Vec<UsedResource>) -> Result<Lowered, crate::ShaderError> {
+        let mut native = program(words, used);
+        native.io = StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [32, 1, 1],
+        });
+        let p = ir::build(&native.code, false, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            target: crate::emit::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
+        })
     }
 
     fn only_data(r: Result<(), crate::ShaderError>) -> bool {
@@ -623,6 +698,99 @@ mod tests {
                 "{kind:?}, {dwords}"
             );
         }
+        // Nor where no entry says what the descriptor is: the texture the
+        // handle declared could be a view of any kind.
+        let p = program(&words, vec![]);
+        assert!(only_data(
+            emit_for(&p, crate::emit::Target::ANY).map(|_| ())
+        ));
+    }
+
+    /// The console compiler's waterfall over a buffer descriptor (as
+    /// `resource::tests::WATERFALL_INDEXED_WAVE32` over an image): each
+    /// lane's entry at byte (lane & 1) * 32 of the table at s0, loaded into
+    /// s[12:15] at the first active lane's offset (s20) for a structured
+    /// load, and again into s[28:31] at `twin_offset` for its record count
+    /// (s30, dword 2), which each lane adds to what it loaded; the result
+    /// goes to the buffer at dword 16 of the table. `first_lane_again`
+    /// reads the offset into s22 a second time first.
+    fn waterfall_twin(first_lane_again: bool) -> Vec<u32> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x360E_0081, // v_and_b32 v7, 1, v0
+            0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            0x7E28_0507, // 0x28: v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        ];
+        if first_lane_again {
+            words.push(0x7E2C_0507); // v_readfirstlane_b32 s22, v7
+        }
+        let twin = if first_lane_again {
+            0x2C00_0000 // s22
+        } else {
+            0x2800_0000 // s20
+        };
+        words.extend([
+            0xF408_0302,
+            0x2800_0000, // s_load_dwordx4 s[12:15], s[4:5], s20
+            0xF408_0702,
+            twin,        // s_load_dwordx4 s[28:31], s[4:5], s20 or s22
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_2000,
+            0x8003_0C00, // buffer_load_dword v12, v0, s[12:15], 0 idxen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A18_181E, // v_add_nc_u32 v12, s30, v12
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            if first_lane_again {
+                0xBF89_FFF2 // s_cbranch_execnz -> 0x28
+            } else {
+                0xBF89_FFF3 // s_cbranch_execnz -> 0x28
+            },
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    fn waterfall_entries() -> Vec<UsedResource> {
+        vec![
+            entry(ResourceType::Srv, 0, 4, 4),
+            entry(ResourceType::Uav, 16, 4, 0),
+        ]
+    }
+
+    /// The twin load reads its offset from the loop's first-lane read, so
+    /// each lane has its own descriptor there: its record count comes from
+    /// a heap index per lane, and the lanes outside EXEC (those whose
+    /// descriptor another round takes) skip that query, as they skip the
+    /// load through the loop's own descriptor.
+    #[test]
+    fn a_twin_with_a_lanes_own_offset_is_queried_only_in_exec() {
+        let l = lowered(&waterfall_twin(false), waterfall_entries()).unwrap();
+        // The structured load and the twin's query (the loop's own load is
+        // read by the access only: no query).
+        assert_eq!(l.nonuniform_handles, 2);
+        assert_eq!(l.scalar_guards, 1);
+    }
+
+    /// The twin reads the offset with a second `v_readfirstlane_b32` of the
+    /// same VGPR (each waterfall loop reads the index anew): it is still
+    /// the loop's load, and takes its view. Its own offset is no compared
+    /// first-lane read, so its query is the whole wave's.
+    #[test]
+    fn a_twin_reading_the_first_lane_again_takes_the_loads_view() {
+        let l = lowered(&waterfall_twin(true), waterfall_entries()).unwrap();
+        assert_eq!(l.nonuniform_handles, 1);
+        assert_eq!(l.scalar_guards, 0);
     }
 
     /// A buffer descriptor loaded twice, the first load used by a
