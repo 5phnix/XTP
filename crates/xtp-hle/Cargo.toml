@@ -34,9 +34,9 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Input_XboxController",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Pads' trigger motors (`modules::gameinput::triggers`); diagnostics builds
-# add what recording our own audio needs (`modules::audio::capture`).
-windows = { workspace = true, features = ["Gaming_Input"] }
+# Trigger motors (`modules::gameinput::triggers`) and Windows accessibility
+# settings (`modules::speech::captions`). Diagnostics adds `modules::audio::capture`.
+windows = { workspace = true, features = ["Gaming_Input", "Media_ClosedCaptioning", "UI_ViewManagement"] }
 # `#[implement]` names it.
 windows-core = { workspace = true, optional = true }
 
