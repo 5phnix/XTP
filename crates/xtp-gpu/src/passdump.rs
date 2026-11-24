@@ -4,11 +4,15 @@
 //! title renders to or writes at every present, instead of the title's
 //! image, stretched over a 1920×1080 image of ours (the window's). The
 //! selector is
-//! - `<width>x<height>[:f<format>][:<n>]`: the `n`-th texture (from 0) of
-//!   that size, and host format if given, that the frame writes (as a render
-//!   target, depth or through unordered access), in first-write order. The
+//! - `<width>x<height>[:f<format>][:<n>][@<program>]`: the `n`-th texture
+//!   (from 0) of that size, and host format if given, that the frame writes
+//!   (as a render target, depth or through unordered access), in
+//!   first-write order, through an op of that program (16 hex digits) if
+//!   given; once shown, the same texture stays while frames write it. The
 //!   formats are the host's, as `XTP_DUMP_TARGETS`' file names give them:
-//!   `1280x720:f62` is the world's R8_UINT street of `frame-1009-282`;
+//!   `1280x720:f62` is the world's R8_UINT street of `frame-1009-282`,
+//!   `1280x720:f28@f0c91b4d2578f5bf` the RGBA8 target the material resolve
+//!   writes;
 //! - `0x<address>`: the title resource at that address (addresses change
 //!   from run to run).
 //!

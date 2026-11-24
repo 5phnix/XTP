@@ -50,6 +50,8 @@ repository. Times are local (UTC+1) unless a log line says otherwise.
   the lighting rectangles, the sky compute and the sky dome draws alike.
   With stride's run-time views switched on (`XTP_RUN_TIME_VIEWS=1`), the
   world's first frame never completes (§6.2, stride's task).
+- **Suite (§8).** The open question, the lead (the sky's view LUTs), the
+  scene colour's writers, what is set aside and the exact commands.
 - **The 3D world on screen, unlit (§6.2, worldlight-18).**
   `XTP_PRESENT_TARGET=1280x720:f28@f0c91b4d2578f5bf` shows the material
   resolve's RGBA8 G-buffer target in the window: the game's street moving.
@@ -389,3 +391,149 @@ write the plane after a shader wrote the twin are overwritten by the pass
 when the list closes; in worldlight-10, with twins made eagerly, one
 D32S8 depth read 0.9994 everywhere after a mesh pass, not seen with
 lazy twins in worldlight-11); multisampled textures' views stay null.
+
+## 8. Suite: where the next worker picks this up
+
+What lands with this analysis: the R9G9B9E5 views (§5), the depth twins
+(§6.1, on by default, `XTP_DEPTH_TWINS=0` turns them off), the per-pass
+view and `XTP_PRESENT_TARGET` (§3). What does not: the lit image. The
+world's presented frames are still black.
+
+### 8.1 The open question
+
+Every pass that writes the scene colour leaves it at exactly 0: the
+lighting rectangles, the sky compute, the sky dome draws, the volume
+apply and the last compute before FidelityFX alike. The sampled values
+are 0, not NaN (the per-pass view counts NaN and infinities apart, §3).
+Other RGBA16F targets the same frames write through unordered access do
+hold values (the 960×540 one `51e19585b4753814` writes, the 384×384 light
+textures), so typed writes to RGBA16F work in general. The common cause is
+not known. Programs of very different kinds all write 0 to the same
+texture, so look first for an input or a state they share, not at one
+shader.
+
+### 8.2 The scene colour's writers
+
+worldlight-15, frame 1349 (`E:\xtp-data\runs\worldlight-15\passes-1349.txt`,
+build 02cef68, stride's switches at 0): the scene colour is the 1280×720
+RGBA16F (host format 10) texture that FidelityFX's stand-in upscales
+(`grep "FidelityFX bilinear upscale"` names it as `color:`). Its seven
+writers, in order:
+
+| Pass | Programs | What it is |
+|---|---|---|
+| P247 | compute `f0c91b4d2578f5bf` (one 160×90 dispatch) | material resolve: writes the G-buffer UAVs (RGBA8 street, R8, the classes' depth through its twin) and the scene colour |
+| P403 | compute `348e1e8c414c7eca` (11 dispatches) | the sky: reads the depth, the exposure buffer, the transmittance LUT and two 192×108 R9G9B9E5 views (`0xac4e00000`, `0xac4e20000`) |
+| P404 | vertex `d91fdb5004fdadf1` + pixel `3ae25b11290cadde`; vertex `6e750a37b1da6949` + pixel `d7b97830ede61511` | the sky dome and clouds, drawn (3 draws) |
+| P419 | compute `577248728544d74b` | the volume apply: reads the 480×272 R9G9B9E5 volume, writes the scene colour |
+| P421, P431 | mesh `c5ffa556ab926155` + pixel `c4a269f4eeba3cac` (4 of 17 ran, the rest "NoPipeline") | forward geometry |
+| P460 | compute `731a39171b568298` (indirect dispatch) | the last rewrite before FidelityFX: three 640×360 R9G9B9E5 views, the motion vectors (1280×720 f34) |
+
+With the stride table on (worldlight-16, frame 638, `passes-638.txt`), the
+deferred lighting rectangles run before the sky and write 0 as well:
+P319 (232 indirect rectangle draws, vertex `25ebc92075b62822`, 183 pixel
+programs, `1cd9bc634417a981` among them; depth test "equal" on the
+classes' depth), P326 (235 draws, `1d2c970773ce2183`, `e070816c3b889df0`),
+P327 (172 draws, 10 programs), P329 (11 draws, 6 programs). In
+worldlight-15's frame 1349 they do not appear at all: with the stride table
+off, the classified tiles are fewer (the G-buffer covers ~20 % of the
+screen instead of 100 %).
+
+### 8.3 The lead: the sky's view LUTs (192×108)
+
+`26b8bbb2e7ae4dc6`, one 6×54×1 dispatch (worldlight-15 P14, list 3),
+reads the multiple-scattering LUT (a 32×32 R9G9B9E5 view at `0xac4e40000`
+over a 32×32 R32 texture `545138fdb1d94e1b` writes in P12) and the
+transmittance LUT (256×64 RGB10A2, `53e3931a17a13ac5` in P11: mean 0.74,
+0.64, 0.55), and writes four unordered access views of 192×108 R32
+textures (`s1+16`, `+24`, `+32`, `+40`). The per-pass view finds two
+textures behind them: one holds packed light (1.4e9 to 1.7e9 as integers,
+the R9G9B9E5 bits), the other holds **0 in every texel**: in each of the
+nine frames dumped where the pass runs (worldlight-10, -11, -15, -19). The sky (`348e1e8c414c7eca`) reads two
+192×108 R9G9B9E5 views, 128 KiB apart, right before the 32×32 one; if one
+of them is the zero texture, the sky's light is multiplied or replaced by
+0. To do:
+1. find which view of the four lands on which texture, and which of the
+   sky's two views reads the zero one (the addresses of the R32 textures
+   are not in the op text: `note_op` prints a committed texture's size,
+   format and flags only; the alias registry knows them,
+   `resource/alias.rs`);
+2. read `26b8bbb2e7ae4dc6`'s native code (`xtp shader-info --disasm` on
+   the shader pack, then its translation): why one pair of stores writes 0
+   (a format, a store the translation drops, a mask);
+3. the decoding of R9G9B9E5 views runs once a frame, before the title's
+   next submission (`resource::run_decodes`): a view read in the same list
+   as its writer gets the previous frame's texels. One frame late, not 0,
+   but a transient texture the frame reuses may hold anything by then.
+
+### 8.4 Already set aside
+
+- Exposure: the 16-byte exposure buffer is written every frame and is not
+  0 ([1.57, 0.636, 8, 0.125] in worldlight-3, [12.07, 0.083, 8, 0.125] in
+  -16 as the auto-exposure pushes up against a black scene) (§4.3).
+- Dropped scene colour writers: none of the sky, volume and last passes is
+  dropped; the lighting rectangles all ran (232/232, 235/235, 172/172,
+  11/11) (§4.3, §8.2).
+- The R9G9B9E5 light read as R32 bits: fixed (§5), 50 views decoded a
+  session; the light textures hold light; the image is still black.
+- The material classes refused as depth UAVs: fixed (§6.1); still black.
+- Watch item 183 (the combined deferred pass and its unwritten
+  transmittance): skipping `731a39171b568298` and `577248728544d74b`
+  changes nothing (worldlight-19); the scene colour is 0 before them.
+- Cold shader caches: worldlight-13 made every pipeline ("host pipelines
+  all made", 22:06:14) and still presented no world frame; the cause was
+  `XTP_RUN_TIME_VIEWS=1` (§6.2).
+- Stride's switches: `XTP_RUN_TIME_VIEWS=1` keeps the world's first frame
+  from completing (worldlight-17; stride's task 84451453); with
+  `XTP_STRIDE_TABLE=1` alone the frames come (0.2 fps) and the G-buffer
+  covers the screen, still black (-16); both at 0, black (-15).
+- Shader surveys on the PC during worldlight-8 and -9 explain their slow
+  loads, not the twins (§6.3).
+- smemraw's branch (de9f4f3): no GPU removal in seven sessions with
+  `XTP_D3D12_DRED=1`.
+
+### 8.5 How the sessions were run
+
+The integration build: a local branch merging this branch, smemraw's
+(de9f4f3), stride's (a8f280b) and mesh-fix's (44931a5) on `main` afc81fc
+(`worldlight-big`, 02cef68; local only, never delivered). Built in the
+worktree into `target\diag`:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\xtp-data\tools\cargo-slot.ps1 build --profile diag -p xtp --features diagnostics --locked
+```
+
+A session (Series S, autopilot to the world, `--no-build`: it runs the
+worktree's `target\diag\xtp.exe`; under `measure.lock`, the PC calm, the
+capture folder made first):
+
+```
+New-Item -ItemType Directory -Force E:\xtp-data\runs\<name> | Out-Null
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\tools\stall-probe\session.ps1 -Name <name> -Worktree <worktree> -Limit 150 -Measure 40 -EnvPairs "XTP_WATCHDOG_HOOK=1;XTP_STRIDE_TABLE=0;XTP_RUN_TIME_VIEWS=0;XTP_CAPTURE=E:\xtp-data\runs\<name>;XTP_CAPTURE_WORLD=2000:5:2:10;XTP_PASS_DUMP=0"
+```
+
+- `XTP_CAPTURE_WORLD=2000:5:2:10`: two frames, ten apart, starting five
+  frames after the first that runs 2,000 draws; each gives `frame-<n>.png`
+  (the presented image) and, with `XTP_PASS_DUMP=0`, `passes-<n>.txt`
+  (every output sampled; a width instead of 0 skips narrower outputs).
+- Add `XTP_DUMP_TARGETS=1280` for every 1280-wide target at the end of
+  those frames, `XTP_D3D12_DRED=1` for GPU removals, `XTP_STACKS=40,41,…`
+  for every thread's stack at those seconds (into the session's
+  `play.err.txt`), `XTP_SKIP_PIPELINES=<hash>,<hash>` to drop programs.
+- The showcase (worldlight-18): `-Measure 60` and
+  `XTP_PRESENT_TARGET=1280x720:f28@f0c91b4d2578f5bf` (the RGBA8 target the
+  material resolve writes) instead of the pass view.
+- Results: `E:\xtp-data\runs\stall-<name>\play.out.txt` (frame rate,
+  `gameplay after`), the log `E:\xtp-data\cache\play\<time>\run.log`.
+
+Reading a pass view:
+
+```
+f=E:/xtp-data/runs/<name>/passes-<n>.txt
+# the scene colour (FidelityFX's input) and what it holds after each writer
+c=$(grep -o "FidelityFX bilinear upscale Upscale { list: 0x[0-9a-f]*, color: 0x[0-9a-f]*" $f | head -1 | grep -o "color: 0x[0-9a-f]*" | cut -d' ' -f2)
+sed -n '/== Outputs, pass by pass/,/== Ops/p' $f | awk -v c="$c" '$1==c{f=1;print;next} /^0x/{f=0} f'
+# a pass's programs and outputs, then its ops' views
+grep "^P403 L" $f
+awk -v P=P403 '/^== Ops/{o=1} o && $1==P{p=1; next} o && p && /^P[0-9]+ /{exit} o && p' $f | grep -o '"[0-9a-f]* \(Srv\|Uav\|Cbv\) [^"]*"' | sort -u
+```
