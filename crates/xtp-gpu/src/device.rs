@@ -349,11 +349,94 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// The host GPU's wave lane range (`WaveLaneCountMin`, `WaveLaneCountMax`),
 /// asked once and logged; `None` without a host device. A translation that
 /// needs the console's 64-lane waves (`WaveSize(64)`) runs only where 64 is
-/// in it (an NVIDIA GPU has 32 only); the shader cache keeps translations
-/// per range, so translations made for the host's lanes stay apart.
+/// in it (an NVIDIA GPU has 32 only); shaders are translated for it
+/// ([`host_target`]), and the shader cache keeps translations per target.
 #[cfg(windows)]
 pub fn host_wave_lanes() -> Option<(u32, u32)> {
     host_shaders().map(|s| s.lanes)
+}
+
+/// The wave sizes shaders are translated for (VIctory #223): the host's
+/// lane range ([`host_wave_lanes`]), or `XTP_HOST_LANES=<min>-<max>` (one
+/// number: both) in its place; any ([`Target::ANY`]) without a host device.
+/// On a host without 64-lane waves (NVIDIA: 32 to 32), a console wave64
+/// compute program that needs its whole wave becomes two 32-lane waves
+/// where the translator has a form for it, declaring `WaveSize(32)`.
+/// Decided once and logged, with a warning when 64-lane waves are missing.
+///
+/// The override is for tests and diagnostics: pipelines are still checked
+/// against the host's own lanes, so a target the host does not run gets
+/// its pipelines refused.
+///
+/// [`Target::ANY`]: xtp_shader::emit::Target::ANY
+#[cfg(windows)]
+pub fn host_target() -> xtp_shader::emit::Target {
+    static TARGET: std::sync::OnceLock<xtp_shader::emit::Target> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let forced = std::env::var("XTP_HOST_LANES").ok();
+        let lanes = host_wave_lanes();
+        let (target, forced) = match target_of(lanes, forced.as_deref()) {
+            Ok(target) => (target, forced.is_some()),
+            Err(text) => {
+                tracing::warn!(text, "XTP_HOST_LANES expects <min>-<max> lanes; ignored");
+                let host = target_of(lanes, None).unwrap_or(xtp_shader::emit::Target::ANY);
+                (host, false)
+            }
+        };
+        tracing::info!(
+            lanes = format_args!("{} to {}", target.lanes_min, target.lanes_max),
+            forced,
+            "shaders translated for waves of"
+        );
+        if !target.runs(64) {
+            // VIctory #439's text. Mesh programs are the pipelines' to log,
+            // by the host's own lanes (`pipeline::host::wave64_mesh_allowed`):
+            // their translations declare no wave size.
+            tracing::warn!(
+                "the host has no 64-lane waves: console wave64 compute programs that need \
+                 their whole wave run as two 32-lane waves where there is a form for them; \
+                 the rest do not translate, and their dispatches are dropped"
+            );
+        }
+        target
+    })
+}
+
+/// The target for a host with waves of `lanes` (min, max; none: unknown),
+/// or for `forced` (`<min>-<max>`, or one number) in their place; the
+/// forced text back if it is not a range of powers of two from 4 to 128.
+#[cfg(windows)]
+pub(crate) fn target_of(
+    lanes: Option<(u32, u32)>,
+    forced: Option<&str>,
+) -> Result<xtp_shader::emit::Target, String> {
+    use xtp_shader::emit::Target;
+    let Some(text) = forced else {
+        return Ok(match lanes {
+            Some((min, max)) if min > 0 && min <= max => Target {
+                lanes_min: min,
+                lanes_max: max,
+            },
+            _ => Target::ANY,
+        });
+    };
+    let lane = |n: &str| {
+        n.trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
+    };
+    let (min, max) = match text.split_once('-') {
+        Some((min, max)) => (lane(min), lane(max)),
+        None => (lane(text), lane(text)),
+    };
+    match (min, max) {
+        (Some(min), Some(max)) if min <= max => Ok(Target {
+            lanes_min: min,
+            lanes_max: max,
+        }),
+        _ => Err(text.to_owned()),
+    }
 }
 
 /// The host GPU's highest shader model, as (major, minor); `None` without a
@@ -613,6 +696,29 @@ mod tests {
         eprintln!("host waves: {min} to {max} lanes, shader model {model:?}");
         assert!(min.is_power_of_two() && max.is_power_of_two() && 4 <= min && min <= max);
         assert!(model >= (6, 0));
+    }
+
+    /// Translations are made for the host's lanes, or for the forced ones:
+    /// WARP's 4 to 4 forced to an NVIDIA host's 32 to 32.
+    #[cfg(windows)]
+    #[test]
+    fn the_target_is_the_hosts_lanes_or_the_forced_ones() {
+        use xtp_shader::emit::Target;
+        let lanes = |lanes_min, lanes_max| Target {
+            lanes_min,
+            lanes_max,
+        };
+        assert_eq!(target_of(Some((32, 32)), None), Ok(lanes(32, 32)));
+        assert_eq!(target_of(Some((32, 64)), None), Ok(lanes(32, 64)));
+        assert_eq!(target_of(Some((4, 4)), None), Ok(lanes(4, 4)));
+        assert_eq!(target_of(None, None), Ok(Target::ANY));
+        assert_eq!(target_of(Some((0, 0)), None), Ok(Target::ANY));
+        assert_eq!(target_of(Some((4, 4)), Some("32-32")), Ok(lanes(32, 32)));
+        assert_eq!(target_of(None, Some(" 64 ")), Ok(lanes(64, 64)));
+        assert_eq!(target_of(None, Some("32-64")), Ok(lanes(32, 64)));
+        for bad in ["64-32", "33", "2-4", "256", "wide", ""] {
+            assert_eq!(target_of(Some((32, 32)), Some(bad)), Err(bad.to_owned()));
+        }
     }
 
     #[test]
