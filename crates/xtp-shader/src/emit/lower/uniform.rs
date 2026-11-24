@@ -1040,3 +1040,307 @@ fn support_given(bools: &Bools, b: Bool, known: &HashMap<Atom, bool>) -> Vec<Ato
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native::{MeshIo, NativeProgram, RootParam, RootType, StageIo};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+    /// `exp prim, v9, off, off, off done`.
+    const EXP_PRIM: [u32; 2] = [0xF800_0941, 0x0000_0009];
+    /// `v_mbcnt_lo_u32_b32 v0, -1, 0`: the lane number (below 32).
+    const LANE: [u32; 2] = [0xD765_0000, 0x0001_00C1];
+    const S_MOV_S4_7: u32 = 0xBE84_0387; // s_mov_b32 s4, 7
+    const V_MOV_V1_S4: u32 = 0x7E02_0204; // v_mov_b32 v1, s4
+    const RFL_S5_V1: u32 = 0x7E0A_0501; // v_readfirstlane_b32 s5, v1
+
+    /// A wave64 mesh program of two console waves (128 lanes): `words`,
+    /// then a primitive export; user SGPR 0 holds a descriptor table.
+    fn mesh(words: &[u32]) -> NativeProgram {
+        let mut code: Vec<u32> = words.to_vec();
+        code.extend(EXP_PRIM);
+        code.push(S_ENDPGM);
+        NativeProgram {
+            stage: crate::HwStage::Ms,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: Vec::new(),
+            io: StageIo::Ms(MeshIo {
+                outputs: Vec::new(),
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// The program of `words` ([`mesh`]) and its analysis.
+    fn analyse(words: &[u32]) -> (Program, Uniformity) {
+        let native = mesh(words);
+        let p = crate::ir::build(&native.patched_code(), true, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let u = Uniformity::of(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 128,
+            target: crate::emit::Target {
+                lanes_min: 32,
+                lanes_max: 32,
+            },
+            console_cf: false,
+            per_lane_only: false,
+        });
+        (p, u)
+    }
+
+    /// The levels of the values the program's first-lane reads read, in
+    /// code order.
+    fn first_lanes(words: &[u32]) -> Vec<Level> {
+        let (p, u) = analyse(words);
+        let mut reads: Vec<(usize, Value)> = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == "v_readfirstlane_b32")
+            .map(|i| (i.machine.offset, i.writes[0].1))
+            .collect();
+        reads.sort();
+        reads
+            .into_iter()
+            .map(|(_, w)| {
+                let l = u.first_lane(w).expect("analysed");
+                // The read's result is the console wave's either way.
+                assert_eq!(u.level(w), l.min(Level::Wave));
+                l
+            })
+            .collect()
+    }
+
+    /// The control level of each block holding an `s_barrier`, in code
+    /// order.
+    fn barriers(words: &[u32]) -> Vec<Level> {
+        let (p, u) = analyse(words);
+        let mut out: Vec<(usize, Level)> = Vec::new();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for i in block.insts.iter().filter(|i| i.name() == "s_barrier") {
+                out.push((i.machine.offset, u.control(b)));
+            }
+        }
+        out.sort();
+        out.into_iter().map(|(_, l)| l).collect()
+    }
+
+    /// Constants, the group id and what they compute are the group's; the
+    /// console wave's index is its wave's; the lane number is the lane's.
+    #[test]
+    fn inputs_and_what_they_compute() {
+        let lane = [&LANE[..], &[0x7E0A_0500]].concat(); // v_readfirstlane_b32 s5, v0
+        assert_eq!(first_lanes(&lane), [Level::Lane]);
+        let words = [
+            0x7E04_0505, // v_readfirstlane_b32 s2, v5 (the group id)
+            S_MOV_S4_7,
+            V_MOV_V1_S4,
+            RFL_S5_V1,
+            0x7E04_0203, // v_mov_b32 v2, s3 (the merged wave info)
+            0x7E0C_0502, // v_readfirstlane_b32 s6, v2
+        ];
+        assert_eq!(
+            first_lanes(&words),
+            [Level::Group, Level::Group, Level::Wave]
+        );
+        // With the lane number added, the value is the lane's.
+        let mixed = [
+            &LANE[..],
+            &[
+                S_MOV_S4_7,
+                0x4A02_0004, // v_add_nc_u32 v1, s4, v0
+                RFL_S5_V1,
+            ],
+        ]
+        .concat();
+        assert_eq!(first_lanes(&mixed), [Level::Lane]);
+    }
+
+    /// A lane bit selected from compares of the group's values is the
+    /// group's (BTP 6's validity flags of its mesh counts); from a lane's
+    /// compare, the lane's.
+    #[test]
+    fn selects_on_masks_take_the_masks_level() {
+        let uniform = [
+            S_MOV_S4_7,
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0x8580_807E, // s_cselect_b64 s[0:1], exec, 0
+            0xD501_0001,
+            0x0001_0280, // v_cndmask_b32 v1, 0, 1, s[0:1]
+            RFL_S5_V1,
+        ];
+        assert_eq!(first_lanes(&uniform), [Level::Group]);
+        let lane = [
+            &LANE[..],
+            &[
+                0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+                0xD501_0001,
+                0x01A9_0280, // v_cndmask_b32 v1, 0, 1, vcc
+                RFL_S5_V1,
+            ],
+        ]
+        .concat();
+        assert_eq!(first_lanes(&lane), [Level::Lane]);
+    }
+
+    /// After a branch lanes take differently, a register one side writes is
+    /// the lane's where the sides meet; after a scalar branch, the group's.
+    /// A write under a narrowed EXEC with no branch (a guard) is the lane's
+    /// too.
+    #[test]
+    fn joins_and_guards() {
+        let lane_branch = [
+            &LANE[..],
+            &[
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+                0xBF88_0001, // s_cbranch_execz +1
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+                RFL_S5_V1,
+            ],
+        ]
+        .concat();
+        assert_eq!(first_lanes(&lane_branch), [Level::Lane]);
+        let scalar_branch = [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            S_MOV_S4_7,
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0x7E02_0281, // v_mov_b32 v1, 1
+            RFL_S5_V1,
+        ];
+        assert_eq!(first_lanes(&scalar_branch), [Level::Group]);
+        let guard = [
+            &LANE[..],
+            &[
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+                RFL_S5_V1,
+            ],
+        ]
+        .concat();
+        assert_eq!(first_lanes(&guard), [Level::Lane]);
+    }
+
+    /// A scalar counted in a loop: the group's after it where every lane
+    /// leaves at the same iteration, the lane's where each leaves at its
+    /// own; inside the loop, the group's either way.
+    #[test]
+    fn loops_lanes_leave_apart() {
+        let uniform = [
+            0xBE84_0380, // s_mov_b32 s4, 0
+            // loop:
+            0x8104_8104, // s_add_i32 s4, s4, 1
+            0xBF0A_8404, // s_cmp_lt_u32 s4, 4
+            0xBF85_FFFD, // s_cbranch_scc1 loop
+            V_MOV_V1_S4,
+            RFL_S5_V1,
+        ];
+        assert_eq!(first_lanes(&uniform), [Level::Group]);
+        let apart = [
+            &LANE[..],
+            &[
+                0xBE84_0380, // s_mov_b32 s4, 0
+                0xBE8A_047E, // s_mov_b64 s[10:11], exec
+                // loop:
+                0x8104_8104, // s_add_i32 s4, s4, 1
+                V_MOV_V1_S4,
+                RFL_S5_V1,   // every lane still looping has the same s4
+                0x7D82_0004, // v_cmp_lt_u32 vcc, s4, v0
+                0x8AFE_6A7E, // s_andn2_b64 exec, exec, vcc
+                0xBF89_FFFA, // s_cbranch_execnz loop
+                0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+                0x7E04_0204, // v_mov_b32 v2, s4
+                0x7E0C_0502, // v_readfirstlane_b32 s6, v2
+            ],
+        ]
+        .concat();
+        assert_eq!(first_lanes(&apart), [Level::Group, Level::Lane]);
+    }
+
+    /// Memory the program writes may change between the loads of two host
+    /// waves: a load at the group's address is the group's only in a
+    /// program without stores.
+    #[test]
+    fn loads_of_memory_the_program_writes() {
+        let load = [
+            0xBE82_0308, // s_mov_b32 s2, s8 (user SGPR 0 of a mesh program)
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xE030_1000,
+            0x8001_0103, // buffer_load_dword v1, v3, s[4:7], 0 offen
+            0x7E18_0501, // v_readfirstlane_b32 s12, v1
+        ];
+        assert_eq!(first_lanes(&load), [Level::Group]);
+        let store = [
+            &load[..],
+            &[
+                0xE070_1000,
+                0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+            ],
+        ]
+        .concat();
+        assert_eq!(first_lanes(&store), [Level::Lane]);
+    }
+
+    /// A barrier in a block only some lanes enter is not reached by the
+    /// whole group; one where the sides have met again is, and so is one
+    /// behind a branch on the group's values.
+    #[test]
+    fn barriers_where_lanes_branch_apart() {
+        let words = [
+            &LANE[..],
+            &[
+                0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+                0xBF88_0001, // s_cbranch_execz +1
+                0xBF8A_0000, // s_barrier
+                0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+                0xBF8A_0000, // s_barrier
+            ],
+        ]
+        .concat();
+        assert_eq!(barriers(&words), [Level::Lane, Level::Group]);
+        let scalar = [
+            S_MOV_S4_7,
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBF8A_0000, // s_barrier
+            0xBF8A_0000, // s_barrier
+        ];
+        assert_eq!(barriers(&scalar), [Level::Group, Level::Group]);
+    }
+}

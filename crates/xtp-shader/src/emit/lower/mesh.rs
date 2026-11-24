@@ -233,7 +233,8 @@ impl<'a> Lower<'a> {
         }
         let arr = self.s.m.array(2 * waves, self.s.t.i32);
         let g = self.s.m.global("first_lane", arr, 3);
-        self.s.lds_dwords = own + 2 * waves;
+        // (LDS the program allocates but never accesses has no array.)
+        self.s.lds_dwords = if ds.is_empty() { 0 } else { own } + 2 * waves;
         self.xchg = Some(g);
         Ok(g)
     }
