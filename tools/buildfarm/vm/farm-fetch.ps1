@@ -19,29 +19,39 @@ Test-FarmSlotName $req.slot
 $slotDir = Join-Path $Root "w\$($req.slot)"
 if (-not (Test-Path $slotDir)) { Write-FarmErr "no slot $($req.slot) on $env:COMPUTERNAME"; exit 2 }
 
-$paths = @(@($req.paths) | Where-Object { $_ })
+$paths = @(@($req.paths) | Where-Object { $_ } | ForEach-Object { "$_" })
 if ($req.artifacts) {
     $state = Join-Path $Root "state\$($req.slot).artifacts.json"
     if (Test-Path $state) {
-        foreach ($exe in @(Get-Content -Raw $state | ConvertFrom-Json)) {
-            if (-not $exe) { continue }
+        foreach ($exe in @(ConvertFrom-FarmJsonArray (Get-Content -Raw $state))) {
+            $exe = "$exe"
             $paths += $exe
             if ($req.pdb) {
-                $pdb = [IO.Path]::ChangeExtension($exe, '.pdb')
+                $pdb = [IO.Path]::ChangeExtension($exe, '.pdb').Replace('\', '/')
                 # rustc names the .pdb with underscores for a crate with dashes.
                 $alt = (Split-Path -Parent $pdb).Replace('\', '/') + '/' + ((Split-Path -Leaf $pdb) -replace '-', '_')
                 foreach ($p in $pdb, $alt) {
-                    if ((Test-Path (Join-Path $slotDir $p)) -and $paths -notcontains $p) { $paths += $p; break }
+                    if (Test-Path (Join-Path $slotDir $p)) { $paths += $p; break }
                 }
             }
         }
     }
 }
 
-$items = @()
+# Each file once (XTP_FARM_FETCH may name an executable the build brings
+# back anyway).
+$seen = @{}
+$unique = @()
 foreach ($p in $paths) {
     $rel = "$p".Replace('\', '/').TrimStart('/')
-    if ($rel -match '(^|/)\.\.(/|$)' -or $rel -match '^[A-Za-z]:') { Write-FarmErr "refusing path $p"; exit 2 }
+    if ($seen.ContainsKey($rel.ToLowerInvariant())) { continue }
+    $seen[$rel.ToLowerInvariant()] = $true
+    $unique += $rel
+}
+
+$items = @()
+foreach ($rel in $unique) {
+    if ($rel -match '(^|/)\.\.(/|$)' -or $rel -match '^[A-Za-z]:') { Write-FarmErr "refusing path $rel"; exit 2 }
     $full = Join-Path $slotDir ($rel -replace '/', '\')
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { Write-FarmErr "no file $rel in slot $($req.slot)"; exit 2 }
     $items += [pscustomobject]@{

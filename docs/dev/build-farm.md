@@ -66,7 +66,10 @@ comes. A run that exceeds `maxRunMinutes` (120) is stopped (exit 124).
 executables the build produced (and their `.pdb`) into your worktree's
 `target`, but only those that differ from your local copy (compared by
 SHA-256). So `cargo-slot.ps1 build --profile diag -p xtp` still leaves an
-up-to-date `target\diag\xtp.exe` for a game run. For other files:
+up-to-date `target\diag\xtp.exe` for a game run. If fetching fails after a
+successful build, the command fails with the reason and how to fetch again
+(`--farm-fetch`); it is never built again elsewhere or on the PC. For other
+files:
 
 ```powershell
 # after any successful command
@@ -366,6 +369,7 @@ disks, images, Cloud NAT and firewall rule, nothing else.
 | `Update-FarmPrices.ps1` | list prices from the Cloud Billing Catalog |
 | `Update-FarmAgent.ps1` | push the agent to running VMs |
 | `Remove-Farm.ps1` | delete the farm |
+| `Test-Farm.ps1` | offline checks of the helpers; `-Live`: a diagnostics build of `xtp` on the farm must bring `target\diag\xtp.exe` and its `.pdb` back |
 | `FarmCommon.ps1` | the PC side's shared code |
 | `vm\setup-toolchain.ps1` | toolchain installation (image builder's startup script) |
 | `vm\farm-agent.ps1` | boot tasks and the idle watcher |

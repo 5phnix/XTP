@@ -184,6 +184,17 @@ function Test-FarmGoingAway {
     $false
 }
 
+# The elements of a JSON array. Windows PowerShell's ConvertFrom-Json writes
+# an array as one object, so `@($json | ConvertFrom-Json)` is a one-element
+# array holding the array: callers use `@(ConvertFrom-FarmJsonArray $json)`.
+function ConvertFrom-FarmJsonArray([string] $Json) {
+    if (-not $Json -or -not $Json.Trim()) { return }
+    $value = ConvertFrom-Json -InputObject $Json
+    foreach ($e in @($value)) {
+        if ($null -ne $e) { $e }
+    }
+}
+
 function ConvertFrom-FarmBase64([string] $Text) {
     [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Text)) | ConvertFrom-Json
 }

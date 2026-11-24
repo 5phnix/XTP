@@ -1228,6 +1228,17 @@ function ConvertTo-FarmBase64($Object) {
     [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Object -Depth 8 -Compress)))
 }
 
+# The elements of a JSON array. Windows PowerShell's ConvertFrom-Json writes
+# an array as one object, so `@($json | ConvertFrom-Json)` is a one-element
+# array holding the array: callers use `@(ConvertFrom-FarmJsonArray $json)`.
+function ConvertFrom-FarmJsonArray([string] $Json) {
+    if (-not $Json -or -not $Json.Trim()) { return }
+    $value = ConvertFrom-Json -InputObject $Json
+    foreach ($e in @($value)) {
+        if ($null -ne $e) { $e }
+    }
+}
+
 # Copies files of a slot (paths relative to the worktree) into the worktree,
 # only those that differ. With -Artifacts, the executables the slot's last
 # build produced (and their .pdb unless XTP_FARM_FETCH_PDB=0).
@@ -1238,10 +1249,10 @@ function Receive-FarmFiles {
     $cmd = 'powershell -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -File C:\farm\bin\farm-fetch.ps1 ' + (ConvertTo-FarmBase64 $q)
     $r = Invoke-FarmSsh -Config $Config -Vm $Vm -Command $cmd -Capture
     if ($r.ExitCode -ne 0) { Write-FarmMessage "cannot list files to fetch on ${Vm}: $($r.Err.Trim())"; return $r.ExitCode }
-    $items = @($r.Out | ConvertFrom-Json)
+    $items = @(ConvertFrom-FarmJsonArray $r.Out)
     $need = @()
     foreach ($it in $items) {
-        if (-not $it) { continue }
+        if (-not $it -or -not ($it.path -is [string])) { throw "build farm: unexpected file list from ${Vm}: $($r.Out)" }
         $local = Join-Path $Worktree.Top $it.path
         if ((Test-Path -LiteralPath $local) -and (Get-Item -LiteralPath $local).Length -eq [int64] $it.size -and (Get-FarmFileHash $local) -eq $it.sha256) { continue }
         $need += $it
@@ -1377,8 +1388,19 @@ function Invoke-FarmJob {
                         $wt.Name, $sel.vm, $sel.slot, $what, $code, $secs, ((Get-Date) - $tRun).TotalSeconds, $bundle.Size,
                     (($stepList | ForEach-Object { 'cargo ' + ($_.args -join ' ') }) -join ' ; '))
                 if ($code -eq 0 -and ($CollectBinaries -or $Fetch)) {
-                    $f = Receive-FarmFiles -Config $Config -Vm $sel.vm -Slot $sel.slot -Worktree $wt -Paths $Fetch -Artifacts:$CollectBinaries
-                    if ($f -ne 0) { $code = $f }
+                    # The build is done: a failed fetch is reported, never a
+                    # reason to build again elsewhere or on the PC.
+                    try {
+                        $f = @(Receive-FarmFiles -Config $Config -Vm $sel.vm -Slot $sel.slot -Worktree $wt -Paths $Fetch -Artifacts:$CollectBinaries)[-1]
+                    } catch {
+                        Write-FarmMessage "the build succeeded on $($sel.vm), but fetching its files failed: $($_.Exception.Message)"
+                        Write-FarmLog $Config "fetch from $($sel.vm)/$($sel.slot) failed for $($wt.Name): $($_.Exception.Message)"
+                        $f = 1
+                    }
+                    if ($f -ne 0) {
+                        Write-FarmMessage "files not brought back; retry with: cargo-remote.ps1 --farm-fetch <path> (from $($sel.vm) slot $($sel.slot))"
+                        $code = $f
+                    }
                 }
                 Write-FarmMessage ('{0} finished in {1:N0} s, exit {2}' -f $sel.vm, ((Get-Date) - $t0).TotalSeconds, $code)
                 return $code
