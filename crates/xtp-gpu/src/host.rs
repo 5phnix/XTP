@@ -555,8 +555,9 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
     prelude: Mutex<Prelude>,
-    /// The pipelines the list binds, for reports of slow submissions.
-    pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The pipelines the list binds, for reports of slow submissions:
+    /// shared with its submissions ([`Recorded`]), a reset starts a new set.
+    pipelines: Mutex<std::sync::Arc<std::collections::BTreeSet<String>>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
@@ -567,9 +568,10 @@ pub(crate) struct HostList {
     /// timeline by a reset: its recording since uses none of theirs.
     fresh_after: AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
-    /// data without marker texts), with the host GPU range a copy reads.
+    /// data without marker texts), with the host GPU range a copy reads:
+    /// shared like `pipelines`.
     #[cfg(feature = "diagnostics")]
-    notes: Mutex<Vec<Note>>,
+    notes: Mutex<std::sync::Arc<Vec<Note>>>,
     /// With `XTP_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -586,6 +588,16 @@ impl Drop for HostList {
 
 /// A closed prelude list and its allocator.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// What a submission keeps of a list's recording for its reports (slow
+/// submissions, device removal): a reset while it runs starts the list's
+/// next recording afresh without taking them from it.
+#[derive(Clone, Default)]
+struct Recorded {
+    pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
+    #[cfg(feature = "diagnostics")]
+    notes: std::sync::Arc<Vec<Note>>,
+}
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -798,6 +810,8 @@ impl ListRef {
 /// What is left of a submission once the GPU has run it.
 struct Pending {
     lists: Vec<ListRef>,
+    /// Each list's recording as submitted.
+    recorded: Vec<Recorded>,
     /// Its number in the host copies (`shadow::submission`).
     submission: u64,
     /// The destinations of its GPU buffer copies (host copy, address,
@@ -869,6 +883,7 @@ impl Pending {
         (touches.shaders, touches.copies) = (through(&back), through(&copied));
         let pending = Pending {
             lists: runs.iter().map(|&l| ListRef(l)).collect(),
+            recorded: runs.iter().map(|l| l.recorded()).collect(),
             submission,
             copied,
             back,
@@ -1116,10 +1131,11 @@ impl Host {
             };
             if let Err(e) = signalled {
                 // Nothing would finish it.
+                let recorded: Vec<Recorded> = runs.iter().map(|l| l.recorded()).collect();
                 fail(format_args!(
                     "a host submission of {} lists was not signalled ({e}){}",
                     runs.len(),
-                    self.removal_data(runs)
+                    self.removal_data(runs, &recorded)
                 ));
             }
             #[cfg(feature = "diagnostics")]
@@ -1288,19 +1304,20 @@ impl Host {
     fn removed(&self, finishing: Option<&Pending>) -> ! {
         static REPORTING: Mutex<()> = Mutex::new(());
         let _once = REPORTING.lock().unwrap_or_else(|e| e.into_inner());
-        let mut runs: Vec<&HostList> = finishing
-            .iter()
-            .flat_map(|p| p.lists.iter().map(|l| l.get()))
-            .collect();
-        let first = runs.len();
-        self.timeline
-            .each_work(|w| runs.extend(w.lists.iter().map(|l| l.get())));
+        let (mut runs, mut recorded): (Vec<&HostList>, Vec<Recorded>) = (Vec::new(), Vec::new());
+        let mut add = |p: &Pending| {
+            runs.extend(p.lists.iter().map(|l| l.get()));
+            recorded.extend(p.recorded.iter().cloned());
+        };
+        finishing.into_iter().for_each(&mut add);
+        let first = finishing.map_or(0, |p| p.lists.len());
+        self.timeline.each_work(add);
         fail(format_args!(
             "host GPU device removed after a submission of {first} lists ({} lists in \
              flight){}{}",
             runs.len(),
-            self.removal_data(&runs),
-            last_notes(&runs)
+            self.removal_data(&runs, &recorded),
+            last_notes(&recorded)
         ));
     }
 
@@ -1355,17 +1372,8 @@ impl Host {
         SUBMISSION_US[GPU_US].fetch_add(ran.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if ran > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = p
-                .lists
-                .iter()
-                .flat_map(|l| {
-                    l.get()
-                        .pipelines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
-                .collect();
+            let pipelines: std::collections::BTreeSet<&String> =
+                p.recorded.iter().flat_map(|r| r.pipelines.iter()).collect();
             tracing::warn!(
                 ms = ran.as_millis(),
                 lists = p.lists.len(),
@@ -1410,7 +1418,7 @@ impl Host {
     /// below it; for each list that did not finish, the command it stopped
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
-    fn removal_data(&self, runs: &[&HostList]) -> String {
+    fn removal_data(&self, runs: &[&HostList], recorded: &[Recorded]) -> String {
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
             return String::new();
         };
@@ -1480,11 +1488,14 @@ impl Host {
                         p.BreadcrumbCount, history[done as usize].0
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = runs
+                        .iter()
+                        .position(|r| Some(r.list.as_raw()) == list)
+                        .and_then(|i| recorded.get(i));
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
-                        let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+                        let notes = &r.notes;
                         history
                             .iter()
                             .enumerate()
@@ -1503,8 +1514,7 @@ impl Host {
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
                     } else if let Some(r) = run {
-                        let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-                        text.push_str(&format!(", its pipelines {pipelines:?}"));
+                        text.push_str(&format!(", its pipelines {:?}", r.pipelines));
                     }
                 }
                 plain = p.pNext;
@@ -1763,12 +1773,12 @@ impl HostList {
             }
             allocator.clone()
         };
-        self.pipelines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        // New ones: a submission in flight keeps its own (`Recorded`).
+        *self.pipelines.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            *self.notes.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        }
         // SAFETY: a closed list (D3D12 allows resetting one that still
         // runs) and an allocator nothing running uses.
         if let Err(e) = unsafe { self.list.Reset(&allocator, None) } {
@@ -1874,10 +1884,8 @@ impl HostList {
                 self.list
                     .SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            std::sync::Arc::make_mut(&mut notes).push((what, range));
         }
     }
 
@@ -1885,7 +1893,20 @@ impl HostList {
     pub(crate) fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+            std::sync::Arc::make_mut(&mut pipelines).insert(name.to_owned());
+        }
+    }
+
+    /// What a submission of the list keeps of its recording.
+    fn recorded(&self) -> Recorded {
+        Recorded {
+            pipelines: self
+                .pipelines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            #[cfg(feature = "diagnostics")]
+            notes: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
     }
 
@@ -2889,12 +2910,12 @@ impl Host {
 /// For adapters without device-removed data (the software one): the last
 /// commands each list of the failed submission noted (diagnostics, with
 /// `XTP_D3D12_DRED`).
-fn last_notes(runs: &[&HostList]) -> String {
+fn last_notes(runs: &[Recorded]) -> String {
     #[cfg(feature = "diagnostics")]
     {
         let mut text = String::new();
         for (i, r) in runs.iter().enumerate() {
-            let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+            let notes = &r.notes;
             for (n, _) in notes.iter().rev().take(6).rev() {
                 text.push_str(&format!(
                     "; list {i} of {}, of its {}: {n}",

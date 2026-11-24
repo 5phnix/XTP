@@ -633,3 +633,35 @@ fn a_panic_on_the_completion_thread_ends_the_run() {
         "{stderr}"
     );
 }
+
+/// A list reset while its submission runs leaves that submission the
+/// pipelines (and notes) of the recording it runs, for its reports of a
+/// slow submission or a removed device; the list's next recording starts
+/// afresh.
+#[test]
+fn a_reset_leaves_a_running_submission_its_recording() {
+    let test = "host::submissions::a_reset_leaves_a_running_submission_its_recording";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let list = host.new_list().unwrap();
+    list.used_pipeline("first");
+    list.close();
+    let mut gate = Gate::close(host);
+    host.execute(&[&list]);
+    list.reset();
+    list.used_pipeline("second");
+    let ours = std::ptr::from_ref(&list);
+    let mut kept: Vec<Vec<String>> = Vec::new();
+    host.timeline.each_work(|p| {
+        for (l, r) in p.lists.iter().zip(&p.recorded) {
+            if std::ptr::eq(l.0, ours) {
+                kept.push(r.pipelines.iter().cloned().collect());
+            }
+        }
+    });
+    assert_eq!(kept, [["first"]]);
+    let next: Vec<String> = list.recorded().pipelines.iter().cloned().collect();
+    assert_eq!(next, ["second"]);
+    gate.open();
+    host.drain();
+}
