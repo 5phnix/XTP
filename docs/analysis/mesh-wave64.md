@@ -430,7 +430,13 @@ captures at `E:\xtp-data\runs\frames-mesh*`. All three ran the same binary
   If a group barrier follows, the other lanes wait for it: a hang where
   the console would only have been slow. The title's mesh programs that
   keep barriers are those with LDS (5); the exchanges sit where every lane
-  runs the block. Not measured.
+  runs the block. Not measured. Since then, main's loop limits drain such
+  lanes (`lower/flow.rs`: they keep passing barriers), but not in a wave64
+  mesh program in halves (task a5ce0d66): there the first-lane exchanges
+  add barriers that the drain does not count, so this risk stands. The
+  drain's counts of ended threads are group-shared memory that the mesh
+  PSV now counts (`Shader::shared_extra`): without it, dxil.dll refused
+  every mesh program with LDS and a barrier after a loop.
 - **Cost:** each exchange is two or four group barriers. In the title the
   reads are once per group, outside loops; not measured on the 4080 yet.
 - **LDS a mesh program allocates but never accesses** makes the
