@@ -207,6 +207,19 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Microseconds title threads waited for host pipelines (graphics,
+/// compute) since the last call.
+#[cfg(windows)]
+pub(crate) fn take_wait_us() -> [u64; 2] {
+    make::take_wait_us()
+}
+
+/// The pipelines refused since the start, by reason (`None` if none was).
+#[cfg(windows)]
+pub(crate) fn refusals() -> Option<String> {
+    host::refusals()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -139,7 +139,7 @@ impl GraphicsState {
                         .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
                             SemanticName: PCSTR(name.as_ptr().cast()),
                             Format: DXGI_FORMAT(
-                                crate::resource::pc_format(e.Format.0 as u32) as i32
+                                crate::resource::pc_vertex_format(e.Format.0 as u32) as i32,
                             ),
                             ..*e
                         })
@@ -200,6 +200,49 @@ impl GraphicsState {
             self.depth_format.0,
             self.samples
         )
+    }
+
+    /// Why the host cannot make a pipeline with this state (its target,
+    /// depth and vertex formats, sample count, blending); `None` if it can.
+    pub(crate) fn refusal(&self, caps: &impl crate::resource::format::Caps) -> Option<String> {
+        use crate::resource::format::uses::*;
+        let count = self.samples.Count;
+        let targets = (self.targets.NumRenderTargets as usize).min(8);
+        for (i, f) in self.targets.RTFormats[..targets].iter().enumerate() {
+            let f = f.0 as u32;
+            if f == 0 {
+                continue;
+            }
+            let support = caps.support1(f);
+            let blend = if self.blend.IndependentBlendEnable.as_bool() {
+                self.blend.RenderTarget[i]
+            } else {
+                self.blend.RenderTarget[0]
+            };
+            if support & RENDER_TARGET == 0 {
+                return Some(format!("render target format {f}: no render targets"));
+            }
+            if blend.BlendEnable.as_bool() && support & BLENDABLE == 0 {
+                return Some(format!("render target format {f}: no blending"));
+            }
+            if !caps.samples(f, count) {
+                return Some(format!("render target format {f}: no {count} samples"));
+            }
+        }
+        let depth = self.depth_format.0 as u32;
+        if depth != 0 {
+            if caps.support1(depth) & DEPTH_STENCIL == 0 {
+                return Some(format!("depth format {depth}: no depth-stencil targets"));
+            }
+            if !caps.samples(depth, count) {
+                return Some(format!("depth format {depth}: no {count} samples"));
+            }
+        }
+        self.inputs.iter().find_map(|e| {
+            let f = e.Format.0 as u32;
+            (caps.support1(f) & VERTEX_BUFFER == 0)
+                .then(|| format!("vertex format {f}: not a vertex buffer format"))
+        })
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -282,15 +325,109 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
-/// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
+/// Pipelines that got no host pipeline since the start, by reason.
+static REFUSED: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Counts a pipeline that gets no host pipeline for `reason`; true for the
+/// first of that reason.
+fn note_refusal(reason: String) -> bool {
+    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    let n = refused.entry(reason).or_default();
+    *n += 1;
+    *n == 1
+}
+
+/// Counts a pipeline that gets no host pipeline, before any driver call;
+/// logs the first of each reason.
+fn refuse(reason: impl Into<String>, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    let reason = reason.into();
+    if note_refusal(reason.clone()) {
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
     None
+}
+
+/// The pipelines refused since the start, by reason, most first (`None`
+/// if none was).
+pub(crate) fn refusals() -> Option<String> {
+    let refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if refused.is_empty() {
+        return None;
+    }
+    let mut counts: Vec<(&String, &u64)> = refused.iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let counts: Vec<String> = counts.iter().map(|(r, n)| format!("{n} {r}")).collect();
+    Some(format!(
+        "host pipelines refused so far: {}",
+        counts.join("; ")
+    ))
+}
+
+/// What a translated shader asks of the host: the wave lanes it runs in
+/// (`PSV0`'s expected lane counts; 0 and `u32::MAX`: any) and its shader
+/// model (the `DXIL` program header's version).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Needs {
+    pub(crate) lanes: (u32, u32),
+    pub(crate) model: (u32, u32),
+}
+
+impl Needs {
+    /// What the shader in a DXIL container needs; `None` if the container
+    /// does not say.
+    pub(crate) fn of(dxil: &[u8]) -> Option<Needs> {
+        use xtp_shader::{Container, FourCC};
+        let c = Container::parse(dxil).ok()?;
+        let word = |data: &[u8], at: usize| {
+            Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))
+        };
+        let psv = c.part(FourCC::PSV0)?.data;
+        // The runtime information's size, then its stage-specific 16
+        // bytes, then the lane counts.
+        let lanes = if word(psv, 0)? >= 24 {
+            (word(psv, 20)?, word(psv, 24)?)
+        } else {
+            (0, u32::MAX)
+        };
+        let version = word(c.part(FourCC::DXIL)?.data, 0)?;
+        Some(Needs {
+            lanes,
+            model: (version >> 4 & 0xf, version & 0xf),
+        })
+    }
+
+    /// Why a host with waves of `host` lanes (min, max) and shader model
+    /// `model` cannot run it; `None` if it can.
+    pub(crate) fn refusal(&self, host: (u32, u32), model: (u32, u32)) -> Option<String> {
+        let (min, max) = self.lanes;
+        if min != 0 && (max < host.0 || min > host.1) {
+            let wanted = if min == max {
+                format!("{min}-lane waves")
+            } else {
+                format!("waves of {min} to {max} lanes")
+            };
+            return Some(format!(
+                "needs {wanted}; the host has {} to {}",
+                host.0, host.1
+            ));
+        }
+        (self.model > model).then(|| {
+            format!(
+                "needs shader model {}.{}; the host has {}.{}",
+                self.model.0, self.model.1, model.0, model.1
+            )
+        })
+    }
+}
+
+/// Why the host cannot run `shader`'s translation; `None` if it can (or the
+/// host's lanes are unknown).
+fn shader_refusal(shader: &Translated) -> Option<String> {
+    let needs = Needs::of(&shader.host.dxil)?;
+    let lanes = crate::device::host_wave_lanes()?;
+    let model = crate::device::host_shader_model()?;
+    needs.refusal(lanes, model)
 }
 
 impl HostPipeline {
@@ -332,7 +469,9 @@ impl HostPipeline {
             );
         }
         for (s, _) in &stages {
-            s.translated()?;
+            if let Some(why) = shader_refusal(s.translated()?) {
+                return refuse(format!("{} shader {why}", s.stage), shaders);
+            }
         }
         let host = host()?;
 
@@ -414,6 +553,10 @@ impl HostPipeline {
                 Ok(root) => root,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                    note_refusal(format!(
+                        "the driver refused its root signature ({})",
+                        e.code()
+                    ));
                     return None;
                 }
             };
@@ -446,6 +589,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
+                    note_refusal(format!("the driver refused it ({})", e.code()));
                     return None;
                 }
             };
@@ -465,6 +609,9 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
+        if let Some(why) = g.refusal(&crate::resource::format::HostCaps) {
+            return refuse(why, shaders);
+        }
         let state = g.describe();
         if mesh.is_some() {
             let name = super::library::name(
@@ -478,6 +625,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
+                    note_refusal(format!("the driver refused it ({})", e.code()));
                     return None;
                 }
             };
@@ -539,6 +687,7 @@ impl HostPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
+                note_refusal(format!("the driver refused it ({})", e.code()));
                 return None;
             }
         };
@@ -685,5 +834,161 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A DXIL container with a `PSV0` part (runtime information of
+    /// `info_size` bytes, the lane counts at 16) and a `DXIL` part starting
+    /// with the program version.
+    fn container(info_size: u32, lanes: (u32, u32), version: u32) -> Vec<u8> {
+        let mut psv = info_size.to_le_bytes().to_vec();
+        let mut info = vec![0u8; info_size as usize];
+        if info_size >= 24 {
+            info[16..20].copy_from_slice(&lanes.0.to_le_bytes());
+            info[20..24].copy_from_slice(&lanes.1.to_le_bytes());
+        }
+        psv.extend(info);
+        let dxil = [version.to_le_bytes(), [0; 4]].concat();
+        let parts: [(&[u8; 4], &[u8]); 2] = [(b"PSV0", &psv), (b"DXIL", &dxil)];
+        let header = 0x20 + 4 * parts.len();
+        let mut body = Vec::new();
+        let mut offsets = Vec::new();
+        for (fourcc, data) in parts {
+            offsets.push((header + body.len()) as u32);
+            body.extend(*fourcc);
+            body.extend((data.len() as u32).to_le_bytes());
+            body.extend(data);
+        }
+        let mut out = b"DXBC".to_vec();
+        out.extend([0; 16]);
+        out.extend(1u16.to_le_bytes());
+        out.extend(0u16.to_le_bytes());
+        out.extend(((header + body.len()) as u32).to_le_bytes());
+        out.extend((parts.len() as u32).to_le_bytes());
+        for o in offsets {
+            out.extend(o.to_le_bytes());
+        }
+        out.extend(body);
+        out
+    }
+
+    /// Compute shader (kind 5), shader model 6.6.
+    const CS_6_6: u32 = 5 << 16 | 6 << 4 | 6;
+
+    #[test]
+    fn wave64_programs_are_refused_on_32_lane_hosts() {
+        let wave64 = Needs::of(&container(48, (64, 64), CS_6_6)).unwrap();
+        assert_eq!(
+            wave64,
+            Needs {
+                lanes: (64, 64),
+                model: (6, 6)
+            }
+        );
+        let nvidia = (32, 32);
+        assert_eq!(
+            wave64.refusal(nvidia, (6, 8)).as_deref(),
+            Some("needs 64-lane waves; the host has 32 to 32")
+        );
+        // RDNA: 32 to 64 lanes.
+        assert_eq!(wave64.refusal((32, 64), (6, 8)), None);
+        // No wave size asked: anywhere.
+        let any = Needs::of(&container(48, (0, u32::MAX), CS_6_6)).unwrap();
+        assert_eq!(any.refusal(nvidia, (6, 8)), None);
+        // Older runtime information has no lane counts.
+        let old = Needs::of(&container(16, (64, 64), CS_6_6)).unwrap();
+        assert_eq!(old.lanes, (0, u32::MAX));
+    }
+
+    #[test]
+    fn programs_of_a_newer_shader_model_are_refused() {
+        let needs = Needs::of(&container(48, (0, u32::MAX), CS_6_6)).unwrap();
+        assert_eq!(
+            needs.refusal((32, 32), (6, 5)).as_deref(),
+            Some("needs shader model 6.6; the host has 6.5")
+        );
+        assert_eq!(needs.refusal((32, 32), (6, 6)), None);
+        assert_eq!(Needs::of(b"not a container"), None);
+    }
+
+    /// A host that renders, blends and samples only `targets`, has depth in
+    /// `depth`, vertex input in `vertex`, and 4 samples of nothing.
+    struct Fake {
+        targets: &'static [u32],
+        blend: &'static [u32],
+        depth: &'static [u32],
+        vertex: &'static [u32],
+    }
+
+    impl crate::resource::format::Caps for Fake {
+        fn support1(&self, format: u32) -> u32 {
+            use crate::resource::format::uses::*;
+            let has = |list: &[u32], bit| if list.contains(&format) { bit } else { 0 };
+            has(self.targets, RENDER_TARGET)
+                | has(self.blend, BLENDABLE)
+                | has(self.depth, DEPTH_STENCIL)
+                | has(self.vertex, VERTEX_BUFFER)
+        }
+        fn samples(&self, _: u32, count: u32) -> bool {
+            count <= 1
+        }
+    }
+
+    const HOST: Fake = Fake {
+        targets: &[28, 57],
+        blend: &[28],
+        depth: &[40],
+        vertex: &[2, 28],
+    };
+
+    fn state(targets: &[u32], depth: u32) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = targets.len() as u32;
+        for (slot, &f) in g.targets.RTFormats.iter_mut().zip(targets) {
+            slot.0 = f as i32;
+        }
+        g.depth_format = DXGI_FORMAT(depth as i32);
+        g
+    }
+
+    #[test]
+    fn graphics_states_the_host_lacks_are_refused() {
+        assert_eq!(state(&[28, 0], 40).refusal(&HOST), None);
+        assert_eq!(
+            state(&[115], 0).refusal(&HOST).as_deref(),
+            Some("render target format 115: no render targets")
+        );
+        assert_eq!(
+            state(&[28], 55).refusal(&HOST).as_deref(),
+            Some("depth format 55: no depth-stencil targets")
+        );
+        // Blending a target that cannot blend (an integer format).
+        let mut blended = state(&[28, 57], 0);
+        blended.blend.RenderTarget[0].BlendEnable = true.into();
+        assert_eq!(
+            blended.refusal(&HOST).as_deref(),
+            Some("render target format 57: no blending")
+        );
+        blended.blend.IndependentBlendEnable = true.into();
+        assert_eq!(blended.refusal(&HOST), None, "only target 0 blends");
+        let mut msaa = state(&[28], 0);
+        msaa.samples.Count = 4;
+        assert_eq!(
+            msaa.refusal(&HOST).as_deref(),
+            Some("render target format 28: no 4 samples")
+        );
+        let mut inputs = state(&[28], 0);
+        inputs.inputs.push(D3D12_INPUT_ELEMENT_DESC {
+            Format: DXGI_FORMAT(86),
+            ..Default::default()
+        });
+        assert_eq!(
+            inputs.refusal(&HOST).as_deref(),
+            Some("vertex format 86: not a vertex buffer format")
+        );
     }
 }

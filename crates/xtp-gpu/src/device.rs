@@ -346,6 +346,104 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// The host GPU's wave lane range (`WaveLaneCountMin`, `WaveLaneCountMax`),
+/// asked once and logged; `None` without a host device. A translation that
+/// needs the console's 64-lane waves (`WaveSize(64)`) runs only where 64 is
+/// in it (an NVIDIA GPU has 32 only); the shader cache keeps translations
+/// per range, so translations made for the host's lanes stay apart.
+#[cfg(windows)]
+pub fn host_wave_lanes() -> Option<(u32, u32)> {
+    host_shaders().map(|s| s.lanes)
+}
+
+/// The host GPU's highest shader model, as (major, minor); `None` without a
+/// host device.
+#[cfg(windows)]
+pub fn host_shader_model() -> Option<(u32, u32)> {
+    host_shaders().map(|s| s.model)
+}
+
+/// What the host's shaders can be.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct HostShaders {
+    lanes: (u32, u32),
+    model: (u32, u32),
+}
+
+#[cfg(windows)]
+fn host_shaders() -> Option<HostShaders> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static SHADERS: std::sync::OnceLock<Option<HostShaders>> = std::sync::OnceLock::new();
+    *SHADERS.get_or_init(|| {
+        let device = &crate::host::host()?.device;
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes its own structure of the given size.
+        unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .ok()?;
+        // The runtime answers only for models it knows: ask from the newest
+        // down.
+        let model = (D3D_SHADER_MODEL_6_0.0..=D3D_SHADER_MODEL_6_9.0)
+            .rev()
+            .find_map(|asked| {
+                let mut data = D3D12_FEATURE_DATA_SHADER_MODEL {
+                    HighestShaderModel: D3D_SHADER_MODEL(asked),
+                };
+                // SAFETY: as above.
+                let ok = unsafe {
+                    device.CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut data).cast(),
+                        size_of_val(&data) as u32,
+                    )
+                };
+                ok.is_ok().then_some(data.HighestShaderModel.0 as u32)
+            })
+            .unwrap_or(0x51);
+        let shaders = HostShaders {
+            lanes: (options.WaveLaneCountMin, options.WaveLaneCountMax),
+            model: (model >> 4, model & 0xf),
+        };
+        tracing::info!(
+            lanes = format_args!("{} to {}", shaders.lanes.0, shaders.lanes.1),
+            wave_ops = options.WaveOps.as_bool(),
+            shader_model = format_args!("{}.{}", shaders.model.0, shaders.model.1),
+            "host shaders"
+        );
+        Some(shaders)
+    })
+}
+
+/// The device's line of the frame report (every few seconds): pipeline
+/// waits per title frame since the last line, pipelines being made, and
+/// what the host refused, or made in a stand-in format, since the start.
+#[cfg(windows)]
+pub(crate) fn log_frame() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = frame::current();
+    let frames = now.saturating_sub(LAST.swap(now, Ordering::Relaxed)).max(1) as f64;
+    let [graphics, compute] = pipeline::take_wait_us().map(|us| us as f64 / 1000.0 / frames);
+    let mut line = format!(
+        "pipeline waits {graphics:.1} ms/frame graphics, {compute:.1} compute ({} being made)",
+        pipeline::making()
+    );
+    for part in [pipeline::refusals(), resource::format::report()]
+        .into_iter()
+        .flatten()
+    {
+        line.push_str("; ");
+        line.push_str(&part);
+    }
+    tracing::info!("{line}");
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -492,6 +590,20 @@ mod tests {
             assert!(fence.GetDevice(&mut device).is_ok());
             assert!(device.is_some());
         }
+    }
+
+    /// The host's wave lanes and shader model are read (32 to 32 lanes and
+    /// 6.8 on an RTX 4080).
+    #[cfg(windows)]
+    #[test]
+    fn the_hosts_wave_lanes_are_known() {
+        let (Some((min, max)), Some(model)) = (host_wave_lanes(), host_shader_model()) else {
+            eprintln!("SKIPPED the_hosts_wave_lanes_are_known: no host GPU");
+            return;
+        };
+        eprintln!("host waves: {min} to {max} lanes, shader model {model:?}");
+        assert!(min.is_power_of_two() && max.is_power_of_two() && 4 <= min && min <= max);
+        assert!(model >= (6, 0));
     }
 
     #[test]

@@ -2,8 +2,11 @@
 //!
 //! Heaps and resources are host memory and a resource's GPU address is its
 //! CPU address, as on the console; textures also get a host copy, and
-//! buffers a host copy when a draw reads them (`shadow`).
+//! buffers a host copy when a draw reads them (`shadow`). [`format`] gives
+//! the host format of each title format.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+pub(crate) mod format;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::c_void;
@@ -103,6 +106,13 @@ pub(crate) struct ResourceDesc {
 pub(crate) struct AllocationInfo {
     size: u64,
     alignment: u64,
+}
+
+impl ResourceDesc {
+    /// The title's format.
+    pub(crate) fn format(&self) -> u32 {
+        self.format
+    }
 }
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
@@ -226,9 +236,18 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     })
 }
 
-/// A format as the host has it. The console's 16-bit depth with stencil
-/// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// A title format as the host has it, for textures, views, targets and
+/// clear values: a format of [`format::TABLE`] the host lacks takes its
+/// stand-in, and [`pc_vertex_format`] applies.
 pub(crate) fn pc_format(format: u32) -> u32 {
+    use format::Caps;
+    format::HostCaps.host_format(format)
+}
+
+/// A title format as the host has it without stand-ins (vertex elements,
+/// whose bytes are the title's). The console's 16-bit depth with stencil
+/// (and its typeless views) has no PC format: the 24-bit ones stand in.
+pub(crate) fn pc_vertex_format(format: u32) -> u32 {
     match format {
         118 => 45,
         119 => 46,
@@ -237,32 +256,34 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// Format families: the typeless format first, then its typed ones.
+const FAMILIES: [(u32, u32); 22] = [
+    (1, 4),
+    (5, 8),
+    (9, 14),
+    (15, 18),
+    (19, 22),
+    (23, 25),
+    (27, 32),
+    (33, 38),
+    (39, 43),
+    (44, 47),
+    (48, 52),
+    (53, 59),
+    (60, 65),
+    (70, 72),
+    (73, 75),
+    (76, 78),
+    (79, 81),
+    (82, 84),
+    (90, 91),
+    (92, 93),
+    (94, 96),
+    (97, 99),
+];
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
-    const FAMILIES: [(u32, u32); 22] = [
-        (1, 4),
-        (5, 8),
-        (9, 14),
-        (15, 18),
-        (19, 22),
-        (23, 25),
-        (27, 32),
-        (33, 38),
-        (39, 43),
-        (44, 47),
-        (48, 52),
-        (53, 59),
-        (60, 65),
-        (70, 72),
-        (73, 75),
-        (76, 78),
-        (79, 81),
-        (82, 84),
-        (90, 91),
-        (92, 93),
-        (94, 96),
-        (97, 99),
-    ];
     match format {
         87 => 90,
         88 => 92,
@@ -271,6 +292,18 @@ pub(crate) fn family(format: u32) -> u32 {
             .find(|&&(first, last)| (first..=last).contains(&f))
             .map_or(f, |&(first, _)| first),
     }
+}
+
+/// The typed formats of a typeless format's family; `None` if `format` is
+/// not typeless.
+pub(crate) fn family_members(format: u32) -> Option<impl Iterator<Item = u32>> {
+    let &(first, last) = FAMILIES.iter().find(|&&(first, _)| first == format)?;
+    let outside = match first {
+        90 => Some(87),
+        92 => Some(88),
+        _ => None,
+    };
+    Some((first + 1..=last).chain(outside))
 }
 
 /// sRGB formats and their linear twins.
@@ -324,6 +357,16 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// Its format.
+    pub(crate) fn format(&self) -> u32 {
+        self.format
+    }
+
+    /// Its width, height and depth in texels, and its row pitch in bytes.
+    pub(crate) fn shape(&self) -> (u32, u32, u32, u32) {
+        (self.width, self.height, self.depth, self.row_pitch)
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -795,20 +838,16 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
-/// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// The host description of a title texture for a device that can do
+/// `caps`: the same description without the console's layout and flags, in
+/// the host's format. Its error says why the device cannot create it (no
+/// driver call is made then).
 #[cfg(windows)]
-fn host_texture(
+pub(crate) fn host_desc(
     desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    use windows::Win32::Graphics::Direct3D12::*;
+    caps: &impl format::Caps,
+) -> Result<ResourceDesc, String> {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
-    if desc.dimension == BUFFER {
-        return None;
-    }
-    let host = crate::host::host()?;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -822,7 +861,11 @@ fn host_texture(
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    if caps.choice(desc.format) == Some(format::Choice::Refused) {
+        return Err("no host format".into());
+    }
+    d.format = caps.host_format(d.format);
+    let typed = d.format;
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -834,6 +877,35 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    if let Some(why) = format::refusal(caps.support(d.format), d.dimension, d.flags) {
+        return Err(format!("as {}: {why}", d.format));
+    }
+    if !caps.samples(typed, d.sample_count) {
+        return Err(format!("as {typed}: no {} samples", d.sample_count));
+    }
+    Ok(d)
+}
+
+/// A host texture like the title's ([`host_desc`]), in GPU memory.
+#[cfg(windows)]
+fn host_texture(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    const PC_FLAGS: u32 = 0xf;
+    if desc.dimension == BUFFER {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let d = match host_desc(desc, &format::HostCaps) {
+        Ok(d) => d,
+        Err(why) => {
+            refuse_texture(desc, why);
+            return None;
+        }
+    };
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -864,6 +936,16 @@ fn host_texture(
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
+        let reason = format!("as {}: the driver refused it ({})", d.format, e.code());
+        format::note_refused(format!(
+            "format {} flags {:#x}: {reason}",
+            desc.format,
+            desc.flags & PC_FLAGS
+        ));
+    }
+    let stand_in = pc_format(desc.format);
+    if texture.is_some() && stand_in != pc_vertex_format(desc.format) {
+        format::note_stand_in(desc.format, stand_in);
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
@@ -874,6 +956,24 @@ fn host_texture(
         });
     }
     texture
+}
+
+/// Counts a texture the host cannot create, by its title format, flags and
+/// `why`; the first of each reason is logged with the description.
+#[cfg(windows)]
+fn refuse_texture(desc: &ResourceDesc, why: String) {
+    const PC_FLAGS: u32 = 0xf;
+    let reason = format!(
+        "format {} flags {:#x}: {why}",
+        desc.format,
+        desc.flags & PC_FLAGS
+    );
+    if format::note_refused(reason.clone()) {
+        tracing::warn!(
+            ?desc,
+            "no host texture: {reason} (refused before the driver; logged once)"
+        );
+    }
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1588,26 +1688,25 @@ mod tests {
         assert_eq!(t, u64::MAX, "no second subresource");
     }
 
-    /// A 4x4 texture filled from a title buffer through our list and queue,
-    /// then read back from the host GPU.
+    /// A 4x4 texture of `format` filled from a title buffer (rows 256 bytes
+    /// apart, `fill`ed) through our list and queue, then read back from the
+    /// host GPU: the host texture's format and its rows (256 bytes apart).
+    /// `None` without a host GPU.
     #[cfg(windows)]
-    #[test]
-    fn buffer_data_reaches_the_host_texture() {
+    fn through_a_list(format: u32, fill: impl Fn(&mut [u8])) -> Option<(u32, Vec<u8>)> {
         use windows::Win32::Graphics::Direct3D12::*;
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
+        let host = crate::host::host()?;
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
         let (mut image, mut source) = (null, null);
-        let rgba = texture(4, 4, 28, 1);
+        let desc = texture(4, 4, format, 1);
         assert_eq!(
             create_committed(
                 null,
                 &PROPERTIES,
                 0,
-                &rgba,
+                &desc,
                 COPY_DEST,
                 null.cast(),
                 iid,
@@ -1630,10 +1729,7 @@ mod tests {
         );
         let (data, _) = buffer_bytes(source).unwrap();
         // SAFETY: the buffer holds 1024 bytes.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
-        }
+        fill(unsafe { std::slice::from_raw_parts_mut(data, 1024) });
 
         let queue_iid = guid(
             0x0ec870a6,
@@ -1676,7 +1772,7 @@ mod tests {
         }
         let rows = PlacedFootprint {
             offset: 0,
-            format: 28,
+            format,
             width: 4,
             height: 4,
             depth: 1,
@@ -1732,6 +1828,8 @@ mod tests {
         }
         let readback = readback.unwrap();
         let host_image = host_resource(image).unwrap();
+        // SAFETY: a live resource.
+        let host_format = unsafe { host_image.GetDesc() }.Format.0 as u32;
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
         // The upload list holds the texture until it is reset.
@@ -1740,7 +1838,10 @@ mod tests {
         let out_to = Location {
             resource: readback.as_raw().cast_const().cast(),
             kind: 1,
-            footprint: rows,
+            footprint: PlacedFootprint {
+                format: host_format,
+                ..rows
+            },
         };
         let out_from = Location {
             resource: host_image.as_raw().cast_const().cast(),
@@ -1778,14 +1879,197 @@ mod tests {
                     Some(&mut mapped),
                 )
                 .unwrap();
-            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024).to_vec()
         };
+        Some((host_format, read))
+    }
+
+    /// A 4x4 texture filled from a title buffer through our list and queue,
+    /// then read back from the host GPU.
+    #[cfg(windows)]
+    #[test]
+    fn buffer_data_reaches_the_host_texture() {
+        let pattern = |bytes: &mut [u8]| {
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+        };
+        let Some((format, read)) = through_a_list(28, pattern) else {
+            eprintln!("SKIPPED buffer_data_reaches_the_host_texture: no host GPU");
+            return;
+        };
+        assert_eq!(format, 28);
+        let mut bytes = vec![0; 1024];
+        pattern(&mut bytes);
         for row in 0..4 {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
     }
 
+    /// B5G5R5A1 texels copied from a title buffer reach a host texture in
+    /// its stand-in as the same values.
+    #[cfg(windows)]
+    #[test]
+    fn buffer_data_reaches_a_stand_in_texture_converted() {
+        // Per texel x of row y: red x*8, green y*8, blue 31, alpha x odd.
+        let texel = |x: u16, y: u16| 31 | (y * 8) << 5 | (x * 8) << 10 | (x & 1) << 15;
+        let fill = |bytes: &mut [u8]| {
+            for y in 0..4u16 {
+                for x in 0..4u16 {
+                    let at = usize::from(y) * 256 + usize::from(x) * 2;
+                    bytes[at..at + 2].copy_from_slice(&texel(x, y).to_le_bytes());
+                }
+            }
+        };
+        let Some((format, read)) = through_a_list(86, fill) else {
+            eprintln!("SKIPPED buffer_data_reaches_a_stand_in_texture_converted: no host GPU");
+            return;
+        };
+        if format == 86 {
+            eprintln!(
+                "SKIPPED buffer_data_reaches_a_stand_in_texture_converted: the host has every use of B5G5R5A1"
+            );
+            return;
+        }
+        assert_eq!(format, 28, "R8G8B8A8_UNORM stands in");
+        let wide = |v: u16| ((u32::from(v) * 255 + 15) / 31) as u8;
+        for y in 0..4u16 {
+            for x in 0..4u16 {
+                let at = usize::from(y) * 256 + usize::from(x) * 4;
+                let alpha = if x & 1 == 1 { 255 } else { 0 };
+                assert_eq!(
+                    read[at..at + 4],
+                    [wide(x * 8), wide(y * 8), 255, alpha],
+                    "texel {x},{y}"
+                );
+            }
+        }
+    }
+
+    /// A WARP device (the software adapter), for tests that need a device
+    /// with known support; `None` (and a note) without one.
+    #[cfg(windows)]
+    fn warp(test: &str) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: plain DXGI and D3D12 creation.
+        let device = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>())
+                .and_then(|adapter| {
+                    let mut device = None;
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                    device.ok_or_else(windows::core::Error::empty)
+                })
+        };
+        match device {
+            Ok(device) => Some(device),
+            Err(e) => {
+                eprintln!("SKIPPED {test}: no WARP device ({e})");
+                None
+            }
+        }
+    }
+
+    /// Every title format with every kind of use: what [`host_desc`] lets
+    /// through, `device` creates (no creation reaches the driver with what
+    /// it does not support), and the first run's two refusals have a host
+    /// texture.
+    #[cfg(windows)]
+    fn host_descriptions_are_ones(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let create = |d: &ResourceDesc| {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a description in the host's layout; the out pointer is
+            // ours.
+            unsafe {
+                device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    std::ptr::from_ref(d).cast(),
+                    D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, 0) as i32),
+                    None,
+                    &mut texture,
+                )
+            }
+        };
+        let (mut made, mut refused, mut stricter) = (0, 0, 0);
+        for format in 1..=191 {
+            for flags in [0, 1, 2, 4, 1 | 4, 2 | 8] {
+                for samples in [1, 4] {
+                    if samples > 1 && flags & 3 == 0 {
+                        continue;
+                    }
+                    let desc = ResourceDesc {
+                        flags,
+                        sample_count: samples,
+                        ..texture(64, 64, format, 1)
+                    };
+                    match host_desc(&desc, device) {
+                        Ok(d) => {
+                            if let Err(e) = create(&d) {
+                                panic!("{desc:?} as {d:?} passed but the device refused it: {e}");
+                            }
+                            made += 1;
+                        }
+                        Err(why) => {
+                            refused += 1;
+                            // What the device would have taken anyway.
+                            let mut raw = desc;
+                            raw.layout = 0;
+                            raw.format = pc_vertex_format(format);
+                            if create(&raw).is_ok() {
+                                stricter += 1;
+                                eprintln!("stricter than the device: {desc:?}: {why}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{made} made, {refused} refused ({stricter} of them the device would have taken)"
+        );
+        assert!(made > 500, "most formats and uses are made");
+        // The first run's: a B5G5R5A1 target that is also unordered access,
+        // and a B4G4R4A4 target, both 2560x1440 (in R8G8B8A8_UNORM where
+        // the device lacks a use of theirs, as an RTX 4080 does).
+        for (format, flags) in [(86, 1 | 4), (115, 1)] {
+            let desc = ResourceDesc {
+                flags,
+                ..texture(2560, 1440, format, 1)
+            };
+            let d = host_desc(&desc, device).unwrap();
+            assert!([format, 28].contains(&d.format), "{format} as {}", d.format);
+            create(&d).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_descriptions_are_ones_warp_creates() {
+        if let Some(device) = warp("host_descriptions_are_ones_warp_creates") {
+            host_descriptions_are_ones(&device);
+        }
+    }
+
+    /// As above on the host GPU (an RTX 4080 on the development PC).
+    #[cfg(windows)]
+    #[test]
+    fn host_descriptions_are_ones_the_host_gpu_creates() {
+        match crate::host::host() {
+            Some(host) => host_descriptions_are_ones(&host.device),
+            None => {
+                eprintln!("SKIPPED host_descriptions_are_ones_the_host_gpu_creates: no host GPU")
+            }
+        }
+    }
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();

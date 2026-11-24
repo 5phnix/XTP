@@ -511,6 +511,20 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        // A destination whose host format stands in for the title's.
+        if src.kind == FOOTPRINT
+            && crate::texture::copy_converted(
+                list,
+                dst.resource,
+                dst.footprint.offset as u32,
+                [x, y, z],
+                src.resource,
+                &src.footprint,
+                source_box,
+            )
+        {
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
