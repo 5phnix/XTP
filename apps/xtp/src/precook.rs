@@ -111,19 +111,25 @@ fn precook(o: Options) -> Result<()> {
     anyhow::ensure!(size <= MAX_FILE, "{} is larger than 2 GiB", path.display());
     let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let pack = blake3::hash(&data);
-    xtp_hle::modules::d3d12x::use_shader_cache(shaders.clone());
+    let read = started.elapsed().as_secs_f64();
     let ready = gpu::start().map_err(|e| anyhow::anyhow!("no host D3D12 device: {e}"))?;
+    let device = started.elapsed().as_secs_f64() - read;
     println!(
-        "precook      {}: {} bytes, blake3 {pack}",
+        "precook      {}: {} bytes, blake3 {pack} (read in {read:.1} s)",
         path.display(),
         data.len()
     );
     println!(
-        "host         waves of {} to {} lanes; translations kept under {}",
+        "host         waves of {} to {} lanes; translations kept under {} (device in {device:.1} s)",
         ready.lanes.0,
         ready.lanes.1,
         &ready.key[..16]
     );
+    // The note first: opening the cache reads every entry's header (25,889
+    // after a pass over the pack), which a precook that is up to date does
+    // not need. Its check stays a matter of seconds whatever the cache
+    // holds (2026-11-25: one that opened the cache first took 85 s on the
+    // PC, the same check right after a pass 1 s).
     let note_path = shaders.join(NOTE);
     let note = Note {
         key: ready.key.clone(),
@@ -138,6 +144,13 @@ fn precook(o: Options) -> Result<()> {
         );
         return Ok(());
     }
+    let opening = Instant::now();
+    xtp_hle::modules::d3d12x::use_shader_cache(shaders.clone());
+    println!(
+        "cache        {} (opened in {:.1} s)",
+        shaders.display(),
+        opening.elapsed().as_secs_f64()
+    );
 
     let threads = o
         .jobs
