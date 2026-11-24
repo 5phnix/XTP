@@ -6,7 +6,16 @@
   What runs (one of):
     -Check          the workspace check: cargo fmt --check, clippy (default
                     and all features, -D warnings), cargo test (the default)
-    -Cargo '<args>' cargo with these arguments, e.g. 'test -p xtp-gpu'
+    -Cargo '<args>' cargo with these arguments, e.g. 'test -p xtp-gpu', and
+                    the environment variables of -Env @{...}
+    -GpuTests       the GPU test set on the L4 (or -Adapter warp): the tests
+                    of -Packages (default xtp-shader, xtp-gpu) and their
+                    #[ignore = "hardware: ..."] ones, each in a process of
+                    its own, -Parallel at a time (default 8), stopped after
+                    -TestTimeout seconds (default 300); those that did not
+                    pass run again alone; -Filter <text> keeps the tests
+                    whose name holds it (see vm\test-each.ps1). The log,
+                    results.csv and the failures' output come back
     -Game           builds the diagnostics xtp (unless -NoBuild) and runs the
                     title for -Seconds in the VM's desktop session, from the
                     golden data folder if the VM has one (see vm\run-game.ps1)
@@ -33,6 +42,9 @@
 .EXAMPLE
   tools\cloud\run-remote.ps1 -Check -Local
   tools\cloud\run-remote.ps1 -Cargo 'test -p xtp-gpu --locked' -Local
+  tools\cloud\run-remote.ps1 -Cargo 'test -p xtp-shader --locked' -Local -Env @{ XTP_REQUIRE_GPU = '1' }
+  tools\cloud\run-remote.ps1 -GpuTests -Local
+  tools\cloud\run-remote.ps1 -GpuTests -Local -Adapter warp
   tools\cloud\run-remote.ps1 -Game -Seconds 240 -Local
   tools\cloud\run-remote.ps1 -Game -NoBuild -Env @{ XTP_LOG = 'xtp_gpu=debug,info' }
   tools\cloud\run-remote.ps1 -Game -Local -Repo E:\XTP -LocalRev main -Autopilot autopilot\gameplay.txt -Seconds 300
@@ -42,7 +54,13 @@ param(
     [Parameter(ParameterSetName = 'Check')] [switch]$Check,
     [Parameter(ParameterSetName = 'Cargo', Mandatory)] [string]$Cargo,
     [Parameter(ParameterSetName = 'Game', Mandatory)] [switch]$Game,
+    [Parameter(ParameterSetName = 'Tests', Mandatory)] [switch]$GpuTests,
     [Parameter(ParameterSetName = 'Device', Mandatory)] [switch]$DeviceCheck,
+    [Parameter(ParameterSetName = 'Tests')] [string[]]$Packages = @('xtp-shader', 'xtp-gpu'),
+    [Parameter(ParameterSetName = 'Tests')] [ValidateSet('hardware', 'warp')] [string]$Adapter = 'hardware',
+    [Parameter(ParameterSetName = 'Tests')] [int]$TestTimeout = 300,
+    [Parameter(ParameterSetName = 'Tests')] [int]$Parallel = 8,
+    [Parameter(ParameterSetName = 'Tests')] [string]$Filter = '',
     [switch]$Local,
     [string]$Repo = '',
     [string]$LocalRev = 'HEAD',
@@ -50,7 +68,7 @@ param(
     [Parameter(ParameterSetName = 'Game')] [string]$Autopilot = '',
     [Parameter(ParameterSetName = 'Game')] [int]$Seconds = 180,
     [Parameter(ParameterSetName = 'Game')] [string]$Keys = '',
-    [Parameter(ParameterSetName = 'Game')] [hashtable]$Env = @{},
+    [Parameter(ParameterSetName = 'Game')] [Parameter(ParameterSetName = 'Cargo')] [hashtable]$Env = @{},
     [Parameter(ParameterSetName = 'Game')] [string]$Name = '',
     [Parameter(ParameterSetName = 'Game')] [string]$XtpArgs = '',
     [Parameter(ParameterSetName = 'Game')] [switch]$NoBuild,
@@ -109,6 +127,7 @@ function Get-RemoteLog([string[]]$Lines) {
     if ($log) { Receive-XtpVmFile -Cfg $cfg -Zone $zone -Path $log -Destination $out }
 }
 
+$envText = ($Env.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';'
 $code = 0
 switch ($what) {
     'check' {
@@ -119,9 +138,20 @@ switch ($what) {
     }
     'cargo' {
         Write-Step "cargo $Cargo on the VM"
-        $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'check.ps1' -Arguments ($source + @{ Mode = 'cargo'; CargoArgs = $Cargo; SessionUser = $cfg.sessionUser }) -AllowFail
+        $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'check.ps1' -Arguments ($source + @{ Mode = 'cargo'; CargoArgs = $Cargo; Env = $envText; SessionUser = $cfg.sessionUser }) -AllowFail
         $code = $LASTEXITCODE
         Get-RemoteLog $lines
+    }
+    'tests' {
+        Write-Step "GPU tests of $($Packages -join ', ') on the VM ($Adapter, each test alone, $TestTimeout s at most)"
+        $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'check.ps1' -AllowFail -Arguments ($source + @{
+                Mode = 'tests'; Packages = ($Packages -join ','); Adapter = $Adapter; TestTimeout = $TestTimeout
+                Parallel = $Parallel; Filter = $Filter; SessionUser = $cfg.sessionUser
+            })
+        $code = $LASTEXITCODE
+        # The run's folder: run.log, results.csv, output\ of the tests that did not pass.
+        $log = ($lines | Select-String -Pattern '\(log (C:\\xtp\\logs\\[^)]+)\\run\.log\)' | Select-Object -Last 1).Matches.Groups[1].Value
+        if ($log) { Receive-XtpVmFile -Cfg $cfg -Zone $zone -Path $log -Destination $out -Recurse }
     }
     'device' {
         Write-Step 'D3D12 device check on the VM'
@@ -132,7 +162,6 @@ switch ($what) {
     'game' {
         if (-not $cfg.titleExe) { throw "Set 'titleExe' in $($cfg.path)" }
         Write-Step "$(if ($NoBuild) { '' } else { 'Diagnostics build, then ' })game run on the VM ($Seconds s)"
-        $envText = ($Env.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';'
         if ($Autopilot) {
             # The script drives the title; no scripted Enter presses beside it.
             $XtpArgs = "$XtpArgs --autopilot $Autopilot".Trim()
