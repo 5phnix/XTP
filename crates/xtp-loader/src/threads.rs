@@ -30,6 +30,18 @@ fn images() -> std::sync::MutexGuard<'static, Vec<Mapped>> {
     IMAGES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The registered title image containing `address`, as `(base, size)`.
+/// A busy registry means unknown rather than blocking an exception handler.
+pub(crate) fn image_at(address: usize) -> Option<(usize, usize)> {
+    let images = IMAGES.try_lock().ok()?;
+    images.iter().find_map(|m| {
+        let base = m.image.base();
+        let size = m.image.info().size_of_image as usize;
+        let end = base.checked_add(size)?;
+        (base <= address && address < end).then_some((base, size))
+    })
+}
+
 pub(crate) fn mapped(image: &LoadedImage) {
     // SAFETY: reads our own static, so the linker keeps it (and its section).
     unsafe { std::ptr::from_ref(&ON_THREAD).read_volatile() };

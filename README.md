@@ -148,7 +148,9 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_WATCHDOG_HOOK=1` | every build: keeps the title's own watchdog from ending it after about 30 s without progress (slow world frames); known builds only (1.0.2.1), otherwise a warning and nothing patched |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+title's data folder. The loader also prints the first 16 title C++ throws
+(type, readable MSVC `std::exception` message and title `module+rva`) to stderr,
+and maps legacy debugger thread names to Windows thread descriptions.
 
 ## Contributing
 
