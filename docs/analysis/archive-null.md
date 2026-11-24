@@ -1,4 +1,4 @@
-# The Archive object that comes back null (int3 at title+0x23d8f03)
+# An archive store entry that comes back null (int3 at title+0x23d8f03)
 
 Task 54cb7617, 2026-11-24. BTP 6 1.0.2.1, Series S. RVAs and behaviour
 only: no bytes or listings of the title's code (docs/asset-policy.md).
@@ -7,8 +7,8 @@ only: no bytes or listings of the title's code (docs/asset-policy.md).
 - The stop is not the title's watchdog, and not a lack of memory.
 - One second before it, XTP's DirectStorage failed two raw reads with
   `ERROR_INVALID_USER_BUFFER`. One of them left an archive header unwritten.
-- The title then could not make that Archive entry's object, and its master
-  build's own check broke.
+- The title then could not make that archive store entry's object, and its
+  master build's own check broke.
 - That error is what Windows returns when the destination page becomes
   read-only while the read copies into it. The GPU side's write guards do
   exactly that when a copy re-arms them, between `kernel_will_write` and the
@@ -26,23 +26,21 @@ binary f6af110, `XTP_WATCHDOG_HOOK=1`) reached gameplay at 44 s. It ended
 
 | Frame | RVA | What it is |
 |---|---|---|
-| 0 | `0x23d8f03` | the `int3` in `0x23d8e70`, slot 3 of the Archive store's vtable |
+| 0 | `0x23d8f03` | the `int3` in `0x23d8e70`, slot 3 of the archive store's vtable |
 | 1 | `0x2593e91` | `0x2593560`, which moves one request through its states |
 | 2 | `0x2592d69` | `0x2592c50`, a request worker thread's function |
 | 3 | `0x2215eca` | `0x2215ea0`, the title's common thread start |
 | 4–5 | KERNEL32, ntdll | the host's thread start |
 
-Before ending, the title ran its crash reporter (Breakpad). It wrote "Game
-Running Time 51 s", the intro mission in prestream, 699 streaming
-requests, and its own memory figures:
+Before ending, the title ran its crash reporter. Its report gave 51 s of
+run time, 699 streaming requests in flight, and the use of its own heaps:
 
-| Category | Used | Size | Full |
+| Heap | Used | Size | Full |
 |---|---:|---:|---:|
-| Game Virtual | 923,879,360 | 1,218,445,296 | 76 % |
-| Game Physical | 1,287,928,512 | 1,339,031,552 | 96 % |
-| Resource Virtual, Resource Physical | 0 | 0 | — |
-| Pool | 267,235,712 | 270,532,592 | 98.8 % |
-| TileHeap (its own line) | 3,030 MB | 3,977 MB | 76 % |
+| a heap of virtual memory | 923,879,360 | 1,218,445,296 | 76 % |
+| a heap of physical memory | 1,287,928,512 | 1,339,031,552 | 96 % |
+| a pool | 267,235,712 | 270,532,592 | 98.8 % |
+| the streaming heap | 3,030 MB | 3,977 MB | 76 % |
 
 These figures turned out to have nothing to do with the stop (below).
 
@@ -64,8 +62,8 @@ These figures turned out to have nothing to do with the stop (below).
   `0x2593560`, which writes the request's state (5 bits, `0x2591de0`) as it
   goes.
 - **The store.** From state `0xc` to `0xd`, the worker calls slot 3 of the
-  request's store. Here that is the "Archive" store, the archives of files
-  that streaming mounts:
+  request's store. Here that is the archive store, which holds the archives
+  of files that streaming mounts:
   - vtable `0x61cf360`, built at `0x5b55850`;
   - a singleton, behind the title's pointer at `0x8fdce30`, made at start-up
     by `0x22798e0` through `0x5b55650`.
@@ -94,8 +92,9 @@ These figures turned out to have nothing to do with the stop (below).
 - **The check.** Slot 3 (`0x23d8e70`) checks that pointer. **A null
   breaks**: the `int3` at `0x23d8f03`, left in the master build. The code
   after it empties the slot and returns.
-- **The caller.** The caller does not test the result. For an Archive, its
-  next two calls (vtable `0x20` and `0xd0`) are stubs that return null, and
+- **The caller.** The caller does not test the result. For the archive
+  store, its next two calls (vtable `0x20` and `0xd0`) are stubs that return
+  null, and
   the request goes through states `0xe` and `0xf` to done. On the console
   nothing catches the break either: the title counts on the header being
   there.
@@ -163,7 +162,7 @@ had the most such overlaps.
     0 here;
   - `0x2474500` checks for 100 MiB free before it writes a final report.
 
-  Its heaps come from the device type ("Conole Type: Lockhart").
+  Its heaps are sized from the console type, not from this budget.
 - **Physical pages never returned.** The title takes its physical memory
   at start-up (4,679 MiB in 4 calls on Series S) and carves its heaps from
   it. The ledger shows no later physical-page traffic in the time covered.
@@ -171,14 +170,14 @@ had the most such overlaps.
   resources of the title's device take memory from the title's allocator
   (allocator id 128, about 150 MiB in the first 10 s), as on the console.
 
-The Pool and Game Physical figures are the title's own fill; they do not
+The two nearly full heaps are the title's own fill; they do not
 reach this path.
 
 ## Measurements in the tree
 
 - `XTP_TITLE_ASSERTS=continue` (`crates/xtp-game/src/asserts.rs`): the
   `int3` becomes a count, then the title's own null path. It also logs a
-  census of the Archive store 60 s in and at the first skip.
+  census of the archive store 60 s in and at the first skip.
 - `XTP_XMEM_LEDGER=1` (`crates/xtp-hle/src/modules/xmem.rs`): XMem by
   category every 10 s (calls, failures, frees, live and peak bytes, the
   budget reported).
@@ -234,7 +233,7 @@ pending. BTP 6 calls none of the completion functions
 (`GetOverlappedResult`, completion ports) we could hook instead.
 
 **The workaround, kept:** `XTP_TITLE_ASSERTS=continue` still lets a session
-pass the check if an Archive header fails for another reason.
+pass the check if an archive header fails for another reason.
 
 ## The session after the fix
 
@@ -251,7 +250,7 @@ What it showed:
   fallback re-read never ran).
 - 79 files opened through DirectStorage.
 - World captures in `E:\xtp-data\runs\frames-watchdog`, frames 796 to 941:
-  the intro's title card and credits, over a world still drawn black. That
+  the start-up screens, over a world still drawn black. That
   is the black world of task c19d640b, not this one.
 
 One session cannot prove a race gone: run A was the only one of 40 with

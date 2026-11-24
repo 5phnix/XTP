@@ -5,19 +5,19 @@
 //! What the title does (1.0.2.1, by RVA). A request worker thread
 //! (`0x2592c50`) moves each of its requests through states (`0x2593560`; a
 //! request's state is 5 bits that `0x2591de0` writes). From state `0xc` to
-//! `0xd` it asks the "Archive" store (vtable `0x61cf360`, built at
+//! `0xd` it asks the archive store (vtable `0x61cf360`, built at
 //! `0x5b55850`; the archives of files that streaming mounts) for the object
 //! of one of its entries: slot 3 of that vtable, `0x23d8e70`, finds the
 //! entry by handle (the low 22 bits; entries of `0x30` bytes) and has the
 //! entry's definition make it (`0xfc2490`: an archive object, valid only
 //! once its header, read from the request's data, starts with the archive
 //! magic). When that gives a null pointer (the header was not valid),
-//! `0x23d8e70` breaks (`int3` at `0x23d8f03`), and
-//! only then empties the entry's slot (releasing the object it held, as
-//! `0x23d8ef0` does) and returns. Its caller does not look at the result:
-//! for an Archive, the next two calls it makes (vtable `0x20` and `0xd0`)
-//! are stubs that give null, and the request goes on through states `0xe`
-//! and `0xf` to done. Nothing catches the break, so the process ends
+//! `0x23d8e70` breaks (`int3` at `0x23d8f03`), and only then empties the
+//! entry's slot (releasing the object it held, as `0x23d8ef0` does) and
+//! returns. Its caller does not look at the result: for the archive store,
+//! the next two calls it makes (vtable `0x20` and `0xd0`) are stubs that
+//! give null, and the request goes on through states `0xe` and `0xf` to
+//! done. Nothing catches the break, so the process ends
 //! there: the title's crash reporter runs, and then it is gone. Session
 //! mesh64-a stopped there (docs/analysis/archive-null.md).
 //!
@@ -38,7 +38,7 @@
 //! at once, then at most every 10 s, with the total.
 //!
 //! 60 s after it is applied, and at the first skip, the hook logs a census
-//! of the Archive store, to tell which class makes its entries' objects. The
+//! of the archive store, to tell which class makes its entries' objects. The
 //! store (the title's pointer at `0x8fdce30`) keeps its entries at
 //! `+0x70`, `0x30` bytes apart (`+0x88`), `+0x78` of them; an entry holds
 //! its definition object at `+0x08` (whose vtable's second function makes
@@ -117,7 +117,7 @@ const ARCHIVE_NULL: [u8; 22] = {
 };
 
 const PATCHES_1_0_2_1: &[Patch] = &[Patch {
-    what: "Archive entry object: count a null pointer, then the title's own null path instead of its int3",
+    what: "archive store entry object: count a null pointer, then the title's own null path instead of its int3",
     rva: ARCHIVE_NULL_AT,
     // int3; mov rcx, [rbx + rdi + 0x20] (the slot); test rcx, rcx;
     // je 0x23d8efa; mov qword ptr [rbx + rdi + 0x20], 0; jmp 0x23d8ef0
@@ -142,7 +142,7 @@ pub fn apply_to(blake3_hex: &str, image: &mut [u8]) -> Result<usize, NotApplied>
     hook_for(blake3_hex)?.apply_to(image)
 }
 
-/// Where one build keeps its Archive store: the RVA of its pointer to it.
+/// Where one build keeps its archive store: the RVA of its pointer to it.
 #[derive(Debug, Clone, Copy)]
 pub struct Store {
     pub build: &'static KnownBuild,
@@ -162,7 +162,7 @@ const DEFINITION: u64 = 0x08;
 const LOADED: u64 = 0x10;
 const PLACING: u64 = 0x20;
 
-/// What a census of the Archive store found.
+/// What a census of the archive store found.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Census {
     pub slots: u64,
@@ -262,7 +262,7 @@ fn read_own(at: u64) -> Option<u64> {
     (ok != 0 && read == 8).then_some(value)
 }
 
-/// Logs the census of the Archive store of `build`, mapped at `base`;
+/// Logs the census of the archive store of `build`, mapped at `base`;
 /// `when` says at which point.
 #[cfg(windows)]
 fn log_census(build: &KnownBuild, base: usize, size: usize, when: &str) {
@@ -273,8 +273,8 @@ fn log_census(build: &KnownBuild, base: usize, size: usize, when: &str) {
         .filter(|&at| at != 0)
         .and_then(|at| census(at, base, size, read_own));
     match taken {
-        Some(c) => tracing::info!("Archive store census ({ENV}, {when}): {c}"),
-        None => tracing::info!("Archive store census ({ENV}, {when}): the store could not be read"),
+        Some(c) => tracing::info!("archive store census ({ENV}, {when}): {c}"),
+        None => tracing::info!("archive store census ({ENV}, {when}): the store could not be read"),
     }
 }
 
@@ -314,7 +314,7 @@ pub unsafe fn apply_if_asked(blake3_hex: &str, base: usize, size: u32) {
             crate::watchdog::watch_counter(base + hook.counter, "xtp-asserts-log", 10, move |n| {
                 tracing::warn!(
                     times = n,
-                    "title assertion at {at:#x} skipped {n} times (an Archive entry's object could not be made; the title took its own null path)"
+                    "title assertion at {at:#x} skipped {n} times (an archive store entry's object could not be made; the title took its own null path)"
                 );
                 first.call_once(|| log_census(hook.build, base, size, "at the first skip"));
             });
