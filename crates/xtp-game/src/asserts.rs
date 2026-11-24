@@ -9,8 +9,10 @@
 //! `0x5b55850`; the archives of files that streaming mounts) for the object
 //! of one of its entries: slot 3 of that vtable, `0x23d8e70`, finds the
 //! entry by handle (the low 22 bits; entries of `0x30` bytes) and has the
-//! entry's definition make it. When that gives a null pointer (the object
-//! could not be allocated), `0x23d8e70` breaks (`int3` at `0x23d8f03`), and
+//! entry's definition make it (`0xfc2490`: an archive object, valid only
+//! once its header, read from the request's data, starts with the archive
+//! magic). When that gives a null pointer (the header was not valid),
+//! `0x23d8e70` breaks (`int3` at `0x23d8f03`), and
 //! only then empties the entry's slot (releasing the object it held, as
 //! `0x23d8ef0` does) and returns. Its caller does not look at the result:
 //! for an Archive, the next two calls it makes (vtable `0x20` and `0xd0`)
@@ -36,7 +38,7 @@
 //! at once, then at most every 10 s, with the total.
 //!
 //! 60 s after it is applied, and at the first skip, the hook logs a census
-//! of the Archive store, to tell which allocator its entries use. The
+//! of the Archive store, to tell which class makes its entries' objects. The
 //! store (the title's pointer at `0x8fdce30`) keeps its entries at
 //! `+0x70`, `0x30` bytes apart (`+0x88`), `+0x78` of them; an entry holds
 //! its definition object at `+0x08` (whose vtable's second function makes
@@ -45,7 +47,7 @@
 //! function, and the entries loaded and being placed. Title memory is read
 //! with `ReadProcessMemory`, so a moved store cannot fault our thread.
 //!
-//! The trade-off: the hook hides an allocation that failed. The request
+//! The trade-off: the hook hides an archive that failed to load. The request
 //! completes with the entry's slot empty, as the title's own code after the
 //! `int3` leaves it; what the title does later with that empty entry is not
 //! known (a null it tests, or a fault elsewhere). It is a way for test
@@ -115,7 +117,7 @@ const ARCHIVE_NULL: [u8; 22] = {
 };
 
 const PATCHES_1_0_2_1: &[Patch] = &[Patch {
-    what: "Archive entry allocation: count a null pointer, then the title's own null path instead of its int3",
+    what: "Archive entry object: count a null pointer, then the title's own null path instead of its int3",
     rva: ARCHIVE_NULL_AT,
     // int3; mov rcx, [rbx + rdi + 0x20] (the slot); test rcx, rcx;
     // je 0x23d8efa; mov qword ptr [rbx + rdi + 0x20], 0; jmp 0x23d8ef0
@@ -312,7 +314,7 @@ pub unsafe fn apply_if_asked(blake3_hex: &str, base: usize, size: u32) {
             crate::watchdog::watch_counter(base + hook.counter, "xtp-asserts-log", 10, move |n| {
                 tracing::warn!(
                     times = n,
-                    "title assertion at {at:#x} skipped {n} times (an Archive entry's allocation gave no memory; the title took its own null path)"
+                    "title assertion at {at:#x} skipped {n} times (an Archive entry's object could not be made; the title took its own null path)"
                 );
                 first.call_once(|| log_census(hook.build, base, size, "at the first skip"));
             });
