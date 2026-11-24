@@ -87,7 +87,9 @@ impl<'a> Lower<'a> {
         // another kind than the view's is undefined on the GPU: through a
         // constant-buffer handle, these loads of d3e44e754b3eb6aa and its
         // batch read raw views, and WARP removes its device on that shape
-        // (docs/analysis/hang.md).
+        // (docs/analysis/hang.md). The same rules as VIctory #1015
+        // (justrealyme) and, for a UAV entry, #1055 (adamdotpy), reached
+        // independently.
         // shortcut: with no entry, a constant buffer the program also reads
         // per lane (a dynamically indexed array) is read raw here too, as
         // `buffer.rs` reads it per lane: one kind for the slot either way.

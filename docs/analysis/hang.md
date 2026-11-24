@@ -273,6 +273,23 @@ Sessions: pending.
 
 ## 8. Upstream
 
+- **VIctory #1015** (justrealyme, open, `b8cfe8ce7`): the same rule as §7
+  for a descriptor with no entry, reached independently. Its survey of the
+  pack: 38,829 scalar loads in about 1,900 programs change kind, and the
+  emitted and validated counts stay the same. On an RTX 5070 Ti it did not
+  fix that tree's world hang (#578, another program), and that tree ran
+  18.7 min without it too: how often the mismatch removes an NVIDIA device
+  depends on what the slot holds.
+- **VIctory #1055** (adamdotpy, open, `21d1b4682`): a table's UAV read by a
+  scalar load goes through a raw UAV handle, as in §7; its WARP test also
+  removed the device before the change.
+- **VIctory #1409** (icdmkg2, open, `de109f1d3`): reads every descriptor
+  loaded from the resource heap raw in scalar loads, whatever its uses. Not
+  taken: XTP's host heap makes a real CBV for a constant buffer view of the
+  title (`make`), so a heap constant buffer that only scalar loads read
+  would get the wrong kind instead.
 - VIctory #1322 (the "downsample" that looped 4 billion times on 0 sizes)
   does not apply: these programs' bounds come from data the host has.
+- VIctory #1483 (the loop limit's conditional back edges) does not apply:
+  no loop of these programs reaches a limit (§4).
 - VIctory #483 bounds heap indices computed from data (§6).
