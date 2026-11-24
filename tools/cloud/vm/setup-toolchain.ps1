@@ -84,7 +84,10 @@ Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name
 # --- NVIDIA driver ----------------------------------------------------------
 Step 'NVIDIA driver'
 $smi = Find-Smi
-if (-not $smi) {
+$nvidia = Get-CimInstance Win32_PnPEntity -Filter "DeviceID LIKE 'PCI\\VEN_10DE%'" -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $smi -and -not $nvidia) {
+    Write-Output '    no NVIDIA GPU on this machine: skipped (a build machine)'
+} elseif (-not $smi) {
     # Google's script picks the driver for this machine (the vWS one on a
     # -vws GPU), checks its SHA-256 and installs it silently, without rebooting.
     $script = Get-File 'https://github.com/GoogleCloudPlatform/compute-gpu-installation/raw/main/windows/install_gpu_driver.ps1' 'install_gpu_driver.ps1'
@@ -93,7 +96,7 @@ if (-not $smi) {
     if (-not $smi) { throw 'The NVIDIA driver did not install (no nvidia-smi).' }
     $reboot = $true
 }
-Invoke-Native $smi @('--query-gpu=name,driver_version', '--format=csv,noheader')
+if ($smi) { Invoke-Native $smi @('--query-gpu=name,driver_version', '--format=csv,noheader') }
 
 # --- Git ---------------------------------------------------------------------
 Step 'Git'

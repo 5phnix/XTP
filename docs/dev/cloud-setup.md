@@ -10,20 +10,19 @@ need, what it costs and the rules that keep your files private.
 You end up with:
 
 ```text
- your PC                                  Google Cloud project (yours)
- ┌────────────────────────┐   IAP tunnel  ┌───────────────────────────────────────────┐
- │ tools\cloud\*.ps1      │ ───────────▶  │ VM xtp-l4: g2-standard-16, 1 NVIDIA L4    │
- │ (gcloud, PowerShell)   │  SSH / RDP,   │ (RTX Virtual Workstation), Windows        │
- │ Claude Code            │  no public    │ Server 2025                               │
- │ your game files        │  port         │   C: Windows, build tools, Rust, C:\xtp   │
- └──────────┬─────────────┘               │   D: data disk: D:\game, D:\golden,       │
-            │ upload-game.ps1             │      D:\xtp-data (cache, runs)            │
-            ▼ (once, then changes only)   │   desktop session for D3D12 game runs     │
- ┌────────────────────────────┐ sync-     │   stops itself when idle                  │
- │ private bucket (same       │ game.ps1  └───────────────────────────────────────────┘
- │ region): reference copy of │ ────────▶   reads the bucket as its service account
- │ the game + golden saves    │             (read-only, this bucket only)
- └────────────────────────────┘
+ your PC                                Google Cloud project (yours)
+ ┌──────────────────────┐  SSH / RDP    ┌──────────────────────────────────────────┐
+ │ tools\cloud\*.ps1    │  through IAP  │ VM xtp-l4: g2-standard-16 + NVIDIA L4    │
+ │ gcloud, PowerShell   │ ────────────▶ │ (RTX Virtual Workstation), Windows 2025  │
+ │ Claude Code          │  no public    │  C: Windows, build tools, Rust, C:\xtp   │
+ │ your game files      │  port         │  D: D:\game, D:\golden, D:\xtp-data      │
+ └──────────┬───────────┘               │  desktop session: builds, tests, runs    │
+            │ upload-game.ps1           │  stops itself when idle                  │
+            ▼                           └──────────────────────────────────────────┘
+ ┌──────────────────────┐   sync-game.ps1, inside Google's network      ▲
+ │ private bucket in    │ ──────────────────────────────────────────────┘
+ │ the same region      │   (the VM's service account: read-only)
+ └──────────────────────┘
 ```
 
 - [Prerequisites](#prerequisites)
@@ -457,8 +456,14 @@ To keep your PC free for game sessions, workers build and test on the VM:
 
 **Build machines without a GPU** use the same scripts with another
 configuration file: `accelerator` empty, another `vm` name and `machineType`
-(for example `c3-standard-22`), and `-Config <that file>`. They need no
-desktop session.
+(for example `c3-standard-22`), and `-Config <that file>`. `setup-vm.ps1`
+then skips the NVIDIA driver; the desktop session is still set up, because
+builds and tests run there. Game files are not needed on them: give them a
+`serviceAccount` of their own (`new-vm.ps1` creates it without any access to
+the bucket; do not run `new-bucket.ps1` with that configuration), skip
+`sync-game.ps1` and use a smaller `dataDiskGb`. Without game files and
+without access to them, such a machine is the place for code you have not
+reviewed yet.
 
 ## 7. Costs, and keeping them down
 
