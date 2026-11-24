@@ -80,8 +80,8 @@ pub(crate) struct State {
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
-    /// address) → dynamic slot.
-    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// address, host copy) → dynamic slot.
+    root_srv_slots: std::collections::HashMap<(usize, u64, usize), u32>,
 }
 
 impl Drop for State {
@@ -541,8 +541,9 @@ impl State {
     /// Binds a root SRV as a one-view table (see
     /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
     /// title buffer's host copy from `address` to the copy's end, or a null
-    /// view (no address, or no host copy). One slot per address per list.
-    /// False if no dynamic slot could be had (the draw is dropped).
+    /// view (no address, or no host copy). One slot per address and host
+    /// copy per list. False if no dynamic slot could be had, or no view
+    /// heap is bound (the draw is dropped).
     fn root_srv_table(
         &mut self,
         list: &HostList,
@@ -550,22 +551,41 @@ impl State {
         param: u32,
         compute: bool,
     ) -> bool {
-        let Some((heap, host)) = self
-            .heaps
-            .iter()
-            .filter(|&&h| h != 0)
-            .map(|&h| crate::descriptor::heap(h as This))
-            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+        // The view heap is first (`set_heaps`).
+        let Some((heap, host)) = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This))
+            .and_then(|h| Some((h, h.host()?)))
         else {
             once!("a root SRV without a bound view heap: the draw is dropped");
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a root SRV without a bound view heap".into());
             return false;
         };
         let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        // By host copy too: a buffer the title makes at the address of one
+        // it released while recording the list has a copy of its own.
+        let copy = shadow
+            .as_ref()
+            .map_or(0, |(_, s)| s.buffer.as_raw() as usize);
+        let key = (
+            std::ptr::from_ref(heap) as usize,
+            address.unwrap_or(0),
+            copy,
+        );
         let index = match self.root_srv_slots.get(&key) {
             Some(&index) => index,
             None => {
                 let Some(index) = host.dynamic(1) else {
+                    static NO_SLOT: AtomicU64 = AtomicU64::new(0);
+                    let n = NO_SLOT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::warn!(
+                            dropped = n,
+                            "a draw or dispatch dropped: no dynamic slot for a root SRV"
+                        );
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_why("no dynamic slot for a root SRV".into());
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -579,11 +599,18 @@ impl State {
                             host.raw_at(index, &s.buffer, offset, s.left(*a));
                         } else {
                             // Raw views start on 16 bytes; one from the
-                            // aligned start would shift every read.
-                            once!(
-                                address = format_args!("{a:#x}"),
-                                "a root SRV not on 16 bytes reads zeros"
-                            );
+                            // aligned start would shift every read. A root
+                            // descriptor (4 bytes) read these before.
+                            static MISALIGNED: AtomicU64 = AtomicU64::new(0);
+                            let n = MISALIGNED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_power_of_two() {
+                                tracing::warn!(
+                                    address = format_args!("{a:#x}"),
+                                    count = n,
+                                    "a root SRV not on 16 bytes of its host copy reads zeros \
+                                     (XTP_ROOT_SRV_DIRECT=1 reads it unbounded)"
+                                );
+                            }
                             host.null_raw_at(index);
                         }
                     }
