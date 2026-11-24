@@ -40,6 +40,7 @@ const RDNA: Target = Target {
 const WARP: Target = Target {
     lanes_min: 4,
     lanes_max: 4,
+    stride_table: false,
 };
 
 /// A console wave64 mesh program of `threads` lanes with `lds_bytes` of

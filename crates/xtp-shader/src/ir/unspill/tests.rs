@@ -107,6 +107,7 @@ fn translate(parts: &[&[u32]], wave64: bool, lanes: (u32, u32)) -> (Option<u32>,
     let target = crate::emit::Target {
         lanes_min: lanes.0,
         lanes_max: lanes.1,
+        stride_table: false,
     };
     let shader = crate::emit::translate_program_for(&c, &native, target)
         .unwrap_or_else(|(step, e)| panic!("{}: {e}", step.name()));
