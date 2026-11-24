@@ -1,9 +1,9 @@
-# VIctory
+# XTP
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
+The title's x86-64 code runs unchanged inside our process; XTP supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
@@ -26,7 +26,7 @@ Tested on one machine: Windows 11, AMD RX 6700 XT.
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
 > moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+> `XTP_D3D12_WARP=1`, which renders on the software adapter.
 
 What each part does today and what it still needs:
 
@@ -57,20 +57,20 @@ the Windows paging file size, then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
+copy xtp.example.toml xtp.toml   # then set your paths (outside the repo)
 cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+cargo run -p xtp -- config           # check your paths
 ```
 
 Run the title:
 
 ```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+cargo build --release -p xtp
+target\release\xtp.exe run <game dir>\<the title's exe> --execute
 ```
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
+are kept under the data folder (default `%LOCALAPPDATA%\xtp\data`), derived
 data under the cache folder.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
@@ -88,17 +88,17 @@ title's window has focus:
 ## Commands
 
 ```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+xtp inspect <exe|dll> [--imports] [--exports]
+xtp census [paths...] [--missing] [--strict]
+xtp lib-exports <import.lib> [--list]
+xtp shader-info [paths...] [--verbose] [--disasm]
+xtp translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+xtp run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
-victory config
+xtp config
 ```
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
+Logging: `XTP_LOG=xtp_loader=trace,info` (a release build logs
 info and above).
 
 ## Debugging
@@ -106,27 +106,27 @@ info and above).
 A release build has no debugging aids. Build them in with
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 ```
 
 | Variable | Effect |
 |----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `XTP_LOG=<target>=debug,...` | debug and trace output |
+| `XTP_STACKS=20,60` | every thread's stack at those seconds |
+| `XTP_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `XTP_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `XTP_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `XTP_CAPTURE=<dir>` | saves presented frames (powers of two, or `XTP_CAPTURE_FRAMES=<list>`) |
+| `XTP_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `XTP_D3D12_DEBUG=1` | host debug layer |
+| `XTP_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `XTP_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `XTP_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `XTP_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `XTP_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `XTP_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `XTP_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
+| `XTP_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
@@ -134,3 +134,7 @@ title's data folder.
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+XTP started from [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
+(commit `ffe310e`); see [NOTICE.md](NOTICE.md) for the origin of the code and
+the projects used as references only.

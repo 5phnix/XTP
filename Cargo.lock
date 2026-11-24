@@ -644,123 +644,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "victory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "memchr",
- "victory-core",
- "victory-game",
- "victory-hle",
- "victory-loader",
- "victory-pe",
- "victory-shader",
- "walkdir",
-]
-
-[[package]]
-name = "victory-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "tempfile",
- "thiserror",
- "toml",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "victory-formats"
-version = "0.1.0"
-
-[[package]]
-name = "victory-game"
-version = "0.1.0"
-dependencies = [
- "memchr",
- "miniz_oxide",
-]
-
-[[package]]
-name = "victory-gpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "miniz_oxide",
- "tempfile",
- "tracing",
- "victory-formats",
- "victory-pipeline",
- "victory-shader",
- "windows",
- "windows-sys",
-]
-
-[[package]]
-name = "victory-hle"
-version = "0.1.0"
-dependencies = [
- "miniz_oxide",
- "opus-pure",
- "tempfile",
- "tracing",
- "victory-formats",
- "victory-gpu",
- "victory-loader",
- "victory-pe",
- "windows",
- "windows-core",
- "windows-sys",
-]
-
-[[package]]
-name = "victory-loader"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "tempfile",
- "thiserror",
- "tracing",
- "victory-core",
- "victory-pe",
- "windows-sys",
-]
-
-[[package]]
-name = "victory-pe"
-version = "0.1.0"
-dependencies = [
- "object",
- "thiserror",
-]
-
-[[package]]
-name = "victory-pipeline"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "tempfile",
- "tracing",
- "victory-core",
-]
-
-[[package]]
-name = "victory-shader"
-version = "0.1.0"
-dependencies = [
- "miniz_oxide",
- "thiserror",
- "windows",
- "windows-sys",
-]
-
-[[package]]
 name = "walkdir"
 version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -911,4 +794,121 @@ dependencies = [
  "anyhow",
  "clap",
  "walkdir",
+]
+
+[[package]]
+name = "xtp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "memchr",
+ "walkdir",
+ "xtp-core",
+ "xtp-game",
+ "xtp-hle",
+ "xtp-loader",
+ "xtp-pe",
+ "xtp-shader",
+]
+
+[[package]]
+name = "xtp-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "xtp-formats"
+version = "0.1.0"
+
+[[package]]
+name = "xtp-game"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "miniz_oxide",
+]
+
+[[package]]
+name = "xtp-gpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "miniz_oxide",
+ "tempfile",
+ "tracing",
+ "windows",
+ "windows-sys",
+ "xtp-formats",
+ "xtp-pipeline",
+ "xtp-shader",
+]
+
+[[package]]
+name = "xtp-hle"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide",
+ "opus-pure",
+ "tempfile",
+ "tracing",
+ "windows",
+ "windows-core",
+ "windows-sys",
+ "xtp-formats",
+ "xtp-gpu",
+ "xtp-loader",
+ "xtp-pe",
+]
+
+[[package]]
+name = "xtp-loader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "windows-sys",
+ "xtp-core",
+ "xtp-pe",
+]
+
+[[package]]
+name = "xtp-pe"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "thiserror",
+]
+
+[[package]]
+name = "xtp-pipeline"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "tempfile",
+ "tracing",
+ "xtp-core",
+]
+
+[[package]]
+name = "xtp-shader"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide",
+ "thiserror",
+ "windows",
+ "windows-sys",
 ]
