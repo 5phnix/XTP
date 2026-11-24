@@ -633,42 +633,62 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
-        return loose(address, end);
-    };
-    let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
+    let (key, entry_end) = {
+        let map = buffers();
+        let found = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end);
+        match found {
+            Some((
+                _,
+                Entry {
+                    shadow: Some(s), ..
+                },
+            )) => return Some(s.clone()),
+            Some((&key, e)) => (key, e.end),
+            None => {
+                drop(map);
+                return loose(address, end);
+            }
         }
-        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
+    };
+    // Made without the map's lock held: making a buffer may wait (for a
+    // heap, or VidMm), and every recording thread looks copies up here.
+    let len = entry_end - key.0;
+    // Rounded up so that views ending in the buffer's last 256 bytes fit.
+    // Shaders write some buffers (unordered access), so not upload memory.
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let made = Arc::new(Shadow::new(buffer, data, gpu, key.0, len));
+    let mut map = buffers();
+    match map.get_mut(&key) {
+        // Another thread made one meanwhile: that one (ours goes).
+        Some(Entry {
+            shadow: Some(s), ..
+        }) => return Some(s.clone()),
+        Some(entry) if entry.end == entry_end => entry.shadow = Some(made.clone()),
+        // Released (or made again) meanwhile: ours serves this use only.
+        _ => return Some(made),
     }
-    entry.shadow.clone()
+    drop(map);
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "large buffer copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "buffer copied to the host"
+        );
+    }
+    Some(made)
 }
 
 /// The copy [`find`] gives `[address, address + len)`, if it is made
@@ -850,21 +870,28 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some(shadow) = LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(start, len))
+    {
         return Some(shadow.clone());
     }
+    // Made without the lock held, as in `find`.
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let made = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    // The first one made stays.
+    let shadow = map.entry((start, len)).or_insert(made).clone();
+    drop(map);
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
         "loose memory copied to the host"
     );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
-    map.insert((start, len), shadow.clone());
     Some(shadow)
 }
 
@@ -1107,5 +1134,46 @@ mod tests {
             !shadow.stale(page, page + PAGE),
             "current after our own write"
         );
+    }
+
+    /// A copy is made without the buffer map's lock held: while one thread
+    /// waits to make a buffer's copy (a heap, VidMm), another finds the
+    /// copies of other buffers. Before, every recording thread queued on
+    /// that lock behind the one waiting (frame-prof's session A).
+    #[test]
+    fn a_copy_is_made_without_the_buffer_lock_held() {
+        let test = "shadow::tests::a_copy_is_made_without_the_buffer_lock_held";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let window = watched(2 << 20);
+        // Two title buffers (the resources are only keys here), the first
+        // of a size no other test asks for.
+        let (slow, quick) = ((window, 0x7_0123u64), (window + (1 << 20), 0x100u64));
+        register(0x5eed_0001, slow.0 as u64, slow.1);
+        register(0x5eed_0002, quick.0 as u64, quick.1);
+        let (release, held) = std::sync::mpsc::channel();
+        *crate::host::buffers::HOLD.lock().unwrap() =
+            Some((slow.1.next_multiple_of(1 << 16), held));
+        let waiting = std::thread::spawn(move || find(slow.0 as u64, 16).is_some());
+        // The first is being made; the second is found meanwhile.
+        while crate::host::buffers::HOLD.lock().unwrap().is_some() {
+            std::thread::yield_now();
+        }
+        let (found, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = found.send(find(quick.0 as u64, 16).is_some());
+        });
+        let quick_found = done.recv_timeout(std::time::Duration::from_secs(10));
+        release.send(()).unwrap();
+        assert_eq!(quick_found, Ok(true), "not held up by the other's making");
+        assert!(waiting.join().unwrap());
+        let first = find(slow.0 as u64, 16).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &find(slow.0 as u64 + 8, 8).unwrap()),
+            "made once"
+        );
+        unregister(0x5eed_0001, slow.0 as u64);
+        unregister(0x5eed_0002, quick.0 as u64);
     }
 }

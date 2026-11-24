@@ -14,6 +14,7 @@
 //! failure (gpu.md, risk 2): each submission is waited for and finished
 //! before `execute` returns, and there is no completion thread.
 
+pub(crate) mod buffers;
 #[cfg(test)]
 mod submissions;
 mod timeline;
@@ -387,6 +388,8 @@ fn create(software: bool) -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        // Heaps for buffers, made from now on by threads of their own.
+        buffers::start(&device);
         tracing::info!(synchronous = sync_submit(), "host D3D12 device ready");
         Ok(Host {
             device,
@@ -2002,7 +2005,6 @@ impl HostList {
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
@@ -2012,6 +2014,7 @@ impl HostList {
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
@@ -2020,14 +2023,19 @@ impl HostList {
             let chunk = match spare {
                 Some(chunk) => chunk,
                 None => {
+                    // Made without the lock held (it may wait for a heap);
+                    // a list records on one thread at a time.
+                    drop(s);
                     let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
                     name(&buffer, || "list scratch".into());
                     // SAFETY: a live buffer.
                     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                    s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
                     (buffer, data as usize, gpu)
                 }
             };
             s.chunks.push(chunk);
+            s.current = s.chunks.len() - 1;
             s.used = 0;
         }
         let (_, data, gpu) = s.chunks[s.current];
@@ -2039,13 +2047,19 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = {
-            let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
-            if budget.is_none() {
+        let made = self
+            .budget
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (buffer, data) = match made {
+            Some(made) => made,
+            None => {
+                // Made without the lock held (it may wait for a heap).
                 let (b, d) = host()?.shared_buffer(256)?;
-                *budget = Some((b, d as usize));
+                let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+                budget.get_or_insert((b, d as usize)).clone()
             }
-            budget.clone()?
         };
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
@@ -2449,8 +2463,12 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
-    /// A buffer in the upload heap, mapped for writing.
+    /// A buffer in the upload heap, mapped for writing: placed in a heap
+    /// reserved ahead ([`buffers`]), else committed.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(placed) = buffers::buffer(buffers::Kind::Upload, size) {
+            return Some(placed);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -2619,6 +2637,9 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             crate::device::log_frame();
+            if let Some(pools) = buffers::summary() {
+                tracing::info!("buffer heaps: {pools}");
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -2857,8 +2878,12 @@ impl Host {
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
-    /// the common state (buffers move out of it implicitly).
+    /// the common state (buffers move out of it implicitly), zeroed. Placed
+    /// in a heap reserved ahead ([`buffers`]), else committed.
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(placed) = buffers::buffer(buffers::Kind::System, size) {
+            return Some(placed);
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
