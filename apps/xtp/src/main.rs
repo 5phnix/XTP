@@ -237,9 +237,6 @@ fn main() -> Result<()> {
     if xtp_hle::modules::audio::capture::child() {
         return Ok(());
     }
-    // An `XTP_*` set to `ab` that cannot alternate (a translation switch,
-    // or one not read through `xtp_core::ab`) stops the run here.
-    xtp_core::ab::check_environment().map_err(anyhow::Error::msg)?;
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect {

@@ -828,7 +828,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -859,7 +858,6 @@ dependencies = [
  "tracing",
  "windows",
  "windows-sys",
- "xtp-core",
  "xtp-formats",
  "xtp-pipeline",
  "xtp-shader",

@@ -12,7 +12,6 @@ blake3.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
-xtp-core.workspace = true
 xtp-formats.workspace = true
 xtp-pipeline.workspace = true
 xtp-shader.workspace = true
