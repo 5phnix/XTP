@@ -672,7 +672,10 @@ impl<'a> Lower<'a> {
 
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
     /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
-    /// the compare and select DXIL specifies gives either zero.
+    /// the compare and select DXIL specifies gives either zero, and a NaN
+    /// operand gives the other one (two NaNs give NaN), chosen here: what
+    /// hosts' FMax/FMin do with a NaN differs (an Intel UHD driver, issue
+    /// #34). A host whose FMax/FMin already skip NaNs folds the selects.
     pub(super) fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
@@ -686,7 +689,11 @@ impl<'a> Lower<'a> {
         let op = if max { Bin::And } else { Bin::Or };
         let sign = self.s.m.bin(c, op, ia, ib);
         let signed = self.as_float(sign);
-        self.s.m.select(c, zeros, signed, r)
+        let r = self.s.m.select(c, zeros, signed, r);
+        let nan_a = self.s.m.cmp(c, pred::UNO, a, a);
+        let nan_b = self.s.m.cmp(c, pred::UNO, b, b);
+        let r = self.s.m.select(c, nan_b, a, r);
+        self.s.m.select(c, nan_a, b, r)
     }
 
     pub(super) fn fmad(&mut self, a: V, b: V, c: V) -> V {
@@ -756,18 +763,33 @@ impl<'a> Lower<'a> {
     }
 
     /// The median of three. With a NaN among them the hardware gives the
-    /// minimum of the three instead (the host's minimum skips NaNs, so that
-    /// is the smallest number among them).
+    /// minimum of the others instead (min3), and NaN when all three are.
+    /// Each NaN is replaced by an operand that is not one before that
+    /// minimum, so it never meets a NaN: hosts' FMin differ there (an Intel
+    /// UHD driver gave 2.0 for (1.0, 2.0, NaN), issue #34).
     pub(super) fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
         let hi = self.binary(35, a, b);
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
-        let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        let (nan_a, nan_b, nan_c) = (
+            self.s.m.cmp(c, pred::UNO, a, a),
+            self.s.m.cmp(c, pred::UNO, b, b),
+            self.s.m.cmp(c, pred::UNO, third, third),
+        );
+        // A number among the three if there is one: a, else b, else third.
+        let b_or_c = self.s.m.select(c, nan_b, third, b);
+        let some = self.s.m.select(c, nan_a, b_or_c, a);
+        let (x, y, z) = (
+            some,
+            self.s.m.select(c, nan_b, some, b),
+            self.s.m.select(c, nan_c, some, third),
+        );
+        let least = self.max_min(false, x, y);
+        let least = self.max_min(false, least, z);
+        let ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
+        let nan = self.s.m.bin(c, Bin::Or, ab, nan_c);
         self.s.m.select(c, nan, least, median)
     }
 
