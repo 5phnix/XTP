@@ -18,7 +18,8 @@ instruction order, and (in groups of exactly 64 threads) whole-wave
 reductions and prefix sums, of integers and floats. Still open: groups of
 several console waves, whole-wave sections in other groups, and
 `ds_permute`; each stops with its own reason. (`ds_bpermute` gathers within each 32-lane half
-and is lowered as an in-half read, like `ds_swizzle`.)
+and is lowered as an in-half read, like `ds_swizzle`.) Wave64 mesh programs
+run on 32-lane hosts ([Mesh programs](#mesh-programs)).
 
 ## The problem
 
@@ -230,6 +231,29 @@ one host wave is the console wave, so ballots are the wave's own and nothing
 is exchanged; any group size and LDS are fine. If the console flow cannot
 lower the program, it keeps the per-lane form (`Parts::per_lane_only`), so
 nothing that translated before is refused.
+
+## Mesh programs
+
+D3D12 gives a mesh shader no wave size to ask for. A console wave64 mesh
+program therefore runs in whatever waves the host forms: 32 lanes on
+NVIDIA, 4 on WARP. XTP lowers mesh code per lane and numbers its lanes from
+the flat thread id (console lane = id % 64, console wave = id / 64). Mesh
+code reads no other lane except within quads, and reads no mask as a
+number. Its one dependence on whole console waves is `v_readfirstlane_b32`:
+- a value proven the same in every lane of the console wave is each lane's
+  own (`emit/lower/uniform.rs`);
+- any other one, in a block every lane of the group runs, comes through
+  group-shared memory between group barriers (`emit/lower/mesh.rs`);
+- the rest is refused on a host without 64-lane waves.
+
+Barriers kept in mesh programs with LDS must sit where the whole group runs
+them, and a group of one console wave with LDS is refused. The runtime lets
+every wave64 mesh program the translator made for the host's lanes run.
+`XTP_WAVE64_MESH=refuse` gives back VIctory #578's refusal.
+
+For BTP 6's pack, 8,807 of 9,282 mesh programs translate and run on
+NVIDIA, against none before. The design, the measurements and what stays
+refused are in [analysis/mesh-wave64.md](analysis/mesh-wave64.md).
 
 ## Testing
 

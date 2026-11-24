@@ -490,7 +490,8 @@ pub(crate) struct Needs {
 
 /// What a wave64 mesh program is refused as with `XTP_WAVE64_MESH=refuse`
 /// ([`Needs::wave64_mesh`]).
-const MESH_REFUSED: &str = "a mesh program written for 64-lane waves                             (XTP_WAVE64_MESH=refuse, as VIctory #578)";
+const MESH_REFUSED: &str =
+    "a mesh program written for 64-lane waves (XTP_WAVE64_MESH=refuse, as VIctory #578)";
 
 /// What a wave64 mesh program translated for a target with 64-lane waves
 /// is refused as on a host without them ([`Needs::wave64_mesh`]).
@@ -508,11 +509,14 @@ pub(crate) fn wave64_mesh_refused() -> bool {
         match crate::device::host_wave_lanes() {
             Some((min, max)) if max < 64 && refuse => tracing::warn!(
                 lanes = format_args!("{min} to {max}"),
-                "XTP_WAVE64_MESH=refuse: wave64 mesh programs are refused on a host without                  64-lane waves (VIctory #578)"
+                "XTP_WAVE64_MESH=refuse: wave64 mesh programs are refused on a host without \
+                 64-lane waves (VIctory #578)"
             ),
             Some((min, max)) if max < 64 => tracing::info!(
                 lanes = format_args!("{min} to {max}"),
-                "the host has no 64-lane waves: wave64 mesh programs read their console wave's                  first lane by proof or through group-shared memory, or do not translate                  (XTP_WAVE64_MESH=refuse refuses them all)"
+                "the host has no 64-lane waves: wave64 mesh programs read their console wave's \
+                 first lane by proof or through group-shared memory, or do not translate \
+                 (XTP_WAVE64_MESH=refuse refuses them all)"
             ),
             _ => {}
         }

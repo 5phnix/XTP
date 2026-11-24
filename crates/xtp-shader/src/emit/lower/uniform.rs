@@ -1289,6 +1289,34 @@ mod tests {
         assert_eq!(first_lanes(&apart), [Level::Group, Level::Lane]);
     }
 
+    /// VIctory issue #1498's program (by r4tedx), in its wave64 form: lanes
+    /// that are done join an exit mask, EXEC loses them, and the mask is
+    /// counted after the loop. On the console every lane counts 64; each
+    /// lane of the per-lane form knows only its own path. The count (and
+    /// any value made from it) is the lane's, never proven alike.
+    #[test]
+    fn a_mask_counted_after_a_loop_lanes_leave_apart() {
+        let words = [
+            &LANE[..],
+            &[
+                0x4A02_0081, // v_add_nc_u32 v1, 1, v0 (lane i loops i + 1 times)
+                0xBE8A_0480, // s_mov_b64 s[10:11], 0 (the exit mask)
+                // loop:
+                0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+                0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+                0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+                0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+                0xBF89_FFFB, // s_cbranch_execnz loop
+                0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+                0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+                0x7E04_0209, // v_mov_b32 v2, s9
+                0x7E18_0502, // v_readfirstlane_b32 s12, v2
+            ],
+        ]
+        .concat();
+        assert_eq!(first_lanes(&words), [Level::Lane]);
+    }
+
     /// Memory the program writes may change between the loads of two host
     /// waves: a load at the group's address is the group's only in a
     /// program without stores.
