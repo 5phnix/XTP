@@ -2,7 +2,7 @@
 //! (byte and half accesses), G2 (the ESGS ring).
 
 use super::{Lower, Why};
-use crate::emit::bitcode::{Bin, V};
+use crate::emit::bitcode::{Attr, Bin, V, pred};
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Reg};
 
@@ -31,6 +31,58 @@ impl<'a> Lower<'a> {
             Some(Operand::Vector { reg, .. }) => Some(*reg),
             _ => None,
         };
+        if name == "ds_bpermute_b32" {
+            // RDNA2 gathers separately within each 32-lane half. Disabled
+            // source lanes supply zero and disabled destinations are preserved.
+            self.cross_lane(false)?;
+            let address =
+                self.vgprs(inst, addr.as_ref().ok_or("a backward permute address")?, 1)?[0];
+            let source = self.vgprs(inst, data.first().ok_or("a backward permute source")?, 1)?[0];
+            let offset = self.s.m.i32(u32::from(*offset0));
+            let byte_address = self.s.m.bin(c, Bin::Add, address, offset);
+            let two = self.s.m.i32(2);
+            let word = self.s.m.bin(c, Bin::LShr, byte_address, two);
+            let mask = self.s.m.i32(31);
+            let within_half = self.s.m.bin(c, Bin::And, word, mask);
+            let lane = self.s.op(
+                c,
+                "waveGetLaneIndex",
+                Attr::ReadOnly,
+                self.s.t.i32,
+                111,
+                &[],
+            );
+            let high_mask = self.s.m.i32(!31);
+            let base = self.s.m.bin(c, Bin::And, lane, high_mask);
+            let index = self.s.m.bin(c, Bin::Or, base, within_half);
+
+            let active = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let ty = self
+                .s
+                .m
+                .named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+            let ballot = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, ty, 116, &[active]);
+            let lo = self.s.m.extract(c, ballot, 0);
+            let hi = self.s.m.extract(c, ballot, 1);
+            let zero = self.s.m.i32(0);
+            let lower_half = self.s.m.cmp(c, pred::EQ, base, zero);
+            let bits = self.s.m.select(c, lower_half, lo, hi);
+            let shifted = self.s.m.bin(c, Bin::LShr, bits, within_half);
+            let one = self.s.m.i32(1);
+            let bit = self.s.m.bin(c, Bin::And, shifted, one);
+            let enabled = self.s.m.cmp(c, pred::NE, bit, zero);
+            let gathered = self.read_lane(source, index);
+            let value = self.s.m.select(c, enabled, gathered, zero);
+            self.write(
+                inst,
+                Reg::V(dst_reg.ok_or("a backward permute result")?),
+                value,
+                guard,
+            );
+            return Ok(());
+        }
         if name == "ds_swizzle_b32" {
             // Bit 15 set: each lane of a quad picks a lane of it; else lanes
             // of each group of 32 combine their index with and/or/xor masks.
@@ -75,6 +127,21 @@ impl<'a> Lower<'a> {
         }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
+        }
+        if self.console_cf
+            && self.split
+            && self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() > 32)
+        {
+            // The console runs an instruction in all 64 lanes before the
+            // next one. The halves are two host waves, both here (console
+            // flow): a group barrier before each LDS access puts it after
+            // every earlier one, whichever half made it.
+            let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds

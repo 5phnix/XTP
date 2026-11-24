@@ -11,6 +11,9 @@
 //!
 //! - `title_memory_import_matrix` runs on the high-performance adapter and on
 //!   WARP, and skips when there is no D3D12 device.
+//! - The registry built on these findings is `src/uma.rs` (G15b). Its tests
+//!   go through the matrix's main rows and the two "under an open heap"
+//!   cases again, through the registry; these stay as the raw API's.
 //! - The `#[ignore]`d tests are the report's benchmarks. They print Markdown
 //!   tables and read the process's commit, so run them optimised and one at a
 //!   time: `cargo test -p xtp-gpu --release --test uma_feasibility --

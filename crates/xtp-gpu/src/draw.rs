@@ -74,22 +74,11 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address, host copy) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64, usize), u32>,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -588,7 +577,7 @@ impl State {
                     crate::pipeline::note_why("no dynamic slot for a root SRV".into());
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                list.keep_dynamic(key.0, index, 1);
                 self.root_srv_slots.insert(key, index);
                 match &shadow {
                     Some((a, s)) => {
@@ -851,8 +840,9 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            // Leased until the recording goes (after its submission, if
+            // the list is reset while it runs).
+            list.keep_dynamic(std::ptr::from_ref(heap) as usize, first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1020,7 +1010,7 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
+            list.defer_host((from, n * 3 * stride), move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {

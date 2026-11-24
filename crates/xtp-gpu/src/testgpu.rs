@@ -255,6 +255,10 @@ impl TitleList {
             S_OK
         );
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &self.list);
+        // Submissions are not waited for: finished here, written back.
+        if let Some(host) = crate::host::made() {
+            host.drain();
+        }
         release(queue);
     }
 }
