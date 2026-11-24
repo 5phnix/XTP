@@ -73,6 +73,12 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\xtp\data`), derived
 data under the cache folder.
 
+Titles can read Windows caption colors, opacity, font, text size and high
+contrast mode. Captions initially follow Windows ShowSounds. A title can
+turn them on or off for its own session. Without preferences, captions are
+off, with white text on black, a transparent window, default font and edge,
+and 100% text size. High contrast defaults to off.
+
 Input: XInput pads; Xbox One and Series pads get their trigger motors too
 (through Windows.Gaming.Input). The keyboard and mouse play as a pad while
 the title's window has focus: a pad of their own while no pad is connected,
