@@ -149,9 +149,54 @@ pub(crate) fn host_adapter() -> Option<IUnknown> {
     adapter.cast().ok()
 }
 
+/// The local video memory `device`'s adapter gives this process, and how
+/// much of it the process uses, in bytes: `(budget, usage)`. Past the
+/// budget, making a resource resident can wait in the kernel for memory.
+/// `None` if DXGI cannot tell.
+pub(crate) fn video_memory(device: &ID3D12Device) -> Option<(u64, u64)> {
+    /// The adapter, asked once.
+    struct Found(Option<IDXGIAdapter3>);
+    // SAFETY: DXGI adapters are free-threaded; this one is only queried.
+    unsafe impl Send for Found {}
+    // SAFETY: as above.
+    unsafe impl Sync for Found {}
+    static ADAPTER: std::sync::OnceLock<Found> = std::sync::OnceLock::new();
+    let adapter = ADAPTER.get_or_init(|| {
+        // SAFETY: plain DXGI queries.
+        Found(unsafe {
+            let luid = device.GetAdapterLuid();
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter3>(luid))
+                .ok()
+        })
+    });
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: the query writes its own structure.
+    unsafe {
+        adapter
+            .0
+            .as_ref()?
+            .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+            .ok()?;
+    }
+    Some((info.Budget, info.CurrentUsage))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host device's adapter reports a budget and this process's use.
+    #[test]
+    fn video_memory_has_a_budget() {
+        let test = "dxgi::adapter::tests::video_memory_has_a_budget";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let (budget, usage) = video_memory(&host.device).expect("a budget");
+        assert!(budget > 0, "{budget}");
+        assert!(usage <= 1 << 40, "{usage}");
+    }
 
     fn adapter(name: &str, software: bool, usable: bool) -> Adapter {
         Adapter {

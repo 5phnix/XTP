@@ -391,6 +391,7 @@ pub fn writing(at: usize, len: usize) {
 /// of the view since the report before, its start block as a view and its
 /// blocks as guarded: the address may be ordinary memory next.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::resource::memory_remapped(at, len);
     let mut g = guards();
     let g = &mut *g;
     let range = blocks(at, len);

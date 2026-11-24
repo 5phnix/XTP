@@ -291,8 +291,16 @@ extern "system" fn present(
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
+    // Several planes: composed into one image (`dxgi::planes`).
     #[cfg(windows)]
-    if planes > 0
+    let composed = crate::dxgi::planes::present(planes, plane_parameters.cast(), frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some((resource, shown)) = composed {
+        blinks(frame, resource, 0x4, shown);
+    }
+    #[cfg(windows)]
+    if composed.is_none()
+        && planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
         && plane.count > 0
