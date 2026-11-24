@@ -176,6 +176,8 @@ struct Own {
     upload: Vec<Chunk>,
     /// Bytes copied on the GPU since the reset.
     copied: u64,
+    /// What the list's indirect rectangle draws are expanded into.
+    rects: Option<crate::rectangles::Scratch>,
 }
 
 struct Chunk {
@@ -200,6 +202,9 @@ unsafe impl Send for Chunk {}
 
 impl Drop for Own {
     fn drop(&mut self) {
+        if let Some(rects) = self.rects.take() {
+            crate::rectangles::give_back(rects);
+        }
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         let pool = &mut *pool;
         for (mine, pooled, gpu) in [
@@ -1678,21 +1683,8 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return fail(Unready::NoPipeline);
         }
-        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
-            // Whether the corners come from vertex buffers or from the
-            // vertex id tells which expansion they need.
-            let inputs = crate::pipeline::host_pipeline(self.pipeline as This)
-                .map(|p| p.inputs.iter().any(|e| !e.per_instance));
-            return fail(match (kind, inputs) {
-                (INDEXED, _) => INDEXED_RECTANGLES.into(),
-                (_, None) => Unready::NoPipeline,
-                (_, Some(true)) => {
-                    "rectangles (not expanded for indirect draws), vertex inputs".into()
-                }
-                (_, Some(false)) => {
-                    "rectangles (not expanded for indirect draws), no vertex inputs".into()
-                }
-            });
+        if kind == INDEXED && self.topology == RECTANGLES {
+            return fail(INDEXED_RECTANGLES.into());
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
@@ -1705,6 +1697,16 @@ impl State {
             },
             None => None,
         };
+        if kind == DRAW && self.topology == RECTANGLES {
+            let rects = (&args, arguments);
+            return match self.indirect_rectangles(list, (stride, max), rects, &counter) {
+                Ok(()) => {
+                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                Err(why) => fail(why),
+            };
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -1761,6 +1763,70 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+}
+
+impl State {
+    /// An indirect draw of rectangle lists: `max` records `stride` bytes
+    /// apart at title address `arguments` (host copy `args`), and the count
+    /// at `counter` if the title gives one, expanded on the GPU
+    /// ([`crate::rectangles`]) and run from the list's own arguments.
+    fn indirect_rectangles(
+        &mut self,
+        list: &HostList,
+        (stride, max): (u32, u32),
+        (args, arguments): (&std::sync::Arc<crate::shadow::Shadow>, u64),
+        counter: &Option<(std::sync::Arc<crate::shadow::Shadow>, u64)>,
+    ) -> Result<(), Unready> {
+        let p = crate::pipeline::host_pipeline(self.pipeline as This).ok_or(Unready::NoPipeline)?;
+        if p.compute || p.mesh {
+            return Err(if p.compute {
+                "a compute pipeline bound"
+            } else {
+                "a mesh pipeline bound"
+            }
+            .into());
+        }
+        if max == 0 {
+            return Ok(());
+        }
+        // The rewritten records: draw arguments, 16 bytes apart.
+        let signature = host_signature(0, 16).ok_or("no host signature")?;
+        let vertices = self.vertex.map(|v| (v.address, v.size, v.stride));
+        let prepared = crate::rectangles::expand(
+            list,
+            &mut self.own.rects,
+            &p.inputs,
+            &vertices,
+            (args, arguments, stride, max),
+            counter.as_ref().map(|(s, at)| (s, *at)),
+        )?;
+        // The passes bound compute state of their own.
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        self.prepare(list, false)?;
+        prepared.bind_vertices(list);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            self.op_text(
+                format!("indirect rectangles max {max} at {arguments:#x}"),
+                false,
+            )
+        });
+        // SAFETY: an open list with everything set; the arguments are the
+        // list's own (records past the title's count are empty draws, so no
+        // count buffer), the signature is cached.
+        unsafe {
+            list.list.ExecuteIndirect(
+                &signature,
+                max,
+                &prepared.args,
+                prepared.offset,
+                None::<&ID3D12Resource>,
+                0,
+            )
+        };
+        Ok(())
     }
 }
 
