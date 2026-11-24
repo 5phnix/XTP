@@ -15,9 +15,11 @@
 //! - Query 0x10004, the jitter phase count `(render width, display width,
 //!   out)`, right after. The frame counter is taken modulo it at
 //!   title+0x28f03e8 (a division by zero when it stays 0).
-//! - Query 0x10005 each frame, the jitter offset `(index, phase count, out
-//!   x, out y)`: the camera is moved by what it writes, into locals the
-//!   title does not initialise.
+//! - Query 0x10005, the jitter offset `(index, phase count, out x, out y)`:
+//!   the camera would be moved by what it writes, into locals the title
+//!   does not initialise. Not reached in XTP's Series S sessions: the
+//!   dispatches carry the title's own jitter (a sequence of its own,
+//!   docs/analysis/fidelityfx.md), so this answer is AMD's in case it is.
 //! - Query 0x10008, the upscaler's GPU memory `(out)`: the title adds what
 //!   it writes, again into uninitialised locals, to a memory total.
 //! - Dispatch 0x10001 each frame: `ffxDispatchDescUpscale` (432 bytes),

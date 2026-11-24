@@ -31,7 +31,7 @@ the loader loads the upscaler, and both export the same five calls
 |---|---|---|---|
 | +0x28ef2cc | create | 0x10000 upscale (flags, largest render 1280×720 and output 1920×1080), chained to 0x1000002 (console backend, the device at +0x10) and 0x1000b (version 0x1001001) | result not read |
 | +0x28ef30f | query 0x10004 | jitter phase count: render width, display width, out | out is the object's +0x10c, the divisor at title+0x28f03e8; a title setting at +0x22c (-1: none) may replace it |
-| +0x28ef625 | query 0x10005 | jitter offset: index, phase count, out x, out y | out are stack locals the title does not initialise; it moves the camera by them and keeps them for the dispatch |
+| +0x28ef625 | query 0x10005 | jitter offset: index, phase count, out x, out y | out are stack locals the title does not initialise; it would move the camera by them and keep them for the dispatch. Never reached in XTP's sessions: the title jitters by a sequence of its own (section 7) |
 | +0x28f03db | dispatch 0x10001 | `ffxDispatchDescUpscale`, 432 bytes | result not read; then the frame index advances modulo the phase count |
 | +0x28f0651 | query 0x10008 | upscaler GPU memory: out | out is an uninitialised local; the title adds its first word to a memory total |
 | +0x28ef512 | destroy | the context | |
@@ -47,10 +47,11 @@ scale, render size (the colour texture's size) at +0x178, output size
 at +0x180, sharpening when the title's sharpness is above 0, frame time,
 pre-exposure 1.0, reset, the camera's near, far and field of view.
 
-So the title reads three things back from FidelityFX: the phase count,
+So the title can read three things back from FidelityFX: the phase count,
 the jitter offsets, and the memory figure. Without answers it divides by
-zero, jitters its camera by stack garbage and adds garbage to its memory
-total.
+zero, and would jitter its camera by stack garbage and add garbage to its
+memory total. In XTP's Series S sessions only the phase count and the
+memory query were asked: the dispatches carry the title's own jitter.
 
 ## 2. The stand-in
 
@@ -58,7 +59,8 @@ total.
   (`ffxFsr3UpscalerGetJitterPhaseCount`): 18 for 1280 → 1920. #730's log
   with AMD's PC FSR 3.1.6 gave 32 for 1920 → 3840, the same formula.
 - **Jitter offset**: Halton (2, 3) of `index % phases + 1`, minus 0.5
-  (`ffxFsr3UpscalerGetJitterOffset`).
+  (`ffxFsr3UpscalerGetJitterOffset`). Kept for a title or a setting that
+  asks; BTP 6 did not in XTP's sessions.
 - **GPU memory**: 0 total, 0 aliasable: the pass takes no title memory.
 - **Dispatch**: a compute pass of XTP's (HLSL, `cs_5_1`, compiled once by
   the system's compiler) on the title's host list. Each output pixel
@@ -162,7 +164,79 @@ drops task's file.
 
 ## 7. Sessions
 
-(Filled in below.)
+Through `E:\tools\stall-probe\session.ps1` (Series S, golden data,
+autopilot, `XTP_SKIP_INTRO=1`, `XTP_WATCHDOG_HOOK=1`), under
+`measure.lock`, on the RTX 4080 SUPER. Times UTC.
+
+**Session 1, HLE** (`20261124-182836`, build of the first commit,
+3e65bac at `refs/ffx/wip`, + #1349; the autopilot's default 30 s in the
+world):
+- The world at 18:29:00 (frame 634), 24 s after the start; the
+  autopilot ended the title 30 s later, exit code 0. No crash.
+- `ffx`: a context 1280×720 → 1920×1080 (flags 0x29), phase count 18;
+  the first dispatch recorded the upscale (`ran=true`). Its description:
+  colour `[2, 4, 1280, 720, 1, 1, 0, 2]` (2D, FidelityFX's
+  R16G16B16A16_FLOAT), output `[2, 29, 1920, 1080, 1, 1, 0, 2]`, states
+  `[12, 12, 12, 0, 0, 0, 2]` (the reactive and transparency masks
+  absent), jitter (-0, -0).
+- FSR4's traces are gone: no "no DXIL part" refusal, no list 0x1a8, no
+  pipeline 0x58. Device 0x218 and 0x1c8 still come, from the title.
+- The capped heap: 737,856 title slots and 262,144 dynamic ones; peak
+  32,774 in use; no title slot past 737,856.
+- The world's frame line (32 s): 0.5 fps, 16 draws a frame, 483 dropped
+  for want of a pipeline with 394 being made, the longest submission
+  14.8 s. The shader cache is keyed by the executable's hash, so this
+  new build translated its 1,208 shaders again: these are cold-cache
+  numbers, not the upscale's cost.
+- No world capture: no frame reached the 150 draws `XTP_CAPTURE_WORLD`
+  asked for.
+
+Sessions 2 to 4: one diagnostic build of this branch (its first three
+commits on be92c57, which has #1349; the later ones add log lines and
+text), `-Measure 120 -Limit 240`, at least 10 minutes apart. Session 2
+ran on a cold shader cache (a new build), 3 and 4 on a warm one.
+
+| | 2: HLE | 3: `XTP_FSR4=1` | 4: HLE |
+|---|---|---|---|
+| Run (`E:\xtp-data\cache\play\`) | `20261124-185341` | `20261124-190642` | `20261124-192036` |
+| World after | 27 s | 24 s | 20 s |
+| End | the autopilot's, after 120 s; exit 0 | **device removed** (`DEVICE_HUNG`) 110 s into the world | **device removed** (`DEVICE_HUNG`) 105 s into the world |
+| fps (median, lowest, highest) | 3.8, 2.6, 7.5 | 4.8, 3.9, 9.5 | 5.0, 3.6, 7.7 |
+| Draws, dropped per frame (median) | 481, 1,097 | 516, 1,045 | 490, 1,050 |
+| FSR4 traces | none | 20 "no DXIL part", pipeline 0x58, its passes "falling back to NewBE" | none |
+| Black frames after a lit one | 9 | 9 | 8 |
+| Dynamic slots (peak of 262,144) | 65,543 | 65,543 | 65,573 |
+
+- **The removals are not FidelityFX's.** Session 3 runs no upscale and
+  session 4 no UAV clear (FSR4 is not loaded), and both end the same way:
+  no list submitted, 31 or 32 in flight, no breadcrumbs. Sessions of other
+  tasks on main that day, which have neither, ended the same way 68 s
+  (copyback B) and 74 s (ds-guards after) into the world. Session 2, on a
+  cold cache, went through the world's opening more slowly and may not
+  have reached the point where it happens. The shader the hang task
+  suspects, compute d3e44e754b3eb6aa, is translated and bound in every
+  HLE session: it is the title's, not FSR4's.
+- **The image is the same.** The world's captures of sessions 3 and 4
+  are byte for byte identical (frames 800 and 1000; 568 to 571 of
+  session 4 and 687 of session 3): the world's opening credits over
+  black. The 3D scene reaches the screen in neither (about 1,050 draws
+  dropped a frame on the RTX 4080, most of them wave64 mesh programs this
+  host refuses: the mesh64 task). These captures cannot judge the
+  upscale: a dump of its input and output (`XTP_DUMP_TARGETS`) is the
+  next step.
+- **The frame rate** is within the sessions' spread: FSR4's refused
+  passes cost nothing, and the bilinear pass (one 1920×1080 dispatch) is
+  not visible in the frame line.
+- **The title's own jitter.** The jitter offset query (0x10005) was never
+  asked: the dispatches carry the title's own offsets. After three
+  dispatches at (−0, −0), the n-th is (−w(n·0.7548777), −w(n·0.5698403)),
+  w wrapping to [−0.5, 0.5): (0.2451, 0.4302), (0.4902, −0.1397),
+  (−0.2646, 0.2905), (−0.0195, −0.2794), (0.2256, 0.1508). That is the
+  R2 sequence (the plastic number's), negated as FidelityFX's samples
+  negate the camera's jitter. Whether it wraps at the phase count was not
+  seen (8 dispatches logged).
+- The black frames after a lit one come in both paths alike, every 70 to
+  110 frames in the world.
 
 ## 8. Critical review
 
@@ -187,17 +261,31 @@ Doubts and answers:
 - *Is 18 the count the title expects?* It is AMD's formula for the
   title's sizes, and AMD's PC upscaler gave the same formula's 32 for
   1920 → 3840 (#730). FSR4's own console DLL was not observed. With no
-  temporal accumulation the cycle's length only sets how often the jitter
-  pattern repeats; the offsets come from the same count, so the title's
-  sequence stays consistent.
-- *Should a bilinear upscale jitter at all?* FSR replaces the title's
-  TAA, so a jittered camera with no accumulation only moves the image by
-  up to half a render pixel each frame. The upscale takes the jitter back
-  (sampling at `+ jitter`, FidelityFX's convention, checked on WARP with
-  a quarter-texel jitter); edges may still crawl a little, as their
-  aliasing changes with the sample position. Zero offsets would give a
-  steadier image; the title then renders without jitter. Kept as AMD
-  answers until captures say otherwise.
+  temporal accumulation the cycle's length only sets how often the
+  title's jitter pattern repeats; what must hold is that it is not 0.
+- *Does the stand-in avoid the device removals?* No. Both paths lose the
+  device about 105 to 110 s into the world (section 7), and nothing of
+  FidelityFX's runs in the HLE one. What the stand-in removes is FSR4's
+  20 refused programs, its missing pipeline method and its UAV clears;
+  what it gives is an output the title's later passes can read, where
+  FSR4's refused programs leave theirs unwritten.
+- *Are the jitter offsets what the title uses?* No: it never asks for
+  them (section 7). It jitters its camera by its own R2 sequence and
+  passes that to the dispatch, so the Halton answer is dead code for
+  BTP 6 1.0.2.1 and only the phase count matters. Zero offsets from XTP
+  would not steady the image: the title would not see them.
+- *Does the upscale take the jitter back the right way?* FSR replaces the
+  title's TAA, so a jittered camera with no accumulation moves the image
+  by up to half a render pixel each frame. The pass samples at
+  `+ jitter`: FSR 2's own reconstruction puts the texel at `i` at
+  `i + 0.5 − jitter` (`fSrcUnjitteredPos`), and the WARP test checks the
+  pass against that with a quarter-texel jitter. The title's dispatch
+  jitter is the negation of its camera's, as FidelityFX's samples pass
+  it, so it follows that convention. Not checked on the title's frames:
+  the world's scene does not reach the screen on this host yet (section
+  7), so consecutive captures cannot show whether the image holds still.
+  Edges may crawl a little even when it does, as their aliasing changes
+  with the sample position.
 - *Is the output resource and state right?* The output is the title's
   render target with unordered access (state 2 in the description); XTP's
   host copy of it is in its R16G16B16A16_FLOAT stand-in. The pass writes
@@ -221,7 +309,17 @@ is not taken: neither the title nor FSR4 called it in XTP's logs.
 
 ## 9. What is left
 
+- The world's device removal, 105 to 110 s in, in both paths (section
+  7): not FidelityFX's; the TDR tasks have the runs.
+- The upscale on the title's own frames: consecutive captures of a
+  world whose scene reaches the screen (after the mesh64 task), to see
+  that the jitter is taken back and how soft the bilinear output is.
 - Picture quality: FSR4's own network (route B, watch item 81) or an
   edge-aware spatial upscale, if the bilinear output is too soft.
 - Device 0x218 and 0x1c8, which the title calls itself.
 - VIctory #1264 for `xmem.rs` (section 5).
+- VIctory #1444 (a view heap released and remade at the same address
+  while a list records skips `SetDescriptorHeaps`): XTP has the same
+  gap. `State::set_host_heaps` compares title heap addresses
+  (`draw.rs`); comparing host heaps, as `host_pipeline` does for
+  pipelines, would close it. It is `draw.rs`'s task's, not this one's.
