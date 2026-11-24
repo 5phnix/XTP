@@ -273,6 +273,11 @@ struct Lower<'a> {
     /// The console thread's flat id in the group (relabelled; see
     /// [`Self::thread_id`]).
     console_flat: Option<V>,
+    /// Compute: the console's group shape where the host's is declared as
+    /// one row of as many threads, for the quads of implicit derivatives
+    /// (see `Lower::new`); the thread ids then come from the flat one
+    /// ([`Self::flat_thread_id`]).
+    flat_group: Option<[u32; 3]>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
     /// Mesh: the thread index in the group (made in the entry block).
@@ -380,6 +385,37 @@ fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(
     (c < extent(b)?).then_some((b, c))
 }
 
+/// The second row of each 16-bit row in `packed` that packs two per dword,
+/// by first row: the next 16-bit row of `elements` that no entry names
+/// (`named`), the packed rows taking theirs in row order. Vertex and mesh
+/// outputs ([`export::half_outputs`]) and pixel inputs
+/// ([`input::half_input_partner`]) pair rows by this one rule, so that what
+/// a vertex program packs into a dword is what its pixel program unpacks:
+/// the vertex metadata names no second row.
+fn packed_partners(
+    elements: &[SigElement],
+    named: impl Fn(u8) -> bool,
+    packed: impl IntoIterator<Item = u8>,
+) -> HashMap<u8, u8> {
+    let mut free: Vec<u8> = elements
+        .iter()
+        .filter(|e| e.half && e.kind == 0)
+        .filter_map(|e| u8::try_from(e.row?).ok())
+        .filter(|&r| !named(r))
+        .collect();
+    free.sort_unstable();
+    free.dedup();
+    let mut rows: Vec<u8> = packed.into_iter().collect();
+    rows.sort_unstable();
+    let mut partners = HashMap::new();
+    for row in rows {
+        if let Some(k) = free.iter().position(|&r| r > row) {
+            partners.insert(row, free.remove(k));
+        }
+    }
+    partners
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -405,8 +441,29 @@ impl<'a> Lower<'a> {
         let mut split = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
+        let mut flat_group = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
+            // Samples taking their level from their quad (implicit
+            // derivatives, `Lower::image`): the console's quad is four
+            // consecutive thread ids, its lanes following the thread order;
+            // the host's, in a group whose X and Y are both even, is a 2 × 2
+            // block of the thread id (SM 6.6 compute derivatives, which
+            // quad reads follow too). One row whose size is a multiple of 4
+            // has the console's quads (SM 6.6's 1D rule), so the group is
+            // declared as that row and the console's ids come from the flat
+            // one. Other sizes have no such row: the samples refuse them.
+            let threads: u32 = cs.threads.iter().product();
+            if threads.is_multiple_of(4)
+                && cs.threads[1..] != [1, 1]
+                && insts().any(|i| {
+                    matches!(i.fields, Fields::Image { .. })
+                        && image::implicit_derivatives(i.name())
+                })
+            {
+                s.threads = Some([threads, 1, 1]);
+                flat_group = Some(cs.threads);
+            }
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
@@ -638,6 +695,7 @@ impl<'a> Lower<'a> {
             wants_console_flow,
             no_console_flow,
             console_flat: None,
+            flat_group,
             xchg: None,
             flat: None,
             no_barrier,

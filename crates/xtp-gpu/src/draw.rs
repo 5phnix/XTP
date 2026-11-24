@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use xtp_shader::{ResourceType, RootType, UsedResource};
@@ -116,6 +117,9 @@ pub(crate) struct State {
     /// (compute, unordered access): a copy of the list's own made before
     /// one is not reused after it.
     writes: u64,
+    /// A dispatch was dropped since the list's last one that ran: the next
+    /// that runs starts with a UAV barrier ([`State::dispatch_dropped`]).
+    dropped_dispatch: bool,
     /// Memory of the list's own that root views are copied into.
     own: Own,
 }
@@ -619,6 +623,15 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+    }
+
+    /// Work of XTP's own bound its heaps, root signature and pipeline on
+    /// the host list (`crate::list`'s upscale and UAV clears): the next draw
+    /// or dispatch binds the title's again.
+    pub(crate) fn forget_host(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -1197,12 +1210,12 @@ impl State {
         Some(copied)
     }
 
-    /// Runs a dispatch on the host.
+    /// Runs a dispatch on the host; the first that runs after dropped ones
+    /// starts with a barrier ([`State::dispatch_dropped`]).
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        const PATH: &str = "dispatch";
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            dropped(PATH, self.pipeline, Unready::NoPipeline);
+            self.dispatch_dropped(Unready::NoPipeline);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1210,23 +1223,47 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            dropped(PATH, self.pipeline, Unready::NoPipeline);
+            self.dispatch_dropped(Unready::NoPipeline);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            dropped(PATH, self.pipeline, "a graphics pipeline bound".into());
+            self.dispatch_dropped("a graphics pipeline bound".into());
             return;
         }
         if let Err(why) = self.bind(list, p, true) {
-            dropped(PATH, self.pipeline, why.into());
+            self.dispatch_dropped(why.into());
             return;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // SAFETY: an open list with everything set; the barrier names no
+        // resource.
+        unsafe {
+            if std::mem::take(&mut self.dropped_dispatch) {
+                list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+            }
+            list.list.Dispatch(x, y, z)
+        };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a dispatch that does not run; the next one of the list that
+    /// runs, direct or indirect, starts with a global UAV barrier. From Marvisak/VIctory#1392 by
+    /// kunalkhude99, for issue #1347: an RTX 4060 lost its device on a
+    /// dispatch of `4c0ac499ad613809` right after three dropped ones, and
+    /// an RTX 3060 Ti named the same program (docs/upstream/watch.md, items
+    /// 99 and 108).
+    /// The PR's reason does not hold here as such: XTP records the title's
+    /// own barriers (`list::barrier`, `list::barrier_groups`) and a dropped
+    /// dispatch records nothing, so no barrier the title asked for goes
+    /// missing. The barrier is a guard, not a proven fix. The PR puts one
+    /// after each dropped dispatch; the Series S world drops about 1,000
+    /// direct dispatches a frame (most do not translate), so here one waits
+    /// for the next dispatch that runs: one a run of drops.
+    fn dispatch_dropped(&mut self, why: Unready) {
+        self.dropped_dispatch = true;
+        dropped("dispatch", self.pipeline, why);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1527,14 +1564,14 @@ impl State {
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false).and_then(|()| {
             if rects {
-                self.rectangles(list, vertices, first)?;
+                self.rectangles(list, vertices, first)
+            } else {
+                Ok(false)
             }
-            Ok(())
         });
-        if ran.is_ok() {
-            // Rectangles were expanded into their own vertex buffers.
+        if let Ok(expanded) = ran {
             let (count, from) = if rects {
-                (vertices / 3 * 6, 0)
+                rectangle_vertices(vertices, first, expanded)
             } else {
                 (vertices, first)
             };
@@ -1552,13 +1589,15 @@ impl State {
         }
     }
 
-    /// Binds vertex buffers holding the rectangles of vertices `first..first
-    /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> Result<(), Unready> {
+    /// Binds vertex buffers holding the rectangles of `count` vertices from
+    /// `first` as triangles, made when the list is submitted, for the
+    /// pipeline's per-vertex slots: whether it has any.
+    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> Result<bool, Unready> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return Err(Unready::NoPipeline);
         };
         let rects = u64::from(count / 3);
+        let mut expanded = false;
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -1574,7 +1613,7 @@ impl State {
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
                 || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
+                || (u64::from(first) + u64::from(count)) * stride > u64::from(v.size)
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
@@ -1603,8 +1642,9 @@ impl State {
             };
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            expanded = true;
         }
-        Ok(())
+        Ok(expanded)
     }
 
     pub(crate) fn draw_indexed(
@@ -1640,6 +1680,23 @@ impl State {
     }
 }
 
+/// The vertices (count, first) a direct rectangle draw of `vertices` from
+/// `first` runs as a triangle list: six a rectangle from 0, in the buffers
+/// they were expanded into (`expanded`); for a pipeline without per-vertex
+/// inputs (corners from the vertex id), each rectangle's first triangle:
+/// the title's draw, with whole rectangles.
+/// shortcut: such a rectangle misses its fourth corner, and its shader sees
+/// the host's vertex ids (D3D12's leave out the start vertex), until the
+/// translator adds the start and the remap (VIctory #255).
+fn rectangle_vertices(vertices: u32, first: u32, expanded: bool) -> (u32, u32) {
+    let rects = vertices / 3;
+    if expanded {
+        (rects.saturating_mul(6), 0)
+    } else {
+        (rects * 3, first)
+    }
+}
+
 /// Why indexed rectangle lists are dropped.
 /// shortcut: they are not expanded, neither direct nor indirect ones.
 const INDEXED_RECTANGLES: &str = "indexed rectangles";
@@ -1650,7 +1707,8 @@ impl State {
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// written them. False if it cannot run on the host; true, and nothing
+    /// drawn or dispatched, for no record.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
@@ -1669,6 +1727,9 @@ impl State {
             MESH => "indirect kind 10 (mesh dispatch)",
             _ => "indirect, another kind",
         };
+        if max == 0 {
+            return true;
+        }
         let pipeline = self.pipeline;
         // Counted in `list` (its indirect drops); here only why.
         let fail = |why: Unready| {
@@ -1745,8 +1806,12 @@ impl State {
             )
         });
         // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // copies the list keeps alive (refresh), the signature is cached;
+        // the barrier names no resource.
         unsafe {
+            if kind == DISPATCH && std::mem::take(&mut self.dropped_dispatch) {
+                list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+            }
             list.list.ExecuteIndirect(
                 &signature,
                 max,
@@ -1766,6 +1831,13 @@ impl State {
     }
 }
 
+/// The records of an indirect rectangle draw, and its count if the title
+/// gives one: a host copy and a title address each.
+type RectangleArguments<'a> = (
+    (&'a Arc<crate::shadow::Shadow>, u64),
+    Option<(&'a Arc<crate::shadow::Shadow>, u64)>,
+);
+
 impl State {
     /// An indirect draw of rectangle lists: `max` records `stride` bytes
     /// apart at title address `arguments` (host copy `args`), and the count
@@ -1775,8 +1847,8 @@ impl State {
         &mut self,
         list: &HostList,
         (stride, max): (u32, u32),
-        (args, arguments): (&std::sync::Arc<crate::shadow::Shadow>, u64),
-        counter: &Option<(std::sync::Arc<crate::shadow::Shadow>, u64)>,
+        (args, arguments): (&Arc<crate::shadow::Shadow>, u64),
+        counter: &Option<(Arc<crate::shadow::Shadow>, u64)>,
     ) -> Result<(), Unready> {
         let p = crate::pipeline::host_pipeline(self.pipeline as This).ok_or(Unready::NoPipeline)?;
         if p.compute || p.mesh {
@@ -1787,38 +1859,39 @@ impl State {
             }
             .into());
         }
-        if max == 0 {
-            return Ok(());
-        }
         if !p.inputs.iter().any(|e| !e.per_instance) {
-            // Corners from the vertex id: drawn as a direct rectangle draw
-            // of such a pipeline is (see `crate::rectangles`); which
-            // pipelines, once each.
-            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-            if !seen.contains(&p.name) {
-                seen.push(p.name.clone());
-                tracing::info!(
-                    pipeline = %p.name,
-                    "indirect rectangles without vertex inputs: 6 vertices a rectangle from vertex 0"
-                );
-            }
+            note_vertex_id_rectangles(p);
         }
+        let counter = counter.as_ref().map(|(s, at)| (s, *at));
+        self.rectangles_indirect(
+            list,
+            &p.inputs,
+            (stride, max),
+            ((args, arguments), counter),
+            |s, l| s.prepare(l, false),
+        )
+    }
+
+    /// [`State::indirect_rectangles`] for a pipeline of `inputs`: the
+    /// expansion, then `bind` (the draw's own state, the pipeline's
+    /// included: the passes bound compute state of theirs), the expanded
+    /// vertices and `ExecuteIndirect` on the list's arguments, with their
+    /// record count as its count buffer.
+    fn rectangles_indirect(
+        &mut self,
+        list: &HostList,
+        inputs: &[crate::pipeline::host::Input],
+        (stride, max): (u32, u32),
+        ((args, arguments), counter): RectangleArguments,
+        bind: impl FnOnce(&mut State, &HostList) -> Result<(), Unready>,
+    ) -> Result<(), Unready> {
         // The rewritten records: draw arguments, 16 bytes apart.
         let signature = host_signature(0, 16).ok_or("no host signature")?;
-        let vertices = self.vertex.map(|v| (v.address, v.size, v.stride));
-        let prepared = crate::rectangles::expand(
-            list,
-            &mut self.own.rects,
-            &p.inputs,
-            &vertices,
-            (args, arguments, stride, max),
-            counter.as_ref().map(|(s, at)| (s, *at)),
-        )?;
-        // The passes bound compute state of their own.
+        let prepared =
+            self.expand_rectangles(list, inputs, (stride, max), (args, arguments), counter)?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        self.prepare(list, false)?;
+        bind(self, list)?;
         prepared.bind_vertices(list);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -1827,20 +1900,68 @@ impl State {
                 false,
             )
         });
-        // SAFETY: an open list with everything set; the arguments are the
-        // list's own (records past the title's count are empty draws, so no
-        // count buffer), the signature is cached.
+        // SAFETY: an open list with everything set; the arguments and their
+        // count are the list's own, in the indirect argument state (records
+        // past the title's count do not run); the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
-                max,
+                prepared.max,
                 &prepared.args,
                 prepared.offset,
-                None::<&ID3D12Resource>,
-                0,
+                &prepared.args,
+                prepared.count_offset,
             )
         };
         Ok(())
+    }
+
+    /// Records the passes that expand an indirect rectangle draw into the
+    /// list's scratch, which its recording holds until it has gone (the
+    /// GPU may run it after the title resets the list).
+    fn expand_rectangles(
+        &mut self,
+        list: &HostList,
+        inputs: &[crate::pipeline::host::Input],
+        (stride, max): (u32, u32),
+        (args, arguments): (&Arc<crate::shadow::Shadow>, u64),
+        counter: Option<(&Arc<crate::shadow::Shadow>, u64)>,
+    ) -> Result<crate::rectangles::Prepared, Unready> {
+        let vertices = self.vertex.map(|v| (v.address, v.size, v.stride));
+        self.recording.lease(list);
+        Ok(crate::rectangles::expand(
+            list,
+            &mut self.own.rects,
+            inputs,
+            &vertices,
+            (args, arguments, stride, max),
+            counter,
+        )?)
+    }
+}
+
+/// Logs a pipeline whose indirect rectangles make their corners from the
+/// vertex id (see [`crate::rectangles`]), once each, for the translator's
+/// side. Cheap on every draw: a recording thread looks in its own set
+/// first, so the shared one is locked once per thread and pipeline.
+fn note_vertex_id_rectangles(p: &HostPipeline) {
+    thread_local! {
+        /// The host pipelines this thread has seen, by address.
+        static MINE: std::cell::RefCell<std::collections::HashSet<usize>> =
+            std::cell::RefCell::new(std::collections::HashSet::new());
+    }
+    if !MINE.with_borrow_mut(|mine| mine.insert(std::ptr::from_ref(p) as usize)) {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&p.name) {
+        seen.push(p.name.clone());
+        tracing::info!(
+            pipeline = %p.name,
+            "indirect rectangles without vertex inputs: each rectangle's first triangle, with the \
+             host's vertex ids (no start vertex)"
+        );
     }
 }
 
@@ -2441,5 +2562,600 @@ void main(uint3 id : SV_DispatchThreadID) {
         );
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A direct rectangle draw runs six vertices a rectangle from 0 in its
+    /// expanded buffers; for a pipeline without per-vertex inputs, each
+    /// rectangle's first triangle, from the title's start (it drew twice
+    /// the vertices from 0 before).
+    #[test]
+    fn direct_rectangles_without_vertex_inputs_keep_their_start() {
+        assert_eq!(rectangle_vertices(7, 12, true), (12, 0));
+        assert_eq!(rectangle_vertices(7, 12, false), (6, 12));
+        assert_eq!(rectangle_vertices(2, 5, false), (0, 5));
+    }
+
+    /// Dropped dispatches (no pipeline) mark the list, so that its next
+    /// dispatch that runs starts with a UAV barrier (VIctory #1392): one a
+    /// run of drops; the mark goes with the title's reset. No test here
+    /// runs a dispatch (no title pipeline), nor could one see what the
+    /// barrier orders (WARP runs commands in order).
+    #[test]
+    fn dropped_dispatches_mark_the_list_for_one_barrier() {
+        let test = "draw::tests::dropped_dispatches_mark_the_list_for_one_barrier";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let list = TitleList::new();
+        let mut state = State::default();
+        assert!(!state.dropped_dispatch);
+        state.dispatch(list.host(), 1, 1, 1);
+        state.dispatch(list.host(), 1, 1, 1);
+        assert!(state.dropped_dispatch, "marked");
+        state.reset(std::ptr::null());
+        assert!(!state.dropped_dispatch, "gone with the reset");
+        list.run();
+    }
+
+    /// An indirect execution of no record draws and dispatches nothing,
+    /// and is not dropped either (whatever is bound).
+    #[test]
+    fn indirect_executions_without_records_draw_nothing() {
+        let test = "draw::tests::indirect_executions_without_records_draw_nothing";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let list = TitleList::new();
+        let args = TitleBuffer::new(256);
+        let mut state = State::default();
+        let before = drawn();
+        state.topology = RECTANGLES;
+        let rectangles = state.execute_indirect(list.host(), (0, 16, 0), args.address(), None);
+        state.topology = 4;
+        let draws = state.execute_indirect(list.host(), (0, 16, 0), args.address(), None);
+        let dispatches = state.execute_indirect(list.host(), (2, 12, 0), args.address(), None);
+        assert_eq!(
+            (rectangles, draws, dispatches),
+            (true, true, true),
+            "not dropped"
+        );
+        assert_eq!(drawn(), before, "not drawn");
+    }
+
+    /// Pixels of a [`Painter`]'s target a side.
+    const SIDE: u32 = 16;
+
+    /// Black, where a [`Painter`] did not draw.
+    const CLEAR: [u8; 4] = [0; 4];
+
+    /// The colors of a [`Painter`]'s four cells.
+    const COLORS: [[u8; 4]; 4] = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 255, 0, 255],
+    ];
+
+    const PAINTER: &str = r#"
+#define RS "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)"
+struct V { float4 pos : SV_Position; float4 color : COLOR; };
+[RootSignature(RS)]
+V vs_inputs(float2 pos : POSITION, float4 color : COLOR) {
+    V v;
+    v.pos = float4(pos, 0.0, 1.0);
+    v.color = color;
+    return v;
+}
+[RootSignature(RS)]
+V vs_ids(uint id : SV_VertexID) {
+    float x = -1.0 + 0.5 * (float)(id / 3u);
+    uint corner = id % 3u;
+    V v;
+    v.pos = float4(corner == 2u ? x + 0.5 : x, corner == 0u ? 1.0 : -1.0, 0.0, 1.0);
+    v.color = float4(1.0, 1.0, 1.0, 1.0);
+    return v;
+}
+float4 ps(V v) : SV_Target { return v.color; }
+"#;
+
+    /// A graphics pipeline standing in for a title's rectangle pipeline,
+    /// drawing into a [`SIDE`]² RGBA8 target of four cells side by side
+    /// (each a quarter of its width). With inputs: positions (R32G32_FLOAT)
+    /// in slot 0, colors (R8G8B8A8_UNORM) in slot 1. Without: corners from
+    /// the vertex id, in white: vertex `i` is corner `i % 3` (top left,
+    /// bottom left, bottom right) of cell `i / 3`.
+    struct Painter {
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+        target: ID3D12Resource,
+        views: ID3D12DescriptorHeap,
+    }
+
+    impl Painter {
+        fn compile(entry: windows::core::PCSTR, target: windows::core::PCSTR) -> ID3DBlob {
+            let mut code: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call.
+            let compiled = unsafe {
+                D3DCompile(
+                    PAINTER.as_ptr().cast(),
+                    PAINTER.len(),
+                    s!("painter"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
+            };
+            if let Err(e) = compiled {
+                let text = errors.map_or_else(String::new, |errors| {
+                    // SAFETY: the blob's own bytes.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            errors.GetBufferPointer().cast::<u8>(),
+                            errors.GetBufferSize(),
+                        )
+                    };
+                    String::from_utf8_lossy(bytes).into_owned()
+                });
+                panic!("the painter did not compile ({e}): {text}");
+            }
+            code.expect("compiled code")
+        }
+
+        fn new(host: &Host, inputs: bool) -> Painter {
+            use windows::Win32::Graphics::Dxgi::Common::*;
+            let entry = if inputs {
+                s!("vs_inputs")
+            } else {
+                s!("vs_ids")
+            };
+            let vs = Painter::compile(entry, s!("vs_5_1"));
+            let ps = Painter::compile(s!("ps"), s!("ps_5_1"));
+            let element = |name, format, slot| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: name,
+                SemanticIndex: 0,
+                Format: format,
+                InputSlot: slot,
+                AlignedByteOffset: 0,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            };
+            let elements = [
+                element(s!("POSITION"), DXGI_FORMAT_R32G32_FLOAT, 0),
+                element(s!("COLOR"), DXGI_FORMAT_R8G8B8A8_UNORM, 1),
+            ];
+            let layout: &[D3D12_INPUT_ELEMENT_DESC] = if inputs { &elements } else { &[] };
+            let device = &host.device;
+            // SAFETY: plain object creation from descriptions and code that
+            // live through the calls; the root signature is in the vertex
+            // shader.
+            unsafe {
+                let vs_bytes = std::slice::from_raw_parts(
+                    vs.GetBufferPointer().cast::<u8>(),
+                    vs.GetBufferSize(),
+                );
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, vs_bytes).unwrap();
+                let mut blend = D3D12_BLEND_DESC::default();
+                blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+                let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+                formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                let pso = device
+                    .CreateGraphicsPipelineState(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        VS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: vs.GetBufferPointer(),
+                            BytecodeLength: vs.GetBufferSize(),
+                        },
+                        PS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: ps.GetBufferPointer(),
+                            BytecodeLength: ps.GetBufferSize(),
+                        },
+                        BlendState: blend,
+                        SampleMask: u32::MAX,
+                        RasterizerState: D3D12_RASTERIZER_DESC {
+                            FillMode: D3D12_FILL_MODE_SOLID,
+                            CullMode: D3D12_CULL_MODE_NONE,
+                            ..Default::default()
+                        },
+                        InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                            pInputElementDescs: layout.as_ptr(),
+                            NumElements: layout.len() as u32,
+                        },
+                        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                        NumRenderTargets: 1,
+                        RTVFormats: formats,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let mut target: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: u64::from(SIDE),
+                            Height: SIDE,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut target,
+                    )
+                    .unwrap();
+                let target = target.expect("a render target");
+                let views: ID3D12DescriptorHeap = device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        NumDescriptors: 1,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                        NodeMask: 0,
+                    })
+                    .unwrap();
+                device.CreateRenderTargetView(
+                    &target,
+                    None,
+                    views.GetCPUDescriptorHandleForHeapStart(),
+                );
+                Painter {
+                    root,
+                    pso,
+                    target,
+                    views,
+                }
+            }
+        }
+
+        /// Clears the target to [`CLEAR`].
+        fn clear(&self, list: &HostList) {
+            // SAFETY: an open list; the view names our live target.
+            unsafe {
+                let rtv = self.views.GetCPUDescriptorHandleForHeapStart();
+                list.list.ClearRenderTargetView(rtv, &[0.0f32; 4], None);
+            }
+        }
+
+        /// Binds the pipeline and its target, as `prepare` binds a
+        /// title's draw.
+        fn bind(&self, list: &HostList) {
+            let side = SIDE as f32;
+            // SAFETY: an open list; our live objects, alive until it has run.
+            unsafe {
+                let rtv = self.views.GetCPUDescriptorHandleForHeapStart();
+                let l = &list.list;
+                l.SetGraphicsRootSignature(&self.root);
+                l.SetPipelineState(&self.pso);
+                l.OMSetRenderTargets(1, Some(&rtv), false, None);
+                l.RSSetViewports(&[D3D12_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: side,
+                    Height: side,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                }]);
+                l.RSSetScissorRects(&[RECT {
+                    left: 0,
+                    top: 0,
+                    right: SIDE as i32,
+                    bottom: SIDE as i32,
+                }]);
+                l.IASetPrimitiveTopology(
+                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                );
+            }
+        }
+
+        /// Runs `list` and reads the target back: RGBA by pixel, rows top
+        /// first.
+        fn read(&self, host: &Host, list: &TitleList) -> Vec<[u8; 4]> {
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+            const PITCH: u32 = 256;
+            let (buffer, data) = host
+                .shared_buffer(u64::from(PITCH * SIDE))
+                .expect("readback");
+            let l = list.host();
+            // SAFETY: an open list; our live target and buffer, the
+            // footprint inside the buffer.
+            unsafe {
+                l.list.ResourceBarrier(&[crate::host::transition(
+                    &self.target,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&buffer),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: SIDE,
+                                Height: SIDE,
+                                Depth: 1,
+                                RowPitch: PITCH,
+                            },
+                        },
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&self.target),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                l.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+            list.run();
+            (0..SIDE * SIDE)
+                .map(|i| {
+                    let at = (i / SIDE * PITCH + i % SIDE * 4) as usize;
+                    // SAFETY: the list has run; inside the mapped buffer.
+                    unsafe { data.add(at).cast::<[u8; 4]>().read() }
+                })
+                .collect()
+        }
+    }
+
+    /// The pixel at (`x`, `y`) of what [`Painter::read`] read.
+    fn pixel(pixels: &[[u8; 4]], x: u32, y: u32) -> [u8; 4] {
+        pixels[(y * SIDE + x) as usize]
+    }
+
+    /// A title buffer of 256 bytes holding `bytes`.
+    fn title_bytes(bytes: &[u8]) -> TitleBuffer {
+        let buffer = TitleBuffer::new(256);
+        buffer.set_words(|i| {
+            let mut w = [0u8; 4];
+            for (k, b) in w.iter_mut().enumerate() {
+                *b = bytes.get(i * 4 + k).copied().unwrap_or(0);
+            }
+            u32::from_le_bytes(w)
+        });
+        let _copy = buffer.shadow();
+        buffer
+    }
+
+    /// Title draw arguments holding `records`.
+    fn title_records(records: &[[u32; 4]]) -> TitleBuffer {
+        let bytes: Vec<u8> = records
+            .iter()
+            .flatten()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        title_bytes(&bytes)
+    }
+
+    /// A [`Painter`] pipeline's vertex inputs, as the host pipeline lists
+    /// them.
+    fn painter_inputs() -> [crate::pipeline::host::Input; 2] {
+        let input = |slot, format| crate::pipeline::host::Input {
+            slot,
+            offset: 0,
+            format,
+            per_instance: false,
+        };
+        [input(0, 16), input(1, 28)]
+    }
+
+    /// The vertex buffers of a rectangle in each of a [`Painter`]'s four
+    /// cells, filling it: positions (top left, bottom left, bottom right)
+    /// and colors ([`COLORS`]).
+    fn cell_rectangles() -> (TitleBuffer, TitleBuffer, [VertexView; 2]) {
+        let (mut positions, mut colors) = (Vec::new(), Vec::new());
+        for (cell, color) in COLORS.iter().enumerate() {
+            let x = -1.0 + 0.5 * cell as f32;
+            for (px, py) in [(x, 1.0f32), (x, -1.0), (x + 0.5, -1.0)] {
+                positions.extend(px.to_le_bytes());
+                positions.extend(py.to_le_bytes());
+                colors.extend(color);
+            }
+        }
+        let (p, c) = (title_bytes(&positions), title_bytes(&colors));
+        let views = [
+            VertexView {
+                address: p.address(),
+                size: positions.len() as u32,
+                stride: 8,
+            },
+            VertexView {
+                address: c.address(),
+                size: colors.len() as u32,
+                stride: 4,
+            },
+        ];
+        (p, c, views)
+    }
+
+    /// An indirect rectangle draw end to end, as `indirect_rectangles`
+    /// records it: the expansion, the draw's own state bound again after
+    /// the passes (here the test pipeline), the expanded vertices of two
+    /// slots, and `ExecuteIndirect` with stride 16 at offset 16 and the
+    /// list's record count. Records: two rectangles from vertex 0 (cells 0
+    /// and 1), one from vertex 6 (cell 2), one from vertex 9 past the
+    /// title's count (2): every rectangle fills its cell (its fourth corner
+    /// made) but the last.
+    #[test]
+    fn indirect_rectangles_draw_from_the_lists_arguments() {
+        let _pool = crate::rectangles::POOL_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let test = "draw::tests::indirect_rectangles_draw_from_the_lists_arguments";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let painter = Painter::new(host, true);
+        let (_positions, _colors, views) = cell_rectangles();
+        let args = title_records(&[[6, 1, 0, 0], [3, 1, 6, 0], [3, 1, 9, 0]]);
+        let count = title_bytes(&2u32.to_le_bytes());
+        let (args_copy, count_copy) = (args.shadow(), count.shadow());
+        let list = TitleList::new();
+        let mut state = State::default();
+        state.set_vertex_buffers(0, &views);
+        // As a dispatch before would leave them.
+        (state.host_pipeline, state.host_roots[1]) = (1, 1);
+        painter.clear(list.host());
+        state
+            .rectangles_indirect(
+                list.host(),
+                &painter_inputs(),
+                (16, 3),
+                (
+                    (&args_copy, args.address()),
+                    Some((&count_copy, count.address())),
+                ),
+                |s, l| {
+                    assert_eq!(
+                        (s.host_pipeline, s.host_roots[1]),
+                        (0, 0),
+                        "bound again after the passes"
+                    );
+                    painter.bind(l);
+                    Ok(())
+                },
+            )
+            .expect("drawn");
+        let pixels = painter.read(host, &list);
+        for cell in 0..4 {
+            let want = if cell < 3 {
+                COLORS[cell as usize]
+            } else {
+                CLEAR
+            };
+            let x = cell * SIDE / 4;
+            assert_eq!(
+                pixel(&pixels, x, SIDE - 1),
+                want,
+                "cell {cell}'s first triangle"
+            );
+            assert_eq!(
+                pixel(&pixels, x + SIDE / 4 - 1, 0),
+                want,
+                "cell {cell}'s fourth corner"
+            );
+        }
+    }
+
+    /// A pipeline without vertex inputs draws each rectangle's first
+    /// triangle, without its fourth corner: one rectangle from vertex 6 and
+    /// two from vertex 9. The host's vertex ids count from 0 in each record
+    /// (D3D12's `SV_VertexID` leaves out the start vertex), so they are
+    /// cells 0, then 0 and 1. They drew twice the vertices before: cells 0
+    /// to 3.
+    #[test]
+    fn indirect_rectangles_without_vertex_inputs_draw_their_first_triangles() {
+        let _pool = crate::rectangles::POOL_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let test =
+            "draw::tests::indirect_rectangles_without_vertex_inputs_draw_their_first_triangles";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let painter = Painter::new(host, false);
+        let args = title_records(&[[3, 1, 6, 0], [6, 1, 9, 0]]);
+        let args_copy = args.shadow();
+        let list = TitleList::new();
+        let mut state = State::default();
+        painter.clear(list.host());
+        state
+            .rectangles_indirect(
+                list.host(),
+                &[],
+                (16, 2),
+                ((&args_copy, args.address()), None),
+                |_, l| {
+                    painter.bind(l);
+                    Ok(())
+                },
+            )
+            .expect("drawn");
+        let pixels = painter.read(host, &list);
+        for cell in 0..4 {
+            let x = cell * SIDE / 4;
+            let first = if cell < 2 { [255; 4] } else { CLEAR };
+            assert_eq!(
+                pixel(&pixels, x, SIDE - 1),
+                first,
+                "cell {cell}'s first triangle"
+            );
+            assert_eq!(
+                pixel(&pixels, x + SIDE / 4 - 1, 0),
+                CLEAR,
+                "cell {cell}: no fourth corner"
+            );
+        }
+    }
+
+    /// A list whose only work is an indirect rectangle draw keeps its
+    /// scratch until its recording has gone: the title may reset the list
+    /// (its state goes) while the GPU still runs it. The scratch went back
+    /// to the pool at that reset before, for later lists to write.
+    #[test]
+    fn a_lists_rectangle_scratch_waits_for_its_recording() {
+        let _pool = crate::rectangles::POOL_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let test = "draw::tests::a_lists_rectangle_scratch_waits_for_its_recording";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let (_positions, _colors, views) = cell_rectangles();
+        let args = title_records(&[[3, 1, 0, 0]]);
+        let args_copy = args.shadow();
+        let list = TitleList::new();
+        let mut state = State::default();
+        state.set_vertex_buffers(0, &views);
+        let prepared = state
+            .expand_rectangles(
+                list.host(),
+                &painter_inputs(),
+                (16, 1),
+                (&args_copy, args.address()),
+                None,
+            )
+            .expect("expanded");
+        let scratch = prepared.args.clone();
+        drop(prepared);
+        let held = state
+            .own
+            .rects
+            .as_ref()
+            .and_then(|s| s.arguments().cloned());
+        assert_eq!(held.as_ref(), Some(&scratch), "the list's scratch");
+        state.reset(std::ptr::null());
+        assert!(
+            !crate::rectangles::pooled(&scratch),
+            "held by the recording"
+        );
+        list.host().close();
+        list.host().reset();
+        assert!(
+            crate::rectangles::pooled(&scratch),
+            "given back once the recording has gone"
+        );
     }
 }
