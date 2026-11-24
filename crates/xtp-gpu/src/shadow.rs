@@ -510,8 +510,8 @@ impl Shadow {
     /// pages while this runs, and a piece written whole puts back the
     /// title's bytes as read before over its writes since.
     ///
-    /// shortcut: what stays open (the review of Marvisak/VIctory#1124 in
-    /// the maintainers' private watch notes). A title write into bytes the GPU changed
+    /// shortcut: what stays open (the private watch notes' review of
+    /// Marvisak/VIctory#1124). A title write into bytes the GPU changed
     /// stays when it was made before this read title memory for the run
     /// (the three-way merge, [`Shadow::write_gpu_runs`]), but not when made
     /// after that read (up to 16 pieces) and before the piece's write: the
