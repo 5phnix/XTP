@@ -543,11 +543,27 @@ pub(crate) fn note_stand_in(title: u32, host: u32) {
     *counts().stood_in.entry((title, host)).or_default() += 1;
 }
 
-/// The frame log's texture part: textures made in a stand-in and refused,
-/// since the start (`None` if neither happened).
+/// Host textures alive: their number and bytes.
+static LIVE: [std::sync::atomic::AtomicI64; 2] = [
+    std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0),
+];
+
+/// Counts a host texture of `bytes` made (`alive`) or freed.
+pub(crate) fn note_texture(alive: bool, bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let sign = if alive { 1 } else { -1 };
+    LIVE[0].fetch_add(sign, Relaxed);
+    LIVE[1].fetch_add(sign * bytes as i64, Relaxed);
+}
+
+/// The frame log's texture part: host textures alive, and textures made in
+/// a stand-in and refused since the start (`None` if none of them).
 pub(crate) fn report() -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (live, bytes) = (LIVE[0].load(Relaxed), LIVE[1].load(Relaxed));
     let counts = counts();
-    if counts.refused.is_empty() && counts.stood_in.is_empty() {
+    if counts.refused.is_empty() && counts.stood_in.is_empty() && live == 0 {
         return None;
     }
     let stood_in: Vec<String> = counts
@@ -561,7 +577,8 @@ pub(crate) fn report() -> Option<String> {
         .map(|(why, n)| format!("{n} {why}"))
         .collect();
     Some(format!(
-        "host textures so far: stand-in formats [{}], refused [{}]",
+        "host textures: {live} alive, {} MiB; so far: stand-in formats [{}], refused [{}]",
+        bytes >> 20,
         stood_in.join(", "),
         refused.join("; ")
     ))

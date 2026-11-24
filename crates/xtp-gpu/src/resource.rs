@@ -820,6 +820,15 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// Bytes of video memory it takes (counted in [`format::report`]).
+    pub(crate) bytes: u64,
+}
+
+#[cfg(windows)]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        format::note_texture(false, self.bytes);
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -912,13 +921,20 @@ pub(crate) fn host_desc(
     Ok(d)
 }
 
-/// A host texture like the title's ([`host_desc`]), in GPU memory.
+/// A host texture like the title's ([`host_desc`]), in GPU memory, and the
+/// bytes it takes.
+///
+/// Creation can wait in the kernel: a session stalled for good in
+/// `CreateCommittedResource` (in `D3DKMTWaitForSynchronizationObjectFromCpu`,
+/// the GPU idle) on the way into the world, 2026-11-24. Big, slow or
+/// over-budget creations are logged before and after the call with their
+/// size and the video memory budget, so a stall names its texture.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf;
     if desc.dimension == BUFFER {
@@ -946,6 +962,18 @@ fn host_texture(
     };
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: the description has the host layout (checked size, same
+    // fields).
+    let bytes = unsafe {
+        host.device.GetResourceAllocationInfo(
+            0,
+            &[std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read()],
+        )
+    }
+    .SizeInBytes;
+    // All ones: a description the device cannot size (it refuses it below).
+    let bytes = if bytes == u64::MAX { 0 } else { bytes };
+    let watch = CreationWatch::before(&host.device, &d, bytes);
+    // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
     let made = unsafe {
         host.device.CreateCommittedResource(
@@ -960,6 +988,7 @@ fn host_texture(
             &mut texture,
         )
     };
+    watch.after(&host.device, &d, bytes, made.is_ok());
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
         let reason = format!("as {}: the driver refused it ({})", d.format, e.code());
@@ -980,8 +1009,95 @@ fn host_texture(
                 d.width, d.height, d.format, d.flags
             )
         });
+        format::note_texture(true, bytes);
     }
-    texture
+    texture.map(|t| (t, bytes))
+}
+
+/// What is logged around a host texture's creation: whether it is big or
+/// over the video memory budget (then a line before the call), and when it
+/// started (a slow one gets a line after).
+#[cfg(windows)]
+struct CreationWatch {
+    started: std::time::Instant,
+    told: bool,
+}
+
+#[cfg(windows)]
+impl CreationWatch {
+    /// From 64 MiB a creation is logged.
+    const BIG: u64 = 64 << 20;
+    /// A creation longer than this is logged after.
+    const SLOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+    fn before(
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        d: &ResourceDesc,
+        bytes: u64,
+    ) -> CreationWatch {
+        let memory = crate::dxgi::video_memory(device);
+        let over = memory.is_some_and(|(budget, usage)| usage.saturating_add(bytes) > budget);
+        let told = bytes >= Self::BIG || over;
+        if told {
+            let (budget, usage) = memory.unwrap_or_default();
+            tracing::info!(
+                mib = bytes >> 20,
+                budget_mib = budget >> 20,
+                usage_mib = usage >> 20,
+                over,
+                desc = ?d,
+                "making a host texture"
+            );
+        }
+        if over {
+            static OVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = OVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    n,
+                    "a host texture past the video memory budget: making it resident may wait"
+                );
+            }
+        }
+        CreationWatch {
+            started: std::time::Instant::now(),
+            told,
+        }
+    }
+
+    fn after(
+        self,
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        d: &ResourceDesc,
+        bytes: u64,
+        made: bool,
+    ) {
+        let took = self.started.elapsed();
+        if !self.told && took < Self::SLOW {
+            return;
+        }
+        let (budget, usage) = crate::dxgi::video_memory(device).unwrap_or_default();
+        let ms = took.as_secs_f64() * 1000.0;
+        if took >= Self::SLOW {
+            tracing::warn!(
+                ms,
+                mib = bytes >> 20,
+                budget_mib = budget >> 20,
+                usage_mib = usage >> 20,
+                made,
+                desc = ?d,
+                "a host texture was slow to make"
+            );
+        } else {
+            tracing::info!(
+                ms,
+                mib = bytes >> 20,
+                usage_mib = usage >> 20,
+                made,
+                "host texture made"
+            );
+        }
+    }
 }
 
 /// Counts a texture the host cannot create, by its title format, flags and
@@ -1080,11 +1196,12 @@ fn hand_out_resource(
         None
     } else {
         alias::shared(address, &desc, how).or_else(|| {
-            host_texture(&desc, state, clear).map(|texture| {
+            host_texture(&desc, state, clear).map(|(texture, bytes)| {
                 let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
                 std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
+                    bytes,
                 })
             })
         })
@@ -1344,7 +1461,9 @@ type PlacedTextures = std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64)>
 /// description `desc` (as words), made on first use. When a texture the
 /// GPU writes comes to that address after it (or another one replaces it),
 /// the next use makes a new resource, which shares that texture's host
-/// copy (`alias`).
+/// copy (`alias`). The resource is made outside the map's lock: making a
+/// host texture can wait in the kernel, and every draw reading a placed
+/// view would wait behind it.
 /// shortcut: the resource replaced is kept (lists and views made before
 /// may still name it).
 #[cfg(windows)]
@@ -1355,33 +1474,53 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if d.dimension == BUFFER {
         return None;
     }
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (address, desc);
+    let lock = || PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let usable = |r: This| resource(r).host.is_some().then_some(r);
     let changes = alias::changes();
-    if let Some(entry) = map.get_mut(&(address, desc)) {
-        let made = entry.0 as This;
-        let current = resource(made).host.clone();
-        let stale = entry.1 != changes
-            && alias::current(address, &d)
-                .is_some_and(|now| !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &now)));
-        entry.1 = changes;
-        if !stale {
-            return current.is_some().then_some(made);
+    // The resource made so far, if it is still the one to use.
+    let before = {
+        let mut map = lock();
+        match map.get_mut(&key) {
+            Some(entry) => {
+                let made = entry.0 as This;
+                let current = resource(made).host.clone();
+                let stale = entry.1 != changes
+                    && alias::current(address, &d)
+                        .is_some_and(|now| !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &now)));
+                entry.1 = changes;
+                if !stale {
+                    return current.is_some().then_some(made);
+                }
+                Some(made)
+            }
+            None => None,
         }
-        let mut out = std::ptr::null();
-        let iid = &RESOURCE_IIDS[0];
-        if at_address(address, d, std::ptr::null(), iid, &mut out, "placed view") != S_OK {
-            return current.is_some().then_some(made);
-        }
-        entry.0 = out as usize;
-        return resource(out).host.is_some().then_some(out);
-    }
+    };
     let mut out = std::ptr::null();
     let iid = &RESOURCE_IIDS[0];
     if at_address(address, d, std::ptr::null(), iid, &mut out, "placed view") != S_OK {
-        return None;
+        return before.and_then(usable);
     }
-    map.insert((address, desc), (out as usize, changes));
-    resource(out).host.is_some().then_some(out)
+    let mut map = lock();
+    match map.get_mut(&key) {
+        // Another thread made or replaced it meanwhile: theirs stays, ours
+        // was never handed out.
+        Some(entry) if Some(entry.0 as This) != before => {
+            let theirs = entry.0 as This;
+            drop(map);
+            resource_release(out);
+            usable(theirs)
+        }
+        Some(entry) => {
+            entry.0 = out as usize;
+            usable(out)
+        }
+        None => {
+            map.insert(key, (out as usize, changes));
+            usable(out)
+        }
+    }
 }
 
 pub(crate) extern "system" fn create_placed(
