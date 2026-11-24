@@ -52,8 +52,17 @@
 //! before the request's status says it completed, which is when the title
 //! may read them. While nothing is guarded ([`guarding`]) it does not look.
 //!
-//! shortcut: a system call writing into a guarded block fails (none is
-//! known to).
+//! The kernel's writes into title memory for the runtime (file reads,
+//! DirectStorage's raw reads) do not fault into our handler either: a
+//! system call that meets a read-only block fails as a whole
+//! (`ERROR_NOACCESS`, or `ERROR_INVALID_USER_BUFFER` when the block turns
+//! read-only while it copies). The runtime announces them
+//! ([`kernel_writing`]), which opens their blocks and holds them open until
+//! the write is done: a copy meanwhile reports them written without guarding
+//! them again, nor guards another view of their pages. Before, the opening
+//! was all, and a copy guarding the blocks again cut reads in the middle
+//! (session mesh64-a's failed DirectStorage reads, then the title's
+//! assertion; docs/analysis/archive-null.md).
 //!
 //! Costs (the review of the VIctory #464 and #490 ports; gpu-measure.md
 //! §4, run1's world frames): the 4.6 to 9.9 GB a world frame checks is not
@@ -211,12 +220,12 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 /// How many blocks `Guards::protected` holds, set under the guards' lock,
-/// so that [`writing`] (called before every kernel write into title memory:
-/// file reads, DirectStorage) sees without the lock that nothing is
+/// so that [`writing`] (after the runtime's own writes into physical pages,
+/// and before the GPU side's) sees without the lock that nothing is
 /// guarded. Raised before blocks are made read-only and lowered after
-/// write access is back: when it reads 0, no block is read-only, and a
-/// guard that starts after that is one that would have started after
-/// `writing` took the lock.
+/// write access is back: when it reads 0, no block is read-only. A kernel
+/// write under way is another matter: a guard may be about to make its
+/// blocks read-only, so [`kernel_writing`] always takes the lock.
 static GUARDED: AtomicUsize = AtomicUsize::new(0);
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -283,15 +292,22 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
+    // Blocks the kernel is writing for the runtime: left open, reported
+    // written, not clean (see `kernel_writing`).
+    let flying = flying(first..last);
     for block in first..=last {
         #[cfg(feature = "diagnostics")]
         if block < last && g.absent.contains(&block) {
             crate::copystat::add(crate::copystat::C::Absent, 1);
         }
-        let open = block < last && !g.clean.contains(&block) && !g.absent.contains(&block);
+        let landing = block < last && is_flying(&flying, block);
+        let open =
+            block < last && (landing || !g.clean.contains(&block)) && !g.absent.contains(&block);
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
+            if landing {
+                // Its write opens it if a guard got there first.
+            } else if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
             } else if !g.unguardable.contains(&block) {
@@ -359,9 +375,22 @@ fn protect_other_views(g: &mut Guards, from: usize, to: usize) {
         .collect();
     others.sort_unstable();
     others.dedup();
+    // A view the kernel is writing for the runtime is not made read-only
+    // (`kernel_writing`): its page's views are opened again, as when one
+    // cannot be.
+    let mut failed = Vec::new();
+    if let (Some(&low), Some(&high)) = (others.first(), others.last()) {
+        let flying = flying(low..high + 1);
+        others.retain(|&other| {
+            let landing = is_flying(&flying, other);
+            if landing {
+                failed.push(other);
+            }
+            !landing
+        });
+    }
     // Counted before they are read-only (see `GUARDED`).
     GUARDED.store(g.protected.len() + others.len(), SeqCst);
-    let mut failed = Vec::new();
     for run in others.chunk_by(|a, b| a + 1 == *b) {
         // The GPU's page mappings make one view per page: then block by
         // block.
@@ -374,6 +403,7 @@ fn protect_other_views(g: &mut Guards, from: usize, to: usize) {
             }
         }
     }
+    failed.sort_unstable();
     let mut left_open: Vec<usize> = pairs
         .iter()
         .filter(|(_, other)| failed.binary_search(other).is_ok())
@@ -522,11 +552,11 @@ fn blocks(at: usize, len: usize) -> Range<usize> {
     at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)
 }
 
-/// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory, and after its own writes into physical pages
-/// for each title address showing them (xmem).
+/// Opens the guarded blocks of title memory `[at, at + len)` and notes them
+/// written: before a write that does not fault into our handler, or after
+/// one. The runtime calls it (as `kernel_wrote`) after its own writes into
+/// physical pages, for each title address showing them (xmem); writes the
+/// kernel makes for it take [`kernel_writing`], which calls this.
 pub fn writing(at: usize, len: usize) {
     // Without the lock when nothing is guarded (no copy of view memory
     // taken yet, or all of it remapped since), which DirectStorage's
@@ -535,6 +565,106 @@ pub fn writing(at: usize, len: usize) {
         return;
     }
     open(&mut guards(), blocks(at, len));
+}
+
+/// Kernel writes into title memory under way ([`kernel_writing`]): each
+/// one's blocks, by number.
+struct InFlight {
+    next: u64,
+    writes: BTreeMap<u64, Range<usize>>,
+}
+
+static IN_FLIGHT: Mutex<InFlight> = Mutex::new(InFlight {
+    next: 1,
+    writes: BTreeMap::new(),
+});
+
+/// How many writes `IN_FLIGHT` holds, set under its lock, so that `guard`
+/// takes that lock only when some are out. A write is counted before it
+/// opens its blocks (under the guards' lock): a guard that saw none out
+/// finished before that opening, which then undoes what it guarded.
+static FLYING: AtomicUsize = AtomicUsize::new(0);
+
+fn in_flight() -> std::sync::MutexGuard<'static, InFlight> {
+    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The blocks of kernel writes under way that meet `blocks`, merged, in
+/// order; empty, without the lock, when none is out. Taken with the guards'
+/// lock held (that lock first, this one after; the writes take only this).
+fn flying(blocks: Range<usize>) -> Vec<Range<usize>> {
+    if FLYING.load(SeqCst) == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<Range<usize>> = in_flight()
+        .writes
+        .values()
+        .filter(|r| r.start < blocks.end && blocks.start < r.end)
+        .cloned()
+        .collect();
+    out.sort_unstable_by_key(|r| r.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(out.len());
+    for r in out {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
+/// Whether `block` lies in `flying` (merged and in order, as [`flying`]
+/// gives them).
+fn is_flying(flying: &[Range<usize>], block: usize) -> bool {
+    let i = flying.partition_point(|r| r.end <= block);
+    flying.get(i).is_some_and(|r| r.start <= block)
+}
+
+/// A kernel write into title memory under way, from [`kernel_writing`] until
+/// this drops: its blocks stay open.
+#[must_use = "dropping it at once leaves the blocks to the next copy before the kernel writes them"]
+#[derive(Debug)]
+pub struct KernelWrite(u64);
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            let mut f = in_flight();
+            f.writes.remove(&self.0);
+            FLYING.store(f.writes.len(), SeqCst);
+        }
+    }
+}
+
+/// Before the kernel writes into title memory `[at, at + len)` for us (a
+/// file read, DirectStorage's raw reads), until the returned value drops:
+/// [`writing`], and the blocks are held open meanwhile. A copy that asks
+/// about them then neither guards them again nor counts them clean: it
+/// reports them written, so the copy after it takes them again. Without
+/// this, a copy could make a block read-only in the middle of the read,
+/// and the kernel failed the whole call (`ERROR_INVALID_USER_BUFFER`,
+/// `ERROR_NOACCESS` if before it; docs/analysis/archive-null.md). Drop it
+/// once the write is done: for an overlapped read, once it completed.
+pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    if len == 0 {
+        return KernelWrite(0);
+    }
+    let id = {
+        let mut f = in_flight();
+        let id = f.next;
+        f.next += 1;
+        f.writes.insert(id, blocks(at, len));
+        FLYING.store(f.writes.len(), SeqCst);
+        id
+    };
+    // Under the guards' lock even when nothing is guarded (not `writing`'s
+    // shortcut): a copy may be guarding these blocks right now, having
+    // looked for writes under way before this one was counted. The lock
+    // waits for it, and the opening undoes what it guarded; a copy after it
+    // sees this write. (`writing`'s shortcut never fires in the world, where
+    // some view is always guarded.)
+    open(&mut guards(), blocks(at, len));
+    KernelWrite(id)
 }
 
 /// Whether some block of view memory is guarded now, without the guards'
@@ -2318,6 +2448,73 @@ mod tests {
         }
         // SAFETY: our section.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
+    }
+
+    /// A kernel read into view memory while a copy keeps asking about it
+    /// (and so guards again what the read's announcement opened): every read
+    /// lands, and its data is there. Before the read's blocks were held open
+    /// until it ended, a copy could make a block read-only in the middle of
+    /// the read, and the kernel failed it (ERROR_INVALID_USER_BUFFER when
+    /// the block turned read-only during the read, ERROR_NOACCESS before):
+    /// DirectStorage's failed reads in session mesh64-a
+    /// (docs/analysis/archive-null.md).
+    #[test]
+    fn a_kernel_read_is_not_cut_by_a_copy_guarding_its_blocks() {
+        use std::io::Write;
+        use std::os::windows::fs::FileExt;
+        use std::sync::atomic::AtomicBool;
+        const BLOCKS: usize = 32;
+        const READS: usize = 1000;
+        let _serial = serial();
+        let view = mapped(BLOCKS);
+        let len = BLOCKS * BLOCK;
+        let path = std::env::temp_dir().join(format!("xtp-watch-race-{}.bin", std::process::id()));
+        let data: Vec<u8> = (0..len).map(|i| (i * 7 + i / 4096) as u8).collect();
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(&data))
+            .unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // Something guarded, as in the world.
+        guard(view, view + len);
+        let stop = AtomicBool::new(false);
+        let (mut failed, mut errors) = (0, Vec::new());
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(SeqCst) {
+                    guard(view, view + len);
+                }
+            });
+            for _ in 0..READS {
+                let writing = kernel_writing(view, len);
+                // SAFETY: our view, `len` bytes.
+                let out = unsafe { std::slice::from_raw_parts_mut(view as *mut u8, len) };
+                let read = file.seek_read(out, 0);
+                drop(writing);
+                match read {
+                    Ok(n) if n == len => {}
+                    Ok(n) => errors.push(format!("short read: {n}")),
+                    Err(e) => {
+                        failed += 1;
+                        if errors.len() < 4 {
+                            errors.push(e.to_string());
+                        }
+                    }
+                }
+            }
+            stop.store(true, SeqCst);
+        });
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(failed, 0, "reads failed: {errors:?}");
+        // SAFETY: our view, readable.
+        let now = unsafe { std::slice::from_raw_parts(view as *const u8, len) };
+        assert!(now == &data[..], "the data landed");
+        // The read is seen by the next copy: every page written.
+        guard(view, view + len);
+        drop(kernel_writing(view, len));
+        let written = guard(view, view + len).unwrap();
+        assert_eq!(written.len(), len / PAGE);
+        unmapped(view, BLOCKS);
     }
 
     /// Whether one protection change over a run of blocks costs less than

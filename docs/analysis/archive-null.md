@@ -13,8 +13,9 @@ only: no bytes or listings of the title's code (docs/asset-policy.md).
   read-only while the read copies into it. The GPU side's write guards do
   exactly that when a copy re-arms them, between `kernel_will_write` and the
   end of the read.
-- The fix belongs in `crates/xtp-hle/src/modules/dstorage.rs` and
-  `files.rs`, or in `crates/xtp-gpu/src/watch.rs` (see the end).
+- The fix holds the blocks of a kernel write open until it is done
+  (`crates/xtp-gpu/src/watch.rs`, used by `dstorage.rs` and `files.rs`; see
+  the end).
 
 ## The stop
 
@@ -120,9 +121,9 @@ the destination as it was.
 
 ### What makes a read fail with ERROR_INVALID_USER_BUFFER
 
-`dstorage.rs` reads a raw destination in place. It calls
-`xtp_gpu::kernel_will_write`, which opens the GPU side's write guards on
-those blocks, then makes a synchronous `ReadFile` straight into the title's
+`dstorage.rs` read a raw destination in place. It called
+`xtp_gpu::kernel_will_write`, which opened the GPU side's write guards on
+those blocks, then made a synchronous `ReadFile` straight into the title's
 memory. On the host, measured on this PC with a standalone test:
 
 | Destination when `ReadFile` runs | Result |
@@ -135,12 +136,12 @@ The kernel checks the buffer when the call starts (998). A page that
 becomes read-only while the file system copies into it faults inside the
 copy, and NTFS returns that as an invalid user buffer (1784).
 
-The GPU side does exactly that. Before it copies view memory
+The GPU side did exactly that. Before it copies view memory
 (`xtp_gpu::watch::guard`), it makes every block written since its last copy
-read-only again, and `kernel_will_write` has just marked the read's blocks
-written. So when a frame's copy covers a block a read is landing in, the
-copy re-arms the guard in the middle of the read, and the read fails. The
-same window also lets a copy take the block's old bytes.
+read-only again, and `kernel_will_write` had just marked the read's blocks
+written. So when a frame's copy covered a block a read was landing in, the
+copy re-armed the guard in the middle of the read, and the read failed. The
+same window also let a copy take the block's old bytes.
 
 The window is as wide as a read. It opens only when a GPU copy covers that
 block at the same moment, which is why the failure is rare and depends on
@@ -182,24 +183,42 @@ reach this path.
   category every 10 s (calls, failures, frees, live and peak bytes, the
   budget reported).
 
-## The fix (proposal, outside this task's files)
+## The fix
 
-**1. Quick: retry the read.** In `dstorage.rs`'s `read_into`, and in
-`files.rs`'s `ReadFile` and `fread` wrappers, retry a read that fails with
-`ERROR_INVALID_USER_BUFFER`:
-- call `kernel_will_write` again, then read again, a few times at most;
-- the retry loses nothing: the failed read wrote nothing that counts, and
-  the next copy takes the block because it is marked written again;
-- for an overlapped `ReadFile`, the error comes at completion: those reads
-  need the second fix.
+**`crates/xtp-gpu/src/watch.rs`: blocks stay open while the kernel writes
+them.**
+- `kernel_will_write` (`kernel_writing`) now returns a `KernelWrite`, which
+  counts the write's blocks as under way until it drops.
+- A copy that asks about such a block (`guard`) leaves it open and not
+  clean, and reports it written, so the copy after it takes it again.
+- `protect_other_views` does not make another view of the page read-only
+  while it is being written either.
+- `kernel_writing` always takes the guards' lock after it counts the write.
+  It skips the shortcut `writing` takes when nothing is guarded, because a
+  copy may be guarding those blocks at that very moment. The first version
+  of the fix had that hole: 51 of 400 reads still failed.
 
-**2. Thorough: keep blocks open while the kernel writes them.** In
-`watch.rs`:
-- `kernel_will_write` returns a token, and blocks with a token out are
-  neither re-armed nor counted clean by `guard`;
-- the copy then takes them unguarded, and the next copy takes them again;
-- this closes both the failure and the stale copy.
+**Its callers:**
+- `dstorage.rs` holds the token for a raw destination until the read or
+  decompression into it is done. Page destinations go through xmem's own
+  view, which no copy guards.
+- `files.rs` holds it across `ReadFile` and `fread`. For an overlapped
+  `ReadFile` still pending, it holds it until the kernel sets the
+  `OVERLAPPED`'s status (read with `ReadProcessMemory` at the next read;
+  BTP 6's reads are synchronous).
+- xmem's opening after its own writes into physical pages uses the plain
+  opening (`kernel_wrote`), as before.
 
-**The workaround until then:** `XTP_TITLE_ASSERTS=continue` lets test
-sessions pass the check. The entry stays empty; what the title does with it
-later is not known.
+**The fallback:** both callers re-read once on
+`ERROR_INVALID_USER_BUFFER`, with a warning, so that any case left shows in
+the log.
+
+**The test** (`watch::tests::a_kernel_read_is_not_cut_by_a_copy_guarding_its_blocks`):
+a thread keeps guarding a 2 MiB view while the test reads a file into it.
+- Before the fix: 400 of 400 reads failed.
+- With the first version: 51 of 400.
+- Now: none of 1,000, and the data lands. The next copy then sees every page
+  written.
+
+**The workaround, kept:** `XTP_TITLE_ASSERTS=continue` still lets a session
+pass the check if an Archive header fails for another reason.

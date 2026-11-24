@@ -873,7 +873,7 @@ fn opened(section: &Section, index: usize, n: usize) {
     // (see `Aliases`). An address shows one page: no repeats.
     at.sort_unstable();
     for run in at.chunk_by(|a, b| a + PAGE == *b) {
-        xtp_gpu::kernel_will_write(run[0], run.len() * PAGE);
+        xtp_gpu::kernel_wrote(run[0], run.len() * PAGE);
     }
 }
 
