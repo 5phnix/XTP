@@ -1,0 +1,50 @@
+name: Feature or improvement
+description: Something XTP should do, or do better (a missing API, a tool, a workflow)
+title: '<area>: <what XTP should do>'
+labels: [enhancement, needs triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For larger work, open this first and agree on the approach before writing the
+        pull request: it saves a rewrite. A pull request of 1000 lines or more needs that
+        agreement (CONTRIBUTING.md, "Size").
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is missing
+      description: What you want to do and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How it could work, which crates it would touch, and how it would be tested without game files.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - core
+        - pe
+        - loader
+        - hle
+        - gpu
+        - shader
+        - formats
+        - pipeline
+        - game
+        - app
+        - xtask
+        - tests
+        - ci
+        - docs
+        - build
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I would like to implement this myself.

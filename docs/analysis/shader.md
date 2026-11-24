@@ -55,14 +55,15 @@ HLE, formats, tooling — except where an item below needs them, which is said.
 | `src/structure.rs` | 1 234 | structurisation: EXEC removed, masks → per-lane booleans, guards only where unproven |
 | `src/resource.rs` | 3 053 | traces every descriptor and scalar address to a root parameter; waterfall loops → non-uniform heap index |
 | `src/io.rs` | 700 | inputs, interpolation, exports per stage |
-| `src/emit/lower.rs` | 7 421 | IR → DXIL, one machine instruction at a time |
+| `src/emit/lower.rs` | 7 421 | IR → DXIL, one machine instruction at a time (since S0b `src/emit/lower/`, 19 files, map in `lower/mod.rs`) |
 | `src/emit/wave.rs` | 679 | whole-wave sections (reductions, prefix sums) simulated → DXIL wave ops |
 | `src/emit/{bitcode,shader,container,sampler}.rs` | 1 208, 665, 389, 125 | LLVM 3.7 bitcode writer, DXIL module/metadata, SFI0/ISG1/OSG1/PSV0 container + hash, static samplers |
 | `src/emit/{validator,host}.rs` | 221, 1 381 | `dxil.dll` validator (tests), host D3D12 checks |
 | `src/emit/{valu,waterfall,diff}_tests.rs` | 939, 249, 1 287 | GPU/WARP execution tests, differential tests against the console compiler |
 
 Outside the crate: `crates/xtp-gpu/src/shader_cache.rs` (on-disk cache of
-translations), `apps/xtp/src/{translate,shader}.rs` (survey tools),
+translations), `apps/xtp/src/{translate,shader,survey}.rs` (survey tools;
+`survey.rs` is S0's `xtp shader-survey`),
 `docs/architecture.md` § Shaders.
 
 ### xcl (reference, `E:/xtp-refs/xcl` at 47efa2e) — about 20 900 + 3 200 lines
@@ -98,6 +99,18 @@ nothing of it was copied.
   `dxil.dll` 1.8 (`emit::validator`). 45 s on all cores. Backlog item S0
   brings this into the repo.
 
+**Since S0 (2026-11-24)** the run is in the repository:
+`cargo run --release -p xtp -- shader-survey [PACK] [--json FILE]
+[--validate | --validate-every 50]` (the pack: the argument, else
+`XTP_SAMPLE_SHADERS`, else `shaders.rpf` in the configured game folder).
+`xtp translate` did find the pack's records (the SGD5 marker scan of
+`xtp-game/src/sgd5.rs` sees them as the pack stores them), but it skips
+repeated containers (614) and counts every step's failure; the survey
+counts each of the 26 698 programs once, under the error
+`emit::translate_program` stops it with. It reproduces the tables of this
+section and of section 4 exactly, and `--validate-every 50` the 450 of
+453 below.
+
 Results per stage (programs; one record can hold several):
 
 | Stage | Programs | xcl, no unsupported instruction | XTP translated |
@@ -120,6 +133,7 @@ For comparison, the VIctory README's in-game counts (the world): mesh
 ## 4. Why XTP's 4 213 programs fail
 
 First blocker per program (fixing it can reveal a second one).
+`xtp shader-survey` prints this table, with the backlog item of each row.
 
 | Cause (XTP error text, shortened) | CS | MS | PS | VS | Total |
 |---|---:|---:|---:|---:|---:|
@@ -226,6 +240,13 @@ change, then those that do, then geometry, then 32-lane GPUs.
 - xcl: `gpu/pack.rs` `scan`, `inflate`; `shaders.rs` survey output.
 - Test: on the person's pack, 26 503 records, 26 698 programs, 22 485
   translated; unit test on a synthetic record stream with decoy names.
+- Done (2026-11-24): `xtp shader-survey` (`apps/xtp/src/survey.rs`)
+  through `emit::translate_program`; `--json` writes one program per line
+  with the hash of its translation, so two runs compare with
+  `git diff --no-index before.json after.json`. Opt-in test
+  `survey::tests::the_pack_survey_keeps_its_floor` (`XTP_SAMPLE_SHADERS`,
+  floor 22 485: raise it when an item lands; `cargo test --release -p xtp
+  survey`).
 
 **S0b — Split `emit/lower.rs`** (M, deps: S0)
 - Goal: no behaviour change; split the 7 421-line file by encoding (SALU,
@@ -235,11 +256,18 @@ change, then those that do, then geometry, then 32-lane GPUs.
 - xcl: none.
 - Test: S0's survey byte-identical DXIL for every program (hash of all
   outputs unchanged); crate tests pass.
+- Done (2026-11-24): `emit/lower/` holds `mod` (types, `new`, `run`, the
+  dispatch `inst`), `operand`, `flow`, `mask`, `compare`, `lanes`, `mesh`,
+  `salu`, `smem`, `descriptor`, `buffer`, `valu`, `valu16`, `integer`,
+  `image`, `lds`, `input`, `export`, `tests`; which item edits which file
+  is at the top of `emit/lower/mod.rs`, and in the items' Files lines
+  below. The survey's JSON is byte-identical before and after (outputs
+  blake3 `8dfd4306…`, 22 485 translations).
 
 **S1 — MIMG addressing long tail** (S, deps: S0b) — gain 153
 - Goal: biased samples with 16-bit coordinates, `image_sample_d_cl`,
   `image_gather4_l`, with the A16 address packing of each form.
-- Files: `emit/lower.rs` (image part).
+- Files: `emit/lower/image.rs` (the address and sample parts of `image`).
 - xcl: `emit.rs` `mimg`, `sample_coord`, `moved_coords`; test
   `gpu_images_a16_d16`.
 - Test: synthetic programs per form, run on GPU/WARP against a CPU
@@ -250,7 +278,8 @@ change, then those that do, then geometry, then 32-lane GPUs.
   untracked mask, opaque or constant masks, joins of untracked masks), keep
   the mask as a 32/64-bit number and let each lane test its own bit by its
   console lane; in compute with console lanes the number is the ballot.
-- Files: `structure.rs`, `emit/lower.rs` (mask reads, `v_cndmask`, carries).
+- Files: `structure.rs`, `emit/lower/{mask,compare}.rs` (mask reads),
+  `emit/lower/valu.rs` (`v_cndmask`), `emit/lower/salu.rs` (carries).
 - xcl: `recomp/mod.rs` module notes (masks from `WaveActiveBallot`, lanes
   test their bit); `emit.rs` `ballot_fn`, `vopc_write`, `mask_zero`.
 - Test: synthetic compute programs (`v_cmp` → `s_and` with a constant →
@@ -261,7 +290,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
   constants) when some of its lanes are elsewhere in the structured
   program: inactive lanes count as 0 bits, as on the console; requires the
   console wave layout (`WaveSize`), as `console_lanes` already gives.
-- Files: `structure.rs`, `emit/lower.rs`, `emit/wave.rs`.
+- Files: `structure.rs`, `emit/lower/{mask,lanes,salu}.rs`, `emit/wave.rs`.
 - xcl: `docs/wave64-on-wave32.md` § "Execution model it relies on";
   `emit.rs` `ballot_fn`.
 - Test: synthetic waterfall-like and count-active-lanes programs, wave32 and
@@ -273,7 +302,8 @@ change, then those that do, then geometry, then 32-lane GPUs.
   from constants); then lower every `s_load_dword*` whose address traces to
   a root CBV/SRV address as a raw load from that root descriptor, which XTP
   already binds.
-- Files: `resource.rs` (classification), `emit/lower.rs` (`smem`).
+- Files: `resource.rs` (classification), `emit/lower/smem.rs` (`smem`,
+  `descriptor_data`).
 - xcl: `emit.rs` `smem`, `window_read` (every scalar load is a flat-memory
   read); `recomp/mod.rs` notes on the flat model.
 - Test: unit test in `resource.rs` per address source; GPU test reading a
@@ -284,8 +314,9 @@ change, then those that do, then geometry, then 32-lane GPUs.
   unsigned view, SM 6.6 64-bit typed atomics; the translation states the
   view it needs (R64_UINT) and the host requirement
   (`AtomicInt64OnTypedResourceSupported`).
-- Files: `emit/lower.rs` (image atomics), `emit/mod.rs` (binding notes,
-  `HostShader`); `crates/xtp-gpu` view creation (GPU report).
+- Files: `emit/lower/image.rs` (the atomic branch of `image`),
+  `emit/mod.rs` (binding notes, `HostShader`); `crates/xtp-gpu` view
+  creation (GPU report).
 - xcl: no reference (see 5.3); buffer 64-bit atomics: `emit.rs` `atomic64`,
   tests `atomic_fmin_fmax_x2_are_native_64_bit_atomics`.
 - Test: synthetic PS/CS doing `image_atomic_umax` 64-bit from many lanes,
@@ -295,7 +326,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
 - Goal: an input half (fp16 packed pair) that no signature element holds:
   find it through the FSSM input table's second row, as `native.rs` already
   reads it.
-- Files: `io.rs`, `native.rs`, `emit/lower.rs` (input loads).
+- Files: `io.rs`, `native.rs`, `emit/lower/input.rs` (input loads).
 - xcl: `recomp/mod.rs` `ps_input_table`, `ps_attribute_slot`, test
   `packed_registers_are_one_param`.
 - Test: synthetic PS with a packed pair, drawn on GPU; survey +166.
@@ -307,8 +338,8 @@ change, then those that do, then geometry, then 32-lane GPUs.
   (SM 6.1 `GetAttributeAtVertex` on a `nointerpolation` input, or the
   attribute at the provoking vertex plus deltas) and interpolate in the
   shader as the hardware does.
-- Files: `io.rs`, `emit/lower.rs`, `emit/shader.rs` (signature
-  interpolation modes).
+- Files: `io.rs`, `emit/lower/input.rs` (`interp`), `emit/shader.rs`
+  (signature interpolation modes).
 - xcl: no exact reference (see 5.3); `emit.rs` `interp`, `interp_fields`
   for the operand layout only.
 - Test: PS that scales I/J before p2, drawn on GPU against a CPU
@@ -328,7 +359,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
   T#/V#/S# words) as one raw SRV; the translation reads descriptor dwords
   and table data from it when the code uses them as numbers (sizes, record
   counts, format bits), and keeps host views for the accesses.
-- Files: `emit/lower.rs` (`descriptor_data`), `emit/mod.rs` (binding),
+- Files: `emit/lower/smem.rs` (`descriptor_data`), `emit/mod.rs` (binding),
   `crates/xtp-gpu` (bind the shadow; GPU report decides).
 - xcl: flat model, `gpu/uma.rs`, `gpu/desc.rs` (T#/V#/S# field meanings).
 - Test: GPU test reading width/height bits of a T# and a record count of a
@@ -338,7 +369,8 @@ change, then those that do, then geometry, then 32-lane GPUs.
 - Goal: an indexed buffer access whose used-resource entry has no stride:
   read it as raw with the stride from the V# (via R2) or from the
   instruction's own arithmetic.
-- Files: `emit/lower.rs` (buffer), `resource.rs`.
+- Files: `emit/lower/buffer.rs`, `emit/lower/descriptor.rs` (`used_kind`),
+  `resource.rs`.
 - xcl: `emit.rs` `mubuf`, `buffer_op`.
 - Test: synthetic CS with an idxen load on a V# of stride 12 and 20; survey
   +148.
@@ -348,7 +380,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
   title memory), per-lane descriptors the waterfall tracer cannot pin
   (computed first lanes, partial joins, chosen by control flow): fall back
   to one non-uniform access whose index is read per lane.
-- Files: `resource.rs`, `emit/lower.rs`.
+- Files: `resource.rs`, `emit/lower/descriptor.rs`.
 - xcl: none specific (its uniform model runs waterfall loops literally).
 - Test: extend `resource::tests` and `emit/waterfall_tests.rs` with each
   shape; survey gain.
@@ -356,7 +388,8 @@ change, then those that do, then geometry, then 32-lane GPUs.
 **S3 — Small instruction and I/O gaps** (S, deps: S0b) — gain ≈ 52
 - Goal: LDS byte/half reads and writes, `v_cvt_f32_f64`, `s_getpc_b64`,
   `v_permlanex16_b32`, the hardware SGPR inputs of PS, conditional exports.
-- Files: `emit/lower.rs`, `io.rs`.
+- Files: `emit/lower/{lds,valu,salu,lanes,input,export}.rs` (one per
+  gap), `io.rs`.
 - xcl: `emit.rs` `ds`, `ds_d16`, `valu64`, `sopp`, `export`; tests
   `gpu_format_stores_atomics_global_lds`, `gpu_f64_rounding_and_conversions`.
 - Test: synthetic program per instruction on GPU/WARP; survey gain.
@@ -366,7 +399,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
   translate rounding/denormal changes the program makes (or refuse when it
   cannot be expressed), and check that non-fused `v_mad_f32`/`v_mac_f32`
   are not contracted to FMA by the host compiler.
-- Files: `emit/lower.rs`, `emit/bitcode.rs` (flags).
+- Files: `emit/lower/{salu,valu}.rs`, `emit/bitcode.rs` (flags).
 - xcl: `emit.rs` `configure_round_modes`, `decode_hwreg`; tests
   `gpu_nonfused_mad_and_mac_prevent_fma_contraction`,
   `gpu_s_round_mode_controls_f16_rounding_across_modes`.
@@ -377,7 +410,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
   reference (`v_*_f64`, `v_frexp_*`, `v_ldexp_*`, `v_pk_*` ints, `v_sad_*`,
   `v_dot*` variants) — none blocks the pack today, but title DLL shaders
   (BVH builder, upscaler) use some.
-- Files: `emit/lower.rs`.
+- Files: `emit/lower/{valu,valu16,integer}.rs`.
 - xcl: `emit.rs` `valu64`, `valu16`, `valu_pk`; tests
   `gpu_f64_math_random`, `gpu_packed_math_dots_movrel`.
 - Test: randomised GPU tests against Rust references.
@@ -403,7 +436,8 @@ change, then those that do, then geometry, then 32-lane GPUs.
   group-shared memory, `s_sendmsg` emit/cut → triangle-strip outputs), no
   cross-lane needed; split into two sessions if larger than a few hundred
   lines (LDS ring + ES part, then GS emit/cut).
-- Files: `emit/lower.rs`, `io.rs`, `emit/shader.rs`.
+- Files: `emit/lower/{mesh,lds,export}.rs` (or a new file beside them),
+  `io.rs`, `emit/shader.rs`.
 - xcl: `recomp/mod.rs` module notes on GS, `translate_geometry`; tests
   `gpu_geometry_mode_es_gs_strip`.
 - Test: synthetic ES+GS strip drawn on GPU, every vertex exact; survey +390.
@@ -412,7 +446,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
 - Goal: when the host's `WaveLaneCountMax` is 32, a compute program that
   needs console lanes runs as two 32-lane halves exchanging ballots and
   lane reads through group-shared memory with a group barrier.
-- Files: `emit/lower.rs`, `emit/wave.rs`, `emit/mod.rs` (a translation
+- Files: `emit/lower/lanes.rs`, `emit/wave.rs`, `emit/mod.rs` (a translation
   option, part of the cache key in `xtp-gpu/shader_cache.rs`).
 - xcl: `docs/wave64-on-wave32.md` (sections "The form", "Synchronisation"
   first case); `emit.rs` `x64_prelude`, `x64_entry`, `rla_half_fn`;
@@ -431,7 +465,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
 **L3 — Wave64 VS/PS lanes 32..63** (M, deps: L1)
 - Goal: what console lanes ≥ 32 hold where a VS/PS reads them (unwritten,
   whole-wave constant, spill shadow), for hosts that run them in 32 lanes.
-- Files: `emit/wave.rs`, `emit/lower.rs`.
+- Files: `emit/wave.rs`, `emit/lower/lanes.rs`.
 - xcl: `upper_lanes.rs` (module notes), tests
   `gpu_wave64_ps_spill_slots`, `gpu_wave64_ps_whole_wave_reductions`.
 - Test: wave64 PS with a reduction and a spill slot on a 32-lane device.
@@ -463,7 +497,8 @@ blockers, risk 1).
    (view formats, a descriptor-heap shadow, VS+GS and two-pass pipelines,
    the cache key). If the GPU report decides otherwise, they stop at the
    translator half.
-4. **One 7 421-line file.** Without S0b most items edit `emit/lower.rs` and
+4. **One 7 421-line file** (resolved by S0b: `emit/lower/`, one file per
+   encoding or concern). Without S0b most items edit `emit/lower.rs` and
    conflict when run in parallel.
 5. **Silent approximations.** Porting from xcl's behaviour where xcl
    approximates (5.3) would turn refusals into wrong images. Fail-closed

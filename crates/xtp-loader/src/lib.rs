@@ -16,17 +16,31 @@
 //! 4. bind every import ourselves through an [`ImportResolver`], our
 //!    runtime (`xtp-hle`), the host or the title's DLLs, and route
 //!    anything unresolved to a generated stub that reports exactly what
-//!    was called;
+//!    was called, and by whom, and can return what the stub table
+//!    ([`StubDb`]) gives it; [`Census`] is the same as a dry run, without
+//!    loading anything;
 //! 5. initialise the title's DLLs, then run TLS callbacks and the entry
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
+//!
+//! Crashes, and the failures that end the process past every handler (a
+//! stack cookie overwritten, a CRT invalid parameter, `NtTerminateProcess`
+//! with a failure status), are named in the crash log (`report_crashes`).
 
+pub mod census;
 #[cfg(windows)]
 mod crash;
+#[cfg(windows)]
+mod fastfail;
+#[cfg(windows)]
+mod insn;
 pub mod prepare;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
+pub mod stubdb;
+#[cfg(all(test, windows))]
+mod test_call;
 #[cfg(windows)]
 mod threads;
 #[cfg(windows)]
@@ -36,6 +50,7 @@ mod tls;
 #[cfg(windows)]
 mod windows;
 
+pub use census::Census;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
 #[cfg(windows)]
@@ -46,10 +61,11 @@ pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
+pub use stubdb::{StubDb, WithOrdinalNames};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]
-pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
+pub use thunks::{StubCalls, UnimplementedPolicy, stub_calls, unimplemented_call_count};
 #[cfg(windows)]
 pub use windows::{
     BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,

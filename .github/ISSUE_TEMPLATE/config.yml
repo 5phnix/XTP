@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Start here
+    url: https://github.com/MiamiGame/XTP/blob/main/docs/dev/START_HERE.md
+    about: Build, run on your own files, find your way in the code, pick a first issue
+  - name: Contributing
+    url: https://github.com/MiamiGame/XTP/blob/main/CONTRIBUTING.md
+    about: The rules, conventions and review process for pull requests
+  - name: Report a security vulnerability
+    url: https://github.com/MiamiGame/XTP/security/advisories/new
+    about: Privately, never in a public issue (see SECURITY.md)

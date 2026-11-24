@@ -1,0 +1,279 @@
+# Triage that needs no maintainer: area and size labels, a welcome for
+# first-time contributors, a `conflict` label while a PR conflicts with main,
+# and a warning comment when open PRs change the same files. The title and
+# commit conventions are checked by pr-conventions.yml (a required check).
+#
+# `pull_request_target` runs this file as it is on main with a token that can
+# label and comment. No job checks out, builds or runs anything from the PR:
+# they read it through the API only. Keep it that way (CONTRIBUTING.md and
+# docs/dev/maintainers.md). The labels must exist beforehand
+# (docs/dev/maintainers.md): the jobs are not allowed to create them.
+name: PR intake
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  # A push to main can make open PRs conflict.
+  push:
+    branches: [main]
+  # Catches up on what the events above miss (closed PRs, skipped runs).
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  labels:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: pr-intake-labels-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Reads .github/labeler.yml from main through the API (no checkout).
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          sync-labels: true
+      - name: Size label
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // Changed lines (additions + deletions) without Cargo.lock; the
+            // limits are those of CONTRIBUTING.md ("Size").
+            const SIZES = [['size/XS', 10], ['size/S', 100], ['size/M', 400], ['size/L', 1000], ['size/XL', Infinity]];
+            const NOT_COUNTED = new Set(['Cargo.lock']);
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: issue_number, per_page: 100,
+            });
+            const lines = files
+              .filter((f) => !NOT_COUNTED.has(f.filename))
+              .reduce((sum, f) => sum + f.additions + f.deletions, 0);
+            const [size] = SIZES.find(([, below]) => lines < below);
+            const current = context.payload.pull_request.labels.map((l) => l.name);
+            for (const old of current.filter((n) => n.startsWith('size/') && n !== size)) {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number, name: old }).catch((e) => {
+                if (e.status !== 404) throw e;
+              });
+            }
+            if (!current.includes(size)) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [size] });
+            }
+            core.info(`${lines} changed lines: ${size}`);
+            if (size !== 'size/XL') return;
+            const marker = '<!-- xtp:pr-size -->';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            if (comments.some((c) => c.user?.type === 'Bot' && c.body?.startsWith(marker))) return;
+            const guide = `${context.serverUrl}/${owner}/${repo}/blob/main/CONTRIBUTING.md#size`;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body: `${marker}\nThis pull request changes ${lines} lines (Cargo.lock aside). ` +
+                `Pull requests of 1000 lines or more are reviewed only once split, or when a ` +
+                `maintainer agreed to the size beforehand in an issue: see [Size](${guide}). ` +
+                `If that agreement exists, link it in the description.`,
+            });
+
+  welcome:
+    if: >-
+      github.event_name == 'pull_request_target' && github.event.action == 'opened' &&
+      contains(fromJSON('["FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: pr-intake-welcome-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const blob = `${context.serverUrl}/${owner}/${repo}/blob/main`;
+            await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['first-time contributor'] });
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body: [
+                `Welcome, and thank you for your first pull request to XTP!`,
+                ``,
+                `What happens next:`,
+                `- A maintainer approves the first run of the checks (GitHub asks for this on a first contribution).`,
+                `- **CI** and **PR conventions** must pass. Run the same checks on your machine with \`cargo xtask pr-check\`.`,
+                `- Area and size labels are added automatically; a reviewer of that area is asked to review.`,
+                `- First response within 2 working days, review within 5 for PRs under 400 lines ([review process](${blob}/CONTRIBUTING.md#review)).`,
+                ``,
+                `Before then, please check that:`,
+                `- the title and every commit read \`<area>: <summary>\` ([conventions](${blob}/CONTRIBUTING.md#commits-and-pull-request-titles));`,
+                `- the description keeps the template and **Provenance** has a ticked box;`,
+                `- nothing from the game, no keys, no console SDK material and no code from xcl or AnyPS5 is included ([rules](${blob}/CONTRIBUTING.md#the-rules)).`,
+                ``,
+                `New to the code? [docs/dev/START_HERE.md](${blob}/docs/dev/START_HERE.md) maps the crates.`,
+              ].join('\n'),
+            });
+
+  conflicts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One run at a time over all open PRs; a newer request waits and replaces
+    # any request already waiting.
+    concurrency:
+      group: pr-intake-conflicts
+      cancel-in-progress: false
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const LABEL = 'conflict';
+            const marker = '<!-- xtp:pr-conflict -->';
+            const { owner, repo } = context.repo;
+            const query = `query($owner: String!, $repo: String!, $cursor: String) {
+              repository(owner: $owner, name: $repo) {
+                pullRequests(states: OPEN, first: 100, after: $cursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { number mergeable labels(first: 50) { nodes { name } } }
+                }
+              }
+            }`;
+            const load = async () => {
+              const prs = [];
+              let cursor = null;
+              do {
+                const page = (await github.graphql(query, { owner, repo, cursor })).repository.pullRequests;
+                prs.push(...page.nodes);
+                cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+              } while (cursor);
+              return prs;
+            };
+            // GitHub computes mergeability lazily: asking starts it.
+            let prs = await load();
+            for (let attempt = 0; attempt < 4 && prs.some((p) => p.mergeable === 'UNKNOWN'); attempt++) {
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+              prs = await load();
+            }
+            for (const pr of prs) {
+              const labelled = pr.labels.nodes.some((l) => l.name === LABEL);
+              const issue_number = pr.number;
+              if (pr.mergeable === 'CONFLICTING' && !labelled) {
+                core.info(`#${issue_number} conflicts with its base`);
+                await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [LABEL] });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number,
+                  body: `${marker}\nThis pull request now conflicts with its base branch. ` +
+                    `Please rebase it on \`main\` (or merge \`main\` into it) and resolve the conflicts; ` +
+                    `the \`${LABEL}\` label goes away by itself once it merges cleanly.`,
+                });
+              } else if (pr.mergeable === 'MERGEABLE' && labelled) {
+                core.info(`#${issue_number} merges cleanly again`);
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name: LABEL }).catch((e) => {
+                  if (e.status !== 404) throw e;
+                });
+              }
+            }
+            const unknown = prs.filter((p) => p.mergeable === 'UNKNOWN').map((p) => `#${p.number}`);
+            if (unknown.length) core.notice(`Mergeability still unknown, left as is: ${unknown.join(', ')}`);
+
+  overlap:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # A PR event updates that PR's warning; the hourly run updates them all.
+    concurrency:
+      group: pr-intake-overlap-${{ github.event.pull_request.number || 'all' }}
+      cancel-in-progress: false
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const LABEL = 'overlap';
+            const marker = '<!-- xtp:pr-overlap -->';
+            // Files nearly every PR touches: sharing them says nothing.
+            const IGNORED = new Set(['Cargo.lock']);
+            const MAX_FILES = 100; // files compared per PR
+            const { owner, repo } = context.repo;
+            const query = `query($owner: String!, $repo: String!, $cursor: String) {
+              repository(owner: $owner, name: $repo) {
+                pullRequests(states: OPEN, first: 50, after: $cursor, orderBy: { field: CREATED_AT, direction: ASC }) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes {
+                    number isDraft
+                    labels(first: 50) { nodes { name } }
+                    files(first: ${MAX_FILES}) { totalCount nodes { path } }
+                  }
+                }
+              }
+            }`;
+            const prs = [];
+            let cursor = null;
+            do {
+              const page = (await github.graphql(query, { owner, repo, cursor })).repository.pullRequests;
+              prs.push(...page.nodes);
+              cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+            } while (cursor);
+
+            const files = new Map(prs.map((p) => [p.number, new Set(p.files.nodes.map((f) => f.path).filter((f) => !IGNORED.has(f)))]));
+            const overlaps = (pr) => prs
+              .filter((other) => other.number !== pr.number)
+              .map((other) => ({ other, shared: [...files.get(pr.number)].filter((f) => files.get(other.number).has(f)) }))
+              .filter(({ shared }) => shared.length > 0);
+            const render = (pr, found) => {
+              const code = (f) => '`' + f + '`';
+              const rows = found.map(({ other, shared }) => {
+                const listed = shared.slice(0, 8).map(code).join(', ');
+                const more = shared.length > 8 ? ` and ${shared.length - 8} more` : '';
+                return `| #${other.number}${other.isDraft ? ' (draft)' : ''} | ${listed}${more} |`;
+              });
+              const truncated = [pr, ...found.map((f) => f.other)].some((p) => p.files.totalCount > MAX_FILES);
+              return [
+                marker,
+                '**Other open pull requests change the same files.** Check that they do not do the same work, ' +
+                  'and agree with their authors on which lands first: the other one will then need a rebase.',
+                '',
+                '| Pull request | Files changed by both |',
+                '|---|---|',
+                ...rows,
+                '',
+                (truncated ? `Only the first ${MAX_FILES} files of each pull request are compared. ` : '') +
+                  'This comment is kept up to date automatically and removed when the overlap ends.',
+              ].join('\n');
+            };
+
+            const event = context.payload.pull_request?.number;
+            const targets = event
+              ? prs.filter((p) => p.number === event)
+              : prs.filter((p) => overlaps(p).length > 0 || p.labels.nodes.some((l) => l.name === LABEL));
+            for (const pr of targets) {
+              const issue_number = pr.number;
+              const found = overlaps(pr);
+              const labelled = pr.labels.nodes.some((l) => l.name === LABEL);
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number, per_page: 100,
+              });
+              const mine = comments.find((c) => c.user?.type === 'Bot' && c.body?.startsWith(marker));
+              if (found.length) {
+                const body = render(pr, found);
+                if (!labelled) await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [LABEL] });
+                if (!mine) await github.rest.issues.createComment({ owner, repo, issue_number, body });
+                else if (mine.body !== body) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+                core.info(`#${issue_number} overlaps ${found.map((f) => '#' + f.other.number).join(', ')}`);
+              } else {
+                if (mine) await github.rest.issues.deleteComment({ owner, repo, comment_id: mine.id });
+                if (labelled) {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number, name: LABEL }).catch((e) => {
+                    if (e.status !== 404) throw e;
+                  });
+                }
+              }
+            }

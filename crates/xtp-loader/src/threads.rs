@@ -74,6 +74,12 @@ unsafe extern "C" {
 /// Set once the process is ending: no more thread notices.
 static EXITING: AtomicBool = AtomicBool::new(false);
 
+/// Whether the title's exit has begun ending threads: from then on a lock
+/// may be held by a thread that is gone (the heap's, the log writer's).
+pub(crate) fn exiting() -> bool {
+    EXITING.load(Ordering::SeqCst)
+}
+
 /// How long title images may take to detach before the process ends anyway
 /// (a thread ended while holding a lock their detach code wants).
 const DETACH_DEADLINE: Duration = Duration::from_secs(5);
