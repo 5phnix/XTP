@@ -45,6 +45,20 @@ Converting them ahead of time from files is only a warm-up.
 Everything except `xtp-game` is platform-level and can be tested with
 any Xbox Series title.
 
+The pipeline cache uses a 1 GiB payload budget by default. Pass a byte
+budget to `Cache::open_with_limit`, or zero to disable disk access. When
+space is needed, the cache evicts entries in write-time order and skips
+active readers and files it cannot remove. Disk errors still let the caller
+use a successful conversion. Each disk read verifies the payload length
+and BLAKE3 checksum. Older entries without a header are rebuilt on demand.
+
+Threads sharing a cache directory in one process share a budget, reader
+pins and in-flight conversions. A converter or decoder must not look up its
+own in-flight key, because it would wait for itself. Another process can
+publish a valid entry that this process discovers on lookup. Each process
+tracks its own pins and budget. `Cache::stats` reports indexed entries,
+payload bytes and successful reuses; legacy files count at their full size.
+
 ## Import resolution
 
 For every `dll!function` the title imports, in order:
@@ -76,7 +90,26 @@ An exe's code reaches its static TLS as slot 0; mapped as a DLL it gets
 another slot, so the loader redirects those loads (`xtp-loader::tls`).
 `xtp run --execute` installs a crash reporter that names faults as
 `module+rva` and unwinds the faulting thread's stack
-(`xtp-loader::crash`).
+(`xtp-loader::crash`). Handler installation through `report_crashes()` is
+idempotent (`Once`). The same observer logs at most 16 first-chance C++
+events, including rethrows (each verified title rethrow consumes one slot).
+It accepts a title PC only when intervening frames belong to the exception
+machinery: ntdll, kernelbase, ucrtbase, vcruntime140 or msvcp140 DLL families.
+An unrelated host, HLE or unknown intermediary stops attribution even if a
+title frame is deeper in the stack. A single nonblocking acquisition
+snapshots title membership for the candidate PCs, without allocations under
+the registry lock. A busy registry conservatively skips the event; poisoning
+is recovered.
+Metadata and strings are read fallibly with bounded lengths;
+`std::exception` messages use the MSVC x64 non-virtual base layout without
+calling object methods. Unsupported layouts retain a type diagnostic.
+Unhandled C++ reports use the same fallible decoder, independently of the
+first-chance budget. Debugger thread-name notifications set the current or
+explicitly named host thread's description, restricted to this process.
+Legacy extra parameters and reserved flags are tolerated; long readable
+names are truncated. Both notifications continue normal exception dispatch.
+Both observers return before any decoding or allocation once process exit
+has begun, because terminated threads may still hold allocator or I/O locks.
 
 `xtp census` shows this classification without running anything (it
 does not map title DLLs; `xtp run` without `--execute` does).
