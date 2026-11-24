@@ -1,9 +1,9 @@
 # HLE system libraries: what XTP keeps from VIctory, what it rewrites after xcl
 
-Status: analysis, 2026-11-24. Inputs: XTP at the VIctory import (VIctory
+Status: analysis. Inputs: XTP at the VIctory import (VIctory
 `ffe310e`, crates since renamed `victory-*` → `xtp-*`), xcl at `47efa2e`
-(`E:/xtp-refs/xcl`), and the import tables of the user's dump
-(`game_scarlett_master.exe` and the DLLs beside it, read-only).
+(`E:/xtp-refs/xcl`), and the import tables of a title folder
+(the title executable and the DLLs beside it, read-only).
 
 xcl is GPL-2.0-only and XTP GPL-3.0-or-later: nothing below is to be copied
 from xcl. Each xcl reference names a file and a function so a worker can read
@@ -74,15 +74,15 @@ title end to end.
 | Media Foundation helpers | `hle/mfplat.rs` | 364 | 3 |
 
 Integration: `tests/testtitle` (a console title of xcl's own, run by
-`crates/xcl/tests/e2e.rs`), `tests/pls_quota.rs`, opt-in tests on the user's
-files (`XCL_SAMPLE_DLLS`: the game's libHttpClient initialises through the
+`crates/xcl/tests/e2e.rs`), `tests/pls_quota.rs`, opt-in tests on real
+inputs (`XCL_SAMPLE_DLLS`: the game's libHttpClient initialises through the
 thunks; `XCL_SAMPLE_AWC`: a game sound decodes). Docs read:
-`docs/specs/2026-11-20-xcl-design.md`, `docs/xnetworking-rust-review.md`,
+xcl's design notes (`docs/specs/`), `docs/xnetworking-rust-review.md`,
 `HANDOFF.md` (sections on XGameRuntime, audio, retail bring-up).
 
 ## 2. What the title asks for
 
-Console-only DLLs in the import tables of the dump (static and delay-load):
+Console-only DLLs in the import tables of the title folder (static and delay-load):
 
 | DLL | Imported by | Functions | XTP | xcl |
 |-----|-------------|-----------|-----|-----|
@@ -571,7 +571,7 @@ richer), xcl's XGameSave storage (XTP's is crash-safe).
   `xgameruntime.lib` (names, GUIDs, slot numbers)? The person decides; R1's
   design depends on it.
 - **Q2.** Which runtime classes and slots does the title actually call past
-  the first mission? Only a run with R1's census answers it; R8, R9, R2 and
+  the first 3D scene? Only a run with R1's census answers it; R8, R9, R2 and
   the unset XPackage/XStore slots wait for that list.
 - **Q3.** Does any path in the title (crash reporter, telemetry, Bink, the
   BVH or FSR libraries) reach the network through COM or a host DLL today?

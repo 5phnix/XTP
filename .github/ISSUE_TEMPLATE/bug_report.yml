@@ -8,11 +8,11 @@ body:
       value: |
         Thank you for reporting. Before you start:
         - Search the open issues: add to an existing one rather than opening a new one.
-        - **Attach nothing from the game or derived from it**: no executables, archives,
+        - **Attach nothing from any game or derived from it**: no executables, archives,
           dumps, `XTP_CAPTURE` frames, render targets, shader dumps, and no screenshots
-          or video of the title for now ([asset policy](https://github.com/MiamiGame/XTP/blob/main/docs/asset-policy.md)).
-          Describe what you see instead. Offsets (`module+rva`), BLAKE3 hashes and our
-          own log lines are fine.
+          or video of a title for now ([asset policy](https://github.com/MiamiGame/XTP/blob/main/docs/asset-policy.md)).
+          Describe what XTP does instead, without title names or local game paths.
+          Offsets (`module+rva`) and our own log lines are fine.
         - A security problem goes to [a private advisory](https://github.com/MiamiGame/XTP/security/advisories/new), not here.
   - type: textarea
     id: what
@@ -28,7 +28,7 @@ body:
       description: The commands, from a clean cache folder if it matters.
       placeholder: |
         1. cargo build --release -p xtp
-        2. target\release\xtp.exe run <game dir>\<exe> --execute
+        2. target\release\xtp.exe run "<title folder>" --execute
         3. ...
     validations:
       required: true
@@ -43,13 +43,13 @@ body:
       value: |
         xtp commit    :
         build         : release | diag
-        title blake3  :
+        title build   : known | unknown
         console mode  : series-x | series-s
         windows       :
         cpu, memory   :
         gpu, driver   :
         command       :
-        stage reached :
+        result        :
         crashes.log   :
     validations:
       required: true
@@ -74,5 +74,5 @@ body:
     attributes:
       label: Rules
       options:
-        - label: Nothing attached comes from the game or is derived from it.
+        - label: Nothing attached comes from any game or is derived from it.
           required: true

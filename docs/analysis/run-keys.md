@@ -1,8 +1,8 @@
 # Reaching the world: scripted keys, the golden save and the title's state
 
-How to get BTP 6 from launch into the first mission's world,
+How to get from launch to the first 3D scene from a save,
 reproducibly and without a person at the keyboard, on XTP at `main`
-`2d0257e` (diagnostics build). Measured on 2026-11-24 on the person's
+`2d0257e` (diagnostics build). Measured on the person's
 machine (RTX 4080 SUPER, Ryzen 9 7950X3D, 64 GB, Windows 11).
 
 Scope, as the orchestrator set it: start from a save only. The first-boot
@@ -16,7 +16,7 @@ title code and data by RVA and value. Run logs and captures stay under
 ## 1. Summary
 
 - **Golden data folder** `E:\xtp-data\golden\data`: first boot done, the
-  `Player` save written in the world. Every run copies it; nothing writes it.
+  progress save written in the world. Every run copies it; nothing writes it.
 - **Launcher** `E:\xtp-data\play.ps1` (outside the repository): builds the
   diagnostics build if asked, copies the golden folder into a new run folder,
   sets `XTP_CONFIG` and `XTP_KEYS`, starts the title and logs to
@@ -41,17 +41,16 @@ title code and data by RVA and value. Run logs and captures stay under
 
 | | |
 |---|---|
-| Path | `E:\xtp-data\golden\data` (contains `7952987A\`) |
-| Made from | run `20261124-1414-B-save`: a fresh data folder taken through the first-boot screens (run `20261124-1410-A-fresh`), then started again from its save and taken into the world, where the title rewrote its `Player` container (`v4`) |
-| Contents | `saves\…\SettingsProfileSettings~…\v1`, `saves\…\Player~…\v4`, `storage\settings\settings.xml`, `temp\telemetrycache.dat`; no `crashes.log` |
+| Path | `E:\xtp-data\golden\data` (holds the title's data folder) |
+| Made from | run `20261124-1414-B-save`: a fresh data folder taken through the first-boot screens (run `20261124-1410-A-fresh`), then started again from its save and taken into the world, where the title rewrote its progress container |
+| Contents | the title's profile and progress containers, a settings file and a telemetry cache; no `crashes.log` |
 | Rule | read only; each run copies it (`play.ps1` does), so a run that crashes or saves never changes the next run's start |
 
-The `Player` container is about 2 KB: a profile and progress record, not a
-full story save. Starting from it, the title loads the first mission
-(`story000` packs) directly.
+The progress container is about 2 KB: a profile and progress record, not a
+full save. Starting from it, the title loads its first scene directly.
 
 To rebuild it: run from an empty data folder with the keys of section 6
-until the world, let the title save (its `Player` container is rewritten
+until the world, let the title save (its progress container is rewritten
 about 20 to 25 s after the world appears), stop it, and copy the data
 folder without `crashes.log`.
 
@@ -89,7 +88,7 @@ What it does, in order, under the machine's rules for game sessions:
 3. waits up to 90 s for no `rustc.exe` to run, and reports the session as
    not clean if one still runs or appears during the session;
 4. copies the golden folder into `E:\xtp-data\runs\play-<yyyyMMdd-HHmmss>[-name]\data`
-   and writes that run's `xtp.toml` (game `E:\uwu`, cache
+   and writes that run's `xtp.toml` (game `<title folder>`, cache
    `E:\xtp-data\cache`, data the copy);
 5. sets `XTP_KEYS` (empty unless `-Keys`) and adds the state words of
    section 5 to `XTP_WATCH`;
@@ -140,7 +139,7 @@ second around the transitions) and the title variables of section 5:
 | 2 | profile screen: dark background, two prompts at the bottom right (profile selector on Y; the signed-in profile, named PLAYER by XTP's offline user, on A) | left at +17.6 s | left at ≈ +38 s | on screen +4 s, left at ≈ +46 s | on screen from ≤ +38 s to ≥ +98 s |
 | 3 | star-burst transition, intro montage (about 10 s), studio logo (about 3 s) | +18 → +31 s | +38 → +44 s | +46 → +60 s | not captured |
 | 4 | loading screen: a slideshow of character art (`0xab43664` = 0xe) | +31.7 → +52.9 s | +44.6 → +73.7 s | ≈ +61 → +80 s | from +116 s; the title stopped itself at +155 s (`run-world.md` 7.3) |
-| 5 | the world (first mission); renders black today | +52.9 s | +73.7 s | +80 s | – |
+| 5 | the world (the first 3D scene); renders black today | +52.9 s | +73.7 s | +80 s | – |
 
 Times are seconds after launch (run C from its log's first line, test1 from
 the memory scan's start, B and F from the process start). Run B pressed
@@ -182,47 +181,9 @@ creates during the world load waits about 2 s in the kernel.
 
 ## 5. Title state variables for an autopilot
 
-Found by reverse engineering for interoperability (authorised by the
-person): a read-only scanner copied the title's `.data` section (RVA
-0x67e2000, 0x43ec398 bytes) out of the running process every 0.5 s and kept
-every 32-bit word that changes rarely, then kept the words whose changes
-fall on the transitions of section 4 (run test1), and checked the same
-words in a second scan (run C). The candidates were then logged with
-`XTP_WATCH` (polled every 5 ms) in runs C and D. RVAs are relative to the
-base of `game_scarlett_master.exe` (build blake3 `b99f876b74d4a77f…`);
-another build moves them.
-
-| RVA | Type | Values and meaning | Seen in |
-|---|---|---|---|
-| `0xab43664` | u32 | `0xe` (14) while a loading screen is up: the boot loading (≈ +2.5 → +5.5 s) and the save → world loading; `0` otherwise. Falls to 0 at the world's first frame. | test1, C, D |
-| `0x74e2c1c` | u32 | `1` from the end of boot initialisation (≈ +2.5 s) while the front end runs (profile screen, intro, logo); `0` from the moment the title commits to loading the world (with the loading screen in runs test1 and C, 6 s before it in run D). `0x74f5bb4` (`0xd`) and `0x7453ed4` (`0x101`) cover the same span. | test1, C, D |
-| `0x9e58138` | u32 | `1` from boot to the world's first frame, then `0`. | test1, C |
-| `0x74dfa9c` | u32 | `0x1000000` outside the game, `0x1000100` from the world's first frame (byte `0x74dfa9d` = 1 in game). | test1, C |
-| `0x7528c1c` | u32 | `0` until the profile screen accepts A, then `0xd`, about 0.7 s after the acceptance (candidate: two scans, not yet watched) | test1, C (scans) |
-| `0x74e007c` | u32, four u8 flags | `0` → `0x1` at boot, then the three other bytes become 1 between the profile acceptance and the world load, **in an order that differs between runs** (byte `0x74e007f` first in runs test1 and C, last in run D). All four are 1 from the world load on. Not a reliable "profile accepted" signal. | test1, C, D |
-
-Since no key is needed (section 4.1), these words serve to tell the
-stages apart rather than to drive input. `play.ps1` already uses them:
-
-1. the front end is over when `0x74e2c1c` falls to 0 (the world load
-   starts; `0xab43664` becomes 0xe at the same time or a few seconds
-   later);
-2. the title is in the world when `0x9e58138` falls to 0 (with
-   `0xab43664` back to 0 and byte `0x74dfa9d` = 1); a measurement starts
-   its clock there (`-WorldSeconds`);
-3. a loading screen that stops presenting frames while `0xab43664` is 0xe
-   is the stall of section 4.1; an autopilot in XTP could report it before
-   the title stops itself.
-
-If a later build needs a press after all, the rule that cannot land a
-press in the world is: press A every 2.5 s while `0x74e2c1c` is 1, never
-after (it falls at least 20 s before the world appears).
-
-Not found yet: a "player controllable" flag. The world renders black, so
-there is no visible moment (end of the intro cutscene, first input
-accepted) to line a scan up with. The same scan, run once the world shows
-an image, should find it: line its changes up with the first frame where
-movement input moves the camera.
+The title state words the autopilot waits on, and how they were found, are
+kept in the maintainers' private notes; `autopilot/gameplay.txt` lists the
+values it uses (`docs/dev/autopilot.md`).
 
 ## 6. From an empty data folder (no longer required)
 
@@ -231,13 +192,12 @@ empty data folder through the first-boot screens (accessibility, language,
 display and controls, then a "finish the setup?" screen with A to
 continue), the intro and the loading screen into the world at +97 s
 (loading from +75 s). Every first-boot screen takes A as its default
-choice. The title wrote `SettingsProfileSettings` at the end of the setup
-and `Player` in the world.
+choice. The title wrote its settings container at the end of the setup and
+its progress container in the world.
 
 ## 7. Notes for whoever measures
 
-- The machine's rules for game sessions (set by the person on
-  2026-11-24): one session at a time under `E:\xtp-data\measure.lock`; at
+- The machine's rules for game sessions (set by the person): one session at a time under `E:\xtp-data\measure.lock`; at
   most 3 minutes in the world per session and at least 10 minutes between
   two sessions, because a world frame holds the GPU for about a second and
   the desktop waits behind it; render-target dumps only for a few chosen
@@ -262,6 +222,6 @@ and `Player` in the world.
 - Timings vary with the machine's load: the profile screen left at 17.6 s
   on a quiet machine and at 116 s while other workers compiled. Compare
   runs only when their `times.txt` shows no `rustc`.
-- After each batch of sessions, check that `E:\uwu` is unchanged: sizes
-  and dates were compared with `E:\xtp-data\uwu-before.tsv` after the
-  sessions of this report and matched.
+- After each batch of sessions, check that `<title folder>` is unchanged:
+  sizes and dates were compared with a listing taken before the sessions of
+  this report and matched.

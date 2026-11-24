@@ -1,10 +1,10 @@
 # Host pipelines refused with E_INVALIDARG: why, and what is left
 
 Why the driver refused hundreds of XTP's translated pipelines with
-`E_INVALIDARG` (0x80070057) in the session logs of 2026-11-24, what each
+`E_INVALIDARG` (0x80070057) in the session logs, what each
 refusal was, what fixed it, and what the RTX 4080 accepts now. Measured on
-the person's PC (RTX 4080 SUPER, 32-lane waves; Windows build 26300) on
-2026-11-24. The title is BTP 6. Times are UTC. Logs and probe outputs are
+the person's PC (RTX 4080 SUPER, 32-lane waves; Windows build 26300).
+The title is BTP 6. Times are UTC. Logs and probe outputs are
 under `E:\xtp-data\`, none in the repository (§8).
 
 ## 1. Summary
@@ -42,7 +42,7 @@ under `E:\xtp-data\`, none in the repository (§8).
 - **The 21 cost little.** Each one is dropped at most once or twice a frame,
   against about 3,500 drops a frame in all (§4.2). Of the 21:
   - 14, groups of 128 or 256 threads with no LDS and no barrier, are what
-    the testers' `shader/wave-per-group` form runs (watch pass 6, item 126).
+    the testers' `shader/wave-per-group` form runs.
   - 6 share LDS across the console waves of their group and need #1433's
     form.
   - 1 is a whole-wave section of a 32-thread group (L1).
@@ -177,7 +177,7 @@ the LDS field of `COMPUTE_PGM_RSRC2`, `s_barrier` and `ds_*` counts):
 - **The 14 without LDS or barriers** read lanes of their own console wave
   only (7 to 31 `v_readlane` / `v_writelane` / `v_readfirstlane` each).
   They are the case the testers' `shader/wave-per-group` (r4tedx/VIctory,
-  update 10, watch pass 6 item 126) runs:
+  update 10) runs:
   - each console wave of the group becomes a host group of 64 threads;
   - a direct dispatch of (x, y, z) groups becomes (x × waves, y, z);
   - its 20 of the pack's 43 that validate are "most of them cascade-shadow
@@ -286,7 +286,7 @@ The task asked for the debug layer's message per cause; this PC gives none.
 
 ## 7. Found on the way: translations the validator refuses
 
-`xtp shader-survey E:\uwu\shaders.rpf --validate --host-lanes 32-32` (`main`
+`xtp shader-survey <title folder>\shaders.rpf --validate --host-lanes 32-32` (`main`
 `796e848`): 24,199 of the pack's 26,698 programs translate, and dxil.dll
 accepts 24,041 of those translations. It refuses 158:
 
@@ -325,7 +325,7 @@ delivered.
 ## 8. Method
 
 - **Logs.** `E:\xtp-data\runs\*\run.log` and
-  `E:\xtp-data\cache\play\*\run.log`, read on 2026-11-24 up to 19:31.
+  `E:\xtp-data\cache\play\*\run.log`, read up to 19:31.
   - Refusals by session and shader, and the shaders' fate in the latest
     sessions: one grep each.
   - Drops by shader: the frame reports' detail lines ("dropped N/frame

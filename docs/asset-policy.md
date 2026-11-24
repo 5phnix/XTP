@@ -1,7 +1,7 @@
 # Asset policy (rule #1)
 
-**Nothing from the game is ever stored in this repository.** Everything is
-built on the user's machine from files the user supplies. The same applies
+**Nothing from any game is ever stored in this repository**; what XTP
+derives at run time stays in the user's cache, outside it. The same applies
 to other titles used for testing, and to any other proprietary material.
 
 ## Not allowed
@@ -29,7 +29,7 @@ In any form (files, string literals, fixtures, snapshots, docs):
 tables of the BCPack format (entropy models, index rank tables, control
 codes, per-format dictionaries). A BCPack stream cannot be decoded without
 exactly these tables and they cannot be derived, so they ship with XTP
-by the project owner's decision (2026-11-23), entered as an exception in
+by the project owner's decision, entered as an exception in
 `xtask/src/policy.rs`. They are part of the format, not our work, and the
 repository's licence does not cover them. Nothing else of this kind is
 accepted.
@@ -37,7 +37,7 @@ accepted.
 ## Where data lives
 
 Outside the repository, configured in `xtp.toml`: `game_dir` (the
-user's dump), `test_titles`, and `cache_dir` for everything derived
+title folder), `test_titles`, and `cache_dir` for everything derived
 (default `%LOCALAPPDATA%\xtp\cache`).
 
 ## Enforcement

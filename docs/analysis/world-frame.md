@@ -2,8 +2,8 @@
 
 Where the 5 to 50 s of a loading frame and the seconds of a "world frame"
 go on today's `main` (`488f2b4`), measured on the person's PC (RTX 4080
-SUPER 16 GB, driver 621.01, Ryzen 9 7950X3D, 64 GB, Windows 11 26300) on
-2026-11-24, with every thread of the process sampled every 0.5 to 1 s. It
+SUPER 16 GB, driver 621.01, Ryzen 9 7950X3D, 64 GB, Windows 11 26300),
+with every thread of the process sampled every 0.5 to 1 s. It
 replaces the ranking of `run-world.md` (measured at `2d0257e`) for the
 current code and points each cost at the task that removes it. Times are
 UTC; GiB are 2^30 bytes, as VidMm's counters print them. Logs and samples
@@ -326,7 +326,7 @@ delivered: `E:\xtp-data\runs\frame-prof-C-xtask-args.patch`). The title
 then takes the Series S budgets. Log
 `E:\xtp-data\cache\play\20261124-163332\run.log`, counters
 `E:\xtp-data\runs\stall-frame-prof-C-seriesS`, crash record
-`…\data\7952987A\crashes.log`.
+`crashes.log` in the run's data folder.
 
 | | Series X (T2, A, B) | Series S (C) |
 |---|---|---|

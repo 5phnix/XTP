@@ -4,15 +4,15 @@ How XTP runs BTP 6's mesh programs on NVIDIA, whose waves have 32 lanes
 when every one of these programs was written for the console's 64. What the
 translator proves, what it exchanges through group-shared memory, and what
 it still refuses, measured over the title's shader pack before and after.
-Task mesh64 (0a31f0cb), 2026-11-24, on the person's PC (RTX 4080 SUPER,
+Task mesh64 (0a31f0cb), on the person's PC (RTX 4080 SUPER,
 Series S mode). The title is BTP 6. Logs and the pack stay under
-`E:\xtp-data\` and `E:\uwu\`, none in the repository.
+`E:\xtp-data\` and the title folder, none in the repository.
 
 ## 1. Summary
 
 - **Before:** the translator made 8,726 of the pack's 9,282 mesh programs
   for a 32-lane host, and the runtime refused every one of them (VIctory
-  #578, item 2 of `docs/upstream/watch.md`): the world lost the geometry
+  #578): the world lost the geometry
   these programs draw.
 - **After:** 8,725 translate and run on NVIDIA by default. dxil.dll refuses
   none that it did not refuse before. 11 are refused, each for a precise
@@ -174,7 +174,7 @@ are gone: the translator now does both, with the proof. The old opt-in
 
 ## 5. Survey of the pack
 
-Every MS program of `E:\uwu\shaders.rpf`, translated for a 32-32 host and
+Every MS program of `<title folder>\shaders.rpf`, translated for a 32-32 host and
 checked by dxil.dll, with a tool outside the repository
 (`E:\xtp-data\tmp\mesh64\measure`). Before: main at `c135f4c`, this
 branch's base after its last merge.
@@ -199,7 +199,7 @@ branch's base after its last merge.
   structured buffer of unknown stride); they now stop at their first-lane
   read first.
 - The 62 invalid translations are not this task's: 53 have more than 32 KiB
-  of vertex and primitive outputs (VIctory #1385's case, watch item 98),
+  of vertex and primitive outputs (VIctory #1385's case),
   9 have signature mismatches.
 - The reasons the other 546 stop: a scalar memory read as data (383), a lane
   mask read as data (101), per-lane descriptors (34 + 12 + 6 + 3), a
@@ -224,14 +224,14 @@ captures at `E:\xtp-data\runs\frames-mesh*`. All three ran the same binary
     0x2215d9b);
   - in the 7 s before, at once: main's new FSR4 path (every pass "falling
     back"), a 510 ms submission, and about 200 mesh pipelines made;
-  - the captures stop at the introduction's title card, before the world.
+  - the captures stop at the opening credits, before the world.
 - **B** (19:30 UTC, the autopilot ending the title 30 s into gameplay):
   - gameplay at 22 s, 237 mesh pipelines made, none refused;
   - no stop, so the stop of A does not come with every run of the mesh
     programs (the third watchdog path is task 54cb7617's);
   - the run ends at frame 598, as the world starts. Its first world frame
     (3,932 draws) is presented black, and the captured frames are the
-    introduction's title card and its fade.
+    opening credits and their fade.
 - **C** (19:51 UTC, 150 s in the world):
   - 25 frame-rate lines: 0.7 fps median (0.3 to 6.2), 2,525 draws a frame
     (up to 5,956), 985 dropped;
