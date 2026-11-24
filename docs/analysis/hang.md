@@ -1,10 +1,10 @@
 # The Series S world hang: compute program d3e44e754b3eb6aa
 
-Why the Series S world loses the host GPU (`DXGI_ERROR_DEVICE_HUNG`,
-0x887A0006) one and a half to two and a half minutes after its first
-frames, on the person's PC (RTX 4080 SUPER 16 GB). The first device removal
-with DRED on (task 78d58a42, session `stall-copyback-B3-dred`) stopped in
-compute program d3e44e754b3eb6aa. Programs are named by hash only: the first
+Why the Series S world lost the host GPU (`DXGI_ERROR_DEVICE_HUNG`,
+0x887A0006) 40 s to 2.5 min after its first frames, on the person's PC
+(RTX 4080 SUPER 16 GB). The first device removal with DRED on (task
+78d58a42, session `stall-copyback-B3-dred`) stopped in compute program
+d3e44e754b3eb6aa. Programs are named by hash only: the first
 16 hex digits of the BLAKE3 of the container the title passes, as the
 runtime logs them. Times are UTC. Logs are under `E:\xtp-data\runs\`; none
 is in the repository, and no title bytes or listings are quoted here.
@@ -40,6 +40,11 @@ is in the repository, and no title bytes or listings are quoted here.
   slot holds: the one its table entry says (SRV or UAV), or, with no entry,
   the one the program's vector accesses of the same descriptor declare.
   Every handle of the slot then has one kind (§7).
+- **Evidence.** On WARP, the same shape loses the device without the change
+  ("The GPU device instance has been suspended") and runs right with it.
+  Two Series S sessions of 5 min with the change, with DRED and without,
+  had no device removal (§7). The same rules wait upstream in VIctory
+  #1015 and #1055 (§8).
 
 ## 2. The report
 
@@ -269,7 +274,33 @@ What it does not change:
   root constants as heap slots; proposed for the owner of draw.rs: label
   only the user data of a table or heap parameter.
 
-Sessions: pending.
+Sessions (Series S, build cf8ac38, `XTP_SKIP_INTRO=1`,
+`XTP_WATCHDOG_HOOK=1`, autopilot and golden data, `session.ps1 -Measure 310
+-Limit 420`, one at a time under `measure.lock`):
+
+| Session | DRED | World | Ended | Time in the world | Device removed | Median frame |
+| --- | --- | --- | --- | --- | --- | --- |
+| `stall-hang-fix-dred` | on | 19:59:53 | 20:05:02, the autopilot's end | 5 min 9 s | no | 989 ms (1.0 fps) |
+| `stall-hang-fix-nodred` | off | 20:08:04 | 20:13:14, the autopilot's end | 5 min 10 s | no | 189 ms (5.3 fps) |
+
+Neither session logged a wait for the host GPU. The three programs were
+translated by this build (a new cache key) and their pipelines made before
+the world.
+
+How much the sessions prove, read with the others:
+
+- Before: eight Series S sessions from 18:13 to 19:23 lost the device 40 s
+  to 2.5 min after the program first appeared in the log (§2).
+- The four sessions after that, on builds without this change
+  (`drops-fix-before`, `drops-fix-after`, `gpu-prof-B2-dred`, `mesh64-c`),
+  ran 2 to 2.5 min in the world without a removal. Main changed meanwhile:
+  for instance 9ab3e98, where DirectStorage writes open the guards of every
+  view of a page.
+- So two clean sessions of 5 min agree with the cause found, without proving
+  it alone. The direct evidence is the DRED report (§2), the defect in the
+  three programs (§5) and WARP losing its device on that shape (§7). A
+  control session of main without the change, run for 5 min or more, would
+  tell the rest.
 
 ## 8. Upstream
 
