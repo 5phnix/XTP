@@ -103,7 +103,7 @@ switch ($what) {
     'game' {
         if (-not $cfg.titleExe) { throw "Set 'titleExe' in $($cfg.path)" }
         Write-Step "$(if ($NoBuild) { '' } else { 'Diagnostics build, then ' })game run on the VM ($Seconds s)"
-        $envText = ($Env.Keys | ForEach-Object { "$_=$($Env[$_])" }) -join ';'
+        $envText = ($Env.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';'
         # One call: the VM keeps the clone locked from the build to the end of the run.
         $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'run-game.ps1' -AllowFail -Arguments ($source + @{
                 TitleExe = $cfg.titleExe; Seconds = $Seconds; Keys = $Keys; Env = $envText; Name = $Name; XtpArgs = $XtpArgs
@@ -123,9 +123,9 @@ switch ($what) {
             $null = Invoke-XtpVm -Cfg $cfg -Zone $zone -Script $pack
             Receive-XtpVmFile -Cfg $cfg -Zone $zone -Path $zip -Destination $out
             $null = Invoke-XtpVm -Cfg $cfg -Zone $zone -Script "Remove-Item -LiteralPath '$zip' -Force"
-            $local = Join-Path $out (Split-Path -Leaf $zip)
-            Expand-Archive -LiteralPath $local -DestinationPath $out -Force
-            Remove-Item -LiteralPath $local
+            $localZip = Join-Path $out (Split-Path -Leaf $zip)
+            Expand-Archive -LiteralPath $localZip -DestinationPath $out -Force
+            Remove-Item -LiteralPath $localZip
         }
     }
 }

@@ -31,7 +31,7 @@ function Enter-XtpLock([string]$Name, [switch]$NoWait) {
                 continue
             }
             if ($NoWait) { throw "$lock is held by pid $holder." }
-            if (-not $said) { Write-Host "waiting for $Name (held by pid $holder)"; $said = $true }
+            if (-not $said) { [Console]::Out.WriteLine("waiting for $Name (held by pid $holder)"); $said = $true }
             Start-Sleep -Seconds 10
         }
     }
@@ -105,7 +105,7 @@ function Invoke-XtpSessionJob {
             }
             if ($finished) { break }
             if ((Get-Date) -gt $deadline) { throw "The session job did not finish (no $done): see Task Scheduler, xtp-session-job." }
-            if (((Get-Date) - $last).TotalSeconds -ge 60) { Write-Host ("    ... {0:N0} s" -f ((Get-Date) - $t0).TotalSeconds); $last = Get-Date }
+            if (((Get-Date) - $last).TotalSeconds -ge 60) { [Console]::Out.WriteLine(("    ... {0:N0} s" -f ((Get-Date) - $t0).TotalSeconds)); $last = Get-Date }
             Start-Sleep -Seconds 3
         }
         $result = Get-Content -LiteralPath $done -Raw | ConvertFrom-Json

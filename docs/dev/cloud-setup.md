@@ -53,8 +53,10 @@ You end up with:
   often does not find gcloud's credentials or Python: use PowerShell (or set
   `CLOUDSDK_PYTHON` to the SDK's bundled Python).
 - **Upstream bandwidth** for one upload of the game files (about 210 GB):
-  about 5 hours at 100 Mbit/s, 25 to 30 minutes at 1 Gbit/s (we measured
-  1.19 Gbit/s on a fibre line). Later uploads only send what changed.
+  about 5 hours at 100 Mbit/s. On a fibre line we measured 1.19 Gbit/s at
+  the start and 40 minutes for the whole 208.6 GiB (88 MiB/s on average:
+  the last, largest files go up with fewer parallel streams). Later uploads
+  only send what changed.
 - A clone of XTP on your PC (the scripts live in it; they do not build
   anything locally).
 
@@ -258,7 +260,9 @@ does only what is missing. Each prints what it does.
 
 5. **The game files on the VM** — `tools\cloud\sync-game.ps1`
    On the VM, `gcloud storage rsync` from the bucket to `D:\game` and
-   `D:\golden\data`. Inside the region this takes minutes and costs nothing.
+   `D:\golden\data`. Inside the region it costs nothing; we measured about
+   120 MiB/s (29 minutes for 208.6 GiB), close to what a 300 GB
+   `pd-balanced` disk can write. Later runs copy only what changed.
 
 6. **Check it works**
 

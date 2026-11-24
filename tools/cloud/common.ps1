@@ -220,8 +220,10 @@ function Start-XtpVm($Cfg) {
 function Invoke-XtpVmTool {
     param([Parameter(Mandatory)] $Cfg, [Parameter(Mandatory)] [string]$Zone,
         [Parameter(Mandatory)] [string]$Name, [hashtable]$Arguments = @{}, [switch]$AllowFail)
-    $parts = foreach ($k in $Arguments.Keys) {
-        $v = $Arguments[$k]
+    # GetEnumerator, not .Keys: a hashtable with a 'Keys' entry would return it.
+    $parts = foreach ($entry in $Arguments.GetEnumerator()) {
+        $k = $entry.Key
+        $v = $entry.Value
         if ($v -is [bool] -or $v -is [System.Management.Automation.SwitchParameter]) {
             if ($v) { "-$k" }
         } elseif ($v -is [int] -or $v -is [long] -or $v -is [double]) {
