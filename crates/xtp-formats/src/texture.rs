@@ -274,8 +274,9 @@ pub struct Layout {
     pub mips: Vec<Mip>,
     /// The pipe configuration the XOR modes' addresses follow.
     pub pipes: Pipes,
-    /// The base swizzle (addrlib's `pipeBankXor`) of an XOR mode: pipe bits,
-    /// then bank bits, XORed into every block from address bit 8.
+    /// The base swizzle (addrlib's `pipeBankXor`) of an XOR mode, 0 for the
+    /// others: pipe bits, then bank bits, XORed into every block from
+    /// address bit 8.
     pub pipe_bank_xor: u32,
     /// The pattern, read by coordinate bit; `None` for linear and the
     /// layouts without addressing.
@@ -566,7 +567,7 @@ impl Layout {
             first_tail_mip,
             mips,
             pipes,
-            pipe_bank_xor,
+            pipe_bank_xor: if d.swizzle.xor() { pipe_bank_xor } else { 0 },
             flips,
             xor,
         }
