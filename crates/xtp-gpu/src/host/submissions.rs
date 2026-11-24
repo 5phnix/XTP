@@ -271,6 +271,57 @@ fn a_gpu_copy_over_what_earlier_shaders_write_waits_for_them() {
     assert_eq!(out.words(), want);
 }
 
+/// Three submissions whose shaders write one host copy, the second still
+/// in flight when the third is prepared: each tells what its shaders wrote
+/// from the copy's bytes before its own GPU work. With one snapshot per
+/// copy, the third compared with bytes from before the first, took the
+/// zeros its shaders wrote for unchanged and left the title's write in
+/// place of them.
+#[test]
+fn three_submissions_on_one_shadow_compare_with_their_own_snapshots() {
+    let test =
+        "host::submissions::three_submissions_on_one_shadow_compare_with_their_own_snapshots";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let kernel = Kernel::new(host);
+    // One host copy (the window's), each range on a page of its own; all
+    // zeros at first.
+    let window = watched(4 << 20);
+    let page = crate::watch::PAGE;
+    let (a, b, zeros, scratch) = (window, window + page, window + 2 * page, window + 3 * page);
+    let lists: Vec<HostList> = (0..3).map(|_| host.new_list().unwrap()).collect();
+    kernel.dispatch(&lists[0], Pass::Fill, scratch as u64, a as u64);
+    lists[0].close();
+    kernel.dispatch(&lists[1], Pass::Fill, scratch as u64, b as u64);
+    lists[1].close();
+    let mut first_gate = Gate::close(host);
+    host.execute(&[&lists[0]]);
+    let mut second_gate = Gate::close(host);
+    host.execute(&[&lists[1]]);
+    // The first runs and is finished; the second stays in flight.
+    first_gate.open();
+    lists[0].settle();
+    assert!(lists[1].running());
+    let filled: Vec<u32> = (0..64).map(pattern).collect();
+    assert_eq!(words_at(a), filled, "the first's output written back");
+    // The title writes `a` again, then the third copies zeros over it.
+    for i in 0..64 {
+        // SAFETY: the test's memory.
+        unsafe { (a as *mut u32).add(i).write_volatile(0x1111_1111) };
+    }
+    kernel.dispatch(&lists[2], Pass::Copy, zeros as u64, a as u64);
+    lists[2].close();
+    host.execute(&[&lists[2]]);
+    second_gate.open();
+    host.drain();
+    assert_eq!(
+        words_at(a),
+        [0; 64],
+        "the third's zeros, not the title's write"
+    );
+    assert_eq!(words_at(b), filled, "the second's output");
+}
+
 /// A host list another thread submits.
 struct Shared(HostList);
 
@@ -529,4 +580,88 @@ fn a_synchronous_submission_is_finished_when_it_returns() {
     assert!(!list.running());
     assert_eq!(word(&label), 5);
     assert_eq!(out.words(), (0..64).map(pattern).collect::<Vec<u32>>());
+}
+
+/// Set by a test: the next submission finished panics.
+pub(super) static PANIC_IN_COMPLETE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A panic on the completion thread ends the run with a failure report
+/// instead of leaving the title waiting for ever: run in a child process,
+/// which must end through the failure hook, not by its own time limit.
+#[test]
+fn a_panic_on_the_completion_thread_ends_the_run() {
+    const CHILD: &str = "XTP_TEST_COMPLETION_PANIC";
+    const REPORTED: i32 = 77;
+    let test = "host::submissions::a_panic_on_the_completion_thread_ends_the_run";
+    if std::env::var_os(CHILD).is_some() {
+        on_failure(|text| {
+            eprintln!("failure reported: {text}");
+            std::process::exit(REPORTED)
+        });
+        let host = device(test).expect("a device, as in the parent");
+        let label: &'static u64 = Box::leak(Box::new(0u64));
+        let list = host.new_list().unwrap();
+        list.defer_write(ptr(label), Written::Value(1), 8);
+        list.close();
+        PANIC_IN_COMPLETE.store(true, Ordering::SeqCst);
+        host.execute(&[&list]);
+        // As the title waits: for its label, which only the completion
+        // thread writes.
+        let started = std::time::Instant::now();
+        while word(label) == 0 && started.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        eprintln!("no failure reported (label {})", word(label));
+        std::process::exit(1);
+    }
+    let _serial = serial();
+    if device(test).is_none() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        // Asynchronous submission: a completion thread to panic.
+        .env_remove("XTP_SYNC_SUBMIT")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(REPORTED), "the child: {stderr}");
+    assert!(
+        stderr.contains("completion thread panicked (a panic a test asked for)"),
+        "{stderr}"
+    );
+}
+
+/// A list reset while its submission runs leaves that submission the
+/// pipelines (and notes) of the recording it runs, for its reports of a
+/// slow submission or a removed device; the list's next recording starts
+/// afresh.
+#[test]
+fn a_reset_leaves_a_running_submission_its_recording() {
+    let test = "host::submissions::a_reset_leaves_a_running_submission_its_recording";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let list = host.new_list().unwrap();
+    list.used_pipeline("first");
+    list.close();
+    let mut gate = Gate::close(host);
+    host.execute(&[&list]);
+    list.reset();
+    list.used_pipeline("second");
+    let ours = std::ptr::from_ref(&list);
+    let mut kept: Vec<Vec<String>> = Vec::new();
+    host.timeline.each_work(|p| {
+        for (l, r) in p.lists.iter().zip(&p.recorded) {
+            if std::ptr::eq(l.0, ours) {
+                kept.push(r.pipelines.iter().cloned().collect());
+            }
+        }
+    });
+    assert_eq!(kept, [["first"]]);
+    let next: Vec<String> = list.recorded().pipelines.iter().cloned().collect();
+    assert_eq!(next, ["second"]);
+    gate.open();
+    host.drain();
 }

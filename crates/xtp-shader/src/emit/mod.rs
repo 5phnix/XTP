@@ -84,6 +84,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
+mod image_tests;
+#[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 // IR to DXIL, one file per encoding or concern: which backlog item of
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
@@ -107,27 +109,43 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 2^14 (16,384), under the host's
+/// GPU watchdog (see `lower::LOOP_LIMIT`).
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
-/// With the `diagnostics` feature, `XTP_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
-/// every lane of a full-screen pass still runs for seconds (2^20 times a
-/// 4K screen is about 10^13 iterations); a much lower limit shows whether
-/// such loops are what makes a frame slow. The value is part of the
-/// translation, so the shader cache must key on it (`xtp-gpu`'s does).
+/// `XTP_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least 1) sets it
+/// instead, in every build: a release build can then show which loops make
+/// a frame slow without a diagnostics build. A loop that hits the limit in
+/// every lane of a full-screen pass still costs (2^14 times a 4K screen is
+/// about 10^11 iterations); a lower value shows whether such loops are what
+/// makes a frame slow. The default cuts short a legitimate loop of more
+/// than 16,384 iterations per lane, which then gives a wrong result; a
+/// higher value (the old default was `0x100000`) shows whether a wrong
+/// result comes from that, at the risk of the watchdog removing the device.
+/// The value is part of the translation, so the shader cache must key on it
+/// (`xtp-gpu`'s does).
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("XTP_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
-    })
+    *LIMIT.get_or_init(|| parse_loop_limit(std::env::var("XTP_SHADER_LOOP_LIMIT").ok().as_deref()))
+}
+
+/// The spin-wait limit under the default loop limit: 4096.
+pub const DEFAULT_SPIN_LIMIT: u32 = 1 << 12;
+
+/// The iteration count after which a loop that only waits for memory to
+/// change (a spin wait, see `lower/spin.rs`) is left: [`DEFAULT_SPIN_LIMIT`],
+/// or [`loop_limit`] when that is lower. On the console the write such a
+/// loop waits for comes within microseconds; on the host, when it never
+/// comes (the writer's view is another host resource, null, or the load was
+/// hoisted), 2^20 uncached reads per lane (the old general limit) cost
+/// about a second per wave; 4096 reads are a few milliseconds. It follows
+/// the loop limit and has no switch of its own, so the shader cache's key
+/// on [`loop_limit`] covers it.
+pub(crate) fn spin_limit() -> u32 {
+    DEFAULT_SPIN_LIMIT.min(loop_limit())
 }
 
 /// `XTP_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -375,6 +393,8 @@ pub fn emit_for(
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
+            // Until a read says which mode (`lower`).
+            (28, _) => 2,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
@@ -531,6 +551,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
@@ -584,6 +605,9 @@ mod tests {
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
+        assert_eq!(LOOP_LIMIT, 16_384);
+        // Spin waits never get more than the general limit.
+        const { assert!(super::DEFAULT_SPIN_LIMIT <= LOOP_LIMIT) };
         assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
         assert_eq!(parse_loop_limit(Some("4096")), 4096);
         assert_eq!(parse_loop_limit(Some(" 0x1000 ")), 4096);

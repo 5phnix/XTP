@@ -66,6 +66,21 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Whether [`Self::handle`] gives each lane a heap index of its own for
+    /// `src` (a waterfall loop's load, a descriptor fetched or chosen per
+    /// lane). What a lane outside EXEC holds there may be no index at all:
+    /// it must not reach an access through such a handle.
+    pub(super) fn lane_descriptor(&self, src: &Source) -> bool {
+        match src {
+            Source::Loaded { load, .. } => self.x.res.waterfall.loads.contains(load),
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => true,
+            Source::Built { .. }
+            | Source::Constant(_)
+            | Source::Phi { .. }
+            | Source::Select { .. } => false,
+        }
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     pub(super) fn handle(
         &mut self,

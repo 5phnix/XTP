@@ -582,7 +582,12 @@ impl Section {
                 page += 1;
                 continue;
             }
+            // The run starts at this page, seen uncommitted just now, even
+            // if another thread commits it before the next look: asked
+            // again, it could end the run before it starts, and committing
+            // no bytes fails.
             let from = page;
+            page += 1;
             while page < end && !self.is_committed(page) {
                 page += 1;
             }
