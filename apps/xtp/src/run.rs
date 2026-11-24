@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -11,6 +11,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    autopilot: Option<PathBuf>,
 ) -> Result<()> {
     use std::sync::Arc;
     use xtp_hle::{HleResolver, HostPolicy};
@@ -128,6 +129,11 @@ pub fn run(
     xtp_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    if let Some(script) = autopilot {
+        let size = image.info().size_of_image as usize;
+        xtp_hle::modules::autopilot::start(&script, &hash, image.base(), size)
+            .map_err(anyhow::Error::msg)?;
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
@@ -341,6 +347,13 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: Option<PathBuf>,
+) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

@@ -23,6 +23,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// A data folder kept as it is (a save in the world, say), copied for
+    /// each `cargo xtask play` run.
+    pub golden_data: Option<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
     /// `[input]`: keyboard and mouse settings, from the file only.
@@ -60,6 +63,7 @@ struct FilePaths {
     data_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
+    golden_data: Option<PathBuf>,
 }
 
 impl Config {
@@ -114,6 +118,7 @@ impl Config {
             cache_dir,
             data_dir,
             test_titles,
+            golden_data: env_path("XTP_GOLDEN_DATA").or(file.golden_data),
             source,
             input: Input::default(),
         })
@@ -171,6 +176,20 @@ mod tests {
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
+    }
+
+    #[test]
+    fn golden_data_comes_from_the_environment_or_the_file() {
+        let file = || FilePaths {
+            golden_data: Some("golden-from-file".into()),
+            ..Default::default()
+        };
+        let none = |_: &str| None;
+        let cfg = Config::resolve(file(), None, none).unwrap();
+        assert_eq!(cfg.golden_data, Some(PathBuf::from("golden-from-file")));
+        let env = |k: &str| (k == "XTP_GOLDEN_DATA").then(|| OsString::from("golden-from-env"));
+        let cfg = Config::resolve(file(), None, env).unwrap();
+        assert_eq!(cfg.golden_data, Some(PathBuf::from("golden-from-env")));
     }
 
     #[test]
