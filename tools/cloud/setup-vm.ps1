@@ -66,4 +66,5 @@ $null = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'd3d12-check.ps1' -AllowFai
 if ($LASTEXITCODE -ne 0) { Write-Warning 'The D3D12 check failed: see above (driver, adapter order).' }
 
 Write-Host ''
-Write-Host "Set up. Next: tools\cloud\sync-game.ps1, then tools\cloud\run-remote.ps1 -Check. The VM stops by itself after $($cfg.idleMinutes) idle minutes (or tools\cloud\stop-vm.ps1)."
+$stops = if ([int]$cfg.idleMinutes -gt 0) { "The VM stops by itself after $($cfg.idleMinutes) idle minutes (or tools\cloud\stop-vm.ps1)." } else { 'The idle shutdown is off: the VM runs until you stop it (tools\cloud\stop-vm.ps1).' }
+Write-Host "Set up. Next: tools\cloud\sync-game.ps1, then tools\cloud\run-remote.ps1 -Check. $stops"
