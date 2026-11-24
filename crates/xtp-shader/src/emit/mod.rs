@@ -1170,11 +1170,11 @@ mod tests {
         }
     }
 
-    /// On every hardware adapter: a wave64 program that reads other lanes
-    /// translates in groups of one console wave (natively or in the console
-    /// flow) and the adapter takes it; in groups of two it translates
-    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
-    /// and an NVIDIA GPU this checks both answers.
+    /// On every hardware adapter with a supported wave path: a wave64 program
+    /// that reads other lanes translates in groups of one console wave (natively
+    /// or in the console flow) and the adapter takes it; in groups of two it
+    /// translates exactly when the adapter runs 64-lane waves. An adapter with
+    /// neither 64- nor 32-lane waves correctly refuses the one-wave program.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -1190,8 +1190,13 @@ mod tests {
             };
             let target = host.target();
             eprintln!("{name}: waves {}-{}", target.lanes_min, target.lanes_max);
-            let one =
-                emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let one = match emit_for(&compute(&words, true), target) {
+                Ok(one) => one,
+                Err(e) => {
+                    assert!(!target.runs(64) && !target.runs(32), "{name}: {e}");
+                    continue;
+                }
+            };
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             match emit_for(&compute_of(&words, true, 128), target) {
