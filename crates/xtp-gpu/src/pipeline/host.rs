@@ -1688,6 +1688,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = xtp_pipeline::Cache::open(dir.path()).unwrap();
         let runs = AtomicU64::new(0);
+        let _serial = crate::shader_cache::serial();
         let translate = |in_half: bool, target: Target| {
             let (c, native) = crate::shader_cache::wave64_program(in_half);
             let container: &[u8] = if in_half {
