@@ -1137,7 +1137,7 @@ impl Drop for Resource {
                 tracing::info!(
                     n,
                     desc = ?self.desc,
-                    "a title texture was released while a list not yet reset names its host copy"
+                    "a title texture was released while a list not yet reset (or an alias, `alias`) names its host copy"
                 );
             }
         }
