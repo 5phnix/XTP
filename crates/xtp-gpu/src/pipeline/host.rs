@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
-use xtp_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use xtp_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 
 use super::{Shader, Translated};
 use crate::host::host;
@@ -380,6 +380,10 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// The root parameter of the runtime stride table (`t0` in
+    /// [`STRIDE_SPACE`]), if its shader reads one: a root SRV of the view
+    /// heap's table, which draws bind or are dropped without.
+    pub(crate) stride_table: Option<u32>,
 }
 
 impl Stage {
@@ -745,6 +749,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                stride_table: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -813,6 +818,23 @@ impl HostPipeline {
                         ShaderVisibility: visibility,
                     });
                 }
+            }
+            if t.stride_table {
+                // A root SRV: the table covers every slot of the heap, and a
+                // shader reads it at the slot of a handle it makes there.
+                // The host rewrites entries while lists that read it run.
+                stage.stride_table = Some(params.len() as u32);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: STRIDE_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
@@ -1200,6 +1222,7 @@ mod tests {
         let target = xtp_shader::emit::Target {
             lanes_min: lanes.0,
             lanes_max: lanes.1,
+            stride_table: false,
         };
         xtp_shader::emit::translate_program_for(&c, &native, target).expect("it translates")
     }
@@ -1408,6 +1431,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                stride_table: false,
+                run_time_buffers: 0,
             },
             used: Vec::new(),
             wave64: true,
@@ -1630,7 +1655,8 @@ mod tests {
             target,
             Target {
                 lanes_min: 32,
-                lanes_max: 32
+                lanes_max: 32,
+                stride_table: false,
             }
         );
 
