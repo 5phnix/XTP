@@ -513,13 +513,14 @@ fn the_programs_decode_as_written() {
     assert_eq!(ps[4], "exp mrt0, v0, v1, v2, v3 done vm");
 }
 
-/// [`drawn_mesh`] drawn into 63 x 2 texels on the test adapter, for the
-/// adapter's waves: every texel has the console waves' values.
-#[test]
-fn wave64_mesh_reads_draw_the_console_waves_values() {
+/// The mesh program `native`, whose one attribute is TEXCOORD in row 1,
+/// drawn with [`flat_pixel`] into `size` texels on the test adapter (WARP
+/// on this PC), translated for the adapter's waves: the target, the mesh
+/// module's operations and the texels. `None` without an SM 6.6 device.
+fn draw_flat(native: &NativeProgram, size: (u32, u32)) -> Option<(Target, String, Vec<[f32; 4]>)> {
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 device; skipped");
-        return;
+        return None;
     };
     let target = host.target();
     let ms_sig = crate::dxbc::build(&[(
@@ -550,10 +551,7 @@ fn wave64_mesh_reads_draw_the_console_waves_values() {
     ]);
     let ms_c = crate::Container::parse(&ms_sig).unwrap();
     let ps_c = crate::Container::parse(&ps_sig).unwrap();
-    let (ms, ops) = translate(&drawn_mesh(), &ms_c, target).unwrap();
-    if !target.runs(64) {
-        assert!(ops.contains("barrier"), "exchanges on {target:?}: {ops}");
-    }
+    let (ms, ops) = translate(native, &ms_c, target).unwrap();
     let (ps, _) = translate(&flat_pixel(), &ps_c, target).unwrap();
     let (root, pso) = host.mesh_pipeline(&ms, &ps).unwrap();
     let texels = host
@@ -566,12 +564,25 @@ fn wave64_mesh_reads_draw_the_console_waves_values() {
                 samplers: &[],
                 vertices: &[],
                 stride: 0,
-                size: (63, 2),
+                size,
                 mesh_groups: 1,
             },
         )
         .unwrap();
     eprintln!("{target:?}: {} texels drawn", texels.len());
+    Some((target, ops, texels))
+}
+
+/// [`drawn_mesh`] drawn into 63 x 2 texels on the test adapter, for the
+/// adapter's waves: every texel has the console waves' values.
+#[test]
+fn wave64_mesh_reads_draw_the_console_waves_values() {
+    let Some((target, ops, texels)) = draw_flat(&drawn_mesh(), (63, 2)) else {
+        return;
+    };
+    if !target.runs(64) {
+        assert!(ops.contains("barrier"), "exchanges on {target:?}: {ops}");
+    }
     let mut wrong = Vec::new();
     for (n, t) in texels.iter().enumerate() {
         let (k, row) = (n % 63, n / 63);
@@ -592,4 +603,117 @@ fn wave64_mesh_reads_draw_the_console_waves_values() {
         texels.len(),
         wrong[..wrong.len().min(16)].join("\n")
     );
+}
+
+/// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
+const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+/// The corners' edge flags (bits 9, 19 and 29).
+const EDGE_FLAGS: u32 = 1 << 9 | 1 << 19 | 1 << 29;
+/// The culling bit.
+const CULL: u32 = 1 << 31;
+
+/// Ported from Marvisak/VIctory#1718 (head c0228d9) by tjthebigbearcat-hub:
+/// a wave32 mesh program of 32 lanes, each exporting primitive `prim` and,
+/// as vertex `lane`, the position (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1,
+/// 0.5, 1), so that triangle (0, 1, 2) covers the whole target, with the
+/// attribute (1, 0.5, 0.25, 1).
+fn triangle_mesh(prim: u32) -> NativeProgram {
+    let words = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x3604_0281, // v_and_b32 v2, 1, v1
+        0x3606_0282, // v_and_b32 v3, 2, v1
+        0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+        0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+        0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+        0x0608_08F3, // v_add_f32 v4, -1.0, v4
+        0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+        0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+        0x7E0C_02F0, // v_mov_b32 v6, 0.5
+        0x7E0E_02F2, // v_mov_b32 v7, 1.0
+        0x7E14_02F2, // v_mov_b32 v10, 1.0
+        0x7E16_02F0, // v_mov_b32 v11, 0.5
+        0x7E18_02FF,
+        0x3E80_0000, // v_mov_b32 v12, lit(0.25)
+        0x7E1A_02F2, // v_mov_b32 v13, 1.0
+        0xF800_08CF,
+        0x0706_0504, // exp pos0, v4, v5, v6, v7 done
+        0xF800_020F,
+        0x0D0C_0B0A, // exp param0, v10, v11, v12, v13
+        0x7E12_02FF,
+        prim, // v_mov_b32 v9, prim
+        0xF800_0941,
+        0x0000_0009, // exp prim, v9, off, off, off done
+        S_ENDPGM,
+    ];
+    NativeProgram {
+        stage: crate::HwStage::Ms,
+        wave64: false,
+        vgprs: 16,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ms(MeshIo {
+            outputs: vec![VsOutput {
+                usage: Usage::Generic,
+                row: 1,
+                param: 0,
+                fp16: false,
+                pack2: false,
+            }],
+            clip_cntl: 0,
+            threads: 32,
+            max_vertices: 32,
+            max_primitives: 32,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// Ported from Marvisak/VIctory#1718 (head c0228d9) by tjthebigbearcat-hub
+/// (`edge_flagged_triangles_draw_as_unflagged_ones`): a primitive export's
+/// corners are 9-bit indices, and the edge flag above each is no part of
+/// it. On the test adapter, triangle (0, 1, 2) covers the target with its
+/// corners' edge flags set as without them; with the culling bit, nothing
+/// is lit. (A 10-bit mask read the flagged corners as vertices 512 to 514,
+/// past the program's 32.) Each module is checked by dxil.dll where it is.
+#[test]
+fn edge_flagged_triangles_draw_as_unflagged_ones() {
+    let text: Vec<String> = crate::gfx10::decode(&triangle_mesh(TRIANGLE).code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(false))
+        .collect();
+    for (at, want) in [
+        (5, "v_mul_f32 v4, 4.0, v2"),
+        (13, "v_mov_b32 v12, lit(0x3e800000)"),
+        (15, "exp pos0, v4, v5, v6, v7 done"),
+        (16, "exp param0, v10, v11, v12, v13"),
+        (18, "exp prim, v9, off, off, off done"),
+    ] {
+        assert_eq!(text[at], want, "{text:#?}");
+    }
+    for (prim, culled) in [
+        (TRIANGLE, false),
+        (TRIANGLE | EDGE_FLAGS, false),
+        (TRIANGLE | EDGE_FLAGS | CULL, true),
+    ] {
+        let Some((target, _, texels)) = draw_flat(&triangle_mesh(prim), (16, 16)) else {
+            return;
+        };
+        let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+        if culled {
+            assert_eq!(
+                lit, 0,
+                "{target:?}, {prim:#x}: a culled triangle lit texels"
+            );
+            continue;
+        }
+        assert!(
+            texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+            "{target:?}, {prim:#x}: {lit} of {} texels lit",
+            texels.len()
+        );
+    }
 }
