@@ -19,6 +19,16 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     xtp_hle::modules::lifecycle::wait_for_previous();
     let cfg = xtp_core::Config::load()?;
+    let input = &cfg.input;
+    xtp_hle::modules::gameinput::configure(&xtp_hle::modules::gameinput::Settings {
+        keyboard_mouse: input.keyboard_mouse,
+        mouse_sensitivity: input.mouse_sensitivity,
+        mouse_curve: input.mouse_curve,
+        mouse_dead_zone: input.mouse_dead_zone,
+        invert_y: input.invert_y,
+        bindings: input.bindings.clone(),
+    })
+    .map_err(|e| anyhow::anyhow!("[input] in the config: {e}"))?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = xtp_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();

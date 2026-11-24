@@ -160,6 +160,7 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
+    super::gameinput::window_created(hwnd);
 }
 
 extern "system" fn window_proc(
@@ -182,6 +183,11 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    // The mouse as the right stick: Raw Input, the cursor held while the
+    // window is active, the cursor hidden.
+    if let Some(answer) = super::gameinput::window_message(hwnd, message, wparam, lparam) {
+        return answer;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
@@ -286,6 +292,8 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    // A held cursor would outlive us.
+    super::gameinput::release_mouse();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     xtp_gpu::pipeline::save_pipeline_cache();
