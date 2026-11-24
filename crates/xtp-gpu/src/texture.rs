@@ -103,6 +103,11 @@ pub(crate) struct Staging {
     suspect: AtomicBool,
     /// Changes its guards missed.
     missed: AtomicU64,
+    /// Tells it apart in tests from a staging state of another test freed
+    /// at the same address (whose copies and hashes the address would
+    /// count).
+    #[cfg(test)]
+    id: u64,
     /// Its checks since the last summary (diagnostics).
     #[cfg(feature = "diagnostics")]
     seen: Seen,
@@ -290,17 +295,22 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         DECIDED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((Arc::as_ptr(&staging) as usize, runs));
+            .push((staging.id, runs));
     });
 }
 
-/// Each copy decided in tests: its staging buffer and whether it ran.
+/// Each copy decided in tests: its staging state's [`Staging::id`] and
+/// whether it ran.
 #[cfg(test)]
-static DECIDED: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+static DECIDED: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
 
-/// Each hash a check took in tests: its staging buffer.
+/// Each hash a check took in tests: its staging state's [`Staging::id`].
 #[cfg(test)]
-static HASHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static HASHED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The ids of staging states in tests.
+#[cfg(test)]
+static IDS: AtomicU64 = AtomicU64::new(0);
 
 /// GPU copies of staging buffers recorded, by whether they ran: count and
 /// bytes (staging sizes), since the last summary.
@@ -941,7 +951,7 @@ impl Staging {
         HASHED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(std::ptr::from_ref(self) as usize);
+            .push(self.id);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::TexHashed, bytes.len() as u64);
@@ -1150,6 +1160,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         sampled: AtomicBool::new(false),
         suspect: AtomicBool::new(false),
         missed: AtomicU64::new(0),
+        #[cfg(test)]
+        id: IDS.fetch_add(1, Ordering::Relaxed),
         #[cfg(feature = "diagnostics")]
         seen: Seen::default(),
     });
@@ -1280,7 +1292,7 @@ mod tests {
 
     /// The decisions made for `staging` so far, in order.
     fn decided(staging: &Arc<Staging>) -> Vec<bool> {
-        let key = Arc::as_ptr(staging) as usize;
+        let key = staging.id;
         DECIDED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1409,7 +1421,7 @@ mod tests {
 
     /// The times `staging` was hashed so far.
     fn hashes(staging: &Arc<Staging>) -> usize {
-        let key = Arc::as_ptr(staging) as usize;
+        let key = staging.id;
         HASHED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
