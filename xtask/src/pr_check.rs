@@ -278,6 +278,61 @@ mod tests {
         Some(body.join("\n"))
     }
 
+    /// The hardening rules of docs/dev/maintainers.md, on every workflow:
+    /// no default permissions, permissions per job, actions pinned to a
+    /// commit, and no checkout in a `pull_request_target` workflow.
+    #[test]
+    fn workflows_are_hardened() {
+        let dir = crate::workspace_root().join(".github/workflows");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(&path).unwrap();
+            seen += 1;
+            assert!(
+                text.contains("\npermissions: {}\n"),
+                "{name}: start from `permissions: {{}}`"
+            );
+            for line in text.lines().map(str::trim) {
+                let Some(action) = line
+                    .strip_prefix("- uses: ")
+                    .or_else(|| line.strip_prefix("uses: "))
+                else {
+                    continue;
+                };
+                let sha = action
+                    .split_once('@')
+                    .map_or("", |(_, rev)| rev.split_whitespace().next().unwrap_or(""));
+                assert!(
+                    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{name}: `{action}` is not pinned to a commit SHA"
+                );
+            }
+            if text
+                .lines()
+                .any(|l| l.trim_end() == "  pull_request_target:")
+            {
+                assert!(
+                    !text.contains("actions/checkout"),
+                    "{name}: a pull_request_target workflow must not check out code"
+                );
+            }
+            let jobs = text.split_once("\njobs:\n").map_or("", |(_, j)| j);
+            let job_count = jobs
+                .lines()
+                .filter(|l| l.starts_with("  ") && !l.starts_with("   ") && l.ends_with(':'))
+                .count();
+            let with_permissions = jobs.lines().filter(|l| *l == "    permissions:").count();
+            assert!(job_count > 0, "{name}: no jobs found");
+            assert_eq!(
+                job_count, with_permissions,
+                "{name}: every job declares its permissions"
+            );
+        }
+        assert!(seen >= 3, "found only {seen} workflows");
+    }
+
     #[test]
     fn step_names_are_unique() {
         let mut names = step_names();

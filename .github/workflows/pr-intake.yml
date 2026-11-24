@@ -87,6 +87,9 @@ jobs:
       contains(fromJSON('["FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER"]'), github.event.pull_request.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: pr-intake-welcome-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     permissions:
       pull-requests: write
     steps:
