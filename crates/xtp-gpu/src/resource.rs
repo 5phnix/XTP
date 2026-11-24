@@ -2334,7 +2334,8 @@ fn decode_now(
     let mut decoded = DECODED.lock().unwrap_or_else(|e| e.into_inner());
     let decoded = decoded.get_or_insert_with(std::collections::HashMap::new);
     let fits = |d: &Decoded| {
-        std::ptr::eq(d.from.as_ptr(), Arc::as_ptr(from)) && std::ptr::eq(d.to.as_ptr(), Arc::as_ptr(to))
+        std::ptr::eq(d.from.as_ptr(), Arc::as_ptr(from))
+            && std::ptr::eq(d.to.as_ptr(), Arc::as_ptr(to))
     };
     if !decoded.get(&(placed as usize)).is_some_and(fits) {
         decoded.retain(|_, d| d.to.strong_count() > 0 && d.from.strong_count() > 0);
@@ -2402,9 +2403,19 @@ fn decode_now(
     unsafe {
         l.ResourceBarrier(&[t(&d.words, common, copy_dest)]);
         for (index, (of_words, _)) in d.parts.iter().enumerate() {
-            l.CopyTextureRegion(&rows(&d.words, of_words), 0, 0, 0, &part(&from.texture, index), None);
+            l.CopyTextureRegion(
+                &rows(&d.words, of_words),
+                0,
+                0,
+                0,
+                &part(&from.texture, index),
+                None,
+            );
         }
-        l.ResourceBarrier(&[t(&d.words, copy_dest, read), t(&d.texels, common, unordered)]);
+        l.ResourceBarrier(&[
+            t(&d.words, copy_dest, read),
+            t(&d.texels, common, unordered),
+        ]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
         l.SetComputeRootShaderResourceView(1, d.words.GetGPUVirtualAddress());
@@ -2425,9 +2436,19 @@ fn decode_now(
             l.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
             l.Dispatch(w.Width.div_ceil(8), w.Height.div_ceil(8), w.Depth);
         }
-        l.ResourceBarrier(&[t(&d.texels, unordered, copy_source), t(&d.words, read, common)]);
+        l.ResourceBarrier(&[
+            t(&d.texels, unordered, copy_source),
+            t(&d.words, read, common),
+        ]);
         for (index, (_, of_texels)) in d.parts.iter().enumerate() {
-            l.CopyTextureRegion(&part(&to.texture, index), 0, 0, 0, &rows(&d.texels, of_texels), None);
+            l.CopyTextureRegion(
+                &part(&to.texture, index),
+                0,
+                0,
+                0,
+                &rows(&d.texels, of_texels),
+                None,
+            );
         }
         l.ResourceBarrier(&[t(&d.texels, copy_source, common)]);
     }
@@ -2440,7 +2461,11 @@ fn decode_now(
 /// The buffers and layouts [`decode_now`] needs for `from` and `to`, if
 /// they have the same shape (levels, layers, sizes).
 #[cfg(windows)]
-fn decoding(host: &crate::host::Host, from: &Arc<HostTexture>, to: &Arc<HostTexture>) -> Option<Decoded> {
+fn decoding(
+    host: &crate::host::Host,
+    from: &Arc<HostTexture>,
+    to: &Arc<HostTexture>,
+) -> Option<Decoded> {
     use windows::Win32::Graphics::Direct3D12::*;
     // SAFETY: live textures.
     let (of_from, of_to) = unsafe { (from.texture.GetDesc(), to.texture.GetDesc()) };
@@ -4095,10 +4120,16 @@ mod tests {
         let elsewhere = fresh_memory(&mut held);
         let stand_in = at(elsewhere.address(), &texture(16, 16, R16G16B16A16_FLOAT, 1));
         let (from, to) = (host_copy(target).unwrap(), host_copy(stand_in).unwrap());
-        assert!(!decodes(R16G16B16A16_FLOAT, &from, &to), "only R9G9B9E5 reads");
+        assert!(
+            !decodes(R16G16B16A16_FLOAT, &from, &to),
+            "only R9G9B9E5 reads"
+        );
         assert!(decodes(67, &from, &to));
         assert!(decode_now(host, stand_in, target, &from, &to));
-        assert!(decode_now(host, stand_in, target, &from, &to), "once a frame");
+        assert!(
+            decode_now(host, stand_in, target, &from, &to),
+            "once a frame"
+        );
         host.drain();
         let words = read_words(host, stand_in);
         for (x, y) in [(0, 0), (15, 15), (7, 9)] {
