@@ -38,6 +38,7 @@
 
 use std::ffi::c_void;
 use std::mem::offset_of;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{HleModule, hle_export};
 
@@ -200,6 +201,16 @@ fn jitter_offset(index: i32, phases: i32) -> Option<(f32, f32)> {
     Some((halton(i, 2) - 0.5, halton(i, 3) - 0.5))
 }
 
+/// The jitter queries and dispatches seen, of which the first few are
+/// logged: what the title does with the offsets.
+static JITTER_QUERIES: AtomicU32 = AtomicU32::new(0);
+static DISPATCHES: AtomicU32 = AtomicU32::new(0);
+
+/// Whether `seen` counts one of the first eight calls.
+fn first_few(seen: &AtomicU32) -> bool {
+    seen.fetch_add(1, Ordering::Relaxed) < 8
+}
+
 /// Logs the first time `call` sees description type `kind`.
 fn note(call: &'static str, kind: u64) {
     static SEEN: std::sync::Mutex<Vec<(&str, u64)>> = std::sync::Mutex::new(Vec::new());
@@ -350,6 +361,9 @@ pub extern "C" fn ffxQuery(_context: *mut *mut c_void, desc: *mut Header) -> Ret
                 q.out_x.write(x);
                 q.out_y.write(y);
             }
+            if first_few(&JITTER_QUERIES) {
+                tracing::info!(q.index, q.phase_count, x, y, "ffx: jitter offset");
+            }
             OK
         }
         QUERY_GPU_MEMORY => {
@@ -422,6 +436,9 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
         ONCE.call_once(|| tracing::warn!(?c, render = ?u.render, size = ?u.size, "ffx: a dispatch past its context's sizes"));
     }
     let ran = xtp_gpu::list::upscale(&u);
+    if first_few(&DISPATCHES) {
+        tracing::info!(jitter = ?d.jitter, reset = d.reset, ran, "ffx: dispatch");
+    }
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| {
         tracing::info!(
