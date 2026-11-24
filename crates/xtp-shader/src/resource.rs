@@ -512,6 +512,9 @@ impl<'a> Tracer<'a> {
         if let Some(src) = self.uniform_first_lane(v) {
             return self.sum(self.vorigin(src));
         }
+        if let Some(s) = self.first_lane_folded(v) {
+            return s;
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
@@ -635,7 +638,7 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
-        let (lo, hi) = (self.unlaned(lo), self.unlaned(hi));
+        let (lo, hi) = (self.unlaned(lo), self.unlaned_high(hi));
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
@@ -695,7 +698,7 @@ impl<'a> Tracer<'a> {
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
     /// `v_add_co_ci_u32` with `high` as an operand.
     fn carried(&self, hi: Term, high: Value) -> bool {
-        let Term::Value(v) = self.unlaned(hi) else {
+        let Term::Value(v) = self.unlaned_high(hi) else {
             return false;
         };
         if v == high {
@@ -2272,13 +2275,11 @@ pub(crate) mod tests {
         assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
     }
 
-    /// Per lane, only lanes 0 to 4 enter the block and all of them set v7
-    /// alike. In the console flow every lane runs it, and lanes 5 to 31 keep
-    /// their own v7, load other dwords into s6 and read them after the join:
-    /// the claim must hold in both lowerings, so it is refused.
-    #[test]
-    fn a_code_table_index_set_under_a_narrowed_exec_is_per_lane_in_the_console_flow() {
-        let words = [
+    /// A code table read in a block only lanes 0 to 4 enter, at index v7:
+    /// `set` sets v7 there, then the address is built and read from the
+    /// first lane, and s6 is read after the join.
+    fn narrowed_code_table(set: u32) -> [u32; 20] {
+        [
             0xBE80_1F00, // s_getpc_b64 s[0:1]
             0x8000_FF00,
             0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
@@ -2286,7 +2287,7 @@ pub(crate) mod tests {
             0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0
             0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
             0xBF88_000A, // s_cbranch_execz end
-            0x7E0E_0283, // v_mov_b32 v7, 3
+            set,
             0x3402_0E82, // v_lshlrev_b32 v1, 2, v7
             0xD70F_6A01,
             0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
@@ -2299,11 +2300,35 @@ pub(crate) mod tests {
             0x887E_087E, // end: s_or_b32 exec_lo, exec_lo, s8
             0x7E12_0206, // v_mov_b32 v9, s6
             S_ENDPGM,
-        ];
+        ]
+    }
+
+    /// Per lane, only lanes 0 to 4 enter the block and all of them set v7
+    /// alike (to s9). In the console flow every lane runs it, and lanes 5 to
+    /// 31 keep their own v7, load other dwords into s6 and read them after
+    /// the join: the claim must hold in both lowerings, so it is refused.
+    #[test]
+    fn a_code_table_index_set_under_a_narrowed_exec_is_per_lane_in_the_console_flow() {
+        // v_mov_b32 v7, s9
+        let words = narrowed_code_table(0x7E0E_0209);
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         assert!(crate::structure::structure_console(&p).is_ok());
         assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+    }
+
+    /// The same with a constant index: the first active lane computed the
+    /// address from constants in the read's block, under the EXEC the read
+    /// runs with, so it is entry 3 whatever the other lanes hold, and the
+    /// load needs no lane's VGPR in either lowering (the console compiler's
+    /// form in the exposure and irradiance passes).
+    #[test]
+    fn a_constant_code_table_index_under_a_narrowed_exec_is_folded() {
+        // v_mov_b32 v7, 3
+        let r = code_table_trace(&narrowed_code_table(0x7E0E_0283)).unwrap();
+        let (_, a) = r.scalar.iter().find(|s| s.1.param == CODE).unwrap();
+        assert_eq!(a.offset, 4 + 0xDDC + 3 * 4);
+        assert_eq!(a.dynamic, None);
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the

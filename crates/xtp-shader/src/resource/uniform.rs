@@ -53,7 +53,7 @@
 
 use std::cell::{OnceCell, RefCell};
 
-use super::{MAX_ROUNDS, Site, Term, Tracer};
+use super::{MAX_ROUNDS, Site, Sum, Term, Tracer};
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{EXEC, Exit, Inst, Reg, Value, reverse_postorder};
 use crate::structure::{Atom, Bool, Bools, LaneExit, Structured};
@@ -140,6 +140,139 @@ impl Tracer<'_> {
                 .map_or(t, |src| self.vorigin(src)),
             Term::Const(_) => t,
         }
+    }
+
+    /// `t` for the high dword of an address: as [`Self::unlaned`], and also
+    /// through a first-lane read of a VGPR its block writes after its last
+    /// EXEC write, which the first active lane ran. Only the high half's
+    /// shape is checked; no lowering uses its value.
+    pub(super) fn unlaned_high(&self, t: Term) -> Term {
+        let Term::Value(v) = t else {
+            return t;
+        };
+        match self.first_lane_source(v) {
+            Some(src) if self.uniform(src) || self.same_exec(v, src) => self.vorigin(src),
+            _ => t,
+        }
+    }
+
+    /// The sum the first-lane read `v` takes, when the VGPR it reads is
+    /// computed from constants and scalars only ([`Self::folded`]), in the
+    /// read's block after its last EXEC write: the first active lane ran
+    /// each of those instructions, so the address is that sum whatever the
+    /// other lanes hold, and no lowering needs a lane's VGPR for it.
+    pub(super) fn first_lane_folded(&self, v: Value) -> Option<Sum> {
+        let src = self.first_lane_source(v)?;
+        let (b, i) = self.defs[v.0 as usize]?;
+        self.folded(src, b, self.exec_written(b, i))
+    }
+
+    /// The first instruction of block `b` from which EXEC is the one
+    /// instruction `i` runs with (after the last EXEC write before it).
+    fn exec_written(&self, b: usize, i: usize) -> usize {
+        self.p.blocks[b].insts[..i]
+            .iter()
+            .rposition(|x| x.writes.iter().any(|w| is_exec(w.0)))
+            .map_or(0, |k| k + 1)
+    }
+
+    /// Whether `src` is written in the block of `v`'s definition, before
+    /// it, with the EXEC it runs with.
+    fn same_exec(&self, v: Value, src: Value) -> bool {
+        match (self.defs[v.0 as usize], self.defs[src.0 as usize]) {
+            (Some((b, i)), Some((sb, si))) => sb == b && si < i && si >= self.exec_written(b, i),
+            _ => false,
+        }
+    }
+
+    /// The sum VGPR value `v` holds in the lanes that ran the instructions
+    /// computing it: written in block `b` from instruction `from` on, from
+    /// constants and scalars, by additions (a base or a scalar term may
+    /// stay) and by the other integer operations of [`UNIFORM_VALU`] on
+    /// constants.
+    fn folded(&self, v: Value, b: usize, from: usize) -> Option<Sum> {
+        let (db, di) = self.defs[v.0 as usize]?;
+        if db != b || di < from {
+            return None;
+        }
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if f.dpp.is_some()
+            || f.sdwa.is_some()
+            || f.neg != 0
+            || f.abs != 0
+            || f.opsel != 0
+            || f.clamp
+            || f.omod != 0
+        {
+            return None;
+        }
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        // The dword of the result `v` is.
+        let k = (0..2).find(|&k| inst.write(Reg::V(reg + k)) == Some(v))?;
+        let sum = |op: &Operand| -> Option<Sum> {
+            match *op {
+                Operand::Vector { reg, dwords: 1 } => self.folded(inst.read(Reg::V(reg))?, b, from),
+                Operand::Scalar { .. } | Operand::Const(_) | Operand::Literal(_) => {
+                    Some(self.sum(self.term(inst, op)?))
+                }
+                _ => None,
+            }
+        };
+        let constant = |op: &Operand| {
+            sum(op).and_then(|s| (s.base.is_none() && s.dynamic.is_none()).then_some(s.offset))
+        };
+        let src = |n: usize| f.src.get(n);
+        let name = inst.name();
+        if matches!(name, "v_add_co_u32" | "v_add_nc_u32") && k == 0 {
+            let (x, y) = (sum(src(0)?)?, sum(src(1)?)?);
+            if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
+                return None;
+            }
+            return Some(Sum {
+                base: x.base.or(y.base),
+                offset: x.offset.wrapping_add(y.offset),
+                dynamic: x.dynamic.or(y.dynamic),
+            });
+        }
+        let c = |n: usize| src(n).and_then(constant);
+        let value = match (name, k) {
+            ("v_mov_b32", 0) => c(0)?,
+            ("v_sub_co_u32" | "v_sub_nc_u32", 0) => c(0)?.wrapping_sub(c(1)?),
+            ("v_lshlrev_b32", 0) => c(1)?.wrapping_shl(c(0)? & 31),
+            ("v_lshl_add_u32", 0) => c(0)?.wrapping_shl(c(1)? & 31).wrapping_add(c(2)?),
+            ("v_add3_u32", 0) => c(0)?.wrapping_add(c(1)?).wrapping_add(c(2)?),
+            ("v_ashrrev_i32", 0) => ((c(1)? as i32) >> (c(0)? & 31)) as u32,
+            ("v_med3_i32", 0) => {
+                let mut x = [c(0)? as i32, c(1)? as i32, c(2)? as i32];
+                x.sort_unstable();
+                x[1] as u32
+            }
+            ("v_and_b32", 0) => c(0)? & c(1)?,
+            ("v_or_b32", 0) => c(0)? | c(1)?,
+            ("v_mul_lo_u32", 0) => c(0)?.wrapping_mul(c(1)?),
+            ("v_lshlrev_b64", k) => {
+                let Some(&Operand::Vector { reg: r, dwords: 2 }) = src(1) else {
+                    return None;
+                };
+                let dword = |n| {
+                    let s = self.folded(inst.read(Reg::V(r + n))?, b, from)?;
+                    (s.base.is_none() && s.dynamic.is_none()).then_some(u64::from(s.offset))
+                };
+                let x = (dword(0)? | dword(1)? << 32) << (c(0)? & 63);
+                (x >> (32 * u32::from(k))) as u32
+            }
+            _ => return None,
+        };
+        Some(Sum {
+            base: None,
+            offset: value,
+            dynamic: None,
+        })
     }
 
     /// Whether every lane that reads `v` holds the same value (module
