@@ -20,6 +20,8 @@ pub const SECTOR_SIZE: usize = 2048;
 /// not issue one syscall per 2 KiB while keeping memory strictly bounded.
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
+const _: () = assert!(CHUNK_SIZE.is_multiple_of(SECTOR_SIZE));
+
 /// Offset of the 32-byte TOC sample region inside an RPF9 header.
 pub const TOC_OFFSET: usize = 0x40;
 
@@ -61,12 +63,12 @@ pub struct ProbeReport {
     /// `true` if at least two complete headers with non-zero TOCs were seen and
     /// all of them had the exact same TOC sample.
     pub all_tocs_identical: bool,
-    /// `true` if more than `MAX_TRACKED_TOCS` distinct non-zero TOC samples were
-    /// seen and later distinct samples were not inserted to keep memory bounded.
+    /// `true` if more than 4096 distinct non-zero TOC samples were seen and
+    /// later distinct samples were not inserted to keep memory bounded.
     pub toc_tracking_capped: bool,
-    /// Byte offsets of up to `MAX_RECORDED_OFFSETS` detected headers, in stream order.
+    /// Byte offsets of up to 256 detected headers, in stream order.
     pub header_offsets: Vec<u64>,
-    /// `true` if more than `MAX_RECORDED_OFFSETS` headers were seen.
+    /// `true` if more than 256 headers were seen.
     pub header_offsets_capped: bool,
 }
 
@@ -291,6 +293,23 @@ mod tests {
     }
 
     #[test]
+    fn mixed_zero_and_nonzero_toc_areas() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&make_sector([0u8; TOC_SAMPLE_LEN]));
+        data.extend_from_slice(&make_sector([0x42; TOC_SAMPLE_LEN]));
+        data.extend_from_slice(&make_sector([0u8; TOC_SAMPLE_LEN]));
+        data.extend_from_slice(&make_sector([0x42; TOC_SAMPLE_LEN]));
+
+        let report = probe(Cursor::new(data)).unwrap();
+        assert_eq!(report.headers, 4);
+        assert_eq!(report.complete_headers, 4);
+        assert_eq!(report.nonzero_toc_headers, 2);
+        assert_eq!(report.repeated_toc_count, 1);
+        assert!(report.toc_areas_repeat);
+        assert!(report.all_tocs_identical);
+    }
+
+    #[test]
     fn different_toc_areas_do_not_repeat() {
         let mut data = Vec::new();
         for i in 1u8..=4 {
@@ -351,15 +370,20 @@ mod tests {
 
         let mut stream = SyntheticStream::new(MAX_TRACKED_TOCS as u64 + 1);
         let report = probe(&mut stream).unwrap();
-        assert!(
-            stream.max_read_req <= CHUNK_SIZE,
-            "reader was asked for {} bytes (> CHUNK_SIZE {CHUNK_SIZE})",
-            stream.max_read_req
-        );
+        assert_eq!(stream.max_read_req, CHUNK_SIZE);
+        assert!(report.has_root_header);
         assert_eq!(report.headers, MAX_TRACKED_TOCS as u64 + 1);
+        assert_eq!(report.nested_headers, MAX_TRACKED_TOCS as u64);
+        assert_eq!(
+            report.bytes_scanned,
+            (MAX_TRACKED_TOCS as u64 + 1) * SECTOR_SIZE as u64
+        );
         assert!(report.toc_tracking_capped);
         assert!(report.header_offsets_capped);
         assert_eq!(report.header_offsets.len(), MAX_RECORDED_OFFSETS);
+        for (i, &off) in report.header_offsets.iter().enumerate() {
+            assert_eq!(off, i as u64 * SECTOR_SIZE as u64);
+        }
         assert!(!report.toc_areas_repeat);
     }
 
