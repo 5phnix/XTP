@@ -5,7 +5,8 @@
 //! `kernel` has the host copies' refreshes and copy-backs go through the
 //! kernel's copy (`ReadProcessMemory`, `WriteProcessMemory`) as before W1,
 //! to time it against their plain copies (`XTP_SHADOW_ONCE=0` brings back
-//! all of W1's before).
+//! all of W1's before). `XTP_COPYBACK_CENSUS=1` (or `all`) adds the
+//! copy-back's first-touch census ([`crate::shadow::census`]) to the line.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -185,6 +186,8 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    // With `XTP_COPYBACK_CENSUS`: what the CPU touches of what came back.
+    crate::shadow::census::log(frames);
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

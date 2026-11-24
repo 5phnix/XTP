@@ -73,6 +73,11 @@ pub(crate) struct Shadow {
     /// copy's bytes before it ran, over the ranges they write. What the GPU
     /// wrote differs.
     before: Mutex<Vec<Before>>,
+    /// For the first-touch census ([`census`]): whether the title memory
+    /// copied back is a view of physical pages, asked once: unknown, a
+    /// view, other memory.
+    #[cfg(any(test, feature = "diagnostics"))]
+    kind: AtomicU8,
 }
 
 /// What a copy holds of a page of title memory as the title wrote it.
@@ -275,7 +280,37 @@ impl Shadow {
             watched: AtomicU8::new(0),
             busy: Mutex::default(),
             before: Mutex::default(),
+            #[cfg(any(test, feature = "diagnostics"))]
+            kind: AtomicU8::new(0),
         }
+    }
+
+    /// Whether the title memory at `at` (in the buffer) is a view of
+    /// physical pages, which the guard of view memory keeps read-only
+    /// ([`census`]). Asked of the system once per copy: a query in a big
+    /// view walks its page tables to the region's end.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn census_view(&self, at: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
+        let kind = match self.kind.load(Ordering::Relaxed) {
+            0 => {
+                // SAFETY: plain data filled in by the query.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+                let kind = if n != 0 && info.Type == MEM_MAPPED {
+                    1
+                } else {
+                    2
+                };
+                self.kind.store(kind, Ordering::Relaxed);
+                kind
+            }
+            kind => kind,
+        };
+        kind == 1
     }
 
     fn busy(&self) -> std::sync::MutexGuard<'_, Vec<Busy>> {
@@ -396,6 +431,10 @@ impl Shadow {
                 |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
             let differs =
                 |before: &[u8], a: usize, b: usize| host(a, b) != &before[a - from..b - from];
+            #[cfg(any(test, feature = "diagnostics"))]
+            let census = census::before_back(submission, start + from, start + to, || {
+                self.census_view(start + from)
+            });
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -435,6 +474,8 @@ impl Shadow {
                 .partial
                 .extend(synced.into_iter().filter(|p| !whole(p)));
             self.mark_current(&current);
+            #[cfg(any(test, feature = "diagnostics"))]
+            census::after_back(census, submission, start + from, start + to);
         }
         // Every step of the submission that declared a range in it is done
         // with it, and the submission's snapshot with its last range.
@@ -467,29 +508,40 @@ impl Shadow {
     /// submission's copies declared ([`Shadow::copying`]): refreshes may
     /// take them again. Returns the bytes written.
     pub(crate) fn write_back(&self, submission: u64, address: usize, len: usize) -> usize {
-        let written = self.write_copied(address, len);
+        let written = self.write_copied(submission, address, len);
         let end = address + len;
         self.busy()
             .retain(|b| b.shaders || b.submission != submission || b.from < address || b.to > end);
         written
     }
 
-    fn write_copied(&self, address: usize, len: usize) -> usize {
+    fn write_copied(&self, submission: u64, address: usize, len: usize) -> usize {
         let (from, to) = self.inside(address, len);
         if from >= to {
             return 0;
         }
         let start = self.start as usize;
+        // The submission, for the census only.
+        #[cfg(not(any(test, feature = "diagnostics")))]
+        let _ = submission;
+        #[cfg(any(test, feature = "diagnostics"))]
+        let census = census::before_back(submission, start + from, start + to, || {
+            self.census_view(start + from)
+        });
         crate::watch::writing(start + from, to - from);
         // SAFETY: inside the mapping; the submitting thread leaves the
         // range alone until this submission has finished.
         let host = unsafe { self.data.add(from) };
         write_title(start + from, host, to - from);
+        #[cfg(any(test, feature = "diagnostics"))]
+        census::wrote(start + from, to - from);
         // Whole pages written are now as the copy has them, unless the
         // title wrote them meanwhile: our own write is not taken for the
         // title's.
         let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
         self.mark_current(&(first..last).collect::<Vec<_>>());
+        #[cfg(any(test, feature = "diagnostics"))]
+        census::after_back(census, submission, start + from, start + to);
         to - from
     }
 
@@ -588,6 +640,8 @@ impl Shadow {
                     }
                     write_title(at + j, host[j..].as_ptr(), theirs - j);
                     written += theirs - j;
+                    #[cfg(any(test, feature = "diagnostics"))]
+                    census::wrote(at + j, theirs - j);
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::BackRuns, 1);
                 }
@@ -1031,6 +1085,24 @@ unsafe extern "system" fn stopped(
     const WRITE: usize = 1;
     // SAFETY: the system passes the exception being dispatched.
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+    // The census's guards, from any code: the system took the guard off,
+    // and the access goes on (the copy's too). A write that faults while
+    // the census changes a block's protection goes on once it is done.
+    #[cfg(any(test, feature = "diagnostics"))]
+    if record.NumberParameters >= 2 {
+        let (kind, at) = (
+            record.ExceptionInformation[0],
+            record.ExceptionInformation[1],
+        );
+        let going_on = match record.ExceptionCode {
+            STATUS_GUARD_PAGE_VIOLATION => census::fault(kind == WRITE, at, context.Rip as usize),
+            EXCEPTION_ACCESS_VIOLATION if kind == WRITE => census::settle(at, context.Rip as usize),
+            _ => false,
+        };
+        if going_on {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     let faults = [
         EXCEPTION_ACCESS_VIOLATION,
         EXCEPTION_IN_PAGE_ERROR,
@@ -1082,6 +1154,21 @@ unsafe extern "system" fn stopped(
     EXCEPTION_CONTINUE_EXECUTION
 }
 
+/// Registers [`stopped`], once, first, ahead of the crash reporter's:
+/// before the first plain copy, and before the census guards a page.
+fn install() {
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+    static HANDLER: std::sync::Once = std::sync::Once::new();
+    // SAFETY: a handler that only moves past the copy's instruction, opens
+    // a guarded block as the guard's own handler does, or lets an access to
+    // a page the census guarded go on.
+    HANDLER.call_once(|| unsafe {
+        #[cfg(any(test, feature = "diagnostics"))]
+        census::find_our_image();
+        AddVectoredExceptionHandler(1, Some(stopped));
+    });
+}
+
 /// Whether `at` is committed memory that can be written now.
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
@@ -1126,14 +1213,7 @@ fn can_write(protect: u32) -> bool {
 /// that is accessible may be read (`src`) and written (`dst`): title memory,
 /// or memory of ours no reference points to meanwhile.
 unsafe fn try_copy(dst: *mut u8, src: *const u8, len: usize) -> usize {
-    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
-    static HANDLER: std::sync::Once = std::sync::Once::new();
-    // First, ahead of the crash reporter's (see [`stopped`]).
-    // SAFETY: a handler that only moves past the copy's instruction, or
-    // opens a guarded block as the guard's own handler does.
-    HANDLER.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(stopped));
-    });
+    install();
     // Every byte before `at` is copied; `[at, end)` is left to copy.
     let (mut at, mut end) = (0, len);
     while at < end {
@@ -1314,6 +1394,641 @@ fn write_title(dst: usize, src: *const u8, len: usize) {
             continue;
         }
         at += out_of_reach(dst + at, true).min(left);
+    }
+}
+
+/// First-touch census of the copy-back (diagnostics; `XTP_COPYBACK_CENSUS`,
+/// docs/analysis/lazy-copyback.md): of the title memory copy-backs cover,
+/// how much the CPU touches before the GPU writes it again. The idea is xcl
+/// issue #1640's (its census found about 96 % of the GPU's stores into
+/// title memory overwritten before any CPU read); none of its code is
+/// taken.
+///
+/// After each copy-back ([`Shadow::copy_back`], [`Shadow::write_back`]),
+/// every 4 KiB page of its range gets a guard (`PAGE_GUARD`); the first
+/// access to a page faults once into [`stopped`], which counts it (a read
+/// or a write, by XTP's code or another's) and lets it go on: the system
+/// takes the guard off. The next copy-back over the page counts what no
+/// access reached as written again by the GPU first. Only what the copy-back
+/// covers is counted: the GPU's bytes it writes back, and the whole range it
+/// compares, which a copy-back on first touch would leave alone.
+///
+/// Which memory gets guards: with `XTP_COPYBACK_CENSUS=1`, only blocks the
+/// guard of view memory keeps read-only ([`crate::watch`]). The runtime opens
+/// those before every kernel write into title memory (file reads,
+/// DirectStorage), which takes the census's guard off with the guard's
+/// protection, so no system call fails on it. Read-write memory (write-
+/// watched, or view blocks written since they were guarded) gets guards
+/// with `XTP_COPYBACK_CENSUS=all` only: there a kernel write fails once on
+/// the guard, which BTP 6's synchronous reads retry, but a DirectStorage or
+/// `fread` read into it would fail.
+///
+/// shortcut: what the census does not see. A kernel read of a guarded page
+/// (`ReadProcessMemory`: the textures' and the title copies' reads, which
+/// read again after a failure) takes its guard off without a fault; the
+/// page then counts as not touched. A kernel or runtime write the journal
+/// sees counts as written unseen. A write to a read-only view block opens
+/// the whole block ([`crate::watch`]), its other guards with it: the rest of
+/// its pages count as uncounted after a write. A guard the guard of view
+/// memory takes off otherwise (the other views of a page it guards, a
+/// remapping) goes unnoticed.
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) mod census {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{KERNEL_PAGE, PAGE};
+
+    /// The 4 KiB pages of a 64 KiB block (the census's unit, and that of
+    /// protections).
+    const SMALL: usize = PAGE / KERNEL_PAGE;
+    /// Instruction addresses kept of the touches.
+    const RIPS: usize = 32;
+
+    /// Counters since the last line: bytes (of 4 KiB pages), but where said.
+    #[derive(Clone, Copy)]
+    pub(crate) enum K {
+        /// Bytes of copied-back ranges guarded, and those left without a
+        /// guard (read-write memory without `all`, memory neither watched
+        /// nor a view, a protection change that failed).
+        Armed,
+        Unarmed,
+        /// Guarded bytes a later copy-back covered before any touch: the
+        /// GPU wrote them again first.
+        Again,
+        /// Guarded bytes touched first by a read, or a write, of code other
+        /// than XTP's (the title's, the system's it calls), and by XTP's
+        /// own (its copies, its texture hashing).
+        Read,
+        Write,
+        Ours,
+        /// Guarded bytes written without a fault (the journal saw it: a
+        /// kernel or runtime write, another view of the page).
+        Unseen,
+        /// Guarded bytes uncounted after a write to their block: to a
+        /// read-only block, which opens the whole block; to another, when
+        /// the journal then finds the block written (it knows blocks, not
+        /// pages).
+        AfterWrite,
+        /// Bytes of the 64 KiB blocks with a touch (a copy-back on first
+        /// touch by block would compare those).
+        Blocks,
+        /// Bytes the GPU changed that a copy-back wrote into guarded pages;
+        /// of them, in pages touched (or written unseen, or uncounted after
+        /// a write) before a later copy-back, and in pages a later
+        /// copy-back covered first.
+        Gpu,
+        GpuTouched,
+        GpuAgain,
+        /// Faults on guarded pages (a count: guard faults, and stores that
+        /// fault on the read-only protection under a guard first),
+        /// protection changes (a count), and the census's own time in its
+        /// copy-back steps (microseconds).
+        Faults,
+        Protections,
+        Us,
+    }
+    const COUNTERS: usize = 15;
+    static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+
+    fn add(k: K, n: u64) {
+        COUNT[k as usize].fetch_add(n, Relaxed);
+    }
+
+    /// The counters since the last call, cleared.
+    pub(crate) fn take() -> [u64; COUNTERS] {
+        std::array::from_fn(|i| COUNT[i].swap(0, Relaxed))
+    }
+
+    /// What a census guards: 0 nothing (no census), 1 read-only view
+    /// blocks, 2 all.
+    pub(crate) fn mode() -> u8 {
+        #[cfg(test)]
+        {
+            let forced = super::tests::CENSUS.load(Relaxed);
+            if forced != 0 {
+                return forced - 1;
+            }
+        }
+        static MODE: OnceLock<u8> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            match std::env::var("XTP_COPYBACK_CENSUS")
+                .as_deref()
+                .map(str::trim)
+            {
+                Ok("1" | "on") => 1,
+                Ok("all") => 2,
+                _ => 0,
+            }
+        })
+    }
+
+    /// A 64 KiB block of title memory a census guarded.
+    struct Block {
+        /// The submission whose copy-back guarded it last.
+        submission: u64,
+        /// The journal's asking after that copy-back's own writes.
+        asked: u64,
+        /// Its 4 KiB pages counted (bit i: the i-th), and those guarded as
+        /// far as the census knows.
+        armed: u16,
+        guarded: u16,
+        /// The bytes the GPU wrote back into each page then.
+        gpu: [u16; SMALL],
+        /// Its protection under the guard is read-only (the guard of view
+        /// memory's): a write opens the whole block.
+        read_only: bool,
+        /// A copy-back over it is under way: its faults are the copy-back's.
+        busy: bool,
+        /// A page of it was touched since it was guarded, and written (a
+        /// guard fault on a store).
+        touched: bool,
+        wrote: bool,
+    }
+
+    struct Census {
+        blocks: BTreeMap<usize, Block>,
+        /// Every block a census guarded: a guard fault there is the
+        /// census's, whatever it knows of the block since.
+        ever: BTreeSet<usize>,
+        /// Where touches came from: instruction address, touches.
+        rips: Vec<(usize, u64)>,
+    }
+
+    static CENSUS: Mutex<Census> = Mutex::new(Census {
+        blocks: BTreeMap::new(),
+        ever: BTreeSet::new(),
+        rips: Vec::new(),
+    });
+
+    /// Taken by the handler on the faulting thread: nothing holds it while
+    /// it touches title memory.
+    fn census() -> std::sync::MutexGuard<'static, Census> {
+        CENSUS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    thread_local! {
+        /// The GPU's bytes the copy-back under way on this thread wrote, as
+        /// (4 KiB page number, bytes), while it is counted.
+        static WROTE: std::cell::RefCell<Option<Vec<(usize, u32)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// XTP's executable image (its code faults as XTP's own), and the copy's
+    /// instruction.
+    static IMAGE: OnceLock<(usize, usize)> = OnceLock::new();
+
+    /// Notes where XTP's image lies (with the handler's registration). In
+    /// tests none: the tests' accesses stand in for the title's.
+    pub(crate) fn find_our_image() {
+        #[cfg(not(test))]
+        {
+            use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows_sys::Win32::System::ProcessStatus::{K32GetModuleInformation, MODULEINFO};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            // SAFETY: the process's own executable; a sized structure.
+            let image = unsafe {
+                let module = GetModuleHandleW(std::ptr::null());
+                let mut info: MODULEINFO = std::mem::zeroed();
+                let ok = K32GetModuleInformation(
+                    GetCurrentProcess(),
+                    module,
+                    &mut info,
+                    size_of::<MODULEINFO>() as u32,
+                ) != 0;
+                let base = info.lpBaseOfDll as usize;
+                if ok {
+                    (base, base + info.SizeOfImage as usize)
+                } else {
+                    (0, 0)
+                }
+            };
+            let _ = IMAGE.set(image);
+        }
+    }
+
+    fn ours(rip: usize) -> bool {
+        let (from, to) = IMAGE.get().copied().unwrap_or_default();
+        rip == &raw const super::xtp_gpu_try_copy_moving as usize || (from..to).contains(&rip)
+    }
+
+    /// The bits of the 4 KiB pages `[from, to)` of a block.
+    fn mask(from: usize, to: usize) -> u16 {
+        ((((1u32 << to) - 1) & !((1u32 << from) - 1)) & 0xffff) as u16
+    }
+
+    fn bits(mask: u16) -> impl Iterator<Item = usize> {
+        (0..SMALL).filter(move |i| mask & (1 << i) != 0)
+    }
+
+    /// The journal's last writing of `block`'s page (0: none known).
+    fn last_write(written: &[(usize, u64)], block: usize) -> u64 {
+        written
+            .binary_search_by_key(&block, |&(p, _)| p)
+            .map_or(0, |i| written[i].1)
+    }
+
+    /// How a copy-back takes part: whether the census counts it, and
+    /// guards its range after.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Back {
+        counted: bool,
+        view: bool,
+    }
+
+    /// Before a copy-back of `submission` writes title memory `[from, to)`
+    /// (`view`: whether it is a view of physical pages, asked only with a
+    /// census): what a census guarded there and no access reached, the GPU
+    /// wrote again first. Faults there until [`after_back`] are the
+    /// copy-back's own.
+    pub(crate) fn before_back(
+        submission: u64,
+        from: usize,
+        to: usize,
+        view: impl FnOnce() -> bool,
+    ) -> Back {
+        let mode = mode();
+        if mode == 0 || from >= to {
+            return Back {
+                counted: false,
+                view: false,
+            };
+        }
+        let view = view();
+        if mode == 1 && !view {
+            // Read-write memory, which a census leaves alone without `all`.
+            add(
+                K::Unarmed,
+                (to - from).div_ceil(KERNEL_PAGE) as u64 * KERNEL_PAGE as u64,
+            );
+            return Back {
+                counted: false,
+                view,
+            };
+        }
+        let started = std::time::Instant::now();
+        // The journal as before the copy-back's own writes.
+        let asked = crate::watch::writes(from, to, true);
+        {
+            let mut census = census();
+            for (&block, b) in census.blocks.range_mut(from / PAGE..=(to - 1) / PAGE) {
+                b.busy = true;
+                if b.submission == submission {
+                    // Another copy of the same title memory, back from the
+                    // same submission: the same GPU work.
+                    continue;
+                }
+                let written = asked.as_ref().map_or(0, |(_, w)| last_write(w, block));
+                // Written since it was guarded: a write the guard did not see
+                // (which may have taken the guards off), unless a store to
+                // one of its pages faulted, which the journal cannot tell
+                // apart (it knows blocks).
+                let unseen = written > b.asked;
+                for i in bits(b.armed & b.guarded) {
+                    let (bytes, gpu) = match (unseen, b.wrote) {
+                        (false, _) => (K::Again, K::GpuAgain),
+                        (true, false) => (K::Unseen, K::GpuTouched),
+                        (true, true) => (K::AfterWrite, K::GpuTouched),
+                    };
+                    add(bytes, KERNEL_PAGE as u64);
+                    add(gpu, u64::from(b.gpu[i]));
+                }
+                b.armed = 0;
+                if unseen {
+                    b.guarded = 0;
+                }
+            }
+        }
+        WROTE.set(Some(Vec::new()));
+        add(K::Us, started.elapsed().as_micros() as u64);
+        Back {
+            counted: true,
+            view,
+        }
+    }
+
+    /// The copy-back under way on this thread wrote the GPU's bytes into
+    /// title memory `[at, at + len)`.
+    pub(crate) fn wrote(at: usize, len: usize) {
+        WROTE.with_borrow_mut(|wrote| {
+            let Some(wrote) = wrote else {
+                return;
+            };
+            let mut a = at;
+            while a < at + len {
+                let end = (a / KERNEL_PAGE + 1) * KERNEL_PAGE;
+                let n = end.min(at + len) - a;
+                match wrote.last_mut() {
+                    Some((page, bytes)) if *page == a / KERNEL_PAGE => *bytes += n as u32,
+                    _ => wrote.push((a / KERNEL_PAGE, n as u32)),
+                }
+                a += n;
+            }
+        });
+    }
+
+    /// After the copy-back of `[from, to)` by `submission` ([`before_back`]
+    /// told how it takes part): guards each 4 KiB page of the range, for
+    /// the first access to tell.
+    pub(crate) fn after_back(back: Back, submission: u64, from: usize, to: usize) {
+        if !back.counted {
+            return;
+        }
+        super::install();
+        let started = std::time::Instant::now();
+        let mut wrote = WROTE.take().unwrap_or_default();
+        wrote.sort_unstable();
+        // The journal after the copy-back's own writes (its asking): a write
+        // it finds now is another's, made while the copy-back ran.
+        let asked = crate::watch::writes(from, to, true);
+        let mut census = census();
+        let census = &mut *census;
+        if census.rips.capacity() < RIPS {
+            // Room for the handler, which does not allocate.
+            census.rips.reserve(RIPS);
+        }
+        for block in from / PAGE..=(to - 1) / PAGE {
+            let at = block * PAGE;
+            let (a, b) = (
+                (from.max(at) - at) / KERNEL_PAGE,
+                (to.min(at + PAGE) - at).div_ceil(KERNEL_PAGE),
+            );
+            let pages = mask(a, b);
+            let bytes = ((b - a) * KERNEL_PAGE) as u64;
+            let Some((now, written)) = &asked else {
+                add(K::Unarmed, bytes);
+                continue;
+            };
+            let mut gpu = [0u16; SMALL];
+            let first = wrote.partition_point(|&(p, _)| p < at / KERNEL_PAGE);
+            let end = (at + PAGE) / KERNEL_PAGE;
+            for &(page, n) in wrote[first..].iter().take_while(|&&(p, _)| p < end) {
+                let n = n.min(u32::from(u16::MAX)) as u16;
+                gpu[page % SMALL] = gpu[page % SMALL].saturating_add(n);
+            }
+            let ours = gpu.iter().any(|&n| n != 0);
+            // Where the copy-back wrote, its write and another's look alike.
+            let theirs = !ours && last_write(written, block) == *now;
+            let Census { blocks, ever, .. } = census;
+            let entry = blocks.entry(block).or_insert(Block {
+                submission,
+                asked: 0,
+                armed: 0,
+                guarded: 0,
+                gpu,
+                read_only: back.view,
+                busy: false,
+                touched: false,
+                wrote: false,
+            });
+            // Still guarded where it counts, and nothing took the guards
+            // off: our write (the guard of view memory opens the block
+            // first), another's while the copy-back ran.
+            let intact = entry.guarded & pages == pages && !ours && !theirs;
+            *entry = Block {
+                submission,
+                asked: *now,
+                armed: pages,
+                guarded: entry.guarded,
+                gpu,
+                read_only: entry.read_only,
+                busy: false,
+                touched: false,
+                wrote: false,
+            };
+            if theirs {
+                // Touched (written) as it came back: a touch before the
+                // next GPU write.
+                add(K::Unseen, bytes);
+                add(K::GpuTouched, gpu.iter().map(|&n| u64::from(n)).sum());
+                entry.armed = 0;
+                continue;
+            }
+            if !intact {
+                // Known as the census's before it is guarded: a fault there
+                // waits for the lock, then finds it.
+                ever.insert(block);
+                match guard(at + a * KERNEL_PAGE, b - a, back.view) {
+                    Some(read_only) => {
+                        entry.guarded |= pages;
+                        entry.read_only = read_only;
+                    }
+                    None => {
+                        entry.armed = 0;
+                        entry.guarded &= !pages;
+                        add(K::Unarmed, bytes);
+                        continue;
+                    }
+                }
+            }
+            add(K::Armed, bytes);
+            add(K::Gpu, gpu.iter().map(|&n| u64::from(n)).sum());
+        }
+        add(K::Us, started.elapsed().as_micros() as u64);
+    }
+
+    /// Guards `pages` 4 KiB pages from `at`, keeping the protection under
+    /// the guard: read-only for view memory, which the guard of view memory
+    /// keeps so (read-write too with `all`), read-write for other memory
+    /// (`all` only). Returns whether the protection under it is read-only,
+    /// or `None` (the protection as it was) for any other protection.
+    fn guard(at: usize, pages: usize, view: bool) -> Option<bool> {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
+        };
+        let len = pages * KERNEL_PAGE;
+        let set = |protection: u32| {
+            add(K::Protections, 1);
+            let mut old = 0;
+            // SAFETY: title memory; only its protection changes, and a
+            // fault on the guard is the census's (the caller noted the
+            // block first).
+            let ok = unsafe { VirtualProtect(at as *const _, len, protection, &mut old) } != 0;
+            ok.then_some(old)
+        };
+        let expected = if view { PAGE_READONLY } else { PAGE_READWRITE };
+        let old = set(expected | PAGE_GUARD)?;
+        let under = old & !PAGE_GUARD;
+        if under == expected {
+            return Some(view);
+        }
+        if view && under == PAGE_READWRITE && mode() == 2 {
+            // A view block written since it was guarded: read-write.
+            return set(PAGE_READWRITE | PAGE_GUARD).map(|_| false);
+        }
+        // Not what the guard or the title leaves there (another modifier,
+        // no access): as it was.
+        set(old);
+        None
+    }
+
+    /// The handler, at a guard fault on `at` (`write`: a store) by the
+    /// instruction at `rip`: whether the census guarded it, then counted
+    /// and let go on (the system took the guard off).
+    pub(crate) fn fault(write: bool, at: usize, rip: usize) -> bool {
+        if mode() == 0 {
+            return false;
+        }
+        let mut census = census();
+        if !census.ever.contains(&(at / PAGE)) {
+            return false;
+        }
+        touch(&mut census, write, at, rip);
+        true
+    }
+
+    /// The handler, at a write fault on `at` by the instruction at `rip`:
+    /// whether it is in a block the census guarded, and writable now, then
+    /// let go on. A store to a read-only page faults on its protection
+    /// before its guard (which stays): the census counts it here, and the
+    /// guard of view memory then opens the block, its guards with it. A
+    /// store also faults on a block the census made read-only for a moment
+    /// (a protection it gives back): writable once that is done.
+    pub(crate) fn settle(at: usize, rip: usize) -> bool {
+        if mode() == 0 {
+            return false;
+        }
+        {
+            let mut census = census();
+            if !census.ever.contains(&(at / PAGE)) {
+                return false;
+            }
+            touch(&mut census, true, at, rip);
+        }
+        super::writable(at)
+    }
+
+    /// Counts the first access to the 4 KiB page of `at`, if guarded and
+    /// counted, by the instruction at `rip`.
+    fn touch(census: &mut Census, write: bool, at: usize, rip: usize) {
+        add(K::Faults, 1);
+        let Some(b) = census.blocks.get_mut(&(at / PAGE)) else {
+            return;
+        };
+        let i = at % PAGE / KERNEL_PAGE;
+        let bit = 1u16 << i;
+        if b.armed & b.guarded & bit != 0 && !b.busy {
+            let kind = if ours(rip) {
+                K::Ours
+            } else if write {
+                K::Write
+            } else {
+                K::Read
+            };
+            add(kind, KERNEL_PAGE as u64);
+            add(K::GpuTouched, u64::from(b.gpu[i]));
+            b.armed &= !bit;
+            b.wrote |= write;
+            if !b.touched {
+                b.touched = true;
+                add(K::Blocks, PAGE as u64);
+            }
+        }
+        b.guarded &= !bit;
+        if write && b.read_only {
+            // The guard of view memory opens the whole block for the store:
+            // the other guards go with its read-only protection.
+            if !b.busy {
+                for j in bits(b.armed & b.guarded) {
+                    add(K::AfterWrite, KERNEL_PAGE as u64);
+                    add(K::GpuTouched, u64::from(b.gpu[j]));
+                }
+            }
+            (b.armed, b.guarded) = (0, 0);
+        }
+        let rips = &mut census.rips;
+        if let Some(r) = rips.iter_mut().find(|r| r.0 == rip) {
+            r.1 += 1;
+        } else if rips.len() < rips.capacity() {
+            rips.push((rip, 1));
+        } else if let Some(r) = rips.iter_mut().min_by_key(|r| r.1) {
+            *r = (rip, 1);
+        }
+    }
+
+    /// Logs the counters per frame over `frames` frames, and where the
+    /// touches came from.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn log(frames: f64) {
+        if mode() == 0 {
+            return;
+        }
+        let c = take().map(|v| v as f64 / frames);
+        let (armed, mut rips) = {
+            let mut census = census();
+            let armed: u64 = census
+                .blocks
+                .values()
+                .map(|b| u64::from((b.armed & b.guarded).count_ones()))
+                .sum();
+            let rips = std::mem::take(&mut census.rips);
+            (armed * KERNEL_PAGE as u64, rips)
+        };
+        let mb = |k: K| c[k as usize] / 1e6;
+        tracing::info!(
+            "copy-back census per frame (4 KiB pages): guarded {:.1} MB (not guarded {:.1} MB); \
+             the GPU wrote {:.1} MB again before any touch; touched first {:.2} MB (reads \
+             {:.2}, writes {:.2}, XTP's own {:.2}; {:.1} MB of 64 KiB blocks), written unseen \
+             {:.2} MB, uncounted after a write {:.2} MB; the GPU's bytes written back {:.3} MB: \
+             {:.3} MB touched, {:.3} MB written again first; {:.0} guard faults, {:.0} \
+             protection changes, census {:.2} ms; {:.1} MB guarded now",
+            mb(K::Armed),
+            mb(K::Unarmed),
+            mb(K::Again),
+            mb(K::Read) + mb(K::Write) + mb(K::Ours),
+            mb(K::Read),
+            mb(K::Write),
+            mb(K::Ours),
+            mb(K::Blocks),
+            mb(K::Unseen),
+            mb(K::AfterWrite),
+            mb(K::Gpu),
+            mb(K::GpuTouched),
+            mb(K::GpuAgain),
+            c[K::Faults as usize],
+            c[K::Protections as usize],
+            c[K::Us as usize] / 1e3,
+            armed as f64 / 1e6,
+        );
+        rips.sort_unstable_by_key(|r| std::cmp::Reverse(r.1));
+        for (rip, n) in rips.into_iter().take(8) {
+            tracing::info!(
+                "  census touches at {}: {:.1}/frame",
+                place(rip),
+                n as f64 / frames
+            );
+        }
+    }
+
+    /// `rip` as module+offset, when a module the system knows holds it.
+    #[cfg(feature = "diagnostics")]
+    fn place(rip: usize) -> String {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            GetModuleFileNameW, GetModuleHandleExW,
+        };
+        let mut module = std::ptr::null_mut();
+        // SAFETY: an address as the module name, with the flag that says so;
+        // the reference count stays as it is.
+        let found = unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                rip as *const u16,
+                &mut module,
+            )
+        } != 0;
+        if !found {
+            return format!("{rip:#x} (no module the system knows: the title's image?)");
+        }
+        let mut name = [0u16; 260];
+        // SAFETY: a buffer of its stated length.
+        let n =
+            unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+        let path = String::from_utf16_lossy(&name[..n]);
+        let file = path.rsplit('\\').next().unwrap_or(&path);
+        format!("{file}+{:#x}", rip - module as usize)
     }
 }
 
@@ -1716,6 +2431,20 @@ mod tests {
         /// How far short of the faulting byte the next fault at the copy's
         /// instruction on this thread stops it ([`stopped`]).
         pub(super) static LAG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The census's mode for this process ([`census::mode`]) plus one, 0
+    /// to leave it to `XTP_COPYBACK_CENSUS`: set by the census tests, each
+    /// in a process of its own ([`alone`]).
+    pub(super) static CENSUS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    /// The census's counters since the last call.
+    fn counted() -> [u64; 15] {
+        census::take()
+    }
+
+    fn at(c: &[u64; 15], k: census::K) -> u64 {
+        c[k as usize]
     }
 
     /// Runs `body` in a process of its own: the test binary again, with
@@ -2515,6 +3244,179 @@ mod tests {
             );
             assert!(!shadow.stale(window + PAGE, window + 2 * PAGE), "current");
             assert_eq!(shadow.update(from, len), 0);
+        });
+    }
+
+    /// The census on view memory (`XTP_COPYBACK_CENSUS=1`): a copy-back
+    /// guards every 4 KiB page of its range; the first access to a page is
+    /// counted once (a read, a write, XTP's own copy) and sees the GPU's
+    /// bytes; a write to a read-only block leaves the rest of it uncounted;
+    /// the next copy-back over the range counts what no access reached as
+    /// written again by the GPU first. XTP's own copy goes on through the
+    /// guards (before, a guard fault ended it: zeros in the copy). Without
+    /// a census nothing is guarded.
+    #[test]
+    fn the_census_counts_the_first_touch_of_what_came_back() {
+        use census::K;
+        let test = "shadow::tests::the_census_counts_the_first_touch_of_what_came_back";
+        alone(test, || {
+            if crate::testgpu::device(test).is_none() {
+                return;
+            }
+            let mapped = view(2 * WINDOW as usize);
+            let window = mapped.next_multiple_of(WINDOW as usize);
+            let shadow = find(window as u64, (3 * PAGE) as u64).expect("a host copy");
+            let len = 3 * PAGE;
+            shadow.update(window, len);
+            // No census: nothing counted, nothing guarded.
+            let gpu = submission();
+            shadow.writing(gpu, window, len);
+            shadow.set_host(window + 0x40, 4, 0x99);
+            assert_eq!(shadow.copy_back(gpu, window, len), 4);
+            assert_eq!(counted(), [0; 15]);
+            assert!(title(window + 0x40, 4).iter().all(|&b| b == 0x99));
+            assert_eq!(counted(), [0; 15], "no guard fault");
+            CENSUS.store(2, Ordering::SeqCst);
+            // The GPU writes the first page of the first block and the third
+            // of the third.
+            let gpu = submission();
+            shadow.writing(gpu, window, len);
+            shadow.set_host(window + 0x10, 16, 0xab);
+            shadow.set_host(window + 2 * PAGE + 0x2010, 8, 0xcd);
+            assert_eq!(shadow.copy_back(gpu, window, len), 24);
+            let c = counted();
+            assert_eq!(at(&c, K::Armed), len as u64, "every page guarded");
+            assert_eq!(at(&c, K::Unarmed), 0);
+            assert_eq!(at(&c, K::Gpu), 24);
+            assert_eq!(
+                at(&c, K::Faults),
+                0,
+                "the copy-back's own access is not a touch"
+            );
+            // Reads see the GPU's bytes; a page faults once.
+            assert!(title(window + 0x10, 16).iter().all(|&b| b == 0xab));
+            assert!(title(window + 0x10, 16).iter().all(|&b| b == 0xab));
+            let _ = title(window + KERNEL_PAGE, 4);
+            assert!(
+                title(window + 2 * PAGE + 0x2010, 8)
+                    .iter()
+                    .all(|&b| b == 0xcd)
+            );
+            // A write to the third block: the guard of view memory opens it
+            // whole.
+            set_title(window + 2 * PAGE + 0x5000, 4, 0x11);
+            let c = counted();
+            assert_eq!(at(&c, K::Read), 3 * KERNEL_PAGE as u64);
+            assert_eq!(at(&c, K::Write), KERNEL_PAGE as u64);
+            assert_eq!(at(&c, K::AfterWrite), 14 * KERNEL_PAGE as u64);
+            assert_eq!(at(&c, K::Blocks), 2 * PAGE as u64);
+            assert_eq!(at(&c, K::GpuTouched), 24);
+            assert_eq!(at(&c, K::Faults), 4);
+            // The next submission writes the range again, the GPU changing
+            // nothing: the first block's 14 untouched pages and the second
+            // block were written again first.
+            let next = submission();
+            shadow.writing(next, window, len);
+            assert_eq!(shadow.copy_back(next, window, len), 0);
+            let c = counted();
+            assert_eq!(at(&c, K::Again), 30 * KERNEL_PAGE as u64);
+            assert_eq!(at(&c, K::GpuAgain), 0);
+            assert_eq!(at(&c, K::Unseen), 0);
+            assert_eq!(at(&c, K::Armed), len as u64);
+            // XTP's own copy through the guarded second block reads it all.
+            let mut read = vec![0xeeu8; PAGE];
+            assert_eq!(
+                read_title(read.as_mut_ptr(), window + PAGE, PAGE),
+                0,
+                "no zeros"
+            );
+            assert_eq!(read, title(window + PAGE, PAGE));
+            let c = counted();
+            assert_eq!(at(&c, K::Ours), PAGE as u64);
+            assert_eq!(at(&c, K::Read), 0, "the test's own reads came after");
+            CENSUS.store(0, Ordering::SeqCst);
+        });
+    }
+
+    /// The census on write-watched memory: left alone with
+    /// `XTP_COPYBACK_CENSUS=1` (a kernel write into it would fail on the
+    /// guard), guarded with `all`. A write there opens one page only, and a
+    /// write the guard does not see (the kernel's) counts as written unseen
+    /// at the next copy-back.
+    #[test]
+    fn the_census_guards_write_watched_memory_with_all_only() {
+        use census::K;
+        let test = "shadow::tests::the_census_guards_write_watched_memory_with_all_only";
+        alone(test, || {
+            if crate::testgpu::device(test).is_none() {
+                return;
+            }
+            let len = 2 * PAGE;
+            let window = watched(len);
+            let shadow = find(window as u64, len as u64).expect("a host copy");
+            shadow.update(window, len);
+            CENSUS.store(2, Ordering::SeqCst);
+            let gpu = submission();
+            shadow.writing(gpu, window, len);
+            shadow.set_host(window + 0x10, 8, 0xa1);
+            assert_eq!(shadow.copy_back(gpu, window, len), 8);
+            let c = counted();
+            assert_eq!(at(&c, K::Armed), 0);
+            assert_eq!(at(&c, K::Unarmed), len as u64);
+            assert!(title(window + 0x10, 8).iter().all(|&b| b == 0xa1));
+            assert_eq!(at(&counted(), K::Faults), 0, "not guarded");
+            CENSUS.store(3, Ordering::SeqCst);
+            let gpu = submission();
+            shadow.writing(gpu, window, len);
+            shadow.set_host(window + PAGE + 0x3000, 8, 0xa2);
+            assert_eq!(shadow.copy_back(gpu, window, len), 8);
+            assert_eq!(at(&counted(), K::Armed), len as u64);
+            // A title write opens its page only; a read of another page of
+            // the block still faults.
+            set_title(window + PAGE + 0x3004, 2, 0x5a);
+            let _ = title(window + PAGE, 4);
+            let c = counted();
+            assert_eq!(at(&c, K::Write), KERNEL_PAGE as u64);
+            assert_eq!(at(&c, K::Read), KERNEL_PAGE as u64);
+            assert_eq!(at(&c, K::AfterWrite), 0);
+            assert_eq!(at(&c, K::GpuTouched), 8);
+            // A kernel write into the first block (its guard fails it once,
+            // then the system has taken the guard off).
+            use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let ours = [0x77u8; 4];
+            let mut done = 0;
+            for _ in 0..2 {
+                // SAFETY: the test's memory, our own buffer.
+                unsafe {
+                    WriteProcessMemory(
+                        GetCurrentProcess(),
+                        (window + 0x100) as *const _,
+                        ours.as_ptr().cast(),
+                        ours.len(),
+                        &mut done,
+                    )
+                };
+            }
+            assert_eq!(title(window + 0x100, 4), ours, "written the second time");
+            let c = counted();
+            assert_eq!(at(&c, K::Faults), 0, "the kernel's access does not fault");
+            let next = submission();
+            shadow.writing(next, window, len);
+            assert_eq!(shadow.copy_back(next, window, len), 0);
+            let c = counted();
+            assert_eq!(
+                at(&c, K::Unseen),
+                16 * KERNEL_PAGE as u64,
+                "the first block"
+            );
+            assert_eq!(
+                at(&c, K::AfterWrite),
+                14 * KERNEL_PAGE as u64,
+                "the second's others: its write shows in the journal too"
+            );
+            assert_eq!(at(&c, K::Again), 0);
+            CENSUS.store(0, Ordering::SeqCst);
         });
     }
 
