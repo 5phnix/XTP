@@ -294,6 +294,53 @@ pub(crate) fn mapping_alpha_one(mapping: u32) -> u32 {
     })
 }
 
+/// The bits of each channel of host format `format`, in the order of a
+/// clear's four values (red, green, blue, alpha); 0 for a channel it lacks.
+/// `None` for a format without such channels (depth with stencil,
+/// block-compressed, shared exponent, video).
+pub(crate) fn channel_bits(format: u32) -> Option<[u32; 4]> {
+    Some(match format {
+        1..=4 => [32; 4],
+        5..=8 => [32, 32, 32, 0],
+        9..=14 => [16; 4],
+        15..=18 => [32, 32, 0, 0],
+        23..=25 | 89 => [10, 10, 10, 2],
+        26 => [11, 11, 10, 0],
+        27..=32 | 87 | 90 | 91 => [8; 4],
+        33..=38 => [16, 16, 0, 0],
+        39..=43 => [32, 0, 0, 0],
+        48..=52 => [8, 8, 0, 0],
+        53..=59 => [16, 0, 0, 0],
+        60..=64 => [8, 0, 0, 0],
+        65 => [0, 0, 0, 8],
+        85 => [5, 6, 5, 0],
+        86 => [5, 5, 5, 1],
+        88 | 92 | 93 => [8, 8, 8, 0],
+        115 => [4; 4],
+        _ => return None,
+    })
+}
+
+/// The values of an integer UAV clear (`ClearUnorderedAccessViewUint`) of
+/// a view in host format `format`, each cut to the low bits its channel
+/// holds, which is what D3D documents and WARP writes. Hosts differ past
+/// that: the L4's driver (NVIDIA 596.86) saturates each value to its
+/// channel's largest unsigned value, signed formats included (0x104 gave
+/// 0xff in an 8-bit channel, and so did -128 in a signed one), and writes
+/// a value that fits as it is (docs/analysis/hardware-tests.md). A format
+/// without plain channels keeps its values.
+// shortcut: a stand-in (TABLE) has wider channels than the title's format,
+// and the clear keeps the stand-in's bits, not the title's.
+pub(crate) fn uint_clear(format: u32, values: [u32; 4]) -> [u32; 4] {
+    let Some(bits) = channel_bits(format) else {
+        return values;
+    };
+    std::array::from_fn(|i| match bits[i] {
+        0 | 32.. => values[i],
+        n => values[i] & ((1 << n) - 1),
+    })
+}
+
 /// What the host uses for a format of the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Choice {
@@ -641,6 +688,48 @@ pub(crate) fn report() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uint_clears_keep_the_low_bits_of_each_channel() {
+        assert_eq!(uint_clear(28, [1, 2, 3, 0x104]), [1, 2, 3, 4]);
+        // Signed channels too: the bits, not a clamped value.
+        assert_eq!(
+            uint_clear(32, [0xffff_ff80, 0x17f, 0x80, u32::MAX]),
+            [0x80, 0x7f, 0x80, 0xff]
+        );
+        assert_eq!(
+            uint_clear(25, [0x401, 0x3ff, 0x7ff, 5]),
+            [1, 0x3ff, 0x3ff, 1]
+        );
+        // A channel the format lacks keeps its value (the host ignores it).
+        assert_eq!(
+            uint_clear(36, [0x1_2345, 0xffff_0001, 9, 9]),
+            [0x2345, 1, 9, 9]
+        );
+        assert_eq!(uint_clear(85, [0x3f; 4]), [0x1f, 0x3f, 0x1f, 0x3f]);
+        assert_eq!(uint_clear(42, [u32::MAX; 4]), [u32::MAX; 4]);
+        // BC1: no plain channels.
+        assert_eq!(uint_clear(71, [0x104; 4]), [0x104; 4]);
+    }
+
+    /// Each format's channels fill its element, but for the unused X bits
+    /// of B8G8R8X8.
+    #[test]
+    fn channel_bits_fill_the_element() {
+        for format in 1..=191 {
+            let (Some(bits), Some((bytes, 1))) =
+                (channel_bits(format), crate::resource::element(format))
+            else {
+                continue;
+            };
+            let unused = if matches!(format, 88 | 92 | 93) { 8 } else { 0 };
+            assert_eq!(
+                bits.iter().sum::<u32>() + unused,
+                8 * bytes as u32,
+                "format {format}"
+            );
+        }
+    }
 
     /// What an NVIDIA RTX 40 reports for the formats of the first run's
     /// refusals (sampling, targets, blending; no unordered access, and no

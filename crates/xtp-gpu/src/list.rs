@@ -888,6 +888,26 @@ fn untyped_buffer_view(words: &[u32]) -> bool {
     words.get(5).is_some_and(|&stride| stride != 0) || words.get(8).is_some_and(|&f| f & RAW != 0)
 }
 
+/// The host format a UAV clear writes in: the host texture's (its view is
+/// of the texture's family, whose formats share their channels), else a
+/// typed buffer view's as the host view has it; 0 for a raw or structured
+/// buffer view.
+#[cfg(windows)]
+fn clear_format(
+    target: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    words: Option<&[u32]>,
+) -> u32 {
+    // SAFETY: a live resource.
+    let own = unsafe { target.GetDesc() }.Format.0 as u32;
+    if own != 0 {
+        return own;
+    }
+    words
+        .filter(|w| !untyped_buffer_view(w))
+        .and_then(|w| w.first())
+        .map_or(0, |&f| crate::resource::pc_format(f))
+}
+
 /// The UAV clears. Both handles are the console's: descriptor slots in
 /// title memory, the first in the bound shader-visible heap, the second in
 /// a CPU-only one. They hold our view records, not host descriptors: a host
@@ -963,6 +983,15 @@ fn clear_uav(
                 );
                 return;
             }
+            // Drivers differ on values wider than their channels: give them
+            // the low bits only (format::uint_clear).
+            let clear = match clear {
+                Clear::Uint(v) => Clear::Uint(crate::resource::format::uint_clear(
+                    clear_format(&target, words),
+                    v,
+                )),
+                float => float,
+            };
             if let Some((address, len)) = range
                 && len > 0
                 && let Some(shadow) = crate::shadow::find(address, len)
@@ -2422,11 +2451,12 @@ mod tests {
         }
 
         /// Clears of typed buffer views whose channels are narrower than
-        /// the values. An integer clear keeps the low bits of each value
-        /// (D3D's rule, which WARP follows; the L4's driver saturated them,
-        /// docs/analysis/hardware-tests.md). A float clear converts as
-        /// D3D's float-to-normalized rules say: NaN gives 0, the rest is
-        /// clamped, then rounded.
+        /// the values. An integer clear keeps the low bits of each value:
+        /// D3D's rule, which WARP follows; the L4's driver saturates what
+        /// does not fit, so XTP passes it the low bits only
+        /// (`format::uint_clear`, docs/analysis/hardware-tests.md). A float
+        /// clear converts as D3D's float-to-normalized rules say (NaN gives
+        /// 0, the rest is clamped, then rounded), on both.
         #[test]
         fn uav_clears_of_typed_buffers_write_the_documented_bits() {
             let test = "list::tests::gpu::uav_clears_of_typed_buffers_write_the_documented_bits";
@@ -2487,9 +2517,8 @@ mod tests {
                 .enumerate()
                 .filter_map(|(i, (format, kind, want))| {
                     let got = &words[4 * i..4 * i + 4];
-                    (got != [want; 4]).then(|| {
-                        format!("format {format} ({kind}): {got:08x?}, want {want:08x}")
-                    })
+                    (got != [want; 4])
+                        .then(|| format!("format {format} ({kind}): {got:08x?}, want {want:08x}"))
                 })
                 .collect();
             assert!(wrong.is_empty(), "{}", wrong.join("; "));
