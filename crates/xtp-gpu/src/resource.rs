@@ -845,6 +845,83 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
     (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
+/// The shader view to make of title texture `this` for the title's view
+/// `desc` (none: the whole texture): as it is, but for a texture whose host
+/// format has an alpha its title format lacks ([`format::alpha_one`]),
+/// whose alpha then reads one, as on the console (after VIctory #492's
+/// stand-in, from the review of its port).
+#[cfg(windows)]
+pub(crate) fn view_alpha(
+    this: This,
+    desc: Option<windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC>,
+) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    let Some((_, title)) = texture_memory(this) else {
+        return desc;
+    };
+    if !format::alpha_one(title.format) {
+        return desc;
+    }
+    let mut view = match desc {
+        Some(view) => view,
+        // SAFETY: a live resource.
+        None => whole_view(&unsafe { host_resource(this)?.GetDesc() }),
+    };
+    view.Shader4ComponentMapping = format::mapping_alpha_one(view.Shader4ComponentMapping);
+    Some(view)
+}
+
+/// A shader view of the whole of a texture described by `d`, as D3D12
+/// makes one without a description (with its default component mapping).
+#[cfg(windows)]
+fn whole_view(
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let all = u32::MAX;
+    let arrays = u32::from(d.DepthOrArraySize);
+    let mut view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: d.Format,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match (d.Dimension, arrays > 1, d.SampleDesc.Count > 1) {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, false, _) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            view.Anonymous.Texture1D.MipLevels = all;
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, true, _) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+            view.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                MipLevels: all,
+                ArraySize: arrays,
+                ..Default::default()
+            };
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE3D, ..) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            view.Anonymous.Texture3D.MipLevels = all;
+        }
+        (_, false, true) => view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS,
+        (_, true, true) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            view.Anonymous.Texture2DMSArray.ArraySize = arrays;
+        }
+        (_, false, false) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Anonymous.Texture2D.MipLevels = all;
+        }
+        (_, true, false) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            view.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MipLevels: all,
+                ArraySize: arrays,
+                ..Default::default()
+            };
+        }
+    }
+    view
+}
+
 /// The host GPU's copy of a title resource, if it has one.
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
@@ -2645,6 +2722,47 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// The whole view of a texture is D3D12's own: every mip (and slice),
+    /// the default component mapping, the dimension of the texture.
+    #[cfg(windows)]
+    #[test]
+    fn whole_views_are_d3d12s_default() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let d = |dimension, arrays, samples| D3D12_RESOURCE_DESC {
+            Dimension: dimension,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: arrays,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: samples,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let plain = whole_view(&d(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 1));
+        assert_eq!(plain.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
+        assert_eq!(plain.Format, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert_eq!(plain.Shader4ComponentMapping, 0x1688);
+        // SAFETY: the 2D member of a 2D view.
+        assert_eq!(unsafe { plain.Anonymous.Texture2D.MipLevels }, u32::MAX);
+        let array = whole_view(&d(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6, 1));
+        assert_eq!(array.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: the array member of an array view.
+        assert_eq!(unsafe { array.Anonymous.Texture2DArray.ArraySize }, 6);
+        let ms = whole_view(&d(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 4));
+        assert_eq!(ms.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DMS);
+        let volume = whole_view(&d(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 4, 1));
+        assert_eq!(volume.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE3D);
+        let line = whole_view(&d(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 2, 1));
+        assert_eq!(line.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE1DARRAY);
+        // Read alpha as one: only the alpha selector changes.
+        let one = format::mapping_alpha_one(plain.Shader4ComponentMapping);
+        assert_eq!(one, 0x1688 & !(7 << 9) | 5 << 9);
     }
 
     /// Descriptions as words, with these padding words.

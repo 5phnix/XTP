@@ -30,6 +30,8 @@ pub(crate) struct GraphicsState {
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
+    /// The targets' title formats (`resource::format::blend_without_alpha`).
+    title_targets: D3D12_RT_FORMAT_ARRAY,
     depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
 }
@@ -80,6 +82,7 @@ impl Default for GraphicsState {
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
             targets: D3D12_RT_FORMAT_ARRAY::default(),
+            title_targets: D3D12_RT_FORMAT_ARRAY::default(),
             depth_format: DXGI_FORMAT_UNKNOWN,
             samples: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -100,7 +103,13 @@ impl GraphicsState {
         unsafe {
             let data = at.add(4);
             match kind {
-                8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
+                8 => {
+                    self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned();
+                    crate::resource::format::blend_without_alpha(
+                        &mut self.blend,
+                        &self.title_targets,
+                    );
+                }
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
                 11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
@@ -155,6 +164,11 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
+                    self.title_targets = self.targets;
+                    crate::resource::format::blend_without_alpha(
+                        &mut self.blend,
+                        &self.title_targets,
+                    );
                     for f in &mut self.targets.RTFormats {
                         f.0 = crate::resource::pc_format(f.0 as u32) as i32;
                     }
