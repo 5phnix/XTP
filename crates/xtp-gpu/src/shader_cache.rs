@@ -119,25 +119,17 @@ fn cached(
         translate,
         ran: AtomicBool::new(false),
     };
-    for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
-        }
-        tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
-        let _ = std::fs::remove_file(&path);
-    }
-    MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    let shader = cache
+        .get_or_convert_with(&converter, &input, |bytes| decode(&bytes))
+        .map_err(|e| format!("{e:#}"))?;
+    let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+        (&MISSES, "translated")
+    } else {
+        (&HITS, "from the cache")
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!("shader {what}");
+    Ok(shader)
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";

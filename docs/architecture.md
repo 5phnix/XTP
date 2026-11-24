@@ -40,6 +40,14 @@ Converting them ahead of time from files is only a warm-up.
 | `xtp-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
 | `apps/xtp` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
+
+The pipeline cache limits committed payloads to 1 GiB by default.
+`Cache::open_with_limit` accepts a byte budget. When a conversion needs
+space, the cache removes the oldest stored outputs first and skips entries
+being read. A result that cannot fit is still returned to the caller.
+Threads using the same cache directory in one process share conversions
+for each key. `Cache::stats` reports committed entries, payload bytes and
+successful lookups that reused a cached or in-flight result.
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
 
 Everything except `xtp-game` is platform-level and can be tested with
