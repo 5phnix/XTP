@@ -30,6 +30,8 @@ pub(crate) struct GraphicsState {
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
+    /// The targets' title formats ([`blend_without_alpha`]).
+    title_targets: D3D12_RT_FORMAT_ARRAY,
     depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
 }
@@ -80,6 +82,7 @@ impl Default for GraphicsState {
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
             targets: D3D12_RT_FORMAT_ARRAY::default(),
+            title_targets: D3D12_RT_FORMAT_ARRAY::default(),
             depth_format: DXGI_FORMAT_UNKNOWN,
             samples: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -100,7 +103,10 @@ impl GraphicsState {
         unsafe {
             let data = at.add(4);
             match kind {
-                8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
+                8 => {
+                    self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned();
+                    blend_without_alpha(&mut self.blend, &self.title_targets);
+                }
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
                 11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
@@ -155,6 +161,10 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
+                    // The blend and the formats come in either order: each
+                    // applies it, and twice changes nothing more.
+                    self.title_targets = self.targets;
+                    blend_without_alpha(&mut self.blend, &self.title_targets);
                     for f in &mut self.targets.RTFormats {
                         f.0 = crate::resource::pc_format(f.0 as u32) as i32;
                     }
@@ -291,6 +301,77 @@ pub(crate) struct Input {
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
+/// A pipeline's blending for render targets of title formats `targets`,
+/// with those whose stand-in has an alpha the title's format lacks
+/// ([`crate::resource::format::alpha_one`]: R9G9B9E5 as RGBA16F, B5G6R5
+/// as RGBA8) neither writing alpha nor blending with the target's alpha,
+/// as on the console, where that alpha reads one: in the colour factors,
+/// destination alpha becomes one, its inverse zero, and saturated source
+/// alpha (`min(As, 1 - Ad)`) zero. The alpha factors stay: what they make
+/// is not written. Applied as a stream is read, so pipeline names in the
+/// library change with it (the review of the #492 port, from dark-world).
+fn blend_without_alpha(blend: &mut D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) {
+    blend_without(blend, targets, crate::resource::format::alpha_one);
+}
+
+/// [`blend_without_alpha`] for the title formats `lacks_alpha` names. One
+/// blending for every target stays one where every target lacks alpha,
+/// and becomes one per target where some target keeps its alpha, unless
+/// it has a logic operation: D3D12 takes none with blending per target
+/// (`IndependentBlendEnable` must be false), so such a pipeline keeps its
+/// blending and writes the alpha of its targets without one.
+// shortcut: a logic operation on targets with and without alpha still
+// writes the stand-in's alpha (rare: no logic operation on float targets,
+// R9G9B9E5's stand-in is one).
+fn blend_without(
+    blend: &mut D3D12_BLEND_DESC,
+    targets: &D3D12_RT_FORMAT_ARRAY,
+    lacks_alpha: impl Fn(u32) -> bool,
+) {
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let bound = || (0..count).filter(|&i| targets.RTFormats[i].0 != 0);
+    let lacking: Vec<usize> = bound()
+        .filter(|&i| lacks_alpha(targets.RTFormats[i].0 as u32))
+        .collect();
+    if lacking.is_empty() {
+        return;
+    }
+    let keeping = bound().any(|i| !lacks_alpha(targets.RTFormats[i].0 as u32));
+    if !blend.IndependentBlendEnable.as_bool() && keeping {
+        if blend.RenderTarget[0].LogicOpEnable.as_bool() {
+            return;
+        }
+        blend.IndependentBlendEnable = true.into();
+        blend.RenderTarget = [blend.RenderTarget[0]; 8];
+    }
+    let slots = if blend.IndependentBlendEnable.as_bool() {
+        lacking
+    } else {
+        vec![0]
+    };
+    let factor = |f: D3D12_BLEND| match f {
+        D3D12_BLEND_DEST_ALPHA => D3D12_BLEND_ONE,
+        D3D12_BLEND_INV_DEST_ALPHA | D3D12_BLEND_SRC_ALPHA_SAT => D3D12_BLEND_ZERO,
+        other => other,
+    };
+    for i in slots {
+        let t = &mut blend.RenderTarget[i];
+        t.SrcBlend = factor(t.SrcBlend);
+        t.DestBlend = factor(t.DestBlend);
+        t.RenderTargetWriteMask &= !(D3D12_COLOR_WRITE_ENABLE_ALPHA.0 as u8);
+    }
+}
+
+/// Whether root SRVs are bound as one-view tables of the buffer's host
+/// copy (reads past its end return zeros) rather than root descriptors
+/// (unbounded: a mesh shader's vertex fetch, which has no record limit,
+/// read past the copy into memory the host had freed). Set
+/// `XTP_ROOT_SRV_DIRECT=1` to go back.
+pub(crate) fn bounded_root_srvs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XTP_ROOT_SRV_DIRECT").is_none())
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -365,15 +446,115 @@ pub(crate) fn refusals() -> Option<String> {
 }
 
 /// What a translated shader asks of the host: the wave lanes it runs in
-/// (`PSV0`'s expected lane counts; 0 and `u32::MAX`: any) and its shader
-/// model (the `DXIL` program header's version).
+/// (`PSV0`'s expected lane counts; 0 and `u32::MAX`: any), its shader
+/// model (the `DXIL` program header's version), and whether it is a mesh
+/// program that needs the console's 64-lane waves whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Needs {
     pub(crate) lanes: (u32, u32),
     pub(crate) model: (u32, u32),
+    /// Why a console mesh program that runs in 64-lane waves needs them
+    /// whole, if it does: its translation declares no wave size (only
+    /// compute translations do), so `lanes` does not say so.
+    ///
+    /// VIctory #578 refuses every such program on hosts without 64-lane
+    /// waves, and so does XTP by default. VIctory's runs without a hang on
+    /// NVIDIA (an RTX 5080 with #439, an RTX 5090 with #578) left them out,
+    /// and the RTX 5090 was removed as hung while they ran. VIctory's
+    /// translator then (XTP's base) already refused cross-lane operations,
+    /// lane masks read as data and whole-wave reductions in mesh code: what
+    /// hung is not known. In Grand Theft Auto VI's pack every mesh program
+    /// is wave64 (8,726 translate for 32-lane hosts): refused, the world
+    /// loses that geometry on NVIDIA.
+    ///
+    /// `XTP_WAVE64_MESH=allow` ([`wave64_mesh_allowed`]) lets through those
+    /// whose known hazards are absent: LDS one wave shares without barriers
+    /// ([`Translated::mesh_lds_in_one_wave`]) and first-lane reads
+    /// ([`Translated::mesh_first_lane_reads`]). Until a world session on
+    /// NVIDIA runs with it and no device removal, it stays opt-in.
+    ///
+    /// shortcut: with it, an `s_barrier` in a block that one 32-lane half
+    /// enters with no lane active is still let through: the console runs it
+    /// for the whole wave, the host wave of that half skips it (the
+    /// translator emits a group barrier where the console has one,
+    /// `xtp-shader` `emit/lower/mod.rs`).
+    pub(crate) wave64_mesh: Option<&'static str>,
+}
+
+/// What a wave64 mesh program is refused as by default ([`Needs::wave64_mesh`]).
+const MESH_WAVE64: &str = "a mesh program written for 64-lane waves \
+                           (VIctory #578; XTP_WAVE64_MESH=allow lets some through)";
+
+/// What a wave64 mesh program that shares LDS within one wave is refused
+/// as with `XTP_WAVE64_MESH=allow`.
+const MESH_LDS_IN_ONE_WAVE: &str = "a mesh program sharing LDS within one 64-lane wave";
+
+/// What a wave64 mesh program that reads its wave's first lane is refused
+/// as with `XTP_WAVE64_MESH=allow`.
+const MESH_FIRST_LANE: &str = "a mesh program reading its 64-lane wave's first lane";
+
+/// Whether `XTP_WAVE64_MESH=allow` lets wave64 mesh programs without the
+/// known hazards run on hosts without 64-lane waves ([`Needs::wave64_mesh`]);
+/// read once, and logged with what it means on this host.
+pub(crate) fn wave64_mesh_allowed() -> bool {
+    static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOW.get_or_init(|| {
+        let allow = std::env::var("XTP_WAVE64_MESH").is_ok_and(|v| v == "allow");
+        // The host's own lanes, not the translations' target: mesh
+        // translations declare no wave size.
+        match crate::device::host_wave_lanes() {
+            Some((min, max)) if max < 64 && allow => tracing::warn!(
+                lanes = format_args!("{min} to {max}"),
+                "XTP_WAVE64_MESH=allow: wave64 mesh programs run as 32-lane waves, except \
+                 those that share LDS within one wave or read their wave's first lane"
+            ),
+            Some((min, max)) if max < 64 => tracing::warn!(
+                lanes = format_args!("{min} to {max}"),
+                "the host has no 64-lane waves: wave64 mesh programs are refused (VIctory \
+                 #578); XTP_WAVE64_MESH=allow lets through those without known hazards"
+            ),
+            _ => {}
+        }
+        allow
+    })
 }
 
 impl Needs {
+    /// What a translated `stage` shader needs; `None` if its container does
+    /// not say and it is no wave64 mesh program that needs its waves whole
+    /// (that check does not depend on the container).
+    pub(crate) fn of_translated(stage: &str, shader: &Translated) -> Option<Needs> {
+        let wave64_mesh = Self::mesh_reason(stage, shader, wave64_mesh_allowed());
+        match Needs::of(&shader.host.dxil) {
+            Some(needs) => Some(Needs {
+                wave64_mesh,
+                ..needs
+            }),
+            None => wave64_mesh.map(|_| Needs {
+                lanes: (0, u32::MAX),
+                model: (0, 0),
+                wave64_mesh,
+            }),
+        }
+    }
+
+    /// [`Needs::wave64_mesh`] for a translated `stage` shader; `allow`:
+    /// `XTP_WAVE64_MESH=allow`. A program whose first-lane reads were not
+    /// looked at counts as reading.
+    fn mesh_reason(stage: &str, shader: &Translated, allow: bool) -> Option<&'static str> {
+        if stage != "mesh" || !shader.wave64 {
+            None
+        } else if !allow {
+            Some(MESH_WAVE64)
+        } else if shader.mesh_lds_in_one_wave {
+            Some(MESH_LDS_IN_ONE_WAVE)
+        } else if shader.mesh_first_lane_reads != Some(false) {
+            Some(MESH_FIRST_LANE)
+        } else {
+            None
+        }
+    }
+
     /// What the shader in a DXIL container needs; `None` if the container
     /// does not say.
     pub(crate) fn of(dxil: &[u8]) -> Option<Needs> {
@@ -394,11 +575,17 @@ impl Needs {
         Some(Needs {
             lanes,
             model: (version >> 4 & 0xf, version & 0xf),
+            wave64_mesh: None,
         })
     }
 
     /// Why a host with waves of `host` lanes (min, max) and shader model
-    /// `model` cannot run it; `None` if it can.
+    /// `model` cannot run it; `None` if it can. One reason, the first of:
+    /// the wave size its translation declares (a wave64 program the
+    /// translator made 32-lane declares `WaveSize(32)` and runs on a 32-lane
+    /// host); a wave64 mesh program that needs its waves whole
+    /// ([`Needs::wave64_mesh`]), which declares none, on a host without
+    /// 64-lane waves; its shader model.
     pub(crate) fn refusal(&self, host: (u32, u32), model: (u32, u32)) -> Option<String> {
         let (min, max) = self.lanes;
         if min != 0 && (max < host.0 || min > host.1) {
@@ -412,6 +599,17 @@ impl Needs {
                 host.0, host.1
             ));
         }
+        // shortcut: a host whose range holds 64 lanes (AMD RDNA: 32 to 64)
+        // is taken to run mesh programs in 64-lane waves. D3D12 gives mesh
+        // shaders no wave size to ask for, so its driver may pick 32 (VIctory
+        // #578 takes the same; refusing there would drop every mesh program
+        // on AMD too).
+        if let Some(what) = self.wave64_mesh
+            && min == 0
+            && host.1 < 64
+        {
+            return Some(format!("is {what}; the host has {} to {}", host.0, host.1));
+        }
         (self.model > model).then(|| {
             format!(
                 "needs shader model {}.{}; the host has {}.{}",
@@ -421,10 +619,10 @@ impl Needs {
     }
 }
 
-/// Why the host cannot run `shader`'s translation; `None` if it can (or the
-/// host's lanes are unknown).
-fn shader_refusal(shader: &Translated) -> Option<String> {
-    let needs = Needs::of(&shader.host.dxil)?;
+/// Why the host cannot run the translation of a `stage` shader; `None` if
+/// it can (or the host's lanes are unknown).
+fn shader_refusal(stage: &str, shader: &Translated) -> Option<String> {
+    let needs = Needs::of_translated(stage, shader)?;
     let lanes = crate::device::host_wave_lanes()?;
     let model = crate::device::host_shader_model()?;
     needs.refusal(lanes, model)
@@ -469,7 +667,7 @@ impl HostPipeline {
             );
         }
         for (s, _) in &stages {
-            if let Some(why) = shader_refusal(s.translated()?) {
+            if let Some(why) = shader_refusal(s.stage, s.translated()?) {
                 return refuse(format!("{} shader {why}", s.stage), shaders);
             }
         }
@@ -477,6 +675,9 @@ impl HostPipeline {
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        // Ranges the table parameters point at, alive until the root
+        // signature is made.
+        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
@@ -515,6 +716,32 @@ impl HostPipeline {
                 ),
             ] {
                 for &slot in slots {
+                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+                        // A one-view table: the view's size bounds the reads,
+                        // which a root descriptor leaves unbounded.
+                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                            NumDescriptors: 1,
+                            BaseShaderRegister: u32::from(slot),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                            OffsetInDescriptorsFromTableStart: 0,
+                        }));
+                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                        out.push((slot, params.len() as u32));
+                        params.push(D3D12_ROOT_PARAMETER1 {
+                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                    NumDescriptorRanges: 1,
+                                    pDescriptorRanges: range,
+                                },
+                            },
+                            ShaderVisibility: visibility,
+                        });
+                        continue;
+                    }
                     out.push((slot, params.len() as u32));
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,
@@ -886,7 +1113,8 @@ mod tests {
             wave64,
             Needs {
                 lanes: (64, 64),
-                model: (6, 6)
+                model: (6, 6),
+                wave64_mesh: None,
             }
         );
         let nvidia = (32, 32);
@@ -902,6 +1130,174 @@ mod tests {
         // Older runtime information has no lane counts.
         let old = Needs::of(&container(16, (64, 64), CS_6_6)).unwrap();
         assert_eq!(old.lanes, (0, u32::MAX));
+    }
+
+    /// What the wave64 port emits for a 32-lane host, `WaveSize(32)`, runs
+    /// there; WARP's 4-lane waves run neither (VIctory #578's PSV0 check,
+    /// which fb3db31's [`Needs`] already made).
+    #[test]
+    fn wave32_translations_run_on_32_lane_hosts() {
+        let wave32 = Needs::of(&container(48, (32, 32), CS_6_6)).unwrap();
+        assert_eq!(wave32.refusal((32, 32), (6, 8)), None);
+        assert_eq!(wave32.refusal((32, 64), (6, 8)), None);
+        assert_eq!(
+            wave32.refusal((4, 4), (6, 8)).as_deref(),
+            Some("needs 32-lane waves; the host has 4 to 4")
+        );
+        // An SM 6.8 range overlapping the host's runs.
+        let range = Needs::of(&container(48, (32, 64), CS_6_6)).unwrap();
+        assert_eq!(range.refusal((32, 32), (6, 8)), None);
+    }
+
+    /// A mesh program written for 64-lane waves declares no wave size. One
+    /// that needs its waves whole is refused where the host has none
+    /// (VIctory #578); one reason only.
+    #[test]
+    fn wave64_mesh_programs_that_need_their_waves_whole_need_64_lane_hosts() {
+        let any = Needs::of(&container(48, (0, u32::MAX), CS_6_6)).unwrap();
+        let mesh = Needs {
+            wave64_mesh: Some(MESH_WAVE64),
+            ..any
+        };
+        assert_eq!(
+            mesh.refusal((32, 32), (6, 8)).as_deref(),
+            Some(
+                "is a mesh program written for 64-lane waves (VIctory #578; \
+                 XTP_WAVE64_MESH=allow lets some through); the host has 32 to 32"
+            )
+        );
+        assert_eq!(
+            mesh.refusal((4, 4), (6, 5)).as_deref(),
+            Some(
+                "is a mesh program written for 64-lane waves (VIctory #578; \
+                 XTP_WAVE64_MESH=allow lets some through); the host has 4 to 4"
+            ),
+            "the lanes are the reason, not the shader model too"
+        );
+        assert_eq!(mesh.refusal((32, 64), (6, 8)), None);
+        assert_eq!(
+            any.refusal((32, 32), (6, 8)),
+            None,
+            "a mesh program that needs no whole wave"
+        );
+        // A translation that declares its wave size is judged by it.
+        let declared = Needs {
+            lanes: (32, 32),
+            ..mesh
+        };
+        assert_eq!(declared.refusal((32, 32), (6, 8)), None);
+        for (what, text) in [
+            (
+                MESH_LDS_IN_ONE_WAVE,
+                "is a mesh program sharing LDS within one 64-lane wave; the host has 32 to 32",
+            ),
+            (
+                MESH_FIRST_LANE,
+                "is a mesh program reading its 64-lane wave's first lane; the host has 32 to 32",
+            ),
+        ] {
+            let allowed = Needs {
+                wave64_mesh: Some(what),
+                ..any
+            };
+            assert_eq!(allowed.refusal((32, 32), (6, 8)).as_deref(), Some(text));
+        }
+    }
+
+    /// Which translated shaders need their 64-lane waves whole: mesh
+    /// programs only (a wave64 compute translation says what it needs in
+    /// its PSV0); every wave64 one by default, and with
+    /// `XTP_WAVE64_MESH=allow` those sharing LDS within one wave or reading
+    /// their wave's first lane (or not looked at); whether their container
+    /// says what else they need or not.
+    #[test]
+    fn wave64_mesh_needs_come_from_the_console_program() {
+        let translated = |dxil: Vec<u8>, wave64, lds, first_lane| Translated {
+            host: xtp_shader::emit::HostShader {
+                stage: xtp_shader::HwStage::Ms,
+                dxil,
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+            },
+            used: Vec::new(),
+            wave64,
+            mesh_lds_in_one_wave: lds,
+            mesh_first_lane_reads: first_lane,
+        };
+        let psv = || container(48, (0, u32::MAX), CS_6_6);
+        let lds = translated(psv(), true, true, Some(false));
+        let first = translated(psv(), true, false, Some(true));
+        let unread = translated(psv(), true, false, None);
+        let plain = translated(psv(), true, false, Some(false));
+        let wave32 = translated(psv(), false, false, Some(true));
+        let reason = Needs::mesh_reason;
+        for t in [&lds, &first, &unread, &plain] {
+            assert_eq!(reason("mesh", t, false), Some(MESH_WAVE64), "by default");
+        }
+        assert_eq!(reason("mesh", &lds, true), Some(MESH_LDS_IN_ONE_WAVE));
+        assert_eq!(reason("mesh", &first, true), Some(MESH_FIRST_LANE));
+        assert_eq!(
+            reason("mesh", &unread, true),
+            Some(MESH_FIRST_LANE),
+            "not looked at"
+        );
+        assert_eq!(reason("mesh", &plain, true), None, "allowed");
+        assert_eq!(reason("mesh", &wave32, false), None);
+        assert_eq!(reason("compute", &lds, false), None);
+
+        // A container without a PSV0 part does not let it through (#578's
+        // check depended on one), with the switch or without.
+        let unsaid = translated(b"not a container".to_vec(), true, true, Some(true));
+        let needs = Needs::of_translated("mesh", &unsaid).expect("the mesh check");
+        let refused = needs.refusal((32, 32), (6, 8)).unwrap_or_default();
+        assert!(refused.starts_with("is a mesh program"), "{refused}");
+        assert_eq!(needs.refusal((32, 64), (6, 5)), None, "nor anything else");
+    }
+
+    /// The first-lane reads a wave64 mesh program may keep with
+    /// `XTP_WAVE64_MESH=allow`: the mesh group id's (`v5` on entry), not
+    /// another value's.
+    #[test]
+    fn mesh_first_lane_reads_keep_only_the_group_id() {
+        use xtp_shader::native::{MeshIo, StageIo};
+        let mesh = |words: &[u32]| xtp_shader::NativeProgram {
+            stage: xtp_shader::HwStage::Ms,
+            wave64: true,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ms(MeshIo {
+                outputs: Vec::new(),
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let end = 0xBF81_0000; // s_endpgm
+        // v_readfirstlane_b32 s0, v5: the group id.
+        assert!(!super::super::mesh_first_lane_reads(&mesh(&[
+            0x7E00_0505,
+            end
+        ])));
+        // v_readfirstlane_b32 s0, v0: lane 0's thread id, not lane 32's.
+        assert!(super::super::mesh_first_lane_reads(&mesh(&[
+            0x7E00_0500,
+            end
+        ])));
+        // v5 changed first (v_mov_b32 v5, v0): no longer the group id.
+        assert!(super::super::mesh_first_lane_reads(&mesh(&[
+            0x7E0A_0300,
+            0x7E00_0505,
+            end
+        ])));
+        assert!(!super::super::mesh_first_lane_reads(&mesh(&[end])), "none");
     }
 
     #[test]
@@ -990,5 +1386,309 @@ mod tests {
             inputs.refusal(&HOST).as_deref(),
             Some("vertex format 86: not a vertex buffer format")
         );
+    }
+
+    /// A target whose stand-in has an alpha the title's format lacks
+    /// neither writes alpha nor blends with it; the others keep their
+    /// blending, per target only where some target keeps its alpha
+    /// (dark-world's test from the review of the #492 port, extended).
+    #[test]
+    fn targets_without_alpha_blend_with_alpha_one() {
+        let target = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            SrcBlend: D3D12_BLEND_INV_DEST_ALPHA,
+            DestBlend: D3D12_BLEND_DEST_ALPHA,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_SRC_ALPHA_SAT,
+            DestBlendAlpha: D3D12_BLEND_SRC_ALPHA,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            RenderTargetWriteMask: 0xf,
+            ..Default::default()
+        };
+        let shared = D3D12_BLEND_DESC {
+            RenderTarget: [target; 8],
+            ..Default::default()
+        };
+        let formats = |list: &[i32]| {
+            let mut formats = [DXGI_FORMAT(0); 8];
+            for (f, &title) in formats.iter_mut().zip(list) {
+                f.0 = title;
+            }
+            D3D12_RT_FORMAT_ARRAY {
+                RTFormats: formats,
+                NumRenderTargets: list.len() as u32,
+            }
+        };
+        let lacks = |f| f == 67 || f == 85;
+        let text = |b: &D3D12_BLEND_DESC| format!("{b:?}");
+
+        // Nothing to change for formats with their own alpha.
+        let mut same = shared;
+        blend_without(&mut same, &formats(&[28, 0]), lacks);
+        assert_eq!(text(&same), text(&shared));
+
+        // A target keeping its alpha beside one without: per target.
+        let mut mixed = shared;
+        blend_without(&mut mixed, &formats(&[28, 67]), lacks);
+        assert!(mixed.IndependentBlendEnable.as_bool());
+        let (kept, changed) = (mixed.RenderTarget[0], mixed.RenderTarget[1]);
+        assert_eq!(
+            text(&D3D12_BLEND_DESC {
+                RenderTarget: [kept; 8],
+                ..shared
+            }),
+            text(&shared)
+        );
+        assert_eq!(changed.SrcBlend, D3D12_BLEND_ZERO);
+        assert_eq!(changed.DestBlend, D3D12_BLEND_ONE);
+        assert_eq!(
+            changed.SrcBlendAlpha, D3D12_BLEND_SRC_ALPHA_SAT,
+            "not written"
+        );
+        assert_eq!(changed.RenderTargetWriteMask, 0x7);
+        // The blend and the formats come in either order: twice is once.
+        let mut twice = mixed;
+        blend_without(&mut twice, &formats(&[28, 67]), lacks);
+        assert_eq!(text(&twice), text(&mixed));
+
+        // Every bound target without alpha: still one blending for all.
+        let mut alone = shared;
+        blend_without(&mut alone, &formats(&[67, 0, 85]), lacks);
+        assert!(!alone.IndependentBlendEnable.as_bool());
+        assert_eq!(alone.RenderTarget[0].SrcBlend, D3D12_BLEND_ZERO);
+        assert_eq!(alone.RenderTarget[0].DestBlend, D3D12_BLEND_ONE);
+        assert_eq!(alone.RenderTarget[0].RenderTargetWriteMask, 0x7);
+
+        // A logic operation never becomes per target (D3D12 refuses it):
+        // the alpha goes out of the writes only where every target lacks it.
+        let logic = D3D12_BLEND_DESC {
+            RenderTarget: [D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: false.into(),
+                LogicOpEnable: true.into(),
+                LogicOp: D3D12_LOGIC_OP_XOR,
+                ..target
+            }; 8],
+            ..Default::default()
+        };
+        let mut kept = logic;
+        blend_without(&mut kept, &formats(&[28, 85]), lacks);
+        assert_eq!(text(&kept), text(&logic), "unchanged");
+        let mut masked = logic;
+        blend_without(&mut masked, &formats(&[85]), lacks);
+        assert!(!masked.IndependentBlendEnable.as_bool());
+        assert!(masked.RenderTarget[0].LogicOpEnable.as_bool());
+        assert_eq!(masked.RenderTarget[0].RenderTargetWriteMask, 0x7);
+    }
+
+    /// The acceptance test of the wave64 wiring (VIctory #223), on the
+    /// test's device (WARP on the person's PC, whose waves are 4 lanes):
+    /// translations for a target forced to an NVIDIA host's 32 to 32 lanes
+    /// (what `XTP_HOST_LANES=32-32` makes it), kept in a shader cache under
+    /// that target's key, made into host pipelines as a title's are.
+    /// - A console wave64 compute program whose lanes read only inside
+    ///   their half declares `WaveSize(32)`, and is found again under its
+    ///   own key, apart from its translation for any host (`WaveSize(64)`).
+    ///   Where the device runs 32-lane waves its pipeline is made and gives
+    ///   the console's result. Where it does not (WARP) it is refused for
+    ///   its lanes before any driver call, and the driver refuses it too:
+    ///   the early refusal drops nothing the device would run.
+    /// - The same program without lane reads declares no wave size and runs
+    ///   on every device, which also checks the dispatch read back here.
+    #[test]
+    fn wave64_compute_for_a_forced_32_lane_target() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use xtp_shader::emit::{HostShader, Target};
+        let test = "pipeline::host::tests::wave64_compute_for_a_forced_32_lane_target";
+        let Some(device) = crate::testgpu::device(test) else {
+            return;
+        };
+        let lanes = crate::device::host_wave_lanes().expect("the device's lanes");
+        let target = crate::device::target_of(Some(lanes), Some("32-32")).unwrap();
+        assert_eq!(
+            target,
+            Target {
+                lanes_min: 32,
+                lanes_max: 32
+            }
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = xtp_pipeline::Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |in_half: bool, target: Target| {
+            let (c, native) = crate::shader_cache::wave64_program(in_half);
+            let container: &[u8] = if in_half {
+                b"wave64 reading in half"
+            } else {
+                b"wave64 reading its own lane"
+            };
+            crate::shader_cache::kept(&cache, container, target, |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                xtp_shader::emit::translate_program_for(&c, &native, target)
+                    .map_err(|(step, e)| format!("{}: {e}", step.name()))
+            })
+            .unwrap()
+        };
+        let halves = translate(true, target);
+        assert_eq!(halves.wave_size(), Some(32), "two 32-lane waves");
+        assert_eq!(translate(true, target), halves, "found again");
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "under its own key");
+        let whole = translate(true, Target::ANY);
+        assert_eq!(whole.wave_size(), Some(64), "for any host: one wave64");
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "under another key");
+        let local = translate(false, target);
+        assert_eq!(local.wave_size(), None);
+
+        let pipeline = |host: HostShader, hash: &str| {
+            let shader = Arc::new(Shader {
+                stage: "compute",
+                hash: hash.into(),
+                container: Vec::new(),
+                translated: std::sync::OnceLock::from(Some(Translated {
+                    host,
+                    used: Vec::new(),
+                    wave64: true,
+                    mesh_lds_in_one_wave: false,
+                    mesh_first_lane_reads: None,
+                })),
+            });
+            HostPipeline::new(&[shader], None)
+        };
+        // The driver check below tells a refusal from a description it takes.
+        assert!(
+            !driver_refuses(device, &local),
+            "the driver takes a pipeline of no wave size"
+        );
+        let groups = 2;
+        let made = pipeline(local, "forced-32-own-lane").expect("a pipeline of no wave size");
+        let own: Vec<u32> = (0..groups).flat_map(|_| 0..64).collect();
+        assert_eq!(run_wave64_program(device, &made, groups), own);
+
+        let made = pipeline(halves.clone(), "forced-32-in-half");
+        if lanes.0 <= 32 && 32 <= lanes.1 {
+            let made = made.unwrap_or_else(|| panic!("a host of {lanes:?} lanes makes it"));
+            let console: Vec<u32> = (0..groups).flat_map(|_| (0..64).map(|t| t ^ 31)).collect();
+            assert_eq!(run_wave64_program(device, &made, groups), console);
+        } else {
+            assert!(made.is_none(), "{lanes:?}");
+            let why = format!(
+                "compute shader needs 32-lane waves; the host has {} to {}",
+                lanes.0, lanes.1
+            );
+            let refused = refusals().unwrap_or_default();
+            assert!(refused.contains(&why), "{refused}");
+            assert!(
+                driver_refuses(device, &halves),
+                "the device makes WaveSize(32) pipelines though its waves are {lanes:?} lanes: \
+                 Needs refuses them wrongly"
+            );
+        }
+    }
+
+    /// Runs `p`, a pipeline of [`crate::shader_cache::wave64_program`],
+    /// over `groups` groups: the dwords its threads store.
+    fn run_wave64_program(host: &crate::host::Host, p: &HostPipeline, groups: u32) -> Vec<u32> {
+        use crate::testgpu::{TitleBuffer, TitleList};
+        let words = 64 * groups;
+        let bytes = 4 * u64::from(words);
+        let dst = TitleBuffer::new(1 << 16);
+        dst.set_words(|_| 0xdead_beef);
+        let to = dst.shadow();
+        // SAFETY: plain heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("a view heap")
+        };
+        // The raw UAV at slot 1: the table's user data is its offset in the
+        // heap at the console's 32 bytes per descriptor.
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: to.offset(dst.address()) / 4,
+                    NumElements: words,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of the heap made above, a live buffer covering the
+        // view.
+        unsafe {
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            host.device.CreateUnorderedAccessView(
+                &to.buffer,
+                None,
+                Some(&uav),
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: start.ptr + step as usize,
+                },
+            );
+        }
+        let (param, dwords) = p.stages[0].user_data.expect("the table's user data");
+        let mut data = vec![0u32; dwords as usize];
+        data[0] = 32;
+        let list = TitleList::new();
+        let l = list.host();
+        to.refresh(l, dst.address(), bytes);
+        to.gpu_writes(l, dst.address(), bytes);
+        l.keep(&heap);
+        l.keep(&p.root);
+        l.keep(&p.pso);
+        // SAFETY: an open list; live objects kept until it is reset.
+        unsafe {
+            l.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            l.list.SetComputeRootSignature(&p.root);
+            l.list.SetPipelineState(&p.pso);
+            l.list
+                .SetComputeRoot32BitConstants(param, dwords, data.as_ptr().cast(), 0);
+            l.list.Dispatch(groups, 1, 1);
+        }
+        list.run();
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        dst.words()[..words as usize].to_vec()
+    }
+
+    /// Whether the device's driver refuses a compute pipeline of `shader`,
+    /// made without [`Needs`]' checks.
+    fn driver_refuses(host: &crate::host::Host, shader: &xtp_shader::emit::HostShader) -> bool {
+        let params = [D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: shader.user_data_dwords().max(1),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        }];
+        let (root, _) =
+            root_signature(&host.device, &params, &[], true).expect("its root signature");
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: shader.dxil.as_ptr().cast(),
+                BytecodeLength: shader.dxil.len(),
+            },
+            ..Default::default()
+        };
+        // SAFETY: the description points at live data.
+        let made: windows::core::Result<ID3D12PipelineState> =
+            unsafe { host.device.CreateComputePipelineState(&desc) };
+        made.is_err()
     }
 }

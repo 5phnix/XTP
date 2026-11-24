@@ -295,26 +295,39 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        // Lanes outside EXEC run a load too where nothing branches them away
+        // (every lane in the console flow; under a guard in the per-lane
+        // form). With a heap index per lane, theirs may be no index at all
+        // (past the heap: a fault, the device removed), so they skip the
+        // load and keep their registers.
+        let lane_guard = guard.filter(|_| self.lane_descriptor(src));
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
-            let byte = match index {
-                Some(i) => {
-                    let sixteen = self.s.m.i32(16);
-                    let rows = self.s.m.bin(c, Bin::Mul, i, sixteen);
-                    self.s.m.bin(c, Bin::Add, rows, off)
-                }
-                None => off,
-            };
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for k in 0..count {
-                let four = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+            let xs = self.guarded_load(lane_guard, |l| {
+                let h = l.handle(site, src, false, (13, 0x1_0000))?;
+                let c = l.cur;
+                let byte = match index {
+                    Some(i) => {
+                        let sixteen = l.s.m.i32(16);
+                        let rows = l.s.m.bin(c, Bin::Mul, i, sixteen);
+                        l.s.m.bin(c, Bin::Add, rows, off)
+                    }
+                    None => off,
+                };
+                let mut xs = Vec::new();
+                for k in 0..count {
+                    let four = l.s.m.i32(4 * k);
+                    let a = l.s.m.bin(c, Bin::Add, byte, four);
+                    xs.push(l.cbuffer_dword(h, a));
+                }
+                Ok(xs)
+            })?;
+            for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -436,100 +449,119 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        if let Some(f) = *format {
-            if index.is_some() {
-                return Err("a typed-format load by index");
-            }
-            let h = self.handle(site, src, false, (11 | u, 0))?;
-            let Some(Operand::Vector { reg, .. }) = *data else {
-                return Err("a buffer result");
-            };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
-            }
-            return Ok(());
-        }
-        let r = if typed {
-            if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
-                return Err("a typed buffer load at an offset");
-            }
-            if uav {
-                self.s.flags |= flags::TYPED_UAV_LOADS;
-            }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
-            let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
-        } else {
-            let mask = self.s.m.i8((1u8 << count) - 1);
-            let align = self.s.m.i32(4);
-            match index {
-                Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
-                }
-                None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
-                }
-            }
-        };
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
-        if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
-            let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
-            for k in 0..count.div_ceil(2) {
-                let mut x = None;
-                for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
-                    let h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
-                    x = Some(match x {
-                        Some(hi) => {
-                            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                            self.s.m.bin(c, Bin::Or, h, hi)
-                        }
-                        None => h,
-                    });
+        // (What can stop the load is checked before its guarded block.)
+        let stride = used.map_or(0, |u| u.stride);
+        match *format {
+            Some(_) if index.is_some() => return Err("a typed-format load by index"),
+            Some(_) => {}
+            None if typed => {
+                if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
+                    return Err("a typed buffer load at an offset");
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                if uav {
+                    self.s.flags |= flags::TYPED_UAV_LOADS;
+                }
             }
-            return Ok(());
+            None if index.is_some() && (stride < 4 || !stride.is_multiple_of(4)) => {
+                return Err("a structured buffer of unknown stride");
+            }
+            None => {}
         }
-        for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+        let xs = self.guarded_load(lane_guard, |l| {
+            if let Some(f) = *format {
+                let h = l.handle(site, src, false, (11 | u, 0))?;
+                return l.format_load(h, off, f, count);
+            }
+            let c = l.cur;
+            let r = if typed {
+                let h = l.handle(site, src, false, (10 | u, 0x409))?;
+                let index = index.unwrap_or(l.s.m.i32(0));
+                l.s.op(
+                    c,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    l.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                )
+            } else {
+                let mask = l.s.m.i8((1u8 << count) - 1);
+                let align = l.s.m.i32(4);
+                let (h, coords) = match index {
+                    Some(index) => (l.handle(site, src, false, (12 | u, stride))?, [index, off]),
+                    None => (l.handle(site, src, false, (11 | u, 0))?, [off, iu]),
+                };
+                l.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    l.s.t.res_ret,
+                    139,
+                    &[h, coords[0], coords[1], mask, align],
+                )
+            };
+            let mut xs = Vec::new();
+            if d16 {
+                // Two f16 channels per VGPR (an odd last high half 0).
+                let k16 = l.s.m.i32(16);
+                let i32t = l.s.t.i32;
+                for k in 0..count.div_ceil(2) {
+                    let mut x = None;
+                    for ch in (2 * k..(2 * k + 2).min(count)).rev() {
+                        let f = l.s.m.extract(c, r, ch);
+                        let h = l.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                        x = Some(match x {
+                            Some(hi) => {
+                                let hi = l.s.m.bin(c, Bin::Shl, hi, k16);
+                                l.s.m.bin(c, Bin::Or, h, hi)
+                            }
+                            None => h,
+                        });
+                    }
+                    xs.push(x.expect("a channel"));
+                }
+                return Ok(xs);
+            }
+            for k in 0..count {
+                let x = l.s.m.extract(c, r, k);
+                xs.push(l.as_int(x));
+            }
+            Ok(xs)
+        })?;
+        for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// The dwords `load` gives, computed only in lanes where `guard` holds
+    /// (none: all); 0 in the others, whose registers the write's own guard
+    /// keeps. `load` runs inside the guarded block: a failure there still
+    /// closes it.
+    pub(super) fn guarded_load(
+        &mut self,
+        guard: Option<V>,
+        load: impl FnOnce(&mut Self) -> Result<Vec<V>, Why>,
+    ) -> Result<Vec<V>, Why> {
+        #[cfg(test)]
+        if guard.is_some() {
+            GUARDED_LOADS.with(|n| n.set(n.get() + 1));
+        }
+        let at = self.begin_guarded(guard);
+        match load(self) {
+            Ok(xs) => {
+                let zero = self.s.m.i32(0);
+                let pairs: Vec<(V, V)> = xs.iter().map(|&x| (x, zero)).collect();
+                Ok(self.end_guarded(at, &pairs))
+            }
+            Err(why) => {
+                self.end_guarded(at, &[]);
+                Err(why)
+            }
+        }
     }
 
     /// A global memory load (`global_load_*`): from the program's constant
@@ -621,5 +653,113 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Loads [`Lower::guarded_load`] put under a guard on this thread.
+    static GUARDED_LOADS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Parts, lower};
+    use super::GUARDED_LOADS;
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
+    use crate::{io, ir, resource, structure};
+
+    /// Lowers a wave32 compute program of 32 threads with a table of
+    /// structured dword buffers at s0 (a raw UAV at dword 16) and 512
+    /// bytes of LDS: whether it uses a non-uniform handle, and how many
+    /// loads the lowering put under a guard (summed over its attempts).
+    fn guarded_loads(words: &[u32]) -> (u32, u32) {
+        let range = |kind, table_offset_dwords, stride| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 32,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![
+                range(ResourceType::Srv, 0, 4),
+                range(ResourceType::Uav, 16, 0),
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 1 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        GUARDED_LOADS.with(|n| n.set(0));
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            target: crate::emit::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
+        })
+        .unwrap();
+        (
+            l.nonuniform_handles,
+            GUARDED_LOADS.with(std::cell::Cell::get),
+        )
+    }
+
+    /// A waterfall loop's buffer load reads each lane's own descriptor; a
+    /// lane outside EXEC (from 24 on, or one whose descriptor an earlier
+    /// round took) may hold no descriptor to load through, so the load is
+    /// guarded. A load through a descriptor of the whole wave under the
+    /// same kind of EXEC keeps no guard of its own (its write still has
+    /// one). (No device needed: `waterfall_tests` runs the first program.)
+    #[test]
+    fn loads_through_a_lanes_own_descriptor_skip_lanes_outside_exec() {
+        use crate::resource::tests::WATERFALL_JOINED_BUFFER_WAVE32;
+        let (nonuniform, guarded) = guarded_loads(WATERFALL_JOINED_BUFFER_WAVE32);
+        assert_eq!(nonuniform, 1);
+        assert!(guarded > 0);
+        let uniform = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(guarded_loads(&uniform), (0, 0));
     }
 }

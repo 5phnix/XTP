@@ -32,13 +32,20 @@ pub(crate) enum C {
     Fallbacks,
     /// Writes taken by the guard on view memory.
     GuardFaults,
+    /// Time in the guard of view memory (part of `WatchUs`), the system
+    /// queries it made (is it a view, is it a placeholder), its protection
+    /// changes, and the blocks it skipped as unmapped.
+    GuardUs,
+    ViewQueries,
+    Protections,
+    Absent,
     /// Texture bytes detiled after a watched write; hashed; detiled after a
     /// hash change.
     TexWatched,
     TexHashed,
     TexChanged,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 26;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -101,7 +108,8 @@ pub(crate) fn log(frames: f64) {
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         unchanged; {:.1} fallbacks; {:.0} guard faults; guard {:.2} ms, {:.0} view queries, \
+         {:.0} protection changes, {:.0} unmapped blocks skipped; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -123,6 +131,10 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
         c[C::GuardFaults as usize],
+        ms(c[C::GuardUs as usize]),
+        c[C::ViewQueries as usize],
+        c[C::Protections as usize],
+        c[C::Absent as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),

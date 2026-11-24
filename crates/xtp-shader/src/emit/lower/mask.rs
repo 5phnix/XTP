@@ -70,8 +70,38 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if m == Bool::FALSE {
+            // No lane anywhere: 0 whoever holds the mask.
+            return Ok(self.s.m.i32(0));
+        }
+        if self.console_cf {
+            // Every lane runs every block: the mask's bits are the lanes'
+            // own, both halves' words exchanged.
+            if let Some(&xy) = self.ballots.get(&lo) {
+                return Ok(if high { xy.1 } else { xy.0 });
+            }
+            let at = match self.def_block.get(&lo) {
+                None => self.s.entry,
+                Some(&b) if b == self.cur_ir => self.cur,
+                Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+            };
+            let bit = self.boolean(m, at)?;
+            let xy = self.console_ballot(at, bit);
+            self.ballots.insert(lo, xy);
+            return Ok(if high { xy.1 } else { xy.0 });
+        }
+        if self.split {
+            return Err("a lane mask read whole in a wave64 program split in halves");
+        }
         if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
+            // Lanes of the mask are in other blocks (lanes that left a
+            // loop, say), so no ballot here holds them. In compute the
+            // console flow has the mask: every lane runs every block there.
+            return Err(if self.console_flow_runs() && !self.x.per_lane_only {
+                super::CONSOLE_FLOW
+            } else {
+                "a lane mask holding lanes elsewhere read as data"
+            });
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
@@ -170,14 +200,35 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            // Split in halves, a host lane is not its console lane (the
+            // upper half's lanes 0-31 are console lanes 32-63), so the
+            // per-lane form has no bit of a mask held as a number to test
+            // (a select or carry on one, which the split test does not
+            // see): the console flow has.
+            Atom::Opaque(_) | Atom::Constant(_) if self.split && !self.console_cf => {
+                Err(if self.x.per_lane_only || !self.console_flow_runs() {
+                    "a lane mask held as a number in a wave64 program split in halves"
+                } else {
+                    super::CONSOLE_FLOW
+                })
+            }
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
-                };
-                let lo = self.get(v)?;
+                // The number may itself be known only as this mask's dword
+                // (a mask copied dword by dword): no number to test then.
+                if !self.opaque_open.insert(v) {
+                    return Err("an opaque lane mask");
+                }
+                let words = (|| {
+                    let hi = match self.pair_high(v) {
+                        Some(h) => Some(self.get(h)?),
+                        None => None,
+                    };
+                    Ok((self.get(v)?, hi))
+                })();
+                self.opaque_open.remove(&v);
+                let (lo, hi) = words?;
                 let word = |w: Val| match w {
                     Val::I32(x) => Ok(x),
                     _ => Err("an opaque lane mask"),
@@ -196,8 +247,27 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// This lane's bit of the mask `lo`, `hi` (wave64).
+    /// This lane's bit of the mask `lo`, `hi` (wave64; host lane = console
+    /// lane, so not in a program split in halves: [`Self::atom`] sends
+    /// those to the console flow first).
     pub(super) fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
+        debug_assert!(!self.split || self.console_cf);
+        if self.console_cf {
+            // The console lane's bit: its half's word, its host lane's bit.
+            let (lane, half) = self.console_lane();
+            let (k31, one, z) = (self.s.m.i32(31), self.s.m.i32(1), self.s.m.i32(0));
+            let word = match hi {
+                Some(hi) => {
+                    let low = self.s.m.cmp(at, pred::EQ, half, z);
+                    self.s.m.select(at, low, lo, hi)
+                }
+                None => lo,
+            };
+            let sh = self.s.m.bin(at, Bin::And, lane, k31);
+            let t = self.s.m.bin(at, Bin::LShr, word, sh);
+            let t = self.s.m.bin(at, Bin::And, t, one);
+            return self.s.m.cmp(at, pred::NE, t, z);
+        }
         let lane = self.s.op(
             at,
             "waveGetLaneIndex",
@@ -248,13 +318,18 @@ impl<'a> Lower<'a> {
                 .find(|q| q.reg == h)
                 .map(|q| q.value);
         }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
+        // Written with it by one instruction; else (two instructions, one
+        // for each dword) the dword the mask's reader takes with it.
+        let together = || {
+            let b = *self.def_block.get(&lo)?;
+            let inst = p.blocks[b]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+            let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
+            inst.write(pick(reg)?)
+        };
+        together().or_else(|| self.x.st.pairs.get(&lo).copied())
     }
 
     pub(super) fn is_mask(&self, v: Option<Value>) -> bool {

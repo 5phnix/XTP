@@ -53,6 +53,8 @@ mod testgpu;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+pub mod uma;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

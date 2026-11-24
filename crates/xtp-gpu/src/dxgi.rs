@@ -1,13 +1,16 @@
 //! The DXGI side of the device: one adapter with one output, reached from
 //! the device by interface query. Tables follow the PC interfaces' order
 //! (IUnknown, the object methods, then each interface's methods). The host
-//! adapter our own device is made on is chosen in [`adapter`].
+//! adapter our own device is made on is chosen in [`adapter`]; the planes
+//! of a present are composed in [`planes`].
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 #[cfg(windows)]
 mod adapter;
 #[cfg(windows)]
-pub(crate) use adapter::host_adapter;
+pub(crate) mod planes;
+#[cfg(windows)]
+pub(crate) use adapter::{host_adapter, video_memory};
 
 use crate::object::{
     self, ADAPTER, DXGI_DEVICE, E_INVALIDARG, FACTORY, HRESULT, Iid, MORE_DATA, NOT_FOUND, OUTPUT,

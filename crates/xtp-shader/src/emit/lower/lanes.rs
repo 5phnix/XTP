@@ -11,6 +11,7 @@ use crate::emit::bitcode::{Attr, Bin, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Dpp, Fields, Operand};
 use crate::ir::{Inst, Reg, Value};
+use crate::structure::Bool;
 
 impl<'a> Lower<'a> {
     /// Finds the whole-wave sections and the values they leave.
@@ -99,6 +100,9 @@ impl<'a> Lower<'a> {
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
+        if self.split && !self.console_cf {
+            return Err("a wave reduction in a wave64 program split in halves");
+        }
         let c = self.cur;
         let &m = self
             .x
@@ -163,6 +167,69 @@ impl<'a> Lower<'a> {
                 )
             }
         };
+        if self.console_cf && self.split {
+            // The halves exchange dwords: a float goes as its bits. (The
+            // console adds a wave's floats in its own order, the host's
+            // wave operations in theirs, and the halves' sums are added
+            // last: sums may differ in the last bits, as they already do
+            // in one host wave.)
+            let bits = |l: &mut Self, v: V| if float { l.as_int(v) } else { v };
+            let value = |l: &mut Self, v: V| if float { l.as_float(v) } else { v };
+            // The console-flow path keeps both halves converged. The exclusive
+            // prefix for the upper half includes the complete lower half's sum.
+            if prefix.is_some() {
+                let add = self.s.m.i8(0);
+                let unsigned = self.s.m.i8(if float { 0 } else { 1 });
+                let total = self.s.op(
+                    c,
+                    &format!("waveActiveOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    119,
+                    &[arg, add, unsigned],
+                );
+                let total = bits(self, total);
+                let (lo, _) = self.exchange(c, total);
+                let lo = value(self, lo);
+                let (_, half) = self.console_lane();
+                let zero = self.s.m.i32(0);
+                let upper = self.s.m.cmp(c, pred::NE, half, zero);
+                // (A select of the sums, not of the carry: adding 0.0 would
+                // turn a lower half's -0.0 into 0.0.)
+                let carried = self.s.m.bin(c, Bin::Add, r, lo);
+                let r = self.s.m.select(c, upper, carried, r);
+                return Ok(bits(self, r));
+            }
+            let r = bits(self, r);
+            let (lo, hi) = self.exchange(c, r);
+            if float {
+                let (lo, hi) = (self.as_float(lo), self.as_float(hi));
+                let r = match op {
+                    Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+                    // FMin and FMax, as the per-lane `v_min_f32` / `v_max_f32`.
+                    Op::MinF => self.binary(36, lo, hi),
+                    _ => self.binary(35, lo, hi),
+                };
+                return Ok(self.as_int(r));
+            }
+            return Ok(match op {
+                Op::AddU => self.s.m.bin(c, Bin::Add, lo, hi),
+                Op::And => self.s.m.bin(c, Bin::And, lo, hi),
+                Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
+                Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
+                Op::MinU | Op::MaxU | Op::MinI | Op::MaxI => {
+                    let pred = match op {
+                        Op::MinU => pred::IULT,
+                        Op::MaxU => pred::IUGT,
+                        Op::MinI => pred::SLT,
+                        _ => pred::SGT,
+                    };
+                    let choose = self.s.m.cmp(c, pred, lo, hi);
+                    self.s.m.select(c, choose, lo, hi)
+                }
+                _ => return Err("a whole-wave reduction across 32-lane halves"),
+            });
+        }
         Ok(if float { self.as_int(r) } else { r })
     }
 
@@ -195,29 +262,7 @@ impl<'a> Lower<'a> {
         }
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
-        let i32t = self.s.t.i32;
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
-        self.s.flags |= flags::WAVE_OPS;
+        let f = self.console_flat();
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
             0 => self.s.m.bin(e, Bin::URem, f, xk),
@@ -276,7 +321,52 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Console flow: `x` of console lane `lane` (uniform), from whichever
+    /// half holds it.
+    pub(super) fn console_read_lane(&mut self, x: V, lane: V) -> V {
+        if !self.split {
+            // One host wave is the console wave, all of its lanes here.
+            return self.read_lane(x, lane);
+        }
+        let c = self.cur;
+        let (k31, k5, one, z) = (
+            self.s.m.i32(31),
+            self.s.m.i32(5),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let at = self.s.m.bin(c, Bin::And, lane, k31);
+        let mine = self.read_lane_in_wave(x, at);
+        let (x0, x1) = self.exchange(c, mine);
+        let h = self.s.m.bin(c, Bin::LShr, lane, k5);
+        let h = self.s.m.bin(c, Bin::And, h, one);
+        let low = self.s.m.cmp(c, pred::EQ, h, z);
+        self.s.m.select(c, low, x0, x1)
+    }
+
+    /// `x` of lane `lane`. In compute, lanes are the console's: the
+    /// console takes a lane operand's low six bits (five in wave32), and a
+    /// host lane past the wave reads nothing defined, so the lane is
+    /// reduced to them (lane 70 of a wave64 is lane 6).
     pub(super) fn read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = if self.mask_data == MaskData::Console {
+            let wave = self.wave();
+            match self.s.m.int_value(lane) {
+                Some(k) if (k as u32) < wave => lane,
+                Some(k) => self.s.m.i32(k as u32 & (wave - 1)),
+                None => {
+                    let m = self.s.m.i32(wave - 1);
+                    self.s.m.bin(self.cur, Bin::And, lane, m)
+                }
+            }
+        } else {
+            lane
+        };
+        self.read_lane_in_wave(x, lane)
+    }
+
+    /// `x` of host lane `lane`, which is in the host wave.
+    fn read_lane_in_wave(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -381,7 +471,7 @@ impl<'a> Lower<'a> {
         let mut r = if mesh_quad {
             self.quad_pick(x, src)
         } else {
-            self.read_lane(x, src)
+            self.read_lane_in_wave(x, src)
         };
         let mut enable = None;
         if let Some(inside) = inside {
@@ -393,9 +483,16 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some((rows, banks)) = masks {
-            // Row (16 lanes) and bank (4 lanes of a row) write masks.
+            // Row (16 lanes) and bank (4 lanes of a row) write masks. Rows
+            // are the console's: split in halves, the upper half's host rows
+            // 0 and 1 are console rows 2 and 3.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            let row_lane = if self.split {
+                self.console_lane().0
+            } else {
+                lane
+            };
+            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);
@@ -412,5 +509,174 @@ impl<'a> Lower<'a> {
             });
         }
         Ok((r, enable))
+    }
+
+    /// Console flow: whether `m` holds in some lane of the console wave.
+    pub(super) fn any_lane(&mut self, m: Bool) -> Result<V, Why> {
+        let c = self.cur;
+        let bit = self.boolean(m, c)?;
+        let (lo, hi) = self.console_ballot(c, bit);
+        let or = self.s.m.bin(c, Bin::Or, lo, hi);
+        let z = self.s.m.i32(0);
+        Ok(self.s.m.cmp(c, pred::NE, or, z))
+    }
+
+    /// Console flow: the console wave's ballot of `bit`, low and high word.
+    pub(super) fn console_ballot(&mut self, at: usize, bit: V) -> (V, V) {
+        if self.split {
+            let word = self.ballot_word(at, bit);
+            return self.exchange(at, word);
+        }
+        // One host wave is the console wave (the high word is 0 in waves
+        // of 32).
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
+    }
+
+    /// The host wave's ballot of `bit` (32 lanes: the first word).
+    pub(super) fn ballot_word(&mut self, at: usize, bit: V) -> V {
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        self.s.m.extract(at, r, 0)
+    }
+
+    /// The console thread's flat id in the group (see [`Self::thread_id`]).
+    pub(super) fn console_flat(&mut self) -> V {
+        if let Some(f) = self.console_flat {
+            return f;
+        }
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        let flat = self.s.op(
+            e,
+            "flattenedThreadIdInGroup.i32",
+            Attr::ReadNone,
+            i32t,
+            96,
+            &[],
+        );
+        let first = self.s.op(
+            e,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[flat],
+        );
+        let wave = self.s.wave_size.expect("set with console lanes");
+        let mask = self.s.m.i32(!(wave - 1));
+        let base = self.s.m.bin(e, Bin::And, first, mask);
+        let lane = self.s.op(
+            e,
+            "waveGetLaneIndex",
+            Attr::ReadOnly,
+            self.s.t.i32,
+            111,
+            &[],
+        );
+        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        self.s.flags |= flags::WAVE_OPS;
+        self.console_flat = Some(f);
+        f
+    }
+
+    /// This lane's console lane (0..63, 0..31 in waves of 32) and its
+    /// half of a wave64 (0, 1).
+    pub(super) fn console_lane(&mut self) -> (V, V) {
+        let f = self.console_flat();
+        let e = self.s.entry;
+        let (mask, k5) = (self.s.m.i32(self.wave() - 1), self.s.m.i32(5));
+        let lane = self.s.m.bin(e, Bin::And, f, mask);
+        let half = self.s.m.bin(e, Bin::LShr, lane, k5);
+        (lane, half)
+    }
+
+    /// Whether the console flow can run this compute program on the host:
+    /// what `Lower::new` requires before it asks for it. In two 32-lane
+    /// halves, one console wave per group (the halves meet at group
+    /// barriers), no `ds_permute` across the halves, and whole-wave
+    /// sections only in a group of exactly 64 threads; on a host that runs
+    /// the console's waves, no `ds_permute`.
+    pub(super) fn console_flow_runs(&self) -> bool {
+        if self.mask_data != MaskData::Console {
+            return false;
+        }
+        let Some(t) = self.s.threads else {
+            return false;
+        };
+        let threads: u32 = t.iter().product();
+        let p = self.x.p;
+        let permute = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
+        if self.x.native.wave64 && !self.x.target.runs(64) {
+            let sections =
+                (0..p.blocks.len()).any(|b| !crate::emit::wave::sections(p, b).is_empty());
+            self.x.target.runs(32) && threads <= 64 && !permute && (threads == 64 || !sections)
+        } else {
+            self.x.target.runs(self.wave()) && !permute
+        }
+    }
+
+    /// Console flow in halves: whether the two group-shared dwords the
+    /// halves exchange through ([`Self::exchange`]) fit next to the
+    /// program's own LDS in DXIL's 32 KiB of group-shared memory. (A group
+    /// of 32 threads or fewer exchanges nothing.)
+    pub(super) fn exchange_fits(&self) -> Result<(), Why> {
+        let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if self.console_cf && self.split && threads > 32 && self.s.lds_dwords + 2 > 8192 {
+            return Err("a wave64 program whose LDS leaves no room for its halves' exchange");
+        }
+        Ok(())
+    }
+
+    /// Console flow: each half gives `x` (the same in all its lanes) and
+    /// both get (the lower half's, the upper half's): through two group-
+    /// shared dwords between group barriers, which every thread of the
+    /// group reaches (see [`CONSOLE_FLOW`]). A group of 32 threads or
+    /// fewer has no upper half: its lanes count as inactive there (0).
+    pub(super) fn exchange(&mut self, at: usize, x: V) -> (V, V) {
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        let z = self.s.m.i32(0);
+        if threads <= 32 {
+            return (x, z);
+        }
+        let (_, half) = self.console_lane();
+        let slots = match self.xchg {
+            Some(g) => g,
+            None => {
+                let arr = self.s.m.array(2, self.s.t.i32);
+                let g = self.s.m.global("xchg", arr, 3);
+                self.xchg = Some(g);
+                g
+            }
+        };
+        let void = self.s.t.void;
+        // Thread-group sync with a group-shared memory fence.
+        let mode = self.s.m.i32(1 | 8);
+        let mine = self.s.m.element(at, slots, half);
+        self.s.m.store(at, mine, x);
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let one = self.s.m.i32(1);
+        let p0 = self.s.m.element(at, slots, z);
+        let p1 = self.s.m.element(at, slots, one);
+        let lo = self.s.m.load(at, p0);
+        let hi = self.s.m.load(at, p1);
+        // Both read before the next exchange writes.
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        (lo, hi)
     }
 }

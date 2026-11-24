@@ -1,8 +1,184 @@
 # Upstream watch: what XTP should take or reimplement
 
-**Pass 1, 2026-11-24.** GitHub read between 12:10 and 13:40 UTC, read-only
+**Pass 2, 2026-11-24.** GitHub read between 16:20 and 16:40 UTC, read-only
 (`gh pr list/view/diff`, `gh api`). Nothing was posted, starred or opened.
-The next pass starts from the marks in [README.md](README.md).
+
+- Section 0 is this pass: what appeared after pass 1's marks (13:40 UTC),
+  and what changed in pass 1's items.
+- Sections 1 to 7 are pass 1's list, read between 12:10 and 13:40 UTC.
+  Section 0.7 says which of their items have landed in XTP or closed
+  upstream since.
+- The next pass starts from the marks in [README.md](README.md).
+
+## 0. Pass 2: since 13:40 UTC
+
+### 0.1 Summary
+
+- **Volume.**
+  - VIctory reopened pull requests to everyone at about 14:12 UTC. Since
+    the mark: about 170 new PRs (#922–#1183) and 92 issues, none merged.
+    `main` is still `ffe310e`.
+  - xcl: about 210 new PRs (#1244–#1458), and 50 commits on `main`
+    (`47efa2e` → `b7aa9f3`): 20 small PRs merged.
+  - Everything was triaged by title; about 45 items were read.
+- **Video memory, the question asked first.** No project manages
+  residency the way XTP's stall needs. No project reaches the world at a
+  usable rate either. The best report: 0.4–0.9 fps at 2,300–3,100 draws a
+  frame on a 12 GB card (VIctory issue #1086, item 72).
+  - xcl puts every GPU-owned texture (render target, depth buffer, UAV) on
+    64 KiB pages of video memory, taken from 64 MiB heaps. There is one
+    page per page of the title's memory, shared by the textures that alias
+    it (item 49). That is one VidMm admission per 64 MiB, not one per
+    texture. XTP's pool design (task tex-pool) keeps those targets
+    committed.
+  - xcl's real backend never calls `MakeResident`, `Evict` or
+    `SetResidencyPriority`. It peaks at 14.1 GB of local video memory on a 16 GB card, and its world
+    load still ends at the title's stop at `+0x23cf683` (item 50).
+  - Series S mode asks for about 2.2 GB less video memory in the world
+    (VIctory #952: 6.4–7.1 GB against 8.6–9.1 GB). That would bring XTP's
+    8.1 GB of textures under the ~9.5 GB threshold. XTP has the mode and
+    #211, so this is an A/B to run now (item 52).
+  - Making sampled textures without their top level saved 1 GiB (11.3 →
+    10.3 GiB) in #1086's world run (VIctory issue #737, item 53). OCE
+    OpenScarlett does the same.
+- **The stop at `+0x23cf683` is the title's GPU-progress watchdog.** xcl
+  issue #505 decodes the message that site builds before it faults: a
+  GPU-progress check (the message itself is the title's, not quoted). VIctory
+  (#1118) and xcl (#534, on AMD cards of 12 and 24 GB) end there too, so
+  the stop is not specific to XTP's wait on VidMm. Once the stall is
+  fixed, XTP should expect the same stop for another reason (item 74).
+- **The four PRs named in the task:**
+  - #1122 (item 57) and #1124 (item 58): take with credit;
+  - #1126 (item 59): take, with the heap-cap items (item 66);
+  - #1127 (item 60): ignore. XTP's port of #539 already does more. It is on
+    `hangar/port-victory-539-453-592-621-24cfee`, not landed.
+- **Wave64 on NVIDIA.** Three findings bear on XTP's port of the stack:
+  - VIctory issue #1132: a lone `v_readfirstlane` under a partial EXEC is
+    not routed to the console flow in #439, so lanes 32–63 silently read a
+    wrong value (item 64).
+  - #1086's row 2: silently wrong cross-lane compute kept the world pass
+    from ever being submitted. That is a candidate cause of XTP's 1–7 draws
+    a frame.
+  - VIctory issue #940: numbering wave64 mesh lanes by the host's lane put
+    world geometry in the G-buffer on an RTX 5080 (item 65). It is an
+    alternative to refusing wave64 mesh programs (#578).
+- **Pass 1's first pick for XTP's check changed.** VIctory #689 was closed
+  in favour of #985 (item 61).
+
+### 0.2 How to read the mapping
+
+Each item's "Maps to" cell names the backlog item (`docs/analysis/`), then
+the findings of today it bears on:
+
+| Tag | Finding |
+|---|---|
+| STALL | The world-load stall. Past about 9.5 GB resident on this PC, VidMm admits one resident allocation per 0.5–2 s, and XTP makes one per host texture ([stall.md](../analysis/stall.md)). The fix in progress is pooled heaps made ahead of need: task tex-pool (450ec9ba), with `docs/analysis/vram.md` on its branch. |
+| VRAM | XTP holds 8.1 GB of host textures by the stall; the PC's VidMm threshold is about 9.5 GB. |
+| W64 | NVIDIA and wave64. Wave64 mesh programs hang NVIDIA and are refused by default (#578, `XTP_WAVE64_MESH=allow`). The GPU half of the stack's wiring was reverted at 16:18 UTC (`4394656`), then reapplied (`5eb9213`). |
+| DRAWS | The world frame runs at 0.2–0.4 fps with only 1–7 draws per frame. |
+| SS | Series S mode (`--console series-s`). #211's planes are in XTP. |
+
+The symptom codes (C, D, W, F, H, K) are pass 1's (section 2).
+
+### 0.3 Video memory: how the others create host resources
+
+xcl is GPL-2.0-only. The mechanisms below are described in this document's
+own words from reading xcl `main` at `b7aa9f3` (paths under
+`crates/xcl/src/`). They are reimplemented from this description only, and
+nothing of the code is copied.
+
+| # | Item | Licence · state | What it does | Maps to | Action and why |
+|---|---|---|---|---|---|
+| 49 | xcl `hle/d3d12x/vram.rs` ("Pages", "Arenas"), called from `create_placed_resource_x` in `hle/d3d12x/device_x.rs` | GPL-2.0-only · `main` | **Textures at title addresses in pooled video memory.**<br>• A render target, depth buffer or UAV texture the title places at its address becomes a reserved (tiled) resource. Its 64 KiB tiles map onto one 64 KiB page of video memory per 64 KiB page of the title's address. Targets at one address share those pages, so each alias sees the others' writes, and a page exists once however many targets cover it.<br>• Pages come from 64 MiB heaps (1,024 tiles, `DEFAULT`, no flags under resource heap tier 2). A heap is made only when no free or cooled tile is left.<br>• Tile mappings run on a queue of xcl's own, with a fence. Each title queue waits for that fence on the GPU before its next work, so the CPU never waits.<br>• A page no target uses is kept 2 s for the next target at its address, and a freed tile is not reused for 2 s (`IDLE`, `COOL`).<br>• What cannot be tiled goes into an "arena": D32S8, MSAA, or an address not 64 KiB aligned. An arena is a heap of the placement's own size, at its address, shared by the placements inside it and freed 2 s after its last user. Merged 256 MiB arenas had made 15 GB in 2 s.<br>• Sampled textures go on the same pages when tier 2 allows (`place_pages`); otherwise they are committed. All of this needs tiled resources tier 2, where unmapped tiles read zero. | gpu · G17, G19 · STALL, VRAM; dark world | **Reimplement, as tex-pool's second step.** tex-pool pools title-written sampled textures and keeps targets committed, so each target still costs one admission. Pages give one admission per 64 MiB for targets too. Shared pages also save what xcl #1182 counted: 1.85 GB of targets placed over other targets' pages (item 25). Keep tex-pool's choice of making heaps ahead, on a background thread. xcl makes them on demand on the creating thread (`take_tile`), which here would pay the admission on the title's thread. A freshly placed target needs a `DiscardResource` before its first use (xcl #1342, open). |
+| 50 | xcl residency and budget | GPL-2.0-only · `main` | xcl's real D3D12 backend makes no residency call (`MakeResident`, `Evict`, `SetResidencyPriority`, budget events): those names appear only in its vtable layout and its null backend. `QueryVideoMemoryInfo` only feeds its activity log. A tester's run (#1248, RX 9070 XT 16 GB): 9.8 GB of target pages and 14.1 GB of local video memory at the peak. Presents fell to 0 at 110–120 s, then the title stopped at `+0x23cf683`. | gpu · G17 · STALL, VRAM | **Nothing to take; a warning for tex-pool.** Pooling alone did not keep xcl's world load going on a 16 GB card. XTP's plan (heaps made resident off the title's thread, a watch on the budget) goes further than xcl. |
+| 51 | xcl `hle/d3d12x/sparse.rs`, `gpu/uma.rs` | GPL-2.0-only · `main` | **The title's GPU buffers in video memory.**<br>• A memory reservation where the title keeps GPU data gets an address in a "sparse window". That window is a 4 GiB reserved buffer whose 64 KiB tiles are mapped onto 64 MiB heaps of video memory as the title commits pages.<br>• Before each `ExecuteCommandLists`, what the CPU wrote (write-watch) goes up through a 64 MiB staging ring, on a queue of xcl's own. The title's queues wait for its fence on the GPU.<br>• Only the 64-byte chunks whose hash changed are sent, so bytes the GPU wrote on the same page are not overwritten.<br>• Coherent memory stays in heaps opened over title memory (`OpenExistingHeapFromAddress`, at most 4,095 MiB, fully committed). | gpu · G15b, G16, G17a · VRAM; C | **Reimplement in G16–G17a.** This is palmwave's rule (item 41), built: the title's heaps in VRAM, and only small CPU-read memory imported. VIctory issue #1147 measures why. On an RTX 5080, scattered GPU reads of imported system memory run at 0.3–0.4 GB/s, against 22–24 GB/s from VRAM, and a 2 GB pass removed the device on a 4070 Ti. These heaps count against the 9.5 GB. |
+| 52 | Series S: xcl `config.rs`; VIctory [#952](https://github.com/Marvisak/VIctory/pull/952) (Ege-Mert), issue [#904](https://github.com/Marvisak/VIctory/issues/904) (YaoweiXiao) | xcl GPL-2.0-only; #952 GPL-3.0, open, clean, `faccc4e` | • xcl tells the title it has 8,192 MiB of memory in Series S mode (`lockhart`), and 13,824 in Series X mode.<br>• #952 logs the process's local video memory use and budget every 5 s. On an RTX 3060 Laptop (6 GB), in the world: 8.6–9.1 GB in Series X mode, 6.4–7.1 GB in Series S mode. Before loading: 4.5 against 2.5 GB.<br>• #904, RTX 5060 Laptop (8 GB), Series S with #211 and #578: menus and loading art render correctly. The world stays black but stable for 8 min, at 1–3 fps and 95–432 draws a frame, with 7.2 of 8.0 GB of VRAM in use. | gpu · G2; hle (title memory status) · SS, VRAM, STALL, DRAWS | **Run XTP in Series S mode on this PC now, as an A/B of the stall.** No port is needed: the mode and #211 are in XTP. About 2.2 GB less would put 8.1 GB of textures under the threshold. XTP reports 13.5 GiB of title memory in Series X mode and 7,776 MiB in Series S mode (`xtp-gpu/src/console.rs`); its comment says GTA VI goes by the device type. Take #952's periodic line with credit if XTP's budget log (`8ab1787`) lacks it. |
+| 53 | VIctory issue [#737](https://github.com/Marvisak/VIctory/issues/737): `antikohza/VIctory` `feat/texture-mip-drop-budget` (`2df78b6`); OCE OpenScarlett [`f8238f6`](https://github.com/OpenCommunityEdition/OpenScarlett/commit/f8238f6) | #737 GPL-3.0, branch; OCE AGPL-3.0 | `VICTORY_TEXTURE_MIP_DROP=1..3` makes the host copies of pure sampled textures (no RT, DS, UAV or MSAA) without their top levels. They are detiled from the console's level 1 or 2, and views and copies are shifted to match. In #1086's world run: 11.3 → 10.3 GiB. That run needed two fixes: textures under 2048 on either axis are spared, since the loading art turned flat colour without that (`4c84a09`), and copies into dropped levels are routed (`2df78b6`). OCE makes placed 2D textures from 512×512 one level smaller: 27 GB of commit at 65 s instead of 33.5 GB. | gpu · resource.rs, texture.rs · VRAM, STALL | **Take #737 with credit, opt-in, after tex-pool**, as the fallback when the pool still goes over 9.5 GB. It changes the picture, so it stays off by default. |
+| 54 | xcl [#1248](https://github.com/ivall/xcl/pull/1248) (AmYisael) | GPL-2.0-only · open | A sampled texture of at most 4 KiB that lies inside one page of the title's memory goes into a 4 KiB slot of a 4 MiB heap, not into a 64 KiB tile of its own. GTA VI makes about 12,000 16×4 RGBA16F textures of 1–2.5 KB while it loads the world: 768 MiB of tiles for 20 MiB of textures. A tester on an RX 9070 XT measured 0.7 GB less local video memory at the peak, and also about two-thirds of `main`'s frame rate after the first A press, not explained yet. | gpu · tex-pool · VRAM | **Already in tex-pool's design** (its 4 KiB class). Use the count of 12,000 to size that class, and time the class against the 64 KiB one. |
+| 55 | Residency priority and eviction: Neonbridge [`2fa28a9`](https://github.com/DesignWithTommy/Neonbridge/commit/2fa28a9), [`d69cf7f`](https://github.com/DesignWithTommy/Neonbridge/commit/d69cf7f), [`9d48cd8`](https://github.com/DesignWithTommy/Neonbridge/commit/9d48cd8), [`6d94818`](https://github.com/DesignWithTommy/Neonbridge/commit/6d94818); OCE OpenScarlett [`3da6373`](https://github.com/OpenCommunityEdition/OpenScarlett/commit/3da6373), [`2c27467`](https://github.com/OpenCommunityEdition/OpenScarlett/commit/2c27467) | Neonbridge: ideas only (it contains xcl code); OCE: AGPL-3.0 | • Neonbridge gives heaps that hold only sampled textures a LOW residency priority, and heaps with targets HIGH.<br>• Neonbridge also evicted heaps unused for 10 s when over budget. Tracking their use cost 35–40 → 15 fps, so that is now off by default.<br>• Neonbridge's pools hand out the fullest pool's tiles first, so sparse pools drain and can be released.<br>• OCE makes a page pool's heap only when its first tile is mapped.<br>• OCE measured that, on NVIDIA, a texture committed in video memory also costs its size in the process's private bytes (688 MB of BC7: +691 MB). The title's textures are therefore held twice. OCE ends the process before the system's commit limit is reached. | gpu · tex-pool, G17 · VRAM, STALL | **Reimplement two rules in tex-pool:** residency priority by content (sampled LOW, targets HIGH), and fullest-pool-first allocation. Leave out per-submission use tracking, whose cost Neonbridge measured. Add the process's commit to the frame line. |
+| 56 | VIctory [#982](https://github.com/Marvisak/VIctory/pull/982) (chemokita13) | GPL-3.0 · open, clean, `b4abe5d` | Upload buffers for footprint copies and scratch memory are pooled across list resets, instead of one committed resource per copy. A buffer is reused if it is at most twice the size asked for, and at most 32 are kept. | gpu · host.rs · STALL | **Take with credit.** XTP has the same shortcut (`host.rs:1948`, "one buffer per copy"). Upload heaps are in system memory, outside the local segment's threshold. But each committed creation still queues behind the device's residency lock, which stall.md §2.1 shows held during the stall. Count creations per frame before and after. |
+
+### 0.4 New VIctory items
+
+All are GPL-3.0-or-later, so take with credit unless the row says
+otherwise. Numbers are VIctory PRs unless marked "issue". "Clean" means
+the PR merges onto `ffe310e`.
+
+| # | Item | State | What it does (measured) | Maps to | Action and why |
+|---|---|---|---|---|---|
+| 57 | [#1122](https://github.com/Marvisak/VIctory/pull/1122) (tightfall) | open, clean, `9ed6093`, +201/−9 | **Guards on every view of a physical page.**<br>• xmem keeps, for each physical page, the views that show it (`map_alias` and pool mappings).<br>• Guarding a block now guards its aliases too, and a write through one view opens the guards of all of them.<br>• Before, a write through the other view never faulted, and the host copy kept its first contents: stale mesh data, then page faults like #59 and #597.<br>• A test maps one pagefile section twice and checks both directions. A reviewer (adamdotpy) made it fail with the lookup turned off.<br>• RX 9070, on an older stack (`d2a4bae` + #135): world runs of 1:40–4:44 became 10:15, then 17:32 with `TdrDelay=10`. | gpu · watch.rs, G19; hle · xmem · H, K, DRAWS | **Take with credit.** XTP's `watch.rs` has no alias handling; `xmem.rs:952` has `map_alias`. XTP changed `watch.rs` since `ffe310e` (F5, `5553e29`, #464, #490), so the port needs adapting. Add the review's two points: prune the reverse pairs in `title_memory_remapped`, and make the comments say that a block is a page. |
+| 58 | [#1124](https://github.com/Marvisak/VIctory/pull/1124) (divyeshganta), from issue [#918](https://github.com/Marvisak/VIctory/issues/918) (cybx, `4c0d57d`) | open, clean, `b3d8f95` | **Batched copy-back.** Copy-back compares and merges as before, but writes each run of joined 64 KiB pieces back with one kernel call. A run that is partly unmapped falls back to piece by piece (DrDarkDK's fix for runs that cross a piece boundary). cybx's run (Ryzen 7 9800X3D, RTX 5070 Ti, `main` plus open PRs): copy-back 555 → 133 ms a frame, frame ~1,033 → ~750 ms. | gpu · shadow.rs (interim, before G15–G18) · C, DRAWS (frame time) | **Take with credit, on top of XTP's own copy-back fix** (`747da15` on `hangar/w1-refresh-each-shadow-range-at-74bc23`, not on `main`), which writes only the GPU's bytes. Document the window the review points at: a title write between the read and the write-back of a long run. Measure it with G2. |
+| 59 | [#1126](https://github.com/Marvisak/VIctory/pull/1126) (EatCodeSleep2), for issue [#911](https://github.com/Marvisak/VIctory/issues/911) | open, clean, `bb65bc3`, CI green | **Descriptor tables after a rejected bind.** When a draw or dispatch cannot get a fresh descriptor table, the ranges it reserved during that bind go back, and so do their cache entries. Tables from earlier accepted binds stay. The synthetic D3D12 test fails with the rollback turned off (reviewed). Not measured in the title. A comment notes that a rejected bind's uploads and transitions stay recorded. | gpu · draw.rs, descriptor.rs · D, DRAWS | **Take with credit, together with item 66.** XTP has the same table code and the same 65,536 dynamic slots (`descriptor/host.rs:78`). A rejected bind that leaks slots brings the next "no dynamic slots" drops sooner. |
+| 60 | [#1127](https://github.com/Marvisak/VIctory/pull/1127) (ashrafsdrop) | open, clean, `52a5381`, no CI run | 64-bit image atomics as DXIL i64 `atomicBinOp` and `atomicCompareExchange`. | shader · I1 | **Ignore: XTP's port of #539 is ahead** (`d651284` on `hangar/port-victory-539-453-592-621-24cfee`, not landed). <br>• #1127 sets only the INT64 flag, not the SFI0 bits for 64-bit atomics on typed and on heap resources.<br>• It takes its handle from `handle`, which caches by the annotation's first word. XTP's port avoids that bug with a handle of its own, made per lane.<br>• Its test checks the flag bit only, with no validator and no GPU run. XTP's port was validated on the whole pack (22,508 → 23,034 programs) and run on WARP. |
+| 61 | [#985](https://github.com/Marvisak/VIctory/pull/985) (Makto94), in place of #689 | #689 closed at 14:54 ("superseded by #985"); #985 open, clean, `211d365` | The frame-wait test keeps its own clock. Each flip must land on a new tick, not before the tick due and not after the ticks that passed, and at least one flip must land exactly on time. Test only. | gpu · frame.rs; tooling · B1 | **Take with credit, first,** in #689's place. XTP's `frame.rs:221` still asserts consecutive ticks. |
+| 62 | [#1094](https://github.com/Marvisak/VIctory/pull/1094) (adamdotpy, carrying lines9686-rgb's fix from issue [#1089](https://github.com/Marvisak/VIctory/issues/1089)) | open, clean, `0061ed8` | A translation that fails is cached too: a `VSF1` entry with the reason, under the same key, so it is not tried again on every run. On an RTX 3060 Ti, about 400 programs failed in every run, the big compute ones taking 2–3 s each. For about 1.5 min after world entry the creation workers did only that, and their draws were dropped. | gpu · shader_cache.rs, G12 · DRAWS, STALL (the title waits during the load) | **Take with credit.** XTP's `shader_cache.rs:343` still says "Failures are not stored". The key must include XTP's wave-size target. |
+| 63 | [#1129](https://github.com/Marvisak/VIctory/pull/1129) (divyeshganta, carrying Peppacodes' `d09c31b` from issue [#966](https://github.com/Marvisak/VIctory/issues/966)) | open, clean | Pipeline workers get a 64 MiB stack. On an RTX 5080, NVIDIA's compiler recursed past Rust's 2 MiB default and the pipeline came back as `E_OUTOFMEMORY`. With the larger stack it builds. | gpu · pipeline/make.rs · W64, DRAWS (on NVIDIA) | **Take with credit** (8 lines). XTP sets no stack size, and its dev GPU is NVIDIA. Look for `E_OUTOFMEMORY` pipeline refusals in XTP's logs first. |
+| 64 | Issue [#1132](https://github.com/Marvisak/VIctory/issues/1132) (N7z, with MichaelSmithAI's comment) | open | Three wave64 implementations tested on one RTX 4060 Laptop, all green. It found two test-harness bugs, and one correctness gap.<br>• On a hybrid laptop, adapter 0 is the iGPU, so the "hardware" tests ran on the Intel GPU.<br>• Test adapters must be filtered by `WaveLaneCountMax ≥ 32`, not by name.<br>• **The gap, in #439:** a lone `v_readfirstlane_b32` under a partial EXEC is not routed to the console flow. Lanes 32–63 then read their own half's first lane (103 instead of 37, on an RTX 4090), and pipeline creation still succeeds. | shader · L1, L2 · W64, DRAWS | **Check XTP now**, with that program as a test: 64 threads, lanes 10–63 active, each holding 3·lane+7, and every active lane must read 37. #1086's row 2 shows what silently wrong cross-lane compute does: the title's own checks never pass, and the world pass is never submitted. That fits 1–7 draws a frame. Take the adapter filter for XTP's GPU tests. |
+| 65 | Issue [#940](https://github.com/Marvisak/VIctory/issues/940) (Peppacodes): `Peppacodes/VIctory` `exp/mesh-host-lanes` (`ed9afc0`, on #189) | open | On a 32-lane host, a wave64 mesh program runs as two 32-lane waves. Its lane numbers now come from the host's lane (`WaveGetLaneIndex`), so lane numbers and the masks from host ballots agree within each half. RTX 5080: world geometry in the G-buffer at frame 1550. Without the change, the first world submission ran for 62.8 s. It does not cover the 115 programs with explicit lane reads, and the run still ended later on a 63 s submission. | shader · L1 (mesh); gpu · #578 · W64, DRAWS | **Reimplement in XTP's stack** (the commit is written for #189's lowering). It is an alternative to refusing wave64 mesh programs that have no cross-lane reads. Try it under `XTP_WAVE64_MESH=allow`, with G11's bounds. |
+| 66 | [#1133](https://github.com/Marvisak/VIctory/pull/1133) (rivaldodev); issue [#902](https://github.com/Marvisak/VIctory/issues/902) (Xvania7, `fix/issue-887-descriptor-heap-limit`); OCE OpenScarlett [`0fbe1ce`](https://github.com/OpenCommunityEdition/OpenScarlett/commit/0fbe1ce) | #1133 open, clean, `be0fe04`; #902 a branch; OCE AGPL-3.0 | The title asks for 1,245,184 view slots, and NVIDIA caps a shader-visible heap at 1,000,000.<br>• #1133: indices past the cap read the heap's last slot, which stays null, and the cap is part of the cache key. Also, on narrow-wave hosts, a barrier inside a lane-dependent branch keeps its memory fence but drops the group sync: a host wave that never arrives would hang the GPU. RTX 4070 Ti SUPER: the hang came at 60–140 s before, at 145–534 s after.<br>• #902: 131,072 dynamic slots on a capped heap, a ladder of smaller heap sizes, and a fixed wrap-around search. Before it, "no dynamic slots" drops reached 65,536.<br>• OCE: the PC heap is a cache of the title's heap, in pages of 4,096 slots. | gpu · descriptor/host.rs · W64, H, D, DRAWS | **Take #1133's barrier rule with credit** (W64), after a review of when the sync may be dropped. **Choose one answer to the capped heap**: #1133's clamp, #483's guard slot (item 3) or #955. Raise the dynamic headroom as #902 does. |
+| 67 | [#1135](https://github.com/Marvisak/VIctory/pull/1135) (from talakasse's `af4fef4`, issue [#915](https://github.com/Marvisak/VIctory/issues/915)); issue [#916](https://github.com/Marvisak/VIctory/issues/916) (alessiodeia, `8cb0222`) | #1135 open, clean; #916 a branch | • #1135: after a texture's first detile, only the changed 64 KiB pages are read or hashed again, and only the levels and slices they hold are detiled.<br>• #916: on an RTX 2070 SUPER, `Staging::refresh_now` spent 308–416 ms a frame hashing 150–156 MB of unwatched textures, none of which had changed. The fix caches "not watched", keeps a remap epoch and uses a faster digest.<br>• DrDarkDK found a race in #916: `xmem::unmap` moves the epoch before Windows removes the view. | gpu · texture.rs · C, DRAWS (frame time) | **Take #1135 with credit; take #916 once its race is fixed.** Check the texture-refresh time in XTP's frame report first. |
+| 68 | [#1010](https://github.com/Marvisak/VIctory/pull/1010) (TG0000), [#991](https://github.com/Marvisak/VIctory/pull/991) (matheusfrta), [#1024](https://github.com/Marvisak/VIctory/pull/1024) (Dufftwt) | open, clean | • #1010: copies from title memory run in user mode, with a vectored handler for a page that faults. 256-byte fills: 796 → 81 ns. Not measured in the title.<br>• #991: overlapping write-back ranges merged, and guard openings coalesced.<br>• #1024: copy-back writes only the GPU's bytes, and marks only unchanged pages as current (fixes #721 and #722). | gpu · host.rs, shadow.rs, watch.rs · C | **#1024: compare with XTP's `747da15`**, which makes the same two fixes, and take what it lacks. **#991 after item 58. #1010 once G2 shows what `ReadProcessMemory` costs per fill.** All interim work: Phase 3 removes this code. |
+| 69 | [#1013](https://github.com/Marvisak/VIctory/pull/1013) (matheusfrta); xcl [#1273](https://github.com/ivall/xcl/pull/1273), [#1278](https://github.com/ivall/xcl/pull/1278), xcl `main` `25c6f7e` | #1013 open, clean; xcl open, and `main` | • #1013: urgent and background pipeline queues, so live binds do not wait behind preloads; faster structurisation.<br>• xcl: a bind waits only when a worker has started its build or is free to start it.<br>• xcl: compute programs of 4 MB of DXIL or more build in a queue of their own. Three screen-probe programs are 13–29 MB of DXIL, and NVIDIA had not finished one after 14 min, at 4.6 GB.<br>• xcl: a big build the title waits for does not wait for its turn. | gpu · G12 · DRAWS, STALL | **Take #1013's queue split after #275 and #546 (item 5), and reimplement xcl's rules in G12.** Find those three programs in XTP's census (xcl #1278 gives their record numbers in the shader pack, 22,616–22,618). On the 4080 they must never block other builds. |
+| 70 | [#1081](https://github.com/Marvisak/VIctory/pull/1081) (iurysf), [#1082](https://github.com/Marvisak/VIctory/pull/1082) (bvtterbroot), issue [#1054](https://github.com/Marvisak/VIctory/issues/1054) (bittertea0323) | open, clean | • #1081: behind a switch, each loop of a translated shader stores its iteration count in system memory. After a device removal, the report names the five busiest loops. On an RTX 4070: `loop 2 of slot 621 ran 512 iterations`, in the vertex program of the list DRED named.<br>• #1082 logs the TDR settings and warns when a GPU hang would freeze the PC: with `TdrLevel=0`, a slow frame becomes a hard freeze (#1054). | gpu · G2, G11; tooling · H | **Take #1081 for G11's diagnosis, and #1082 as it is.** This PC's SSD is fragile, so XTP should say at start when a GPU hang would freeze it. |
+| 71 | Issue [#979](https://github.com/Marvisak/VIctory/issues/979) (bittertea0323, `b6a9bdc`, `c8353a8`); [#1130](https://github.com/Marvisak/VIctory/pull/1130) (felicienradio), [#1067](https://github.com/Marvisak/VIctory/pull/1067) (undeadhuman37) | open | "A scalar memory read as data" is the largest offline failure class: 771 programs. A descriptor read only as data now takes its view from the used-resource entry it falls in: a 2D image for 8 dwords, a structured or raw buffer for 4. 771 → 0, and +231 DXIL programs. #1130 and #1067 do the same thing. | shader · R2 · D, DRAWS | **Take one of the three with credit, after S0.** XTP's #539 survey names this as the next blocker, for 104 programs. |
+| 72 | Issue [#1086](https://github.com/Marvisak/VIctory/issues/1086) (bittertea0323, branch `try/wave64` `6090ffb`) | open | **The world on a 12 GB card**: RTX 4070 SUPER, Windows 10. It took nine stacked changes: TDR settings, #189's emulate mode, the Agility SDK (#729), #940, mip drop (item 53), 1 MiB windows for title memory (RAM 12.6 → 3.7 GB), and item 71. Result: 2,296–3,111 draws a frame, no pipeline refused, 10.3 GiB of VRAM, 0.4–0.9 fps. On an RTX 4080, the same tree plus #493 and #206 ran 900 s with no device removal. Still in the way: about 512 pipelines rebuilt on every run (library misses, #352). | all · DRAWS, VRAM, W64 | **Evidence: the best world run reported this pass.** Compare XTP's world log with its counts. The 1 MiB windows are a lead for XTP's RAM use. |
+| 73 | [#1009](https://github.com/Marvisak/VIctory/pull/1009) (NuraadGit), [#961](https://github.com/Marvisak/VIctory/pull/961) (EduBertozzi), [#970](https://github.com/Marvisak/VIctory/pull/970) (pushkarreddyy), [#1152](https://github.com/Marvisak/VIctory/pull/1152) (pablogonz12), [#1041](https://github.com/Marvisak/VIctory/pull/1041) (gabrielcruzg3), [#956](https://github.com/Marvisak/VIctory/pull/956) (MartinIndra02), [#1160](https://github.com/Marvisak/VIctory/pull/1160) (geiyiliyabumo) | open, clean | • #1009 reserves the space below 4 GiB for the title's 32-bit `XMemVirtualAlloc`. The title asks for 185 MB there, and asserts at `+0x19f4f58` when refused.<br>• #961 draws mesh pipelines through compute, including mesh programs whose output is above D3D12's 32 KiB.<br>• #970 gives typeless views a concrete format by aspect: the DSV-only fix that item 35 asked for.<br>• #1152: no blending on integer targets.<br>• #1041 zeroes PSO padding and deduplicates library stores.<br>• #956 and #1160: multi-argument `ExecuteIndirect` with root constants (G13, xcl #869's case). | loader; gpu · G13, G7, G12 · D, DRAWS | **Read by title and summary only.** #970 goes with item 35. For G13, pick one of #956 and #1160 after a review: it is the GPL-3.0 form of item 24. Take #1009 if XTP meets that assertion, and #1041 if XTP's pipeline library misses (#1086's 512 rebuilds). |
+| 74 | Issue [#1118](https://github.com/Marvisak/VIctory/issues/1118) (CaptureLance35); xcl issues [#505](https://github.com/ivall/xcl/issues/505) and [#534](https://github.com/ivall/xcl/issues/534); xcl [#1288](https://github.com/ivall/xcl/pull/1288) (imnicho) | open | **The stop at `+0x23cf683`.**<br>• That site builds a message naming a GPU-progress check, then writes to address 0: it is the title's GPU-progress watchdog (xcl #505; the message is not quoted here).<br>• VIctory #1118, RTX 3070 Ti (8 GB): 8 of 8 runs stop there about 1 min into the world, with the title's own memory 95 % used (its tile heap at 3,521 of 6,236 MB). xcl #534 stops there on AMD cards of 12 and 24 GB.<br>• Just before it, in xcl: the first call of command-list method #101 (a stub in xcl), and xcl's deferred CPU writes putting back old counter values (3L1A5-1).<br>• xcl #1288 stops `Sleep` from counting the time the title is held in a bind. On an RTX 5090 the run went on, but presents stayed at 0 from 82 s. | gpu · G10, G2; hle · STALL | **Reimplement the diagnosis.** XTP's stall ends at this site too (stall.md). Once the VidMm fix is in, check what XTP does with command-list method #101, and in what order bottom-of-pipe writes land. Do not hide the watchdog the way #1288 does: XTP already has an opt-in hook (#454). |
+
+### 0.5 New xcl items and other projects
+
+Ideas only, unless the licence column says otherwise.
+
+| # | Item | Licence · state | What it does | Maps to | Action and why |
+|---|---|---|---|---|---|
+| 75 | xcl `main` since `47efa2e`: 50 commits and 20 merged PRs, including [#1150](https://github.com/ivall/xcl/pull/1150) | GPL-2.0-only · merged | Small fixes:<br>• clear values of placed resources converted (#1150, one of pass 1's checks in 4.4);<br>• default SRVs of multisampled depth buffers as Texture2DMS (#1265);<br>• allocation info of several resources padded to their alignment (#1354);<br>• partially executed lists first in DRED reports (#1330);<br>• copies within one memory window through a scratch buffer. | gpu · resource.rs; 4.4 | **The checks in 4.4 stay checks.** Nothing new to reimplement. |
+| 76 | xcl [#1428](https://github.com/ivall/xcl/pull/1428) (lukastaro) | GPL-2.0-only · open | Dispatches of more than 65,535 groups in X are folded into Y. | gpu · indirect.rs · D | **Check XTP.** D3D12 refuses more than 65,535 groups in one dimension, so such a dispatch is dropped or clamped. |
+| 77 | xcl [#1457](https://github.com/ivall/xcl/pull/1457) (ySKELLETONX), [#1323](https://github.com/ivall/xcl/pull/1323) (IvyNotFound) | GPL-2.0-only · open; #1457 draft | • #1457: a heap over title memory is held until the queues are past the work that used its buffers, instead of being freed at the title's last `Release`.<br>• #1323: markers written before and after each dispatch (`WriteBufferImmediate`) name the dispatches a stalled queue has not finished. With DRED on, NVIDIA skipped its cached pipelines there: one 1.99 MB pipeline took 153 s to build. | gpu · G15b, G2 | **Check G15b (`XTP_UMA=1`) for #1457's case.** Keep the DRED effect in mind when timing pipeline builds. |
+| 78 | five-star-recomp `main` `e761558` (61 commits) | GPL-3.0-or-later | A shared time budget for first-use work on game threads. Its status page now names the GPU's writes into game memory as its blocker. | gpu · G12, C | **Read next pass.** Only commit titles were read in this one. |
+| 79 | New projects: [itsF4LCON/Prodigy](https://github.com/itsF4LCON/Prodigy), [Sicaduj/XboxCompatLayer](https://github.com/Sicaduj/XboxCompatLayer), [wqryx/Leonida](https://github.com/wqryx/Leonida) | GPL-2.0; GPL-2.0; GPL-3.0 | • Prodigy says it is "an independent continuation of XCL" with VIctory parts; GTA VI reaches its menus.<br>• XboxCompatLayer carries xcl's README and code under another name.<br>• wqryx/Leonida is one commit with leonida's README. | – | **Ignore.** Copies or forks with nothing XTP lacks. Prodigy mixes xcl's GPL-2.0-only code with VIctory's. |
+
+### 0.6 Ignore (new)
+
+| Item | Why |
+|---|---|
+| VIctory [#1076](https://github.com/Marvisak/VIctory/pull/1076) (legayclightning22) | 1,722 lines in 15 files: a med3 fix, one submission per list, memo bounds and format flags, mixed. A review found a lost UAV capability. Its parts are covered elsewhere (item 70 for TDRs, and G11). |
+| VIctory #1121, #994, #1011, #1007, #1066 | Linux, Proton, Apple Silicon and Intel Arc. XTP targets Windows on NVIDIA. |
+| VIctory: about 30 PRs by geiyiliyabumo (#1155–#1174 and others) | Synthetic unit tests and HLE slots, opened minutes apart. None touches the world's frame. |
+| VIctory #1002, #1033, #1180, #999, #947 | Faster translation (−4 to −16 %): offline time, not frame time. |
+| xcl [#1426](https://github.com/ivall/xcl/pull/1426) (bmjask) | A direct RDNA2 → DXIL backend for xcl (18,866 lines). XTP already emits DXIL directly. |
+| xcl [#1329](https://github.com/ivall/xcl/pull/1329), [#1326](https://github.com/ivall/xcl/pull/1326) (vakaobr) | A copy of the coherent window in video memory, for hosts without `OpenExistingHeapFromAddress` (macOS). Windows keeps the import. |
+
+### 0.7 Pass 1's items: what changed
+
+- **Landed in XTP since pass 1:**
+  - the wave64 stack, item 1 (`2d978f7`, `0b85474`, `d01bc62`). Its GPU
+    wiring was reverted at 16:18 UTC (`4394656`), then reapplied (`5eb9213`);
+  - #578, item 2 (`575d721`). Wave64 mesh programs are refused by default
+    again since `2c65877`;
+  - #493, item 3 (`bdd0091`);
+  - #595, item 4 (`40ec751`);
+  - #464 and #490, item 6 (`f2a4c7c`, `6b8be7e`);
+  - #492, item 8 (`19047bd`);
+  - #643 and #211, items 10 and 15 (`2775f7f`, in the dark-world merge);
+  - #454, item 17 (`55f39e1`, `XTP_WATCHDOG_HOOK`).
+- **On an XTP branch, not landed:** #539, #592 and #621 (items 7 and 13),
+  on `hangar/port-victory-539-453-592-621-24cfee`.
+- **Upstream:**
+  - No item was merged.
+  - #689 was closed in favour of #985 (item 61).
+  - #703 now merges cleanly.
+  - #233, #320, #439, #578, #493, #483, #595, #490, #89, #206, #346, #592
+    and others were updated after 13:40 UTC (comments or pushes). A porting
+    task takes the head its task names, then reads what came after it.
+  - xcl #1150 (4.4) was merged.
+- **The testers' tree** moved to `94e0ea5` (16:16 UTC). Its
+  `INTEGRATION.md` was not re-read in this pass.
+- **Before porting a PR:** VIctory issue #1184 lists the 24 mergeable PRs
+  whose CI fails (9 of them from #801).
+
+## Pass 1 (12:10–13:40 UTC)
+
+Sections 1 to 7 are pass 1's text. Read their states with section 0.7.
 
 XTP is VIctory imported at `ffe310e` (GPL-3.0-or-later), with the crates and
 variables renamed (`victory-*` → `xtp-*`, `VICTORY_*` → `XTP_*`). The goal
@@ -141,6 +317,9 @@ XTP's workspace check failed on this test on 2026-11-24 (ticks
 `[7, 8, 10, 12]`), on a docs-only change. Alone, the test passed 10 of 10.
 **Take with credit, first** (gpu · `frame.rs`, tooling · B1): every
 delivery's check depends on it.
+
+*Pass 2:* #689 was closed at 14:54 UTC in favour of #985. Take #985
+instead (item 61).
 
 | # | Item | State | Author | What it does | XTP area · backlog | Sym. | Action and why |
 |---|---|---|---|---|---|---|---|
