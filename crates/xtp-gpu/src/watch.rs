@@ -86,7 +86,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if !guarded {
             return None;
         }
-        guard(first * PAGE, last * PAGE)?
+        #[cfg(feature = "diagnostics")]
+        let guarding = std::time::Instant::now();
+        let written = guard(first * PAGE, last * PAGE);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::GuardUs,
+            guarding.elapsed().as_micros() as u64,
+        );
+        written?
     } else {
         Vec::new()
     };
@@ -127,8 +135,10 @@ struct Guards {
     /// MB per world frame.
     absent: BTreeSet<usize>,
     /// Blocks found to be in a view when an asking began there, until the
-    /// runtime remaps them. Asking the system each time (`VirtualQuery`)
-    /// cost 100-230 ms per world frame, more than the rest of the guard.
+    /// runtime remaps them. Asking the system each time (`VirtualQuery`,
+    /// which walks a view's page tables to the region's end) cost 100-230
+    /// ms per world frame in VIctory #490's runs, and 300-400 ms for a
+    /// frame's 1 050 askings of one 174 MB view here (`guard_costs`).
     views: BTreeSet<usize>,
 }
 
@@ -161,8 +171,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Asked under the lock, which `title_memory_remapped` takes. The runtime
     // tells us before it unmaps a view, so a view noted just then may be
-    // gone: its blocks are placeholders (absent), and nothing can write
-    // there until a mapping, which tells us again.
+    // gone. Its blocks are then placeholders, or guarded and clean from
+    // before: not reported, but nothing can write there until a mapping,
+    // which tells us again.
     if !g.views.contains(&first) {
         if !view(start) {
             return None;
@@ -172,6 +183,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     for block in first..=last {
+        #[cfg(feature = "diagnostics")]
+        if block < last && g.absent.contains(&block) {
+            crate::copystat::add(crate::copystat::C::Absent, 1);
+        }
         let open = block < last && !g.clean.contains(&block) && !g.absent.contains(&block);
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
@@ -222,6 +237,8 @@ fn set_protection(blocks: Range<usize>, protection: u32) -> bool {
     use windows_sys::Win32::System::Memory::VirtualProtect;
     #[cfg(test)]
     tests::PROTECTED.with(|n| n.set(n.get() + 1));
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::Protections, 1);
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
     unsafe {
@@ -239,6 +256,8 @@ fn view(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
     #[cfg(test)]
     tests::QUERIED.with(|n| n.set(n.get() + 1));
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ViewQueries, 1);
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -257,6 +276,8 @@ fn placeholder(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ViewQueries, 1);
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -316,8 +337,9 @@ fn blocks(at: usize, len: usize) -> Range<usize> {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
-    // Without the lock when nothing is guarded (the case outside the world:
-    // loading, menus), which many DirectStorage workers would contend for.
+    // Without the lock when nothing is guarded (no copy of view memory
+    // taken yet, or all of it remapped since), which DirectStorage's
+    // workers would contend for; with blocks guarded, the lock as before.
     if GUARDED.load(SeqCst) == 0 {
         return;
     }
@@ -433,7 +455,9 @@ mod tests {
 
     /// A pagefile section of `blocks` blocks, mapped read-write: its view.
     fn mapped(blocks: usize) -> usize {
-        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
+        };
         // SAFETY: a fresh section, mapped whole.
         let view = unsafe {
             let section = CreateFileMappingW(
@@ -544,7 +568,11 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            VirtualFree(p as *mut _, 2 * BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree(
+                p as *mut _,
+                2 * BLOCK,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
             let views = [0, 2].map(|block| {
                 let view = MapViewOfFile3(
                     section,
@@ -607,7 +635,10 @@ mod tests {
         let view = mapped(1);
         assert!(guard(view, view + BLOCK).is_some());
         assert_eq!(GUARDED.load(SeqCst), 1);
-        assert!(!returns(Duration::from_millis(200)), "it did not take the lock");
+        assert!(
+            !returns(Duration::from_millis(200)),
+            "it did not take the lock"
+        );
         unmapped(view, 1);
     }
 
@@ -1114,12 +1145,7 @@ mod tests {
         // The title commits it and writes there, with no mapping.
         // SAFETY: our reservation; one byte of the committed block.
         unsafe {
-            let at = VirtualAlloc(
-                (p + BLOCK) as *const _,
-                BLOCK,
-                MEM_COMMIT,
-                PAGE_READWRITE,
-            );
+            let at = VirtualAlloc((p + BLOCK) as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE);
             assert_eq!(at as usize, p + BLOCK);
             ((p + BLOCK + 8) as *mut u8).write_volatile(1);
         }
@@ -1135,5 +1161,278 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 2 * BLOCK);
+    }
+
+    /// What guarding view memory costs in a world frame: 30 submissions
+    /// asking the guards about 35 times each (gpu-measure.md §7: 750 to
+    /// 1 500 askings a frame), over a 174 MB heap of physical-page views,
+    /// with what they report copied as refreshes copy it (through the
+    /// kernel, unmapped pages by the fallback). The heap is one view, then
+    /// one view per block with every 16th block an unmapped placeholder
+    /// (11 MB; run1 read 55 to 240 MB a frame through the fallback). Each
+    /// submission asks about the whole heap and 34 ranges of 64 KiB to 2 MiB
+    /// in it, after the title wrote 8 of its blocks. Then a kernel write
+    /// over the whole guarded view (`writing`), and `writing` elsewhere from
+    /// 16 threads, with the heap guarded and with nothing guarded. Run with
+    /// `cargo test --release -p xtp-gpu -- --ignored --nocapture guard_costs`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn guard_costs() {
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3,
+            PAGE_NOACCESS, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let _serial = serial();
+        const LEN: usize = 174 << 20;
+        const BLOCKS: usize = LEN / BLOCK;
+        const SUBMISSIONS: usize = 30;
+        const RANGES: usize = 34;
+        const FRAMES: usize = 4;
+        // SAFETY: a pagefile section of the heap's size.
+        let section = unsafe {
+            CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: the section, mapped whole.
+        let whole = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN) };
+        assert!(!whole.Value.is_null());
+        let gap = |block: usize| block % 16 == 15;
+        // SAFETY: a fresh placeholder of the heap's size.
+        let paged = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+        } as usize;
+        assert_ne!(paged, 0);
+        let views: Vec<MEMORY_MAPPED_VIEW_ADDRESS> = (0..BLOCKS)
+            .filter(|&b| !gap(b))
+            .map(|block| {
+                let at = paged + block * BLOCK;
+                // SAFETY: splits the placeholder at the block (failing
+                // harmlessly for its last block) and maps the section's
+                // block there.
+                let view = unsafe {
+                    VirtualFree(at as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                    MapViewOfFile3(
+                        section,
+                        GetCurrentProcess(),
+                        at as *const _,
+                        (block * BLOCK) as u64,
+                        BLOCK,
+                        MEM_REPLACE_PLACEHOLDER,
+                        PAGE_READWRITE,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(view.Value as usize, at);
+                view
+            })
+            .collect();
+        /// Copies pages `pages` of the heap at `heap` into `copy` through
+        /// the kernel, as a refresh does.
+        fn copy_run(heap: usize, pages: std::ops::Range<usize>, copy: &mut [u8]) -> usize {
+            let (at, n) = ((pages.start - heap / PAGE) * PAGE, pages.len() * PAGE);
+            let from = (pages.start * PAGE) as *const u8;
+            crate::host::copy_mapped(copy[at..].as_mut_ptr(), from, n, false);
+            n
+        }
+        /// The pages of `pages` written since their copy, copied in runs,
+        /// as `Shadow::copy_stale` does.
+        fn copy_stale(
+            heap: usize,
+            pages: std::ops::Range<usize>,
+            (now, written): (u64, &[(usize, u64)]),
+            copied: &mut [u64],
+            copy: &mut [u8],
+        ) -> usize {
+            let base = heap / PAGE;
+            let mut writes = written.iter().peekable();
+            let (mut bytes, mut run) = (0, None);
+            for page in pages.clone() {
+                let write = match writes.peek() {
+                    Some(&&(p, w)) if p == page => {
+                        writes.next();
+                        w
+                    }
+                    _ => 0,
+                };
+                let at = &mut copied[page - base];
+                if *at == 0 || write > *at {
+                    *at = now;
+                    run.get_or_insert(page);
+                } else if let Some(first) = run.take() {
+                    bytes += copy_run(heap, first..page, copy);
+                }
+            }
+            if let Some(first) = run {
+                bytes += copy_run(heap, first..pages.end, copy);
+            }
+            bytes
+        }
+        let mut copy = vec![0u8; LEN];
+        // One frame: time asking, time copying, bytes copied.
+        let frame = |heap: usize, f: usize, copied: &mut [u64], copy: &mut [u8]| {
+            let (mut asking, mut copying, mut bytes) = (Duration::ZERO, Duration::ZERO, 0);
+            for s in 0..SUBMISSIONS {
+                for k in 0..8 {
+                    let block = ((f * SUBMISSIONS + s) * 8 + k) * 7_919 % BLOCKS;
+                    let block = if gap(block) { block - 1 } else { block };
+                    // SAFETY: a mapped block of the heap; guarded, the write
+                    // goes through our handler.
+                    unsafe { ((heap + block * BLOCK + 64 * k) as *mut u8).write_volatile(s as u8) };
+                }
+                let ranges = std::iter::once((0, BLOCKS)).chain((0..RANGES).map(|r| {
+                    let n = 1 << (r % 6);
+                    let block = (s * RANGES + r) * 104_729 % (BLOCKS - n);
+                    (if gap(block) { block - 1 } else { block }, n)
+                }));
+                for (block, n) in ranges {
+                    let (from, to) = (heap + block * BLOCK, heap + (block + n) * BLOCK);
+                    let started = Instant::now();
+                    let (now, written) = writes(from, to, true).expect("a view");
+                    asking += started.elapsed();
+                    let started = Instant::now();
+                    let pages = from / PAGE..to / PAGE;
+                    bytes += copy_stale(heap, pages, (now, &written), copied, copy);
+                    copying += started.elapsed();
+                }
+            }
+            (asking, copying, bytes)
+        };
+        for (name, heap) in [
+            ("one view", whole.Value as usize),
+            ("a view per block, every 16th unmapped", paged),
+        ] {
+            let mut copied = vec![0u64; LEN / PAGE];
+            // The first copies, which guard it all.
+            frame(heap, 0, &mut copied, &mut copy);
+            let times: Vec<_> = (1..=FRAMES)
+                .map(|f| frame(heap, f, &mut copied, &mut copy))
+                .collect();
+            let asking = times.iter().map(|t| t.0).sum::<Duration>() / FRAMES as u32;
+            let copying = times.iter().map(|t| t.1).sum::<Duration>() / FRAMES as u32;
+            let mb = times.iter().map(|t| t.2).sum::<usize>() as f64 / FRAMES as f64 / 1e6;
+            println!(
+                "174 MB heap, {name}: a frame of {SUBMISSIONS} x {} askings: {asking:?} asking, \
+                 {copying:?} copying {mb:.1} MB",
+                RANGES + 1
+            );
+        }
+        let heap = whole.Value as usize;
+        let opened: Vec<Duration> = (0..10)
+            .map(|_| {
+                // Guarded whole again.
+                writes(heap, heap + LEN, true).expect("a view");
+                let started = Instant::now();
+                writing(heap, LEN);
+                started.elapsed()
+            })
+            .collect();
+        println!(
+            "a kernel write over the guarded 174 MB view: {:?}",
+            opened.iter().sum::<Duration>() / 10
+        );
+        const THREADS: usize = 16;
+        const CALLS: usize = 100_000;
+        let plain = vec![0u8; PAGE];
+        let elsewhere = |what: &str| {
+            let at = plain.as_ptr() as usize;
+            let started = Instant::now();
+            std::thread::scope(|s| {
+                for _ in 0..THREADS {
+                    s.spawn(move || {
+                        for _ in 0..CALLS {
+                            writing(std::hint::black_box(at), PAGE);
+                        }
+                    });
+                }
+            });
+            println!(
+                "a kernel write elsewhere, {THREADS} threads, {what}: {:.1} ns per call",
+                started.elapsed().as_secs_f64() * 1e9 / (THREADS * CALLS) as f64
+            );
+        };
+        writes(heap, heap + LEN, true).expect("a view");
+        elsewhere("the heap guarded");
+        title_memory_remapped(heap, LEN);
+        title_memory_remapped(paged, LEN);
+        elsewhere("nothing guarded");
+        // SAFETY: our views, the placeholder's blocks and the section.
+        unsafe {
+            UnmapViewOfFile(whole);
+            for view in views {
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            }
+            for block in 0..BLOCKS {
+                VirtualFree((paged + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    /// Whether one protection change over a run of blocks costs less than
+    /// one per block (F5 merges `open`'s), for a 4 MiB buffer and the
+    /// 174 MB heap, its pages present, read-only to read-write as `open`
+    /// does: medians of 15 rounds, the two ways alternated. Run with
+    /// `cargo test --release -p xtp-gpu -- --ignored --nocapture protection_change_costs`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn protection_change_costs() {
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+        let set = |at: usize, n: usize, protection: u32| {
+            let mut old = 0;
+            // SAFETY: our view; only its protection changes.
+            let set = unsafe { VirtualProtect(at as *const _, n * BLOCK, protection, &mut old) };
+            assert_ne!(set, 0);
+        };
+        for blocks in [64, (174 << 20) / BLOCK] {
+            let view = mapped(blocks);
+            // SAFETY: our view: every page made present.
+            unsafe { std::ptr::write_bytes(view as *mut u8, 1, blocks * BLOCK) };
+            let (mut merged, mut each) = (Vec::new(), Vec::new());
+            for round in 0..15 {
+                for way in [round % 2, 1 - round % 2] {
+                    set(view, blocks, PAGE_READONLY);
+                    let started = Instant::now();
+                    if way == 0 {
+                        set(view, blocks, PAGE_READWRITE);
+                    } else {
+                        for b in 0..blocks {
+                            set(view + b * BLOCK, 1, PAGE_READWRITE);
+                        }
+                    }
+                    [&mut merged, &mut each][way].push(started.elapsed());
+                }
+            }
+            let median = |t: &mut Vec<Duration>| {
+                t.sort();
+                t[t.len() / 2]
+            };
+            println!(
+                "{} MiB read-only to read-write: {:?} in one change, {:?} block by block",
+                (blocks * BLOCK) >> 20,
+                median(&mut merged),
+                median(&mut each)
+            );
+            unmapped(view, blocks);
+        }
     }
 }
