@@ -938,7 +938,9 @@ impl HostHeap {
         if !made {
             null_for(view, self.cpu(index));
         }
-        self.note_view(index, viewed.filter(|_| made));
+        // (A view the host could not make may still give the table its
+        // bytes: `off_element_view`.)
+        self.note_view(index, viewed);
         self.keep(index, kept.flatten());
         made
     }
@@ -1156,7 +1158,7 @@ impl HostHeap {
                 null_for(view, self.cpu(index));
             }
             // The entry with the descriptor, under the same lock.
-            self.note_view(index, viewed.filter(|_| kept.is_some()));
+            self.note_view(index, viewed);
             match buffer_range(view).filter(|&(_, len)| kept.is_some() && len > 0) {
                 Some((address, len)) => {
                     let unordered = matches!(view, View::Unordered(..) | View::Placed(true, ..));
@@ -1685,6 +1687,78 @@ fn off_element(unordered: bool, offset: u64, element: u64) {
     }
 }
 
+/// Counts a structured view `XTP_RAW_STRUCTURED` leaves structured because
+/// its bytes do not start on 16 bytes of its copy (watch.md item 200: such
+/// a view is still read wrong on NVIDIA where a shader reads its slot raw;
+/// through the stride table its raw view starts on any dword).
+fn off_16(start: u64, element: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            count = n,
+            start,
+            element,
+            "a structured view off 16 bytes of its host copy stays structured"
+        );
+    }
+}
+
+/// A buffer view whose buffer does not start on one of its elements in
+/// the host copy (`start`: the view's first byte there; `elements` of
+/// `element` bytes), which the host cannot count a view from: its bytes go
+/// to the runtime stride table, whose raw views start on any dword, and
+/// with `XTP_RAW_STRUCTURED=1` the slot gets a raw view of them where they
+/// start on 16 bytes. Else the slot is made null, as before, and counted.
+/// The idea of five-star-recomp's 955a679 and 7bd1ca8 (watch.md item 201:
+/// such a view becomes a raw view at its byte, not a null one), written
+/// anew.
+fn off_element_view(
+    copy: &Arc<Shadow>,
+    (start, elements, element): (u64, u32, u64),
+    unordered: bool,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    viewed: Option<&mut Option<Viewed>>,
+) -> Option<Kept> {
+    // SAFETY: a live buffer.
+    let width = unsafe { copy.buffer.GetDesc() }.Width;
+    let fit = width
+        .saturating_sub(start)
+        .checked_div(element)
+        .map_or(0, |left| u64::from(elements).min(left));
+    if fit == 0 || !start.is_multiple_of(4) {
+        off_element(unordered, start, element);
+        return None;
+    }
+    let len = fit * element;
+    if let Some(v) = viewed {
+        *v = Some(Viewed {
+            buffer: copy.buffer.clone(),
+            start,
+            len,
+            element,
+            raw: false,
+            unordered,
+        });
+    }
+    let window = raw_window_of(start, len).filter(|_| xtp_shader::emit::raw_structured());
+    let Some((first, dwords)) = window else {
+        off_element(unordered, start, element);
+        return None;
+    };
+    raw_view(
+        &copy.buffer,
+        RawWindow {
+            first,
+            dwords,
+            bias: 0,
+        },
+        unordered,
+        at,
+    );
+    Some(Some(copy.buffer.clone()))
+}
+
 /// Makes a buffer view's elements fit its host copy `copy` (`first`,
 /// `elements` of `element` bytes, the first moved to the copy already):
 /// none if no element does, or if the host refuses such a view (a stride
@@ -1769,8 +1843,9 @@ fn buffer_srv(
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
-        off_element(false, offset, element);
-        return None;
+        let start = offset + buffer.FirstElement * element;
+        let elements = buffer.NumElements;
+        return off_element_view(&shadow, (start, elements, element), false, at, viewed);
     }
     buffer.FirstElement += offset / element;
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
@@ -1796,9 +1871,11 @@ fn buffer_srv(
     if shape.0 > 0 && xtp_shader::emit::raw_structured() {
         // SAFETY: a buffer view's union member.
         let b = unsafe { &mut desc.Anonymous.Buffer };
-        if let Some((first, dwords)) =
-            raw_window_of(b.FirstElement * element, u64::from(b.NumElements) * element)
-        {
+        let window = raw_window_of(b.FirstElement * element, u64::from(b.NumElements) * element);
+        if window.is_none() {
+            off_16(b.FirstElement * element, element);
+        }
+        if let Some((first, dwords)) = window {
             (b.FirstElement, b.NumElements) = (first, dwords);
             b.StructureByteStride = 0;
             b.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
@@ -1878,8 +1955,9 @@ fn buffer_uav(
     };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
-        off_element(true, offset, element);
-        return None;
+        let start = offset + buffer.FirstElement * element;
+        let elements = buffer.NumElements;
+        return off_element_view(&shadow, (start, elements, element), true, at, viewed);
     }
     buffer.FirstElement += offset / element;
     buffer.CounterOffsetInBytes = 0;
@@ -1906,9 +1984,11 @@ fn buffer_uav(
     if shape.0 > 0 && xtp_shader::emit::raw_structured() {
         // SAFETY: a buffer view's union member.
         let b = unsafe { &mut desc.Anonymous.Buffer };
-        if let Some((first, dwords)) =
-            raw_window_of(b.FirstElement * element, u64::from(b.NumElements) * element)
-        {
+        let window = raw_window_of(b.FirstElement * element, u64::from(b.NumElements) * element);
+        if window.is_none() {
+            off_16(b.FirstElement * element, element);
+        }
+        if let Some((first, dwords)) = window {
             (b.FirstElement, b.NumElements) = (first, dwords);
             b.StructureByteStride = 0;
             b.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
@@ -2321,6 +2401,47 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view whose buffer does not start on one of its elements in the
+    /// host copy (watch.md items 180, 201) still gives the stride table its
+    /// bytes: the entry names a raw view of them, though the slot itself
+    /// stays null without `XTP_RAW_STRUCTURED`. Past the copy it is cut.
+    #[test]
+    fn views_off_their_elements_give_the_table_their_bytes() {
+        use crate::testgpu::TitleBuffer;
+        let test = "descriptor::host::tests::views_off_their_elements_give_the_table_their_bytes";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
+        let buffer = TitleBuffer::new(1 << 16);
+        let copy = buffer.shadow();
+        // SAFETY: a live buffer.
+        let width = unsafe { copy.buffer.GetDesc() }.Width;
+        // Four elements of 12 bytes from byte 20 (not on an element).
+        let mut viewed = None;
+        let made = off_element_view(&copy, (20, 4, 12), false, heap.cpu(3), Some(&mut viewed));
+        assert!(made.is_none(), "the slot stays null without the switch");
+        let v = viewed.as_ref().expect("its bytes");
+        assert_eq!((v.start, v.len, v.element), (20, 48, 12));
+        heap.note_view(3, viewed);
+        let entry = heap.entry(3);
+        assert_eq!((entry.stride, entry.bias, entry.count), (12, 4, 4));
+        // Running past the copy: cut to the elements that fit.
+        let mut viewed = None;
+        off_element_view(
+            &copy,
+            (width - 28, 4, 12),
+            false,
+            heap.cpu(4),
+            Some(&mut viewed),
+        );
+        assert_eq!(viewed.map(|v| v.len), Some(24));
+        // Off a dword: nothing a raw view could read.
+        let mut viewed = None;
+        off_element_view(&copy, (22, 4, 12), false, heap.cpu(5), Some(&mut viewed));
+        assert!(viewed.is_none());
+    }
 
     /// A structured view is made raw only where its bytes start on 16
     /// bytes, are whole dwords and fit one view.
