@@ -3,7 +3,7 @@
 //! formats PC D3D12 lacks (its own numbers 116, 117, 189, 190, 191) and
 //! uses a PC driver refuses: Grand Theft Auto VI's 2560x1440 B5G5R5A1 target
 //! that is also unordered access, and its B4G4R4A4 target (E_INVALIDARG on
-//! an NVIDIA driver, first run).
+//! an NVIDIA driver, first run), and R9G9B9E5 targets (GPUs have none).
 //!
 //! 1. [`TABLE`] lists the title formats the host may lack, each with its
 //!    stand-in: a host format holding the same values with as many bits or
@@ -58,6 +58,8 @@ pub(crate) enum Convert {
     Rg4,
     /// R10G10B10_SNORM_A2_UNORM (the console's 189) to R16G16B16A16_SNORM.
     Snorm10a2,
+    /// R9G9B9E5_SHAREDEXP to R16G16B16A16_FLOAT (alpha one), exactly.
+    Rgb9e5,
 }
 
 impl Convert {
@@ -66,7 +68,7 @@ impl Convert {
         match self {
             Convert::Bgr565 | Convert::Bgr5a1 | Convert::Bgra4 => (2, 4),
             Convert::Rg4 => (1, 2),
-            Convert::Snorm10a2 => (4, 8),
+            Convert::Snorm10a2 | Convert::Rgb9e5 => (4, 8),
         }
     }
 
@@ -117,8 +119,44 @@ impl Convert {
                         *to = (c as u16).to_le_bytes();
                     }
                 }
+                Convert::Rgb9e5 => {
+                    let v = u32::from_le_bytes([from[0], from[1], from[2], from[3]]);
+                    let exponent = v >> 27;
+                    let channels = [
+                        half_of_9e5(v & 0x1ff, exponent),
+                        half_of_9e5(v >> 9 & 0x1ff, exponent),
+                        half_of_9e5(v >> 18 & 0x1ff, exponent),
+                        HALF_ONE,
+                    ];
+                    for (to, c) in to.as_chunks_mut::<2>().0.iter_mut().zip(channels) {
+                        *to = c.to_le_bytes();
+                    }
+                }
             }
         }
+    }
+}
+
+/// 1.0 as a 16-bit float.
+const HALF_ONE: u16 = 0x3c00;
+
+/// A channel of R9G9B9E5_SHAREDEXP, `mantissa / 2^9 * 2^(exponent - 15)`
+/// (no implicit one), as a 16-bit float. Every such value is one exactly:
+/// at most 9 significant bits, from 2^-24 (the smallest subnormal) to
+/// 65,408 (below the largest, 65,504).
+fn half_of_9e5(mantissa: u32, exponent: u32) -> u16 {
+    if mantissa == 0 {
+        return 0;
+    }
+    // The value is 2^(top + exponent - 24) * (mantissa / 2^top).
+    let top = 31 - mantissa.leading_zeros();
+    let biased = (top + exponent) as i32 - 9;
+    if biased >= 1 {
+        (biased as u16) << 10 | ((mantissa << (10 - top)) & 0x3ff) as u16
+    } else {
+        // Subnormal: multiples of 2^-24, `mantissa * 2^exponent` of them
+        // (below 2^10 here).
+        (mantissa << exponent) as u16
     }
 }
 
@@ -158,7 +196,18 @@ const R8G8B8A8_UNORM: u32 = 28;
 const R8G8_UNORM: u32 = 49;
 
 /// The substitution table.
-pub(crate) const TABLE: [Entry; 8] = [
+pub(crate) const TABLE: [Entry; 9] = [
+    // GPUs neither render to nor write R9G9B9E5 (the RTX 4080 and the
+    // VIctory testers' cards; WARP does): the title's HDR scene and lighting
+    // targets fail there without a stand-in (VIctory #492).
+    // RGBA16F holds every value exactly (xcl takes R11G11B10_FLOAT, which
+    // rounds 9-bit mantissas to 6 and 5 bits), at twice the memory.
+    Entry {
+        title: 67,
+        name: "R9G9B9E5_SHAREDEXP",
+        on_pc: true,
+        stand_in: Some((R16G16B16A16_FLOAT, Some(Convert::Rgb9e5))),
+    },
     Entry {
         title: 85,
         name: "B5G6R5_UNORM",
@@ -703,6 +752,77 @@ mod tests {
             words,
             [0, near(1.0 / 511.0), near(-256.0 / 511.0), near(1.0 / 3.0)]
         );
+    }
+
+    /// R9G9B9E5_SHAREDEXP (VIctory #492): where the host neither renders to
+    /// it nor writes it (GPUs; WARP does both), RGBA16F stands in for every
+    /// texture, view, target and clear value of it.
+    #[test]
+    fn shared_exponent_textures_stand_in_as_half_floats() {
+        use uses::*;
+        let pc = |f| match f {
+            67 => TEXTURE_2D | SHADER_SAMPLE,
+            _ => CONSOLE_USES,
+        };
+        let wanted = Choice::StandIn(R16G16B16A16_FLOAT, Some(Convert::Rgb9e5));
+        assert_eq!(choose(entry(67).unwrap(), pc), wanted);
+        assert_eq!(choose(entry(67).unwrap(), nvidia), wanted);
+        assert_eq!(choose(entry(67).unwrap(), |_| CONSOLE_USES), Choice::Own);
+    }
+
+    /// The host device renders to and writes 67 itself (WARP), or has a
+    /// stand-in for it that it renders to and writes (the RTX 4080).
+    #[cfg(windows)]
+    #[test]
+    fn the_host_renders_shared_exponent_targets_in_half_floats() {
+        let test =
+            "resource::format::tests::the_host_renders_shared_exponent_targets_in_half_floats";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let own = HostCaps.support1(67);
+        if own & CONSOLE_USES == CONSOLE_USES {
+            assert_eq!(HostCaps.host_format(67), 67, "{own:#x}");
+            eprintln!("{test}: the host has every use of R9G9B9E5 ({own:#x}): kept");
+            return;
+        }
+        assert_eq!(HostCaps.host_format(67), R16G16B16A16_FLOAT, "{own:#x}");
+        let support = HostCaps.support1(R16G16B16A16_FLOAT);
+        assert_eq!(support & CONSOLE_USES, CONSOLE_USES, "{support:#x}");
+    }
+
+    /// Every shared-exponent channel is the same 16-bit float, exactly.
+    #[test]
+    fn shared_exponent_texels_widen_to_the_same_values() {
+        let value = |h: u16| {
+            let (e, f) = (i32::from(h >> 10 & 0x1f), f64::from(h & 0x3ff));
+            assert!(e < 31, "{h:#x} is not finite");
+            if e == 0 {
+                f * 2f64.powi(-24)
+            } else {
+                (1.0 + f / 1024.0) * 2f64.powi(e - 15)
+            }
+        };
+        for exponent in 0..32 {
+            for mantissa in 0..512 {
+                let exact = f64::from(mantissa) * 2f64.powi(exponent as i32 - 24);
+                let h = half_of_9e5(mantissa, exponent);
+                assert_eq!(value(h), exact, "{mantissa} * 2^({exponent} - 24)");
+            }
+        }
+        assert_eq!(half_of_9e5(511, 31), 0x7bfc, "65,408, the largest");
+        assert_eq!(half_of_9e5(1, 0), 1, "2^-24, the smallest");
+        // A texel: red 1 (256 at exponent 16), green 0.5, blue 0.
+        let texel: u32 = 256 | 128 << 9 | 16 << 27;
+        let mut to = [0u8; 8];
+        Convert::Rgb9e5.row(&texel.to_le_bytes(), &mut to);
+        let halves: Vec<u16> = to
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|w| u16::from_le_bytes(*w))
+            .collect();
+        assert_eq!(halves, [0x3c00, 0x3800, 0, HALF_ONE]);
     }
 
     #[test]

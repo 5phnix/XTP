@@ -416,6 +416,13 @@ fn host_shaders() -> Option<HostShaders> {
             shader_model = format_args!("{}.{}", shaders.model.0, shaders.model.1),
             "host shaders"
         );
+        if shaders.lanes.1 < 32 {
+            // WARP: 4 to 4 (VIctory #578 logs it too).
+            tracing::warn!(
+                "the host's waves are narrower than the console's 32 lanes (a software \
+                 adapter such as WARP): pipelines whose shaders declare a wave size are refused"
+            );
+        }
         Some(shaders)
     })
 }
