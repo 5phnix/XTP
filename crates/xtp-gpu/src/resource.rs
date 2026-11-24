@@ -1513,10 +1513,11 @@ fn at_address(
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description (padding zeroed): a
 /// resource at that address, made the first time a draw reads one, and the
-/// alias count (`alias::changes`) it was last matched at.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
+/// alias count (`alias::changes`) it was last matched at. They are released
+/// when the runtime maps or unmaps their memory ([`memory_remapped`]), and
+/// when a new one replaces them.
+/// shortcut: memory the title reuses without remapping it keeps the
+/// textures of its earlier descriptions until then.
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<PlacedTextures> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -1525,15 +1526,82 @@ static PLACED_TEXTURES: std::sync::Mutex<PlacedTextures> =
 #[cfg(windows)]
 type PlacedTextures = std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64)>;
 
+/// Resources of placed views no longer in [`PLACED_TEXTURES`], with when
+/// they left it: released [`GRACE`] later, as a caller of `texture_at` may
+/// still be using one it was just given (lists keep only their address, and
+/// their host copies).
+#[cfg(windows)]
+static RELEASED: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, usize)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+#[cfg(windows)]
+const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Releases `resources` (of placed views) once [`GRACE`] has passed, and
+/// those waiting for longer.
+#[cfg(windows)]
+fn release_later(resources: Vec<usize>) {
+    let now = std::time::Instant::now();
+    RELEASED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(resources.into_iter().map(|r| (now, r)));
+    release_waiting(GRACE);
+}
+
+/// Releases the resources that have waited `grace` or more.
+#[cfg(windows)]
+fn release_waiting(grace: std::time::Duration) {
+    let now = std::time::Instant::now();
+    let mut waiting = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+    let due = waiting
+        .iter()
+        .take_while(|(at, _)| now - *at >= grace)
+        .count();
+    let due: Vec<usize> = waiting.drain(..due).map(|(_, r)| r).collect();
+    drop(waiting);
+    for r in due {
+        resource_release(r as This);
+    }
+}
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`: the
+/// textures of placed views there no longer show it, and are released
+/// (memory streamed in and out would otherwise keep a host texture per
+/// page and description viewed for the run).
+#[cfg(windows)]
+pub(crate) fn memory_remapped(at: usize, len: usize) {
+    let (start, end) = (at as u64, (at as u64).saturating_add(len as u64));
+    let gone: Vec<usize> = {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<_> = map
+            .range((start, [0; 14])..(end, [0; 14]))
+            .map(|(k, _)| *k)
+            .collect();
+        keys.iter()
+            .filter_map(|k| map.remove(k))
+            .map(|(r, _)| r)
+            .collect()
+    };
+    if !gone.is_empty() {
+        tracing::debug!(
+            at = format_args!("{at:#x}"),
+            len,
+            textures = gone.len(),
+            "placed views' textures released with their memory"
+        );
+    }
+    release_later(gone);
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use. When a texture the
 /// GPU writes comes to that address after it (or another one replaces it),
 /// the next use makes a new resource, which shares that texture's host
-/// copy (`alias`). The resource is made outside the map's lock: making a
-/// host texture can wait in the kernel, and every draw reading a placed
-/// view would wait behind it.
-/// shortcut: the resource replaced is kept (lists and views made before
-/// may still name it).
+/// copy (`alias`), and the one it replaces is released ([`release_later`]).
+/// The resource is made outside the map's lock: making a host texture can
+/// wait in the kernel, and every draw reading a placed view would wait
+/// behind it.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let desc = canonical_resource_desc(*desc);
@@ -1581,7 +1649,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             usable(theirs)
         }
         Some(entry) => {
-            entry.0 = out as usize;
+            let replaced = std::mem::replace(&mut entry.0, out as usize);
+            drop(map);
+            release_later(vec![replaced]);
             usable(out)
         }
         None => {
@@ -2797,6 +2867,9 @@ mod tests {
         assert!(crate::texture::title_written(
             host_resource(before).unwrap()
         ));
+        // Taken now: once replaced, `before` may be released by any test
+        // emptying the waiting list.
+        let replaced = host_copy(before).unwrap();
         let target = at(
             address,
             &ResourceDesc {
@@ -2815,5 +2888,42 @@ mod tests {
         // The view keeps the copy (title memory still holds what was
         // drawn, on the console); nothing makes it again.
         assert_eq!(texture_at(address, &view), Some(after));
+        // The resource it replaced goes after its grace.
+        memory_remapped(address as usize, KIB_64 as usize);
+        release_waiting(std::time::Duration::ZERO);
+        assert_eq!(Arc::strong_count(&replaced), 1, "released");
+    }
+
+    /// The runtime remaps the memory of a placed view: its texture goes
+    /// (after the grace), and the next view of it makes a new one.
+    #[cfg(windows)]
+    #[test]
+    fn placed_views_go_with_their_memory() {
+        let test = "resource::tests::placed_views_go_with_their_memory";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        let view = words(&texture(16, 16, 28, 1), [0, 0]);
+        let first = texture_at(address, &view).unwrap();
+        let copy = host_copy(first).unwrap();
+        // Memory just past it is no matter.
+        memory_remapped((address + KIB_64) as usize, KIB_64 as usize);
+        assert_eq!(texture_at(address, &view), Some(first));
+        memory_remapped(address as usize, 4096);
+        let gone = PLACED_TEXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .all(|&(a, _)| a != address);
+        assert!(gone);
+        release_waiting(std::time::Duration::ZERO);
+        assert_eq!(Arc::strong_count(&copy), 1, "the resource let go of it");
+        let again = texture_at(address, &view).unwrap();
+        assert!(!Arc::ptr_eq(&host_copy(again).unwrap(), &copy));
+        memory_remapped(address as usize, KIB_64 as usize);
+        release_waiting(std::time::Duration::ZERO);
     }
 }

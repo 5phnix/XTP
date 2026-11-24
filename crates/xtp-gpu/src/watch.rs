@@ -355,6 +355,7 @@ pub fn writing(at: usize, len: usize) {
 /// written before it goes): blocks still guarded get write access back,
 /// else the title's next write there would fault with nothing to take it.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::resource::memory_remapped(at, len);
     let mut g = guards();
     let range = blocks(at, len);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
