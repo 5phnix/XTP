@@ -10,24 +10,29 @@ Series S mode). The title is BTP 6. Logs and the pack stay under
 
 ## 1. Summary
 
-- **Before:** the translator made 8,813 of the pack's 9,282 mesh programs
+- **Before:** the translator made 8,726 of the pack's 9,282 mesh programs
   for a 32-lane host, and the runtime refused every one of them (VIctory
   #578, item 2 of `docs/upstream/watch.md`): the world lost the geometry
   these programs draw.
-- **After:** 8,807 translate and run on NVIDIA by default, every one
-  checked by dxil.dll. 11 are refused, each for a precise reason (§5).
-  `XTP_WAVE64_MESH=refuse` restores #578's refusal, for an A/B in game.
+- **After:** 8,725 translate and run on NVIDIA by default. dxil.dll refuses
+  none that it did not refuse before. 11 are refused, each for a precise
+  reason (§5). `XTP_WAVE64_MESH=refuse` restores #578's refusal, for an A/B
+  in game.
 - The one wave-size hazard of the title's mesh code is `v_readfirstlane_b32`
-  (§2). 7,611 programs need no more than a proof that the value read is
-  the same in every lane of the console wave, so each lane reads its own.
-  1,196 read a value only the data makes uniform (the counts of the
-  meshlet that a group's first lane draws); they get the console's first
-  lane through group-shared memory, between group barriers (§3.2).
+  (§2):
+  - 7,540 programs need no more than a proof that the value read is the
+    same in every lane of the console wave, so each lane reads its own;
+  - 1,185 read a value only the data makes uniform (the counts of the
+    meshlet a group's first lane draws). They get the console's first lane
+    through group-shared memory, between group barriers (§3.2).
 - Tests: unit tests of the proof (`emit/lower/uniform.rs`), translation
   tests of every rule, and a program drawn on WARP whose 4-lane waves split
   each console wave into 16 (`emit/mesh_tests.rs`). The old lowering gets
   all 126 texels of that draw wrong; the new one, none.
-- World sessions: §6.
+- World sessions (§6): three on NVIDIA with the mesh programs running, and
+  no device removal. In the third, 150 s in the world, the G-buffer holds
+  the world's geometry. The presented image stays dark, for another reason
+  than the mesh programs.
 
 ## 2. What depends on whole console waves in mesh code
 
@@ -171,41 +176,43 @@ are gone: the translator now does both, with the proof. The old opt-in
 
 Every MS program of `E:\uwu\shaders.rpf`, translated for a 32-32 host and
 checked by dxil.dll, with a tool outside the repository
-(`E:\xtp-data\tmp\mesh64\measure`). Before: main at `a7b6aa5` (its
-translator is that of this branch's base).
+(`E:\xtp-data\tmp\mesh64\measure`). Before: main at `c135f4c`, this
+branch's base after its last merge.
 
 | | before | after |
 |---|---|---|
 | MS programs | 9,282 | 9,282 |
-| translated for 32-32 | 8,813 | 8,807 |
-| … that the runtime lets run on NVIDIA | 0 | 8,807 |
-| … with an exchange (§3.2) | — | 1,196 |
+| translated for 32-32 | 8,726 | 8,725 |
+| … that the runtime lets run on NVIDIA | 0 | 8,725 |
+| … reading their first lanes as their own (§3.1) | — | 7,540 |
+| … with an exchange (§3.2) | — | 1,185 |
 | refused for a first-lane read (this task) | — | 11 |
-| refused for other reasons (unchanged causes) | 469 | 464 |
-| translations dxil.dll refuses | 66 | the same 66 |
+| refused for other reasons (unchanged causes) | 556 | 546 |
+| translations dxil.dll refuses | 62 | the same 62 |
 
 - The 11 refused: their reads are in loops that index VGPRs (`v_movrels`
   with the first lane's index in M0, a waterfall) inside branches lanes
   take apart. Each lane's own index would be right there (a waterfall that
   runs each lane once); proving that shape is left for later.
-- Of the 6 programs that translated before and are now refused, all are
-  among the 11. 5 of the 11 failed for another reason before; they now
-  stop at their first-lane read first.
-- The 66 invalid translations are not this task's: 53 have more than 32 KiB
+- One of them translated before. The other 10 failed for another reason
+  before (a lane mask read as data, a scalar memory read as data, a
+  structured buffer of unknown stride); they now stop at their first-lane
+  read first.
+- The 62 invalid translations are not this task's: 53 have more than 32 KiB
   of vertex and primitive outputs (VIctory #1385's case, watch item 98),
-  13 have signature mismatches.
-- The reasons the other 464 stop: a scalar memory read as data (199), a lane
-  mask read as data (158), a lane-mask join of an untracked mask (45),
-  per-lane descriptors (34 + 12 + 6 + 3), a descriptor read only as data
-  (5), a cross-lane operation (2).
+  9 have signature mismatches.
+- The reasons the other 546 stop: a scalar memory read as data (383), a lane
+  mask read as data (101), per-lane descriptors (34 + 12 + 6 + 3), a
+  descriptor read only as data (5), a cross-lane operation (2).
 
 ## 6. World sessions
 
 Series S, `E:\tools\stall-probe\session.ps1`, autopilot from the golden
 save, `XTP_SKIP_INTRO=1`, `XTP_WATCHDOG_HOOK=1`, `XTP_D3D12_DRED=1`,
-captures at `E:\xtp-data\runs\frames-mesh*`, 180 s at most.
+captures at `E:\xtp-data\runs\frames-mesh*`. All three ran the same binary
+(this branch at `f6af110`, mesh programs running) and none lost the device.
 
-- **A** (20:13, this branch at `f6af110`, mesh programs running):
+- **A** (19:13 UTC):
   - the world's gameplay reached at 44 s: 1.2 fps, 1,289 draws a frame,
     924 dropped;
   - 154 mesh translations (median 15 ms, at most 237 ms), 223 mesh
@@ -218,8 +225,28 @@ captures at `E:\xtp-data\runs\frames-mesh*`, 180 s at most.
   - in the 7 s before, at once: main's new FSR4 path (every pass "falling
     back"), a 510 ms submission, and about 200 mesh pipelines made;
   - the captures stop at the introduction's title card, before the world.
-- **B** (the same binary with `XTP_WAVE64_MESH=refuse`): to tell whether
-  that stop comes with the mesh draws. Result: see the task's comments.
+- **B** (19:30 UTC, the autopilot ending the title 30 s into gameplay):
+  - gameplay at 22 s, 237 mesh pipelines made, none refused;
+  - no stop, so the stop of A does not come with every run of the mesh
+    programs (the third watchdog path is task 54cb7617's);
+  - the run ends at frame 598, as the world starts. Its first world frame
+    (3,932 draws) is presented black, and the captured frames are the
+    introduction's title card and its fade.
+- **C** (19:51 UTC, 150 s in the world):
+  - 25 frame-rate lines: 0.7 fps median (0.3 to 6.2), 2,525 draws a frame
+    (up to 5,956), 985 dropped;
+  - 523 mesh pipelines made, none refused. The mesh dispatches still
+    dropped are of programs that do not translate for other reasons: a
+    scalar memory read as data, a descriptor read from the first lane of
+    computed VGPRs;
+  - the render targets of frames 949, 979 and 1009 dumped
+    (`XTP_DUMP_TARGETS=1280`). **Frame 1009's 1280 x 720 targets hold a
+    street of the world in 3D**: fences, poles, parasols, facades, objects
+    on the ground, whole and in place;
+  - the presented frame shows the introduction's credits over a nearly
+    black scene, and frames 949 and 979 are black: what darkens the image
+    lies past the geometry (lighting, composition, upscaling, exposure),
+    not in the mesh programs.
 
 ## 7. Upstream, reviewed
 

@@ -251,7 +251,7 @@ them, and a group of one console wave with LDS is refused. The runtime lets
 every wave64 mesh program the translator made for the host's lanes run.
 `XTP_WAVE64_MESH=refuse` gives back VIctory #578's refusal.
 
-For BTP 6's pack, 8,807 of 9,282 mesh programs translate and run on
+For BTP 6's pack, 8,725 of 9,282 mesh programs translate and run on
 NVIDIA, against none before. The design, the measurements and what stays
 refused are in [analysis/mesh-wave64.md](analysis/mesh-wave64.md).
 
