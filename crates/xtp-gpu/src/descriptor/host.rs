@@ -1605,6 +1605,29 @@ fn raw_view(
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
+/// Counts a buffer view the host cannot make because its buffer's start in
+/// the host copy (`offset`) is not on one of its elements (of `element`
+/// bytes): the slot reads zeros. A console view starts at any address, and
+/// the title places structured views at ring positions inside a big buffer
+/// (VIctory's 86a5ed6: the meshlet culling's 456-byte constants, so every
+/// meshlet was culled; watch.md item 180). Logged at the first and each
+/// power of two, with the element size: how many a frame, and of what.
+/// shortcut: such a view needs a copy of its own bytes (86a5ed6's
+/// `shadow::for_view`), which is not made here.
+fn off_element(unordered: bool, offset: u64, element: u64) {
+    static COUNT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    let n = COUNT[usize::from(unordered)].fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            count = n,
+            unordered,
+            offset,
+            element,
+            "buffer view not on an element of its host copy: null"
+        );
+    }
+}
+
 /// Makes a buffer view's elements fit its host copy `copy` (`first`,
 /// `elements` of `element` bytes, the first moved to the copy already):
 /// none if no element does, or if the host refuses such a view (a stride
@@ -1613,6 +1636,13 @@ type Kept = Option<ID3D12Resource>;
 /// refuses can remove the device; the console reads zeros past a view's
 /// end, as the cut view does (VIctory #193, f99b792; the `buffer_view_ok`
 /// of fxceless's VIctory fork, 578d459).
+///
+/// A view running past its copy is cut, not made null as VIctory's main
+/// does since 4051149 (watch.md item 182): the device removal it guards
+/// against comes from a view past its resource, and the cut view lies
+/// wholly inside its copy; it reads the bytes the console reads, and zeros
+/// past the copy (D3D12's bounds), where a null view would read zeros for
+/// the valid part too, the very failure of the culling's zero reads.
 fn fit_view(
     copy: &ID3D12Resource,
     first: u64,
@@ -1668,11 +1698,7 @@ fn buffer_srv(
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
-        once!(
-            offset,
-            element,
-            "buffer view not on an element of its host copy"
-        );
+        off_element(false, offset, element);
         return None;
     }
     buffer.FirstElement += offset / element;
@@ -1735,11 +1761,7 @@ fn buffer_uav(
     };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
-        once!(
-            offset,
-            element,
-            "unordered buffer view not on an element of its host copy"
-        );
+        off_element(true, offset, element);
         return None;
     }
     buffer.FirstElement += offset / element;
