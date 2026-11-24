@@ -165,6 +165,25 @@ function Get-FarmCargo {
     Join-Path $fe.CARGO_HOME 'bin\cargo.exe'
 }
 
+# Is this VM going away? A Spot reclaim (GCE's metadata says so as soon as
+# it starts) or a shutdown in progress (a stop). Windows kills the build's
+# processes first, so a failed step may only mean that.
+function Test-FarmGoingAway {
+    try {
+        $p = Invoke-RestMethod -UseBasicParsing -TimeoutSec 2 -Headers @{ 'Metadata-Flavor' = 'Google' } `
+            -Uri 'http://metadata.google.internal/computeMetadata/v1/instance/preempted'
+        if ("$p".Trim() -eq 'TRUE') { return $true }
+    } catch { }
+    try {
+        if (-not ('FarmNative' -as [type])) {
+            Add-Type -Name FarmNative -Namespace '' -MemberDefinition '[DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);'
+        }
+        # SM_SHUTTINGDOWN
+        if ([FarmNative]::GetSystemMetrics(0x2000) -ne 0) { return $true }
+    } catch { }
+    $false
+}
+
 function ConvertFrom-FarmBase64([string] $Text) {
     [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Text)) | ConvertFrom-Json
 }

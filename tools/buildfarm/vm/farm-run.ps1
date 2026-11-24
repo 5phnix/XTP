@@ -8,7 +8,8 @@
 # and bundle (bundle ref and size, 0 for none), cwd, steps [{args, label}],
 # env, collect, maxMinutes, waitMinutes, worktree.
 #
-# Exit code: the last cargo command's, or 96 agent outdated, 97 commits
+# Exit code: the last cargo command's, or 95 this VM is going away (Spot
+# reclaim or stop: run the job elsewhere), 96 agent outdated, 97 commits
 # missing (send a full bundle), 98 farm error, 99 slot busy too long,
 # 124 run over time, 125 client gone.
 #
@@ -145,6 +146,10 @@ try {
         $last = $a
         if ($step.label) { [Console]::Out.WriteLine($step.label); [Console]::Out.Flush() }
         $code = Invoke-FarmWatched -FilePath $cargo -ArgumentList $a -Environment $envs -WorkingDirectory $cwd -MaxMinutes ([int] $req.maxMinutes) -Watch $watch
+        if ($code -ne 0 -and (Test-FarmGoingAway)) {
+            Write-FarmErr "$vmName is being stopped (Spot reclaim or stop): the client runs the job elsewhere"
+            $code = 95
+        }
         if ($code -ne 0) { break }
     }
 

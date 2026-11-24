@@ -739,6 +739,15 @@ function Invoke-FarmSsh {
         -NoStdin:(-not $StdinFile) -Environment (Get-FarmGcloudEnv)
 }
 
+# After a failed job: is the VM still up and staying? When it shuts down
+# (a Spot reclaim or a stop), Windows kills the job's processes, the runner
+# included, so the exit code alone cannot tell that from a failed build.
+function Test-FarmVmStaying([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Vm) {
+    $r = Invoke-FarmSsh -Config $Config -Vm $Vm -Capture -ConnectTimeout 20 `
+        -Command 'powershell -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -File C:\farm\bin\farm-probe.ps1'
+    $r.ExitCode -eq 0 -and $r.Out.Trim() -eq 'ok'
+}
+
 function Wait-FarmVmReady {
     param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Vm, [int] $TimeoutSeconds = 480)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -1330,7 +1339,7 @@ function Invoke-FarmJob {
                     waitMinutes = 30
                     worktree    = $wt.Name
                 }
-                Write-FarmMessage ('{0} slot {1}: {2}, sent {3:N0} KB' -f $sel.vm, $sel.slot, $what, ([double] $bundle.Size / 1KB))
+                Write-FarmMessage ('{0} slot {1}: {2}, sent {3:0} KB' -f $sel.vm, $sel.slot, $what, ([double] $bundle.Size / 1KB))
                 $cmd = 'powershell -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -File C:\farm\bin\farm-run.ps1 ' + (ConvertTo-FarmBase64 $req)
                 $tRun = Get-Date
                 $code = (Invoke-FarmSsh -Config $Config -Vm $sel.vm -Command $cmd -StdinFile $bundle.Path).ExitCode
@@ -1345,11 +1354,21 @@ function Invoke-FarmJob {
                     $known = @()
                     continue
                 }
-                if ($code -eq 255) { $lost = $true; break }
+                if ($code -eq 255 -or $code -eq 95) {
+                    # 255: the connection dropped; 95: the VM is being reclaimed or stopped.
+                    $lost = $true
+                    break
+                }
                 if ($code -eq 98 -or $code -eq 99) {
                     # The VM could not prepare the job (its message says why).
                     $lost = $true
                     Set-FarmHealth $Config $sel.vm 5 "could not prepare a job (exit $code)"
+                    break
+                }
+                if ($code -ne 0 -and $code -ne 124 -and -not (Test-FarmVmStaying $Config $sel.vm)) {
+                    # Killed by a reclaim or a stop, not a failed build.
+                    $code = 95
+                    $lost = $true
                     break
                 }
                 Add-FarmKnown $Config $sel.vm $sel.id @($snap.Target, $snap.Head)
@@ -1365,14 +1384,30 @@ function Invoke-FarmJob {
                 return $code
             }
             if (-not $lost) { throw "build farm: $($sel.vm) kept refusing the job" }
+            if ($code -eq 95) {
+                Write-FarmMessage "$($sel.vm) is being reclaimed or stopped: running the job elsewhere"
+                Write-FarmLog $Config "$($sel.vm) went away during a job of $($wt.Name)"
+                Set-FarmHealth $Config $sel.vm 5 'reclaimed or stopped'
+                $exclude += $sel.vm
+                continue
+            }
+            if ($code -eq 98 -or $code -eq 99) {
+                $exclude += $sel.vm
+                continue
+            }
+            # The connection dropped. A VM that GCE still shows running may be
+            # shutting down (a reclaim takes it down in about a minute): retry
+            # it only if it answers at once.
             $now = @(Get-FarmInstances -Config $Config -Refresh) | Where-Object { $_.name -eq $sel.vm } | Select-Object -First 1
             $status = $(if ($now) { $now.status } else { 'gone' })
-            Write-FarmMessage "lost the connection to $($sel.vm) (now $status): retrying"
-            Write-FarmLog $Config "lost $($sel.vm) ($status) during a job of $($wt.Name)"
-            if (-not $now -or -not (Test-FarmRunning $now)) {
-                Set-FarmHealth $Config $sel.vm 5 "stopped or reclaimed ($status)"
-                $exclude += $sel.vm
-            } elseif ($attempt -ge 2) {
+            $answers = $false
+            if ($now -and (Test-FarmRunning $now) -and $attempt -lt 2) {
+                try { Wait-FarmVmReady $Config $sel.vm -TimeoutSeconds 20; $answers = $true } catch { $answers = $false }
+            }
+            Write-FarmMessage "lost the connection to $($sel.vm) ($status$(if (-not $answers) { ', not answering' })): retrying"
+            Write-FarmLog $Config "lost $($sel.vm) ($status, answers: $answers) during a job of $($wt.Name)"
+            if (-not $answers) {
+                Set-FarmHealth $Config $sel.vm 5 "connection lost ($status)"
                 $exclude += $sel.vm
             }
         } catch {

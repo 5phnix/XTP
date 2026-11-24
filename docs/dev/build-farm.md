@@ -47,7 +47,7 @@ lost its disk asks for a full bundle (exit 97) and gets one automatically.
 
 **Slots.** A slot is a checkout of the mirror, `C:\farm\w\s1` to `s6`, each
 with its own persistent `target` directory. A worktree gets the same slot
-each time it builds on that VM; a new worktree (a Hangar delivery check, for
+each time it builds on that VM; a new worktree (a delivery check in a fresh checkout, for
 example) takes the least recently used free slot. Since every branch is
 close to `main`, a checkout over another branch's slot only rewrites the
 files that differ, and cargo rebuilds incrementally.
@@ -83,9 +83,13 @@ PC share leases in the state folder, so they spread over the VMs.
 
 **Spot.** The VMs are Spot VMs: much cheaper, but Google may reclaim one at
 any time. A reclaimed VM is stopped, not deleted, and keeps its disk. When
-that happens during a job, the SSH connection drops; the client marks the
-VM unavailable for a few minutes and runs the job again on another VM. When
-none is left, the command falls back to the PC (exit 75).
+that happens during a job, Windows shuts down and kills the job's processes,
+so a failed job's exit code alone cannot tell a reclaim from a failed build:
+after any failed job the client asks the VM (`vm\farm-probe.ps1`, about 2 s),
+which checks GCE's preemption flag (metadata `instance/preempted`) and
+whether Windows is shutting down. When the VM is going away, does not answer,
+or the SSH connection dropped, the client marks it unavailable for a few
+minutes and runs the job again on another VM. When none is left, the command falls back to the PC (exit 75).
 
 **Idle stop.** The farm agent (`vm\farm-agent.ps1`, a startup task on each
 VM) shuts the VM down after 15 minutes (`idleMinutes`) without a farm run,
@@ -365,11 +369,12 @@ disks, images, Cloud NAT and firewall rule, nothing else.
 | `FarmCommon.ps1` | the PC side's shared code |
 | `vm\setup-toolchain.ps1` | toolchain installation (image builder's startup script) |
 | `vm\farm-agent.ps1` | boot tasks and the idle watcher |
-| `vm\farm-run.ps1`, `vm\farm-fetch.ps1` | a job; files for the client |
+| `vm\farm-run.ps1`, `vm\farm-fetch.ps1`, `vm\farm-probe.ps1` | a job; files for the client; "is this VM going away?" |
 | `vm\farm-install.ps1`, `vm\FarmVm.ps1` | agent installation; VM side's shared code |
 
 Exit codes of the farm (cargo's pass through): 75 the farm cannot take the
-command, 76 the command runs locally, 96 agent outdated, 97 commits missing,
+command, 76 the command runs locally, 95 the VM is going away (Spot reclaim
+or stop: the job runs again elsewhere), 96 agent outdated, 97 commits missing,
 98 the VM could not prepare the job, 99 slot busy too long, 124 run over
 time.
 
@@ -393,7 +398,7 @@ time.
 
 ## Measurements
 
-On the person's farm (c2d-highcpu-16 Spot, europe-west1-b, November 2026),
+On the maintainer's farm (c2d-highcpu-16 Spot, europe-west1-b, November 2026),
 from a worktree on the PC:
 
 | What | Time |
@@ -403,9 +408,12 @@ from a worktree on the PC:
 | First sync of a VM (full bundle, 1 MB) | under 1 s |
 | Later syncs (uncommitted changes only, 51 KB) | under 1 s |
 | `xtp-check.ps1` on a new slot (cold target directory) | 100 s: clippy 41 s, clippy `--all-features` 17 s, tests built in 35 s, run |
-| `xtp-check.ps1` again, after small changes | 25 s |
+| `xtp-check.ps1` with every VM stopped, after merging `main` (VM start included) | 116 s |
+| `xtp-check.ps1` again, after small changes | 28 s |
 | `cargo test -p xtp-gpu` after a one-line change in `crates/xtp-gpu` | 8.2 s (cargo 1.9 s) |
-| A stopped VM started on demand, until SSH answers | about 50 s |
+| A stopped VM started on demand, until the job runs | 29 s |
+| A Spot reclaim during a job, until it runs again on another VM | about 1 minute |
+| A failed job's extra check (is the VM going away?) | about 2 s |
 
 ## Limits
 
