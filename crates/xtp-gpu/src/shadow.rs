@@ -1032,8 +1032,17 @@ unsafe extern "system" fn stopped(
         && record.ExceptionInformation[0] == WRITE
         && OPENED.get() < OPENINGS
     {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // The faulting thread's last error stays its own (it may be the
+        // title's): opening the other views of a page fails where one is
+        // unmapped meanwhile, as the guard's handler knows.
+        // SAFETY: plain reads and writes of this thread's last error.
+        let error = unsafe { GetLastError() };
         crate::watch::writing(at, 1);
-        if writable(at) {
+        let opened = writable(at);
+        // SAFETY: as above.
+        unsafe { SetLastError(error) };
+        if opened {
             OPENED.set(OPENED.get() + 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
