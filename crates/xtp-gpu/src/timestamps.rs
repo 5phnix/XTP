@@ -384,6 +384,7 @@ pub(crate) fn open(list: &HostList) {
     // Its chunks go back outside the lock (unless a submission holds them).
     drop(old);
     stamp(list, BETWEEN);
+    crate::pipestats::open(list);
 }
 
 /// Just before a list is closed: its last timestamp, and the resolve of
@@ -394,6 +395,7 @@ pub(crate) fn close(list: &HostList) {
     }
     let Some(heap) = heap() else { return };
     stamp(list, BETWEEN);
+    crate::pipestats::close(list);
     let mut lists = LISTS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entry) = lists.as_mut().and_then(|l| l.get_mut(&key(list))) else {
         return;
@@ -429,6 +431,7 @@ pub(crate) struct Command<'a>(Option<&'a HostList>);
 impl Drop for Command<'_> {
     fn drop(&mut self) {
         if let Some(list) = self.0 {
+            crate::pipestats::end(list);
             stamp(list, BETWEEN);
         }
     }
@@ -447,6 +450,7 @@ pub(crate) fn command<'a>(
     }
     let program = pipeline.map_or(0, |p| program(&p.name, || wave64(p)));
     stamp(list, Label { what, program });
+    crate::pipestats::begin(list, what, pipeline);
     Command(Some(list))
 }
 
@@ -612,6 +616,7 @@ pub(crate) fn submitted(queue: &ID3D12CommandQueue, runs: &[&HostList], value: u
     };
     host.after(move || read(submission));
     log_due();
+    crate::pipestats::submitted(runs);
 }
 
 /// One list's timestamps, read: what each span went to and how long it

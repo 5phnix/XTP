@@ -140,10 +140,12 @@ const HOSTS: [super::Target; 2] = [
     super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        stride_table: false,
     },
     super::Target {
         lanes_min: 32,
         lanes_max: 64,
+        stride_table: false,
     },
 ];
 
@@ -366,6 +368,7 @@ fn the_halves_exchange_must_fit_next_to_the_programs_lds() {
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        stride_table: false,
     };
     assert_eq!(
         emit_for(&with_lds(64), nvidia).err(),
@@ -379,6 +382,7 @@ fn the_halves_exchange_must_fit_next_to_the_programs_lds() {
     let rdna = super::Target {
         lanes_min: 32,
         lanes_max: 64,
+        stride_table: false,
     };
     assert!(emit_for(&with_lds(64), rdna).is_ok());
 }
@@ -436,10 +440,12 @@ fn a_select_on_a_mask_held_as_a_number_translates_for_every_host() {
         super::Target {
             lanes_min: 32,
             lanes_max: 32,
+            stride_table: false,
         },
         super::Target {
             lanes_min: 64,
             lanes_max: 64,
+            stride_table: false,
         },
     ] {
         let cs = emit_for(&program(HELD_SELECT, 64), target)
@@ -484,6 +490,7 @@ fn console_flow_is_for_one_console_wave_per_group() {
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        stride_table: false,
     };
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
     assert!(emit_for(&program(&body, 128), nvidia).is_err());
@@ -694,6 +701,7 @@ fn the_last_modules_summary_names_its_group_wave_size_and_operations() {
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        stride_table: false,
     };
     let body = [
         0xD760_0009,
@@ -848,6 +856,7 @@ fn whole_wave_sections_in_partial_groups_still_stop() {
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        stride_table: false,
     };
     let mut body = reduction_scan(37, 0x80);
     body.push(0x7E04_020A); // v_mov_b32 v2, s10
@@ -1219,6 +1228,7 @@ fn numeric_selects_beside_in_half_reads() {
     let wave32 = super::Target {
         lanes_min: 32,
         lanes_max: 32,
+        stride_table: false,
     };
     let unused = program(&body, 128);
     let shader = emit_for(&unused, wave32).unwrap();
@@ -1293,6 +1303,7 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
         let target = super::Target {
             lanes_min,
             lanes_max,
+            stride_table: false,
         };
         let e = emit_for(&program(&body, 64), target)
             .expect_err("stops")

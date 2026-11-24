@@ -82,6 +82,9 @@ enum Cmd {
         /// Run the diagnostics build as it is, without cargo build.
         #[arg(long)]
         no_build: bool,
+        /// Start the title without `xtp precook` first.
+        #[arg(long)]
+        no_precook: bool,
     },
 }
 
@@ -131,6 +134,7 @@ fn main() -> Result<()> {
             script,
             exe,
             no_build,
+            no_precook,
         } => play::run(
             &root,
             &play::Options {
@@ -138,6 +142,7 @@ fn main() -> Result<()> {
                 script,
                 exe,
                 no_build,
+                no_precook,
             },
         ),
     }

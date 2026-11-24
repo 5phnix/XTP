@@ -9,6 +9,8 @@
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+#[cfg(test)]
+mod fingerprint;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
@@ -21,6 +23,13 @@ pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
+
+/// The fingerprint of this crate's sources and build settings (32
+/// hexadecimal digits, made by `build.rs`, see `src/fingerprint.rs`): what a
+/// translation depends on besides its container, its settings (the loop
+/// limit and budget) and its target. The host's shader cache keys
+/// translations by it, so they outlive builds that differ elsewhere.
+pub const SOURCES: &str = env!("XTP_SHADER_SOURCES");
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
