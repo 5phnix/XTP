@@ -1,0 +1,4 @@
+#!/bin/sh
+# Checks the commit message against CONTRIBUTING.md ("Commits and pull request
+# titles"). Install with: cargo xtask install-hooks
+exec cargo xtask conventions --message-file "$1"

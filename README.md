@@ -56,7 +56,7 @@ Check **Committed** under **Task Manager → Performance → Memory**. If
 the Windows paging file size, then retry.
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
+cargo xtask install-hooks                # policy and commit-message checks on every commit
 copy xtp.example.toml xtp.toml   # then set your paths (outside the repo)
 cargo test --workspace                   # needs no game data
 cargo run -p xtp -- config           # check your paths
@@ -130,6 +130,22 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first: it
+has the rules every change must follow (nothing from the game, no keys, no
+console SDK material, nothing that circumvents DRM, GPL-3.0-or-later, no code
+from the projects we only use as references), the commit and pull request
+conventions and how review works. [docs/dev/START_HERE.md](docs/dev/START_HERE.md)
+maps the code and lists good first issues. Before opening a pull request, run
+
+```powershell
+cargo xtask pr-check     # what CI checks, with a summary
+```
+
+Report vulnerabilities privately as [SECURITY.md](SECURITY.md) describes.
+Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

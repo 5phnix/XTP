@@ -1,0 +1,31 @@
+# Weekly dependency updates. Commit messages and PR titles follow the
+# conventions (`deps: ...`, `ci: ...`) so that PR conventions passes on them.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Minor and patch updates in one PR; a major update gets its own.
+    groups:
+      cargo:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+    labels: [area/deps]
+    open-pull-requests-limit: 5
+
+  # Also updates the commit SHAs actions are pinned to, and their comments.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ['*']
+    commit-message:
+      prefix: ci
+    labels: [area/ci]
+    open-pull-requests-limit: 2

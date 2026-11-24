@@ -1,0 +1,78 @@
+name: Bug report
+description: Something XTP does wrong (a crash, a hang, a wrong result, a broken command)
+title: '<area>: <what goes wrong>'
+labels: [bug, needs triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting. Before you start:
+        - Search the open issues: add to an existing one rather than opening a new one.
+        - **Attach nothing from the game or derived from it**: no executables, archives,
+          dumps, `XTP_CAPTURE` frames, render targets, shader dumps, and no screenshots
+          or video of the title for now ([asset policy](https://github.com/MiamiGame/XTP/blob/main/docs/asset-policy.md)).
+          Describe what you see instead. Offsets (`module+rva`), BLAKE3 hashes and our
+          own log lines are fine.
+        - A security problem goes to [a private advisory](https://github.com/MiamiGame/XTP/security/advisories/new), not here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands, from a clean cache folder if it matters.
+      placeholder: |
+        1. cargo build --release -p xtp
+        2. target\release\xtp.exe run <game dir>\<exe> --execute
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: run-report
+    attributes:
+      label: Run report
+      description: >-
+        The block described in docs/dev/START_HERE.md, "Run report". Replace your
+        user name in paths if you prefer.
+      render: text
+      value: |
+        xtp commit    :
+        build         : release | diag
+        title blake3  :
+        console mode  : series-x | series-s
+        windows       :
+        cpu, memory   :
+        gpu, driver   :
+        command       :
+        stage reached :
+        crashes.log   :
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: >-
+        The last lines of XTP's output before the problem (`XTP_LOG=...` if you raised
+        the level). Only XTP's own lines: leave out anything the title printed.
+      render: text
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Did it work before?
+      options:
+        - I don't know
+        - No, it never worked
+        - Yes (give the last good commit above)
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Rules
+      options:
+        - label: Nothing attached comes from the game or is derived from it.
+          required: true

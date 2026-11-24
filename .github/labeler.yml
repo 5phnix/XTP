@@ -1,0 +1,97 @@
+# Area labels for pull requests, applied by .github/workflows/pr-intake.yml
+# (actions/labeler, sync-labels: a label goes when its files leave the PR).
+# The `area/...` names are the areas of commit and PR title headers
+# (xtask/src/conventions.rs, AREAS); a test in xtask keeps the two in step.
+# Size labels (size/XS ... size/XL) are set by pr-intake.yml, not here.
+
+area/core:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-core/**'
+
+area/pe:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-pe/**'
+
+area/loader:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-loader/**'
+
+area/hle:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-hle/**'
+
+area/gpu:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-gpu/**'
+
+area/shader:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-shader/**'
+
+area/formats:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-formats/**'
+
+area/pipeline:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-pipeline/**'
+
+area/game:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/xtp-game/**'
+
+area/app:
+  - changed-files:
+      - any-glob-to-any-file: 'apps/**'
+
+area/xtask:
+  - changed-files:
+      - any-glob-to-any-file: 'xtask/**'
+
+area/tests:
+  - changed-files:
+      - any-glob-to-any-file: 'tests/**'
+
+area/ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+          - '.githooks/**'
+
+area/docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'docs/**'
+          - '**/*.md'
+
+area/deps:
+  - changed-files:
+      - any-glob-to-any-file: 'Cargo.lock'
+
+area/build:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'Cargo.toml'
+          - 'rust-toolchain.toml'
+          - 'rustfmt.toml'
+          - '.cargo/**'
+          - '.gitattributes'
+          - '.gitignore'
+          - 'xtp.example.toml'
+
+# Files that carry the project's rules: a maintainer reads every change.
+policy:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'LICENSE'
+          - 'NOTICE.md'
+          - 'SECURITY.md'
+          - 'CODE_OF_CONDUCT.md'
+          - 'CONTRIBUTING.md'
+          - 'docs/asset-policy.md'
+          - 'xtask/src/policy.rs'
+          - '.github/CODEOWNERS'
+          - '.github/workflows/**'
+          - '.gitattributes'
+          - '.gitignore'
+          - '.xtp-root'

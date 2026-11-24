@@ -1,0 +1,42 @@
+# Code owners, by area: GitHub asks them to review every PR that touches
+# their paths, and the "Protect main" ruleset can require their approval.
+#
+# DRAFT. Every rule is commented out because the reviewers are not known yet.
+# To enable an area, create its team (docs/dev/maintainers.md, "Code owners"),
+# replace the placeholder with it (e.g. @<org>/xtp-gpu) and uncomment the
+# line. The last matching rule wins, so keep the catch-all first.
+
+# Catch-all: the maintainers.
+# *                                   <maintainers>
+
+# Platform crates
+# /crates/xtp-core/                   <core-owners>
+# /crates/xtp-pe/                     <loader-owners>
+# /crates/xtp-loader/                 <loader-owners>
+# /crates/xtp-hle/                    <hle-owners>
+# /crates/xtp-gpu/                    <gpu-owners>
+# /crates/xtp-shader/                 <shader-owners>
+# /crates/xtp-formats/                <formats-owners>
+# /crates/xtp-pipeline/               <pipeline-owners>
+
+# Title-specific code
+# /crates/xtp-game/                   <game-owners>
+
+# Front end, tests and tooling
+# /apps/                              <maintainers>
+# /tests/                             <maintainers>
+# /xtask/                             <maintainers>
+
+# The project's rules and automation: maintainers only.
+# /.github/                           <maintainers>
+# /.githooks/                         <maintainers>
+# /xtask/src/policy.rs                <maintainers>
+# /docs/asset-policy.md               <maintainers>
+# /LICENSE                            <maintainers>
+# /NOTICE.md                          <maintainers>
+# /CONTRIBUTING.md                    <maintainers>
+# /SECURITY.md                        <maintainers>
+# /CODE_OF_CONDUCT.md                 <maintainers>
+# /Cargo.toml                         <maintainers>
+# /Cargo.lock                         <maintainers>
+# /rust-toolchain.toml                <maintainers>
