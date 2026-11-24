@@ -1079,20 +1079,147 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
+        let edge = |j: usize| -> Vec<Term> {
+            words
+                .iter()
+                .map(|w| match phi_of(w) {
+                    Some((_, i)) => self.origin(phis[i].args[j]),
+                    None => *w,
+                })
+                .collect()
+        };
         let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
-                let edge: Vec<Term> = words
-                    .iter()
-                    .map(|w| match phi_of(w) {
-                        Some((_, i)) => self.origin(phis[i].args[j]),
-                        None => *w,
-                    })
-                    .collect();
-                self.classify(&edge, joins, known)
-            })
+            .map(|j| self.classify(&edge(j), joins, known))
             .collect::<Result<_, _>>();
+        let source = match args {
+            Ok(args) => Ok(Source::Phi { block, args }),
+            // An edge holds no descriptor. With one edge left that the lanes
+            // reading the descriptor can have come by, it is what the
+            // registers hold on that one, if lowering can name it where it
+            // is read: a wave that took another edge has no such lane left
+            // (an arm under the copy of EXEC the program started with,
+            // `s_and_saveexec` of it, where the console compiler set a
+            // sampler's constants; what the registers held before the arm
+            // is what the skipping edge joins in).
+            Err(e) => match self.only_edge(block, known) {
+                Some((j, conditions)) => {
+                    let n = known.len();
+                    known.extend(conditions);
+                    let one = self.classify(&edge(j), joins, known);
+                    known.truncate(n);
+                    match one {
+                        Ok(source) if self.anywhere(&source) => Ok(source),
+                        _ => Err(e),
+                    }
+                }
+                None => Err(e),
+            },
+        };
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        source.map(Some)
+    }
+
+    /// The one forward edge into the join `block`, by its index in the
+    /// block's predecessors, that lanes satisfying `known` can have taken,
+    /// with what holds in the lanes that take it; `None` unless the lanes'
+    /// paths ([`Structured`]) rule out every other edge, and at loop
+    /// headers.
+    ///
+    /// Ported from fxceless's VIctory fork (commit 578d459) by fxceless:
+    /// `only_edge`, `anywhere` and their use when an edge of a join holds
+    /// no descriptor ([`Self::phi`]). Here the lanes that take the edge
+    /// are known while its dwords are traced, and a load's base must come
+    /// from the entry ([`Self::anywhere`]).
+    fn only_edge(&self, block: usize, known: &mut Known) -> Option<(usize, Known)> {
+        let lanes = self.lanes?;
+        let preds = &self.p.blocks[block].preds;
+        if preds.len() < 2 || preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+            return None;
+        }
+        let mut only = None;
+        for (j, &q) in preds.iter().enumerate() {
+            let mut edge = vec![(lanes.reach[q], true)];
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = lanes.exits[q]
+                && taken != not_taken
+            {
+                edge.push((when, taken == block));
+            }
+            let n = known.len();
+            known.extend(edge.iter().copied());
+            let taken = lanes.bools.meet(known);
+            known.truncate(n);
+            if taken && only.replace((j, edge)).is_some() {
+                return None;
+            }
+        }
+        only
+    }
+
+    /// Whether lowering can make a handle for `source` in any block: its
+    /// heap index comes from root parameters and constants alone. A table
+    /// offset the code computes exists only where the load is; so does a
+    /// load's base unless it is an input or a constant through moves, which
+    /// lowering gives the input's own value (computed in the entry block).
+    fn anywhere(&self, source: &Source) -> bool {
+        match source {
+            Source::Constant(_) => true,
+            Source::Built { address, .. } => address.dynamic.is_none(),
+            Source::Loaded { load, .. } => {
+                let inst = self.inst(*load);
+                let Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } = &inst.fields
+                else {
+                    return false;
+                };
+                let entry = |op: &Operand| match *op {
+                    Operand::Scalar { code: NULL, .. }
+                    | Operand::Const(_)
+                    | Operand::Literal(_) => true,
+                    Operand::Scalar { code, .. } => {
+                        inst.read(Reg::S(code)).is_some_and(|v| self.from_entry(v))
+                    }
+                    _ => false,
+                };
+                entry(base)
+                    && entry(soffset)
+                    && self
+                        .smem_address(inst, base, *offset, soffset)
+                        .is_ok_and(|a| a.dynamic.is_none())
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is an input or a constant, through scalar moves.
+    fn from_entry(&self, mut v: Value) -> bool {
+        for _ in 0..MAX_ROUNDS {
+            if self.inputs[v.0 as usize].is_some() {
+                return true;
+            }
+            let Some(inst) = self.def(v) else {
+                return false;
+            };
+            if !matches!(inst.name(), "s_mov_b32" | "s_mov_b64" | "s_movk_i32") {
+                return false;
+            }
+            let Some(k) = inst.writes.iter().position(|w| w.1 == v) else {
+                return false;
+            };
+            match copy_source(inst, k) {
+                Some(Moved::Value(s)) => v = s,
+                Some(Moved::Const(_)) => return true,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -2128,6 +2255,144 @@ pub(crate) mod tests {
             offsets.contains(&0) && offsets.contains(&0x10),
             "{offsets:?}"
         );
+    }
+
+    /// A wave64 compute program that builds a sampler's constants in s[0:3]
+    /// in an arm entered by `guard` (an `s_and_saveexec_b64 s[20:21], ...`
+    /// skipped by `s_cbranch_execz`) and samples with it after the arm.
+    /// Before the arm s[0:3] hold two lane masks: what the edge that skips
+    /// the arm joins in.
+    fn sampler_built_in_an_arm(guard: u32) -> Result<Resources, ShaderError> {
+        let words = [
+            0xBEA8_047E, // s_mov_b64 s[40:41], exec
+            0xBEFE_0A7E, // s_wqm_b64 exec, exec
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF40C_0106,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[12:13], null
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0: lanes 0 to 4
+            0xBE80_046A, // s_mov_b64 s[0:1], vcc
+            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+            guard,
+            0xBF88_0006, // s_cbranch_execz -> 0x50
+            0x7E26_02F2, // v_mov_b32 v19, 1.0
+            0xB000_0092, // s_movk_i32 s0, 0x92
+            0xBE81_03FF,
+            0x00C0_0000, // s_mov_b32 s1, 0xc00000
+            0xBE82_0BA8, // s_brev_b32 s2, 40
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBEFE_0414, // 0x50: s_mov_b64 exec, s[20:21]
+            0xF09C_0108,
+            0x0001_0102, // image_sample_lz v1, v[2:3], s[4:11], s[0:3]
+            S_ENDPGM,
+        ];
+        wave64_compute(&words)
+    }
+
+    /// The same shape for the image descriptor: s[4:11] hold lane masks
+    /// before an arm under the starting EXEC that loads them from the table
+    /// at s[12:13] (`arm`: the load, after what else the arm does to the
+    /// base), the sampler's constants set before the access.
+    fn image_loaded_in_an_arm(arm: &[u32]) -> Result<Resources, ShaderError> {
+        let skip = 0xBF88_0000 | arm.len() as u32;
+        let mut words = vec![
+            0xBEA8_047E, // s_mov_b64 s[40:41], exec
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0
+            0xBE84_046A, // s_mov_b64 s[4:5], vcc
+            0xBE86_046A, // s_mov_b64 s[6:7], vcc
+            0xBE88_046A, // s_mov_b64 s[8:9], vcc
+            0xBE8A_046A, // s_mov_b64 s[10:11], vcc
+            0xBE94_2428, // s_and_saveexec_b64 s[20:21], s[40:41]
+            skip,        // s_cbranch_execz over the arm
+        ];
+        words.extend(arm);
+        words.extend([
+            0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+            0xB000_0092, // s_movk_i32 s0, 0x92
+            0xBE81_03FF,
+            0x00C0_0000, // s_mov_b32 s1, 0xc00000
+            0xBE82_0BA8, // s_brev_b32 s2, 40
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF09C_0108,
+            0x0001_0102, // image_sample_lz v1, v[2:3], s[4:11], s[0:3]
+            S_ENDPGM,
+        ]);
+        wave64_compute(&words)
+    }
+
+    /// `words` as a wave64 compute program whose table is at s9, traced.
+    fn wave64_compute(words: &[u32]) -> Result<Resources, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let st = lanes(&p);
+        assert!(st.is_some(), "the program structures");
+        track(&p, &[param(Table, 9, 1)], HwStage::Cs, st.as_ref())
+    }
+
+    const S_LOAD_IMAGE: [u32; 2] = [0xF40C_0106, 0xFA00_0000]; // s_load_dwordx8 s[4:11], s[12:13], null
+
+    /// The arm runs under the copy of EXEC the program started with, which
+    /// every lane's bit is set in: the wave skips it only when no lane is
+    /// left that would run it, and no lane takes the edge that skips it.
+    /// The sampler is its constants (`2da4beb386509b77` at 0x4d0, refused
+    /// as "neither loaded nor built" before: docs/analysis/world-black.md
+    /// §8.4). Under a per-lane compare instead, lanes 5 and up skip the arm
+    /// and sample with the lane masks: refused still.
+    #[test]
+    fn a_sampler_built_under_the_starting_exec_is_its_constants() {
+        // s_and_saveexec_b64 s[20:21], s[40:41]
+        let r = sampler_built_in_an_arm(0xBE94_2428).unwrap();
+        let samplers: Vec<_> = r
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Sampler)
+            .collect();
+        assert_eq!(samplers.len(), 1, "{:?}", r.descriptors);
+        assert_eq!(
+            samplers[0].source,
+            Source::Constant(vec![0x92, 0x00C0_0000, 0x1400_0000, 0])
+        );
+        // s_and_saveexec_b64 s[20:21], s[0:1]: lanes 0 to 4
+        match sampler_built_in_an_arm(0xBE94_2400) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "a descriptor neither loaded nor built");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    /// The image descriptor of such an arm is its load when the load's
+    /// address comes from the entry (the table's own SGPRs). Moved by an
+    /// addition in the arm, the base exists only where the arm ran, so the
+    /// load cannot be named at the access: refused still.
+    #[test]
+    fn an_image_loaded_under_the_starting_exec_is_its_load() {
+        let r = image_loaded_in_an_arm(&S_LOAD_IMAGE).unwrap();
+        let images: Vec<_> = r
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+            .collect();
+        assert_eq!(images.len(), 1, "{:?}", r.descriptors);
+        let Source::Loaded { load, first: 0 } = images[0].source else {
+            panic!("{:?}", images[0].source)
+        };
+        let address = r.scalar.iter().find(|s| s.0 == load).unwrap().1;
+        assert_eq!(address, at(0, 0));
+        let moved = [0x800C_C00C, S_LOAD_IMAGE[0], S_LOAD_IMAGE[1]]; // s_add_u32 s12, s12, 64
+        match image_loaded_in_an_arm(&moved) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "a descriptor neither loaded nor built");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
     }
 
     #[test]
