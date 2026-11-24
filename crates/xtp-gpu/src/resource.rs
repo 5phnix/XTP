@@ -9,6 +9,8 @@
 #[cfg(windows)]
 mod alias;
 pub(crate) mod format;
+#[cfg(windows)]
+mod residency;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::c_void;
@@ -978,7 +980,7 @@ fn host_texture(
     let made = unsafe {
         host.device.CreateCommittedResource(
             &heap,
-            D3D12_HEAP_FLAG_NONE,
+            residency::heap_flags(),
             (&raw const d).cast(),
             D3D12_RESOURCE_STATES(
                 crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
@@ -989,6 +991,12 @@ fn host_texture(
         )
     };
     watch.after(&host.device, &d, bytes, made.is_ok());
+    if made.is_ok()
+        && !residency::direct()
+        && let Some(t) = texture.take()
+    {
+        texture = resident(&host.device, t, desc, &d, bytes);
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
         let reason = format!("as {}: the driver refused it ({})", d.format, e.code());
@@ -1012,6 +1020,66 @@ fn host_texture(
         format::note_texture(true, bytes);
     }
     texture.map(|t| (t, bytes))
+}
+
+/// `texture` (of the title's `desc`, made as `d`, `bytes` long) made
+/// resident (`residency`); `None`, logged and counted, if it cannot be in
+/// time.
+#[cfg(windows)]
+fn resident(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    desc: &ResourceDesc,
+    d: &ResourceDesc,
+    bytes: u64,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static OVER: AtomicU64 = AtomicU64::new(0);
+    const PC_FLAGS: u32 = 0xf;
+    let started = std::time::Instant::now();
+    let result = residency::make_resident(device, &texture);
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let (budget, usage) = crate::dxgi::video_memory(device).unwrap_or_default();
+    match result {
+        Ok(false) => Some(texture),
+        Ok(true) => {
+            let n = OVER.fetch_add(1, Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    n,
+                    ms,
+                    mib = bytes >> 20,
+                    budget_mib = budget >> 20,
+                    usage_mib = usage >> 20,
+                    desc = ?d,
+                    "a host texture made resident past the video memory budget"
+                );
+            }
+            Some(texture)
+        }
+        Err(why) => {
+            tracing::warn!(
+                ?why,
+                ms,
+                mib = bytes >> 20,
+                budget_mib = budget >> 20,
+                usage_mib = usage >> 20,
+                desc = ?d,
+                "a host texture not made resident: refused (XTP_TEXTURE_RESIDENCY=direct waits instead)"
+            );
+            format::note_refused(format!(
+                "format {} flags {:#x}: not made resident ({})",
+                desc.format,
+                desc.flags & PC_FLAGS,
+                match why {
+                    residency::Failed::Refused(e) => format!("{}", e.code()),
+                    residency::Failed::TimedOut =>
+                        format!("not in {} s", residency::TIMEOUT.as_secs()),
+                }
+            ));
+            None
+        }
+    }
 }
 
 /// What is logged around a host texture's creation: whether it is big or
