@@ -38,12 +38,17 @@ repository. Times are local (UTC+1) unless a log line says otherwise.
   and, where the host keeps R9G9B9E5 as RGBA16F (the RTX 4080: XTP's
   stand-in, VIctory #492), by a decoding pass of ours on the GPU. Two WARP
   tests; the view reads 0 without the change.
-- **Not enough alone (§6).** The deferred lighting also tests each tile's
-  rectangle against material classes a compute program writes into a depth
-  texture through unordered access, which XTP's host depth textures do not
-  allow ("view the host does not allow unordered=true format=53 flags=2",
-  every session). fxceless's fork gives such depth textures colour twins
-  (commit 578d459); that port is a task of its own.
+- **Second fix: depth twins (§6.1).** The deferred lighting also tests
+  each tile's rectangle against material classes a compute program writes
+  into a depth texture through unordered access, which XTP's host depth
+  textures did not allow ("view the host does not allow unordered=true
+  format=53 flags=2", every session). Ported from fxceless's fork (commit
+  578d459): such depth textures get colour twins. The refusal is gone.
+- **Still black (§6.3).** With both fixes, and with smemraw's and
+  mesh-fix's branches merged for the sessions, the scene colour still
+  holds 0 after every pass that writes it (worldlight-11 and -15). With
+  stride's stride table and run-time views switched on, the world's first
+  frame never completes (§6.2).
 - **Tooling (§3).** A per-pass view of a frame (`XTP_PASS_DUMP`), and
   `XTP_PRESENT_TARGET` to put any target the frame writes on screen: the
   person watched the world's street move, as an R8 material target, in two
@@ -248,27 +253,81 @@ with the copy alone, stayed black (no "copied from it" line). So
   decoding, a target shown scaled, a pass sampled after its ops with its
   small buffer.
 
-## 6. What still keeps the lighting black
+## 6. Depth twins, and what still keeps the lighting black
 
-(worldlight-5's result goes here.)
+### 6.1 The port (fxceless's fork, commit 578d459)
 
-- **Depth twins** (watch, fork study pick 1; fxceless's fork, commit
-  578d459): the tiled lighting writes each pixel's material class into a
-  depth texture through unordered access, then draws each class's
-  rectangles with the depth test "equal". XTP's host depth textures have no
-  unordered access (`resource::host_flags`) and the view is refused
-  (`descriptor/host.rs` `fits`): "view the host does not allow
-  unordered=true format=53 flags=2" in every session. No rectangle passes
-  the test. The fork gives such depth textures a colour twin that shaders
-  write, copies one side into the other when used, and draws a depth plane
-  of a depth-stencil format from its twin with a pass of ours (`SV_Depth`,
-  `class × asfloat(0x37800080)`). It touches `resource.rs`, `host.rs`
-  (prelude), `draw.rs`, `list.rs` and `descriptor/host.rs`.
-- **The world's geometry in the G-buffer**: the main mesh draws that do
-  not translate (§4.3) and the meshlet culling read as constant buffers
-  (watch item 147).
-- `11eeb27c2d15980d` (the light loop's preparation) does not translate in
-  any session ("a descriptor's address or format read as data").
+The tiled lighting writes each pixel's material class into a depth
+texture through unordered access, then draws each class's rectangles with
+the depth test "equal" (depth `class × asfloat(0x37800080)`). XTP's host
+depth textures have no unordered access (`resource::host_flags`), so the
+view was refused ("view the host does not allow unordered=true format=53
+flags=2" in every session) and the classes went nowhere. Ported:
+
+- `resource.rs`: `Twin`, a colour texture of the depth format's typeless
+  family (R16 or R32) with unordered access, or for a depth-stencil format
+  an R8 twin of the stencil plane (copied through a buffer) and an R16 or
+  R32 twin of the depth plane; `twin_view` makes the title's unordered
+  access views of the depth texture on its twin.
+- `host/twins.rs`: per list, which side it uses and writes (`twin_use`,
+  `twins_written`); a side written by one list and used by a later one is
+  brought up to date in the later list's prelude at submission; a twin the
+  list wrote last is copied back when the list closes, and a depth plane
+  is drawn from its twin by a pass of ours (`SV_Depth`, test "always").
+- Hooks (added lines): `draw.rs` (depth target, shader reads, unordered
+  access, end of binding), `list.rs` (copies, resolves, depth clears, UAV
+  clears), `descriptor/host.rs` (the view on the twin).
+- Changed from the fork: a twin is made with the first unordered access
+  view of its texture, not with the texture (e6d37c2). The title places
+  its shadow maps anew every frame with unordered access asked and never
+  viewed; a committed twin for each cost a video memory admission apiece.
+- Tests (WARP): `host::twins::tests::a_depth_texture_reads_what_its_twin_was_written`,
+  `a_depth_stencil_textures_twins_reach_its_planes` (classes 65 and 129
+  found in the depth plane, the stencil plane copied).
+- Effect in sessions: the refusal is gone (worldlight-10, -11).
+
+### 6.2 Sessions after the fixes
+
+| Session | Build | Result |
+|---|---|---|
+| worldlight-5, -6 | alias decode, before main's read-race fix | the title stopped (assertion in a file read; fixed on `main`, a2b07a9) |
+| worldlight-7 | + mesh-fix | world in 25 s; 50 views decoded; light textures no longer 0 (two 384×384: max 0.16, 0.50); scene colour still 0 after its 7 writers |
+| worldlight-8, -9 | + twins, + smemraw (8) | loading 90 s or more: shader surveys of other tasks ran on the PC at the same time (CPU 100 %); not the twins (§ worldlight-10) |
+| worldlight-10 | + twins (made with the texture) | world in 30 s, 3.2 fps; no refusal; scene colour 0; a D32S8 depth uniform at 0.9994 after a mesh pass (not seen in -11) |
+| worldlight-11 | + twins made at the first view | world in 31 s, 2.4 fps; depth normal (7.3 % geometry); scene colour 0 |
+| worldlight-12 | everything (mine, smemraw, stride with its switches, mesh-fix) | world at 49 s, then no frame in 40 s: thousands of new translations, cold caches |
+| worldlight-13, -14 | the same, a 150 s warm-up, then with `XTP_STACKS` | world at 64 and 25 s, then no frame at all, every pipeline made: not a cold cache; the title's main thread waits in the title, nothing of XTP's is blocked |
+| worldlight-15 | the same, `XTP_STRIDE_TABLE=0`, `XTP_RUN_TIME_VIEWS=0` | frames again (world at 47 s, 1 fps); scene colour 0 (`frame-1349.png` black) |
+
+### 6.3 What still keeps the lighting black
+
+- Every pass that writes the scene colour still leaves 0 with everything
+  above (worldlight-15, frame 1349: seven passes). The light textures read
+  through the R9G9B9E5 views now hold light (worldlight-7: max 0.16 and
+  0.50 in two 384×384 targets), and the depth classes reach the depth
+  textures, so the lighting's inputs are no longer all black; its output
+  is.
+- The sky (`348e1e8c414c7eca`, 11 dispatches) writes 0 with its inputs
+  decoded. Its exposure is sane (8.39 then, the auto-exposure pushing up
+  against a black scene); its other inputs are table constants read from
+  title memory at submission (`draw.rs`: constant tables are filled from
+  title memory, which misses constants the GPU writes in the same frame)
+  and buffers.
+- Watch item 183 (another tester): the combined deferred pass multiplies
+  the lit scene by a 960×540 transmittance texture that nothing writes. In
+  the per-pass views no op reads a 960×540 texture and writes the scene
+  colour: the pass is dropped or reads through computed heap indices. Not
+  found yet; `XTP_SKIP_PIPELINES=<hash>` (diagnostics) skips one once it is.
+- Watch item 181: on NVIDIA the view heap is capped at 1,000,000 slots
+  (1,245,184 asked, 737,856 mirrored, 262,144 dynamic): 41 % of the
+  title's slots have no host slot and read zeros.
+- Programs that still do not translate: 255 a session before smemraw
+  (mesh `910b4be059bfb28f`, `321d411b20a35ef9`: scalar memory read as data,
+  which smemraw fixes; `11eeb27c2d15980d`, the light loop's preparation: "a
+  descriptor's address or format read as data").
+- Shader surveys of other tasks ran on the PC during worldlight-8 and -9:
+  their 90-second loads and five-times slower translations are those
+  surveys', not the twins'.
 
 ## 7. Upstream, reviewed
 
@@ -288,3 +347,25 @@ the list used the source otherwise. Changed:
   every texture every draw reads.
 Not taken: the fork's switch `VICTORY_ALIAS_COPY` (XTP's `XTP_ALIAS_SHARING=0`
 already turns aliasing off for A/B runs, diagnostics builds).
+
+**fxceless's fork, depth twins (commit 578d459, GPL-3.0).** Taken: the
+`Twin` (a colour texture per depth texture written through unordered
+access; per plane for depth-stencil formats), the per-list record of which
+side is used and written, the copies in the submission prelude, the copy
+back when a list closes, the depth plane pass with `SV_Depth` and the class
+step constant, the stencil plane copied through a buffer, the view
+mapping. Changed:
+- a twin is made with the first unordered access view of its texture: the
+  fork makes it with the texture, and here every shadow map placed anew
+  each frame with unordered access asked would cost a video memory
+  admission;
+- the twin's own textures are host textures of XTP's (resident, unpooled)
+  and its lists' state tracking is XTP's (`HostList::transition` and the
+  prelude);
+- the fork's switches are `XTP_DEPTH_TWINS=0|stencil|nodepth`.
+Kept as the fork has them, and said: whole textures are copied, not the
+mips written; a depth plane's twin is not given the plane (draws that
+write the plane after a shader wrote the twin are overwritten by the pass
+when the list closes; in worldlight-10, with twins made eagerly, one
+D32S8 depth read 0.9994 everywhere after a mesh pass, not seen with
+lazy twins in worldlight-11); multisampled textures' views stay null.
