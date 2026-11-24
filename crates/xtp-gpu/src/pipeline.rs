@@ -101,6 +101,11 @@ pub(crate) struct Translated {
     /// Whether the console program runs in 64-lane waves (its lane masks
     /// and lane numbers are a wave64's).
     pub(crate) wave64: bool,
+    /// Whether it is a mesh program whose thread group is one console
+    /// wave of more than 32 lanes, with LDS: inside one wave the console
+    /// compiler leaves out the barriers between lanes, which a host that
+    /// runs the wave as two 32-lane waves needs (see `host::Needs`).
+    pub(crate) mesh_lds_in_one_wave: bool,
 }
 
 #[cfg(windows)]
@@ -139,7 +144,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use xtp_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container, crate::device::host_target())?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let (used, wave64) = match c.part(FourCC::DXIL) {
+    let native = match c.part(FourCC::DXIL) {
         Some(part) => xtp_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -148,12 +153,39 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                     p.stage,
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
-            })
-            .map(|p| (p.used, p.wave64))
-            .unwrap_or_default(),
-        None => (Vec::new(), false),
+            }),
+        None => None,
     };
-    Ok(Translated { host, used, wave64 })
+    Ok(match native {
+        Some(p) => Translated {
+            host,
+            wave64: p.wave64,
+            mesh_lds_in_one_wave: mesh_lds_in_one_wave(&p),
+            used: p.used,
+        },
+        None => Translated {
+            host,
+            used: Vec::new(),
+            wave64: false,
+            mesh_lds_in_one_wave: false,
+        },
+    })
+}
+
+/// Whether `p` is a mesh program whose group is one console wave of more
+/// than 32 lanes and that has LDS ([`Translated::mesh_lds_in_one_wave`]).
+/// The group's lane count is the HLSL group rounded up to waves; a group
+/// of several console waves has its barriers (the console needs them
+/// between its waves).
+// shortcut: the LDS a program allocates, not whether one half of a wave
+// reads what the other wrote; telling those apart is the translator's
+// (it does so for compute programs, which take WaveSize(64) or the
+// console flow instead).
+#[cfg(windows)]
+fn mesh_lds_in_one_wave(p: &xtp_shader::NativeProgram) -> bool {
+    let wave = if p.wave64 { 64 } else { 32 };
+    matches!(&p.io, xtp_shader::native::StageIo::Ms(ms)
+        if ms.lds_bytes > 0 && ms.threads > 32 && ms.threads <= wave)
 }
 
 #[repr(C)]
@@ -536,49 +568,37 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
-    /// The acceptance test of the wave64 wiring (VIctory #223): on the
-    /// test's device (WARP with `XTP_TEST_ADAPTER=warp`, whose waves are 4
-    /// lanes), the target forced to an NVIDIA host's 32 to 32 (as
-    /// `XTP_HOST_LANES=32-32` does) translates a console wave64 compute
-    /// program as two 32-lane waves, `WaveSize(32)`. Its host pipeline is
-    /// made where the device runs 32-lane waves (an RTX 4080), and refused
-    /// for that reason, before any driver call, where it does not (WARP).
+    /// A mesh program shares LDS within one console wave when its group is
+    /// one wave64 of more than 32 lanes with LDS: Grand Theft Auto VI's
+    /// mesh programs are all 128-lane groups (two waves, with barriers).
     #[cfg(windows)]
     #[test]
-    fn wave64_compute_is_translated_for_a_forced_32_lane_target() {
-        let test = "pipeline::tests::wave64_compute_is_translated_for_a_forced_32_lane_target";
-        if crate::testgpu::device(test).is_none() {
-            return;
-        }
-        let lanes = crate::device::host_wave_lanes().expect("the device's lanes");
-        let target = crate::device::target_of(Some(lanes), Some("32-32")).unwrap();
-        let (c, native) = crate::shader_cache::wave64_in_half_program();
-        let translated = xtp_shader::emit::translate_program_for(&c, &native, target)
-            .unwrap_or_else(|(step, e)| panic!("{}: {e}", step.name()));
-        let needs = host::Needs::of(&translated.dxil).unwrap();
-        assert_eq!(needs.lanes, (32, 32), "WaveSize(32)");
-        let shader = Arc::new(Shader {
-            stage: "compute",
-            hash: "forced32-wave64".into(),
-            container: Vec::new(),
-            translated: OnceLock::from(Some(Translated {
-                host: translated,
-                used: native.used.clone(),
-                wave64: native.wave64,
-            })),
-        });
-        let made = host::HostPipeline::new(&[shader], None);
-        if lanes.0 <= 32 && 32 <= lanes.1 {
-            assert!(made.is_some(), "a 32-lane host makes it ({lanes:?})");
-        } else {
-            assert!(made.is_none(), "{lanes:?}");
-            let why = format!(
-                "compute shader needs 32-lane waves; the host has {} to {}",
-                lanes.0, lanes.1
-            );
-            let refused = refusals().unwrap_or_default();
-            assert!(refused.contains(&why), "{refused}");
-        }
+    fn mesh_lds_in_one_wave_is_a_one_wave_group_with_lds() {
+        use xtp_shader::native::{MeshIo, StageIo};
+        let mesh = |wave64, threads, lds_bytes| xtp_shader::NativeProgram {
+            stage: xtp_shader::HwStage::Ms,
+            wave64,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ms(MeshIo {
+                outputs: Vec::new(),
+                clip_cntl: 0,
+                threads,
+                max_vertices: 64,
+                max_primitives: 64,
+                topology: 2,
+                lds_bytes,
+            }),
+            code: Vec::new(),
+        };
+        assert!(mesh_lds_in_one_wave(&mesh(true, 64, 16)));
+        assert!(!mesh_lds_in_one_wave(&mesh(true, 64, 0)), "no LDS");
+        assert!(!mesh_lds_in_one_wave(&mesh(true, 128, 16)), "two waves");
+        assert!(!mesh_lds_in_one_wave(&mesh(true, 32, 16)), "one host wave");
+        assert!(!mesh_lds_in_one_wave(&mesh(false, 32, 16)), "wave32");
+        let (_, compute) = crate::shader_cache::wave64_in_half_program();
+        assert!(!mesh_lds_in_one_wave(&compute), "compute");
     }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {

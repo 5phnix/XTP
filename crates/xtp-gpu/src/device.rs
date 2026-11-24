@@ -388,12 +388,13 @@ pub fn host_target() -> xtp_shader::emit::Target {
             "shaders translated for waves of"
         );
         if !target.runs(64) {
-            // VIctory #439's text, and #578's mesh programs.
+            // VIctory #439's text, and #578's mesh programs as XTP narrows
+            // them (`pipeline::host::Needs::wave64_mesh`).
             tracing::warn!(
                 "the host has no 64-lane waves: console wave64 compute programs that need \
                  their whole wave run as two 32-lane waves where there is a form for them; \
                  the rest do not translate, and their dispatches are dropped; wave64 mesh \
-                 programs are refused"
+                 programs that share LDS within one wave are refused"
             );
         }
         target

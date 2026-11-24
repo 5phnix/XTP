@@ -3,9 +3,9 @@
 //! translated it (the BLAKE3 of our executable), so a rebuilt translator
 //! never serves an old translation, and by the wave sizes it was made for
 //! (VIctory #223: a translation for a 32-lane host is not a 64-lane one's).
-//! Entries go through
-//! `xtp-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! Entries go through `xtp-pipeline`'s content-addressed cache, which
+//! writes them atomically; an entry that does not read back is translated
+//! again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
@@ -72,13 +72,26 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
     let translate =
         |c: &[u8]| xtp_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &key(build(), target), container, translate),
+        Some(cache) => kept(cache, container, target, translate),
         None => translate(container),
     }
 }
 
+/// `translate`'s translation of `container` for `target` from `cache`,
+/// under this build's key for that target; made and stored on a miss.
+/// The target that keys the entry is the one `translate` is for: the
+/// caller passes both.
+pub(crate) fn kept(
+    cache: &Cache,
+    container: &[u8],
+    target: Target,
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<HostShader, String> {
+    cached(cache, &key(build(), target), container, translate)
+}
+
 /// The part of an entry's key before the container: the build, and the
-/// wave sizes translated for.
+/// wave sizes translated for (fixed sizes, so no two pairs run together).
 fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
@@ -86,8 +99,8 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// The cache entry's converter: the key ([`key`]) and the container in,
+/// the encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
@@ -110,11 +123,11 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
 
 fn cached(
     cache: &Cache,
-    build: &[u8; 32],
+    key: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    let input = [&key[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
@@ -140,36 +153,59 @@ fn cached(
     (converter.translate)(container)
 }
 
-/// For tests: a console wave64 compute program of 64 threads whose lanes
-/// read only inside their 32-lane half (a `ds_swizzle` xor 16, then a DPP
-/// row mirror: lane t ends with lane t ^ 31's v0) and store it, with an
-/// empty container. Translated for a host without 64-lane waves it runs as
-/// two 32-lane waves and declares `WaveSize(32)`, else `WaveSize(64)`.
-/// The code is the wave64 port's own test program (`emit/split_tests.rs`,
-/// from VIctory #233 by r4tedx).
+/// For tests: [`wave64_program`] with its lane reads.
 #[cfg(test)]
 pub(crate) fn wave64_in_half_program() -> (xtp_shader::Container<'static>, xtp_shader::NativeProgram)
 {
+    wave64_program(true)
+}
+
+/// For tests: a console wave64 compute program of 64 threads that stores
+/// one dword per thread, dword 64 g + t for thread t of group g, through a
+/// raw UAV whose table is user data 0, with an empty container. With
+/// `in_half`, its lanes read only inside their 32-lane half (a `ds_swizzle`
+/// xor 16, then a DPP row mirror) and thread t stores t ^ 31: translated
+/// for a host without 64-lane waves it runs as two 32-lane waves and
+/// declares `WaveSize(32)`, else `WaveSize(64)`. Without, thread t stores
+/// t and the translation runs in waves of any size. The code is the wave64
+/// port's own test program (`emit/split_tests.rs`, from VIctory #233 by
+/// r4tedx).
+#[cfg(test)]
+pub(crate) fn wave64_program(
+    in_half: bool,
+) -> (xtp_shader::Container<'static>, xtp_shader::NativeProgram) {
     use xtp_shader::native::{ComputeIo, RootParam, StageIo};
     let threads = 64;
+    let reads: &[u32] = if in_half {
+        &[
+            0xD8D4_401F,
+            0x0100_0000, // ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM, and 0x1f, xor 0x10)
+            0x7E04_02FA,
+            0xFF01_4001, // v_mov_b32_dpp v2, v1 row_mirror row_mask:0xf bank_mask:0xf
+        ]
+    } else {
+        &[0x7E04_0300] // v_mov_b32 v2, v0
+    };
     let words = [
-        0xBE82_0300, // s_mov_b32 s2, s0
-        0xBE83_0380, // s_mov_b32 s3, 0
-        0xF408_0101,
-        0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
-        0x9308_FF01,
-        threads * 4, // s_mul_i32 s8, s1, threads * 4
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0xD8D4_401F,
-        0x0100_0000, // ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM, and 0x1f, xor 0x10)
-        0x7E04_02FA,
-        0xFF01_4001, // v_mov_b32_dpp v2, v1 row_mirror row_mask:0xf bank_mask:0xf
-        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
-        0x4A06_0608, // v_add_nc_u32 v3, s8, v3
-        0xE070_1000,
-        0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
-        0xBF81_0000, // s_endpgm
-    ];
+        &[
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+            0x9308_FF01,
+            threads * 4, // s_mul_i32 s8, s1, threads * 4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ][..],
+        reads,
+        &[
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0x4A06_0608, // v_add_nc_u32 v3, s8, v3
+            0xE070_1000,
+            0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+            0xBF81_0000, // s_endpgm
+        ],
+    ]
+    .concat();
     let native = xtp_shader::NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
