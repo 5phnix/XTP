@@ -20,19 +20,30 @@
 //! A value is uniform when it is:
 //! - an SGPR input, a `v_readfirstlane_b32` or `v_readlane_b32` result, or
 //!   the result of a scalar instruction whose reads are all uniform (its
-//!   SCC too);
-//! - the result of an operation of [`UNIFORM_VALU`] without DPP whose reads
-//!   are all uniform. A carry-in is read lane by lane: its lane bits must be
-//!   uniform ([`Tracer::mask_uniform`]). The old value of the VGPRs it
-//!   writes, which lanes that skip it keep, counts where lanes may skip it
-//!   (a guard in the per-lane form, an EXEC short of every lane in the
-//!   console flow): that old value must be uniform, and so must the
-//!   condition, so that every lane runs it or none does;
+//!   SCC too), but never a value of EXEC (below);
+//! - the result of an operation of [`UNIFORM_VALU`] that every lane runs
+//!   (no guard in the per-lane form, the EXEC of every lane in the console
+//!   flow), that writes whole dwords from its own lane (no DPP, no SDWA
+//!   destination narrower than a dword: [`keeps_old`]), and whose operands
+//!   are all uniform. The tracer reads such a result from the instruction's
+//!   operands ([`Tracer::vorigin`], [`Tracer::vadd`]), which is the value
+//!   only in the lanes that ran it, so a write some lane may skip is never
+//!   uniform, not even when every lane runs it or none does (a uniform
+//!   condition, a uniform old value): when none does, the address is the
+//!   old value's. The operands are those of the encoding ([`explicit`]): an
+//!   EXEC named there counts (and is not uniform, above), the EXEC that
+//!   guards the instruction and the old value of the VGPRs it writes (which
+//!   no lane keeps) do not. A carry-in is read lane by lane: its lane bits
+//!   must be uniform ([`Tracer::mask_uniform`]);
 //! - a phi whose arguments are all uniform, when no branch whose lanes may
 //!   part ways sends lanes to it along different edges: not a join of the
 //!   two arms of such a branch, nor a block of a loop it can leave or stay
 //!   in lane by lane. The set of uniform phis is the greatest fixed point (a
 //!   loop counter's own increment feeds its exit test).
+//!
+//! EXEC as a number holds the lanes that run where it is read: the per-lane
+//! form builds it with a ballot of the lanes there, not from operands each
+//! lane holds alike, so no value of EXEC is uniform here.
 //!
 //! A branch is uniform when its per-lane condition ([`LaneExit::Branch`])
 //! is made of uniform atoms: SCC values that are uniform, and lane bits of
@@ -46,24 +57,37 @@
 //! exposure passes compute their table index so (a clamp of constants)
 //! under a narrowed EXEC, where the console flow forbids the uniform claim.
 //!
-//! Not taken from upstream, each a claim that holds in no lowering:
-//! - `s_cbranch_execz` and `s_cbranch_execnz` as uniform branches. The
-//!   per-lane form branches on the lane's own EXEC bit there, so a value
-//!   only the lanes an `s_and_saveexec` let in write is per-lane at the
-//!   join.
+//! Not taken from upstream, each a claim that fails in at least one
+//! lowering (the tests that pin each are named):
+//! - `s_cbranch_execz` and `s_cbranch_execnz` as uniform branches. They are
+//!   in the console flow, where the wave takes them as one; the per-lane
+//!   form branches on the lane's own EXEC bit, so a value only the lanes an
+//!   `s_and_saveexec` let in write, an SGPR too, is per-lane at the join
+//!   (`a_scalar_set_on_one_side_of_an_execz_skip_is_per_lane`).
 //! - A guarded write as uniform when its old value is: lanes that run it
-//!   hold the new value, lanes that skip it the old one.
+//!   hold the new value, lanes that skip it the old one
+//!   (`tests::a_write_some_lane_may_skip_is_not_uniform`). Nor when its
+//!   condition is uniform too, as this port first had it (b8714dd): see
+//!   above (`a_write_no_lane_runs_is_not_read_from_its_operands`).
 //! - A carry-in, and the mask a branch on VCC tests, as uniform when the
 //!   SGPR value holding it is: an SGPR is the same in every lane, its bits
-//!   are not.
+//!   are not (`a_carry_in_from_an_sgpr_mask_is_per_lane`,
+//!   `a_loop_left_on_the_lane_bits_of_an_sgpr_is_per_lane`).
 //! - DPP operands: a lane reads another lane's value, or keeps its old one
 //!   where it has no source lane.
+//!
+//! Overlap, for later: the mesh lowering's analysis (`emit/lower/uniform.rs`
+//! on the wave64 mesh branch, not on main yet) has its own `Uniformity`,
+//! post-dominators and rules, for its own question (which values the lanes
+//! of a console wave, or of its thread group, share). Once it lands,
+//! [`keeps_old`] and [`explicit`] should be its `keeps_old` and
+//! `source_regs`, and one post-dominator implementation should serve both.
 
 use std::cell::{OnceCell, RefCell};
 
 use super::{MAX_ROUNDS, Site, Sum, Term, Tracer};
-use crate::gfx10::{Fields, Operand};
-use crate::ir::{EXEC, Exit, Inst, Reg, Value, reverse_postorder};
+use crate::gfx10::{Fields, NULL, Operand, Valu};
+use crate::ir::{EXEC, Exit, Inst, M0, Reg, VCC, Value, reverse_postorder};
 use crate::structure::{Atom, Bool, Bools, LaneExit, Structured};
 
 /// VALU operations whose result is uniform when their operands are: the
@@ -90,8 +114,9 @@ const UNIFORM_VALU: &[&str] = &[
 /// Per block: the blocks a lane-divergent branch there taints.
 type Regions = Vec<Option<Vec<usize>>>;
 
-/// What the tracer learns about uniformity, on first use.
-pub(super) struct Uniformity {
+/// What the tracer learns about the uniformity of address values, on first
+/// use.
+pub(super) struct AddressUniformity {
     /// Per value: [`Tracer::uniform`], once known.
     memo: RefCell<Vec<Option<bool>>>,
     /// Per value: whether a phi is uniform, once settled.
@@ -102,10 +127,10 @@ pub(super) struct Uniformity {
     console: OnceCell<Option<Structured>>,
 }
 
-impl Uniformity {
+impl AddressUniformity {
     /// For a program of `values` values.
     pub(super) fn new(values: usize) -> Self {
-        Uniformity {
+        AddressUniformity {
             memo: RefCell::new(vec![None; values]),
             phi_ok: RefCell::new(None),
             regions: OnceCell::new(),
@@ -116,6 +141,38 @@ impl Uniformity {
 
 fn is_exec(reg: Reg) -> bool {
     matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+}
+
+/// Whether a VALU instruction keeps part of a register it writes even in
+/// the lanes that run it, or reads another lane's: DPP (masked rows, lanes
+/// with no source lane), SDWA destinations narrower than a dword (the other
+/// bits stay or are made from the selected ones; any narrow `dst_sel` is
+/// refused, as the mesh analysis's `keeps_old` does). The other operations
+/// of [`UNIFORM_VALU`] write whole dwords.
+fn keeps_old(f: &Valu) -> bool {
+    f.dpp.is_some() || f.sdwa.is_some_and(|s| s.dst_sel < 6)
+}
+
+/// Whether `reg` is one of the registers the operand `op` names, as
+/// [`crate::ir`] reads them (`vccz`, `execz`, `scc` and `lds_direct` read
+/// the register behind them); `lanes` is the mask's dwords.
+fn explicit(op: &Operand, reg: Reg, lanes: u8) -> bool {
+    let range = |first: u8, n: u8, x: u8| {
+        (0..u16::from(n)).contains(&(u16::from(x).wrapping_sub(first.into())))
+    };
+    let within = |first: u8, n: u8| matches!(reg, Reg::S(c) if range(first, n, c));
+    match *op {
+        Operand::Scalar { code, .. } if code == NULL => false,
+        Operand::Scalar { code, dwords } => within(code, dwords),
+        Operand::Vector { reg: first, dwords } => {
+            matches!(reg, Reg::V(v) if range(first, dwords, v))
+        }
+        Operand::Const(251) => within(VCC, lanes),
+        Operand::Const(252) => within(EXEC, lanes),
+        Operand::Const(253) => reg == Reg::Scc,
+        Operand::Const(254) => within(M0, 1),
+        _ => false,
+    }
 }
 
 /// The lane mask `inst` reads lane by lane as a carry-in (the third operand
@@ -298,7 +355,7 @@ impl Tracer<'_> {
     fn uniform_now(&self, v: Value) -> bool {
         let n = v.0 as usize;
         if let Some(reg) = self.inputs[n] {
-            return matches!(reg, Reg::S(_));
+            return matches!(reg, Reg::S(_)) && !is_exec(reg);
         }
         if self.phis[n].is_some() {
             return self.phi_uniform(v);
@@ -306,12 +363,15 @@ impl Tracer<'_> {
         let (Some(site), Some(inst)) = (self.defs[n], self.def(v)) else {
             return false;
         };
+        if inst.writes.iter().any(|&(r, w)| w == v && is_exec(r)) {
+            return false;
+        }
         if matches!(inst.name(), "v_readfirstlane_b32" | "v_readlane_b32") {
             return true;
         }
         match &inst.fields {
             Fields::Sop { .. } => inst.reads.iter().all(|&(_, x)| self.uniform(x)),
-            Fields::Valu(f) if f.dpp.is_none() && UNIFORM_VALU.contains(&inst.name()) => {
+            Fields::Valu(f) if !keeps_old(f) && UNIFORM_VALU.contains(&inst.name()) => {
                 self.valu_uniform(site, inst)
             }
             _ => false,
@@ -319,32 +379,30 @@ impl Tracer<'_> {
     }
 
     /// Whether the VALU instruction `inst` at `site` writes the same value
-    /// in every lane, in both forms of the program.
+    /// in every lane, in both forms of the program: every lane runs it, from
+    /// uniform operands. The console flow, which is built on first use, is
+    /// checked last.
     fn valu_uniform(&self, (b, i): Site, inst: &Inst) -> bool {
         let Some(st) = self.lanes else {
             return false;
         };
-        // Where some lanes may skip it, keeping the old value.
-        let per_lane = st.guards[b][i].map(|g| (&st.bools, g));
-        let console = self
-            .console()
-            .and_then(|cs| Some((&cs.bools, cs.execs[b][i].filter(|&e| e != Bool::TRUE)?)));
-        let skips = [per_lane, console];
-        skips
-            .iter()
-            .flatten()
-            .all(|&(bools, when)| self.bool_uniform(bools, when))
-            && self.reads_uniform(inst, skips.iter().any(Option::is_some))
+        st.guards[b][i].is_none()
+            && self.reads_uniform(inst)
+            && self
+                .console()
+                .is_none_or(|cs| cs.execs[b][i] == Some(Bool::TRUE))
     }
 
-    /// Whether `inst` reads uniform values, but EXEC, a carry-in (whose lane
-    /// bits must be uniform instead) and, unless `old`, the old value of the
-    /// VGPRs it writes and does not take as an operand (the IR lists a
-    /// register read twice once).
-    fn reads_uniform(&self, inst: &Inst, old: bool) -> bool {
+    /// Whether the operands `inst` reads ([`explicit`]) are uniform, a
+    /// carry-in by its lane bits. Its other reads, EXEC as its guard and the
+    /// old value of the VGPRs it writes, do not count: the callers take
+    /// instructions every lane runs whole, or lane bits that do not depend
+    /// on them.
+    fn reads_uniform(&self, inst: &Inst) -> bool {
         let Fields::Valu(f) = &inst.fields else {
             return false;
         };
+        let lanes = if self.p.wave64 { 2 } else { 1 };
         let carry = carry_in(inst);
         if let Some((code, dwords)) = carry {
             let lo = inst.read(Reg::S(code));
@@ -357,16 +415,8 @@ impl Tracer<'_> {
             (Reg::S(c), Some((code, n))) => (code..code + n).contains(&c),
             _ => false,
         };
-        let operand = |r: Reg| {
-            f.src.iter().any(|op| match (*op, r) {
-                (Operand::Vector { reg, dwords }, Reg::V(v)) => (reg..reg + dwords).contains(&v),
-                _ => false,
-            })
-        };
-        let only_old =
-            |r: Reg| matches!(r, Reg::V(_)) && !operand(r) && inst.writes.iter().any(|w| w.0 == r);
         inst.reads.iter().all(|&(reg, x)| {
-            is_exec(reg) || carried(reg) || (!old && only_old(reg)) || self.uniform(x)
+            !f.src.iter().any(|op| explicit(op, reg, lanes)) || carried(reg) || self.uniform(x)
         })
     }
 
@@ -410,9 +460,7 @@ impl Tracer<'_> {
         };
         let name = inst.name();
         let carry_out = UNIFORM_VALU.contains(&name) && f.carry.is_some();
-        (name.starts_with("v_cmp") || carry_out)
-            && f.dpp.is_none()
-            && self.reads_uniform(inst, false)
+        (name.starts_with("v_cmp") || carry_out) && f.dpp.is_none() && self.reads_uniform(inst)
     }
 
     /// The program in the console flow, made on first use.
@@ -628,4 +676,50 @@ fn postdominators(n: usize, succs: &[Vec<usize>], fwd: &[bool]) -> Vec<usize> {
         }
     }
     ipdom
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Tracer;
+    use crate::ir::Reg;
+    use crate::native::HwStage;
+
+    /// The guarded-write rule alone, in the per-lane form (the program as
+    /// if it had no console flow, so that rule cannot refuse it instead):
+    /// v7 is written under EXEC narrowed by `compare`, with no branch, so
+    /// lanes outside it keep the old v7. With a per-lane compare, lanes 0
+    /// to 4 hold 12 and the others 0 (upstream took the write as uniform
+    /// because its old value is); with a uniform one, every lane holds 12
+    /// or every lane 0, which the tracer cannot tell apart from the
+    /// operands (b8714dd took it as uniform).
+    #[test]
+    fn a_write_some_lane_may_skip_is_not_uniform() {
+        for (compare, what) in [
+            (0x7D88_0085, "v_cmp_gt_u32 vcc_lo, 5, v0: lanes 0 to 4"),
+            (
+                0x7D84_1280,
+                "v_cmp_eq_u32 vcc_lo, 0, v9: every lane or none",
+            ),
+        ] {
+            let words: [u32; 7] = [
+                0x7E0E_0280, // v_mov_b32 v7, 0
+                0x7E12_0205, // v_mov_b32 v9, s5
+                compare,
+                0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+                0x7E0E_028C, // v_mov_b32 v7, 12
+                0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+                0xBF81_0000, // s_endpgm
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let t = Tracer::new(&p, &[], HwStage::Cs, Some(&st)).unwrap();
+            t.uniformity.console.set(None).unwrap();
+            let insts = &p.blocks[0].insts;
+            let v7 = |i: usize| insts[i].write(Reg::V(7)).unwrap();
+            assert!(st.guards[0][4].is_some(), "{what}: the move is guarded");
+            assert!(t.uniform(v7(0)), "{what}: the old value is uniform");
+            assert!(!t.uniform(v7(4)), "{what}");
+        }
+    }
 }
