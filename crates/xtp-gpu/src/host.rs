@@ -798,6 +798,8 @@ impl ListRef {
 /// What is left of a submission once the GPU has run it.
 struct Pending {
     lists: Vec<ListRef>,
+    /// Its number in the host copies (`shadow::submission`).
+    submission: u64,
     /// The destinations of its GPU buffer copies (host copy, address,
     /// bytes), merged per host copy.
     copied: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -815,7 +817,7 @@ impl Pending {
     /// A submission's, after its steps ran, with the title memory its GPU
     /// work writes (written back, written at the bottom of the pipe) and
     /// reads (host copies and textures brought up to date for it).
-    fn of(runs: &[&HostList]) -> (Pending, Touches) {
+    fn of(runs: &[&HostList], submission: u64) -> (Pending, Touches) {
         type Ranges = Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>;
         let (mut back, mut copied): (Ranges, Ranges) = (Vec::new(), Vec::new());
         let (mut writes, mut touches) = (Vec::new(), Touches::default());
@@ -867,6 +869,7 @@ impl Pending {
         (touches.shaders, touches.copies) = (through(&back), through(&copied));
         let pending = Pending {
             lists: runs.iter().map(|&l| ListRef(l)).collect(),
+            submission,
             copied,
             back,
             writes,
@@ -1043,8 +1046,8 @@ impl Host {
             });
         }
         // One submission at a time from preparation to submission (to
-        // copy-back with `XTP_SYNC_SUBMIT`): snapshots and the ranges
-        // shaders write are per host copy, not per submission.
+        // copy-back with `XTP_SYNC_SUBMIT`): what a step waits for is
+        // decided against the submissions before it.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         let waited_before = waited_here();
@@ -1070,6 +1073,7 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch {
             host: Some(self),
+            submission: crate::shadow::submission(),
             ..Batch::default()
         };
         for list in runs {
@@ -1081,7 +1085,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        let (mut pending, touches) = Pending::of(runs);
+        let (mut pending, touches) = Pending::of(runs, batch.submission);
         // Preparing, without the waits for earlier submissions (counted as
         // waiting).
         let waited = std::time::Duration::from_micros(waited_here() - waited_before);
@@ -1357,11 +1361,11 @@ impl Host {
         // big ranges dozens of times).
         let copying = std::time::Instant::now();
         for (shadow, address, len) in &p.copied {
-            let written = shadow.write_back(*address, *len);
+            let written = shadow.write_back(p.submission, *address, *len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         for (shadow, address, len) in &p.back {
-            let written = shadow.copy_back(*address, *len);
+            let written = shadow.copy_back(p.submission, *address, *len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         let back = copying.elapsed();
@@ -2135,7 +2139,7 @@ impl HostList {
                     // the shaders start from the title's data.
                     batch.settle(*address, *len, false);
                     batch.flush();
-                    shadow.writing(*address, *len);
+                    shadow.writing(batch.submission, *address, *len);
                     continue;
                 }
                 // The copy reads host copies on the GPU, written back after.
@@ -2144,6 +2148,7 @@ impl HostList {
                 // wrote is told from the copy's bytes, which it would change.
                 Step::GpuCopy(shadow, address, len) => {
                     batch.settle_shaders(shadow, *address, *len);
+                    shadow.copying(batch.submission, *address, *len);
                     moved(Moved::GpuCopy, *len);
                     continue;
                 }
@@ -2181,6 +2186,8 @@ struct Batch<'a> {
     textures: std::collections::HashSet<usize>,
     /// The host, whose earlier submissions may still be in flight.
     host: Option<&'a Host>,
+    /// The submission's number in the host copies (`shadow::submission`).
+    submission: u64,
 }
 
 impl Batch<'_> {

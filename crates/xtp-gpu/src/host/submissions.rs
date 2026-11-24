@@ -271,6 +271,57 @@ fn a_gpu_copy_over_what_earlier_shaders_write_waits_for_them() {
     assert_eq!(out.words(), want);
 }
 
+/// Three submissions whose shaders write one host copy, the second still
+/// in flight when the third is prepared: each tells what its shaders wrote
+/// from the copy's bytes before its own GPU work. With one snapshot per
+/// copy, the third compared with bytes from before the first, took the
+/// zeros its shaders wrote for unchanged and left the title's write in
+/// place of them.
+#[test]
+fn three_submissions_on_one_shadow_compare_with_their_own_snapshots() {
+    let test =
+        "host::submissions::three_submissions_on_one_shadow_compare_with_their_own_snapshots";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let kernel = Kernel::new(host);
+    // One host copy (the window's), each range on a page of its own; all
+    // zeros at first.
+    let window = watched(4 << 20);
+    let page = crate::watch::PAGE;
+    let (a, b, zeros, scratch) = (window, window + page, window + 2 * page, window + 3 * page);
+    let lists: Vec<HostList> = (0..3).map(|_| host.new_list().unwrap()).collect();
+    kernel.dispatch(&lists[0], Pass::Fill, scratch as u64, a as u64);
+    lists[0].close();
+    kernel.dispatch(&lists[1], Pass::Fill, scratch as u64, b as u64);
+    lists[1].close();
+    let mut first_gate = Gate::close(host);
+    host.execute(&[&lists[0]]);
+    let mut second_gate = Gate::close(host);
+    host.execute(&[&lists[1]]);
+    // The first runs and is finished; the second stays in flight.
+    first_gate.open();
+    lists[0].settle();
+    assert!(lists[1].running());
+    let filled: Vec<u32> = (0..64).map(pattern).collect();
+    assert_eq!(words_at(a), filled, "the first's output written back");
+    // The title writes `a` again, then the third copies zeros over it.
+    for i in 0..64 {
+        // SAFETY: the test's memory.
+        unsafe { (a as *mut u32).add(i).write_volatile(0x1111_1111) };
+    }
+    kernel.dispatch(&lists[2], Pass::Copy, zeros as u64, a as u64);
+    lists[2].close();
+    host.execute(&[&lists[2]]);
+    second_gate.open();
+    host.drain();
+    assert_eq!(
+        words_at(a),
+        [0; 64],
+        "the third's zeros, not the title's write"
+    );
+    assert_eq!(words_at(b), filled, "the second's output");
+}
+
 /// A host list another thread submits.
 struct Shared(HostList);
 
