@@ -1,5 +1,6 @@
-//! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! Command queues. Submitted lists run on the host GPU in submission order
+//! (all queues on one host queue); a fence signal takes effect once the
+//! submissions before it have finished.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,8 +111,8 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007), counted
-/// as one title submission for the frame-rate line.
+/// Runs the lists' host lists (decision 0007), counted as one title
+/// submission for the frame-rate line.
 extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
@@ -145,8 +146,8 @@ pub(crate) struct Plane {
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
-/// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they return, so it signals at once.
+/// Signal with sync settings for the top and bottom of the pipe: as a plain
+/// signal, once earlier submissions have finished.
 extern "system" fn signal2_x(
     this: This,
     fence: This,
@@ -158,9 +159,23 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+/// Sets the fence once every submission so far has finished (written back,
+/// bottom-of-pipe writes done): at once if none is in flight.
+pub(crate) extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if let Some(host) = crate::host::made() {
+        // Kept until it is set.
+        object::add_ref(fence);
+        let at = fence as usize;
+        host.after(move || {
+            let fence = at as This;
+            crate::fence::signal(fence, value);
+            crate::fence::release_kept(fence);
+        });
+        return S_OK;
     }
     crate::fence::signal(fence, value)
 }
@@ -276,8 +291,16 @@ extern "system" fn present(
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
+    // Several planes: composed into one image (`dxgi::planes`).
     #[cfg(windows)]
-    if planes > 0
+    let composed = crate::dxgi::planes::present(planes, plane_parameters.cast(), frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some((resource, shown)) = composed {
+        blinks(frame, resource, 0x4, shown);
+    }
+    #[cfg(windows)]
+    if composed.is_none()
+        && planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
         && plane.count > 0
@@ -360,8 +383,9 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Done once every earlier
+/// submission has finished (what they write goes to the pages mapped when
+/// they were submitted).
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -375,6 +399,10 @@ extern "system" fn copy_page_mappings(
     };
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if let Some(host) = crate::host::made() {
+        host.drain();
     }
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
@@ -503,6 +531,12 @@ mod tests {
         );
         let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
         assert_eq!(signal(q, fence, 7), S_OK);
+        // Other tests' submissions may be in flight: the signal is behind
+        // them.
+        #[cfg(windows)]
+        if let Some(host) = crate::host::made() {
+            host.drain();
+        }
         assert_eq!(
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
             7

@@ -88,7 +88,9 @@ fn give_back(v: Vec<u8>) {
 const NOT_WATCHED: u8 = 2;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// written by the submitting thread, and by the thread finishing an earlier
+// submission only in ranges that one's GPU work wrote (which the submitting
+// thread leaves alone until it has finished: `host::Batch::settle`).
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -217,8 +219,8 @@ impl Shadow {
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
+                // SAFETY: inside the mapping; the submitting thread leaves
+                // the range alone until this submission has finished.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
@@ -258,8 +260,10 @@ impl Shadow {
                 }
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // Every submitted step that declared the range is done with it
+        // (submissions in flight do not declare overlapping ranges of a
+        // copy: a later one finishes the earlier first), and the snapshot
+        // with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty()
@@ -290,7 +294,8 @@ impl Shadow {
         }
         let start = self.start as usize;
         crate::watch::writing(start + from, to - from);
-        // SAFETY: inside the mapping; only the submitting thread writes it.
+        // SAFETY: inside the mapping; the submitting thread leaves the
+        // range alone until this submission has finished.
         let host = unsafe { self.data.add(from) };
         crate::host::write_mapped((start + from) as *mut u8, host, to - from);
         // Whole pages written are now as the copy has them: our own write
@@ -345,6 +350,34 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// Whether the title may have written a page of `[from, to)` since the
+    /// copy last took it (always, for memory that is neither write-watched
+    /// nor guarded). Asks the write journal, which keeps the answer for the
+    /// refresh that follows. (Marvisak/VIctory#595, for refreshes that
+    /// overlap what an earlier submission's GPU work writes.)
+    pub(crate) fn stale(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return false;
+        }
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return true;
+        }
+        let Some((_, written)) = crate::watch::writes(from, to, true) else {
+            return true;
+        };
+        let base = start / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        (from / PAGE..=(to - 1) / PAGE).any(|page| {
+            let at = copied[page - base];
+            let write = written
+                .binary_search_by_key(&page, |&(p, _)| p)
+                .map_or(0, |i| written[i].1);
+            at == 0 || write > at
+        })
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no

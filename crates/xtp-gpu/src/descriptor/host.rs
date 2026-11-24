@@ -1033,6 +1033,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
+                let desc = crate::resource::view_alpha(resource, desc);
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(

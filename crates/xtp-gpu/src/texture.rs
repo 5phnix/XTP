@@ -238,7 +238,8 @@ pub(crate) fn copy_converted(
     };
     // At submission, when the title has written the buffer.
     let (title, mapped) = (data as usize + footprint.offset as usize, mapped as usize);
-    list.defer_host(move || {
+    let read = title_pitch as usize * lines.saturating_sub(1) + width as usize * from;
+    list.defer_host((title, read), move || {
         let mut texels = vec![0u8; width as usize * from];
         for line in 0..lines {
             let row = (title + line * title_pitch as usize) as *const u8;
@@ -302,19 +303,27 @@ pub(crate) fn copy_converted(
 }
 
 impl Staging {
+    /// The title memory the texture is read from: start and end.
+    pub(crate) fn range(&self) -> (usize, usize) {
+        let start = self.memory as usize;
+        (start, start + self.layout.size as usize)
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    /// since the last time (and is mapped at all). `before_write` runs
+    /// just before the staging buffer is overwritten: an earlier
+    /// submission's GPU copy may still read it.
+    pub(crate) fn refresh(&self, before_write: impl FnOnce()) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let read = self.refresh_now();
+        let read = self.refresh_now(before_write);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, before_write: impl FnOnce()) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -328,6 +337,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+            before_write();
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -352,6 +362,9 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
+        // A title write during the wait is detiled too; the next check sees
+        // the memory differ from the hash and detiles it again.
+        before_write();
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);

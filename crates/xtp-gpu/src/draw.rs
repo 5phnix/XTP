@@ -92,10 +92,12 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// What the list holds in host view heaps (its fresh tables' and own
-    /// copies' dynamic slots, the shared root SRV views it binds), given
-    /// back in one batch when it is reset or released.
-    held: crate::descriptor::Held,
+    /// What the recording holds in host view heaps (its fresh tables' and
+    /// own copies' dynamic slots, the shared root SRV views it binds), and
+    /// with it [`State::own`]: given back in one batch once the list is
+    /// reset or released and the recording has gone (after its submission,
+    /// if the list is reset while it runs).
+    recording: crate::descriptor::Recording,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// Root SRVs bound as one-view tables in this list: (view heap, title
@@ -120,7 +122,8 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        crate::descriptor::give_back(&mut self.held);
+        let own = std::mem::take(&mut self.own);
+        self.recording.finish(Box::new(own));
     }
 }
 
@@ -164,8 +167,9 @@ const SMALL_LEFT: u64 = 4 << 10;
 /// Memory of a list's own, for root views the host cannot read in place:
 /// on the GPU (default heap) what CopyBufferRegion copies from host copies
 /// at the list's place, and upload memory filled from title memory at
-/// submission. Its chunks go back to [`POOL`] when the list is reset (its
-/// submissions have run) or released.
+/// submission. It goes with the list's recording ([`State::recording`]),
+/// and its chunks back to [`POOL`] once the recording has gone (its
+/// submissions have run).
 #[derive(Default)]
 struct Own {
     gpu: Vec<Chunk>,
@@ -1036,7 +1040,7 @@ impl State {
         let slot = if in_place {
             let slot = host.shared_raw(&s, offset, s.left(a));
             if let Some(slot) = slot {
-                self.held.shared.push((heap, slot));
+                self.recording.shared(list, heap, slot);
             }
             slot
         } else {
@@ -1085,7 +1089,7 @@ impl State {
             );
         }
         let slot = host.dynamic(1)?;
-        self.held.ranges.push((heap, slot, 1));
+        self.recording.range(list, heap, slot, 1);
         // Whole dwords, the last one too: the copy is rounded up to 64 KiB.
         // SAFETY: a live buffer.
         let width = unsafe { s.buffer.GetDesc() }.Width;
@@ -1124,6 +1128,8 @@ impl State {
         let len = s.left(address).min(CBV_SPAN);
         let gpu = s.gpu(address);
         if !gpu.is_multiple_of(256) {
+            // The memory goes with the recording.
+            self.recording.lease(list);
             return self.own.upload_fill(list, address, len);
         }
         s.refresh(list, address, len);
@@ -1143,6 +1149,7 @@ impl State {
             left = s.left(address),
             "a root CBV within 64 KiB of its host copy's end: copied on the GPU"
         );
+        self.recording.lease(list);
         let Some((buffer, at)) = self.own.gpu_copy(list, &s.buffer, offset, len) else {
             // In place, unbounded, as before root CBVs were bounded.
             return Some(gpu);
@@ -1370,9 +1377,10 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.held
-                .ranges
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            // Held until the recording goes (after its submission, if the
+            // list is reset while it runs).
+            self.recording
+                .range(list, std::ptr::from_ref(heap) as usize, first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1540,7 +1548,7 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
+            list.defer_host((from, n * 3 * stride), move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
@@ -2209,23 +2217,35 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(slot(&mut b, &lb, Some(16)), first, "shared with list b");
         let other = slot(&mut a, &la, Some(32));
         assert_ne!(other, first);
-        assert_eq!(a.held.shared, [(key, first), (key, other)]);
+        assert_eq!(a.recording.held().shared, [(key, first), (key, other)]);
         // Copies: the list's own, made again after work that may write.
         let copied = slot(&mut a, &la, Some(4));
         assert_eq!(slot(&mut a, &la, Some(4)), copied);
         a.writes += 1;
         let again = slot(&mut a, &la, Some(4));
         assert_ne!(again, copied);
-        assert_eq!(a.held.ranges, [(key, copied, 1), (key, again, 1)]);
+        assert_eq!(
+            a.recording.held().ranges,
+            [(key, copied, 1), (key, again, 1)]
+        );
         assert_eq!(slot(&mut a, &la, None), slot(&mut b, &lb, None), "null");
         assert_eq!(views.shared_count(), (2, 0));
         // The shared views' chunk, the null view and the two copies.
         assert_eq!(views.dynamic_use().0, SHARED_CHUNK + 3);
+        // List a is reset as the title resets one: its recording goes (the
+        // host list), then its state.
+        la.host().close();
+        la.host().reset();
+        assert_eq!(views.shared_count(), (2, 0), "the state still has it");
         a.reset(std::ptr::null());
-        assert!(a.held.ranges.is_empty() && a.held.shared.is_empty());
+        assert_eq!(a.recording.held(), &crate::descriptor::Held::default());
         assert_eq!(views.shared_count(), (2, 1), "list b holds the first");
         assert_eq!(views.dynamic_use().0, SHARED_CHUNK + 1);
+        // List b's state goes first: nothing goes back before its recording.
         drop(b);
+        assert_eq!(views.shared_count(), (2, 1), "its recording is still there");
+        lb.host().close();
+        lb.host().reset();
         assert_eq!(views.shared_count(), (2, 2), "kept for later lists");
         // The next list finds the view made for the first two.
         let mut c = state(heap.0);

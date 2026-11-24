@@ -148,10 +148,144 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Gives back dynamic slots of the host heap behind the title heap at
+/// `heap`, if that heap still exists: what a recording leases with
+/// [`crate::host::HostList::keep_dynamic`], once it has gone. A
+/// [`Recording`]'s lease (`heap` [`BATCH`]) gives back all it holds.
+#[cfg(windows)]
+pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+    if heap == BATCH {
+        return batch_gone(u64::from(first) | u64::from(n) << 32);
+    }
+    give_back(&mut Held {
+        ranges: vec![(heap, first, n)],
+        shared: Vec::new(),
+    });
+}
+
+/// The lease key of [`Recording`]s (no title heap is at this address).
+#[cfg(windows)]
+const BATCH: usize = usize::MAX - 1;
+
+/// What one recording of a list holds: dynamic slots, holds on shared
+/// views, and memory of the list's own its commands use (dropped with it).
+/// It all goes back in one batch, per heap one lock, once both the list's
+/// state is done with the recording (reset or released) and the recording
+/// has gone: at the host list's reset, or, for a list reset while it runs,
+/// once that submission has finished. A recording leases one entry of
+/// [`crate::host::HostList::keep_dynamic`] for it all.
+#[cfg(windows)]
+#[derive(Default)]
+pub(crate) struct Recording {
+    /// Its batch, from the first thing it holds on.
+    id: Option<u64>,
+    held: Held,
+}
+
+/// A recording's batch: what its state handed over, and whether the state
+/// is done with it and whether the recording has gone.
+#[cfg(windows)]
+#[derive(Default)]
+struct Batch {
+    held: Held,
+    memory: Vec<Box<dyn Send>>,
+    finished: bool,
+    gone: bool,
+}
+
+#[cfg(windows)]
+static BATCHES: std::sync::Mutex<Option<std::collections::HashMap<u64, Batch>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn batches() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<u64, Batch>>> {
+    BATCHES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(windows)]
+impl Recording {
+    /// Leases the recording's batch in `list`, once.
+    pub(crate) fn lease(&mut self, list: &crate::host::HostList) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        if self.id.is_some() {
+            return;
+        }
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        batches()
+            .get_or_insert_with(Default::default)
+            .insert(id, Batch::default());
+        list.keep_dynamic(BATCH, id as u32, (id >> 32) as u32);
+        self.id = Some(id);
+    }
+
+    /// `n` dynamic slots from `first` of `heap`'s host heap, held until the
+    /// recording has gone.
+    pub(crate) fn range(&mut self, list: &crate::host::HostList, heap: usize, first: u32, n: u32) {
+        self.lease(list);
+        self.held.ranges.push((heap, first, n));
+    }
+
+    /// A hold on shared view `slot` of `heap`'s host heap (see
+    /// [`host::HostHeap::shared_raw`]), given back once the recording has
+    /// gone.
+    pub(crate) fn shared(&mut self, list: &crate::host::HostList, heap: usize, slot: u32) {
+        self.lease(list);
+        self.held.shared.push((heap, slot));
+    }
+
+    /// The state is done with the recording: what it holds goes, now or
+    /// once the recording has gone, with `memory`.
+    pub(crate) fn finish(&mut self, memory: Box<dyn Send>) {
+        let Some(id) = self.id.take() else {
+            // Nothing held, nothing the recording's commands use.
+            return;
+        };
+        let mut all = batches();
+        let Some(batch) = all.as_mut().and_then(|b| b.get_mut(&id)) else {
+            return;
+        };
+        batch.held.ranges.append(&mut self.held.ranges);
+        batch.held.shared.append(&mut self.held.shared);
+        batch.memory.push(memory);
+        batch.finished = true;
+        if batch.gone {
+            let batch = all.as_mut().and_then(|b| b.remove(&id));
+            drop(all);
+            if let Some(mut batch) = batch {
+                give_back(&mut batch.held);
+            }
+        }
+    }
+
+    /// What the recording holds (tests).
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> &Held {
+        &self.held
+    }
+}
+
+/// Recording `id` has gone: its batch goes back once its state is done
+/// with it.
+#[cfg(windows)]
+fn batch_gone(id: u64) {
+    let mut all = batches();
+    let Some(batch) = all.as_mut().and_then(|b| b.get_mut(&id)) else {
+        return;
+    };
+    batch.gone = true;
+    if batch.finished {
+        let batch = all.as_mut().and_then(|b| b.remove(&id));
+        drop(all);
+        if let Some(mut batch) = batch {
+            give_back(&mut batch.held);
+        }
+    }
+}
+
 /// What a list holds in host view heaps, by heap: the title heap's
 /// address, or [`OWN_VIEW_HEAP`].
 #[cfg(windows)]
-#[derive(Default)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub(crate) struct Held {
     /// Dynamic slot ranges of its own: heap, first, count.
     pub(crate) ranges: Vec<(usize, u32, u32)>,
