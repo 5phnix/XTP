@@ -42,6 +42,9 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// Why the host refused it, once it has (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    refusal: OnceLock<String>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -80,13 +83,35 @@ impl Pending {
             finished: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
+            refusal: OnceLock::new(),
         }
     }
 
     /// Makes the host pipeline (once); true for the call that finished it.
     fn make(&self) -> bool {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            #[cfg(feature = "diagnostics")]
+            let _ = super::host::take_refusal();
+            let started = Instant::now();
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let ms = started.elapsed().as_millis() as u64;
+            if ms >= SLOW_MS {
+                tracing::info!(
+                    ms,
+                    shaders = ?self.shaders,
+                    made = made.is_some(),
+                    "host pipeline slow to make (its translations and the driver's compile)"
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            if made.is_none()
+                && let Some(why) = super::host::take_refusal()
+            {
+                let _ = self.refusal.set(why);
+            }
+            made
+        });
         let first = !self.finished.swap(true, Ordering::Relaxed);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -99,13 +124,15 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Why a pipeline has no host pipeline, and which shaders that concerns
+/// (diagnostics): "being made"; "does not translate", with its shaders
+/// that do not; "refused" and the host's reason, with all its shaders.
+/// `None` if it has one.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn missing(p: &Pending) -> Option<String> {
+pub(crate) fn missing(p: &Pending) -> Option<(String, Option<String>)> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(("being made".into(), None)),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -114,9 +141,13 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
+                let why = p
+                    .refusal
+                    .get()
+                    .map_or("refused".into(), |r| format!("refused, {r}"));
+                (why, Some(format!("{:?}", p.shaders)))
             } else {
-                failed.join(" + ")
+                ("does not translate".into(), Some(failed.join(" + ")))
             })
         }
     }
@@ -124,6 +155,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 
 /// Signalled whenever a pipeline has been made.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+
+/// A pipeline that takes a worker this long or more is logged.
+const SLOW_MS: u64 = 100;
 
 /// Waiting allowed per title frame, over all threads: for graphics
 /// pipelines, then for compute ones.
@@ -367,12 +401,24 @@ fn worker(i: usize) -> std::thread::Builder {
         .stack_size(PIPELINE_STACK)
 }
 
-/// The workers (half the logical processors, 2 to 8), started on first
-/// use: how many there are.
+/// Pipeline workers at most.
+///
+/// One translation can hold a worker for seconds: in the Series S world
+/// 16 compute programs took 20 to 28 s each before the translator refused
+/// them (lane masks read as data; docs/analysis/drops.md), and with eight
+/// workers a few of them held most of the pool while cheap pipelines
+/// waited, with 8 to 10 of the process's threads running on 32 logical
+/// processors. The workers run below the title's threads.
+const MAX_WORKERS: usize = 16;
+
+/// The workers (half the logical processors, 2 to [`MAX_WORKERS`]),
+/// started on first use: how many there are.
 fn workers() -> usize {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     *WORKERS.get_or_init(|| {
-        let wanted = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let wanted =
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, MAX_WORKERS));
+        tracing::info!(workers = wanted, "pipeline workers");
         (0..wanted)
             .filter(|&i| {
                 let spawned = worker(i).spawn(work);

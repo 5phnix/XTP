@@ -23,7 +23,8 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them on top of every title slot or caps the
+    /// heap ([`capped_split`]), else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from,
@@ -133,19 +134,33 @@ pub(crate) fn near_heaps(va: u64) -> String {
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
+/// tiers 1 and 2; tier 3 hardware may take more. An RTX 4080 SUPER (tier
+/// 3) takes exactly this many, not one more (2026-11-24).
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
 /// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
-/// each a device removal shortly after; #59).
+/// each a device removal shortly after; #59), and on capped heaps too:
+/// NVIDIA worlds stalled (VIctory #747), and XTP's Series S world on the
+/// RTX 4080 reached 57,364 of 65,536 and dropped draws for want of slots.
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// The dynamic slots of a heap that the host would not make with
+/// [`DYNAMIC`] more but would with these, which leave every title slot
+/// in.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// A capped view heap of `limit` host slots split into (title slots
+/// mirrored, dynamic slots): [`DYNAMIC`] dynamic ones, at least one title
+/// slot when `limit` > 1. The title's slots past the first part read
+/// nothing; BTP 6's view heap has 1,245,184, and none of its runs wrote a
+/// slot past 934,464 (the part 2^16 dynamic slots leave).
+fn capped_split(limit: u32) -> (u32, u32) {
+    let dynamic = DYNAMIC.min(limit.saturating_sub(1));
+    (limit - dynamic, dynamic)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -167,8 +182,9 @@ impl HostHeap {
                     })
             }
         };
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
+        // The larger dynamic range where the host takes it on top of every
+        // title slot; else the smaller one, which keeps every title slot;
+        // past the host's cap, the larger one again (VIctory #1349).
         let (heap, count, extra) = if sampler {
             match make(count) {
                 Ok(heap) => (heap, count, 0),
@@ -184,13 +200,17 @@ impl HostHeap {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (
-                        make(PORTABLE_VIEWS).ok()?,
-                        PORTABLE_VIEWS - MIN_DYNAMIC,
-                        MIN_DYNAMIC,
-                    )
+                    // out; a title that reaches them needs remapping ("title
+                    // slot past the host heap" says so).
+                    let (mirrored, dynamic) = capped_split(PORTABLE_VIEWS);
+                    tracing::warn!(
+                        error = %e,
+                        count,
+                        mirrored,
+                        dynamic,
+                        "host view heap capped at {PORTABLE_VIEWS}"
+                    );
+                    (make(PORTABLE_VIEWS).ok()?, mirrored, dynamic)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -1448,6 +1468,36 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A capped view heap keeps 2^18 of its slots dynamic and the rest for
+    /// the title; small limits keep a title slot and never underflow
+    /// (VIctory #1349).
+    #[test]
+    fn capped_view_heaps_split_their_slots() {
+        assert_eq!(capped_split(PORTABLE_VIEWS), (737_856, 1 << 18));
+        assert_eq!(capped_split(1024), (1, 1023));
+        assert_eq!(capped_split(1), (1, 0));
+        assert_eq!(capped_split(0), (0, 0));
+    }
+
+    /// A view heap of BTP 6's size, past the 1,000,000 slots many hosts
+    /// cap at: capped, it has 2^18 dynamic slots, all free at first; a host
+    /// that takes it whole keeps every title slot.
+    #[test]
+    fn a_heap_of_the_titles_size_keeps_its_dynamic_slots() {
+        const TITLE: u32 = 1_245_184;
+        let Some(heap) = HostHeap::new(false, TITLE) else {
+            return; // no host GPU
+        };
+        if heap.count() < TITLE {
+            assert_eq!((heap.count(), heap.dynamic), capped_split(PORTABLE_VIEWS));
+        } else {
+            assert!(heap.dynamic >= MIN_DYNAMIC);
+        }
+        let first = heap.dynamic(heap.dynamic).expect("every dynamic slot free");
+        assert_eq!(first, heap.count());
+        heap.release(first, heap.dynamic);
     }
 
     /// The peak of dynamic slots in use is kept, and ranges go back in one

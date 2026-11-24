@@ -107,6 +107,10 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    /// The form the program was lowered in, for diagnostics
+    /// (`emit::last_module_summary`): "per lane", "per lane in halves",
+    /// "console flow" or "console flow in halves".
+    pub flow: &'static str,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -122,6 +126,14 @@ pub(crate) struct Lowered {
     /// Loops given the spin-wait limit.
     #[cfg(test)]
     pub spin_loops: usize,
+    /// The limit each back edge compares its loop's count with, in the
+    /// order they were lowered.
+    #[cfg(test)]
+    pub loop_limits: Vec<u32>,
+    /// Scalar memory reads through a per-lane descriptor put under a lane
+    /// guard (`Lower::scalar_guard`).
+    #[cfg(test)]
+    pub scalar_guards: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -300,6 +312,18 @@ struct Lower<'a> {
     /// Headers of loops that only wait for memory to change: they stop at
     /// [`super::spin_limit`] instead ([`spin`]).
     spin: HashSet<usize>,
+    /// Headers of counted loops: they stop at [`super::counted_loop_limit`]
+    /// instead ([`flow::counted_loops`]).
+    counted: HashSet<usize>,
+    /// See [`Lowered::loop_limits`].
+    #[cfg(test)]
+    limits: Vec<u32>,
+    /// See [`Lowered::scalar_guards`].
+    #[cfg(test)]
+    scalar_guards: u32,
+    /// Values read other than as a resource access's descriptor: by an
+    /// instruction that accesses no resource, or by a phi.
+    data_reads: HashSet<Value>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -314,11 +338,22 @@ struct Lower<'a> {
 /// RTX 5070, with 2^20 submissions took up to 10.6 s and the device was
 /// removed; with 2^16 the longest was 1.1 s; with 2^14, 371 ms with no
 /// device removal and the same frame rate. Loops that only wait for memory
-/// stop sooner ([`spin`]).
-// shortcut: a legitimate loop of more than 16,384 iterations per lane is
-// cut short, so its result is wrong there; raising `XTP_SHADER_LOOP_LIMIT`
-// shows whether a wrong result comes from it.
+/// stop sooner ([`spin`]); counted loops, whose count is the program's own,
+/// later ([`COUNTED_LOOP_LIMIT`]).
+// shortcut: a legitimate loop of more than 16,384 iterations per lane that
+// is no counted loop (one that walks a list, say) is cut short, so its
+// result is wrong there; raising `XTP_SHADER_LOOP_LIMIT` shows whether a
+// wrong result comes from it.
 pub(super) const LOOP_LIMIT: u32 = 1 << 14;
+
+/// The limit of counted loops ([`flow::counted_loops`]): 2^20 (1,048,576),
+/// the old general limit. Their iteration count comes from an induction
+/// variable and a bound the loop does not change, so 2^14 would cut short
+/// legitimate loops of 16,385 to 2^20 iterations.
+// shortcut: #452's device removals were measured with 2^20 for every loop;
+// a counted loop whose bound comes from data the host has not mirrored can
+// still run that long.
+pub(super) const COUNTED_LOOP_LIMIT: u32 = 1 << 20;
 
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
@@ -632,6 +667,26 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             spin: HashSet::new(),
+            counted: HashSet::new(),
+            #[cfg(test)]
+            limits: Vec::new(),
+            #[cfg(test)]
+            scalar_guards: 0,
+            data_reads: {
+                let access: HashSet<Site> = x.res.descriptors.iter().map(|d| d.site).collect();
+                let mut reads = HashSet::new();
+                for (b, block) in p.blocks.iter().enumerate() {
+                    for phi in &block.phis {
+                        reads.extend(phi.args.iter().copied());
+                    }
+                    for (i, inst) in block.insts.iter().enumerate() {
+                        if !access.contains(&(b, i)) {
+                            reads.extend(inst.reads.iter().map(|r| r.1));
+                        }
+                    }
+                }
+                reads
+            },
         }
     }
 
@@ -672,8 +727,10 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`; spin waits less).
+        // Loop headers count iterations (`LOOP_LIMIT`; spin waits less,
+        // counted loops more).
         self.spin = spin::spin_loops(p);
+        self.counted = flow::counted_loops(p, self.x.st);
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -742,6 +799,12 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            flow: match (self.console_cf, self.split) {
+                (false, false) => "per lane",
+                (false, true) => "per lane in halves",
+                (true, false) => "console flow",
+                (true, true) => "console flow in halves",
+            },
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -751,6 +814,10 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & super::shader::flags::WAVE_OPS != 0,
             #[cfg(test)]
             spin_loops: self.spin.len(),
+            #[cfg(test)]
+            loop_limits: std::mem::take(&mut self.limits),
+            #[cfg(test)]
+            scalar_guards: self.scalar_guards,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,

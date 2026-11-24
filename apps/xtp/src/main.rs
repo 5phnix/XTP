@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod preflight;
 mod run;
 mod shader;
 mod survey;
