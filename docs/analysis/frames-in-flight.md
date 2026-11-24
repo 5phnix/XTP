@@ -200,8 +200,66 @@ second's line may hold part of the frame before's GPU time.
 
 ## 6. Critical review
 
-(below)
+Of AnyPS5's mechanism, of the brief, and of this change.
+
+- **AnyPS5's commits were read at its head, not as diffs.** The local copy
+  (`E:\xtp-refs\AnyPS5`) is a shallow clone of one commit (`7de61e3`); the
+  three commits Samuel named are not in it. What was ported is the
+  behaviour their code shows at that head (`commandScheduler.cpp`,
+  `DeferFlipCompletion` and `FlipCompletionThread`; `graphicsRun.cpp`,
+  `SuspendPoint` and `m_frame_ready`; `runtimeSwitches.cpp`, `AtFlip`), as
+  docs/analysis/anyps5.md §7.1 describes them. No line of it was copied:
+  the model differs (Vulkan command buffers and a flip thread there, the
+  title's own D3D12.X submissions here).
+- **AnyPS5 allows two frames in flight at its flip; this allows one.**
+  Its own later commit (`4328d9d796`) bounds the title to one frame ahead
+  after eight let a title rewrite tables the GPU had not read; the brief
+  asks for one. A second frame would hide more GPU time but doubles what a
+  title-side race can reach; not tried.
+- **The present's drain was not only the title's safety.** The brief's
+  shortcut comment suggested it stood for "titles not known to wait for
+  their fences". The search found two of XTP's own uses that depended on
+  it: the plane compositor rewriting the views its last submission reads
+  (BTP 6 composes two planes every frame), and the diagnostics black-frame
+  probe reusing one readback buffer. Both are handled (§3.3, §3.4); a
+  reviewer should look for other per-frame state of ours that a running
+  submission reads. None was found among the lists of ours that are
+  reset: the others are made per use and drained.
+- **The flip wait now waits for the GPU.** That is a change in a path the
+  brief did not name, and it is what makes one frame in flight faithful for
+  a title paced by flips: without it, the flip after frame N's present
+  would end on a tick with frame N maybe unfinished, where a console's flip
+  would not. Its cost is nil when the present already finished everything
+  (frames in flight off). Risk: a title that waits for the flip on the
+  thread the completion depends on would hang; none does (completion runs
+  on XTP's own thread, and the GPU never waits for the CPU here).
+- **Lists of ours wait at reset.** Chosen over editing `dxgi/planes.rs`
+  (outside this task's files): it keeps every list of ours from
+  overlapping with itself, the compositor's and any later one. It is
+  keyed on how the list was last submitted (`execute` against `submit`),
+  so a test standing for a title's list must submit it as the title does;
+  three tests were changed so.
+- **The cap on submissions in flight moves with the switch** (16 off, 128
+  on): with one frame in flight, 16 would let the title start at most half
+  of its next frame (20 to 40 submissions a frame) before waiting for the
+  oldest. The A/B therefore compares the two caps too; the cap alone was
+  not measured.
+- **Black frames are reported one present late with frames in flight.**
+  A second readback buffer per frame in flight would keep them exact; it
+  would mean changing `capture.rs` (not this task's) for a diagnostics
+  log. Documented instead, and `XTP_FRAMES_IN_FLIGHT=0` gives exact reports.
+- **gpu.md question 7 stays open.** The safety argument is the console's
+  semantics plus BTP 6's flip waits, not a proof that BTP 6 reads no GPU
+  result without a wait. The sessions of §5 are the evidence for its world.
 
 ## 7. Open questions
 
-(below)
+- Does BTP 6 read a GPU result at a fixed frame latency without any wait
+  (gpu.md question 7)? A stack sample cannot tell; a watch of the fence
+  methods' callers (`GetCompletedValue`, `SetEventOnCompletion`, at the
+  fence's slots 0x40 and 0x48) would show which title code waits on which
+  fence per frame.
+- Two frames in flight, as AnyPS5's flip thread allows, once one is known
+  safe.
+- A flip wait with a time-out does not wait for the GPU (frame.rs
+  shortcut).

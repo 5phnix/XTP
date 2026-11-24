@@ -108,6 +108,48 @@ const GPU_US: usize = 1;
 const WAITED_US: usize = 2;
 const FRAME_END_US: usize = 3;
 
+/// Where the title's threads waited for submissions: the code that asked
+/// for each wait (the caller of `Host::settle`, `Host::drain` or a step's
+/// check, by `#[track_caller]`), with the microseconds and waits there.
+#[cfg(any(test, feature = "diagnostics"))]
+#[derive(Default)]
+struct Waits(Vec<(&'static std::panic::Location<'static>, u64, u64)>);
+
+#[cfg(any(test, feature = "diagnostics"))]
+impl Waits {
+    fn add(&mut self, at: &'static std::panic::Location<'static>, us: u64) {
+        match self.0.iter_mut().find(|(place, ..)| *place == at) {
+            Some((_, total, n)) => (*total, *n) = (*total + us, *n + 1),
+            None => self.0.push((at, us, 1)),
+        }
+    }
+
+    /// The `n` places waited at longest, over `frames` frames, as `file:line
+    /// <ms> ms/frame (<waits>/frame)`; the counts start again.
+    fn take(&mut self, frames: f64, n: usize) -> Vec<String> {
+        let mut waits = std::mem::take(&mut self.0);
+        waits.sort_by_key(|&(_, us, _)| std::cmp::Reverse(us));
+        let frames = frames.max(1.0);
+        waits
+            .into_iter()
+            .take(n)
+            .map(|(at, us, count)| {
+                let file = at.file().rsplit(['/', '\\']).next().unwrap_or(at.file());
+                format!(
+                    "{file}:{} {:.1} ms/frame ({:.1}/frame)",
+                    at.line(),
+                    us as f64 / 1e3 / frames,
+                    count as f64 / frames
+                )
+            })
+            .collect()
+    }
+}
+
+/// The waits since the last frame-rate second (diagnostics).
+#[cfg(feature = "diagnostics")]
+static WAITS: Mutex<Waits> = Mutex::new(Waits(Vec::new()));
+
 /// After submissions: GPU copy destinations and shader-written ranges
 /// written back into title memory (microseconds, bytes written), since the
 /// last frame-rate line.
@@ -557,6 +599,32 @@ mod tests {
         assert_eq!(overlapped(200.0, 100.0, 300.0), 0.0);
         assert_eq!(overlapped(200.0, 100.0, 40.0), 260.0);
         assert_eq!(overlapped(10.0, 0.0, 15.0), 0.0);
+    }
+
+    /// Waits add up by the place that asked for them, longest first, per
+    /// frame; taking them starts the counts again.
+    #[test]
+    fn waits_are_counted_by_where_they_were_asked() {
+        #[track_caller]
+        fn here() -> &'static std::panic::Location<'static> {
+            std::panic::Location::caller()
+        }
+        let a = here();
+        let b = here();
+        let mut waits = Waits::default();
+        waits.add(a, 1_000);
+        waits.add(b, 6_000);
+        waits.add(a, 3_000);
+        let lines = waits.take(2.0, 8);
+        let (la, lb) = (a.line(), b.line());
+        assert_eq!(
+            lines,
+            [
+                format!("host.rs:{lb} 3.0 ms/frame (0.5/frame)"),
+                format!("host.rs:{la} 2.0 ms/frame (1.0/frame)"),
+            ]
+        );
+        assert!(waits.take(1.0, 8).is_empty());
     }
 
     #[test]
@@ -1255,6 +1323,7 @@ impl Host {
 
     /// Finishes every submission up to the one that signals `value`,
     /// waiting for the GPU to run them.
+    #[track_caller]
     pub(crate) fn settle(&self, value: u64) {
         if self
             .timeline
@@ -1269,6 +1338,7 @@ impl Host {
     }
 
     /// Finishes every submission made so far.
+    #[track_caller]
     pub(crate) fn drain(&self) {
         if let Some((_, newest)) = self.timeline.span() {
             self.settle(newest);
@@ -1310,6 +1380,7 @@ impl Host {
     /// len)` (or, with `writing`, writes it): finishes the submissions in
     /// flight whose GPU work writes it (or reads it), so that the step sees
     /// title memory and host copies as if they had run when submitted.
+    #[track_caller]
     fn settle_range(&self, address: usize, len: usize, writing: bool) {
         if let Some(value) = self
             .timeline
@@ -1327,11 +1398,15 @@ impl Host {
 
     /// Runs `f`, counting its time as the title's threads waiting for
     /// submissions (for the GPU, or for their finishing): not on the
-    /// completion thread, and once however deep the calls go.
+    /// completion thread, and once however deep the calls go. Diagnostics
+    /// builds also count it by where the wait was asked ([`Waits`]).
+    #[track_caller]
     fn waiting<T>(&self, f: impl FnOnce() -> T) -> T {
         if FINISHER.get() {
             return f();
         }
+        #[cfg(feature = "diagnostics")]
+        let at = std::panic::Location::caller();
         let (depth, so_far) = WAITING.get();
         WAITING.set((depth + 1, so_far));
         let started = std::time::Instant::now();
@@ -1344,6 +1419,10 @@ impl Host {
         };
         WAITING.set((depth - 1, so_far + us));
         SUBMISSION_US[WAITED_US].fetch_add(us, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if us > 0 {
+            WAITS.lock().unwrap_or_else(|e| e.into_inner()).add(at, us);
+        }
         out
     }
 
@@ -1829,6 +1908,7 @@ impl HostList {
 
     /// Waits for the list's last submission and finishes it (and those
     /// before it).
+    #[track_caller]
     pub(crate) fn settle(&self) {
         let last = self.last.load(Ordering::Acquire);
         if last != 0
@@ -2379,6 +2459,7 @@ impl Batch<'_> {
     /// Before a step reads (or, with `writing`, writes) title memory
     /// `[address, address + len)`: earlier submissions whose GPU work
     /// writes (or reads) it are finished first.
+    #[track_caller]
     fn settle(&self, address: usize, len: usize, writing: bool) {
         if let Some(host) = self.host {
             host.settle_range(address, len, writing);
@@ -2391,6 +2472,7 @@ impl Batch<'_> {
     /// title wrote a page of the overlap since the copy took it (the
     /// world's big heap is both refreshed and written on the GPU in most
     /// submissions).
+    #[track_caller]
     fn settle_refresh(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -2411,6 +2493,7 @@ impl Batch<'_> {
     /// Before a GPU write to `[address, address + len)` of `shadow`: an
     /// earlier submission whose shaders write the range through it is
     /// finished first.
+    #[track_caller]
     fn settle_shaders(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -2427,6 +2510,7 @@ impl Batch<'_> {
 
     /// Before new bytes are detiled into a texture's staging buffer: an
     /// earlier submission whose GPU copy still reads it is finished first.
+    #[track_caller]
     fn settle_staging(&self, staging: &crate::texture::Staging) {
         if let Some(host) = self.host
             && let Some(value) = host
@@ -2789,6 +2873,11 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        #[cfg(feature = "diagnostics")]
+        let waits = WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(frames, 8);
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -2818,6 +2907,12 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                if !waits.is_empty() {
+                    tracing::info!(
+                        "waiting for submissions, by where it was asked: {}",
+                        waits.join("; ")
+                    );
+                }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
