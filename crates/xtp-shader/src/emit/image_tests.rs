@@ -65,7 +65,9 @@ struct Mimg {
     dmask: u8,
     a16: bool,
     d16: bool,
-    /// A sample with implicit derivatives.
+    /// A comparison sample with implicit derivatives (sampleCmp; the other
+    /// implicit samples become explicit quad gradients outside pixel
+    /// shaders, VIctory #180).
     implicit: bool,
     /// On a cube image (else 2D).
     cube: bool,
@@ -124,6 +126,7 @@ fn mimg(name: &str, dmask: u8) -> Mimg {
         a16: false,
         d16: false,
         implicit: name.starts_with("image_sample")
+            && name.split('_').any(|t| t == "c")
             && !name.split('_').any(|t| explicit.contains(&t)),
         cube: false,
     }
@@ -207,12 +210,15 @@ fn native(words: &[u32]) -> NativeProgram {
 }
 
 /// What validator 1.6, the version the translation declares, says of
-/// implicit derivatives in a compute shader (1.8 takes them). It refuses
-/// the plain `image_sample` there as well; the host's driver runs them.
+/// implicit derivatives in a compute shader (1.8 takes them). The plain
+/// and biased samples there take their quad's gradients explicitly; the
+/// comparison ones (SM 6.6 has no SampleCmpGrad) keep sampleCmp, which the
+/// host's driver runs.
 const CS_DERIVATIVES: &str = "Function uses features incompatible with the shader stage (cs)";
 
 /// `inst`'s program translated, and validated when the validator is found
-/// (`CS_DERIVATIVES` let through for a sample with implicit derivatives).
+/// (`CS_DERIVATIVES` let through for a comparison sample with implicit
+/// derivatives).
 fn translate(inst: Mimg, literals: &[(u8, u32)]) -> Result<HostShader, ShaderError> {
     let s = lower(&program(inst, literals))?;
     if let Ok(mut v) =
@@ -1047,6 +1053,23 @@ fn literals(name: &str, zero_bias: bool, zero_level: bool) -> Vec<(u8, u32)> {
         l.push((level, 0));
     }
     l
+}
+
+/// Outside pixel shaders the console takes a sample's level from its quad
+/// of lanes: the plain and biased forms become sampleGrad with the quad's
+/// differences (`quadReadLaneAt`), with no implicit derivatives left and no
+/// wave size asked for.
+#[test]
+fn compute_samples_take_their_quads_gradients() {
+    for name in ["image_sample", "image_sample_b_cl_o", "image_sample_cl"] {
+        let lits = literals(name, false, false);
+        translate(mimg(name, 0xF), &lits).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let summary = super::last_module_summary();
+        assert!(summary.contains("sampleGrad"), "{name}: {summary}");
+        assert!(summary.contains("quadReadLaneAt"), "{name}: {summary}");
+        assert!(!summary.contains("sampleBias"), "{name}: {summary}");
+        assert!(summary.contains("wave size any"), "{name}: {summary}");
+    }
 }
 
 #[test]

@@ -687,6 +687,41 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
+                60 | 61 if !self.s.pixel => {
+                    // Outside pixel shaders the console still takes the level
+                    // from each quad of lanes (lane 1 minus lane 0 across,
+                    // lane 2 minus lane 0 down); DXIL before validator 1.8
+                    // has no implicit derivatives there, so the quad's
+                    // differences become explicit gradients. A bias scales
+                    // them by 2^bias, the same level for isotropic filtering.
+                    // A quad's four lanes share a host wave of any size, so
+                    // this needs neither the console's wave size nor its
+                    // lane order beyond the quad.
+                    if self.s.mesh.is_some() {
+                        return Err("a cross-lane operation in a mesh shader");
+                    }
+                    if self.s.threads.is_none() {
+                        return Err("a cross-lane operation outside compute");
+                    }
+                    let scale = if op == 61 {
+                        let bias = float(self, bias_at)?;
+                        Some(self.unary(21, bias))
+                    } else {
+                        None
+                    };
+                    let g = self.quad_gradients(&cs[..spatial], scale);
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(clamp);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
+                }
                 60 => {
                     args.extend(&os);
                     args.push(clamp);
@@ -932,6 +967,37 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// Coarse derivatives of `coords` across this lane's quad (lanes 4n to
+    /// 4n + 3: lane 1 minus lane 0, then lane 2 minus lane 0), as DXIL
+    /// gradients (x for up to three coordinates, then y), each times
+    /// `scale` if given.
+    // shortcut: a quad lane the program left inactive gives what the host
+    // reads there (the console's derivative reads that lane's stale value).
+    fn quad_gradients(&mut self, coords: &[V], scale: Option<V>) -> Vec<V> {
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let fu = self.s.m.undef(f32t);
+        let mut g = vec![fu; 6];
+        for (k, &x) in coords.iter().enumerate().take(3) {
+            // The quad's lane `n` (a constant, as quad reads take it).
+            let at = |l: &mut Self, n: u32| {
+                let n = l.s.m.i32(n);
+                l.s.op(c, "quadReadLaneAt.f32", Attr::NoUnwind, f32t, 122, &[x, n])
+            };
+            let origin = at(self, 0);
+            for d in 0..2 {
+                let there = at(self, d as u32 + 1);
+                let mut diff = self.s.m.bin(c, Bin::Sub, there, origin);
+                if let Some(s) = scale {
+                    diff = self.s.m.bin(c, Bin::Mul, diff, s);
+                }
+                g[3 * d + k] = diff;
+            }
+        }
+        g
     }
 
     /// The direction a cube sample's face coordinates stand for: the
