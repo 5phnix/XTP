@@ -1,19 +1,185 @@
 # Upstream watch: what XTP should take or reimplement
 
-**Pass 3, 2026-11-24.** GitHub read between 17:18 and 17:40 UTC, read-only
-(`gh pr view/diff`, `gh api`, `gh search`). Nothing was posted, starred or
-opened.
+**Pass 4, 2026-11-24.** GitHub read between 17:49 and 18:05 UTC, read-only
+(`gh api`, `gh search`). Nothing was posted, starred or opened. xcl now
+lives at `xcl-dev/xcl`: the older `ivall/xcl` links below redirect, but
+the search API answers only to the new name.
 
-- Section 0 is this pass, Series S first: what appeared after pass 2's
-  marks (16:25 UTC), what earlier items answer for Series S, and what
-  changed in the earlier items (0.7).
+- Section 0 is this pass: what appeared after pass 3's marks (17:18 UTC),
+  wave64 mesh programs on 32-lane hosts first, then Series S, and what
+  changed in the earlier items (0.8). Earlier items that answer the
+  wave64 mesh question are read again here (items 95, 96).
+- Section P3 is pass 3 (17:18–17:40 UTC), items 80–93.
 - Section P2 is pass 2 (16:20–16:40 UTC), items 49–79.
 - Sections 1 to 7 are pass 1's list (12:10–13:40 UTC), items 1–48.
 - The next pass starts from the marks in [README.md](README.md).
 
-## 0. Pass 3: since 16:25 UTC, Series S first
+## 0. Pass 4: since 17:18 UTC, wave64 mesh first
 
 ### 0.1 Summary
+
+- **Volume.**
+  - VIctory: 118 new PRs and 12 issues (#1310–#1440), none merged. `main`
+    is still `ffe310e`.
+  - xcl: 56 new PRs and 4 issues (#1530–#1589). `main` is still
+    `9e3831e`.
+  - AnyPS5: nothing new.
+  - Triage by title, keyword searches of both trackers (wave64, mesh,
+    readfirstlane, barriers, Series S, FSR, indirect), and the other
+    projects' commits. About 35 items were read.
+- **The question: how other projects run the title's wave64 mesh
+  programs on 32-lane GPUs.** Four answers, the most portable first.
+  1. **Prove that most of them need no whole wave.** five-star-recomp's
+     window analysis (item 95) finds that 6,217 of the pack's 8,765 mesh
+     programs give console results on any host wave of 4 lanes or more,
+     as they are. Its rules cover XTP's three blockers:
+     - a `v_readfirstlane` is right when the host wave holds an active
+       lane of the console wave: after EXEC = −1, on the taken side of an
+       execz branch, or for a value only the lanes active then wrote;
+     - a mesh barrier after the output-count message is right when the
+       host wave that skips it writes no output before its next barrier;
+     - a divergent path that a host wave skips is right when it leaves
+       nothing live behind.
+
+     LDS shared between lanes still needs the whole wave.
+  2. **For the rest, every thread passes every group barrier.**
+     five-star's "supersteps" (2,511 of the remaining 2,548 compile) and
+     VIctory #1433 (item 94) do this. #1433 pairs barriers by count and
+     turns `s_barrier` into a stamped wait. It covers compute groups of
+     64–1,024 threads: in a Series S world on an RTX 4050 Laptop, refused
+     compute programs went from 112 to 1. Neither form makes one half
+     spin on the other. #1433 sits on #439, which XTP already has.
+  3. **xcl pairs the two halves through arrival counters** (a bounded
+     spin) (item 96). XTP's design note dropped that form. xcl's NVIDIA
+     runs show the spin does progress there, but #1433 makes it
+     unnecessary.
+  4. **Run mesh as compute plus a vertex-pulling draw** (VIctory #961,
+     five-star's fallback, xcl #724; item 98). The compute forms of
+     wave64 then apply. On the 4080, which has mesh shaders, this is only
+     needed for programs whose outputs pass D3D12's 32 KiB.
+- **NVIDIA device removals once mesh programs run.** The newest reports
+  trace most NVIDIA world hangs to mesh draws that read null heap slots:
+  the capped heap's 65,536 dynamic slots run out. Reserving 2^18 stops
+  them on an RTX 5070, a 5060 Ti and a 5070 Ti (item 97). XTP keeps 2^16
+  on a capped heap. Its own Series S run of 17:39 UTC already dropped
+  draws for "no dynamic slots", while every wave64 mesh program was still
+  refused.
+- **Series S.**
+  - A Series S world on an RTX 3080 held 5–7 min with wave64 mesh
+    programs run as plain 32-lane waves (item 101). Fences and poles
+    were drawn. Ground and buildings were missing: about 730 indirect
+    mesh dispatches a frame were dropped.
+  - five-star fixed its game-memory corruption: a translator bug in
+    wave64 mask pairs (item 100). It also added a check for GPU buffers
+    that keep their old physical frames after a remap, which is the
+    class of XTP's crash object.
+- **FidelityFX HLE (#1284):** nothing new since 17:07. A seventh UAV
+  clear implementation came in (item 105).
+- **Indirect producers (#1225, #1231):** no new commit, and #1276
+  recovers the same two programs. #1407 lowers "a lane mask holding
+  lanes elsewhere read as data", the second reason AnyXboxX named for
+  the refused producer passes (item 103).
+
+### 0.2 How to read the mapping
+
+The tags are P3.2's. SS is today's state:
+
+| Tag | Finding |
+|---|---|
+| SS | Series S mode, the person's direction (roadmap #15). The world holds 150 s at 0.9–1.7 fps, and every UI frame is drawn. There is no 3D: all 9,282 mesh programs are wave64 in 128-lane groups, and on the 4080 XTP refuses them (VIctory #578). `XTP_WAVE64_MESH=allow` lets none of them through, because each has a `v_readfirstlane`, an `s_barrier` and divergent flow. Task mesh64 (0a31f0cb) works on this. |
+| W64 | NVIDIA and wave64 (32-lane host, the RTX 4080 SUPER). |
+| DRAWS-P | Series S world: draws dropped for want of a pipeline (1,196 a frame in session C). |
+| DRAWS-I | Series S world: indirect commands dropped (3,515 a frame). |
+| STALL, VRAM | Series X: parked. |
+
+### 0.3 Wave64 mesh programs on 32-lane hosts
+
+| # | Item | Licence · state | What it does (measured) | Maps to | Action and why |
+|---|---|---|---|---|---|
+| 94 | VIctory [#1433](https://github.com/Marvisak/VIctory/pull/1433) (anasssssssss1, `anasssssssss1/VIctory` `fix-console-flow-multi-wave` `b3efa1c`, +3,544/−118 in 16 files, opened 17:58) | GPL-3.0 · open, stacked on #439 | **The console flow for groups of several console waves.**<br>• Before: a wave64 program that needs its whole wave ran in the console flow only in groups of one console wave. The waves of a bigger group branch and loop apart, so group barriers paired by place would hang or pair the wrong halves.<br>• Group barriers are now paired by count. Each thread counts the barriers it has passed (one groupshared dword per thread). Both halves of a console wave reach each exchange at the same count.<br>• The program's `s_barrier` becomes a wait. The half stamps its arrival (the count mod 4, and its phase), then keeps passing group barriers until every half has arrived or ended.<br>• A thread that ends, or reaches the loop limit, stamps its half as ended and keeps passing barriers. No exchange is ever left one thread short.<br>• Whatever must agree across threads is read after a barrier, from stamps written before it. Each check is one wave operation (at most 32 halves).<br>• Only groups of whole console waves (64 to 1,024 threads), and only where the LDS plus `threads + 3 × halves` dwords fit in 32 KiB.<br>• 4 GPU tests, exact on an RTX 4050 Laptop (split) and a Radeon 680M (native wave64): lane 40 read in groups of 128 and 256, console waves that branch and loop differently, LDS ordered between console waves by `s_barrier`.<br>• In the title, Series S, RTX 4050 Laptop, on the testers' update 9: refused compute programs in the world went from 112 to 1. The picture stayed black.<br>• Compute only. Mesh programs are not covered. | shader · lower (console flow); `docs/wave64-on-wave32.md`, "Groups of several console waves"; task mesh64 · W64, SS | **Take with credit, as mesh64's base.** It is the group-wide form XTP's design note leaves open, built on the #439 that XTP already has.<br>• Then extend it to the mesh stage: a 128-lane mesh group is two console waves. XTP calls `setMeshOutputCounts` at entry with the declared maxima, so that call stays in uniform flow.<br>• Review it as a port: one author, opened at the end of this pass, no second tester yet.<br>• Measure on the 4080 what a group barrier per exchange costs. |
+| 95 | five-star-recomp `docs/shader-translation.md` ("Mesh windows", "Supersteps"), `Translation/Waves/WindowAnalysis`, `rdna_superstep.hlsli`; commits [`f652127`](https://github.com/ThatRecompDev/five-star-recomp/commit/f65212736) and [`910f023`](https://github.com/ThatRecompDev/five-star-recomp/commit/910f0239a) (2026-11-23) | GPL-3.0-or-later (C#, HLSL) · `main` | **Which mesh programs need their whole wave, and a form for those that do.**<br>• A host wave narrower than the console's (a "window") sees only its part of every mask. The analysis tracks, per variable, which bits are the console's. A program's "floor" is the narrowest host wave that gives console results.<br>• Masks used as masks are right in each lane; a ballot read as a number is not.<br>• `v_readfirstlane` is right in the bits all active lanes agree on, when the window holds an active lane: after EXEC = −1, on the taken side of an execz branch, or for a value only the lanes active then wrote.<br>• A path that a window skips is right when it keeps EXEC empty on the window's lanes, leaves nothing unguarded live where the paths meet, and holds no store, `s_endpgm` or barrier.<br>• The output-count message (GS_ALLOC_REQ) on the console's path is fine. So is a mesh barrier after it, when the skipping window writes no output before its next barrier. LDS shared between lanes keeps the whole wave.<br>• On the title's pack: of 8,765 mesh programs, 6,217 have floor 4 and 2,548 need the whole wave. First reasons: a first-lane read of a per-lane value in an output or in GS_ALLOC_REQ (1,338), an integer VCC branch (588), a VCC branch whose mask lost its relation to EXEC (304), an execz path that cannot be skipped (246).<br>• Supersteps, for the rest: blocks are cut at each wave operation. A thread stores its value and bit to groupshared and stops. Once every thread has stopped (at an operation, an `s_barrier` or the end), one group barrier passes and each thread reads its console wave's result. A thread at an `s_barrier` waits until no thread is at an operation. An LDS access is a step of its own.<br>• 2,511 of the 2,548 get a superstep form that compiles; the other 37 compile only through the compute fallback (item 98). WARP and an RTX 4090 accept them.<br>• Tests: assembled programs on WARP at 2, 4, 16 and 64 lanes, including a 128-thread group whose two console waves branch apart. No NVIDIA world measurement is given. | shader · lower (mesh), a new analysis; gpu · pipeline/host.rs (`Needs::mesh_reason`) · W64, SS | **Reimplement, the window analysis first.** It would replace XTP's blanket mesh refusals (`MESH_FIRST_LANE`, `MESH_LDS_IN_ONE_WAVE`) with a proof per program. On five-star's count, about 70 % of the mesh programs then run as they are, with no exchange.<br>• Count XTP's 9,282 under the same rules first, offline (`xtp shader-survey --host-lanes 32-32`).<br>• Then item 94, or supersteps, for the rest.<br>• It is C# emitting HLSL, so nothing ports as is; credit the design. |
+| 96 | xcl `docs/wave64-on-wave32.md` and the merged [#39](https://github.com/xcl-dev/xcl/pull/39), [#67](https://github.com/xcl-dev/xcl/pull/67), [#94](https://github.com/xcl-dev/xcl/pull/94) (2026-11-22/23); [#1252](https://github.com/xcl-dev/xcl/pull/1252) (not-rex, draft, `77a8190`), [#1193](https://github.com/xcl-dev/xcl/pull/1193) (zondy1i, `7c16823`) | GPL-2.0-only · `main`; open | **How xcl runs wave64 mesh programs on NVIDIA**, in this document's words:<br>• A console wave runs as two 32-lane halves of one group. Both hold the whole 64-bit EXEC, VCC and SGPRs, so they take every branch alike. They meet in groupshared memory for masks read whole, `v_readlane` / `v_readfirstlane`, `ds_bpermute` and coherent scalar loads.<br>• With one console wave per group, each exchange is a group barrier. With several (a 128-lane mesh group), each pair meets through arrival counters with double-buffered slots. The wait is bounded at 2^20 polls; past that, the wave goes on with half-local values instead of hanging. The console's `s_barrier` stays a group barrier.<br>• Host waves take their console thread ids from a groupshared counter as they arrive: NVIDIA does not form waves from consecutive thread indices in 8×8×4 groups.<br>• A mask read only lane by lane is not exchanged (a backward liveness pass).<br>• #39, the first form (independent halves), took the title's mesh pipelines through xcl's hook from 0 of 7 to 7 of 7 on an RTX 5050.<br>• #1252: the halves meet before every LDS access, since a console wave orders LDS by instruction. Tested on an RTX 3080 and an RTX 4090 (a 20-run matrix). The title ran on an RTX 5080 into world loading with no device removal.<br>• #1193: no exchange for a `v_readfirstlane` of a value proven uniform. Green on an RTX 5080 and a 5060. An AMD run with the split forced shows failures that are `main`'s.<br>• Cost on an RTX 3090, in a worst-case loop: 1.0–1.8× with a group barrier, 1.1–4.3× with the counters. | shader · lower (console flow) · W64 | **Ideas only; do not take the counters.** XTP's design note dropped them because D3D12 promises no forward progress, and items 94 and 95 do without.<br>• One fact to keep: the counter form passed xcl's tests on five NVIDIA cards (3080, 3090, 4090, 5070 Ti, 5080), and one title run on the 5080, without a hang. In practice, the note's inference that the wait would never be met there does not hold on NVIDIA; D3D12 still promises nothing.<br>• #1193's uniform first-lane read is the proof `MESH_FIRST_LANE` needs beyond the group id (`v5`). |
+| 97 | VIctory issue [#747](https://github.com/Marvisak/VIctory/issues/747) (Vaximous; urattems' and MrEjecutor's runs), [#1349](https://github.com/Marvisak/VIctory/pull/1349) (wbkepler, `eb5fea7`), issue [#264](https://github.com/Marvisak/VIctory/issues/264) (xFIR3x's run), [#1133](https://github.com/Marvisak/VIctory/pull/1133) (DeerSilver's run) | GPL-3.0 · open | **NVIDIA's world hang is often a mesh draw that reads null heap slots.**<br>• NVIDIA caps a shader-visible view heap at 1,000,000 slots, an RTX 5060 Laptop too (#1133). The title asks for 1,245,184. With 2^16 dynamic slots left, the world's tables run out of room.<br>• RTX 5070, Series X: `main` lost the device in 3 runs of 3. DRED stops in an indirect mesh draw whose `u8`–`u10` heap indices are null slots. With #578 and 2^18 dynamic slots: 11 min, 8 of them in the world, no device removal, and no drop for want of slots.<br>• RTX 5060 Ti, one change at a time, 240 s runs: `main` lost the device in 2 runs of 2; with #578 alone, 2 of 4; with 2^18 added, 0 of 2; with #322 too, 0 of 2.<br>• RTX 5070 Ti (#264): a `DispatchMesh` hung on null slots. The AnyXboxX tree with 262,144 dynamic slots ran 13 min.<br>• #1349 reserves 2^18 slots on a capped heap (737,856 for the title, 262,144 dynamic) and trims fresh tables to their first-to-last used entry. Unit and device tests only. | gpu · descriptor/host.rs (`MIN_DYNAMIC`), draw.rs · W64, SS, DRAWS-P, DRAWS-I | **Take #1349 with credit, before mesh64 lets mesh programs through.**<br>• XTP keeps 2^16 dynamic slots on a capped heap (`descriptor/host.rs:148`), which leaves the title 934,464.<br>• Its Series S run of 17:39 UTC (`E:\xtp-data\cache\play\20261124-173913\run.log`) already dropped draws for "no dynamic slots" (the count reached 128 at 17:42:38), while every wave64 mesh program was refused (537 host pipelines by 17:42:51).<br>• First, log which title slots above 737,856 a Series S frame uses: those would then read the null slot (#1133's clamp). |
+| 98 | VIctory [#1385](https://github.com/Marvisak/VIctory/pull/1385) (Ctrl-Alt-Haze, for #201, `9e77b5c`), [#961](https://github.com/Marvisak/VIctory/pull/961) (EduBertozzi, `31568ce`; runs by zlwbbb-del and L1DRE); VItoriaBr [`bd33acc`](https://github.com/uiliannn/VItoriaBr/commit/bd33acc69); xcl [#724](https://github.com/xcl-dev/xcl/pull/724) (Cattn) | VIctory GPL-3.0 · open; VItoriaBr GPL-3.0 · commit; xcl GPL-2.0-only · open | **Mesh output counts, and mesh programs run as compute.**<br>• #1385: D3D12 refuses a mesh shader whose outputs pass 32,768 bytes, and the declared 256 vertices and 256 primitives can. It bounds the output-count message's `M0` through scalar code (moves, shifts, masks, min/max, selects, phis with widening). It narrows the declared maxima only when every site is proven, and passes the program's own counts, clamped, to `SetMeshOutputCounts`. 7 synthetic tests on an RTX 5070 Ti and WARP.<br>• #961: a mesh program becomes a compute shader that writes vertices, indices and per-primitive records, plus a vertex shader that reads them back. It is used on hosts without mesh shaders, by switch, or when the outputs pass 32 KiB. GTX 1070 Ti (no mesh shaders), on #1086's tree with #189's emulation: the world drawn at 900–1,970 draws a frame and 0.2–0.6 fps for about 2 min, after two fixes (root signature spaces, a scratch pool).<br>• VItoriaBr bounds mesh outputs and indices by the declared maxima.<br>• xcl #724 runs xcl's two-pass mesh form (compute, then mesh) on `DispatchMesh` and `ExecuteIndirect`. | shader · lower/mesh.rs; gpu · pipeline · W64, DRAWS-P, SS | **Check, then take #1385 with credit if it applies.** XTP passes the declared maxima and culls the extra primitives (`lower/mesh.rs`). It refuses only past 128 threads or 256 outputs: count the mesh programs whose outputs pass 32 KiB.<br>**Ignore #961 on the 4080**, which has mesh shaders, unless item 94's form does not fit in a mesh stage. Then #961 is the way to give mesh programs the compute forms. |
+| 99 | VIctory issue [#1347](https://github.com/Marvisak/VIctory/issues/1347) (Ganfieof) with [#1392](https://github.com/Marvisak/VIctory/pull/1392) (kunalkhude99); issues [#1348](https://github.com/Marvisak/VIctory/issues/1348) (icdmkg2), [#1317](https://github.com/Marvisak/VIctory/issues/1317) (HenriqueSBueno), [#1323](https://github.com/Marvisak/VIctory/issues/1323) (darkjiros), [#71](https://github.com/Marvisak/VIctory/issues/71) (ThomasHFWright's runs); [#1400](https://github.com/Marvisak/VIctory/pull/1400) (piyonchu), [#1414](https://github.com/Marvisak/VIctory/pull/1414) (ESAT586) | GPL-3.0 · reports, open | **Device removals reported since the mark.**<br>• #1347 (RTX 4060): lost on a 32×1×1 compute dispatch, right after three dropped compute programs. #1392 emits a UAV barrier after any dropped compute dispatch: the next dispatch had read those UAVs with no barrier.<br>• #1348 (RX 6750 XT and WARP): lost at frame 1370 every time; with DRED's breadcrumbs, 240 s without a loss. A timing race, not a program.<br>• #1317 (RTX 3080): the hang pair is a mesh program with no loop and a pixel program whose light-list loop ends on an equality with a bound read from a buffer. With loop limits of 1,024 in the pixel, mesh and vertex stages: 17 min without a loss.<br>• #1323 (RTX 4090, Series X): a 5–6 s submission on entering the world; with a 60 s TDR, none. Then the title's watchdog stop at +0x23cf683, whose report names an unsignalled cross-queue barrier.<br>• #71 (RTX 5090, Linux): an MMU fault around one compute dispatch, twice. Skipping that program: 300 s clean.<br>• #1400, #1414: one host list twice in one submission resets its prelude and is submitted twice: `DEVICE_HUNG`. | gpu · list.rs, host.rs, queue.rs; shader · loop limits (G11) · W64, SS, STALL | **Check XTP, each small:**<br>• a dropped dispatch followed by a UAV barrier (#1392);<br>• one list twice in one submission (#1400);<br>• loop limits in mesh and pixel programs, not only compute (#1317, G11).<br>XTP's `queue.rs` `wait` returns `S_OK` without waiting, as VIctory's does. #1317 and #1323 suspect a consumer that runs before the producer it waits for. Log which queue waits the Series S world makes before changing it. |
+
+### 0.4 Series S: the world and the crash
+
+| # | Item | Licence · state | What it does (measured) | Maps to | Action and why |
+|---|---|---|---|---|---|
+| 100 | five-star-recomp [`2781f9c`](https://github.com/ThatRecompDev/five-star-recomp/commit/2781f9ca7), merge [`3160ea5`](https://github.com/ThatRecompDev/five-star-recomp/commit/3160ea569), status [`41b9e7e`](https://github.com/ThatRecompDev/five-star-recomp/commit/41b9e7e43); PR [#5](https://github.com/ThatRecompDev/five-star-recomp/pull/5) (marquezinii, merged, `fad0b7f`); Neonbridge [`e8f1f34`](https://github.com/DesignWithTommy/Neonbridge/commit/e8f1f343c), [`5958301`](https://github.com/DesignWithTommy/Neonbridge/commit/595830139) | GPL-3.0-or-later (C#) · `main`; Neonbridge: ideas only (5.1) | **five-star's game-memory corruption is fixed** (item 84's follow-up).<br>• The cause was its translator. `InstanceCulling~CS_Prop_BatchCull` sets s43 = s60 + 4, the base of its argument array. On another path, a `v_cmp` writes s[42:43]. Mask tracking went by emission order, so the translation read s43 as that mask's high half. The program's InstanceCount atomics then landed near the start of the transient pool.<br>• Now every mask write also sets a variable for its high dword (a ballot), and integer reads use that variable. A WARP case covers the path. Boot 18 ran past 200 s without corruption.<br>• The new blocker: about 200 s in, the GPU frame takes too long. Three compute programs run their loops to the 65,536-step guard, and some culling passes read constant buffers past their descriptor's end.<br>• PR #5: a buffer of device slot 133 keeps the physical frames that were mapped when it was made. When the game remaps a page under it, the CPU sees the new frame and the GPU the old one. Once that old frame is mapped elsewhere, GPU writes through the buffer change memory there. The check logs each such remap, and where the old frame turns up next.<br>• Neonbridge took both, with credit. | shader · IR (mask pairs); hle · xmem.rs; gpu · resource.rs (placed buffers) · SS, W64 | **For the series-s crash, reimplement both checks with credit** (C#):<br>• a test where a `v_cmp` writes s[n:n+1] on one path and s[n+1] is an integer on another. XTP's SSA should keep them apart; the test proves it.<br>• In XTP's xmem diagnostics (`xtp_diag_map`), a line when a page under a live host buffer or placed resource is remapped or unmapped, and where its old frame is mapped next. XTP's overwritten object lies in a 64 KiB view of one physical page that xmem placed: this is that class of fault. |
+| 101 | VIctory issue [#71](https://github.com/Marvisak/VIctory/issues/71): DuarttBR's [RTX 3080 report](https://github.com/Marvisak/VIctory/issues/71#issuecomment-7139417481) (`DuarttBR/VIctory` `rgarage`) and Sunkiller-qc's [reading of it](https://github.com/Marvisak/VIctory/issues/71#issuecomment-7139798289); [#1322](https://github.com/Marvisak/VIctory/pull/1322) (KevinPratap, `7a03753`); issue [#1317](https://github.com/Marvisak/VIctory/issues/1317) | GPL-3.0 · reports, a branch, open | **A Series S world on a 32-lane card that holds, and why its colour is zero.**<br>• RTX 3080 10 GB, Series S, `ffe310e` plus 21 PRs (#189's emulation, but not #578): over several runs, 5 to 7 min in the world with no device removal, at 0.2–1.6 fps and about 18.5 GB of commit. Wave64 mesh programs run there as plain 32-lane waves.<br>• The depth target shows fences, poles and a bin. Ground and most buildings are missing: about 730 indirect mesh dispatches a frame are dropped as "prepare failed (compute false, mesh true)".<br>• The G-buffer pass writes (a forced constant covers 28 % of its target) and the first texture samples are right, but the material colour comes out 0.<br>• Textures read only by heap index were never uploaded; the branch uploads them at each bind, at most 192 MiB of title memory a frame. #458's cap of 384 placed textures was raised to 16,384.<br>• Sunkiller-qc's two leads:<br>  – #1322: title writes under a range that the submission's shaders write are never copied. The world's UAVs cover the whole 174 MB heap. On an RTX 4050 Laptop, a downsample read its sizes as 0, looped about 4 billion times and hung.<br>  – structured views read raw: NVIDIA addresses them in elements, AMD in bytes.<br>• #1317 (RTX 3080): Series S halves the GPU time (1,512 → 701 ms a frame). CPU coherence work dominates: 860 ms of preparation and 330 ms of copy-back. | SS, W64, DRAWS-I, DRAWS | **Evidence for mesh64.** Plain 32-lane mesh waves did not hang a Series S world on Ampere within minutes. A diagnostic switch that lets every wave64 mesh program through as plain 32-lane waves would show the 3D world's draws before the exact form lands. Run it once on the 4080, with item 97's slots.<br>**Check XTP** for #1322's case (its refresh under busy ranges) and for textures read only by heap index: either gives a black world on every vendor. Take #1322 with credit if XTP skips busy ranges. |
+| 102 | xcl issues [#1452](https://github.com/xcl-dev/xcl/issues/1452) (dhanush2412; Ariorh1337's and 3L1A5-1's runs), [#1585](https://github.com/xcl-dev/xcl/issues/1585), [#1566](https://github.com/xcl-dev/xcl/issues/1566); VIctory [#1388](https://github.com/Marvisak/VIctory/pull/1388) (wbkepler, for #700) | xcl GPL-2.0-only (reports); #1388 GPL-3.0 · open | • xcl #1452, Series X: the device is lost 9–48 s after the title's first list call #101 (0x328), in runs on an RTX 3060, 2060 SUPER and 5090. Compute-queue `Wait64BitValueX` waits that no producer signals come before it. On an RTX 5090, with video memory and RAM far from full, the GPU sits at 100 % from that call to the loss: not oversubscription.<br>• #1585 (RTX 5060 8 GB): menus at 30 fps, then video memory runs out. #1566: the title's budget is reported but not enforced; 94 GB of commit.<br>• #1388: list slot 72's 64-bit memory waits. The part of a list after an unsatisfied wait is deferred to a scheduler, so submitting threads never block. | gpu · queue.rs, list.rs · STALL, VRAM | **Parked with Series X**, except one check: list #101 (0x328) is one of item 85's unchecked methods. Log whether the Series S world calls it, and list slot 72, before item 99's queue check. Take #1388 with credit only if XTP drops such waits. |
+
+### 0.5 Dropped draws and indirect commands
+
+| # | Item | Licence · state | What it does (measured) | Maps to | Action and why |
+|---|---|---|---|---|---|
+| 103 | VIctory [#1407](https://github.com/Marvisak/VIctory/pull/1407) (marquezinii, `82ad8ac`) and [#1420](https://github.com/Marvisak/VIctory/pull/1420) (stacked on it); [#1334](https://github.com/Marvisak/VIctory/pull/1334) (KainanP), [#1412](https://github.com/Marvisak/VIctory/pull/1412) (EatCodeSleep2); a count on [#1276](https://github.com/Marvisak/VIctory/pull/1276) (pablogonz12) | GPL-3.0 · open | • #1407 lowers "a lane mask holding lanes elsewhere read as data", the second reason AnyXboxX named for the refused passes that write mesh `ExecuteIndirect` arguments (item 87). When every lane with EXEC clear at the write is proven to have its bit set, the mask is the ballot of the running lanes plus every lane that does not run (`~WaveActiveBallot(true)`). It also takes joins of masks read by a VALU instruction, before the first loop. Compute only; 5 tests on an RTX 5070, wave32 only.<br>• #1420: a mask built in a loop that every lane runs alike. #1334: the SCC of a lane-mask operation read as data. #1412: scalar compares between lane masks stay uniform.<br>• #1225, #1231 and #1276 have no new commit. Offline over 768 programs on RADV, #1276 translates 2 more, the same two that #1225 and #1231 clear. | shader · lane masks, structure · DRAWS-I, W64 | **For the drops task:** once the producer passes are named (item 87), sort them by first reason.<br>• Take #1407 (and #1420) with credit for "lanes elsewhere", after a wave64 run on the 4080.<br>• Of #1225, #1231 and #1276, take one: they reach the same programs. |
+| 104 | VIctory [#1402](https://github.com/Marvisak/VIctory/pull/1402) and the other bundles by MamaLeVrai ([#1319](https://github.com/Marvisak/VIctory/pull/1319), [#1418](https://github.com/Marvisak/VIctory/pull/1418), [#1426](https://github.com/Marvisak/VIctory/pull/1426), [#1439](https://github.com/Marvisak/VIctory/pull/1439)) | GPL-3.0 · open | Open PRs merged unchanged, with hand resolutions. #1402 carries the four shader PRs that gain most in #1247's offline benchmark on a retail dump, none losing a program: #1067 (+295 programs), #305 (+520), #306 (+153), #176 (+117). | shader · DRAWS-P | **Use #1402's list as a ranking, not the bundle:** take its PRs one by one, with their authors' credit. Read #1247's benchmark first. |
+
+### 0.6 FidelityFX, UAV clears, CPU cost
+
+| # | Item | Licence · state | What it does (measured) | Maps to | Action and why |
+|---|---|---|---|---|---|
+| 105 | VIctory [#1352](https://github.com/Marvisak/VIctory/pull/1352) (wbkepler, for #771); #1284, #1292 | GPL-3.0 · open | • #1284 (FidelityFX in HLE, item 80): no commit or comment since 17:07.<br>• #1292 (packed dot products, item 81): verified on an RX 9060 XT, 14 GPU tests.<br>• #1352: texture UAV clears, a seventh implementation for item 82. WARP tests only. | gpu · list.rs · SS | **Items 80–82 stand**: #948 first. |
+| 106 | VIctory [#1405](https://github.com/Marvisak/VIctory/pull/1405) (SantannaCarlos), [#1382](https://github.com/Marvisak/VIctory/pull/1382) and [#1356](https://github.com/Marvisak/VIctory/pull/1356) (wbkepler), [#1424](https://github.com/Marvisak/VIctory/pull/1424) (BaggyALPHA) | GPL-3.0 · open | • #1405 (on #334 and #1019): when a view has its own copy of bytes the submission's shaders wrote, it reads them on the GPU right before the read. RTX 4070, 10 min: 1,938 such ranges (median 4.5 KB, about ten a frame).<br>• #1382: batched barriers, reused draw scratch, pooled list uploads. #1356: read-mostly tables under `RwLock`, per-list address and view caches.<br>• #1424 skips empty submissions, as #1268 does (item 90). | gpu · shadow.rs, host.rs · DRAWS (frame time) | **After the w1-copies task's frame report**, as item 90. #1405 only once #334 and #1019 are in. |
+
+### 0.7 Ignore (new)
+
+| Item | Why |
+|---|---|
+| VIctory: about 25 hardware tests of single instructions (LouisRiverstone, #1360–#1384) and ISA fixes from #1249's static audit (#1312, #1336, #1339–#1342, #1387, #1391, #1395, #1398, #1416, #1437) | Instruction coverage. One check from them: #1312 and #1336 both mask `v_readlane` / `v_writelane`'s lane index (& 31 or & 63) and let `v_writelane` ignore EXEC. Check XTP's per-lane form does the same. |
+| VIctory #1310, issue #1410 | Linux. |
+| VIctory: HLE, loader, input and CLI fixes (#1329, #1357, #1367, #1372, #1373, #1380, #1383, #1394, #1403, #1411, #1415, #1419, #1421, #1429–#1438) | Nothing on the world's frame. |
+| VIctory #1330, #1345; issues #1316, #1318, #1321, #1343, #1375, #1413, #1440 | A fork's whole tree as one PR, docs, a community question, synthetic wave tests (#1318: an RTX 5070 refuses WaveSize 64, as known), byte-LDS PRs compared (XTP has #571), test reports. |
+| xcl: about 50 PRs of tests, audits, HLE, scripts and DXC options (#1530–#1589), DXIL optimisation passes for xcl's own direct backend (#1544–#1547), 64-bit image atomics (#1533, #1541, #1551), BVH (#1542, #1554, #1559) | Nothing on the world's frame, or xcl's own backend. |
+| xcl issues #1538, #1567 | Crash reports without a stack or a method. |
+| New repositories: dankxylese/leotux (empty, no licence); from a port tracker's list, mewiof/Holy-Interoperability (MIT, nothing renders yet) and omonkeyz/xbox-emulator (GPL-3.0, progress notes and a runtime last pushed 2026-11-23, no BTP 6 world) | Nothing XTP lacks. |
+
+### 0.8 Earlier items: what changed
+
+- **Landed in XTP since pass 3:** VIctory #1124, item 58, with W1
+  (`6a51f7b`, the merge `4ee60bd`); the copy-back now scans 8 bytes at a
+  time (`2f0983b`).
+- **Upstream:**
+  - No tracked item was merged or closed. VIctory `main` is still
+    `ffe310e`, xcl `main` still `9e3831e`.
+  - VIctory issue #847 (item 33) has been closed since 13:32 UTC; passes
+    2 and 3 missed it.
+  - Item 84 is fixed upstream (item 100).
+- **Wave64 (items 1, 45, 64, 65):**
+  - alessiodeia's A/B in the title (#1132; RTX 2070 SUPER, 30 min each):
+    #189 recovers 31 wave64 programs and loses 60 that translated before
+    (57 of them as "v_readfirstlane in divergent control flow"). #439
+    recovers 106 and loses none. XTP took #439's stack: confirmed.
+  - On #439: 465d6a0eac's count over 26,148 programs on a 32-lane host,
+    compute emitted 1,221 → 1,422 of 2,582. The 43 still stopped are in
+    groups of more than 64 threads: item 94's case.
+  - r4tedx's next branch, `shader/wave-per-group` (`05c7cbb`), runs a
+    group of several console waves without LDS or `s_barrier` as one host
+    group per console wave: the form XTP's design note plans. It also
+    lowers whole-wave sections in groups of 32 threads or fewer.
+  - OCE's two-lane form (item 45) now writes a third of the HLSL
+    (`47db0c7`, 13:47 UTC): one 141 KB program went from 14.7 MB to
+    5.1 MB. OCE loops that hold a barrier stop after 4,096 steps
+    (`2c27467`). Neither commit mentions mesh programs.
+- **The testers' tree** is still at `94e0ea5` (update 9).
+- **Other projects since 17:18 UTC:**
+  - OCE OpenScarlett: 3 commits (group-memory signed atomics, a root
+    signature check, a worker for translations of 1 MB and more).
+  - five-star-recomp: 13 (item 100).
+  - Neonbridge: 26, among them five-star's two findings and lowerings
+    from Xbox2Windows.
+  - Xbox2Windows: about 40 merges (instruction lowerings, tests);
+    leonida: 8 (GPU test results).
+  - VItoriaBr: 5 (item 98, LDS bounds checks, chunked submissions).
+  - AnyXboxX: only the 17:19 merge `38cc0fa`, the mark.
+  - palmwave, G6Recomp and californiaAlmonds' OpenScarlett: none.
+
+## P3. Pass 3: since 16:25 UTC, Series S first
+
+### P3.1 Summary
 
 - **Volume.**
   - VIctory: 109 new PRs (#1185–#1309) and 16 issues, none merged. `main`
@@ -75,7 +241,7 @@ opened.
     arguments are refused upstream too. Translator PRs and the testers'
     update 9 make them translate (item 87).
 
-### 0.2 How to read the mapping
+### P3.2 How to read the mapping
 
 Each item's "Maps to" cell names the XTP area and backlog item, then the
 findings it bears on:
@@ -91,7 +257,7 @@ findings it bears on:
 
 The symptom codes (C, D, W, F, H, K) are pass 1's (section 2).
 
-### 0.3 Series S: FSR4 and the world crash
+### P3.3 Series S: FSR4 and the world crash
 
 | # | Item | Licence · state | What it does (measured) | Maps to | Action and why |
 |---|---|---|---|---|---|
@@ -103,7 +269,7 @@ The symptom codes (C, D, W, F, H, K) are pass 1's (section 2).
 | 85 | xcl issue [#1337](https://github.com/ivall/xcl/issues/1337) (yangzj0844), "Failure C"; xcl issue [#914](https://github.com/ivall/xcl/issues/914) (oeirughrepuiohg) | xcl GPL-2.0-only (reports, no code) · open | • #1337, RTX 5060 Laptop 8 GB, xcl `930e8b4`, `lockhart`: 204 frames, then the title's assert at +0xcc2834. Just before, the title called methods xcl stubs: list #75, #101, #126, #131, #132, #142; queue #31 (newer layout); allocator #9.<br>• In Series X on the same card: texture-page failures at 70–80 s, then an assert or a device removal.<br>• #914: about 30 s in, Series S asks for a 1920×1080 R9G9B9E5 render target with UAV access (flags 0x300005). The host refuses it, and the title asserts. That is the shape of FSR4's output (item 80). | gpu · list.rs, queue.rs · SS | **Check XTP's tables against #1337's list.** XTP has #126 (0x3f0, shading rate), #131/#132 (0x418/0x420, syncs) and #142 (0x470, ignored). Left to check: list #75 (0x258) and #101 (0x328), queue #31, allocator #9. #914 is covered: XTP has #492 (item 8). |
 | 86 | xcl [#1517](https://github.com/ivall/xcl/pull/1517) (oishigeso, draft); VIctory [#1264](https://github.com/Marvisak/VIctory/pull/1264) (pablogonz12), [#1224](https://github.com/Marvisak/VIctory/pull/1224) (matheusfrta) | xcl GPL-2.0-only · draft; VIctory GPL-3.0 · open | **Series S maps physical pages in small pieces.**<br>• xcl #1517: a title starting in Series S maps 4.3 GB of physical pages in small pieces. At one tile mapping and one signal per new tile (about 0.4 ms each), its loading thread was held about 25 s with nothing presented, and its stall watchdog ended it. New tiles are now mapped together before the next submit.<br>• #1264: `XMemMapPhysicalPagesScatter` mapped one page per call. Consecutive addresses now take one unmap, one view per section run, and one commit. Tested under Wine; not measured in the title.<br>• #1224: `map_alias` joins consecutive slices of one section into one view. It coalesces split placeholders first, so a remap over split pages no longer fails with `ERROR_INVALID_ADDRESS`. | hle · xmem.rs · SS | **Take #1264 with credit if XTP's Series S load scatters many pages**; its diagnostics line counts them.<br>**Read #1224 with the series-s lead in mind.** The overwritten object sits in a view that xmem placed, perhaps through `map_alias` for `CopyPageMappingsBatchX`. If those copies must not change what the CPU sees, #1224 is moot there. If they must, it is the faster form.<br>xcl #1517 is xcl's sparse design: nothing to take. |
 
-### 0.4 Dropped draws and indirect commands
+### P3.4 Dropped draws and indirect commands
 
 | # | Item | Licence · state | What it does (measured) | Maps to | Action and why |
 |---|---|---|---|---|---|
@@ -111,7 +277,7 @@ The symptom codes (C, D, W, F, H, K) are pass 1's (section 2).
 | 88 | VIctory [#1279](https://github.com/Marvisak/VIctory/pull/1279) (Mumogg); VItoriaBr [`1ca533d`](https://github.com/uiliannn/VItoriaBr/commit/1ca533dfe); xcl #1428 (item 76) | GPL-3.0 · open; commit | • #1279 is for Wine only: its HLSL compiler refuses the argument clamp. Its count is a reference. With every indirect command dropped, one world frame lost on average 1,449 mesh dispatches, 776 dispatches, 285 draws and 79 indexed draws.<br>• VItoriaBr zeroes indirect `DispatchMesh` arguments that are out of range, and caps valid ones at 16,384 groups. | gpu · indirect.rs, G13 · DRAWS-I | **Ignore #1279**: Windows compiles the clamp. Read XTP's 3,515 by kind, as its breakdown does. **Check** what XTP's clamp does with out-of-range mesh arguments, against VItoriaBr's rule. |
 | 89 | #965's update 9 run 1 (zaidlutfi); VIctory issues [#1286](https://github.com/Marvisak/VIctory/issues/1286) (aef200), [#1305](https://github.com/Marvisak/VIctory/issues/1305) (KIFIR4KK); [#1281](https://github.com/Marvisak/VIctory/pull/1281) (kss306); xcl [#1474](https://github.com/ivall/xcl/pull/1474), [#1472](https://github.com/ivall/xcl/pull/1472) | GPL-3.0 · reports, open; xcl GPL-2.0-only · open | **Draws without a pipeline.**<br>• #965: the first run of a new tree stayed black for 12 min. The world's draws were skipped while their pipelines waited: about 1,750 were still queued at the end. The second run showed the world.<br>• #1286 (RTX 4060 Ti 8 GB): #189 alone took refused compute pipelines from 92 to 0. The stop at +0x23cf683 stayed.<br>• #1305 (RTX 4060 8 GB, with #175, #189 and #352): stalls of about 2 s on one compute pipeline, then `DEVICE_HUNG`.<br>• #1281 (RTX 4080 SUPER): declares WaveSize 64 on wave64 programs without cross-lane operations.<br>• xcl #1474 and #1472 cache refusals and compiler failures by capability. | gpu · G12, pipeline · DRAWS-P, W64 | **For the drops task: split the 1,196 by reason before porting anything**: not translated (FSR4's 20 are one group, item 81), refused, or still building. Say whether the pipeline cache was warm. #189 and #1281 replace XTP's wave64 stack: ignore them. xcl #1474: XTP has #1094 (item 62). |
 
-### 0.5 Other new items
+### P3.5 Other new items
 
 | # | Item | Licence · state | What it does (measured) | Maps to | Action and why |
 |---|---|---|---|---|---|
@@ -120,7 +286,7 @@ The symptom codes (C, D, W, F, H, K) are pass 1's (section 2).
 | 92 | xcl `main` `b7aa9f3` → `9e3831e`: [#680](https://github.com/ivall/xcl/pull/680) merged, `cad94a2`, `927adcc`, `deb4b92`; xcl [#1514](https://github.com/ivall/xcl/pull/1514), [#1513](https://github.com/ivall/xcl/pull/1513), [#1515](https://github.com/ivall/xcl/pull/1515) (oishigeso, drafts), [#1478](https://github.com/ivall/xcl/pull/1478) (jessenic) | GPL-2.0-only · `main`; open | • #680: memory windows from the descriptor heap. Pass 1 left it aside (4.3): it serves xcl's flat-memory shader ABI.<br>• `cad94a2`: `SetDescriptorHeaps(0, NULL)` clears the list's record of bound heaps.<br>• #1514: placed textures over reserved-only graphics memory get video memory only where the title has pages. 22,808 textures had held 6 GB, 4.3 GB of it over addresses with no title memory.<br>• #1513 detiles on the GPU. #1515 warns within a headroom of the budget.<br>• #1478: a resource's last `Release` no longer waits for the sparse lock. The frame loop had blocked there, and the title's stall check fired at +0x23cf683. | gpu · descriptor, tex-pool, G17 · VRAM, STALL | **Check XTP for `cad94a2`'s case**: a list's bound heaps after `SetDescriptorHeaps(0, NULL)`. The rest is Series X VRAM work, parked. #1514's numbers go to tex-pool's notes. #1478 is one more road to the watchdog stop (item 74). |
 | 93 | VIctory [#1296](https://github.com/Marvisak/VIctory/pull/1296) (antikohza), [#1272](https://github.com/Marvisak/VIctory/pull/1272) (ESAT586), issue [#1302](https://github.com/Marvisak/VIctory/issues/1302) (Xvania7, closed); issue [#1226](https://github.com/Marvisak/VIctory/issues/1226) (Logan-Gaillard) | GPL-3.0 · open | • Mip drop (#737, item 53) as PRs. #1296 turns it on at level 1 by default on cards with at most 8 GB. #1272 turns it on after `E_OUTOFMEMORY`.<br>• #1226: on an 8 GB laptop, a host texture that cannot be made removes the device. VRAM in use was 501 MiB; the process had 15.6 GB private on 15.4 GB of RAM. The limit was commit, not the card. | gpu · resource.rs · VRAM | **Parked**: Series S stays under this PC's threshold. Keep #1226's rule for later: a host texture that cannot be made is dropped, and the device stays. |
 
-### 0.6 Ignore (new)
+### P3.6 Ignore (new)
 
 | Item | Why |
 |---|---|
@@ -135,7 +301,7 @@ The symptom codes (C, D, W, F, H, K) are pass 1's (section 2).
 | xcl [#1110](https://github.com/ivall/xcl/pull/1110) | A Series S cache file for xcl's coherent window: xcl's own design. |
 | New repositories: dare-devil1/XCL, dare-devil1/VICTORY, Defintelythijsss/Stellar-Project, and a port tracker's e-ink plugin (named in the private notes, README) | No licence, copies, or a tracker plugin. Not opened past their search entry. |
 
-### 0.7 Earlier items: what changed
+### P3.7 Earlier items: what changed
 
 - **Landed in XTP since pass 2:**
   - #985, item 61 (`265c209`, `5e41b92`, in the merge `702c621`);
@@ -333,7 +499,7 @@ Ideas only, unless the licence column says otherwise.
 
 ## Pass 1 (12:10–13:40 UTC)
 
-Sections 1 to 7 are pass 1's text. Read their states with sections P2.7 and 0.7.
+Sections 1 to 7 are pass 1's text. Read their states with sections P2.7, P3.7 and 0.8.
 
 XTP is VIctory imported at `ffe310e` (GPL-3.0-or-later), with the crates and
 variables renamed (`victory-*` → `xtp-*`, `VICTORY_*` → `XTP_*`). The goal
