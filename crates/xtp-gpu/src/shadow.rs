@@ -2685,7 +2685,10 @@ mod tests {
         // A range over both and the gap between them: one range.
         assert_eq!(cover(&mut before, &host, 30, 60), 18);
         assert_eq!(before.taken, [(8, 60)]);
-        assert_eq!(before.bytes(39, 49).as_deref(), Some(&[1, 3, 3, 3, 3, 3, 3, 3, 3, 3][..]));
+        assert_eq!(
+            before.bytes(39, 49).as_deref(),
+            Some(&[1, 3, 3, 3, 3, 3, 3, 3, 3, 3][..])
+        );
     }
 
     /// A copy's snapshot mirror outlives its submission: the next
@@ -2716,7 +2719,11 @@ mod tests {
         shadow.writing(next, window, PAGE);
         assert_eq!(counts(&shadow), (2, 0));
         let snapshots = shadow.before.lock().unwrap();
-        let taken = snapshots.live.iter().find(|s| s.submission == next).unwrap();
+        let taken = snapshots
+            .live
+            .iter()
+            .find(|s| s.submission == next)
+            .unwrap();
         assert_eq!(taken.mirror.0.as_ptr(), held, "the same memory");
         assert_eq!(&taken.mirror.0[0x10..0x14], &[0x61; 4], "today's bytes");
         drop(snapshots);

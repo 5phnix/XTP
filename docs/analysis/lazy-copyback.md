@@ -267,6 +267,81 @@ Against a copy-back on first touch:
 None of the fork's code is taken here. The fork study marks this pick
 "reimplement": the idea only.
 
+## Snapshots that do not fault (30fps.md N1, first half)
+
+`docs/analysis/30fps.md` (§4.1) measured the snapshots that the three-way
+merge needs (`Shadow::writing`) at 76.5 ms a frame, with about 74 000 page
+faults. Two things in the old pool caused this:
+
+- it kept at most 16 buffers and freed the rest, so big snapshots landed in
+  fresh memory;
+- each range that overlapped a piece already taken merged both into a new
+  buffer, which copied the piece again.
+
+Now a submission's snapshot of a host copy lives in a **mirror** of the
+copy's size:
+
+- each byte sits at its offset in the copy;
+- a range copies only what the snapshot has not taken yet, each byte once;
+- the mirror is kept for the copy's next snapshots, so its pages are touched
+  already;
+- two submissions in flight on one copy each have their own mirror.
+
+The copystat line prints the snapshots: their count, MB, ms, and the
+mirrors made and held.
+
+`XTP_SNAPSHOT_MIRRORS=0` gives each snapshot fresh memory, to time the
+difference. `XTP_SNAPSHOT_MIRRORS=ab` alternates the two within one run,
+switching every 3 copystat lines; the first line of each phase is the
+settling time and is left out.
+
+Session lazyback-mirrors-ab: Series S, `XTP_FRAME_LINE=2`, 60 s of world,
+the title exited with 0, on 2026-11-24. Medians per frame:
+
+| | mirrors kept (6 lines) | fresh memory each time (8 lines) |
+|---|---:|---:|
+| snapshots, ms | **41.9** | 112.7 |
+| snapshots, MB copied | 618 | 555 |
+| page faults (the process) | **69 900** | 228 700 |
+| mirrors made | 0.1 | 369 |
+| preparing, ms | 70.5 | 173.2 |
+| ms per frame | 249 | 352 |
+| copy-back, ms | 81.2 | 109.2 |
+
+The fresh mode costs more than the old pool did: it takes memory of the
+copy's size each time, not of the piece's. So this A/B overstates the gain.
+
+Against `main` before the change, from fps30's session B:
+- snapshots: 76.5 → 41.9 ms a frame (fps30's timers against the copystat
+  line);
+- page faults: about 118 000 → 70 000 a frame (each session's copystat
+  line).
+
+That is about −35 ms, close to the −40 ms the plan expected. The 42 ms left
+is the copy itself, about 618 MB a frame, at memory speed. Only finding the
+GPU's bytes without a full snapshot (N1's second half) removes it, and the
+copy-back's comparison with it.
+
+## Writing back through the kernel (VIctory #1215)
+
+VIctory #1215 writes the copy-back with `NtWriteVirtualMemory` instead of
+`WriteProcessMemory`. It measures the copy-back falling from 1 713 to 85 ms
+a frame. XTP's default path calls neither:
+
+- Since W1, `write_title` writes with plain stores (`try_copy`). It opens
+  the guard of view memory first (`watch::writing`).
+- A store into a block that a refresh guarded again meanwhile faults into
+  the copy's handler, which gives it to the guard and goes on (copyback,
+  task 78d58a42).
+- `host::write_mapped` (`WriteProcessMemory`) remains only in the kernel
+  mode that diagnostics time (`XTP_SHADOW_ONCE=0`, `XTP_COPY_MODE=kernel`)
+  and in `watch.rs`'s tests.
+
+A system call into a block that the guard keeps read-only fails, whichever
+call it is: `NtWriteVirtualMemory` would lose the GPU's bytes there without
+a word, as `WriteProcessMemory` did before W1. XTP's copy-back time today is
+the comparison (about 638 MB a frame), not the writes. #1215 is not needed.
+
 ## How to run it
 
 A diagnostics build of the task branch, a Series S session under
