@@ -143,23 +143,28 @@ impl Shader {
     }
 
     /// The translation, made on first use; a shader that does not
-    /// translate is logged once.
+    /// translate is logged once. Both say how long the translation took
+    /// (or the cache took to answer): a pipeline worker's time.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                let started = std::time::Instant::now();
                 let done = translate(&self.container, self.native().map_err(str::to_owned));
+                let ms = started.elapsed().as_millis() as u64;
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
+                        ms,
                         "shader translated"
                     ),
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
                         error = %e,
+                        ms,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }

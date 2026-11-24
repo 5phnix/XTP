@@ -93,7 +93,17 @@ impl Pending {
         self.made.get_or_init(|| {
             #[cfg(feature = "diagnostics")]
             let _ = super::host::take_refusal();
+            let started = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let ms = started.elapsed().as_millis() as u64;
+            if ms >= SLOW_MS {
+                tracing::info!(
+                    ms,
+                    shaders = ?self.shaders,
+                    made = made.is_some(),
+                    "host pipeline slow to make (its translations and the driver's compile)"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             if made.is_none()
                 && let Some(why) = super::host::take_refusal()
@@ -145,6 +155,9 @@ pub(crate) fn missing(p: &Pending) -> Option<(String, Option<String>)> {
 
 /// Signalled whenever a pipeline has been made.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+
+/// A pipeline that takes a worker this long or more is logged.
+const SLOW_MS: u64 = 100;
 
 /// Waiting allowed per title frame, over all threads: for graphics
 /// pipelines, then for compute ones.
