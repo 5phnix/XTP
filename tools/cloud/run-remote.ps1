@@ -84,13 +84,13 @@ $code = 0
 switch ($what) {
     'check' {
         Write-Step 'Workspace check on the VM'
-        $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'check.ps1' -Arguments ($source + @{ Mode = 'check' }) -AllowFail
+        $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'check.ps1' -Arguments ($source + @{ Mode = 'check'; SessionUser = $cfg.sessionUser }) -AllowFail
         $code = $LASTEXITCODE
         Get-RemoteLog $lines
     }
     'cargo' {
         Write-Step "cargo $Cargo on the VM"
-        $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'check.ps1' -Arguments ($source + @{ Mode = 'cargo'; CargoArgs = $Cargo }) -AllowFail
+        $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'check.ps1' -Arguments ($source + @{ Mode = 'cargo'; CargoArgs = $Cargo; SessionUser = $cfg.sessionUser }) -AllowFail
         $code = $LASTEXITCODE
         Get-RemoteLog $lines
     }
@@ -102,18 +102,15 @@ switch ($what) {
     }
     'game' {
         if (-not $cfg.titleExe) { throw "Set 'titleExe' in $($cfg.path)" }
-        if (-not $NoBuild) {
-            Write-Step 'Diagnostics build of xtp on the VM'
-            $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'check.ps1' -Arguments ($source + @{ Mode = 'build' }) -AllowFail
-            if ($LASTEXITCODE -ne 0) { Get-RemoteLog $lines; throw "The build failed; log in $out" }
-        }
-        Write-Step "Game run on the VM ($Seconds s)"
+        Write-Step "$(if ($NoBuild) { '' } else { 'Diagnostics build, then ' })game run on the VM ($Seconds s)"
         $envText = ($Env.Keys | ForEach-Object { "$_=$($Env[$_])" }) -join ';'
-        $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'run-game.ps1' -AllowFail -Arguments @{
-            TitleExe = $cfg.titleExe; Seconds = $Seconds; Keys = $Keys; Env = $envText; Name = $Name; XtpArgs = $XtpArgs
-            NoGolden = $NoGolden.IsPresent; NoCapture = $NoCapture.IsPresent; SessionUser = $cfg.sessionUser
-        }
+        # One call: the VM keeps the clone locked from the build to the end of the run.
+        $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'run-game.ps1' -AllowFail -Arguments ($source + @{
+                TitleExe = $cfg.titleExe; Seconds = $Seconds; Keys = $Keys; Env = $envText; Name = $Name; XtpArgs = $XtpArgs
+                Build = -not $NoBuild; NoGolden = $NoGolden.IsPresent; NoCapture = $NoCapture.IsPresent; SessionUser = $cfg.sessionUser
+            })
         $code = $LASTEXITCODE
+        if ($lines -match '^build FAILED') { Get-RemoteLog $lines }
         $lines | Set-Content -LiteralPath (Join-Path $out 'summary.txt') -Encoding utf8
         $run = ($lines | Select-String -Pattern '^RUN DIR (.+)$' | Select-Object -Last 1).Matches.Groups[1].Value
         if ($run) {

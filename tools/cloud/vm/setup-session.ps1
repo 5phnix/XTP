@@ -108,7 +108,9 @@ Set-Service -Name Audiosrv -StartupType Automatic -ErrorAction SilentlyContinue
 Start-Service -Name Audiosrv -ErrorAction SilentlyContinue
 
 # --- What the account may write ---------------------------------------------------
-foreach ($d in 'C:\xtp\jobs', 'D:\xtp-data') {
+# Game runs, and builds and tests (they run in this session too: some need a
+# desktop). Not C:\xtp\tools: SYSTEM and administrators run what is there.
+foreach ($d in 'C:\xtp\jobs', 'C:\xtp\logs', 'C:\xtp\src', 'C:\xtp\rust', 'D:\xtp-data') {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
     $acl = Get-Acl $d
     $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($User, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')

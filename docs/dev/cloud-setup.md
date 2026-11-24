@@ -102,15 +102,17 @@ and most are per region.
 
 ### What the VM needs
 
-| Quota (metric) | Scope | Needed | Typical default |
-|----------------|-------|--------|-----------------|
-| `GPUS_ALL_REGIONS` (`compute.googleapis.com/gpus_all_regions`) | global | 1 | **0** on new projects, 1 on many older ones |
+| Quota (metric) | Scope | Needed | In the project we set up (2026-11) |
+|----------------|-------|--------|------------------------------------|
+| `GPUS_ALL_REGIONS` (`compute.googleapis.com/gpus_all_regions`) | global | 1 | 1 (new projects often start at **0**) |
 | `NVIDIA_L4_GPUS` (`compute.googleapis.com/nvidia_l4_gpus`) | per region | 1 | 1 |
 | `NVIDIA_L4_VWS_GPUS` (`compute.googleapis.com/nvidia_l4_vws_gpus`) | per region | 1 | 1 |
-| `CPUS` (`compute.googleapis.com/cpus`) | per region | 16 | 24 to 200 |
-| `CPUS_ALL_REGIONS` (`compute.googleapis.com/cpus_all_regions`) | global | 16 | 32 to 64 |
-| `SSD_TOTAL_GB` (`compute.googleapis.com/ssd_total_storage`) | per region | 400 (100 boot + 300 data) | **250** in many European regions, 500 to 1000 in some US ones |
-| `IN_USE_ADDRESSES` | per region | 1 | 8 or more |
+| `CPUS` (`compute.googleapis.com/cpus`) | per region | 16 | 200 |
+| `CPUS_ALL_REGIONS` (`compute.googleapis.com/cpus_all_regions`) | global | 16 | 64 |
+| `SSD_TOTAL_GB` (`compute.googleapis.com/ssd_total_storage`) | per region | 400 (100 boot + 300 data) | **250** in europe-west1, -west2, -west3, -west4, -west6; 1000 in us-central1 |
+| `IN_USE_ADDRESSES` (`compute.googleapis.com/in_use_addresses`) | per region | 1 | 8 |
+
+Defaults differ between projects and change over time: check yours (below).
 
 The VM uses the `nvidia-l4-vws` accelerator: an L4 with an NVIDIA RTX
 Virtual Workstation licence that Google adds and bills by the hour. It is what
@@ -267,6 +269,27 @@ does only what is missing. Each prints what it does.
    tools\cloud\run-remote.ps1 -Game          # a 3-minute game run
    ```
 
+   What the device check printed on our VM (driver 596.86, Windows Server
+   2025):
+
+   ```text
+   adapter 0: NVIDIA L4 (vendor 0x10de device 0x27b8, 22,595 MB dedicated)
+       feature level 12_2, shader model 6.8, mesh shader tier 1, wave lanes 32-32, ray tracing tier 1.2
+   adapter 1: Microsoft Basic Render Driver (vendor 0x1414 device 0x008c, 0 MB dedicated)
+   ...
+   nvidia-smi: NVIDIA L4, 596.86, WDDM, 23034 MiB
+   nvidia-smi:        Product Name                                   : NVIDIA RTX Virtual Workstation
+   nvidia-smi:        License Status                                 : Licensed (Expiry: Permanent)
+   XTP device check: OK (adapter 0 is hardware with shader model 6.6+ and mesh shaders)
+   ```
+
+   XTP creates its device on adapter 0, so the L4 must come first (it does:
+   the VM has no other display adapter). The image is Windows Server 2025
+   because XTP ships no D3D12 Agility SDK and relies on the system's D3D12,
+   which there reaches shader model 6.8. The L4 runs 32-lane waves: compute
+   programs that need 64-lane waves (see the README's status table) do not
+   run on it.
+
 7. **Stop it** — `tools\cloud\stop-vm.ps1` (or let it stop itself).
 
 ## 5. Running checks, tests and the game
@@ -290,10 +313,16 @@ first) or on `-Ref`. With `-Local` your current commit is sent as a git bundle
 clone and one `target` folder, so builds are incremental; one build runs at a
 time and a second caller waits.
 
-**The check** (`-Check`) is the same as CI's: `cargo fmt --all --check`,
+**The check** (`-Check`) runs the commands CI runs: `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings`, the same
 with `--all-features`, and `cargo test --workspace --locked`. Its log comes
 back as `<date-time>-check.log`.
+
+**Builds and tests run in the VM's desktop session**, like on a PC, not in
+the SSH session: some tests need a desktop. For example `xtp-hle`'s
+`display::tests::sdr_and_display_deferrals` asks Windows to keep the display
+on, which fails with `ERROR_NOT_SUPPORTED` (0x80070032) in an SSH session and
+passes in the desktop session.
 
 ### Game runs and the desktop session
 
@@ -302,7 +331,11 @@ D3D12 swapchains need an interactive desktop; an SSH session has none. So
 that Windows logs on automatically at every boot. Its random password exists
 only as the LSA secret Windows' automatic logon reads: it is never shown and
 never written to a file. A scheduled task, `xtp-session-job`, runs jobs in
-that account's desktop session.
+that account's desktop session: builds, tests and game runs, one at a time,
+their output streamed back to the SSH session that asked for them. The
+account may write to `C:\xtp\src`, `C:\xtp\rust`, `C:\xtp\logs`,
+`C:\xtp\jobs` and `D:\xtp-data`, not to `C:\xtp\tools` (whose scripts run as
+administrator or SYSTEM).
 
 `run-remote.ps1 -Game` builds the diagnostics build (`target\diag\xtp.exe`,
 needed for scripted keys and frame capture), then `vm\run-game.ps1`:

@@ -50,10 +50,14 @@ if ($out -match 'REBOOT NEEDED') {
 
 Write-Step "Desktop session ($($cfg.sessionUser), automatic logon) and idle shutdown"
 $null = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'setup-session.ps1' -Arguments @{ User = $cfg.sessionUser; ResetPassword = $ResetSessionPassword.IsPresent }
-Restart-XtpVmAndWait 'automatic logon'
+$sessionPattern = "^\s*>?$([regex]::Escape($cfg.sessionUser))\s+console\s+\d+\s+Active"
 $sessions = Invoke-XtpVm -Cfg $cfg -Zone $zone -Script '& query.exe user 2>&1 | ForEach-Object { "$_" }' -AllowFail
+if ($ResetSessionPassword -or -not ($sessions -match $sessionPattern)) {
+    Restart-XtpVmAndWait 'automatic logon'
+    $sessions = Invoke-XtpVm -Cfg $cfg -Zone $zone -Script '& query.exe user 2>&1 | ForEach-Object { "$_" }' -AllowFail
+}
 $sessions | ForEach-Object { Write-Host "    $_" }
-if (-not ($sessions -match "^\s*>?$([regex]::Escape($cfg.sessionUser))\s+console\s+\d+\s+Active")) {
+if (-not ($sessions -match $sessionPattern)) {
     Write-Warning "$($cfg.sessionUser) is not logged on to the console: game runs need it. Try -ResetSessionPassword."
 }
 
