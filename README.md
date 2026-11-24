@@ -36,7 +36,7 @@ What each part does today and what it still needs:
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
+| Input | XInput pads with trigger rumble, keyboard, keyboard and mouse as a pad (keys by place, mouse as the right stick) | Trigger rumble and the mouse are untested in play |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
@@ -73,17 +73,33 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\xtp\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads; Xbox One and Series pads get their trigger motors too
+(through Windows.Gaming.Input). The keyboard and mouse play as a pad while
+the title's window has focus: a pad of their own while no pad is connected,
+on top of the first pad otherwise. Keys go by place, not by label: the
+letters below are a US keyboard's, and on AZERTY the key in W's place (Z)
+pushes the stick forward just the same.
 
-| Keys | Pad |
+| Keys and mouse | Pad |
 |------|-----|
-| W A S D / I J K L | left / right stick |
+| W A S D | left stick |
+| mouse, I J K L | right stick |
 | arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
+| Enter or Space, Backspace or R, X, Y | A, B, X, Y |
+| Q / E, wheel down / up | left / right shoulder (a press a notch) |
+| Z / C, right / left mouse button | left / right trigger |
+| F, H or the middle mouse button | left stick click, right stick click |
 | Esc, Tab | Menu, View |
+
+The mouse plays while the cursor is held in the title's window, hidden:
+from when the window is active until Alt+Tab or Esc (a menu's cursor is
+yours); a click in the window takes it back, and is not a shot.
+`[input]` in `xtp.toml` sets the mouse's sensitivity, curve, dead zone and
+inversion, and other bindings (see `xtp.example.toml`), by control:
+`a`, `b`, `x`, `y`, `menu`, `view`, `dpad_up` (`_down`, `_left`, `_right`),
+`left_shoulder`, `right_shoulder`, `left_trigger`, `right_trigger`,
+`left_stick_click`, `right_stick_click`, `left_stick_up` (`_down`, `_left`,
+`_right`) and `right_stick_up` (likewise).
 
 ## Commands
 
@@ -114,7 +130,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_LOG=<target>=debug,...` | debug and trace output |
 | `XTP_STACKS=20,60` | every thread's stack at those seconds |
 | `XTP_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `XTP_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `XTP_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not (keys by place, named as in `[input.bindings]`) |
 | `XTP_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `XTP_CAPTURE=<dir>` | saves presented frames (powers of two, or `XTP_CAPTURE_FRAMES=<list>`) |
 | `XTP_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
