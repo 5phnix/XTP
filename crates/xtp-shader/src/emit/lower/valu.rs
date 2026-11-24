@@ -580,6 +580,17 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 int(self, a)
             }
+            "v_readfirstlane_b32"
+                if self.s.mesh.is_some()
+                    && self.mesh_first_lane_uniform(inst.writes.first().map(|w| w.1)) =>
+            {
+                // The same in every lane of the console wave (`uniform.rs`):
+                // the lane's own value is the first lane's, whatever waves
+                // the host forms.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
+            "v_readfirstlane_b32" if self.mesh_halves() => Err(super::mesh::MESH_FIRST_LANE),
             "v_readfirstlane_b32" if self.console_cf => {
                 // The console's first lane in EXEC (lane 0 when none).
                 let a = s(self, 0)?;

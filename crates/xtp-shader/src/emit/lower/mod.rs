@@ -77,6 +77,7 @@ mod smem;
 mod spin;
 #[cfg(test)]
 mod tests;
+mod uniform;
 mod valu;
 mod valu16;
 
@@ -266,6 +267,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Mesh: which values are the same in every lane (`mesh_prologue`).
+    uniform: Option<uniform::Uniformity>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -603,6 +606,7 @@ impl<'a> Lower<'a> {
             xchg: None,
             flat: None,
             no_barrier,
+            uniform: None,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
