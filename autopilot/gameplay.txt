@@ -1,5 +1,5 @@
 # From the golden save to gameplay (cargo xtask play, docs/dev/autopilot.md).
-# Grand Theft Auto VI, Xbox Series build; RVAs of game_scarlett_master.exe,
+# BTP 6, Xbox Series build; RVAs of game_scarlett_master.exe,
 # found by the run-world analysis (task 1383180b, docs/analysis/run-keys.md).
 build b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93
 

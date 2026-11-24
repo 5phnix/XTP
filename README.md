@@ -1,6 +1,6 @@
 # XTP
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+Runs BTP 6 (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; XTP supplies
@@ -149,7 +149,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `XTP_ADAPTER=<index>\|<name>` | (every build) host GPU to run on: its index in the startup log's `host adapter` lines, or part of its name (`XTP_ADAPTER=radeon`); by default the first high-performance hardware adapter, a discrete GPU before an integrated one |
 | `XTP_PIPELINE_WAIT_MS=<graphics>,<compute>` | (every build) milliseconds per frame title threads may wait for pipelines being made before their draws and dispatches are dropped for that frame (default `2,8`) |
-| `XTP_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `XTP_SHADER_LOOP_LIMIT=<n>` | (every build) translated shader loops stop after `n` iterations per lane instead of 16384 (2^14, under the host GPU watchdog); loops that only reread memory until it changes (spin waits) after 4096, or `n` if lower (own shader cache entries); a lower `n` shows whether loops hitting the limit make world frames slow, a higher one whether a wrong result comes from a legitimate loop the default cut short |
 | `XTP_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `XTP_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 | `XTP_WATCHDOG_HOOK=1` | every build: keeps the title's own watchdog from ending it after about 30 s without progress (slow world frames), and logs a warning (at most every 30 s) when it would have; a real deadlock then hangs for ever, with no `crashes.log` entry; known builds only (1.0.2.1), otherwise a warning and nothing patched |

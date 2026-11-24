@@ -2,7 +2,9 @@
 
 > From VIctory (GPL-3.0-or-later, like XTP): the plan of Marvisak/VIctory
 > #233, #320 and #439 by r4tedx, with Peter Bonanni (whole-wave sections
-> across the halves, backward permutes) and ifBars (deferred mask phis),
+> across the halves, backward permutes: commits a31c82e and ab7882d, which
+> the GitHub account @Raxstreams offered as r4tedx/VIctory#1 and #2) and
+> ifBars (deferred mask phis),
 > ported into XTP with the code it describes. Numbers such as #233 below
 > are VIctory pull requests, and the measurements (RTX 5070, Radeon iGPU,
 > testers' title runs) are theirs unless XTP is named. What XTP has of it,
@@ -73,8 +75,12 @@ the host has no 64-lane waves and the program:
 - uses no LDS (the console compiler may have left out barriers between
   lanes of one wave).
 
-Anything else still stops with the step 1 reason. `mask_dword`, the wave
-reduction lowering and `lane_bit` refuse the split form as a safety net.
+Anything else still stops with the step 1 reason. `mask_dword` and the wave
+reduction lowering refuse the split form as a safety net. A select or a
+carry on a mask with a part held as a number (a constant, dwords built from
+scalars) is not among the tests above; `atom` sends such a program to the
+console flow rather than test the host lane's bit (in the upper half, host
+lane n is console lane 32 + n). `lane_bit` only asserts it in debug builds.
 (A wave64 program that declares no wave size at all still runs in whatever
 waves the host forms, as on `main`: its `v_readfirstlane` reads the host
 wave's first lane.)
@@ -148,7 +154,7 @@ between them, the lower half reads before the upper half writes every
 time unless the barrier is there
 (`lds_written_and_read_in_different_masked_blocks`).
 
-**Whole-wave sections** (contributed by Raxstreams). A section stays
+**Whole-wave sections** (by Peter Bonanni, offered by @Raxstreams). A section stays
 recognised as it is (`emit::wave`), and only what it leaves crosses the
 halves, where the section is lowered: each half's reduction is exchanged
 and the two are combined with the section's own operation (sum, and, or,

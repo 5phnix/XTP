@@ -98,15 +98,16 @@ fn program(wave: u32, lane: u32, joined_latch: bool) -> crate::NativeProgram {
     }
 }
 
-/// Every hardware adapter's device that runs SM 6.6, by name. (Without
-/// the Agility SDK, Windows 10 offers none: the test then has nothing to
-/// run on, as in `split_tests`.)
+/// Every hardware adapter's device that runs SM 6.6, by name. The tests
+/// that use it are `#[ignore]`d: this PC's tests stay on WARP
+/// (`XTP_TEST_ADAPTER=warp`), whose 4-lane waves run neither program, and
+/// they passed there without having run anything. They run with
+/// `--ignored` on a hardware adapter (the Google Cloud L4 VM) and fail if
+/// there is none; `the_programs_translate_and_validate_without_a_device`
+/// runs their translations everywhere.
 fn devices() -> Vec<(String, Host)> {
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return Vec::new();
-    };
-    names
+    let names = adapters().unwrap_or_else(|e| panic!("no DXGI: {e}"));
+    let hosts: Vec<(String, Host)> = names
         .into_iter()
         .filter_map(|name| match Host::on(&name) {
             Ok(host) => Some((name, host)),
@@ -115,7 +116,36 @@ fn devices() -> Vec<(String, Host)> {
                 None
             }
         })
-        .collect()
+        .collect();
+    assert!(
+        !hosts.is_empty(),
+        "no hardware adapter with an SM 6.6 device (XTP_TEST_ADAPTER keeps tests off hardware?)"
+    );
+    hosts
+}
+
+/// Both programs translate for a host without 64-lane waves (NVIDIA) and
+/// one with both sizes (AMD RDNA), and the validator, where one is
+/// installed, takes them. No device needed.
+#[test]
+fn the_programs_translate_and_validate_without_a_device() {
+    let mut validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+            .ok();
+    for (wave, lane, joined) in [(32, 20, false), (64, 40, false), (64, 40, true)] {
+        for (lanes_min, lanes_max) in [(32, 32), (32, 64)] {
+            let target = super::Target {
+                lanes_min,
+                lanes_max,
+            };
+            let mut cs = emit(&program(wave, lane, joined), target);
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut cs.dxil).unwrap_or_else(|e| {
+                    panic!("wave{wave}, joined {joined}, {target:?}: validation: {e}")
+                });
+            }
+        }
+    }
 }
 
 fn emit(native: &crate::NativeProgram, target: super::Target) -> super::HostShader {
@@ -132,9 +162,9 @@ fn emit(native: &crate::NativeProgram, target: super::Target) -> super::HostShad
 }
 
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see devices())"]
 fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
     let mut wrong = Vec::new();
-    let mut ran = 0;
     for (wave, lane) in [(32, 20), (64, 40)] {
         for (name, host) in devices() {
             // For the host's waves: a wave64 program runs in two halves
@@ -158,7 +188,6 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
                 )
                 .unwrap()
                 .remove(0);
-            ran += 1;
             let bad: Vec<String> = (0..wave)
                 .filter(|&t| out[t as usize] != t + lane)
                 .map(|t| format!("{t}: {} (want {})", out[t as usize], t + lane))
@@ -175,10 +204,6 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
             }
         }
     }
-    if ran == 0 {
-        eprintln!("no SM 6.6 hardware device; skipped");
-        return;
-    }
     assert!(wrong.is_empty(), "wrong on {wrong:?}");
 }
 
@@ -186,6 +211,7 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
 /// header joins on its back edge is itself a join. Lane t still runs the
 /// loop t times and stores t + 40.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see devices())"]
 fn lane_read_loop_with_a_joined_exec_back_edge() {
     const WAVE: u32 = 64;
     const LANE: u32 = 40;

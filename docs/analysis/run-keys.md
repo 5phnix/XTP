@@ -1,6 +1,6 @@
 # Reaching the world: scripted keys, the golden save and the title's state
 
-How to get Grand Theft Auto VI from launch into the first mission's world,
+How to get BTP 6 from launch into the first mission's world,
 reproducibly and without a person at the keyboard, on XTP at `main`
 `2d0257e` (diagnostics build). Measured on 2026-11-24 on the person's
 machine (RTX 4080 SUPER, Ryzen 9 7950X3D, 64 GB, Windows 11).

@@ -526,5 +526,5 @@ blockers, risk 1).
    programs (one effect family) on the critical path of the first mission?
 5. Is the console shader compiler available to run the differential tests
    (`VICTORY_CONSOLE_DXC`), the best oracle for P2, I1 and S4?
-6. Should S0's pack reader live in `xtp-game` (GTA VI–specific record
+6. Should S0's pack reader live in `xtp-game` (BTP 6–specific record
    format) or be a generic tool? The tooling report may own it.

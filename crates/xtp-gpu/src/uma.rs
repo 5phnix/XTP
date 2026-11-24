@@ -78,7 +78,7 @@ impl Kind {
             Kind::Virtual => 64 * KIB,
             // Sections are committed 64 KiB at a time, as DirectStorage
             // first writes their pages: blocks of 64 MiB, opened once all
-            // committed, keep their heaps few (98 for Grand Theft Auto VI's
+            // committed, keep their heaps few (98 for BTP 6's
             // 6.1 GiB) where following each commit would make thousands.
             Kind::Physical => 64 * MIB,
         }

@@ -336,7 +336,7 @@ impl<'a> Lower<'a> {
             self.s.m.i32(0),
         );
         let at = self.s.m.bin(c, Bin::And, lane, k31);
-        let mine = self.read_lane(x, at);
+        let mine = self.read_lane_in_wave(x, at);
         let (x0, x1) = self.exchange(c, mine);
         let h = self.s.m.bin(c, Bin::LShr, lane, k5);
         let h = self.s.m.bin(c, Bin::And, h, one);
@@ -344,7 +344,29 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, low, x0, x1)
     }
 
+    /// `x` of lane `lane`. In compute, lanes are the console's: the
+    /// console takes a lane operand's low six bits (five in wave32), and a
+    /// host lane past the wave reads nothing defined, so the lane is
+    /// reduced to them (lane 70 of a wave64 is lane 6).
     pub(super) fn read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = if self.mask_data == MaskData::Console {
+            let wave = self.wave();
+            match self.s.m.int_value(lane) {
+                Some(k) if (k as u32) < wave => lane,
+                Some(k) => self.s.m.i32(k as u32 & (wave - 1)),
+                None => {
+                    let m = self.s.m.i32(wave - 1);
+                    self.s.m.bin(self.cur, Bin::And, lane, m)
+                }
+            }
+        } else {
+            lane
+        };
+        self.read_lane_in_wave(x, lane)
+    }
+
+    /// `x` of host lane `lane`, which is in the host wave.
+    fn read_lane_in_wave(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -449,7 +471,7 @@ impl<'a> Lower<'a> {
         let mut r = if mesh_quad {
             self.quad_pick(x, src)
         } else {
-            self.read_lane(x, src)
+            self.read_lane_in_wave(x, src)
         };
         let mut enable = None;
         if let Some(inside) = inside {
@@ -576,6 +598,47 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.bin(e, Bin::And, f, mask);
         let half = self.s.m.bin(e, Bin::LShr, lane, k5);
         (lane, half)
+    }
+
+    /// Whether the console flow can run this compute program on the host:
+    /// what `Lower::new` requires before it asks for it. In two 32-lane
+    /// halves, one console wave per group (the halves meet at group
+    /// barriers), no `ds_permute` across the halves, and whole-wave
+    /// sections only in a group of exactly 64 threads; on a host that runs
+    /// the console's waves, no `ds_permute`.
+    pub(super) fn console_flow_runs(&self) -> bool {
+        if self.mask_data != MaskData::Console {
+            return false;
+        }
+        let Some(t) = self.s.threads else {
+            return false;
+        };
+        let threads: u32 = t.iter().product();
+        let p = self.x.p;
+        let permute = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
+        if self.x.native.wave64 && !self.x.target.runs(64) {
+            let sections =
+                (0..p.blocks.len()).any(|b| !crate::emit::wave::sections(p, b).is_empty());
+            self.x.target.runs(32) && threads <= 64 && !permute && (threads == 64 || !sections)
+        } else {
+            self.x.target.runs(self.wave()) && !permute
+        }
+    }
+
+    /// Console flow in halves: whether the two group-shared dwords the
+    /// halves exchange through ([`Self::exchange`]) fit next to the
+    /// program's own LDS in DXIL's 32 KiB of group-shared memory. (A group
+    /// of 32 threads or fewer exchanges nothing.)
+    pub(super) fn exchange_fits(&self) -> Result<(), Why> {
+        let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if self.console_cf && self.split && threads > 32 && self.s.lds_dwords + 2 > 8192 {
+            return Err("a wave64 program whose LDS leaves no room for its halves' exchange");
+        }
+        Ok(())
     }
 
     /// Console flow: each half gives `x` (the same in all its lanes) and

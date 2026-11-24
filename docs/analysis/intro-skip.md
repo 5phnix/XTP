@@ -26,7 +26,7 @@ build 1.0.2.1 is known.
 
 In the whole front end, the title plays **one movie**: Bink 2, 3840×2160,
 450 frames at 30/1, so 15.00 s. It is the montage after the profile
-screen: a star transition, the artwork montage, then the Rockstar logo (the
+screen: a star transition, the artwork montage, then the publisher logo (the
 captures of run-world's sessions C and G show the same sequence). The title
 reads it into memory and hands it to Bink from there (open flag
 `0x04000000`), so it has no path at the Bink level.
