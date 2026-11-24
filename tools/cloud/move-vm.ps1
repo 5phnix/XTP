@@ -69,24 +69,33 @@ if ($DeleteOld) {
 
 if (-not $Zones.Count) { throw 'Pass -Zones: the zones to try, in order (another region than the VM''s own is fine).' }
 $zone = Get-XtpVmZone $cfg
-if (-not $zone) { throw "No VM named $($cfg.vm)." }
-if (Get-Zone $old) { throw "$old exists already: finish or undo the previous move first (move-vm.ps1 -DeleteOld)." }
+$oldZone = Get-Zone $old
+# A move that stopped after the renaming (no zone had a GPU free) goes on
+# from there: the old VM and the snapshots are ready.
+$resume = (-not $zone) -and $oldZone
+if ($resume) {
+    Write-Step "Going on with the move of $old ($oldZone)"
+    $zone = $oldZone
+} else {
+    if (-not $zone) { throw "No VM named $($cfg.vm)." }
+    if ($oldZone) { throw "$old exists already: finish or undo the previous move first (move-vm.ps1 -DeleteOld)." }
 
-# --- 1. Stop and snapshot ------------------------------------------------------
-if ((Get-XtpVmStatus $cfg $zone) -ne 'TERMINATED') {
-    Write-Step "Stopping $($cfg.vm)"
-    $null = Invoke-Gcloud -Arguments (@('compute', 'instances', 'stop', $cfg.vm, "--zone=$zone") + $base)
-}
-foreach ($pair in @(@($bootSnap, $cfg.vm), @($dataSnap, $cfg.dataDisk))) {
-    $snap, $disk = $pair
-    $have = Invoke-Gcloud -Arguments (@('compute', 'snapshots', 'describe', $snap, '--format=value(status)') + $base) -AllowFail -Quiet
-    if ($LASTEXITCODE -eq 0 -and $NewSnapshots) {
-        $null = Invoke-Gcloud -Arguments (@('compute', 'snapshots', 'delete', $snap) + $base)
-        $have = $null
+    # --- 1. Stop and snapshot ------------------------------------------------------
+    if ((Get-XtpVmStatus $cfg $zone) -ne 'TERMINATED') {
+        Write-Step "Stopping $($cfg.vm)"
+        $null = Invoke-Gcloud -Arguments (@('compute', 'instances', 'stop', $cfg.vm, "--zone=$zone") + $base)
     }
-    if (-not $have) {
-        Write-Step "Snapshot $snap of $disk"
-        $null = Invoke-Gcloud -Arguments (@('compute', 'snapshots', 'create', $snap, "--source-disk=$disk", "--source-disk-zone=$zone", '--labels=app=xtp', '--async') + $base)
+    foreach ($pair in @(@($bootSnap, $cfg.vm), @($dataSnap, $cfg.dataDisk))) {
+        $snap, $disk = $pair
+        $have = Invoke-Gcloud -Arguments (@('compute', 'snapshots', 'describe', $snap, '--format=value(status)') + $base) -AllowFail -Quiet
+        if ($LASTEXITCODE -eq 0 -and $NewSnapshots) {
+            $null = Invoke-Gcloud -Arguments (@('compute', 'snapshots', 'delete', $snap) + $base)
+            $have = $null
+        }
+        if (-not $have) {
+            Write-Step "Snapshot $snap of $disk"
+            $null = Invoke-Gcloud -Arguments (@('compute', 'snapshots', 'create', $snap, "--source-disk=$disk", "--source-disk-zone=$zone", '--labels=app=xtp', '--async') + $base)
+        }
     }
 }
 foreach ($snap in $bootSnap, $dataSnap) {
@@ -95,8 +104,10 @@ foreach ($snap in $bootSnap, $dataSnap) {
 }
 
 # --- 2. The old VM steps aside ---------------------------------------------------
-Write-Step "Renaming $($cfg.vm) to $old (kept, stopped, until -DeleteOld)"
-$null = Invoke-Gcloud -Arguments (@('compute', 'instances', 'set-name', $cfg.vm, "--zone=$zone", "--new-name=$old") + $base)
+if (-not $resume) {
+    Write-Step "Renaming $($cfg.vm) to $old (kept, stopped, until -DeleteOld)"
+    $null = Invoke-Gcloud -Arguments (@('compute', 'instances', 'set-name', $cfg.vm, "--zone=$zone", "--new-name=$old") + $base)
+}
 
 # --- 3. The new VM, from the boot snapshot -----------------------------------------
 $create = @('compute', 'instances', 'create', $cfg.vm, "--machine-type=$($cfg.machineType)",
