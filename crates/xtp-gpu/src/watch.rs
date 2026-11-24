@@ -12,9 +12,14 @@
 //! write access back. The runtime tells us when it maps or unmaps views
 //! ([`title_memory_remapped`]), which resets their protection. Blocks found
 //! unmapped are not asked about again until it maps them: view memory
-//! comes from placeholders, which only the runtime's mapping fills.
-//! shortcut: so memory committed otherwise into such a block (a range
-//! reaching from a view into a plain reservation) is not seen.
+//! comes from placeholders, which only the runtime's mapping fills. A
+//! write-watched reservation can be committed without the runtime telling
+//! us (the title's own allocations), and free address space can be
+//! allocated, so blocks there are still asked about each time.
+//! shortcut: a reservation that is not write-watched (one the title placed
+//! itself) looks like a placeholder, so memory committed into it later
+//! without a mapping is not seen, where a range reaches into it from a
+//! view.
 //!
 //! shortcut: writes into physical pages through another view (xmem's
 //! `write_physical`, DirectStorage's page destinations) are not seen at
@@ -112,7 +117,7 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
-    /// Blocks found unmapped (not committed) when a copy took them: the
+    /// Blocks found unmapped ([`placeholder`]) when a copy took them: the
     /// copy holds their zeros until the runtime maps them
     /// ([`title_memory_remapped`]). Without this, every asking found them
     /// "written" again (they cannot be made read-only) and the copy read
@@ -173,7 +178,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
 /// block by block if they span views, leaving out any that fail, and
-/// noting those not committed (unmapped) absent.
+/// noting placeholders absent.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
@@ -199,7 +204,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
-        } else if unmapped(block * BLOCK) {
+        } else if placeholder(block * BLOCK) {
             g.absent.insert(block);
         }
     }
@@ -217,14 +222,38 @@ fn view(at: usize) -> bool {
     n != 0 && info.Type == MEM_MAPPED
 }
 
-/// Whether nothing is committed at `at` (a placeholder between views).
-fn unmapped(at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+/// Whether the block at `at` holds nothing until the runtime maps a view
+/// there: reserved private memory, not committed and not write-watched, as
+/// a placeholder between views is. The system tells a placeholder from a
+/// reservation the title placed itself only by the write watch. Free
+/// address space (anyone may allocate it), a write-watched reservation (the
+/// title commits it without a mapping) and a view not committed yet are
+/// not placeholders.
+fn placeholder(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State != MEM_COMMIT
+    if n == 0 || info.State != MEM_RESERVE || info.Type != MEM_PRIVATE {
+        return false;
+    }
+    let (mut found, mut count, mut granularity) = (0usize, 1, 0);
+    // SAFETY: room for the one address asked for; no reset. It fails
+    // outside write-watched memory.
+    let watched = unsafe {
+        GetWriteWatch(
+            0,
+            at as *const _,
+            BLOCK,
+            (&raw mut found).cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } == 0;
+    !watched
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
@@ -761,5 +790,110 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+    }
+
+    /// A range from a view into a write-watched reservation (the title's
+    /// own allocation) that is not committed yet: the reservation is no
+    /// placeholder, since the title commits it without a mapping. It stays
+    /// reported until committed, and once committed its writes are seen.
+    #[test]
+    fn watched_reservations_next_to_views_are_not_absent() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
+            VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a pagefile section of one block.
+        let section = unsafe {
+            CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // A view of the section in block 0, then a write-watched reservation
+        // in block 1, right after it (retried if another thread takes the
+        // address in between).
+        let (p, view) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh placeholder of two blocks, split; block 0
+                // shows the section, block 1 goes back to free address space
+                // and is reserved again with write watching.
+                unsafe {
+                    let p = VirtualAlloc2(
+                        GetCurrentProcess(),
+                        std::ptr::null(),
+                        2 * BLOCK,
+                        MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                        PAGE_NOACCESS,
+                        std::ptr::null_mut(),
+                        0,
+                    ) as usize;
+                    assert_ne!(p, 0);
+                    VirtualFree(p as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                    let view = MapViewOfFile3(
+                        section,
+                        GetCurrentProcess(),
+                        p as *const _,
+                        0,
+                        BLOCK,
+                        MEM_REPLACE_PLACEHOLDER,
+                        PAGE_READWRITE,
+                        std::ptr::null_mut(),
+                        0,
+                    );
+                    assert_eq!(view.Value as usize, p);
+                    VirtualFree((p + BLOCK) as *mut _, 0, MEM_RELEASE);
+                    let at = VirtualAlloc(
+                        (p + BLOCK) as *const _,
+                        BLOCK,
+                        MEM_RESERVE | MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    ) as usize;
+                    if at == p + BLOCK {
+                        return Some((p, view));
+                    }
+                    UnmapViewOfFile2(GetCurrentProcess(), view, 0);
+                    None
+                }
+            })
+            .expect("the address after the view stays free");
+        let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
+        let both: Vec<usize> = (0..2).flat_map(pages).collect();
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(both));
+        assert_eq!(
+            guard(p, p + 2 * BLOCK),
+            Some(pages(1).collect()),
+            "not committed, but no placeholder"
+        );
+        // The title commits it and writes there, with no mapping.
+        // SAFETY: our reservation; one byte of the committed block.
+        unsafe {
+            let at = VirtualAlloc(
+                (p + BLOCK) as *const _,
+                BLOCK,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            );
+            assert_eq!(at as usize, p + BLOCK);
+            ((p + BLOCK + 8) as *mut u8).write_volatile(1);
+        }
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(Vec::new()));
+        // SAFETY: the committed block, now guarded: into our handler.
+        unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(2) };
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(pages(1).collect()));
+        // SAFETY: our view and reservation.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), view, 0);
+            VirtualFree((p + BLOCK) as *mut _, 0, MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(p, 2 * BLOCK);
     }
 }
