@@ -2148,6 +2148,15 @@ pub(crate) mod tests_support {
         }
     }
 
+    /// A `width` x `height` texture in `format` that shaders only sample
+    /// (the title fills it), in the layout library's pick.
+    pub(crate) fn sampled(width: u64, height: u32, format: u32) -> ResourceDesc {
+        ResourceDesc {
+            flags: 0,
+            ..target(width, height, format)
+        }
+    }
+
     /// A committed title resource described by `desc`.
     pub(crate) fn committed(desc: &ResourceDesc) -> This {
         let null = std::ptr::null();

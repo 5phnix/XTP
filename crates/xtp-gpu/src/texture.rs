@@ -13,15 +13,26 @@
 //! A texture whose host format stands in for the title's
 //! (`resource::format`) has its texels converted on the way.
 //!
+//! Each list that samples such a texture records the copy of the staging
+//! buffer into the host copy, under a predicate of its own
+//! (`SetPredication`): at submission, once the staging buffer is up to
+//! date, the copy is let run only if the host copy has not got these
+//! bytes yet, so the first list after a change copies and the others do
+//! not (a world frame samples the same textures in dozens of lists:
+//! `docs/analysis/gpu-frame.md`). `XTP_TEXTURE_PREDICATION=0` runs every
+//! list's copy, as before.
+//!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::core::Interface;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -39,7 +50,6 @@ macro_rules! once {
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
-    #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -52,16 +62,40 @@ pub(crate) struct Staging {
     mips: u32,
     memory: *const u8,
     last: Mutex<Last>,
+    /// How many times the staging buffer was written (detiled).
+    written: AtomicU64,
+    /// What a host copy last got from it, as decided at submission: the
+    /// count of writes then and the host copy (held weakly: its address is
+    /// not reused meanwhile).
+    copied: Mutex<Option<(u64, Weak<crate::resource::HostTexture>)>>,
+    /// Its checks since the last summary (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    seen: Seen,
+}
+
+/// A texture's checks since the last summary (diagnostics): all of them,
+/// those again in a submission that had checked it, the bytes hashed, the
+/// changes found.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Seen {
+    checks: AtomicU64,
+    again: AtomicU64,
+    hashed: AtomicU64,
+    changed: AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// with room to read the memory into; and the submission that checked it
+/// last (`timestamps::submissions` then, diagnostics).
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
     read: Vec<u8>,
+    #[cfg(feature = "diagnostics")]
+    checked: Option<u64>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -105,9 +139,12 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
-/// submission if the memory changed. Leaves the texture in the copy
-/// destination state.
+/// submission if the memory changed. The copy runs only if the host copy
+/// has not got the staging buffer's bytes yet (decided at submission, see
+/// the module). Leaves the texture in the copy destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    #[cfg(feature = "diagnostics")]
+    summary_due();
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -121,8 +158,23 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(staging) = staging(resource, texture) else {
         return;
     };
+    // The host copy `texture` is: what the copy writes (the list holds it
+    // through its state below).
+    let target = crate::resource::host_copy(resource)
+        .filter(|c| c.texture.as_raw() == texture.as_raw())
+        .map(|c| Arc::downgrade(&c));
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
+    // Without a predicate (none left, or predication off) the copy runs.
+    let predicate = target.as_ref().and_then(|_| Predicate::take());
+    let timed = crate::timestamps::command(list, crate::timestamps::What::TextureUpload, None);
+    if let Some(p) = &predicate {
+        // SAFETY: an open list; the predicate's buffer lives for the run.
+        unsafe {
+            list.list
+                .SetPredication(&p.of.buffer, p.offset(), D3D12_PREDICATION_OP_EQUAL_ZERO)
+        };
+    }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
@@ -172,8 +224,130 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    if predicate.is_some() {
+        // SAFETY: an open list.
+        unsafe {
+            list.list
+                .SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)
+        };
+    }
+    drop(timed);
     // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    list.defer_texture(staging.clone());
+    // Then, for this list: whether its copy runs.
+    let bytes = staging.size;
+    list.defer_host((0, 0), move || {
+        let due = target.as_ref().is_none_or(|t| staging.copy_due(t));
+        if let Some(p) = &predicate {
+            p.set(due);
+        }
+        let runs = due || predicate.is_none();
+        COPIES[usize::from(runs)].fetch_add(1, Ordering::Relaxed);
+        COPIED[usize::from(runs)].fetch_add(bytes, Ordering::Relaxed);
+        #[cfg(test)]
+        DECIDED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((Arc::as_ptr(&staging) as usize, runs));
+    });
+}
+
+/// Each copy decided in tests: its staging buffer and whether it ran.
+#[cfg(test)]
+static DECIDED: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+
+/// GPU copies of staging buffers recorded, by whether they ran: count and
+/// bytes (staging sizes), since the last summary.
+static COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static COPIED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether texture copies run under a predicate (`XTP_TEXTURE_PREDICATION`,
+/// on unless `0`).
+fn predication() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XTP_TEXTURE_PREDICATION").is_none_or(|v| v != "0"))
+}
+
+/// Predicates for texture copies: 8-byte words of one upload buffer (in a
+/// read state, which predication's is part of), one per recorded copy.
+struct Predicates {
+    buffer: ID3D12Resource,
+    data: *mut u64,
+    free: Mutex<Vec<u32>>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; each word of the persistent
+// mapping is written only by the holder of its `Predicate`.
+unsafe impl Send for Predicates {}
+// SAFETY: as above.
+unsafe impl Sync for Predicates {}
+
+/// Predicate words: 64 Ki (512 KiB); a world frame records a few thousand
+/// copies, held until their lists are reset.
+const PREDICATES: u32 = 1 << 16;
+
+static PREDICATE_WORDS: OnceLock<Option<Predicates>> = OnceLock::new();
+
+/// One copy's predicate word: the copy runs unless it is 0. It goes back
+/// when its holder goes (the list's submission step, dropped once the list
+/// is reset and nothing running uses its recording).
+struct Predicate {
+    of: &'static Predicates,
+    at: u32,
+}
+
+impl Predicate {
+    /// A free word, set to run (so a copy whose step never ran would run);
+    /// `None` without predication or once they are all taken (logged once).
+    fn take() -> Option<Predicate> {
+        let of = PREDICATE_WORDS
+            .get_or_init(|| {
+                if !predication() {
+                    return None;
+                }
+                let (buffer, data) = host()?.upload_buffer(u64::from(PREDICATES) * 8)?;
+                crate::host::name(&buffer, || "texture copy predicates".into());
+                Some(Predicates {
+                    buffer,
+                    data: data.cast(),
+                    free: Mutex::new((0..PREDICATES).rev().collect()),
+                })
+            })
+            .as_ref()?;
+        let Some(at) = of.free.lock().unwrap_or_else(|e| e.into_inner()).pop() else {
+            once!("texture copy predicates ran out: copies run every time");
+            return None;
+        };
+        let p = Predicate { of, at };
+        p.set(true);
+        Some(p)
+    }
+
+    fn offset(&self) -> u64 {
+        u64::from(self.at) * 8
+    }
+
+    /// Before the list runs: whether its copy runs.
+    fn set(&self, runs: bool) {
+        // SAFETY: this word of the mapped buffer is ours; the list that
+        // reads it is not running (its submission is being prepared).
+        unsafe {
+            self.of
+                .data
+                .add(self.at as usize)
+                .write_volatile(u64::from(runs))
+        };
+    }
+}
+
+impl Drop for Predicate {
+    fn drop(&mut self) {
+        self.of
+            .free
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(self.at);
+    }
 }
 
 /// A buffer-to-texture copy into subresource `sub` of `dst` at `at`, from
@@ -328,6 +502,14 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
+        #[cfg(feature = "diagnostics")]
+        {
+            let submission = crate::timestamps::submissions();
+            self.seen.checks.fetch_add(1, Ordering::Relaxed);
+            if last.checked.replace(submission) == Some(submission) {
+                self.seen.again.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
@@ -339,8 +521,12 @@ impl Staging {
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
             before_write();
             self.detile(&last.read);
+            self.written.fetch_add(1, Ordering::Release);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            {
+                crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+                self.seen.changed.fetch_add(1, Ordering::Relaxed);
+            }
             return size;
         }
         if !committed(self.memory, size) {
@@ -357,7 +543,10 @@ impl Staging {
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        {
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            self.seen.hashed.fetch_add(size as u64, Ordering::Relaxed);
+        }
         if last.hash == Some(hash) {
             return size;
         }
@@ -366,9 +555,27 @@ impl Staging {
         // the memory differ from the hash and detiles it again.
         before_write();
         self.detile(tiled);
+        self.written.fetch_add(1, Ordering::Release);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        {
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            self.seen.changed.fetch_add(1, Ordering::Relaxed);
+        }
         size
+    }
+
+    /// At submission, once the staging buffer is up to date: whether a copy
+    /// into `target` has to run for it to hold the staging buffer's bytes.
+    /// It is then taken to hold them (the copy runs in submission order,
+    /// before any later list's).
+    fn copy_due(&self, target: &Weak<crate::resource::HostTexture>) -> bool {
+        let written = self.written.load(Ordering::Acquire);
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let due = !copied
+            .as_ref()
+            .is_some_and(|(w, t)| *w == written && Weak::ptr_eq(t, target));
+        *copied = Some((written, target.clone()));
+        due
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -525,7 +732,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,
@@ -535,7 +741,241 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         memory,
         last: Mutex::default(),
+        written: AtomicU64::new(0),
+        copied: Mutex::new(None),
+        #[cfg(feature = "diagnostics")]
+        seen: Seen::default(),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+/// Every few seconds (diagnostics): per frame, the textures checked, how
+/// often, the bytes hashed and the changes, the staging copies recorded and
+/// those that ran, and the textures that took most hashing.
+#[cfg(feature = "diagnostics")]
+fn summary_due() {
+    static NEXT: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    let frames = {
+        let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let frame = crate::frame::current();
+        match *next {
+            None => {
+                *next = Some((now, frame));
+                return;
+            }
+            Some((at, _)) if now.duration_since(at) < std::time::Duration::from_secs(5) => return,
+            Some((_, from)) => {
+                *next = Some((now, frame));
+                frame.saturating_sub(from).max(1) as f64
+            }
+        }
+    };
+    let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) as f64 / frames;
+    let mb = |bytes: f64| bytes / 1e6;
+    /// One texture's line, per frame.
+    struct Row {
+        checks: f64,
+        again: f64,
+        hashed_mb: f64,
+        changes: f64,
+        staging: u64,
+        memory: usize,
+        desc: String,
+    }
+    let mut rows: Vec<Row> = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .flat_map(|m| m.values())
+            .map(|s| Row {
+                checks: take(&s.seen.checks),
+                again: take(&s.seen.again),
+                hashed_mb: mb(take(&s.seen.hashed)),
+                changes: take(&s.seen.changed),
+                staging: s.size,
+                memory: s.memory as usize,
+                desc: format!(
+                    "{}x{}x{}, {} mips, {}-byte elements of {} texels square, {:?}, {:.2} MB in                      title memory",
+                    s.layout.desc.width,
+                    s.layout.desc.height,
+                    s.layout.desc.depth,
+                    s.mips,
+                    s.layout.desc.element_bytes,
+                    s.layout.desc.block,
+                    s.layout.desc.swizzle,
+                    s.layout.size as f64 / 1e6
+                ),
+            })
+            .filter(|r| r.checks > 0.0)
+            .collect()
+    };
+    let [skipped, ran] = [0, 1].map(|i| (take(&COPIES[i]), mb(take(&COPIED[i]))));
+    let sum = |f: fn(&Row) -> f64| -> f64 { rows.iter().map(f).sum() };
+    tracing::info!(
+        "texture checks per frame: {} textures checked {:.0} times ({:.0} again in a submission          that had checked them), {:.1} MB hashed, {:.1} changes; staging copies {:.0} ran          ({:.1} MB), {:.0} skipped ({:.1} MB)",
+        rows.len(),
+        sum(|r| r.checks),
+        sum(|r| r.again),
+        sum(|r| r.hashed_mb),
+        sum(|r| r.changes),
+        ran.0,
+        ran.1,
+        skipped.0,
+        skipped.1
+    );
+    rows.sort_by(|a, b| {
+        b.hashed_mb
+            .total_cmp(&a.hashed_mb)
+            .then(b.checks.total_cmp(&a.checks))
+    });
+    for r in rows.iter().take(12) {
+        tracing::info!(
+            "  texture at {:#x} ({}, staging {:.2} MB): {:.1} checks/frame ({:.1} again), {:.1}              MB hashed, {:.2} changes",
+            r.memory,
+            r.desc,
+            r.staging as f64 / 1e6,
+            r.checks,
+            r.again,
+            r.hashed_mb,
+            r.changes
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::tests_support::{committed, read_back, sampled};
+
+    const COPY_DEST: u32 = 0x400;
+
+    /// The decisions made for `staging` so far, in order.
+    fn decided(staging: &Arc<Staging>) -> Vec<bool> {
+        let key = Arc::as_ptr(staging) as usize;
+        DECIDED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .map(|&(_, ran)| ran)
+            .collect()
+    }
+
+    /// Runs one host list per entry of `lists` in one submission, each
+    /// sampling `resource` (its staging copy recorded as a draw does).
+    fn sample_in(host: &crate::host::Host, resource: This, lists: usize) {
+        let texture = crate::resource::host_resource(resource).expect("a host copy");
+        let made: Vec<HostList> = (0..lists).map(|_| host.new_list().unwrap()).collect();
+        for list in &made {
+            upload(list, resource, texture);
+            list.close();
+        }
+        let runs: Vec<&HostList> = made.iter().collect();
+        host.execute(&runs);
+        host.drain();
+    }
+
+    /// A texture the title fills is copied into its host copy by the first
+    /// list that samples it, and not by the others, nor by later lists
+    /// until its memory changes: the GPU skips their copies (a staging
+    /// buffer written behind its back does not reach the host copy), and a
+    /// change is copied by the next list.
+    #[test]
+    fn a_texture_is_copied_once_until_its_memory_changes() {
+        let test = "texture::tests::a_texture_is_copied_once_until_its_memory_changes";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !predication() {
+            return;
+        }
+        let resource = committed(&sampled(16, 16, 28));
+        let started = std::time::Instant::now();
+        while crate::resource::host_resource(resource).is_none() {
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "the host copy never became resident"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let texture = crate::resource::host_resource(resource).unwrap();
+        let (memory, _) = crate::resource::texture_memory(resource).unwrap();
+        let size = staging(resource, texture).unwrap().layout.size as usize;
+        let fill = |byte: u8| {
+            // SAFETY: the texture's own title memory, `size` bytes.
+            unsafe { memory.cast_mut().write_bytes(byte, size) }
+        };
+        let texels = || -> Vec<u8> {
+            let read = read_back(host, texture, COPY_DEST);
+            (0..16)
+                .flat_map(|y| read[y * 256..y * 256 + 64].to_vec())
+                .collect()
+        };
+        let staging = staging(resource, texture).unwrap();
+
+        // Two lists in one submission: the first copies, the second not.
+        fill(0x11);
+        sample_in(host, resource, 2);
+        assert_eq!(decided(&staging), [true, false]);
+        assert!(texels().iter().all(|&b| b == 0x11));
+
+        // The memory did not change: the next list's copy is skipped on
+        // the GPU, so what is in the staging buffer does not get through.
+        // SAFETY: the mapped staging buffer, `size` bytes; nothing runs.
+        unsafe { staging.data.write_bytes(0x22, staging.size as usize) };
+        sample_in(host, resource, 1);
+        assert_eq!(decided(&staging), [true, false, false]);
+        assert!(
+            texels().iter().all(|&b| b == 0x11),
+            "a skipped copy ran: {:x?}",
+            &texels()[..16]
+        );
+
+        // A change is detiled and copied by the next list.
+        fill(0x33);
+        sample_in(host, resource, 2);
+        assert_eq!(decided(&staging), [true, false, false, true, false]);
+        assert!(texels().iter().all(|&b| b == 0x33));
+        assert_eq!(host.log_messages(), None);
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+    }
+
+    /// A copy into another host copy is due even though the staging buffer
+    /// did not change (the title's resource got a new host copy), and so
+    /// is one into the first again after it.
+    #[test]
+    fn another_host_copy_is_copied_into() {
+        let test = "texture::tests::another_host_copy_is_copied_into";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let [first, second] = [0, 1].map(|_| committed(&sampled(16, 16, 28)));
+        let started = std::time::Instant::now();
+        while [first, second]
+            .iter()
+            .any(|&r| crate::resource::host_copy(r).is_none())
+        {
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "the host copies never became resident"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let [a, b] = [first, second].map(|r| crate::resource::host_copy(r).unwrap());
+        let staging = staging(first, &a.texture).unwrap();
+        let [a, b] = [&a, &b].map(Arc::downgrade);
+        assert!(staging.copy_due(&a), "never copied");
+        assert!(!staging.copy_due(&a), "copied, not changed");
+        assert!(staging.copy_due(&b), "another host copy");
+        assert!(staging.copy_due(&a), "the first one got the other's turn");
+        staging.written.fetch_add(1, Ordering::Release);
+        assert!(staging.copy_due(&a), "written again");
+        assert!(!staging.copy_due(&a));
+        type Release = extern "system" fn(This) -> u32;
+        for r in [first, second] {
+            assert_eq!(crate::object::slot::<Release>(r, 0x10)(r), 0);
+        }
+    }
 }
