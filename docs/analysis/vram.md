@@ -12,7 +12,7 @@ its memory (device method 0x428, `create_at_address`); each texture gets a
 host copy (`host_texture`). Until this change every host copy was a
 committed resource: its own implicit heap, its own residency operation.
 
-stall's measurements (task 6bb65399, this PC, 2026-11-24; a D3D12 probe
+stall's measurements (task 6bb65399, this PC; a D3D12 probe
 without XTP, then sessions R and S in game):
 
 - Past a global threshold (about 9.5–9.75 GB resident for all processes on
@@ -130,7 +130,7 @@ is that half.
 
 `resource::pool::tests::bench_5000_bc7_textures` (ignored; `cargo test -p
 xtp-gpu --release -- --ignored --nocapture pool::tests::bench`): 5,000 BC7
-1024² textures of 9 mips made three ways. Run 2026-11-24 on WARP, on a
+1024² textures of 9 mips made three ways. Run on WARP, on a
 build-farm VM (c2d-highcpu-16, no GPU), release build, tree e17e4f8 plus
 this delivery:
 
@@ -158,7 +158,7 @@ Reading:
   mostly not small ones.
 - WARP's "video memory" is the process's own (private bytes follow it).
 
-### 3.2 In game (Series X, this PC, 2026-11-24)
+### 3.2 In game (Series X, this PC)
 
 `E:\tools\stall-probe\session.ps1` (autopilot, golden data,
 `XTP_WATCHDOG_HOOK=1`, under `measure.lock`, one session at a time); the
@@ -196,7 +196,7 @@ What they show:
 
 ### 3.3 Decision: off by default
 
-The person's decision (relayed by Samuel, 2026-11-24): XTP works in Series S
+The person's decision (relayed by Samuel): XTP works in Series S
 mode, where the world loads in about 10 s under VidMm's ceiling (series-s,
 frame-prof's session C), and no more Series X session is run. B3 (the same
 binary as A3, pool off) was therefore not run, and A3 is not shown to be at

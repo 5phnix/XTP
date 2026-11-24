@@ -1,10 +1,10 @@
 # Series S mode: the crash a few seconds into the world, and the default
 
-Measured on 2026-11-24 on the person's PC (RTX 4080 SUPER 16 GB, Windows 11
+Measured on the person's PC (RTX 4080 SUPER 16 GB, Windows 11
 26300) with build 1.0.2.1 (BLAKE3 `b99f876b…e93`), from the golden save,
 for the task "Series S mode: fix the title crash ~7 s into the world, then
 make Series S the default". RVAs are relative to the base of
-`game_scarlett_master.exe` (or of `amd_fidelityfx_upscaler_xbox.dll`, said
+the title executable (or of `amd_fidelityfx_upscaler_xbox.dll`, said
 so). No title bytes or listings are quoted. Times are UTC. Logs are under
 `E:\xtp-data\cache\play\<stamp>` and `E:\xtp-data\runs\stall-<name>`; none
 is in the repository.
@@ -53,7 +53,7 @@ streamed little in it.
 | 5 | `20261124-173913` | array read when the read runs | 17:40:26.3 | none; ended by the autopilot at 17:42:56.3 |
 
 Sessions C, 2 and 3 have the same shape, read from the title's own crash
-dump (session C: its Breakpad minidump in `data\7952987A\temp`) and from
+dump (session C: its Breakpad minidump in the title's data folder) and from
 the live process under cdb (sessions 2 and 3):
 
 - The faulting function walks objects of the title's heap (in session C an
@@ -68,7 +68,7 @@ the live process under cdb (sessions 2 and 3):
   structure. The next pointer read from there is garbage, and the read
   after it faults.
 - Session C's crash context (written by the title) shows a cutscene
-  prestreaming (`fbk_stry000_FBK_STRY000_INTRO_min`) with 96 % of its
+  prestreaming with 96 % of its
   physical budget in use: streaming is at its busiest.
 
 ## 3. The page's history

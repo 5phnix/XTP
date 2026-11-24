@@ -1,11 +1,11 @@
 # The dark world: from the 1440p targets to the presented image
 
 Why BTP 6's world reaches the screen black under XTP, what was
-fixed, and what still blocks it. Written on 2026-11-24 from XTP's own runs on
+fixed, and what still blocks it. Written from XTP's own runs on
 the person's RTX 4080 SUPER (`E:\xtp-data\runs`, never in the repository),
 the VIctory community's reports, and a reading of the title's code (build
 blake3 `b99f876b74d4a77f…`; addresses are RVAs relative to
-`game_scarlett_master.exe`; findings are described, no title bytes are
+the title executable; findings are described, no title bytes are
 quoted). It answers `gpu.md` §6.1 in part and open question 3.
 
 ## 1. Summary
@@ -39,15 +39,15 @@ quoted). It answers `gpu.md` §6.1 in part and open question 3.
 |---|---|---|
 | 1 | Scene targets at 2560×1440: colour in R8G8B8A8 (f28) and B8G8R8A8 (f87), R10G10B10A2 (f24), depth, and two NVIDIA-refused formats (B5G5R5A1, B4G4R4A4) that now take stand-ins (gpu-nvidia's delivery). | #841's dumps (frames 2000 to 2200: means 139 to 181 of 255); XTP's first runs' refusals |
 | 2 | The upscaler: 1440p to the 3840×2160 R8G8B8A8 output. The title's own (type 6) in Series X mode. | Code reading, section 3 |
-| 3 | The interface (title card, subtitles, HUD) drawn into the 4K output. | Front-end dumps of run `play-F`: the 4K target `0x19cff9472b0` holds the profile screen and its button prompts |
+| 3 | The interface (opening credits, subtitles, HUD) drawn into the 4K output. | Front-end dumps of run `play-F`: the 4K target `0x19cff9472b0` holds the profile screen and its button prompts |
 | 4 | `PresentX`: plane 0's first resource, one of two 4K back buffers in turn (`0x19bec6a0340`, `0x19bec69f3a0` in `play-F`), copied to the swap chain. | `queue::present`; the presented frames match the 4K target in the front end |
 
 #841's dumps (another tree, an RTX 3090) place the break between steps 1
 and 2: the 1440p targets hold the scene, the 4K output 0 to 1 of 255. A
 dense 0-to-1 image rather than the cleared 0 suggests a full-screen pass that
 ran on black input; the interface of step 3 then draws over black, which is
-the README's "the title card shows, and the scene after it stays black" on
-AMD. Why the input reads black is section 4's question.
+the README's earlier report on AMD: the opening credits show, and the
+scene after them stays black. Why the input reads black is section 4's question.
 
 ## 3. Which upscaler runs (code reading)
 
@@ -91,8 +91,8 @@ AMD. Why the input reads black is section 4's question.
   writes black with whatever it adds (dither, film grain), which fits #841's
   0-to-1 output; whether the upscaler reads it that way is what section 6's
   capture must show.
-- Testers with VIctory #643 on an RX 9070 XT saw the "the publisher
-  presents" card for the first time, and cutscene subtitles stopped piling
+- Testers with VIctory #643 on an RX 9070 XT saw the opening
+  credits for the first time, and cutscene subtitles stopped piling
   up on each other: aliases had been resolving to the wrong copy.
 
 ### 4.2 Work dropped on NVIDIA (not this task)

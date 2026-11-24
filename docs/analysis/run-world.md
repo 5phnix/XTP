@@ -1,17 +1,17 @@
 # The running game in the world: frame time, missing image, hangs
 
-What keeps BTP 6's first mission from 30 fps on the person's
+What keeps the first 3D scene from 30 fps on the person's
 machine (RTX 4080 SUPER 16 GB, Ryzen 9 7950X3D, 64 GB, Windows 11
 26300), measured on XTP `main` at `2d0257e` with the diagnostics build
-(`cargo build --profile diag -p xtp --features diagnostics`), on
-2026-11-24. It answers `gpu.md` open questions 1, 2, 6 and part of 3 and 7,
+(`cargo build --profile diag -p xtp --features diagnostics`).
+It answers `gpu.md` open questions 1, 2, 6 and part of 3 and 7,
 and ranks the causes against the backlogs of `gpu.md`, `shader.md`,
 `formats.md` and `hle.md`.
 
 How the runs were made is in `run-keys.md` (golden save, `play.ps1`,
 `XTP_KEYS`). Logs and captures are under `E:\xtp-data\runs\` and
 `E:\xtp-data\run1.clean.log`; none is in the repository. Title code is
-named by RVA (relative to `game_scarlett_master.exe`, build blake3
+named by RVA (relative to the title executable, build blake3
 `b99f876b74d4a77f…`), shaders by their 16-digit hash.
 
 ## 1. Summary
@@ -33,7 +33,7 @@ named by RVA (relative to `game_scarlett_master.exe`, build blake3
   still being made 23 % (first 15-55 s only), indirect executions whose
   preparation fails 15 %, pipelines the NVIDIA driver refuses 5 %.
 - **Every presented world frame is black** (mean level 0.0-0.3 of 255),
-  title card included, although thousands of draws run. On this NVIDIA
+  opening credits included, although thousands of draws run. On this NVIDIA
   machine the likeliest extra cause is the refused 64-lane compute passes
   (section 6); the world's render targets could not be dumped yet.
 - **The GPU hangs**: three of the five world sessions that lasted over
@@ -52,7 +52,7 @@ named by RVA (relative to `game_scarlett_master.exe`, build blake3
   4.4 to 8.4 GB, every texture the title then creates waits 1.5 to 14 s in
   the kernel, frames stop and the title stops itself. Same binary, save and
   cache as the runs that passed; launcher, keys, sound, pipeline library,
-  Discord, the NVIDIA overlay, other GPU tests and a driver reset are ruled
+  another application using the video encoder, the NVIDIA overlay, other GPU tests and a driver reset are ruled
   out. The numbers above come from the runs before it.
 
 The ranked list with shares and backlog items is section 9.
@@ -74,8 +74,8 @@ The ranked list with shares and backlog items is section 9.
 | `play-H` | 14:03:46 | golden | no keys, started through `cmd.exe` as the first runs, muted, quiet machine | not reached: loading from +34 s, no frame after +42 s | – | the title crashes itself at +73 s |
 | `play-I` to `play-N` | 14:15-14:39 | golden | one change each (section 7.4) | not reached: each stops presenting on the loading screen | – | the title crashes itself |
 | `play-O` | 14:43:30 | golden | `main` `e1a4d29`, `cargo xtask play` (autopilot), resource debug log | not reached: loading from about +28 s, no frame after +38 s | – | the title crashes itself at +74 s |
-| `play-P` | 14:54:20 | golden | `main` `c7a4220` after a graphics driver reset, autopilot, VRAM sampling; Discord still running | not reached | – | the title crashes itself |
-| `play-Q` | 14:59:18 | golden | same binary as P, Discord closed (0 processes), 1.4 GB of VRAM in use before the start | not reached | – | the title crashes itself at about +2 min |
+| `play-P` | 14:54:20 | golden | `main` `c7a4220` after a graphics driver reset, autopilot, VRAM sampling; an application using the video encoder still running | not reached | – | the title crashes itself |
+| `play-Q` | 14:59:18 | golden | same binary as P, that application closed (0 processes), 1.4 GB of VRAM in use before the start | not reached | – | the title crashes itself at about +2 min |
 
 "Clean" timing runs are `run1`, `A-fresh` and `play-test1` (captures
 cost a few ms per captured frame). `B-save` carries DRED's per-command
@@ -316,9 +316,9 @@ back a whole family of passes.
   `play-test1` and `play-C`) and still present black, so the scene is not
   missing for lack of draws: the chain that turns it into the presented
   image outputs zero.
-- The README reports, on an AMD RX 6700 XT, that the mission's title card
-  renders and the scene behind it is dark. Here not even the title card
-  shows. What differs on this machine is NVIDIA-only: 118 compute
+- The README reported, on an AMD RX 6700 XT, that the opening credits
+  render and the scene behind them is dark. Here not even the credits
+  show. What differs on this machine is NVIDIA-only: 118 compute
   pipelines refused for their 64-lane waves and two 2560×1440 targets that
   do not exist on the host (section 5). Exposure and luminance reductions,
   and the passes that compose the final image, are typically cross-lane
@@ -408,11 +408,11 @@ today's `main` (`e1a4d29`, run O). Ruled out one session at a time:
 | I | shared pipeline library moved aside (empty library) | stalls |
 | J | silent by volume 0 instead of the mute flag | stalls |
 | K | the title gets the original `TMP`/`TEMP` back | stalls |
-| L | screen sharing (Discord, ~39 % GPU in video encode) and the NVIDIA overlay switched off by the person | stalls |
+| L | another application using the video encoder (~39 % GPU in video encode) and the NVIDIA overlay switched off by the person | stalls |
 | N | Enter every 5 s (see `run-keys.md` 4) until 120 s, as runs C and test1 | stalls |
 | O | today's `main`, the autopilot pressing A every 2.5 s, no GPU test of other workers running | stalls |
 | P | graphics driver reset by the person (Win+Ctrl+Shift+B), `main` `c7a4220` | stalls |
-| Q | as P, Discord closed (it held 3.9 GB of video memory) | stalls |
+| Q | as P, that application closed (it held 3.9 GB of video memory) | stalls |
 
 What the stall is (stacks of M every 5 s; resource log of O):
 
@@ -439,7 +439,7 @@ What the stall is (stacks of M every 5 s; resource log of O):
 
 What triggers it (VRAM sampled every 2-7 s in P and Q):
 
-| | P (Discord running) | Q (Discord closed) |
+| | P (that application running) | Q (closed) |
 |---|---|---|
 | xtp.exe dedicated video memory, front end | 4.4 GB | 4.4 GB |
 | same, from the start of the world load | 8.33-8.40 GB (jump within 10 s) | 8.37-8.40 GB (jump within 8 s) |
@@ -455,7 +455,7 @@ full; from then on the `MakeResident` behind each new host texture (the
 other workers' reading of the kernel wait, task 6bb65399) costs 1.5 to
 14 s. The same binary passed the same load before 13:36, when nothing
 measured video memory. Not established: what allocates those 4 GB, in
-which heap, and why residency became that slow. Closing Discord, resetting
+which heap, and why residency became that slow. Closing that application, resetting
 the driver and stopping other GPU tests did not change it. Until it is
 fixed no session reaches the world on this machine, which blocks the
 watchdog, dark-world, integration and asynchronous-submission checks.

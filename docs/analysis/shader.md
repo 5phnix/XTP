@@ -1,4 +1,4 @@
-# Shader compiler: VIctory vs xcl (analysis, 2026-11-24)
+# Shader compiler: VIctory vs xcl (analysis)
 
 What XTP keeps of VIctory's shader translator (console RDNA2 machine code →
 host DXIL) and what it should rewrite after xcl's approach, with an ordered
@@ -83,11 +83,11 @@ translations), `apps/xtp/src/{translate,shader,survey}.rs` (survey tools;
 
 ## 3. How the measurement was made
 
-Both translators were run on the person's `E:\uwu\shaders.rpf`, read-only;
+Both translators were run on `<title folder>\shaders.rpf`, read-only;
 nothing of it was copied.
 
 * **xcl:** its own build, `E:\xcl\target\release\xcl.exe shaders
-  E:\uwu\shaders.rpf --recomp` (13 s) and `--compile 64` (DXC on a sample:
+  <title folder>\shaders.rpf --recomp` (13 s) and `--compile 64` (DXC on a sample:
   64 OK, 0 errors; DXC 1.8.2502, median 0.45 s, p90 2.34 s per program).
 * **XTP/VIctory:** XTP has no reader for RPF9 shader packs (`xtp translate`
   scans files for DXBC magic and SGD5 records; the pack's records are raw
@@ -99,7 +99,7 @@ nothing of it was copied.
   `dxil.dll` 1.8 (`emit::validator`). 45 s on all cores. Backlog item S0
   brings this into the repo.
 
-**Since S0 (2026-11-24)** the run is in the repository:
+**Since S0** the run is in the repository:
 `cargo run --release -p xtp -- shader-survey [PACK] [--json FILE]
 [--validate | --validate-every 50]` (the pack: the argument, else
 `XTP_SAMPLE_SHADERS`, else `shaders.rpf` in the configured game folder).
@@ -240,7 +240,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
 - xcl: `gpu/pack.rs` `scan`, `inflate`; `shaders.rs` survey output.
 - Test: on the person's pack, 26 503 records, 26 698 programs, 22 485
   translated; unit test on a synthetic record stream with decoy names.
-- Done (2026-11-24): `xtp shader-survey` (`apps/xtp/src/survey.rs`)
+- Done: `xtp shader-survey` (`apps/xtp/src/survey.rs`)
   through `emit::translate_program`; `--json` writes one program per line
   with the hash of its translation, so two runs compare with
   `git diff --no-index before.json after.json`. Opt-in test
@@ -256,7 +256,7 @@ change, then those that do, then geometry, then 32-lane GPUs.
 - xcl: none.
 - Test: S0's survey byte-identical DXIL for every program (hash of all
   outputs unchanged); crate tests pass.
-- Done (2026-11-24): `emit/lower/` holds `mod` (types, `new`, `run`, the
+- Done: `emit/lower/` holds `mod` (types, `new`, `run`, the
   dispatch `inst`), `operand`, `flow`, `mask`, `compare`, `lanes`, `mesh`,
   `salu`, `smem`, `descriptor`, `buffer`, `valu`, `valu16`, `integer`,
   `image`, `lds`, `input`, `export`, `tests`; which item edits which file
@@ -523,7 +523,7 @@ blockers, risk 1).
 3. How much do NVIDIA (32-lane only) users matter now? L1–L3 can wait if
    the target is AMD.
 4. Which runtime misses come first in the world: are the 390 merged ES+GS
-   programs (one effect family) on the critical path of the first mission?
+   programs (one effect family) on the critical path of the first 3D scene?
 5. Is the console shader compiler available to run the differential tests
    (`VICTORY_CONSOLE_DXC`), the best oracle for P2, I1 and S4?
 6. Should S0's pack reader live in `xtp-game` (BTP 6–specific record
