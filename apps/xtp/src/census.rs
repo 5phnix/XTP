@@ -197,3 +197,16 @@ fn looks_like_pe(path: &Path) -> bool {
         .is_ok()
         && &magic == b"MZ"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_census_json_emits_empty_arrays() {
+        let out = to_json(0, 0, (0, 0, 0, 0), &BTreeMap::new(), &BTreeMap::new());
+        assert!(out.contains(r#""format": "xtp-census 1""#));
+        assert!(out.contains(r#""dlls": []"#));
+        assert!(out.contains(r#""missing": []"#));
+    }
+}

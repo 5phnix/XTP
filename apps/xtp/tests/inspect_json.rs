@@ -24,7 +24,7 @@ fn build_probe() -> PathBuf {
     target.join("debug").join("hle_probe.dll")
 }
 
-/// Minimal strict JSON value + parser so tests validate syntax and structure
+/// Minimal JSON value + parser so tests validate syntax and structure
 /// without adding a crate dependency.
 #[derive(Debug, PartialEq)]
 enum Json {
@@ -243,6 +243,7 @@ fn inspect_and_census_json_on_hle_probe() {
     let doc = Parser::parse(&stdout);
     let obj = doc.as_object();
     assert_eq!(obj["format"].as_str(), "xtp-inspect 1");
+    assert_eq!(obj["kind"].as_str(), "dll");
     assert!(obj["file"].as_str().ends_with("hle_probe.dll"));
     assert_eq!(obj["machine"].as_str(), "0x8664");
     assert!(obj["image_base"].as_str().starts_with("0x"));
@@ -256,6 +257,15 @@ fn inspect_and_census_json_on_hle_probe() {
     assert!(
         has_hle_xgr,
         "expected xgameruntime.dll as hle in inspect --json: {stdout}"
+    );
+
+    let has_delayed_probe = imports.iter().any(|item| {
+        let m = item.as_object();
+        m["dll"].as_str().contains("probe-delayed") && m["delay"] == Json::Bool(true)
+    });
+    assert!(
+        has_delayed_probe,
+        "expected xtp-probe-delayed.dll with delay: true in inspect --json: {stdout}"
     );
 
     let has_missing_probe = imports.iter().any(|item| {

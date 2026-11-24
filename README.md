@@ -114,6 +114,19 @@ xtp run <exe> [--execute] [--unimplemented trap|zero] [--strict]
 xtp config
 ```
 
+`xtp inspect --json` emits a stable JSON object (`"format": "xtp-inspect 1"`)
+with string fields `file`, `blake3`, `kind` (`"exe"` or `"dll"`), hex-string
+fields `machine`, `image_base` and `entry_rva`, numeric fields `subsystem` and
+`size_of_image`, and an `imports` array of `{dll, symbol, delay, resolution}`
+objects (`delay` is a boolean; `resolution` is `"hle"`, `"host"`, `"missing"`,
+with `"title"` reserved because static `inspect` does not map title-shipped
+DLLs, so those report as `"missing"`). `--json` ignores `--imports` and
+`--exports`. `xtp census --json` emits `"format": "xtp-census 1"` with numeric
+`images`, `unreadable`, `totals` (`{functions, hle, host, missing}`), a `dlls`
+array (`{dll, functions, hle, host, missing, images}`), and always includes the
+`missing` array (`{dll, symbol, images}`). The `format` version number
+increments on any breaking schema change.
+
 The title sees an Xbox Series S unless `--console series-x` or
 `XTP_CONSOLE=series-x` says otherwise: with Series S budgets the world
 loads in seconds, where Series X's push the host GPU's resident memory
