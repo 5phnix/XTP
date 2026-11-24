@@ -21,7 +21,8 @@
 //! replace costs a system call per range and ran at 0.25 to 0.8 GB/s in the
 //! world (run-world, world-frame session C). The copy-back reads a run of
 //! pieces the GPU changed at once (Marvisak/VIctory#1124) and writes only
-//! the bytes the GPU changed, piece by piece, each byte once per
+//! the bytes the GPU changed and the title left alone (a three-way merge
+//! ported from simnJS/AnyPS5), piece by piece, each byte once per
 //! submission however many of its ranges overlap there
 //! ([`Shadow::copy_back`]). `XTP_SHADOW_ONCE=0` brings
 //! back all of it as before: kernel copies, an asking per gap, partial
@@ -510,13 +511,15 @@ impl Shadow {
     /// title's bytes as read before over its writes since.
     ///
     /// shortcut: what stays open (watch.md item 58, the review of
-    /// Marvisak/VIctory#1124). A title write into bytes the GPU changed is
-    /// overwritten by the GPU's: made while the submission ran (the GPU's
-    /// bytes win where both wrote), or made after this read title memory
-    /// for the run (up to 16 pieces) and before it wrote that piece, which
-    /// it compares with the bytes as read. A title write into bytes the GPU
-    /// left alone stays; the copy then holds the title's bytes as read, and
-    /// the page is not current ([`Shadow::mark_current`] compares).
+    /// Marvisak/VIctory#1124). A title write into bytes the GPU changed
+    /// stays when it was made before this read title memory for the run
+    /// (the three-way merge, [`Shadow::write_gpu_runs`]), but not when made
+    /// after that read (up to 16 pieces) and before the piece's write: the
+    /// merge compares with the bytes as read, and the GPU's go over it. Nor
+    /// when it put back the very value the snapshot holds: the byte looks
+    /// untouched. A title write into bytes the GPU left alone stays; the
+    /// copy then holds the title's bytes as read, and the page is not
+    /// current ([`Shadow::mark_current`] compares).
     fn put_back(&self, from: usize, to: usize, old: &mut [u8], synced: &mut Vec<usize>) -> usize {
         thread_local! {
             /// Title memory of a run, kept (already touched) for the next.
@@ -552,9 +555,15 @@ impl Shadow {
 
     /// Writes into title memory at `at` the runs of bytes the GPU changed
     /// in a piece of the copy (`host`; `old`, its bytes before the
-    /// submission; `title`, title memory as just read) where they differ
-    /// from the title's; the copy takes the title's bytes everywhere else.
+    /// submission; `title`, title memory as just read) where the title
+    /// left them alone; the copy takes the title's bytes everywhere else.
     /// Returns the bytes written.
+    ///
+    /// A three-way merge (ported from simnJS/AnyPS5 (65a1b01db4), its
+    /// `CompareWriteBack`): a byte both changed, the GPU in the copy and the
+    /// title in title memory since the snapshot, keeps the title's. Before,
+    /// the GPU's went over it; title memory is the title's records first,
+    /// and the copy-back comes late (once the submission has finished).
     fn write_gpu_runs(&self, at: usize, host: &mut [u8], old: &[u8], title: &[u8]) -> usize {
         let (mut written, mut opened) = (0, false);
         let mut i = 0;
@@ -565,16 +574,27 @@ impl Shadow {
                 break;
             }
             i = first_same(host, old, run);
-            if host[run..i] != title[run..i] {
-                if !opened {
-                    // The piece's guard, once.
-                    crate::watch::writing(at, host.len());
-                    opened = true;
+            // In the run the GPU changed: the parts the title left alone go
+            // back, those it wrote stay its own (and the copy takes them).
+            let (title_run, old_run) = (&title[..i], &old[..i]);
+            let mut j = run;
+            while j < i {
+                let theirs = first_change(title_run, old_run, j);
+                if theirs > j {
+                    if !opened {
+                        // The piece's guard, once.
+                        crate::watch::writing(at, host.len());
+                        opened = true;
+                    }
+                    write_title(at + j, host[j..].as_ptr(), theirs - j);
+                    written += theirs - j;
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::BackRuns, 1);
                 }
-                write_title(at + run, host[run..].as_ptr(), i - run);
-                written += i - run;
+                j = first_same(title_run, old_run, theirs);
+                host[theirs..j].copy_from_slice(&title[theirs..j]);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::BackRuns, 1);
+                crate::copystat::add(crate::copystat::C::BackKept, (j - theirs) as u64);
             }
         }
         written
@@ -2000,7 +2020,10 @@ mod tests {
         let gpu = submission();
         shadow.writing(gpu, window + PAGE, PAGE);
         shadow.set_host(window + PAGE, PAGE, 0xc1);
-        set_title(window, 3 * PAGE, 0x33);
+        // The title writes the pages around it (where both write, the title's
+        // bytes stay: `where_the_gpu_and_the_title_both_wrote_the_titles_stay`).
+        set_title(window, PAGE, 0x33);
+        set_title(window + 2 * PAGE, PAGE, 0x33);
         ASKED.set(0);
         assert_eq!(shadow.update(window, 3 * PAGE), 2 * PAGE);
         assert_eq!(
@@ -2193,6 +2216,46 @@ mod tests {
                 .iter()
                 .all(|&b| b == 0x5d)
         );
+    }
+
+    /// The copy-back is a three-way merge (ported from simnJS/AnyPS5
+    /// (65a1b01db4)): where the GPU and, since the snapshot, the title both
+    /// changed bytes, the title's stay and the copy takes them; the GPU's
+    /// bytes around them go back. Before, the GPU's went over the title's.
+    #[test]
+    fn where_the_gpu_and_the_title_both_wrote_the_titles_stay() {
+        let test = "shadow::tests::where_the_gpu_and_the_title_both_wrote_the_titles_stay";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let window = watched(PAGE);
+        let shadow = find(window as u64, PAGE as u64).expect("a host copy");
+        shadow.update(window, PAGE);
+        let gpu = submission();
+        shadow.writing(gpu, window, PAGE);
+        // The GPU writes 32 bytes; the title 8 of them meanwhile.
+        shadow.set_host(window + 0x100, 32, 0xa7);
+        set_title(window + 0x108, 8, 0x5e);
+        assert_eq!(
+            shadow.copy_back(gpu, window, PAGE),
+            24,
+            "the GPU's bytes but the title's 8"
+        );
+        assert!(title(window + 0x100, 8).iter().all(|&b| b == 0xa7));
+        assert!(
+            title(window + 0x108, 8).iter().all(|&b| b == 0x5e),
+            "the title's write stays"
+        );
+        assert!(title(window + 0x110, 16).iter().all(|&b| b == 0xa7));
+        assert!(
+            shadow
+                .host_bytes(window + 0x108, 8)
+                .iter()
+                .all(|&b| b == 0x5e),
+            "the copy takes it"
+        );
+        assert!(title(window, 0x100).iter().all(|&b| b == 0), "nothing else");
+        assert!(!shadow.stale(window, window + PAGE), "current");
     }
 
     /// Two ranges of one submission that overlap (the world declares
