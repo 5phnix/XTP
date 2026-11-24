@@ -137,6 +137,7 @@ fn the_programs_translate_and_validate_without_a_device() {
             let target = super::Target {
                 lanes_min,
                 lanes_max,
+                stride_table: false,
             };
             let mut cs = emit(&program(wave, lane, joined), target);
             if let Some(v) = validator.as_mut() {
@@ -222,6 +223,7 @@ fn lane_read_loop_with_a_joined_exec_back_edge() {
         super::Target {
             lanes_min: 32,
             lanes_max: 32,
+            stride_table: false,
         },
     );
     let want: Vec<u32> = (LANE..LANE + WAVE).collect();

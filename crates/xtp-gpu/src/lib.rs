@@ -34,7 +34,11 @@ mod host;
 mod indirect;
 pub mod list;
 pub mod object;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod passdump;
 pub mod pipeline;
+#[cfg(windows)]
+mod pipestats;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

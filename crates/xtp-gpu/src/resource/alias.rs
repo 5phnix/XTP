@@ -19,8 +19,17 @@
 //! once the last of them at an address is released, a texture made there
 //! later (memory reused for streamed data, say) gets its own copy again.
 //!
-//! shortcut: aliases of another shape or format family (an R32_UINT view of
-//! a colour target, a half-size alias) still get their own copy; that is
+//! A texture the GPU does not write, made over a GPU-written one of the
+//! same shape in another format family whose texels are as wide (the
+//! title's compute programs pack light as R9G9B9E5 into R32_UINT textures
+//! and read it through R9G9B9E5 views placed at their addresses), keeps a
+//! copy of its own: the host cannot view one format as the other. It is
+//! brought up to date from the written texture by a copy when a list reads
+//! it ([`written_beside`], `resource::alias_copy`; ported from fxceless's
+//! VIctory fork, `alias_of`, commit 4e17478).
+//!
+//! shortcut: aliases of another shape (a half-size alias, other levels) or
+//! texel width still get their own copy, filled from title memory; that is
 //! G19's shared-memory model, not a lookup by address.
 
 use std::collections::BTreeMap;
@@ -64,6 +73,8 @@ fn shape(desc: &ResourceDesc) -> Shape {
 struct Source {
     resource: usize,
     shape: Shape,
+    /// Bytes per texel of its title format (`None` for block formats).
+    texel: Option<u64>,
     /// Its host copy's flags and format.
     flags: u32,
     format: u32,
@@ -166,6 +177,41 @@ fn lookup(address: u64, want: &ResourceDesc) -> Option<(Option<Found>, &'static 
     Some((None, why))
 }
 
+/// Bytes per texel of a title format, for formats of one texel a block.
+fn texel(format: u32) -> Option<u64> {
+    super::element(format).and_then(|(bytes, width)| (width == 1).then_some(bytes))
+}
+
+/// The GPU-written texture at `address` whose texels a texture described
+/// by `want`, which the GPU does not write, reads in another format: one of
+/// the same shape (dimension, size, array or depth, levels, one sample)
+/// but another format family, texels as wide, and no depth. The title
+/// resource and its host copy. After fxceless's `alias_of`.
+pub(super) fn written_beside(
+    address: u64,
+    want: &ResourceDesc,
+) -> Option<(usize, Arc<HostTexture>)> {
+    if super::host_flags(want.flags) & WRITABLE != 0 {
+        return None;
+    }
+    let want_shape = shape(want);
+    let want_texel = texel(want.format)?;
+    const DEPTH: u32 = 0x2;
+    let map = sources();
+    map.get(&address)?.iter().find_map(|s| {
+        let fits = s.shape.family != want_shape.family
+            && Shape {
+                family: want_shape.family,
+                ..s.shape
+            } == want_shape
+            && want_shape.samples == 1
+            && s.texel == Some(want_texel)
+            && s.flags & DEPTH == 0;
+        fits.then(|| s.host.upgrade().map(|h| (s.resource, h)))
+            .flatten()
+    })
+}
+
 /// Logs the first aliases met over a GPU-written texture (then every
 /// power of two), shared or not and why.
 fn note(address: u64, want: &ResourceDesc, how: &str, with: Option<usize>, why: &str, on: bool) {
@@ -228,6 +274,7 @@ pub(super) fn register(
     let source = Source {
         resource,
         shape: shape(desc),
+        texel: texel(desc.format),
         flags: d.Flags.0 as u32,
         format: d.Format.0 as u32,
         host: Arc::downgrade(host),

@@ -23,6 +23,7 @@ mod frames;
 #[cfg(test)]
 mod submissions;
 mod timeline;
+mod twins;
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -676,6 +677,9 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
     prelude: Mutex<Prelude>,
+    /// What the list does with depth textures that have a colour twin, by
+    /// twin (`twins`).
+    twins: Mutex<twins::TwinUses>,
     /// The pipelines the list binds, for reports of slow submissions:
     /// shared with its submissions ([`Recorded`]), a reset starts a new set.
     pipelines: Mutex<std::sync::Arc<std::collections::BTreeSet<String>>>,
@@ -1123,6 +1127,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: Mutex::new((prelude_allocator, prelude)),
+                twins: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: Mutex::default(),
                 last: AtomicU64::new(0),
@@ -1176,6 +1181,11 @@ impl Host {
     /// Runs a title submission (the lists of one `ExecuteCommandLists`),
     /// counted for the frame-rate line once it has finished.
     pub(crate) fn submit(&self, runs: &[&HostList]) {
+        #[cfg(feature = "diagnostics")]
+        crate::passdump::submitted(runs);
+        // Light the lists read through views in another format, decoded
+        // first (`resource::alias_copy`).
+        crate::resource::run_decodes(self);
         self.run(runs, true);
     }
 
@@ -1888,7 +1898,12 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Depth textures whose twins the list wrote last get what was
+        // written (`twins`).
+        self.twins_to_depth();
         crate::timestamps::close(self);
+        #[cfg(feature = "diagnostics")]
+        crate::passdump::closed(self);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -1988,6 +2003,7 @@ impl HostList {
             }
             allocator.clone()
         };
+        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // New ones: a submission in flight keeps its own (`Recorded`).
         *self.pipelines.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         #[cfg(feature = "diagnostics")]
@@ -2031,21 +2047,25 @@ impl HostList {
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
+        // Depth textures with a colour twin: the side the list uses as it
+        // finds it is first copied from the other if an earlier list left
+        // it behind (`twins`); the copies' textures go through the copy
+        // states.
+        let syncs = self.twin_syncs();
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
+        let (to_copy, mut barriers, copying) = twins::sync_states(&syncs, &states);
+        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
+            let real = copy.state.swap(*last, Ordering::Relaxed);
+            let real = copying.get(key).copied().unwrap_or(real);
+            (real != *first).then(|| {
+                transition(
+                    &copy.texture,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                )
             })
-            .collect();
-        if barriers.is_empty() {
+        }));
+        if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
         let prelude = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
@@ -2056,7 +2076,15 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                if !to_copy.is_empty() {
+                    list.ResourceBarrier(&to_copy);
+                }
+                for (depth, twin, colour) in &syncs {
+                    twins::record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                if !barriers.is_empty() {
+                    list.ResourceBarrier(&barriers);
+                }
                 list.Close()
             })
         };
@@ -2084,6 +2112,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
+        let what = crate::passdump::op(self, what);
         if dred_on() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps()

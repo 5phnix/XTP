@@ -40,10 +40,10 @@ static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// The disk the cache may take, oldest entries out first. One translator's
-/// translations of the whole pack take about 2 GiB (26,503 containers,
-/// 86 KiB an entry on average, 2026-11-24): the former 1 GiB held half of
-/// them, so a session evicted what the one before it, or `xtp precook`,
-/// had made. Room for a few translators (switches on and off) side by side.
+/// answers for the whole pack take 1.1 GiB (25,889 entries, `xtp precook`
+/// on the PC, 2026-11-25): more than the former 1 GiB, which evicted what
+/// the precook or the session before had made. Room for a few translators
+/// (switches on and off) side by side.
 const LIMIT: u64 = 8 << 30;
 
 /// Keeps translated shaders in `dir` from now on.
@@ -73,11 +73,11 @@ fn count<T, E>(counter: &AtomicU64, result: Result<T, E>) -> Result<T, E> {
 /// What identifies the translator this build runs: the fingerprint of
 /// `xtp-shader`'s sources ([`xtp_shader::SOURCES`]), this file (the
 /// entries' encoding, [`ENCODING`]) and the translation settings it runs
-/// with (the loop limit, the loops' budget and the DXIL clean-up passes,
-/// which any build can change at run time). Not the whole executable:
-/// before, the least change anywhere (the HLE, a log line, another
-/// worker's branch) made every translation again, and each worktree's
-/// sessions started cold.
+/// with (the loop limit, the loops' budget, the DXIL clean-up passes and
+/// the raw structured reads, which any build can change at run time). Not
+/// the whole executable: before, the least change anywhere (the HLE, a log
+/// line, another worker's branch) made every translation again, and each
+/// worktree's sessions started cold.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -97,7 +97,9 @@ fn build() -> &'static [u8; 32] {
         if passes != 0 {
             tracing::info!(passes, "XTP_DXIL_OPT: clean-up passes run over translated shaders");
         }
-        build_of(xtp_shader::SOURCES, ENCODING, [limit, budget, passes])
+        // And structured reads through raw handles (XTP_RAW_STRUCTURED).
+        let raw = u32::from(xtp_shader::emit::raw_structured());
+        build_of(xtp_shader::SOURCES, ENCODING, [limit, budget, passes, raw])
     })
 }
 
@@ -106,8 +108,9 @@ fn build() -> &'static [u8; 32] {
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
 /// [`build`]'s key from its parts: the translator's sources, the entries'
-/// encoding and the settings (loop limit, loop budget, clean-up passes).
-fn build_of(sources: &str, encoding: &[u8], settings: [u32; 3]) -> [u8; 32] {
+/// encoding and the settings (loop limit, loop budget, clean-up passes, raw
+/// structured reads).
+fn build_of(sources: &str, encoding: &[u8], settings: [u32; 4]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     for part in [sources.as_bytes(), encoding] {
         h.update(&(part.len() as u64).to_le_bytes());
@@ -300,7 +303,10 @@ pub(crate) fn wave64_program(
     (container, native)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+/// A translation's entry: this, then [`encode`]'s words. 2: with whether it
+/// reads the runtime stride table (VIctory #193) and the buffers it reads
+/// through slots picked at run time.
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A refusal's entry: this, then the text's length (little endian, 4 bytes),
 /// then a checksum of the text (4 bytes), then the error's text (UTF-8). The
 /// length tells a cut-short entry from a shorter error, and the checksum
@@ -414,6 +420,8 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.stride_table));
+    word(&mut out, u32::from(s.run_time_buffers));
     out
 }
 
@@ -470,6 +478,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let stride_table = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let run_time_buffers = u8::try_from(r.word()?).ok()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -478,6 +492,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        stride_table,
+        run_time_buffers,
     })
 }
 
@@ -550,6 +566,8 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            stride_table: true,
+            run_time_buffers: 3,
         }
     }
 
@@ -740,6 +758,7 @@ mod tests {
         let nvidia = Target {
             lanes_min: 32,
             lanes_max: 32,
+            stride_table: false,
         };
         let runs = AtomicU64::new(0);
         // Taken for 64-lane hosts, and by the rebuilt translator for any.
@@ -822,6 +841,7 @@ mod tests {
         let nvidia = Target {
             lanes_min: 32,
             lanes_max: 32,
+            stride_table: false,
         };
         let runs = AtomicU64::new(0);
         let get = |target: Target| {
@@ -845,6 +865,7 @@ mod tests {
         let rdna = Target {
             lanes_min: 32,
             lanes_max: 64,
+            stride_table: false,
         };
         assert_ne!(key(&build, nvidia), key(&build, rdna));
         assert_ne!(key(&build, rdna), key(&build, Target::ANY));
@@ -866,6 +887,7 @@ mod tests {
             xtp_shader::emit::loop_limit(),
             xtp_shader::emit::loop_budget(),
             xtp_shader::emit::dxil_opt(),
+            u32::from(xtp_shader::emit::raw_structured()),
         ];
         let ours = build_of(xtp_shader::SOURCES, ENCODING, settings);
         assert_eq!(*build(), ours, "nothing but these parts");

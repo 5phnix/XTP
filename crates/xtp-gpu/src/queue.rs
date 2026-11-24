@@ -694,6 +694,11 @@ extern "system" fn present(
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
+    // XTP_PRESENT_TARGET: a target of the frame shown instead (`passdump`).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if crate::passdump::present(frame) {
+        return S_OK;
+    }
     // Several planes: composed into one image (`dxgi::planes`).
     #[cfg(windows)]
     let composed = crate::dxgi::planes::present(planes, plane_parameters.cast(), frame);

@@ -281,30 +281,115 @@ unsafe fn clzero(bytes: &[u8], context: &mut CONTEXT) -> usize {
 
 /// Whether all of `[start, start + len)` is committed, writable memory (a
 /// guard page is not).
+///
+/// Each page is asked about once, whatever the number of lines in it: the
+/// pages in the working set by their entries there (`QueryWorkingSetEx`,
+/// about a microsecond for a loop's few pages, however large the
+/// allocation around them), the others with `VirtualQuery`, one call for
+/// as many of them as share its answer. `VirtualQuery` alone is no use on
+/// a title's heap: it measures the run of pages alike around the address,
+/// page by page, so it costs with the size of the allocation, not of the
+/// range asked (about 7 µs per MiB on the cloud VM's Xeon). BTP 6 zeroes lines
+/// of a 1 GiB heap in loops, where that took 4.5 ms a loop and stalled the
+/// world's loading on CPUs without `clzero` (docs/analysis/l4-world.md).
 fn writable(start: u64, len: u64) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
-        PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
     };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    /// Pages asked of the working set in one call (512 bytes of stack).
+    const BATCH: u64 = 32;
     let Some(end) = start.checked_add(len) else {
         return false;
     };
-    let mut at = start;
-    while at < end {
-        // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: reads the address space's bookkeeping, not the memory.
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-        let write = matches!(
-            info.Protect & 0xff,
-            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
-        );
-        if n == 0 || info.State != MEM_COMMIT || !write || info.Protect & PAGE_GUARD != 0 {
-            return false;
+    let mut page = start & !(PAGE - 1);
+    while page < end {
+        let count = (end - page).div_ceil(PAGE).min(BATCH);
+        let batch_end = page + count * PAGE;
+        let mut entries = [PSAPI_WORKING_SET_EX_INFORMATION::default(); BATCH as usize];
+        for (entry, at) in entries
+            .iter_mut()
+            .zip((page..batch_end).step_by(PAGE as usize))
+        {
+            entry.VirtualAddress = at as *mut _;
         }
-        at = info.BaseAddress as u64 + info.RegionSize as u64;
+        // SAFETY: `count` entries of ours, sized as the call expects; it
+        // reads the page tables, not the memory.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                entries.as_mut_ptr().cast(),
+                (count as usize * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        let mut at = page;
+        while at < batch_end {
+            if asked {
+                let entry = &entries[((at - page) / PAGE) as usize];
+                // SAFETY: every bit pattern of the union is a valid usize.
+                match resident_writable(unsafe { entry.VirtualAttributes.Flags }) {
+                    Some(true) => {
+                        at += PAGE;
+                        continue;
+                    }
+                    Some(false) => return false,
+                    None => {}
+                }
+            }
+            // Not in the working set (never touched, or trimmed), or the
+            // call failed: the region's answer, for every page it covers.
+            let Some(region_end) = region_writable(at) else {
+                return false;
+            };
+            at = region_end;
+        }
+        page = at;
     }
     true
+}
+
+/// The host's page.
+const PAGE: u64 = 0x1000;
+
+/// What a working-set entry's flags say of its page: `Some(writable)` for
+/// a page in the working set, `None` for one that is not (its entry has no
+/// protection then).
+fn resident_writable(flags: usize) -> Option<bool> {
+    // PSAPI_WORKING_SET_EX_BLOCK: Valid (bit 0), ShareCount (1 to 3),
+    // Win32Protection (4 to 14).
+    if flags & 1 == 0 {
+        return None;
+    }
+    Some(protection_writable((flags >> 4) as u32 & 0x7ff))
+}
+
+/// A page protection that lets data be written: read-write or copy-on-write,
+/// executable or not, and no guard.
+fn protection_writable(protection: u32) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    let write = matches!(
+        protection & 0xff,
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    );
+    write && protection & PAGE_GUARD == 0
+}
+
+/// If the memory at `at` is committed and writable, the end of the run of
+/// pages `VirtualQuery` finds alike from there (page-aligned, past `at`).
+fn region_writable(at: u64) -> Option<u64> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    #[cfg(test)]
+    tests::REGION_QUERIES.with(|n| n.set(n.get() + 1));
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not the memory.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || !protection_writable(info.Protect) {
+        return None;
+    }
+    Some(info.BaseAddress as u64 + info.RegionSize as u64)
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
@@ -540,9 +625,9 @@ const MAX_CATCHABLE_TYPES: usize = 32;
 const MAX_STRING: usize = 256;
 static FIRST_CHANCE: AtomicUsize = AtomicUsize::new(0);
 
-/// Copies exception-controlled memory through the kernel. Unlike a direct
-/// dereference, this reports free, reserved, no-access and guard pages.
-fn read_memory(address: usize, dst: &mut [u8]) -> bool {
+/// Copies readable memory in the current process through the kernel. Returns
+/// false for unmapped, reserved, no-access or guard pages.
+pub fn read_memory(address: usize, dst: &mut [u8]) -> bool {
     if dst.is_empty() {
         return true;
     }
@@ -1622,6 +1707,157 @@ mod tests {
         assert!(first[..0xfc0].iter().all(|&b| b == 0xff));
         // SAFETY: releases the pages, which nothing uses any more.
         unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+    }
+
+    thread_local! {
+        /// `VirtualQuery` calls `writable` made on this thread (each test
+        /// runs on its own).
+        pub(super) static REGION_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn region_queries() -> usize {
+        REGION_QUERIES.with(|n| n.get())
+    }
+
+    /// `pages` fresh committed read-write pages of ours.
+    fn fresh_pages(pages: usize) -> *mut u8 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        // SAFETY: a fresh allocation, or null.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                pages * 0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!at.is_null());
+        at.cast()
+    }
+
+    fn release(at: *mut u8) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: an allocation of ours that nothing uses any more.
+        unsafe { VirtualFree(at.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn writable_answers_for_touched_untouched_and_protected_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RESERVE, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+        };
+        // 47 pages, more than one batch: the first 20 touched, the rest not.
+        // The 48th, in the allocation granule's rest, is free.
+        let heap = fresh_pages(47);
+        // SAFETY: our pages.
+        unsafe { heap.write_bytes(0xff, 20 * 0x1000) };
+        let at = heap as u64;
+        assert!(writable(at + 0x40, 0x3980), "touched pages");
+        assert!(
+            writable(at + 30 * 0x1000, 0x3000),
+            "untouched, committed pages"
+        );
+        assert!(writable(at, 47 * 0x1000), "both, over two batches");
+        assert!(!writable(at, 48 * 0x1000), "one page past the allocation");
+        let mut old = 0;
+        // SAFETY: our pages; a touched one made read-only, an untouched
+        // one a guard page.
+        unsafe {
+            assert_ne!(
+                VirtualProtect(heap.add(5 * 0x1000).cast(), 0x1000, PAGE_READONLY, &mut old),
+                0
+            );
+            assert_ne!(
+                VirtualProtect(
+                    heap.add(40 * 0x1000).cast(),
+                    0x1000,
+                    PAGE_READWRITE | PAGE_GUARD,
+                    &mut old
+                ),
+                0
+            );
+        }
+        assert!(
+            !writable(at + 4 * 0x1000, 0x2000),
+            "into the read-only page"
+        );
+        assert!(writable(at + 6 * 0x1000, 0x2000), "past it");
+        assert!(!writable(at + 39 * 0x1000, 0x2000), "into the guard page");
+        assert!(writable(at + 41 * 0x1000, 0x2000), "past it");
+        release(heap);
+        // Reserved, not committed.
+        // SAFETY: a fresh reservation, or null.
+        let reserved =
+            unsafe { VirtualAlloc(std::ptr::null(), 0x10000, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!reserved.is_null());
+        assert!(!writable(reserved as u64, 0x40), "reserved only");
+        release(reserved.cast());
+        assert!(
+            !writable(u64::MAX - 0x3f, 0x80),
+            "past the end of the address space"
+        );
+    }
+
+    #[test]
+    fn a_loop_in_a_large_touched_heap_asks_no_region_query() {
+        use windows_sys::Win32::System::Memory::{VirtualLock, VirtualUnlock};
+        // A loop's few pages in a large allocation, touched and held in the
+        // working set: their entries answer, and VirtualQuery, which would
+        // walk the whole allocation, is not called.
+        let pages = 4096; // 16 MiB
+        let heap = fresh_pages(pages);
+        // SAFETY: our pages; the five the loop reaches are locked in.
+        unsafe {
+            heap.write_bytes(0, pages * 0x1000);
+            assert_ne!(VirtualLock(heap.add(0x80_0000).cast(), 5 * 0x1000), 0);
+        }
+        let before = region_queries();
+        assert!(writable(heap as u64 + 0x80_0040, 0x3980));
+        assert_eq!(
+            region_queries(),
+            before,
+            "no VirtualQuery for resident pages"
+        );
+        // Untouched pages are asked of VirtualQuery once per run of pages
+        // alike, not per page or per line.
+        let fresh = fresh_pages(64);
+        let before = region_queries();
+        assert!(writable(fresh as u64, 64 * 0x1000));
+        assert_eq!(region_queries(), before + 1, "one query for the run");
+        // SAFETY: unlocks what was locked above.
+        unsafe { VirtualUnlock(heap.add(0x80_0000).cast(), 5 * 0x1000) };
+        release(heap);
+        release(fresh);
+    }
+
+    #[test]
+    fn working_set_flags_say_whether_a_resident_page_is_writable() {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+            PAGE_WRITECOPY,
+        };
+        let resident = |protection: u32| (protection as usize) << 4 | 1 | 0b1110;
+        assert_eq!(resident_writable(resident(PAGE_READWRITE)), Some(true));
+        assert_eq!(resident_writable(resident(PAGE_WRITECOPY)), Some(true));
+        assert_eq!(
+            resident_writable(resident(PAGE_EXECUTE_READWRITE)),
+            Some(true)
+        );
+        assert_eq!(resident_writable(resident(PAGE_READONLY)), Some(false));
+        assert_eq!(resident_writable(resident(PAGE_NOACCESS)), Some(false));
+        assert_eq!(
+            resident_writable(resident(PAGE_READWRITE | PAGE_GUARD)),
+            Some(false)
+        );
+        // Not in the working set: its entry has no protection.
+        assert_eq!(resident_writable((PAGE_READWRITE as usize) << 4), None);
+        // Bits past Win32Protection (Shared, Node, ...) do not count.
+        assert_eq!(
+            resident_writable(resident(PAGE_READWRITE) | 1 << 15 | 0x3f << 16),
+            Some(true)
+        );
     }
 
     /// On a CPU that has them they run natively, and the tests above test

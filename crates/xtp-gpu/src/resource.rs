@@ -817,6 +817,20 @@ struct Resource {
     /// Whether `host` is another texture's copy (`alias`).
     #[cfg(windows)]
     shared: bool,
+    /// The alias registry's count of changes (`alias::changes`) when
+    /// [`alias_copy`] last found no GPU-written texture under it to copy
+    /// from (0: not looked yet): it looks again only after a change.
+    #[cfg(windows)]
+    beside: std::sync::atomic::AtomicU64,
+    /// For a depth texture the title also writes through unordered
+    /// access, the colour texture shaders write instead ([`Twin`]): made
+    /// with the first unordered access view of it ([`twin_view`]). Many
+    /// depth textures ask for unordered access and never get a view (the
+    /// shadow maps the title places anew every frame); a committed twin
+    /// for each, at its creation, cost a video memory admission apiece
+    /// (0.3 to 0.5 s once VidMm throttles): the world took 90 s to load.
+    #[cfg(windows)]
+    twin: std::sync::OnceLock<Option<Arc<Twin>>>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1485,6 +1499,10 @@ fn hand_out_resource(
         host,
         #[cfg(windows)]
         shared,
+        #[cfg(windows)]
+        beside: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(windows)]
+        twin: std::sync::OnceLock::new(),
     });
     #[cfg(windows)]
     {
@@ -1952,6 +1970,1041 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
 }
 
+/// The buffer a GPU-written texture's texels go through into a texture of
+/// the same shape that reads them in another format ([`alias_copy`]), and
+/// each level's and layer's layout in it, the written texture's first
+/// (the same bytes: the texels are as wide). Made for a pair of host copies.
+#[cfg(windows)]
+struct Through {
+    buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: std::sync::Weak<HostTexture>,
+    to: std::sync::Weak<HostTexture>,
+    parts: Vec<(
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    )>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; lists only record copies with
+// the buffer.
+#[cfg(windows)]
+unsafe impl Send for Through {}
+// SAFETY: as above.
+#[cfg(windows)]
+unsafe impl Sync for Through {}
+
+/// The most levels times layers [`alias_copy`] copies (a cube of nine
+/// levels).
+#[cfg(windows)]
+const ALIAS_PARTS: u32 = 54;
+
+/// The buffers of [`alias_copy`], by the reading texture's resource.
+#[cfg(windows)]
+type Throughs = std::collections::HashMap<usize, Arc<Through>>;
+
+#[cfg(windows)]
+static THROUGH: std::sync::Mutex<Option<Throughs>> = std::sync::Mutex::new(None);
+
+/// The [`Through`] copying `from` into `to`, the host copy of resource
+/// `key`: made the first time, or again for other copies. `None` if their
+/// layouts differ (a stand-in format of another width) or there are too
+/// many parts.
+#[cfg(windows)]
+fn through(
+    host: &crate::host::Host,
+    key: usize,
+    from: &Arc<HostTexture>,
+    to: &Arc<HostTexture>,
+) -> Option<Arc<Through>> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(Throughs::new);
+    if let Some(t) = map.get(&key)
+        && std::ptr::eq(t.from.as_ptr(), Arc::as_ptr(from))
+        && std::ptr::eq(t.to.as_ptr(), Arc::as_ptr(to))
+    {
+        return Some(t.clone());
+    }
+    map.retain(|_, t| t.to.strong_count() > 0 && t.from.strong_count() > 0);
+    // SAFETY: live textures.
+    let (of_from, of_to) = unsafe { (from.texture.GetDesc(), to.texture.GetDesc()) };
+    // Levels times layers (a volume's slices are one part).
+    let parts = |d: &D3D12_RESOURCE_DESC| {
+        let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            1
+        } else {
+            u32::from(d.DepthOrArraySize)
+        };
+        u32::from(d.MipLevels) * layers
+    };
+    let n = parts(&of_from);
+    if n == 0 || n > ALIAS_PARTS || n != parts(&of_to) {
+        return None;
+    }
+    let mut rows =
+        [(); 2].map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize]);
+    let mut bytes = [0u64; 2];
+    // SAFETY: plain queries; the out pointers hold `n` layouts each.
+    unsafe {
+        for (i, d) in [of_from, of_to].iter().enumerate() {
+            host.device.GetCopyableFootprints(
+                d,
+                0,
+                n,
+                0,
+                Some(rows[i].as_mut_ptr()),
+                None,
+                None,
+                Some(&mut bytes[i]),
+            );
+        }
+    }
+    let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
+        let (fa, fb) = (a.Footprint, b.Footprint);
+        a.Offset == b.Offset
+            && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
+                == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
+    });
+    if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
+        return None;
+    }
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes[0],
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; the out pointer is ours.
+    unsafe {
+        host.device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+    }
+    let buffer = buffer?;
+    crate::host::name(&buffer, || {
+        format!(
+            "alias copy {}x{} f{} to f{}",
+            of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+        )
+    });
+    tracing::info!(
+        width = of_from.Width,
+        height = of_from.Height,
+        parts = n,
+        written_as = of_from.Format.0,
+        read_as = of_to.Format.0,
+        "a texture read over a GPU-written one in another format: copied from it on the GPU"
+    );
+    let [of_written, of_read] = rows;
+    let through = Arc::new(Through {
+        buffer,
+        from: Arc::downgrade(from),
+        to: Arc::downgrade(to),
+        parts: of_written.into_iter().zip(of_read).collect(),
+    });
+    map.insert(key, through.clone());
+    Some(through)
+}
+
+/// The program [`decode_now`] runs: R9G9B9E5 texels read as words from one
+/// buffer, written as RGBA16F texels (alpha one) into another, each laid
+/// out as a copy of one level or layer lays them (`p`: width, height,
+/// depth slices, then for the source and the destination its offset, row
+/// pitch and slice pitch, in bytes).
+#[cfg(windows)]
+const DECODE_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=9, b0), SRV(t0), UAV(u0)"
+cbuffer Part : register(b0) {
+    uint width;
+    uint height;
+    uint depth;
+    uint src_offset;
+    uint src_pitch;
+    uint src_slice;
+    uint dst_offset;
+    uint dst_pitch;
+    uint dst_slice;
+};
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= width || id.y >= height || id.z >= depth) return;
+    uint v = src.Load(src_offset + id.z * src_slice + id.y * src_pitch + id.x * 4);
+    // Nine-bit mantissas sharing a five-bit exponent biased by 15.
+    float scale = exp2(float(v >> 27) - 24.0);
+    float3 c = float3(v & 0x1ff, (v >> 9) & 0x1ff, (v >> 18) & 0x1ff) * scale;
+    uint2 h = uint2(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(1.0) << 16);
+    dst.Store2(dst_offset + id.z * dst_slice + id.y * dst_pitch + id.x * 8, h);
+}
+"#;
+
+/// The decoding pass: its root signature and pipeline, made once.
+#[cfg(windows)]
+struct Decode {
+    root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+    pso: windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+    /// The list it records into, run before the next title submission
+    /// ([`run_decodes`]), and whether it is open with work in it.
+    list: crate::host::HostList,
+    open: bool,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the pass is used under its lock.
+#[cfg(windows)]
+unsafe impl Send for Decode {}
+
+#[cfg(windows)]
+static DECODE: std::sync::Mutex<Option<Option<Decode>>> = std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn make_decode(host: &crate::host::Host) -> windows::core::Result<Decode> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::s;
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: the source and names live through the call; out pointers ours.
+    let compiled = unsafe {
+        D3DCompile(
+            DECODE_SOURCE.as_ptr().cast(),
+            DECODE_SOURCE.len(),
+            s!("rgb9e5"),
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = compiled {
+        if let Some(errors) = errors {
+            // SAFETY: the blob's own bytes.
+            let text = unsafe {
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
+            };
+            tracing::warn!("R9G9B9E5 decoding pass: {}", String::from_utf8_lossy(text));
+        }
+        return Err(e);
+    }
+    let code = code.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: the blob's own bytes; the root signature is in the shader.
+    unsafe {
+        let bytes =
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes)?;
+        let pso = host
+            .device
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })?;
+        let list = host.new_list()?;
+        list.close();
+        Ok(Decode {
+            root,
+            pso,
+            list,
+            open: false,
+        })
+    }
+}
+
+/// A device-local buffer of `bytes`, in the common state, with unordered
+/// access if `unordered`.
+#[cfg(windows)]
+fn device_buffer(
+    host: &crate::host::Host,
+    bytes: u64,
+    unordered: bool,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: if unordered {
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+        } else {
+            D3D12_RESOURCE_FLAG_NONE
+        },
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; the out pointer is ours.
+    unsafe {
+        host.device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+    }
+    buffer
+}
+
+/// What [`decode_now`] keeps for a pair of host copies: the buffer the
+/// written texture's words go to and the one the decoded texels come from,
+/// and each level's and layer's layout in them (the written texture's
+/// first).
+#[cfg(windows)]
+struct Decoded {
+    words: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    texels: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: std::sync::Weak<HostTexture>,
+    to: std::sync::Weak<HostTexture>,
+    parts: Vec<(
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    )>,
+    /// The frame it was last decoded for (`queue::presented`).
+    frame: u64,
+}
+
+// SAFETY: D3D12 objects are free-threaded; used under its map's lock.
+#[cfg(windows)]
+unsafe impl Send for Decoded {}
+
+#[cfg(windows)]
+static DECODED: std::sync::Mutex<Option<std::collections::HashMap<usize, Decoded>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a texture of title format `title` whose host copy is `to`
+/// reads R9G9B9E5 through its RGBA16F stand-in, and `from` holds
+/// four-byte texels: what [`decode_now`] turns one into the other.
+#[cfg(windows)]
+fn decodes(title: u32, from: &HostTexture, to: &HostTexture) -> bool {
+    const R9G9B9E5: u32 = 67;
+    const R16G16B16A16_FLOAT: u32 = 10;
+    // SAFETY: live textures.
+    let (f, t) = unsafe { (from.texture.GetDesc(), to.texture.GetDesc()) };
+    title == R9G9B9E5
+        && t.Format.0 as u32 == R16G16B16A16_FLOAT
+        && element(f.Format.0 as u32) == Some((4, 1))
+        && t.SampleDesc.Count == 1
+}
+
+/// Writes the R9G9B9E5 texels `from` holds (as words: a GPU-written
+/// R32 texture) into `to`, the RGBA16F stand-in of a texture that reads
+/// them as R9G9B9E5, decoded on the GPU: in a list of ours, run before the
+/// next title submission ([`run_decodes`]), so it sees what the lists
+/// submitted before it wrote (what lists not yet submitted write shows a
+/// frame later); every decoding of the moment shares the one submission. Once a frame per texture
+/// (`placed`, the title resource of `to`; `source`, that of `from`).
+/// False if the decoding cannot be made (shapes or layouts that differ).
+#[cfg(windows)]
+fn decode_now(
+    host: &crate::host::Host,
+    placed: This,
+    source: This,
+    from: &Arc<HostTexture>,
+    to: &Arc<HostTexture>,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let frame = crate::queue::presented();
+    let mut decoded = DECODED.lock().unwrap_or_else(|e| e.into_inner());
+    let decoded = decoded.get_or_insert_with(std::collections::HashMap::new);
+    let fits = |d: &Decoded| {
+        std::ptr::eq(d.from.as_ptr(), Arc::as_ptr(from))
+            && std::ptr::eq(d.to.as_ptr(), Arc::as_ptr(to))
+    };
+    if !decoded.get(&(placed as usize)).is_some_and(fits) {
+        decoded.retain(|_, d| d.to.strong_count() > 0 && d.from.strong_count() > 0);
+        let Some(made) = decoding(host, from, to) else {
+            return false;
+        };
+        decoded.insert(placed as usize, made);
+    }
+    let Some(d) = decoded.get_mut(&(placed as usize)) else {
+        return false;
+    };
+    if d.frame == frame + 1 {
+        return true;
+    }
+    let mut pass = DECODE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pass) = pass
+        .get_or_insert_with(|| match make_decode(host) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(error = %e, "no R9G9B9E5 decoding pass: such aliases stay black");
+                None
+            }
+        })
+        .as_mut()
+    else {
+        return false;
+    };
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    let list = &pass.list;
+    if !pass.open {
+        list.reset();
+        pass.open = true;
+    }
+    crate::list::ensure_state(list, source, COPY_SOURCE);
+    crate::list::ensure_state(list, placed, COPY_DEST);
+    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index as u32,
+        },
+    };
+    let rows = |buffer: &ID3D12Resource, row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+        D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: *row,
+            },
+        }
+    };
+    let state = |s: D3D12_RESOURCE_STATES| s;
+    let (common, copy_dest, copy_source, read, unordered) = (
+        state(D3D12_RESOURCE_STATE_COMMON),
+        state(D3D12_RESOURCE_STATE_COPY_DEST),
+        state(D3D12_RESOURCE_STATE_COPY_SOURCE),
+        state(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        state(D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    );
+    let t = crate::host::transition;
+    let l = &list.list;
+    // SAFETY: our open list, pass and buffers (kept with the pair); live
+    // textures the list holds through their states; every copy and store
+    // inside the layouts the buffers were sized for.
+    unsafe {
+        l.ResourceBarrier(&[t(&d.words, common, copy_dest)]);
+        for (index, (of_words, _)) in d.parts.iter().enumerate() {
+            l.CopyTextureRegion(
+                &rows(&d.words, of_words),
+                0,
+                0,
+                0,
+                &part(&from.texture, index),
+                None,
+            );
+        }
+        l.ResourceBarrier(&[
+            t(&d.words, copy_dest, read),
+            t(&d.texels, common, unordered),
+        ]);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetPipelineState(&pass.pso);
+        l.SetComputeRootShaderResourceView(1, d.words.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(2, d.texels.GetGPUVirtualAddress());
+        for (of_words, of_texels) in &d.parts {
+            let (w, x) = (of_words.Footprint, of_texels.Footprint);
+            let constants = [
+                w.Width,
+                w.Height,
+                w.Depth,
+                of_words.Offset as u32,
+                w.RowPitch,
+                w.RowPitch * w.Height,
+                of_texels.Offset as u32,
+                x.RowPitch,
+                x.RowPitch * x.Height,
+            ];
+            l.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
+            l.Dispatch(w.Width.div_ceil(8), w.Height.div_ceil(8), w.Depth);
+        }
+        l.ResourceBarrier(&[
+            t(&d.texels, unordered, copy_source),
+            t(&d.words, read, common),
+        ]);
+        for (index, (_, of_texels)) in d.parts.iter().enumerate() {
+            l.CopyTextureRegion(
+                &part(&to.texture, index),
+                0,
+                0,
+                0,
+                &rows(&d.texels, of_texels),
+                None,
+            );
+        }
+        l.ResourceBarrier(&[t(&d.texels, copy_source, common)]);
+    }
+    d.frame = frame + 1;
+    true
+}
+
+/// Runs the decodings [`decode_now`] recorded since the last call, if any:
+/// before a title submission (`Host::submit`), so that lists recorded
+/// after them see what they wrote.
+#[cfg(windows)]
+pub(crate) fn run_decodes(host: &crate::host::Host) {
+    let mut pass = DECODE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(pass)) = pass.as_mut()
+        && pass.open
+    {
+        pass.list.close();
+        host.execute(&[&pass.list]);
+        pass.open = false;
+    }
+}
+
+/// The buffers and layouts [`decode_now`] needs for `from` and `to`, if
+/// they have the same shape (levels, layers, sizes).
+#[cfg(windows)]
+fn decoding(
+    host: &crate::host::Host,
+    from: &Arc<HostTexture>,
+    to: &Arc<HostTexture>,
+) -> Option<Decoded> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    // SAFETY: live textures.
+    let (of_from, of_to) = unsafe { (from.texture.GetDesc(), to.texture.GetDesc()) };
+    let parts = |d: &D3D12_RESOURCE_DESC| {
+        let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            1
+        } else {
+            u32::from(d.DepthOrArraySize)
+        };
+        u32::from(d.MipLevels) * layers
+    };
+    let n = parts(&of_from);
+    if n == 0 || n > ALIAS_PARTS || n != parts(&of_to) {
+        return None;
+    }
+    let mut rows =
+        [(); 2].map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize]);
+    let mut bytes = [0u64; 2];
+    // SAFETY: plain queries; the out pointers hold `n` layouts each.
+    unsafe {
+        for (i, d) in [of_from, of_to].iter().enumerate() {
+            host.device.GetCopyableFootprints(
+                d,
+                0,
+                n,
+                0,
+                Some(rows[i].as_mut_ptr()),
+                None,
+                None,
+                Some(&mut bytes[i]),
+            );
+        }
+    }
+    let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
+        let (fa, fb) = (a.Footprint, b.Footprint);
+        (fa.Width, fa.Height, fa.Depth) == (fb.Width, fb.Height, fb.Depth)
+    });
+    if bytes.contains(&0) || bytes.iter().any(|&b| b > u64::from(u32::MAX)) || !alike {
+        return None;
+    }
+    let words = device_buffer(host, bytes[0], false)?;
+    let texels = device_buffer(host, bytes[1], true)?;
+    crate::host::name(&texels, || {
+        format!("R9G9B9E5 decoded {}x{}", of_to.Width, of_to.Height)
+    });
+    tracing::info!(
+        width = of_from.Width,
+        height = of_from.Height,
+        parts = n,
+        written_as = of_from.Format.0,
+        "a texture read as R9G9B9E5 over a GPU-written one: decoded from it on the GPU into its RGBA16F stand-in"
+    );
+    let [of_words, of_texels] = rows;
+    Some(Decoded {
+        words,
+        texels,
+        from: Arc::downgrade(from),
+        to: Arc::downgrade(to),
+        parts: of_words.into_iter().zip(of_texels).collect(),
+        frame: 0,
+    })
+}
+
+/// `placed`, a title texture the GPU does not write, read by a shader in
+/// `list`. If it lies over a GPU-written texture of the same shape whose
+/// texels are as wide, in another format family (`alias::written_beside`:
+/// light packed as R9G9B9E5 into R32_UINT by compute programs and read
+/// through R9G9B9E5 views), that texture's texels are copied into its host
+/// copy, through a buffer (the host copies between two formats in no other
+/// way): the first time the list reads it, and again whenever the list used
+/// the written texture otherwise since. Where the host keeps R9G9B9E5 as
+/// RGBA16F, the texels are decoded instead, once a frame ([`decode_now`]). Title memory does not have them: a
+/// copy filled from it is black. Leaves `placed` in the copy destination
+/// state and keeps its host copy from being filled from title memory again
+/// (`texture::host_written`). True if `placed` is such a texture.
+///
+/// Ported from fxceless's VIctory fork (commit 4e17478: `alias_of` in
+/// `resource.rs`, `texture::alias`), reworked onto XTP's alias registry.
+#[cfg(windows)]
+pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    if placed.is_null() {
+        return false;
+    }
+    let r = resource(placed);
+    if r.desc.dimension == BUFFER || r.shared {
+        return false;
+    }
+    // Every shader read of every texture comes here: the registry is
+    // looked at again only once it changed.
+    let changes = alias::changes();
+    if r.beside.load(std::sync::atomic::Ordering::Relaxed) == changes {
+        return false;
+    }
+    let Some((source, from)) = alias::written_beside(r.data() as u64, &r.desc) else {
+        r.beside
+            .store(changes, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    };
+    let (Some(to), Some(host)) = (ready_host(placed).cloned(), crate::host::host()) else {
+        return false;
+    };
+    if !from.ready() {
+        return false;
+    }
+    // The host has R9G9B9E5 as RGBA16F (`format`, the RTX 4080): texels
+    // of another width, decoded rather than copied.
+    if decodes(r.desc.format, &from, &to) {
+        let decoded = decode_now(host, placed, source as This, &from, &to);
+        if decoded {
+            crate::texture::host_written(placed);
+        }
+        return decoded;
+    }
+    let Some(through) = through(host, placed as usize, &from, &to) else {
+        return false;
+    };
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
+    let source = source as This;
+    // Resources are 8-byte aligned: a key of the list's own for the copy.
+    let first = list.first_use(placed as usize | 1);
+    // The source's first use in the list records nothing (its prelude
+    // brings it to the state); a use in another way since the last copy
+    // shows as a change of state.
+    let before = list
+        .transition(source, COPY_SOURCE)
+        .map(|(texture, before)| {
+            let state = crate::host::legal_state(texture, COPY_SOURCE);
+            let barrier = crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(state as i32),
+            );
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            before
+        });
+    crate::texture::host_written(placed);
+    if !first && before.is_none() {
+        return true;
+    }
+    crate::list::ensure_state(list, placed, COPY_DEST);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index as u32,
+        },
+    };
+    let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *row,
+        },
+    };
+    let (common, read, written) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    // SAFETY: an open list and live textures (the list holds both host
+    // copies through their states); the buffer is as big as the
+    // footprints and rests in the common state between copies.
+    unsafe {
+        let b = &through.buffer;
+        list.list
+            .ResourceBarrier(&[crate::host::transition(b, common, written)]);
+        for (index, (of_written, _)) in through.parts.iter().enumerate() {
+            let from = part(&from.texture, index);
+            list.list
+                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &from, None);
+        }
+        list.list
+            .ResourceBarrier(&[crate::host::transition(b, written, read)]);
+        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+            let to = part(&to.texture, index);
+            list.list
+                .CopyTextureRegion(&to, 0, 0, 0, &rows(of_read), None);
+        }
+        list.list
+            .ResourceBarrier(&[crate::host::transition(b, read, common)]);
+    }
+    list.keep(&through.buffer);
+    // A draw that also writes the source (a view of it handled before this
+    // one) needs it in that state again; the next read of the alias then
+    // copies once more, as it must after a write.
+    if let Some(before) = before
+        && before & TARGET_OR_UNORDERED != 0
+    {
+        crate::list::ensure_state(list, source, before);
+    }
+    true
+}
+
+/// The colour twin of a depth texture the title also writes through
+/// unordered access. The console allows both on one texture; the host
+/// gives a depth texture no unordered access (`host_flags`), so shaders
+/// write a colour texture of the same size and format family instead, and
+/// one side is copied into the other when it is used after the other was
+/// written (`HostList::twin_use`).
+/// shortcut: whole textures are copied, not the mips and slices written.
+/// A depth texture with a stencil plane gets a twin for each plane: BTP 6's
+/// tiled lighting writes each pixel's material class into the depth plane
+/// and masks into the stencil plane, then draws each class with the depth
+/// test "equal". The stencil plane's twin is copied through a buffer; the
+/// depth plane's is drawn into the plane by a pass of ours
+/// (`HostList::pass_plane`). Unordered access views of a multisampled
+/// texture stay null.
+///
+/// Ported from fxceless's VIctory fork (commit 578d459).
+#[cfg(windows)]
+pub(crate) struct Twin {
+    /// The colour texture and the state it is in, as a host copy's.
+    pub(crate) colour: Arc<HostTexture>,
+    /// Which side lacks what the other was written last, after the lists
+    /// submitted so far: bit 0 the depth texture, bit 1 the twin.
+    pub(crate) behind: std::sync::atomic::AtomicU32,
+    /// For a depth texture with a stencil plane, `colour` is the twin of
+    /// that plane (8 bits a texel) and this the buffer the two are copied
+    /// through: no colour format shares a family with a depth-stencil
+    /// format, but the host copies between a buffer and one plane.
+    pub(crate) through: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    /// For a depth texture with a stencil plane: the twin of its depth
+    /// plane, 16 bits a texel for the console's 16-bit depth-stencil
+    /// formats and a 32-bit float otherwise. No host colour format holds
+    /// the bits of a 24-bit depth plane, so the two are not copied: a pass
+    /// draws the twin into the plane.
+    pub(crate) plane: Option<Arc<HostTexture>>,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+#[cfg(windows)]
+unsafe impl Send for Twin {}
+// SAFETY: as above.
+#[cfg(windows)]
+unsafe impl Sync for Twin {}
+
+/// A host texture of ours (not a title resource's copy) in `state`:
+/// resident, unpooled, counted as alive while it lives.
+#[cfg(windows)]
+fn own_texture(
+    texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+) -> HostTexture {
+    format::note_texture(true, 0, 0, false);
+    HostTexture {
+        texture,
+        state: state.into(),
+        bytes: 0,
+        extra: 0,
+        residency: Arc::new(residency::Residency::resident()),
+        slot: None,
+    }
+}
+
+/// Whether depth twins are made (`XTP_DEPTH_TWINS=0`: none, such views
+/// stay null, as before; `stencil`: only for formats with a stencil plane;
+/// `nodepth`: none for the depth planes of such formats).
+#[cfg(windows)]
+fn twins_asked() -> &'static str {
+    static ASKED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ASKED.get_or_init(|| std::env::var("XTP_DEPTH_TWINS").unwrap_or_default())
+}
+
+/// The colour twin for a texture described by `desc` whose host copy is
+/// `depth`, if the title asks for depth and unordered access both and the
+/// host can copy between the two: the same size, mips and slices in the
+/// depth format's typeless family (R16 for 16-bit depth, R32 for 32-bit),
+/// or R8 for the stencil plane of a format that has one, with unordered
+/// access only. A format with a stencil plane gets a twin for its depth
+/// plane too, R16 for the console's 16-bit depth-stencil formats and R32
+/// otherwise.
+#[cfg(windows)]
+fn twin_texture(
+    desc: &ResourceDesc,
+    depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> Option<Arc<Twin>> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    const DEPTH_AND_UNORDERED: u32 = 6;
+    const UNORDERED: u32 = 4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    // R32 and R16 typeless: the families of the depth formats of one plane.
+    const ONE_PLANE: [u32; 2] = [39, 53];
+    // R32G8X24 and R24G8 typeless: depth with a stencil plane, whose twin
+    // is R8 typeless.
+    const WITH_STENCIL: [u32; 2] = [19, 44];
+    const R8_TYPELESS: u32 = 60;
+    if desc.dimension == BUFFER
+        || desc.flags & DEPTH_AND_UNORDERED != DEPTH_AND_UNORDERED
+        || twins_asked() == "0"
+    {
+        return None;
+    }
+    let typeless = family(pc_format(desc.format));
+    let stencil = WITH_STENCIL.contains(&typeless);
+    if !stencil && twins_asked() == "stencil" {
+        return None;
+    }
+    if !(stencil || ONE_PLANE.contains(&typeless)) || desc.sample_count > 1 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let mut d = *desc;
+    d.layout = 0;
+    d.alignment = 0;
+    d.flags = UNORDERED;
+    d.format = if stencil { R8_TYPELESS } else { typeless };
+    let make = |d: &ResourceDesc, what: &str| -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: the description has the host layout, as in
+        // `host_texture`; the out pointer is ours.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(d).cast(),
+                D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
+                None,
+                &mut texture,
+            )
+        };
+        if let Err(e) = made {
+            tracing::warn!(error = %e, desc = ?d, what, "no twin for a depth texture");
+        }
+        let texture = texture?;
+        crate::host::name(&texture, || {
+            format!("{what} {}x{} f{}", d.width, d.height, d.format)
+        });
+        Some(texture)
+    };
+    let texture = make(&d, "depth twin")?;
+    // The buffer a stencil plane and its twin are copied through: as big
+    // as the plane's mips and slices laid out for a copy (they follow the
+    // depth plane's in the texture's subresources).
+    let through = if stencil {
+        // SAFETY: a live texture.
+        let of = unsafe { depth.GetDesc() };
+        let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
+        let mut bytes = 0;
+        // SAFETY: a plain query; the out pointer is ours.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &of,
+                planes,
+                planes,
+                0,
+                None,
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        Some(device_buffer(host, bytes, false)?)
+    } else {
+        None
+    };
+    // The twin of the depth plane of a format with a stencil plane: R16
+    // typeless (53) for the console's 16-bit depth-stencil formats (118 to
+    // 120), whose shaders write 16-bit steps, R32 typeless (39) otherwise.
+    let plane = if stencil && twins_asked() != "nodepth" {
+        d.format = if (118..=120).contains(&desc.format) {
+            53
+        } else {
+            39
+        };
+        make(&d, "depth plane twin").map(|t| Arc::new(own_texture(t, UNORDERED_ACCESS)))
+    } else {
+        None
+    };
+    tracing::debug!(desc = ?desc, stencil, plane = plane.is_some(), "a depth texture's colour twin");
+    Some(Arc::new(Twin {
+        colour: Arc::new(own_texture(texture, UNORDERED_ACCESS)),
+        behind: std::sync::atomic::AtomicU32::new(0),
+        through,
+        plane,
+    }))
+}
+
+/// The colour twin of title texture `this`, if it has one.
+#[cfg(windows)]
+pub(crate) fn twin(this: This) -> Option<Arc<Twin>> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    r.twin.get().cloned().flatten()
+}
+
+/// The colour twin of title texture `this`, made now if it has none yet
+/// and is a depth texture the title also asks unordered access for.
+#[cfg(windows)]
+fn twin_made(this: This) -> Option<Arc<Twin>> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || r.shared {
+        return None;
+    }
+    r.twin
+        .get_or_init(|| {
+            let host = r.host.as_ref()?;
+            twin_texture(&r.desc, &host.texture)
+        })
+        .clone()
+}
+
+/// The texture and view for the title's unordered access view `desc` of
+/// `this`, a depth texture with a colour twin: the twin's (or, for a view
+/// of the depth plane of a texture with a stencil plane, that plane's
+/// twin's), in the colour format of the twin's family for a depth or
+/// typeless format (R16_UNORM for 16-bit depth, R32_FLOAT for 32-bit; the
+/// bits are the same). Without a description: mip 0 of every slice. The
+/// twin of a stencil plane (R8) stands for the views of that plane only,
+/// which become R8_UINT views of its one plane. `None` for a texture
+/// without a twin (`descriptor/host.rs` makes the view as before).
+#[cfg(windows)]
+pub(crate) fn twin_view(
+    this: This,
+    desc: Option<windows::Win32::Graphics::Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+) -> Option<(
+    &'static windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    windows::Win32::Graphics::Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC,
+)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let twin = twin_made(this)?;
+    let view = |texture: &ID3D12Resource| {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        let mut desc = desc.unwrap_or_else(|| {
+            let mut all = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            if d.DepthOrArraySize > 1 {
+                all.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                all.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                    ..Default::default()
+                };
+            }
+            all
+        });
+        // A stencil plane's twin (R8 typeless, 60): the title's view is of
+        // the stencil plane if it names plane 1 or a stencil view format.
+        if d.Format.0 == 60 {
+            let mut plane = 0;
+            match desc.ViewDimension {
+                D3D12_UAV_DIMENSION_TEXTURE2D => {
+                    // SAFETY: the member the dimension names.
+                    let mut v = unsafe { desc.Anonymous.Texture2D };
+                    plane = std::mem::take(&mut v.PlaneSlice);
+                    desc.Anonymous.Texture2D = v;
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                    // SAFETY: the member the dimension names.
+                    let mut v = unsafe { desc.Anonymous.Texture2DArray };
+                    plane = std::mem::take(&mut v.PlaneSlice);
+                    desc.Anonymous.Texture2DArray = v;
+                }
+                _ => {}
+            }
+            if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
+                return None;
+            }
+            desc.Format.0 = 62;
+            return Some(desc);
+        }
+        // None, typeless and depth formats (R16: 0, 53, 55; R32: 0, 39,
+        // 40), and those of a depth-stencil format's depth plane (19 to 21,
+        // 44 to 46), for the twin of such a plane.
+        desc.Format.0 = match (desc.Format.0, d.Format.0) {
+            (0 | 53 | 55 | 19..=21 | 44..=46, 53) => 56,
+            (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
+            (other, _) => other,
+        };
+        Some(desc)
+    };
+    // SAFETY: the twin lives as long as the resource's, which the title
+    // holds while it makes views of it.
+    let colour: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&twin.colour.texture) };
+    if let Some(v) = view(colour) {
+        return Some((colour, v));
+    }
+    let plane = twin.plane.as_ref()?;
+    // SAFETY: as above.
+    let plane: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&plane.texture) };
+    view(plane).map(|v| (plane, v))
+}
+
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,
@@ -2130,6 +3183,15 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 pub(crate) mod tests_support {
     use super::*;
     use windows::Win32::Graphics::Direct3D12::*;
+
+    /// A `width` x `height` depth texture in `format` that the title also
+    /// asks unordered access for (it gets a colour twin).
+    pub(crate) fn depth_unordered(width: u64, height: u32, format: u32) -> ResourceDesc {
+        ResourceDesc {
+            flags: 6,
+            ..target(width, height, format)
+        }
+    }
 
     /// A `width` x `height` render target in `format`.
     pub(crate) fn target(width: u64, height: u32, format: u32) -> ResourceDesc {
@@ -3207,6 +4269,230 @@ mod tests {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
         assert!(!alias::has_sources(address));
+    }
+
+    /// The 32-bit texels of a title texture's host copy (at most 64 wide),
+    /// in its own format, rows 64 texels apart.
+    #[cfg(windows)]
+    fn read_words(host: &crate::host::Host, resource: This) -> Vec<u32> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let copy = host_copy(resource).unwrap();
+        let texture = &copy.texture;
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        assert!(d.Width <= 64);
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        // SAFETY: a plain query for one subresource.
+        unsafe {
+            host.device
+                .GetCopyableFootprints(&d, 0, 1, 0, Some(&mut footprint), None, None, None);
+        }
+        assert_eq!(footprint.Footprint.RowPitch, 256);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let size = 256 * u64::from(d.Height);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let list = host.new_list().unwrap();
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let state = copy.state.load(std::sync::atomic::Ordering::Relaxed);
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: an open list; both locations name live resources.
+        unsafe {
+            if state != source {
+                list.list
+                    .ResourceBarrier(&[crate::host::transition(texture, state, source)]);
+            }
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            if state != source {
+                list.list
+                    .ResourceBarrier(&[crate::host::transition(texture, source, state)]);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy ran (drained); the buffer is `size` bytes.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), size as usize);
+            let words = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&w| u32::from_le_bytes(w))
+                .collect();
+            readback.Unmap(0, None);
+            words
+        }
+    }
+
+    /// Light packed into an R32 target by the GPU, read through an
+    /// R9G9B9E5 view placed at its address (fxceless's `alias_of`): the
+    /// view's own copy holds title memory's zeros until a list reading it
+    /// copies the target's texels into it; a second read in the list copies
+    /// nothing more.
+    #[cfg(windows)]
+    #[test]
+    fn a_view_in_another_format_reads_what_the_gpu_wrote() {
+        let test = "resource::tests::a_view_in_another_format_reads_what_the_gpu_wrote";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        // R9G9B9E5 (0.5, 0.25, 0.125): mantissas 256, 128, 64, exponent 15.
+        const PACKED: u32 = 256 | 128 << 9 | 64 << 18 | 15 << 27;
+        const R32_FLOAT: u32 = 41;
+        let target = at(
+            address,
+            &ResourceDesc {
+                flags: 1,
+                ..texture(16, 16, R32_FLOAT, 1)
+            },
+        );
+        let rtv = [0u64; 16];
+        let null = std::ptr::null();
+        crate::descriptor::create_rtv(null, target, null.cast(), rtv.as_ptr() as u64);
+        let list = crate::testgpu::TitleList::new();
+        type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
+        let packed = [f32::from_bits(PACKED), 0.0, 0.0, 0.0];
+        let clear = slot::<Clear>(list.this(), 0x1a0);
+        clear(list.this(), rtv.as_ptr() as u64, &packed, 0, null.cast());
+        list.run();
+
+        const R9G9B9E5: u32 = 67;
+        let view = texture_at(address, &words(&texture(16, 16, R9G9B9E5, 1), [1, 2])).unwrap();
+        assert!(!same_copy(view, target), "two formats: two copies");
+        let word = |words: &[u32], x: usize, y: usize| words[y * 64 + x];
+        assert_eq!(word(&read_words(host, view), 3, 5), 0, "title memory");
+
+        let reads = crate::testgpu::TitleList::new();
+        assert!(alias_copy(reads.host(), view));
+        assert!(
+            alias_copy(reads.host(), view),
+            "read again: nothing to copy"
+        );
+        reads.run();
+        let texels = read_words(host, view);
+        for (x, y) in [(0, 0), (15, 15), (7, 9)] {
+            assert_eq!(word(&texels, x, y), PACKED, "texel {x},{y}");
+        }
+        // A texture of the target's own format over it is no such alias.
+        let same = texture_at(address, &words(&texture(16, 16, R32_FLOAT, 1), [3, 4])).unwrap();
+        assert!(!alias_copy(reads.host(), same));
+        assert_eq!(host.log_messages(), None);
+        assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+    }
+
+    /// Where the host keeps R9G9B9E5 as RGBA16F (the RTX 4080), light
+    /// packed into an R32 target is decoded into the stand-in on the GPU:
+    /// (0.5, 0.25, 0.125) and alpha one, as half floats. WARP keeps
+    /// R9G9B9E5 itself, so the stand-in is made here as an RGBA16F texture.
+    #[cfg(windows)]
+    #[test]
+    fn packed_light_is_decoded_into_an_rgba16f_stand_in() {
+        let test = "resource::tests::packed_light_is_decoded_into_an_rgba16f_stand_in";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let mut held = Vec::new();
+        let written = fresh_memory(&mut held);
+        const PACKED: u32 = 256 | 128 << 9 | 64 << 18 | 15 << 27;
+        const R32_FLOAT: u32 = 41;
+        let target = at(
+            written.address(),
+            &ResourceDesc {
+                flags: 1,
+                ..texture(16, 16, R32_FLOAT, 1)
+            },
+        );
+        let rtv = [0u64; 16];
+        let null = std::ptr::null();
+        crate::descriptor::create_rtv(null, target, null.cast(), rtv.as_ptr() as u64);
+        let list = crate::testgpu::TitleList::new();
+        type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
+        let packed = [f32::from_bits(PACKED), 0.0, 0.0, 0.0];
+        let clear = slot::<Clear>(list.this(), 0x1a0);
+        clear(list.this(), rtv.as_ptr() as u64, &packed, 0, null.cast());
+        list.run();
+
+        const R16G16B16A16_FLOAT: u32 = 10;
+        let elsewhere = fresh_memory(&mut held);
+        let stand_in = at(elsewhere.address(), &texture(16, 16, R16G16B16A16_FLOAT, 1));
+        let (from, to) = (host_copy(target).unwrap(), host_copy(stand_in).unwrap());
+        assert!(
+            !decodes(R16G16B16A16_FLOAT, &from, &to),
+            "only R9G9B9E5 reads"
+        );
+        assert!(decodes(67, &from, &to));
+        assert!(decode_now(host, stand_in, target, &from, &to));
+        assert!(
+            decode_now(host, stand_in, target, &from, &to),
+            "once a frame"
+        );
+        run_decodes(host);
+        host.drain();
+        let words = read_words(host, stand_in);
+        for (x, y) in [(0, 0), (15, 15), (7, 9)] {
+            let at = y * 64 + 2 * x;
+            // Halves 0.5 and 0.25, then 0.125 and 1.
+            assert_eq!(
+                [words[at], words[at + 1]],
+                [0x3400_3800, 0x3c00_3000],
+                "texel {x},{y}"
+            );
+        }
+        assert_eq!(host.log_messages(), None);
+        for r in [stand_in, target] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
     }
 
     /// A placed view made before the target it aliases is made again, on
