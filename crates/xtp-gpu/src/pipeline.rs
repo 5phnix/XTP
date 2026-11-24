@@ -98,6 +98,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: xtp_shader::emit::HostShader,
     pub(crate) used: Vec<xtp_shader::UsedResource>,
+    /// Whether the console program runs in 64-lane waves (its lane masks
+    /// and lane numbers are a wave64's).
+    pub(crate) wave64: bool,
 }
 
 #[cfg(windows)]
@@ -134,7 +137,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use xtp_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
+    let (used, wave64) = match c.part(FourCC::DXIL) {
         Some(part) => xtp_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -144,11 +147,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
             })
-            .map(|p| p.used)
+            .map(|p| (p.used, p.wave64))
             .unwrap_or_default(),
-        None => Vec::new(),
+        None => (Vec::new(), false),
     };
-    Ok(Translated { host, used })
+    Ok(Translated { host, used, wave64 })
 }
 
 #[repr(C)]
