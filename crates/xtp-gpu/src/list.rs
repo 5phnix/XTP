@@ -814,6 +814,513 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// Logs a warning the first time it is reached.
+#[cfg(windows)]
+macro_rules! warn_once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
+
+/// What a UAV clear writes: the low bits of each value into each channel
+/// (`Uint`), or the values in the view's format (`Float`).
+#[derive(Clone, Copy, Debug)]
+enum Clear {
+    Uint([u32; 4]),
+    Float([f32; 4]),
+}
+
+/// `ClearUnorderedAccessViewUint` (0x1a8): `(GPU handle, CPU handle,
+/// resource, values, rect count, rects)`, see [`clear_uav`]. FidelityFX's
+/// upscaler (FSR4) calls it on Series S.
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values (null is tolerated).
+    if let Some(&values) = unsafe { values.as_ref() } {
+        clear_uav(
+            this,
+            (gpu, cpu),
+            resource,
+            Clear::Uint(values),
+            count,
+            rects,
+        );
+    }
+}
+
+/// `ClearUnorderedAccessViewFloat` (0x1b0), as [`clear_uav_uint`].
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values (null is tolerated).
+    if let Some(&values) = unsafe { values.as_ref() } {
+        clear_uav(
+            this,
+            (gpu, cpu),
+            resource,
+            Clear::Float(values),
+            count,
+            rects,
+        );
+    }
+}
+
+/// Whether the words of a buffer view describe a raw or a structured view,
+/// which has no format to clear in floats: a stride (word 5) or the raw
+/// flag (word 8).
+#[cfg(windows)]
+fn untyped_buffer_view(words: &[u32]) -> bool {
+    const RAW: u32 = 1;
+    words.get(5).is_some_and(|&stride| stride != 0) || words.get(8).is_some_and(|&f| f & RAW != 0)
+}
+
+/// The UAV clears. Both handles are the console's: descriptor slots in
+/// title memory, the first in the bound shader-visible heap, the second in
+/// a CPU-only one. They hold our view records, not host descriptors: a host
+/// driver handed them reads garbage (on AMD the process ended at the
+/// world's start, as xcl #1291 found). The host gets descriptors of its own
+/// for the view the slots hold: one in a dynamic slot of XTP's own
+/// shader-visible heap, bound for the clear, and one in a CPU-only heap of
+/// ours ([`clear_slots`]). The clear writes what the view names: the host
+/// copy of a texture, or the host copy of a buffer's range, which goes back
+/// to title memory after the submission as shader writes do. `resource`
+/// is the view's (D3D12 asks for the same), so the view's is used.
+fn clear_uav(
+    this: This,
+    (gpu, cpu): (u64, u64),
+    resource: This,
+    clear: Clear,
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        use crate::descriptor::View;
+        use windows::Win32::Foundation::RECT;
+        const UNORDERED_ACCESS: u32 = 0x8;
+        // The title writes the view at the CPU handle and copies it to the
+        // GPU one: either holds its record.
+        let Some(view) = crate::descriptor::view(cpu).or_else(|| crate::descriptor::view(gpu))
+        else {
+            warn_once!("a UAV clear of a slot without a view of ours: not done");
+            return;
+        };
+        let words: Option<&[u32]> = match &view {
+            View::Unordered(_, _, desc) => desc.as_ref().map(|d| &d[..]),
+            View::Placed(true, _, desc) => Some(&desc[..10]),
+            _ => {
+                warn_once!("a UAV clear of a view that is not an unordered access view: not done");
+                return;
+            }
+        };
+        let range = crate::descriptor::host::buffer_range(&view);
+        if matches!(clear, Clear::Float(_))
+            && range.is_some()
+            && words.is_some_and(untyped_buffer_view)
+        {
+            warn_once!("a float clear of a raw or structured buffer view, which the host refuses");
+            return;
+        }
+        with_state(this, |list, state| {
+            let (Some(heap), Some(slots)) = (crate::descriptor::own_view_heap(), clear_slots())
+            else {
+                return;
+            };
+            let Some(slot) = heap.dynamic(1) else {
+                return;
+            };
+            list.keep_dynamic(crate::descriptor::OWN_VIEW_HEAP, slot, 1);
+            // Held until the clear is recorded: the host reads the CPU-only
+            // descriptor then.
+            let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
+            let at = slots.take();
+            let Some(target) = crate::descriptor::host::make_view(&view, at) else {
+                warn_once!(
+                    ?view,
+                    "a UAV clear of a view the host cannot make: not done"
+                );
+                return;
+            };
+            if !heap.make_at(slot, &view) {
+                return;
+            }
+            if let Some((address, len)) = range
+                && len > 0
+                && let Some(shadow) = crate::shadow::find(address, len)
+            {
+                // A clear of part of the range (rectangles) keeps the rest.
+                shadow.refresh(list, address, len);
+                shadow.gpu_writes(list, address, len);
+            } else if let View::Unordered(texture, _, _) = view {
+                let texture = texture as This;
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(texture);
+                ensure_state(list, texture, UNORDERED_ACCESS);
+                crate::texture::host_written(texture);
+            }
+            let rects: &[RECT] = if count > 0 && !rects.is_null() {
+                // SAFETY: the title passes `count` rectangles, laid out as the host's.
+                unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+            } else {
+                &[]
+            };
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("clear UAV {clear:?} of {resource:?}"));
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = resource;
+            list.keep(&heap.heap);
+            list.keep(&target);
+            let gpu = heap.gpu_handle(slot);
+            // SAFETY: an open list; our shader-visible heap, bound here,
+            // holds the view at `gpu`, the CPU-only one at `at`, both of
+            // the live `target`.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                match clear {
+                    Clear::Uint(v) => list
+                        .list
+                        .ClearUnorderedAccessViewUint(gpu, at, &target, &v, rects),
+                    Clear::Float(v) => list
+                        .list
+                        .ClearUnorderedAccessViewFloat(gpu, at, &target, &v, rects),
+                }
+                // Later shader access sees the clear.
+                list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+            }
+            drop(slots);
+            // The title's heaps go back on the list at its next draw.
+            state.forget_host();
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, clear, count, rects);
+}
+
+/// CPU-only view descriptors for the clears' second handle, taken in turn.
+/// The host reads one while the clear is recorded (D3D12 asks for a
+/// CPU-only heap so that drivers read it fast on the CPU), so one would do;
+/// the ring keeps a driver that read it later right for its next clears.
+#[cfg(windows)]
+struct ClearSlots {
+    /// Held: the descriptors live in it.
+    _heap: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    start: usize,
+    step: usize,
+    next: usize,
+}
+
+// SAFETY: D3D12 descriptor heaps are free-threaded; the rest is plain data
+// behind the mutex.
+#[cfg(windows)]
+unsafe impl Send for ClearSlots {}
+
+#[cfg(windows)]
+const CLEAR_SLOTS: usize = 256;
+
+#[cfg(windows)]
+impl ClearSlots {
+    fn take(&mut self) -> windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE {
+        let at = self.start + self.next * self.step;
+        self.next = (self.next + 1) % CLEAR_SLOTS;
+        windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at }
+    }
+}
+
+/// The clears' CPU-only descriptors, made on first use; `None` without a
+/// host GPU.
+#[cfg(windows)]
+fn clear_slots() -> Option<&'static std::sync::Mutex<ClearSlots>> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static SLOTS: std::sync::OnceLock<Option<std::sync::Mutex<ClearSlots>>> =
+        std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(|| {
+            let host = crate::host::host()?;
+            // SAFETY: plain heap creation and queries of a live heap.
+            unsafe {
+                let made = host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(
+                    &D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: CLEAR_SLOTS as u32,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                        NodeMask: 0,
+                    },
+                );
+                let heap = match made {
+                    Ok(heap) => heap,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no CPU-only heap for UAV clears");
+                        return None;
+                    }
+                };
+                let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                let step = host
+                    .device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    as usize;
+                Some(std::sync::Mutex::new(ClearSlots {
+                    _heap: heap,
+                    start,
+                    step,
+                    next: 0,
+                }))
+            }
+        })
+        .as_ref()
+}
+
+/// A bilinear upscale, what `xtp_hle`'s stand-in for FidelityFX's upscaler
+/// records for `ffxDispatch`: the `render` texels at the top left of
+/// `color` stretched over the `size` pixels at the top left of `output`.
+/// `jitter` is the dispatch's jitter offset, in `color`'s texels: the
+/// camera offset the frame was rendered with, which the upscale takes back
+/// (see [`upscale`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Upscale {
+    /// The title's command list.
+    pub list: *const Object,
+    /// The title's textures (`ID3D12Resource`).
+    pub color: *const Object,
+    pub output: *const Object,
+    pub render: [u32; 2],
+    pub size: [u32; 2],
+    pub jitter: [f32; 2],
+}
+
+/// Records `u` in its list on the host GPU, a compute pass of ours: each
+/// output pixel takes the input bilinearly at its own place in the input,
+/// moved by the jitter as FidelityFX's upscalers place their input samples
+/// (the texel at `i` holds the scene at `i + 0.5 - jitter`), and clamped
+/// to the rendered region. `color` ends readable by compute shaders and
+/// `output` in unordered access, the states the title gives FidelityFX.
+/// False (nothing recorded) without a host GPU, without host copies of the
+/// textures or views of them, or without descriptor slots.
+pub fn upscale(u: &Upscale) -> bool {
+    #[cfg(windows)]
+    {
+        let mut ran = false;
+        with_state(u.list, |list, state| ran = upscale::record(list, state, u));
+        ran
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = u;
+        false
+    }
+}
+
+/// The bilinear upscale's shader and recording (see [`upscale`]).
+#[cfg(windows)]
+mod upscale {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::s;
+
+    use super::{This, Upscale, ensure_state};
+    use crate::descriptor::View;
+    use crate::host::HostList;
+
+    const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=8, b0), DescriptorTable(SRV(t0)), " \
+    "DescriptorTable(UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, " \
+    "addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, " \
+    "addressW=TEXTURE_ADDRESS_CLAMP)"
+cbuffer Upscale : register(b0) {
+    // Input texels per output pixel; the jitter, in input texels.
+    float2 scale;
+    float2 jitter;
+    // The rendered region of the input, in texels.
+    float2 render;
+    // The output pixels to write.
+    uint2 size;
+};
+Texture2D<float4> color : register(t0);
+RWTexture2D<float4> output : register(u0);
+SamplerState linear_clamp : register(s0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= size)) return;
+    // Where this pixel's centre is in the input, in texels: the texel at
+    // i holds the scene at i + 0.5 - jitter.
+    float2 at = (float2(id.xy) + 0.5) * scale + jitter;
+    at = clamp(at, 0.5, render - 0.5);
+    float w, h;
+    color.GetDimensions(w, h);
+    output[id.xy] = color.SampleLevel(linear_clamp, at / float2(w, h), 0);
+}
+"#;
+
+    pub(super) struct Pass {
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+    }
+
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Pass {}
+    // SAFETY: as above.
+    unsafe impl Sync for Pass {}
+
+    pub(super) fn pass() -> Option<&'static Pass> {
+        static PASS: std::sync::OnceLock<Option<Pass>> = std::sync::OnceLock::new();
+        PASS.get_or_init(|| match make() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(error = %e, "no bilinear upscale pass: FidelityFX dispatches do nothing");
+                None
+            }
+        })
+        .as_ref()
+    }
+
+    fn make() -> windows::core::Result<Pass> {
+        let device = &crate::host::host()
+            .ok_or_else(windows::core::Error::empty)?
+            .device;
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; out pointers ours.
+        let compiled = unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("upscale"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            if let Some(errors) = errors {
+                // SAFETY: the blob's own bytes.
+                let text = unsafe {
+                    std::slice::from_raw_parts(
+                        errors.GetBufferPointer().cast::<u8>(),
+                        errors.GetBufferSize(),
+                    )
+                };
+                tracing::warn!("bilinear upscale: {}", String::from_utf8_lossy(text));
+            }
+            return Err(e);
+        }
+        let code = code.ok_or_else(windows::core::Error::empty)?;
+        // SAFETY: the blob's own bytes; the root signature is inside the shader.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })?;
+            Ok(Pass { root, pso })
+        }
+    }
+
+    /// The constants the shader takes, in its order.
+    pub(super) fn constants(u: &Upscale) -> [u32; 8] {
+        let [rw, rh] = u.render.map(|v| v.max(1) as f32);
+        let [ow, oh] = u.size.map(|v| v.max(1) as f32);
+        [
+            (rw / ow).to_bits(),
+            (rh / oh).to_bits(),
+            u.jitter[0].to_bits(),
+            u.jitter[1].to_bits(),
+            rw.to_bits(),
+            rh.to_bits(),
+            u.size[0],
+            u.size[1],
+        ]
+    }
+
+    pub(super) fn record(list: &HostList, state: &mut crate::draw::State, u: &Upscale) -> bool {
+        const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let (color, output): (This, This) = (u.color, u.output);
+        let (Some(pass), Some(heap)) = (pass(), crate::descriptor::own_view_heap()) else {
+            return false;
+        };
+        let (Some(input), Some(_)) = (
+            crate::resource::host_resource(color),
+            crate::resource::host_resource(output),
+        ) else {
+            warn_once!("FidelityFX dispatch: a texture without a host copy, nothing upscaled");
+            return false;
+        };
+        if u.size.contains(&0) || u.render.contains(&0) {
+            return false;
+        }
+        let Some(first) = heap.dynamic(2) else {
+            return false;
+        };
+        list.keep_dynamic(crate::descriptor::OWN_VIEW_HEAP, first, 2);
+        if !heap.make_at(first, &View::Shader(color as usize, None))
+            || !heap.make_at(first + 1, &View::Unordered(output as usize, 0, None))
+        {
+            warn_once!("FidelityFX dispatch: the host cannot view its textures, nothing upscaled");
+            return false;
+        }
+        if crate::texture::title_written(input) {
+            crate::texture::upload(list, color, input);
+        }
+        ensure_state(list, color, NON_PIXEL_SHADER_RESOURCE);
+        ensure_state(list, output, UNORDERED_ACCESS);
+        crate::texture::host_written(output);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::capture::note_target(output);
+            list.note_op(|| format!("FidelityFX bilinear upscale {u:?}"));
+        }
+        list.keep(&heap.heap);
+        list.used_pipeline("FidelityFX bilinear upscale");
+        let constants = constants(u);
+        let l = &list.list;
+        // SAFETY: an open list; our heap, root signature and pipeline (kept
+        // for the run), views of live textures the heap's slots hold.
+        unsafe {
+            l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.SetComputeRootSignature(&pass.root);
+            l.SetPipelineState(&pass.pso);
+            l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+            l.SetComputeRootDescriptorTable(1, heap.gpu_handle(first));
+            l.SetComputeRootDescriptorTable(2, heap.gpu_handle(first + 1));
+            l.Dispatch(u.size[0].div_ceil(8), u.size[1].div_ceil(8), 1);
+            // Later work reads what the pass wrote.
+            l.ResourceBarrier(&[crate::host::uav_barrier()]);
+        }
+        // The title's pipeline, root signature and heaps go back on the
+        // list at its next draw or dispatch.
+        state.forget_host();
+        true
+    }
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied like buffer copies (see [`copy_title`]); on the
 /// CPU only if both ranges are mapped.
@@ -1355,7 +1862,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -1396,6 +1903,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, ignored_state as *const ()),             // 0x220 depth bounds
@@ -1630,6 +2139,278 @@ mod tests {
             assert_eq!(got[..3], written, "the dispatch reads the written words");
             assert_eq!(got[3..], [0x1111_1111; 61]);
             assert_eq!(w.words()[..3], written);
+        }
+
+        /// A title resource description (`D3D12_RESOURCE_DESC`), as the
+        /// title passes it.
+        #[repr(C)]
+        struct TextureDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+
+        /// R8G8B8A8_UNORM, which every host keeps and reads back as bytes.
+        const RGBA8: u32 = 28;
+        const UNORDERED_ACCESS: u32 = 0x8;
+
+        /// A committed `width` x `height` RGBA8 title texture, a render
+        /// target with unordered access (as the FidelityFX output is).
+        fn texture(width: u64, height: u32) -> This {
+            const DEFAULT_HEAP: [u32; 5] = [1, 0, 0, 0, 0];
+            const RESOURCE_IID: Iid = guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let desc = TextureDesc {
+                dimension: 3,
+                alignment: 0,
+                width,
+                height,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: RGBA8,
+                sample_count: 1,
+                sample_quality: 0,
+                layout: 0,
+                flags: 1 | 4,
+            };
+            let null = std::ptr::null();
+            let mut out = null;
+            let made = crate::resource::create_committed(
+                null,
+                DEFAULT_HEAP.as_ptr().cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                &RESOURCE_IID,
+                &mut out,
+            );
+            assert_eq!(made, S_OK, "a {width}x{height} title texture");
+            out
+        }
+
+        fn release(object: This) {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+
+        /// Fills the rectangle `[x0, x1) x [y0, y1)` of `texture` with
+        /// `rgba` (bytes) through a render target view, as the title clears.
+        fn fill(list: This, texture: This, (x0, y0, x1, y1): (i32, i32, i32, i32), rgba: [u8; 4]) {
+            let mut slot = [0u64; 16];
+            let handle = slot.as_mut_ptr() as u64;
+            crate::descriptor::create_rtv(std::ptr::null(), texture, std::ptr::null(), handle);
+            let color = rgba.map(|c| f32::from(c) / 255.0);
+            let rect = Rect {
+                left: x0,
+                top: y0,
+                right: x1,
+                bottom: y1,
+            };
+            clear_rtv(list, handle, &color, 1, &rect);
+        }
+
+        /// The red channel of row `y` of a read back texture (rows 256
+        /// bytes apart).
+        fn reds(texels: &[u8], y: usize, width: usize) -> Vec<u8> {
+            (0..width).map(|x| texels[y * 256 + x * 4]).collect()
+        }
+
+        fn near(got: &[u8], want: &[u8]) -> bool {
+            got.len() == want.len() && got.iter().zip(want).all(|(&g, &w)| g.abs_diff(w) <= 1)
+        }
+
+        /// The FidelityFX stand-in's bilinear upscale: an 8x2 input whose
+        /// left 4x2 is rendered (red 0, 64, 128, 192 by column; 255 past
+        /// the rendered region) goes to the 8x4 top left of a 16x6 output.
+        /// Without jitter, output pixel x reads the input at (x + 0.5) / 2;
+        /// with a jitter of a quarter input texel, a quarter further, as
+        /// FidelityFX's convention has it (the texel at i holds the scene
+        /// at i + 0.5 - jitter). Samples never reach past the rendered
+        /// region, and the rest of the output is left as it was.
+        #[test]
+        fn the_fidelityfx_upscale_is_bilinear_jittered_and_stays_in_its_regions() {
+            let test = "list::tests::gpu::the_fidelityfx_upscale_is_bilinear_jittered_and_stays_in_its_regions";
+            let Some(host) = device(test) else { return };
+            let (color, plain, jittered) = (texture(8, 2), texture(16, 6), texture(16, 6));
+            let list = TitleList::new();
+            for (i, red) in [0u8, 64, 128, 192].into_iter().enumerate() {
+                let x = i as i32;
+                fill(list.this(), color, (x, 0, x + 1, 2), [red, 7, 9, 255]);
+            }
+            fill(list.this(), color, (4, 0, 8, 2), [255, 255, 255, 255]);
+            for out in [plain, jittered] {
+                fill(list.this(), out, (0, 0, 16, 6), [1, 2, 3, 4]);
+            }
+            for (out, jitter) in [(plain, [0.0, 0.0]), (jittered, [0.25, 0.0])] {
+                let u = Upscale {
+                    list: list.this(),
+                    color,
+                    output: out,
+                    render: [4, 2],
+                    size: [8, 4],
+                    jitter,
+                };
+                assert!(upscale(&u), "the upscale is recorded");
+            }
+            list.run();
+            let read = |t: This| {
+                let texture = crate::resource::host_resource(t).expect("a host texture");
+                crate::resource::tests_support::read_back(host, texture, UNORDERED_ACCESS)
+            };
+            let (a, b) = (read(plain), read(jittered));
+            for t in [color, plain, jittered] {
+                release(t);
+            }
+            for y in 0..4 {
+                let row = reds(&a, y, 16);
+                assert!(
+                    near(&row[..8], &[0, 16, 48, 80, 112, 144, 176, 192]),
+                    "row {y}: {row:?}"
+                );
+                assert_eq!(row[8..], [1; 8], "row {y} past the output size");
+                let row = reds(&b, y, 16);
+                assert!(
+                    near(&row[..8], &[0, 32, 64, 96, 128, 160, 192, 192]),
+                    "jittered row {y}: {row:?}"
+                );
+                // The other channels come along.
+                assert!(near(&a[y * 256 + 4..y * 256 + 8], &[16, 7, 9, 255]));
+            }
+            for y in 4..6 {
+                assert_eq!(reds(&a, y, 16), [1; 16], "row {y} below the output size");
+            }
+        }
+
+        /// A view's record at `cpu` (memory of the title's, as a CPU-only
+        /// heap is) copied to slot 0 of a shader-visible title heap, as the
+        /// title prepares a UAV clear: the console handles the clear gets.
+        fn console_handles(
+            resource: This,
+            desc: Option<&[u32; 10]>,
+            cpu: &mut [u64; 4],
+            heap: &crate::descriptor::TestHeap,
+        ) -> (u64, u64) {
+            let null: This = std::ptr::null();
+            let cpu = cpu.as_mut_ptr() as u64;
+            let desc = desc.map_or(std::ptr::null(), std::ptr::from_ref);
+            crate::descriptor::create_uav(null, resource, null, desc, cpu);
+            let gpu = crate::descriptor::heap(heap.0).start;
+            const VIEWS: u32 = 0;
+            crate::descriptor::copy_simple(null, 1, gpu, cpu, VIEWS);
+            (gpu, cpu)
+        }
+
+        /// `ClearUnorderedAccessViewFloat` then `…Uint` on a texture, with
+        /// the console's handles (slots of title memory, which a host
+        /// driver cannot read): the float clear converts to the view's
+        /// format, the integer one writes the values' low bits, and only
+        /// inside its rectangle.
+        #[test]
+        fn uav_clears_of_a_texture_go_through_host_views() {
+            let test = "list::tests::gpu::uav_clears_of_a_texture_go_through_host_views";
+            let Some(host) = device(test) else { return };
+            let image = texture(4, 4);
+            let heap = crate::descriptor::TestHeap::views(4);
+            let mut cpu = [0u64; 4];
+            let (gpu, cpu) = console_handles(image, None, &mut cpu, &heap);
+            let list = TitleList::new();
+            fill(list.this(), image, (0, 0, 4, 4), [9, 9, 9, 9]);
+            let float = [0.5f32, 0.25, 0.0, 1.0];
+            clear_uav_float(list.this(), gpu, cpu, image, &float, 0, std::ptr::null());
+            let rect = Rect {
+                left: 2,
+                top: 0,
+                right: 4,
+                bottom: 2,
+            };
+            clear_uav_uint(list.this(), gpu, cpu, image, &[1, 2, 3, 0x104], 1, &rect);
+            list.run();
+            let texture = crate::resource::host_resource(image).expect("a host texture");
+            let texels = crate::resource::tests_support::read_back(host, texture, UNORDERED_ACCESS);
+            release(image);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let at = y * 256 + x * 4;
+                    let want: &[u8] = if x >= 2 && y < 2 {
+                        &[1, 2, 3, 4]
+                    } else {
+                        &[128, 64, 0, 255]
+                    };
+                    assert!(
+                        near(&texels[at..at + 4], want),
+                        "texel {x},{y}: {:?}",
+                        &texels[at..at + 4]
+                    );
+                }
+            }
+        }
+
+        /// A buffer view's integer clear writes its range of the host copy,
+        /// which reaches title memory once the list has run; a float clear
+        /// of a raw view is refused, as the host would.
+        #[test]
+        fn uav_clears_of_a_buffer_reach_title_memory() {
+            let test = "list::tests::gpu::uav_clears_of_a_buffer_reach_title_memory";
+            if device(test).is_none() {
+                return;
+            }
+            const R32_UINT: u32 = 42;
+            const R32_TYPELESS: u32 = 39;
+            const BUFFER: u32 = 1;
+            const RAW: u32 = 1;
+            let buffer = TitleBuffer::new(256);
+            buffer.set_words(|i| i as u32);
+            // Format, dimension, first element (2 words), count, stride,
+            // counter offset (2 words), flags: words 16 to 47.
+            let typed = [R32_UINT, BUFFER, 16, 0, 32, 0, 0, 0, 0, 0];
+            let raw = [R32_TYPELESS, BUFFER, 0, 0, 64, 0, 0, 0, RAW, 0];
+            let heap = crate::descriptor::TestHeap::views(4);
+            let list = TitleList::new();
+            let mut slot = [0u64; 4];
+            let (gpu, cpu) = console_handles(buffer.resource(), Some(&raw), &mut slot, &heap);
+            clear_uav_float(
+                list.this(),
+                gpu,
+                cpu,
+                buffer.resource(),
+                &[1.0; 4],
+                0,
+                std::ptr::null(),
+            );
+            let mut slot = [0u64; 4];
+            let (gpu, cpu) = console_handles(buffer.resource(), Some(&typed), &mut slot, &heap);
+            clear_uav_uint(
+                list.this(),
+                gpu,
+                cpu,
+                buffer.resource(),
+                &[0xc1ea_0000, 0, 0, 0],
+                0,
+                std::ptr::null(),
+            );
+            list.run();
+            let want: Vec<u32> = (0..64)
+                .map(|i| {
+                    if (16..48).contains(&i) {
+                        0xc1ea_0000
+                    } else {
+                        i
+                    }
+                })
+                .collect();
+            assert_eq!(buffer.words(), want);
         }
     }
 }
