@@ -15,6 +15,14 @@
 //! before.json after.json`). A change that must not alter the translation,
 //! such as a refactor of the emitter, leaves the file byte-identical.
 //!
+//! `--host-lanes MIN-MAX` translates for a host whose waves are that many
+//! lanes ([`emit::Target`]): `32-32` is NVIDIA's, where console wave64
+//! programs run as two 32-lane halves or stop with their reason
+//! (`docs/wave64-on-wave32.md`). Without it the translation is the one for
+//! any host, and the JSON is what it was; with it the JSON also says
+//! `host_lanes`, and each translation's `wave` where it requires one. The
+//! report counts the wave size each translation requires, by the console's.
+//!
 //! The pack: the path given, else `XTP_SAMPLE_SHADERS`, else `shaders.rpf`
 //! in the configured game folder. Records are found as `xtp translate`
 //! finds them ([`sources`]: SGD5 records by their marker, which RPF9 packs
@@ -126,6 +134,32 @@ pub(crate) const ROWS: &[Row] = &[
         item: "M2",
         graphics: None,
         texts: &["a whole-wave section step the simulation does not follow"],
+    },
+    Row {
+        category: LANES,
+        label: "console wave64 on a host without 64-lane waves (--host-lanes)",
+        item: "L1",
+        graphics: None,
+        texts: &[
+            "console wave64 lanes on a host without 64-lane waves",
+            "a wave64 group sharing LDS without barriers on a host without 64-lane waves",
+            "a console wave size the host does not run",
+            "ds_permute across the halves of a wave64 on a host without 64-lane waves",
+            "a whole-wave section of a wave64 on a host without 64-lane waves",
+            "a whole-wave reduction across 32-lane halves",
+            "a lane mask read whole in a wave64 program split in halves",
+            "a wave reduction in a wave64 program split in halves",
+            "a branch the console flow does not model",
+        ],
+    },
+    Row {
+        category: LANES,
+        label: "console wave64, several console waves per group (--host-lanes)",
+        item: "L2",
+        graphics: None,
+        texts: &[
+            "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
+        ],
     },
     Row {
         category: LANES,
@@ -289,6 +323,8 @@ pub(crate) enum Outcome {
     Translated {
         output: blake3::Hash,
         check: Option<Result<(), String>>,
+        /// The wave size the translation requires (`WaveSize`), if any.
+        wave: Option<u32>,
     },
     /// Not translated: the step that stopped it and its blocker.
     Failed { step: &'static str, what: String },
@@ -297,6 +333,8 @@ pub(crate) enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Program {
     pub stage: HwStage,
+    /// The console runs it in waves of 64.
+    pub wave64: bool,
     pub outcome: Outcome,
 }
 
@@ -316,6 +354,8 @@ pub(crate) struct Survey {
     pub hash: blake3::Hash,
     /// Validation of every Nth record's translations, if asked.
     pub validate_every: Option<usize>,
+    /// The host wave sizes translated for.
+    pub target: emit::Target,
     pub records: Vec<Record>,
 }
 
@@ -340,8 +380,13 @@ pub fn run(
     json: Option<PathBuf>,
     validate_every: Option<usize>,
     jobs: Option<usize>,
+    host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
     let path = pack_path(pack)?;
+    let target = host_lanes.map_or(emit::Target::ANY, |(lanes_min, lanes_max)| emit::Target {
+        lanes_min,
+        lanes_max,
+    });
     if let Some(out) = &json {
         // Names of the title's programs stay out of the repository.
         xtp_core::ensure_outside_repo(out)?;
@@ -358,7 +403,7 @@ pub fn run(
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let start = std::time::Instant::now();
-    let s = survey(&data, validate_every, dll.as_deref(), threads);
+    let s = survey(&data, validate_every, dll.as_deref(), threads, target);
     print!("{}", report(&s, &path.display().to_string()));
     if let Some(dll) = &dll {
         println!("validator    {}", dll.display());
@@ -371,13 +416,15 @@ pub fn run(
     Ok(())
 }
 
-/// Surveys the pack in `data` on `threads` threads; with `validate_every`,
-/// checks the translations of every Nth record with `dll`'s validator.
+/// Surveys the pack in `data` on `threads` threads, translating for
+/// `target`; with `validate_every`, checks the translations of every Nth
+/// record with `dll`'s validator.
 pub(crate) fn survey(
     data: &[u8],
     validate_every: Option<usize>,
     dll: Option<&Path>,
     threads: usize,
+    target: emit::Target,
 ) -> Survey {
     let sources = sources(data);
     let next = AtomicUsize::new(0);
@@ -396,7 +443,8 @@ pub(crate) fn survey(
                             break;
                         };
                         let check = validate_every.is_some_and(|n| i.is_multiple_of(n.max(1)));
-                        out.push((i, record(source, validator.as_mut().filter(|_| check))));
+                        let validator = validator.as_mut().filter(|_| check);
+                        out.push((i, record(source, validator, target)));
                     }
                     out
                 })
@@ -412,12 +460,13 @@ pub(crate) fn survey(
         bytes: data.len(),
         hash: blake3::hash(data),
         validate_every,
+        target,
         records: records.into_iter().map(|(_, r)| r).collect(),
     }
 }
 
 /// Translates every program of one record.
-fn record(source: &Source, validator: Option<&mut Validator>) -> Record {
+fn record(source: &Source, validator: Option<&mut Validator>, target: emit::Target) -> Record {
     let (offset, name) = match source {
         Source::Raw { offset, .. } => (*offset, None),
         Source::Packed(r) => (r.offset, r.name.map(str::to_owned)),
@@ -452,9 +501,13 @@ fn record(source: &Source, validator: Option<&mut Validator>) -> Record {
         let outcome = match p.stage {
             HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms => {
                 // A panic is a translator bug: it is counted, not fatal.
-                match catch_unwind(AssertUnwindSafe(|| emit::translate_program(&container, p))) {
+                let translated = catch_unwind(AssertUnwindSafe(|| {
+                    emit::translate_program_for(&container, p, target)
+                }));
+                match translated {
                     Ok(Ok(shader)) => Outcome::Translated {
                         output: output_hash(&shader),
+                        wave: shader.wave_size(),
                         check: validator.as_deref_mut().map(|v| {
                             v.validate(&mut shader.dxil.clone())
                                 .map_err(|text| first_error(&text))
@@ -485,6 +538,7 @@ fn record(source: &Source, validator: Option<&mut Validator>) -> Record {
         };
         out.programs.push(Program {
             stage: p.stage,
+            wave64: p.wave64,
             outcome,
         });
     }
@@ -527,6 +581,14 @@ pub(crate) fn output_hash(s: &emit::HostShader) -> blake3::Hash {
 /// Counts per stage.
 type PerStage = BTreeMap<HwStage, usize>;
 
+/// Programs of one stage and console wave size, and the wave sizes their
+/// translations require (`None`: any).
+#[derive(Default)]
+pub(crate) struct WaveCounts {
+    pub programs: usize,
+    pub translated: BTreeMap<Option<u32>, usize>,
+}
+
 /// The survey's counts.
 #[derive(Default)]
 pub(crate) struct Totals {
@@ -541,6 +603,9 @@ pub(crate) struct Totals {
     pub checked: usize,
     pub passed: usize,
     pub rejected: BTreeMap<String, usize>,
+    /// Programs by (stage, console wave64): how many, and those translated
+    /// by the wave size their translation requires.
+    pub waves: BTreeMap<(HwStage, bool), WaveCounts>,
     /// The hash of every translation's hash, in pack order.
     pub digest: Option<blake3::Hash>,
 }
@@ -555,8 +620,15 @@ impl Totals {
             }
             for (k, p) in r.programs.iter().enumerate() {
                 *t.programs.entry(p.stage).or_default() += 1;
+                let waves = t.waves.entry((p.stage, p.wave64)).or_default();
+                waves.programs += 1;
                 match &p.outcome {
-                    Outcome::Translated { output, check } => {
+                    Outcome::Translated {
+                        output,
+                        check,
+                        wave,
+                    } => {
+                        *waves.translated.entry(*wave).or_default() += 1;
                         *t.translated.entry(p.stage).or_default() += 1;
                         digest.update(&(i as u64).to_le_bytes());
                         digest.update(&(k as u64).to_le_bytes());
@@ -617,6 +689,13 @@ pub(crate) fn report(s: &Survey, path: &str) -> String {
         s.records.len(),
         s.hash
     );
+    if s.target != emit::Target::ANY {
+        let _ = writeln!(
+            o,
+            "host waves   {}-{} lanes",
+            s.target.lanes_min, s.target.lanes_max
+        );
+    }
     for (p, n) in &t.problems {
         let _ = writeln!(o, "  {n:>7} records without programs: {p}");
     }
@@ -639,6 +718,36 @@ pub(crate) fn report(s: &Survey, path: &str) -> String {
             "{:<8} {n:>9} {k:>11}  {}",
             stage_name(*st),
             percent(k, n)
+        );
+    }
+
+    // The wave size each translation requires, by the console's (stages
+    // whose translations require one, and every console wave64 stage).
+    let _ = writeln!(
+        o,
+        "\n{:<8} {:<8} {:>9} {:>11}  translations require",
+        "stage", "console", "programs", "translated"
+    );
+    for ((st, wave64), w) in &t.waves {
+        let k: usize = w.translated.values().sum();
+        if !*wave64 && w.translated.keys().all(Option::is_none) {
+            continue;
+        }
+        let sizes: Vec<String> = w
+            .translated
+            .iter()
+            .map(|(size, c)| match size {
+                Some(size) => format!("WaveSize({size}) {c}"),
+                None => format!("any {c}"),
+            })
+            .collect();
+        let _ = writeln!(
+            o,
+            "{:<8} {:<8} {:>9} {k:>11}  {}",
+            stage_name(*st),
+            if *wave64 { "wave64" } else { "wave32" },
+            w.programs,
+            sizes.join(", ")
         );
     }
 
@@ -783,6 +892,14 @@ pub(crate) fn to_json(s: &Survey) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "{{");
     let _ = writeln!(o, "  \"format\": \"xtp-shader-survey 1\",");
+    // Only when asked, so that a survey for any host keeps its bytes.
+    if s.target != emit::Target::ANY {
+        let _ = writeln!(
+            o,
+            "  \"host_lanes\": \"{}-{}\",",
+            s.target.lanes_min, s.target.lanes_max
+        );
+    }
     let _ = writeln!(
         o,
         "  \"pack\": {{\"bytes\": {}, \"records\": {}, \"blake3\": \"{}\"}},",
@@ -861,13 +978,22 @@ pub(crate) fn to_json(s: &Survey) -> String {
         }
         for (k, p) in r.programs.iter().enumerate() {
             let outcome = match &p.outcome {
-                Outcome::Translated { output, check } => {
+                Outcome::Translated {
+                    output,
+                    check,
+                    wave,
+                } => {
                     let check = match check {
                         None => String::new(),
                         Some(Ok(())) => ", \"validator\": \"ok\"".into(),
                         Some(Err(e)) => format!(", \"validator\": {}", quote(e)),
                     };
-                    format!("\"outcome\": \"translated\", \"output\": \"{output}\"{check}")
+                    // With --host-lanes only, as the header's `host_lanes`.
+                    let wave = match wave {
+                        Some(w) if s.target != emit::Target::ANY => format!(", \"wave\": {w}"),
+                        _ => String::new(),
+                    };
+                    format!("\"outcome\": \"translated\", \"output\": \"{output}\"{wave}{check}")
                 }
                 Outcome::Failed { step, what } => format!(
                     "\"outcome\": {}, \"item\": {}",
@@ -892,9 +1018,10 @@ pub(crate) fn to_json(s: &Survey) -> String {
 mod tests {
     use super::*;
 
-    /// The translated count of the person's pack (2026-11-24): the opt-in
-    /// test fails below it. Raise it when an item lands.
-    const TRANSLATED_FLOOR: usize = 22_485;
+    /// The translated count of the person's pack for any host (2026-11-24,
+    /// with the wave64 stack: 22,485 before it): the opt-in test fails
+    /// below it. Raise it when an item lands.
+    const TRANSLATED_FLOOR: usize = 22_508;
 
     /// An SGD5 record (see `xtp_game::sgd5`) holding `payload` as two
     /// stored deflate blocks, split after its second byte so that a
@@ -968,7 +1095,7 @@ mod tests {
         file.extend_from_slice(&[9, 0, 0, 0, 0xE7, 0xDC, 0x0D, 0, 8, 0, 0, 0]);
         let empty = empty_container();
         file.extend(record_bytes("CS_Empty_00112233_Wrapped", &empty));
-        let s = survey(&file, None, None, 3);
+        let s = survey(&file, None, None, 3, emit::Target::ANY);
         assert_eq!(s.records.len(), 2);
         assert_eq!(
             s.records[0].name.as_deref(),
@@ -980,7 +1107,10 @@ mod tests {
         assert_eq!(t.problems.get("no DXIL part"), Some(&1));
         // Stable: the same survey gives the same text, and names are quoted.
         let json = to_json(&s);
-        assert_eq!(json, to_json(&survey(&file, None, None, 1)));
+        assert_eq!(
+            json,
+            to_json(&survey(&file, None, None, 1, emit::Target::ANY))
+        );
         assert!(
             json.contains(r#""name": "PS_Decoy_\"quoted\"_Wrapped""#),
             "{json}"
@@ -1008,7 +1138,7 @@ mod tests {
         };
         let data = std::fs::read(&path).unwrap();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let s = survey(&data, None, None, threads);
+        let s = survey(&data, None, None, threads, emit::Target::ANY);
         let t = Totals::of(&s);
         let translated = sum(&t.translated);
         let panics: Vec<_> = t

@@ -32,7 +32,8 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
-    /// [`IDLE`], [`EARLY`] or [`URGENT`]: the queue it was handed to last.
+    /// [`IDLE`], [`EARLY`], [`URGENT`] or [`MAKING`]: the queue it was
+    /// handed to last, or taken out of it. Changed under the queues' lock.
     queued: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// Set by the call that made it.
@@ -49,10 +50,13 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
-/// Not queued yet; queued as started early; queued for a first use.
+/// Not queued yet; queued as started early; queued for a first use; taken
+/// by the worker that makes it (VIctory #546: a pipeline is never handed to
+/// a second worker, which would wait on the first's compile).
 const IDLE: u8 = 0;
 const EARLY: u8 = 1;
 const URGENT: u8 = 2;
+const MAKING: u8 = 3;
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
@@ -234,18 +238,36 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 }
 
 /// Hands `p` to the workers: once, and once more ahead of the early ones on
-/// a first use.
+/// a first use, unless a worker has taken it already.
 fn start(p: &Arc<Pending>, how: u8) {
-    let was = p.queued.fetch_max(how, Ordering::Relaxed);
-    if was == IDLE {
-        PEAK.fetch_max(
-            WAITING.fetch_add(1, Ordering::Relaxed) + 1,
-            Ordering::Relaxed,
-        );
+    if p.queued.load(Ordering::Relaxed) >= how {
+        return;
     }
-    if was < how {
-        queue(p.clone(), how == URGENT);
+    if workers() == 0 {
+        // No worker: made here instead.
+        let was = {
+            let _held = QUEUES.0.lock().unwrap_or_else(|e| e.into_inner());
+            p.queued.swap(MAKING, Ordering::Relaxed)
+        };
+        if was == IDLE {
+            WAITING.fetch_add(1, Ordering::Relaxed);
+            finish(p);
+        }
+        return;
     }
+    let (lock, ready) = &QUEUES;
+    let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
+    match queues.push(p, how) {
+        Some(true) => {
+            PEAK.fetch_max(
+                WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
+        }
+        Some(false) => {}
+        None => return,
+    }
+    ready.notify_one();
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -282,24 +304,57 @@ fn wait(p: &Pending, frames: &Frame, frame: u64, budget: Budget) {
 }
 
 /// Pipelines for the workers: first uses first, then those started early.
+/// A pipeline started early and then used is in both; the early entry is
+/// passed over once the pipeline is no longer [`EARLY`].
 struct Queues {
     urgent: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
 }
 
-static QUEUES: (Mutex<Queues>, Condvar) = (
-    Mutex::new(Queues {
-        urgent: VecDeque::new(),
-        early: VecDeque::new(),
-    }),
-    Condvar::new(),
-);
+impl Queues {
+    const fn new() -> Queues {
+        Queues {
+            urgent: VecDeque::new(),
+            early: VecDeque::new(),
+        }
+    }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8, started
-/// on first use).
-fn queue(p: Arc<Pending>, urgent: bool) {
+    /// Queues `p` as `how` ([`EARLY`] or [`URGENT`]) unless it is queued
+    /// that way already, or taken: whether it was not queued before, or
+    /// `None` if nothing changed.
+    fn push(&mut self, p: &Arc<Pending>, how: u8) -> Option<bool> {
+        let was = p.queued.load(Ordering::Relaxed);
+        if was >= how {
+            return None;
+        }
+        p.queued.store(how, Ordering::Relaxed);
+        if how == URGENT {
+            self.urgent.push_back(p.clone());
+        } else {
+            self.early.push_back(p.clone());
+        }
+        Some(was == IDLE)
+    }
+
+    /// The next pipeline to make, taken ([`MAKING`]).
+    fn pop(&mut self) -> Option<Arc<Pending>> {
+        let early = &mut self.early;
+        let p = self.urgent.pop_front().or_else(|| {
+            std::iter::from_fn(|| early.pop_front())
+                .find(|p| p.queued.load(Ordering::Relaxed) == EARLY)
+        })?;
+        p.queued.store(MAKING, Ordering::Relaxed);
+        Some(p)
+    }
+}
+
+static QUEUES: (Mutex<Queues>, Condvar) = (Mutex::new(Queues::new()), Condvar::new());
+
+/// The workers (half the logical processors, 2 to 8), started on first
+/// use: how many there are.
+fn workers() -> usize {
     static WORKERS: OnceLock<usize> = OnceLock::new();
-    let workers = *WORKERS.get_or_init(|| {
+    *WORKERS.get_or_init(|| {
         let wanted = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         (0..wanted)
             .filter(|i| {
@@ -312,20 +367,7 @@ fn queue(p: Arc<Pending>, urgent: bool) {
                 spawned.is_ok()
             })
             .count()
-    });
-    if workers == 0 {
-        // No worker: made here instead.
-        finish(&p);
-        return;
-    }
-    let (lock, ready) = &QUEUES;
-    let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
-    if urgent {
-        queues.urgent.push_back(p);
-    } else {
-        queues.early.push_back(p);
-    }
-    ready.notify_one();
+    })
 }
 
 /// A worker: makes pipelines, first uses first, below the title's own
@@ -341,20 +383,13 @@ fn work() {
         let next = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues
-                    .urgent
-                    .pop_front()
-                    .or_else(|| queues.early.pop_front())
-                {
+                if let Some(p) = queues.pop() {
                     break p;
                 }
                 queues = ready.wait(queues).unwrap_or_else(|e| e.into_inner());
             }
         };
-        // Queued twice (early, then for a first use): made once.
-        if !next.finished.load(Ordering::Relaxed) {
-            finish(&next);
-        }
+        finish(&next);
     }
 }
 
@@ -405,7 +440,8 @@ mod tests {
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
         assert!(ready(&p).is_none());
-        assert_eq!(p.queued.load(Ordering::Relaxed), URGENT);
+        // Queued for a first use, or taken by a worker already.
+        assert!(p.queued.load(Ordering::Relaxed) >= URGENT);
         until_finished(&p);
         assert!(matches!(p.made.get(), Some(None)));
     }
@@ -453,9 +489,33 @@ mod tests {
         start(&p, EARLY);
         start(&p, URGENT);
         start(&p, EARLY);
-        assert_eq!(p.queued.load(Ordering::Relaxed), URGENT);
+        assert!(p.queued.load(Ordering::Relaxed) >= URGENT);
         until_finished(&p);
+        assert_eq!(p.queued.load(Ordering::Relaxed), MAKING);
         assert!(matches!(p.made.get(), Some(None)));
         assert!(!p.make(), "already finished");
+    }
+
+    /// First uses come out first; a pipeline started early and then used
+    /// comes out once, at its first use's place, and is not handed out
+    /// again once taken (VIctory #546's test).
+    #[test]
+    fn first_uses_come_first_and_each_pipeline_once() {
+        let pending = || Arc::new(Pending::new(Vec::new(), None));
+        let (earlier, promoted, used) = (pending(), pending(), pending());
+        let mut queues = Queues::new();
+        assert_eq!(queues.push(&earlier, EARLY), Some(true));
+        assert_eq!(queues.push(&promoted, EARLY), Some(true));
+        assert_eq!(queues.push(&used, URGENT), Some(true));
+        assert_eq!(queues.push(&promoted, URGENT), Some(false));
+        assert_eq!(queues.push(&promoted, URGENT), None);
+        assert_eq!(queues.push(&promoted, EARLY), None);
+
+        assert!(Arc::ptr_eq(&queues.pop().unwrap(), &used));
+        assert!(Arc::ptr_eq(&queues.pop().unwrap(), &promoted));
+        assert_eq!(promoted.queued.load(Ordering::Relaxed), MAKING);
+        assert_eq!(queues.push(&promoted, URGENT), None, "taken already");
+        assert!(Arc::ptr_eq(&queues.pop().unwrap(), &earlier));
+        assert!(queues.pop().is_none(), "promoted's early entry passed over");
     }
 }

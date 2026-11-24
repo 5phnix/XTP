@@ -163,6 +163,16 @@ pub(super) fn scan_code(name: &str) -> Option<u32> {
         .map(|&(_, code)| code)
 }
 
+/// The bit of the pad button called `name` in `CONTROLS` (any case).
+pub(super) fn button(name: &str) -> Option<u32> {
+    CONTROLS
+        .iter()
+        .find_map(|&(known, control, _)| match control {
+            Button(bit) if known.eq_ignore_ascii_case(name) => Some(bit),
+            _ => None,
+        })
+}
+
 /// A key or mouse input by name.
 fn input(name: &str) -> Option<Input> {
     scan_code(name).map(Input::Key).or_else(|| {

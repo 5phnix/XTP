@@ -2,6 +2,14 @@
 //! with `XTP_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
+//!
+//! Frames are also listed by number (`XTP_CAPTURE_FRAMES`) or by what they
+//! draw: `XTP_CAPTURE_WORLD=<draws>[:<after>[:<count>[:<every>]]]` lists
+//! `count` frames (3 by default), `every` frames apart (30), starting
+//! `after` frames (30) after the first frame that ran at least `draws`
+//! draws. A world frame of Grand Theft Auto VI runs 900 to 6 000 draws,
+//! its menus and loading screens a few dozen, and the frame the world
+//! starts at varies by a thousand between runs.
 
 use std::path::PathBuf;
 
@@ -16,8 +24,8 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
-/// Frames listed in `XTP_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// Frames listed in `XTP_CAPTURE_FRAMES` (comma-separated) or by
+/// `XTP_CAPTURE_WORLD`: saved too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
@@ -27,6 +35,96 @@ pub(crate) fn listed(n: u64) -> bool {
             .collect()
     })
     .contains(&n)
+        || world().is_some_and(|w| w.lists(n))
+}
+
+/// What `XTP_CAPTURE_WORLD` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct World {
+    draws: u64,
+    after: u64,
+    count: u64,
+    every: u64,
+    /// The frames seen and the draws run when last looked at, and the
+    /// first frame listed once armed.
+    state: (u64, u64, Option<u64>),
+}
+
+impl World {
+    fn parse(text: &str) -> Option<World> {
+        let mut fields = text.split(':').map(|f| f.trim().parse::<u64>());
+        let draws = fields.next()?.ok()?;
+        let mut next = |default| fields.next().map_or(Some(default), |f| f.ok());
+        Some(World {
+            draws,
+            after: next(30)?,
+            count: next(3)?,
+            every: next(30)?.max(1),
+            state: (0, 0, None),
+        })
+    }
+
+    /// Notes that `frames` frames were presented when `drawn` draws had
+    /// run; true if this arms the capture.
+    fn note(&mut self, frames: u64, drawn: u64) -> bool {
+        let (seen, before, first) = self.state;
+        if frames <= seen {
+            return false;
+        }
+        let per_frame = drawn.saturating_sub(before) / (frames - seen);
+        let arms = first.is_none() && seen > 0 && per_frame >= self.draws;
+        let first = if arms {
+            Some(frames + self.after.max(1))
+        } else {
+            first
+        };
+        self.state = (frames, drawn, first);
+        arms
+    }
+
+    /// Whether frame `n` is one of those listed once armed.
+    fn listed(&self, n: u64) -> bool {
+        self.state.2.is_some_and(|first| {
+            n >= first
+                && (n - first).is_multiple_of(self.every)
+                && (n - first) / self.every < self.count
+        })
+    }
+
+    /// Looks at the frames presented so far, then whether `n` is listed.
+    fn lists(&self, n: u64) -> bool {
+        let mut world = WORLD.lock().unwrap_or_else(|e| e.into_inner());
+        let w = world.get_or_insert(*self);
+        let (frames, drawn) = (crate::queue::presented(), crate::draw::drawn());
+        if w.note(frames, drawn) {
+            tracing::info!(
+                frame = frames,
+                first = ?w.state.2,
+                count = w.count,
+                every = w.every,
+                "world capture armed: this frame ran {} draws or more",
+                w.draws
+            );
+        }
+        w.listed(n)
+    }
+}
+
+static WORLD: std::sync::Mutex<Option<World>> = std::sync::Mutex::new(None);
+
+fn world() -> Option<World> {
+    static ASKED: std::sync::OnceLock<Option<World>> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| {
+        let text = std::env::var("XTP_CAPTURE_WORLD").ok()?;
+        let world = World::parse(&text);
+        if world.is_none() {
+            tracing::warn!(
+                text,
+                "XTP_CAPTURE_WORLD is not <draws>[:<after>[:<count>[:<every>]]]"
+            );
+        }
+        world
+    })
 }
 
 /// Whether frame `n` is saved.
@@ -185,8 +283,8 @@ pub(crate) fn save_read_back(
         }
     };
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished (every submission is waited for); the
-    // mapping spans the footprint's rows.
+    // SAFETY: the copy finished (the present drained it); the mapping
+    // spans the footprint's rows.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
@@ -198,19 +296,31 @@ pub(crate) fn save_read_back(
     }
 }
 
-/// With `XTP_DUMP_TARGETS` set: title textures the frames listed in
-/// `XTP_CAPTURE_FRAMES` render to or write, in first-use order, saved
-/// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
-/// (what each holds at the end of the frame; formats normalized to show
-/// structure: floats scaled by their largest value, depth by its range).
-/// The host copies are held: the title may release a target before the
-/// frame is presented.
+/// With `XTP_DUMP_TARGETS` set: title textures the listed frames render
+/// to or write, in first-use order, saved at that frame's present as
+/// `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png` (what each holds at
+/// the end of the frame; formats normalized to show structure: floats
+/// scaled by their largest value, depth by its range). A number
+/// (`XTP_DUMP_TARGETS=1280`) saves only textures at least that wide; every
+/// one is logged in order. The host copies are held: the title may release
+/// a target before the frame is presented.
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("XTP_DUMP_TARGETS").is_some())
+}
+
+/// The narrowest texture saved (`XTP_DUMP_TARGETS=<width>`; 0 for any).
+fn dump_width() -> u64 {
+    static WIDTH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        std::env::var("XTP_DUMP_TARGETS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// Notes a title texture the frame being built renders to or writes.
@@ -237,7 +347,22 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        tracing::info!(
+            frame,
+            i,
+            resource = format_args!("{resource:#x}"),
+            "target {}x{}x{} f{} flags {:#x} samples {}",
+            d.Width,
+            d.Height,
+            d.DepthOrArraySize,
+            d.Format.0,
+            d.Flags.0,
+            d.SampleDesc.Count
+        );
+        if d.SampleDesc.Count > 1
+            || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || d.Width < dump_width()
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -281,6 +406,7 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
+    host.drain();
     let Some((buffer, footprint)) = read else {
         return;
     };
@@ -548,7 +674,7 @@ pub(crate) fn probe(
 /// Whether every pixel [`probe`] read is (near) black.
 pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copies finished (every submission is waited for).
+    // SAFETY: the copies finished (the present drained them).
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return false;
@@ -582,6 +708,26 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn world_frames_are_listed_after_the_first_busy_one() {
+        let mut w = super::World::parse("500:10:3:20").unwrap();
+        assert_eq!((w.draws, w.after, w.count, w.every), (500, 10, 3, 20));
+        // Menus: a few draws a frame.
+        assert!(!w.note(1, 40));
+        assert!(!w.note(2, 80));
+        assert!(!w.note(5, 200));
+        // The first frame with 500 draws or more arms it.
+        assert!(w.note(6, 900));
+        assert!(!w.note(7, 2000), "once");
+        let listed: Vec<u64> = (0..200).filter(|&n| w.listed(n)).collect();
+        assert_eq!(listed, [16, 36, 56]);
+        // Defaults, and what is not a request.
+        let d = super::World::parse("800").unwrap();
+        assert_eq!((d.after, d.count, d.every), (30, 3, 30));
+        assert!(super::World::parse("").is_none());
+        assert!(super::World::parse("800:x").is_none());
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

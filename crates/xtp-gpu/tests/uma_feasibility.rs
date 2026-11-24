@@ -11,6 +11,9 @@
 //!
 //! - `title_memory_import_matrix` runs on the high-performance adapter and on
 //!   WARP, and skips when there is no D3D12 device.
+//! - The registry built on these findings is `src/uma.rs` (G15b). Its tests
+//!   go through the matrix's main rows and the two "under an open heap"
+//!   cases again, through the registry; these stay as the raw API's.
 //! - The `#[ignore]`d tests are the report's benchmarks. They print Markdown
 //!   tables and read the process's commit, so run them optimised and one at a
 //!   time: `cargo test -p xtp-gpu --release --test uma_feasibility --
@@ -1548,12 +1551,16 @@ fn physical_pages_remapped_under_an_open_heap() {
         drop(imported);
         if !unmapped {
             // Once the heap is gone the same view unmaps: the heap held it.
-            assert!(
-                unmap_to_placeholder(at),
-                "{}: the view stays mapped after the heap is released",
+            let after = once_released(|| unmap_to_placeholder(at)).unwrap_or_else(|| {
+                panic!(
+                    "{}: the view stays mapped after the heap is released",
+                    gpu.name
+                )
+            });
+            println!(
+                "{}: once the heap is released, the view unmaps ({after:?} later)",
                 gpu.name
             );
-            println!("{}: once the heap is released, the view unmaps", gpu.name);
             // SAFETY: the placeholder the view left, ours; the title's drop
             // must not unmap it again.
             unsafe { vm::VirtualFree(at.cast(), 0, vm::MEM_RELEASE) };
@@ -1614,21 +1621,41 @@ fn virtual_memory_decommitted_under_an_open_heap() {
         );
         drop(imported);
         if !decommitted {
-            // SAFETY: as above, with the heap gone.
-            let later =
-                unsafe { vm::VirtualFree(title.at.add(PAGE).cast(), PAGE, vm::MEM_DECOMMIT) } != 0;
+            let later = once_released(|| {
+                // SAFETY: as above, with the heap gone.
+                unsafe { vm::VirtualFree(title.at.add(PAGE).cast(), PAGE, vm::MEM_DECOMMIT) != 0 }
+            });
             println!(
                 "{}: once the heap is released, decommitting {}",
                 gpu.name,
-                if later { "succeeds" } else { "still fails" }
+                match later {
+                    Some(after) => format!("succeeds ({after:?} later)"),
+                    None => "still fails".into(),
+                }
             );
             assert!(
-                later,
+                later.is_some(),
                 "{}: the page stays committed without a heap",
                 gpu.name
             );
         }
     }
+}
+
+/// Runs `call`, a host call an open heap refused, until it succeeds. A
+/// released heap lets go of its pages some time after its last reference
+/// goes, on WARP at least: an unmap or a decommit right after the release
+/// failed in about one run of three on 2026-11-24, more often under load.
+/// Up to 10 s, a margin for a loaded machine; how long it took, or `None`.
+fn once_released(mut call: impl FnMut() -> bool) -> Option<Duration> {
+    let start = Instant::now();
+    while !call() {
+        if start.elapsed() > Duration::from_secs(10) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Some(start.elapsed())
 }
 
 // ---------------------------------------------------------------------------

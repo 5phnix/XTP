@@ -3,12 +3,12 @@
 //! `v_mad_f32`), S5 (f64), S3 (`v_cvt_f32_f64`), M1 (`v_cndmask_b32` on
 //! an untracked mask).
 
-use super::mask::MaskData;
-use super::{Lower, Val, Why};
+use super::mask::{LANE_MASK, MaskData};
+use super::{Lower, UNTRACKED_SELECT, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{Inst, Reg};
+use crate::ir::{EXEC, Inst, Reg};
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 
@@ -480,9 +480,17 @@ impl<'a> Lower<'a> {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                     _ => None,
                 };
+                // A selector that derives from neither EXEC nor a compare
+                // (a constant, a number built from scalars) is a mask held as
+                // a number. The in-half form cannot test the high word, so
+                // defer the select there and retry only if its result is used.
+                let numeric_mask = self.console_lanes && (!self.split || self.console_cf);
                 let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
+                    .and_then(|m| {
+                        let others = numeric_mask.then(|| self.x.st.others.get(&m));
+                        self.x.st.masks.get(&m).or(others.flatten()).copied()
+                    })
+                    .ok_or(UNTRACKED_SELECT)?;
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -535,7 +543,11 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
-                let r = self.read_lane(a, lane);
+                let r = if self.console_cf {
+                    self.console_read_lane(a, lane)
+                } else {
+                    self.read_lane(a, lane)
+                };
                 int(self, r)
             }
             "v_writelane_b32" => {
@@ -549,7 +561,11 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
-                let me = self.lane_index();
+                let me = if self.console_cf {
+                    self.console_lane().0
+                } else {
+                    self.lane_index()
+                };
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -563,6 +579,37 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32" if self.console_cf => {
+                // The console's first lane in EXEC (lane 0 when none).
+                let a = s(self, 0)?;
+                let word = |l: &mut Self, r: u8| -> Result<V, Why> {
+                    match l.get(inst.read(Reg::S(r)).ok_or("EXEC")?)? {
+                        Val::I32(x) => Ok(x),
+                        _ => Err(LANE_MASK),
+                    }
+                };
+                let lo = word(self, EXEC)?;
+                let hi = if self.x.native.wave64 {
+                    word(self, EXEC + 1)?
+                } else {
+                    self.s.m.i32(0)
+                };
+                let i32t = self.s.t.i32;
+                let flo = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+                let fhi = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+                let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+                let none_hi = self.s.m.cmp(c, pred::EQ, hi, z);
+                let fhi = self.s.m.select(c, none_hi, z, fhi);
+                let some_lo = self.s.m.cmp(c, pred::NE, lo, z);
+                let first = self.s.m.select(c, some_lo, flo, fhi);
+                let r = self.console_read_lane(a, first);
+                int(self, r)
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;

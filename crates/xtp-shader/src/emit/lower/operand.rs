@@ -7,6 +7,7 @@ use crate::emit::bitcode::{Bin, Cast, Term, V};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Reg, Value};
+use crate::structure::Bool;
 
 impl<'a> Lower<'a> {
     /// The DXIL form of an IR value.
@@ -248,6 +249,22 @@ impl<'a> Lower<'a> {
     }
 
     pub(super) fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        if self.console_cf {
+            // Every lane is here: EXEC is the guard. Lane reads and writes
+            // ignore EXEC on the console.
+            let inst = &self.x.p.blocks[b].insts[i];
+            let ignores = matches!(
+                inst.name(),
+                "v_readlane_b32" | "v_writelane_b32" | "v_readfirstlane_b32"
+            ) || matches!(
+                inst.fields,
+                Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }
+            );
+            return match self.x.st.execs[b].get(i).copied().flatten() {
+                Some(e) if !ignores && e != Bool::TRUE => Ok(Some(self.boolean(e, self.cur)?)),
+                _ => Ok(None),
+            };
+        }
         match self.x.st.guards[b][i] {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
