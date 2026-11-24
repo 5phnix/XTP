@@ -214,11 +214,12 @@ the same alpha difference. Changes (`resource/format.rs` `alpha_one`,
   view's mapping takes from the texture's alpha takes one instead; a view
   without a description gets D3D12's whole view with that mapping. One line
   in `descriptor/host.rs` calls it.
-- Pipelines rendering to such a target do not write its alpha, and blend
-  as if it were one: destination alpha becomes one, its inverse zero,
-  saturated source alpha zero (blending becomes per target where needed).
-  Three lines in `pipeline/host.rs` apply it as the stream is read, so the
-  pipeline's name in the library changes with it.
+- Not in this delivery: pipelines rendering to such a target should not
+  write its alpha and should blend as if it were one (destination alpha
+  one, its inverse zero, saturated source alpha zero). That change lives in
+  `pipeline/host.rs`, another task's file; it is commit `5e8f880` on branch
+  `hangar/dark-world-492-blend`, one commit to replay on top of this
+  delivery for that file's owner.
 - Not done: clamping negative, infinite and NaN values on writes. Only the
   pixel and compute programs writing such a target can do it (a shader
   translation change: clamp outputs to 67 targets); written down as a
@@ -384,8 +385,9 @@ supports was kept.
 - The conversion of R9G9B9E5 to half floats is exact (checked again: every
   mantissa and exponent, tested).
 - What it missed is what the console reads back: alpha one, negatives
-  clamped. Alpha is now one on reads and targets (section 5.4); the clamp is
-  not, and is written down as a shortcut with the change it needs.
+  clamped. Alpha is now one on reads (section 5.4); on targets it waits for
+  the owner of `pipeline/host.rs` (commit `5e8f880`); the clamp is not done,
+  and is written down as a shortcut with the change it needs.
 - B5G6R5 (85) as RGBA8 had the same alpha difference since gpu-nvidia's
   table; it gets the same treatment.
 
