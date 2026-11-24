@@ -1333,9 +1333,12 @@ fn at_address(
 /// description viewed); release them when the title unmaps or reuses the
 /// memory once streaming grows VRAM use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<
-    std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64)>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::Mutex<PlacedTextures> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Resource and alias count by address and description.
+#[cfg(windows)]
+type PlacedTextures = std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64)>;
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use. When a texture the
@@ -1599,7 +1602,11 @@ pub(crate) mod tests_support {
     /// The 8-bit RGBA texels of subresource 0 of `texture` (at most 64
     /// texels wide), which is in `state` and stays in it: rows 256 bytes
     /// apart.
-    pub(crate) fn read_back(host: &crate::host::Host, texture: &ID3D12Resource, state: u32) -> Vec<u8> {
+    pub(crate) fn read_back(
+        host: &crate::host::Host,
+        texture: &ID3D12Resource,
+        state: u32,
+    ) -> Vec<u8> {
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
         assert!(d.Width <= 64);
@@ -2407,7 +2414,15 @@ mod tests {
     fn at(address: u64, desc: &ResourceDesc) -> This {
         let mut out = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
-        let made = create_at_address(std::ptr::null(), address, desc, 0, std::ptr::null(), iid, &mut out);
+        let made = create_at_address(
+            std::ptr::null(),
+            address,
+            desc,
+            0,
+            std::ptr::null(),
+            iid,
+            &mut out,
+        );
         assert_eq!(made, S_OK);
         out
     }
@@ -2465,7 +2480,9 @@ mod tests {
         let again = texture_at(address, &words(&view, [0xcafe_babe, 9])).unwrap();
         assert_eq!(placed, again, "padding makes no second texture");
         assert!(same_copy(placed, target));
-        assert!(!crate::texture::title_written(host_resource(placed).unwrap()));
+        assert!(!crate::texture::title_written(
+            host_resource(placed).unwrap()
+        ));
         // A resource the title makes at that address shares it too.
         let other = at(address, &view);
         assert!(same_copy(other, target));
@@ -2505,15 +2522,27 @@ mod tests {
         let read = at(address, &view);
         let drawn = at(address, &target);
         assert!(!same_copy(read, drawn));
-        let srgb = at(address, &ResourceDesc { format: 29, ..target });
-        assert!(!same_copy(drawn, srgb), "a typed copy drawn in another format");
+        let srgb = at(
+            address,
+            &ResourceDesc {
+                format: 29,
+                ..target
+            },
+        );
+        assert!(
+            !same_copy(drawn, srgb),
+            "a typed copy drawn in another format"
+        );
         let wide = at(address, &texture(32, 16, 28, 1));
         let half = at(address, &texture(16, 16, 10, 1));
         for other in [wide, half] {
             assert!(!same_copy(drawn, other), "another shape or family");
         }
         let unordered = at(address, &ResourceDesc { flags: 4, ..view });
-        assert!(!same_copy(drawn, unordered), "writes the copy does not allow");
+        assert!(
+            !same_copy(drawn, unordered),
+            "writes the copy does not allow"
+        );
         // An sRGB view reads the target's copy (in its format).
         let srgb_view = at(address, &texture(16, 16, 29, 1));
         assert!(same_copy(drawn, srgb_view));
@@ -2558,7 +2587,9 @@ mod tests {
         let address = memory.address();
         let view = words(&texture(16, 16, 28, 1), [3, 4]);
         let before = texture_at(address, &view).unwrap();
-        assert!(crate::texture::title_written(host_resource(before).unwrap()));
+        assert!(crate::texture::title_written(
+            host_resource(before).unwrap()
+        ));
         let target = at(
             address,
             &ResourceDesc {
@@ -2569,7 +2600,10 @@ mod tests {
         let after = texture_at(address, &view).unwrap();
         assert_ne!(after, before);
         assert!(same_copy(after, target));
-        assert_eq!(texture_at(address, &words(&texture(16, 16, 28, 1), [5, 6])), Some(after));
+        assert_eq!(
+            texture_at(address, &words(&texture(16, 16, 28, 1), [5, 6])),
+            Some(after)
+        );
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
         // The view keeps the copy (title memory still holds what was
         // drawn, on the console); nothing makes it again.

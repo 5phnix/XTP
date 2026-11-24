@@ -136,12 +136,12 @@ pub(super) fn current(address: u64, want: &ResourceDesc) -> Option<Arc<HostTextu
     found.filter(|_| enabled()).map(|(host, _)| host)
 }
 
+/// A host copy to share and the source it comes from.
+type Found = (Arc<HostTexture>, usize);
+
 /// The copy `want` can share at `address` and its source, or why none
 /// fits; `None` when no GPU-written texture lives there.
-fn lookup(
-    address: u64,
-    want: &ResourceDesc,
-) -> Option<(Option<(Arc<HostTexture>, usize)>, &'static str)> {
+fn lookup(address: u64, want: &ResourceDesc) -> Option<(Option<Found>, &'static str)> {
     let mut map = sources();
     let list = map.get_mut(&address)?;
     list.retain(|s| s.host.strong_count() > 0);
@@ -211,7 +211,12 @@ fn note(address: u64, want: &ResourceDesc, how: &str, with: Option<usize>, why: 
 
 /// Notes `resource`, a texture at `address` described by `desc` with the
 /// host copy `host`, as a source if its description asks for GPU writes.
-pub(super) fn register(address: u64, resource: usize, desc: &ResourceDesc, host: &Arc<HostTexture>) {
+pub(super) fn register(
+    address: u64,
+    resource: usize,
+    desc: &ResourceDesc,
+    host: &Arc<HostTexture>,
+) {
     if address == 0 || super::host_flags(desc.flags) & WRITABLE == 0 {
         return;
     }

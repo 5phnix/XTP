@@ -85,7 +85,9 @@ impl World {
     /// Whether frame `n` is one of those listed once armed.
     fn listed(&self, n: u64) -> bool {
         self.state.2.is_some_and(|first| {
-            n >= first && (n - first) % self.every == 0 && (n - first) / self.every < self.count
+            n >= first
+                && (n - first).is_multiple_of(self.every)
+                && (n - first) / self.every < self.count
         })
     }
 
@@ -116,7 +118,10 @@ fn world() -> Option<World> {
         let text = std::env::var("XTP_CAPTURE_WORLD").ok()?;
         let world = World::parse(&text);
         if world.is_none() {
-            tracing::warn!(text, "XTP_CAPTURE_WORLD is not <draws>[:<after>[:<count>[:<every>]]]");
+            tracing::warn!(
+                text,
+                "XTP_CAPTURE_WORLD is not <draws>[:<after>[:<count>[:<every>]]]"
+            );
         }
         world
     })

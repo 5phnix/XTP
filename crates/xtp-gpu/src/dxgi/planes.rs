@@ -102,10 +102,8 @@ fn raw(planes: *const u8, i: usize) -> Vec<u64> {
     if !crate::host::read_into(planes.wrapping_add(i * STRIDE), &mut bytes) {
         return Vec::new();
     }
-    bytes
-        .chunks_exact(8)
-        .map(|w| u64::from_le_bytes(w.try_into().unwrap_or([0; 8])))
-        .collect()
+    let (words, _) = bytes.as_chunks::<8>();
+    words.iter().map(|&w| u64::from_le_bytes(w)).collect()
 }
 
 /// Shows a present of several planes as one image, frame `frame`: its
@@ -247,7 +245,9 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
 /// A blob's bytes.
 fn bytes(blob: &ID3DBlob) -> &[u8] {
     // SAFETY: the blob's own bytes, alive as long as it is.
-    unsafe { std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()) }
+    unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    }
 }
 
 impl Compositor {
@@ -272,9 +272,9 @@ impl Compositor {
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                     NodeMask: 0,
                 })?;
-            let view_size =
-                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-                    as usize;
+            let view_size = device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
             let list = host.new_list()?;
             list.close();
             Ok(Compositor {
@@ -510,19 +510,20 @@ mod tests {
     /// each naming one resource.
     struct Planes {
         bytes: Vec<u8>,
-        _lists: Vec<Box<[usize; 1]>>,
+        /// Each plane's resource list (one resource), which `bytes` points
+        /// into.
+        _lists: Vec<usize>,
     }
 
     fn planes(resources: &[usize], token: u64) -> Planes {
         let mut bytes = vec![0u8; STRIDE * resources.len()];
-        let mut lists = Vec::new();
-        for (i, &r) in resources.iter().enumerate() {
-            let list = Box::new([r]);
+        let lists = resources.to_vec();
+        for i in 0..resources.len() {
+            let list = lists[i..].as_ptr() as u64;
             let at = i * STRIDE;
             bytes[at..at + 8].copy_from_slice(&token.to_le_bytes());
             bytes[at + 8..at + 12].copy_from_slice(&1u32.to_le_bytes());
-            bytes[at + 0x10..at + 0x18].copy_from_slice(&(list.as_ptr() as u64).to_le_bytes());
-            lists.push(list);
+            bytes[at + 0x10..at + 0x18].copy_from_slice(&list.to_le_bytes());
         }
         Planes {
             bytes,
@@ -574,15 +575,33 @@ mod tests {
         let list = crate::testgpu::TitleList::new();
         type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const RECT);
         let clear = slot::<Clear>(list.this(), 0x1a0);
-        clear(list.this(), rtv[0].as_ptr() as u64, &[1.0, 0.0, 0.0, 1.0], 0, null.cast());
-        clear(list.this(), rtv[1].as_ptr() as u64, &[0.0; 4], 0, null.cast());
+        clear(
+            list.this(),
+            rtv[0].as_ptr() as u64,
+            &[1.0, 0.0, 0.0, 1.0],
+            0,
+            null.cast(),
+        );
+        clear(
+            list.this(),
+            rtv[1].as_ptr() as u64,
+            &[0.0; 4],
+            0,
+            null.cast(),
+        );
         let corner = RECT {
             left: 0,
             top: 0,
             right: 4,
             bottom: 4,
         };
-        clear(list.this(), rtv[1].as_ptr() as u64, &[0.0, 0.4, 0.0, 0.4], 1, &corner);
+        clear(
+            list.this(),
+            rtv[1].as_ptr() as u64,
+            &[0.0, 0.4, 0.0, 0.4],
+            1,
+            &corner,
+        );
         list.run();
 
         let p = planes(&[scene as usize, ui as usize], 0x1234);
@@ -591,11 +610,17 @@ mod tests {
         let image = compositor.compose(host, &[scene, ui]).unwrap();
         // SAFETY: a live resource.
         let d = unsafe { image.GetDesc() };
-        assert_eq!((d.Width, d.Height, d.Format), (8, 8, DXGI_FORMAT_R8G8B8A8_UNORM));
+        assert_eq!(
+            (d.Width, d.Height, d.Format),
+            (8, 8, DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
         let texels = crate::resource::tests_support::read_back(host, &image, 0x4);
         let at = |x: usize, y: usize| &texels[y * 256 + x * 4..][..4];
         let near = |texel: &[u8], want: [u8; 3]| {
-            texel[..3].iter().zip(want).all(|(&t, w)| t.abs_diff(w) <= 1)
+            texel[..3]
+                .iter()
+                .zip(want)
+                .all(|(&t, w)| t.abs_diff(w) <= 1)
         };
         // Inside the corner: red under 40 % green, premultiplied.
         assert!(near(at(1, 1), [153, 102, 0]), "{:?}", at(1, 1));
