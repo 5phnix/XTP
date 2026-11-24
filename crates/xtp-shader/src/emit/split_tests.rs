@@ -97,18 +97,79 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
     Ok(out.into_iter().next().unwrap_or_default())
 }
 
+thread_local! {
+    /// Set by [`every_hardware_case_translates_and_validates_without_a_device`]:
+    /// the cases below translate and validate, and run on no device.
+    static DRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Every hardware adapter with an SM 6.6 device; none in a dry run.
+///
+/// The tests that use it are `#[ignore]`d: this PC's tests stay on WARP
+/// (`XTP_TEST_ADAPTER=warp`), whose 4-lane waves run none of these
+/// programs, and before they passed there without having run anything.
+/// They run with `--ignored` where there is a hardware adapter (the Google
+/// Cloud L4 VM: 32-lane waves), and fail if they find none;
+/// [`every_hardware_case_translates_and_validates_without_a_device`] runs
+/// their translations everywhere.
+fn hardware() -> Vec<(String, Host)> {
+    if DRY.with(std::cell::Cell::get) {
+        return Vec::new();
+    }
+    let names = adapters().unwrap_or_else(|e| panic!("no DXGI: {e}"));
+    let hosts: Vec<(String, Host)> = names
+        .into_iter()
+        .filter_map(|name| match Host::on(&name) {
+            Ok(host) => Some((name, host)),
+            Err(e) => {
+                eprintln!("{name}: no SM 6.6 device ({e}); skipped");
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !hosts.is_empty(),
+        "no hardware adapter with an SM 6.6 device (XTP_TEST_ADAPTER keeps tests off hardware?)"
+    );
+    hosts
+}
+
+/// The host kinds every case must translate for without a device: NVIDIA
+/// (32-lane waves only) and AMD RDNA (32 or 64).
+const HOSTS: [super::Target; 2] = [
+    super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    },
+    super::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    },
+];
+
+/// `p` translates for both kinds of host, and the validator (where one is
+/// installed) takes each module: what the hardware tests check without a
+/// device.
+fn translates_everywhere(label: &str, p: &crate::NativeProgram) {
+    let mut validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+            .ok();
+    for target in HOSTS {
+        let mut cs = emit_for(p, target).unwrap_or_else(|e| panic!("{label}, {target:?}: {e}"));
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut cs.dxil)
+                .unwrap_or_else(|e| panic!("{label}, {target:?}: validation: {e}"));
+        }
+    }
+}
+
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn in_half_lane_reads_match_the_console_on_every_adapter() {
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    let mut ran = 0;
-    for name in names {
-        let Ok(host) = Host::on(&name) else {
-            eprintln!("{name}: no SM 6.6 device; skipped");
-            continue;
-        };
+    for threads in [64, 128, 32] {
+        translates_everywhere("in-half reads", &program(IN_HALF, threads));
+    }
+    for (name, host) in hardware() {
         let target = host.target();
         // One console wave, two per group, and a group whose second wave
         // has its lower half only.
@@ -129,10 +190,6 @@ fn in_half_lane_reads_match_the_console_on_every_adapter() {
             assert_eq!(out, want, "{name}: {threads} threads (split {split})");
             eprintln!("{name}: {threads} threads per group exact (split {split})");
         }
-        ran += 1;
-    }
-    if ran == 0 {
-        eprintln!("no hardware adapter; skipped");
     }
 }
 
@@ -172,24 +229,22 @@ fn program_3d(threads: [u32; 3]) -> crate::NativeProgram {
 }
 
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn three_dimensional_groups_keep_the_consoles_lanes() {
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    for name in names {
-        let Ok(host) = Host::on(&name) else {
-            continue;
-        };
+    const GROUPS: [[u32; 3]; 6] = [
+        [4, 4, 4],
+        [8, 8, 2],
+        [2, 4, 8],
+        [16, 2, 4],
+        [8, 8, 4],
+        [4, 8, 8],
+    ];
+    for threads in GROUPS {
+        translates_everywhere("3-D groups", &program_3d(threads));
+    }
+    for (name, host) in hardware() {
         let split = !host.target().runs(64);
-        for threads in [
-            [4, 4, 4],
-            [8, 8, 2],
-            [2, 4, 8],
-            [16, 2, 4],
-            [8, 8, 4],
-            [4, 8, 8],
-        ] {
+        for threads in GROUPS {
             let p = program_3d(threads);
             let n: u32 = threads.iter().product();
             let out = run(&host, &p, 1).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -219,14 +274,8 @@ fn program_case(label: &str, p: &crate::NativeProgram, want: impl Fn(u32) -> u32
         unreachable!()
     };
     let threads = io.threads[0];
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    for name in names {
-        let Ok(host) = Host::on(&name) else {
-            continue;
-        };
+    translates_everywhere(label, p);
+    for (name, host) in hardware() {
         let split = !host.target().runs(64);
         let groups = 2;
         let out = run(&host, p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
@@ -248,6 +297,7 @@ fn program_case(label: &str, p: &crate::NativeProgram, want: impl Fn(u32) -> u32
 /// A mask counted whole: 40 lanes of the console wave, 32 in one half and
 /// 8 in the other.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn masks_read_whole_count_both_halves() {
     let body = [
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
@@ -263,6 +313,7 @@ fn masks_read_whole_count_both_halves() {
 
 /// A lane of the other half: lane 40 is the upper half's lane 8.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn lane_reads_cross_halves() {
     let body = [
         0xD760_0009,
@@ -276,6 +327,7 @@ fn lane_reads_cross_halves() {
 /// read inside: the upper half has no lane there but still meets the lower
 /// one at the exchange.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn exchanges_inside_a_branch_one_half_skips() {
     let body = [
         0x7E04_0281, // v_mov_b32 v2, 1
@@ -338,6 +390,7 @@ fn the_halves_exchange_must_fit_next_to_the_programs_lds() {
 /// and stored 7. The lane read at the start puts the program in the
 /// console flow on every host.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn a_branch_on_the_scc_of_saveexec_skips_when_no_lane_is_left() {
     let body = [
         0xD760_000C,
@@ -435,6 +488,7 @@ fn console_flow_is_for_one_console_wave_per_group() {
 /// The per-lane form got this wrong on every host (#225); hosts with
 /// 64-lane waves now run it in the console flow too, without exchanges.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn loops_run_while_any_lane_of_the_console_wave_does() {
     let body = [
         0xBE89_0380, // s_mov_b32 s9, 0
@@ -460,6 +514,7 @@ fn loops_run_while_any_lane_of_the_console_wave_does() {
 /// rows 0 and 1 (lanes 0 to 31) write, so the upper half keeps its value
 /// although its host rows are 0 and 1 too.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn dpp_row_masks_name_console_rows() {
     let body = [
         0x7E04_0281, // v_mov_b32 v2, 1
@@ -478,6 +533,7 @@ fn dpp_row_masks_name_console_rows() {
 /// the upper half too. With DPP in the program it used to be split in
 /// halves, where the upper half read its own first lane (32).
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn first_lane_reads_are_the_console_waves() {
     let body = [
         0x7E06_02FA,
@@ -491,6 +547,7 @@ fn first_lane_reads_are_the_console_waves() {
 /// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
 /// it still writes lane 40. The per-lane form never had lane 40 there.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn lane_writes_reach_lanes_outside_the_branch() {
     let body = [
         0x7E04_0281, // v_mov_b32 v2, 1
@@ -514,6 +571,7 @@ fn lane_writes_reach_lanes_outside_the_branch() {
 /// each; afterwards every lane has s9 = 40 and counts all 64 lanes in the
 /// exit mask.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn loops_with_an_exit_mask_grown_from_zero() {
     let body = [
         0x4A02_0081, // v_add_nc_u32 v1, 1, v0
@@ -551,6 +609,7 @@ fn program_lds(body: &[u32], threads: u32) -> crate::NativeProgram {
 /// dword t, then reads dword 63 - t; then writes that plus 50 to dword t
 /// and reads dword t ^ 32.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn one_wave_shares_lds_in_instruction_order() {
     let body = [
         0x4C0A_00BF, // v_sub_nc_u32 v5, 63, v0
@@ -589,6 +648,7 @@ fn one_wave_shares_lds_in_instruction_order() {
 /// group's waves without one. `lds_written_and_read_in_different_masked_blocks`
 /// has a case that does fail without it.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn lds_order_holds_when_one_half_is_busy() {
     let mut body = vec![
         0x3412_0082, // v_lshlrev_b32 v9, 2, v0
@@ -651,6 +711,7 @@ fn the_last_modules_summary_names_its_group_wave_size_and_operations() {
 /// Sum lane IDs within rows, add the preceding row, then carry lane 31's
 /// inclusive result into the upper half. Lane 32 must start at 528.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn wave64_inclusive_prefix_joins_both_host_waves() {
     let body = [
         0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
@@ -733,6 +794,7 @@ fn reduction_scan_of(opcode: u32, ident: u32, literal: Option<u32>) -> Vec<u32> 
 /// lane ids, their maximum (lane 63, in the upper half), their minimum
 /// (lane 0, in the lower half) and their bitwise or.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn whole_wave_reductions_join_both_host_waves() {
     // (operation, VOP2 opcode, identity operand, the console's result)
     for (label, opcode, ident, want) in [
@@ -750,6 +812,7 @@ fn whole_wave_reductions_join_both_host_waves() {
 /// The same sum over a mask that straddles the halves: lanes below 40 (32
 /// in the lower half, 8 in the upper). The other lanes keep their value.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn masked_whole_wave_sum_straddles_the_halves() {
     // The result goes through v5: the scan leaves no old value in v2.
     let mut body = vec![
@@ -850,6 +913,7 @@ fn lds_across_masked_blocks(delay: bool) -> Vec<u32> {
 }
 
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn lds_written_and_read_in_different_masked_blocks() {
     program_case(
         "LDS written by every lane, then read by the lower half",
@@ -897,6 +961,7 @@ fn lds_written_and_read_in_different_masked_blocks() {
 }
 
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn backward_permute_wraps_within_each_half() {
     let body = [0x3406_0082, 0xDACC_0004, 0x0200_0003];
     console_flow_case("backward permute", &body, 64, |lane| {
@@ -905,6 +970,7 @@ fn backward_permute_wraps_within_each_half() {
 }
 
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn backward_permute_respects_both_exec_masks() {
     let body = [
         0x7E04_0281, // v_mov_b32 v2, 1
@@ -925,6 +991,7 @@ fn backward_permute_respects_both_exec_masks() {
 /// `ds_bpermute_b32` where lane t reads v0 of lane t + 1 of its half, in the
 /// masks, group sizes and forms the two tests above leave out.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn backward_permute_in_other_masks_groups_and_forms() {
     let next = |t: u32| (t & !31) | ((t + 1) & 31);
     // EXEC over part of each half: lanes 0..21 and 42..63.
@@ -982,6 +1049,7 @@ fn backward_permute_in_other_masks_groups_and_forms() {
 /// (lane 0, in the lower half), with the identities the operations need
 /// (0.0, -inf, +inf). Each half's result crosses as its bits.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn float_whole_wave_reductions_join_both_host_waves() {
     // (operation, VOP2 opcode, identity operand, its literal, the result)
     for (label, opcode, ident, literal, want) in [
@@ -1004,6 +1072,7 @@ fn float_whole_wave_reductions_join_both_host_waves() {
 /// the inclusive float prefix sum of the lane ids, whose upper half starts
 /// from the lower half's total.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn masked_and_prefix_float_sums_cross_the_halves() {
     let mut body = vec![
         0x7E0A_0281, // v_mov_b32 v5, 1
@@ -1061,6 +1130,7 @@ fn masked_and_prefix_float_sums_cross_the_halves() {
 /// bit of the console's mask: lanes 32..63 of a wave64 the high word's,
 /// each lane of a wave32 the one word's.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn selects_on_masks_held_as_numbers() {
     let constant = [
         0xBE8A_03FF,
@@ -1081,17 +1151,18 @@ fn selects_on_masks_held_as_numbers() {
         0xD501_0002,
         0x002A_0101, // v_cndmask_b32 v2, v1, v0, s[10:11]
     ];
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    for name in names {
-        let Ok(host) = Host::on(&name) else {
-            continue;
-        };
-        for (label, body, by_group) in [("constant", &constant[..], false), ("built", &built, true)]
-        {
-            for (wave64, threads) in [(true, 64), (false, 64), (false, 32)] {
+    let cases = [("constant", &constant[..], false), ("built", &built, true)];
+    let forms = [(true, 64), (false, 64), (false, 32)];
+    for (label, body, _) in cases {
+        for (wave64, threads) in forms {
+            let mut p = program(body, threads);
+            p.wave64 = wave64;
+            translates_everywhere(label, &p);
+        }
+    }
+    for (name, host) in hardware() {
+        for (label, body, by_group) in cases {
+            for (wave64, threads) in forms {
                 let mut p = program(body, threads);
                 p.wave64 = wave64;
                 let groups = 2;
@@ -1124,6 +1195,7 @@ fn selects_on_masks_held_as_numbers() {
 }
 
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn numeric_selects_beside_in_half_reads() {
     let mut body = IN_HALF.to_vec();
     body.extend([
@@ -1165,6 +1237,7 @@ fn numeric_selects_beside_in_half_reads() {
 /// and the section is lowered there as it is elsewhere. Lanes below 20
 /// read lane 10; every lane then adds the wave's sum of lane ids.
 #[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn lane_reads_in_branches_beside_a_whole_wave_section() {
     let mut body = reduction_scan(37, 0x80); // s10 = 2016
     body.extend([
@@ -1217,4 +1290,98 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
             .to_string();
         assert!(e.contains(why), "{lanes_min}..{lanes_max}: {e}");
     }
+}
+
+/// `v_readlane` takes its lane from the low six bits of the operand
+/// (five in wave32): lane 70 is lane 6, so every lane stores 6. The host's
+/// `WaveReadLaneAt` of lane 70 is undefined.
+const READLANE_70: &[u32] = &[
+    0xBE8D_03FF,
+    70, // s_mov_b32 s13, 70
+    0xD760_0009,
+    0x0000_1B00, // v_readlane_b32 s9, v0, s13
+    0x7E04_0209, // v_mov_b32 v2, s9
+];
+
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn a_lane_read_past_the_wave_reads_its_low_bits() {
+    console_flow_case("v_readlane 70", READLANE_70, 64, |_| 6);
+}
+
+/// LDS in a group of 48 threads: the console wave's upper half has 16
+/// lanes. Lane t writes t to dword t, then reads dword (t + 16) % 48,
+/// across the halves both ways, one instruction after the write (no
+/// `s_barrier`: the console runs each instruction in every lane first).
+const LDS_48: &[u32] = &[
+    0x4A0A_0090, // v_add_nc_u32 v5, 16, v0
+    0x4E0C_0AB0, // v_subrev_nc_u32 v6, 48, v5
+    0x7D88_0AB0, // v_cmp_gt_u32 vcc, 48, v5
+    0x020A_0B06, // v_cndmask_b32 v5, v6, v5, vcc
+    0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+    0x340C_0A82, // v_lshlrev_b32 v6, 2, v5
+    0xD834_0000,
+    0x0000_0004, // ds_write_b32 v4, v0
+    0xD8D8_0000,
+    0x0200_0006, // ds_read_b32 v2, v6
+];
+
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn lds_in_a_group_of_48_threads_reads_both_halves() {
+    program_case(
+        "LDS, 48 threads",
+        &program_lds(LDS_48, 48),
+        |t| (t + 16) % 48,
+        true,
+    );
+}
+
+/// Without a device: on a 32-lane host that program runs in two waves of
+/// 32 in the console flow, a group barrier before each LDS access.
+#[test]
+fn lds_in_a_group_of_48_threads_takes_the_console_flow_on_32_lane_hosts() {
+    let nvidia = HOSTS[0];
+    let cs = emit_for(&program_lds(LDS_48, 48), nvidia).unwrap();
+    assert_eq!(wave_size(&cs.dxil), Some(32));
+    let summary = super::last_module_summary();
+    assert!(summary.starts_with("threads 48x1x1, wave size 32;"), "{summary}");
+    assert!(summary.contains("barrier"), "{summary}");
+}
+
+/// Every hardware case above translates for both kinds of host and the
+/// validator takes it: their dry run, which needs no device and runs on
+/// every PC (the hardware part runs with `--ignored`).
+#[test]
+fn every_hardware_case_translates_and_validates_without_a_device() {
+    DRY.with(|d| d.set(true));
+    in_half_lane_reads_match_the_console_on_every_adapter();
+    three_dimensional_groups_keep_the_consoles_lanes();
+    masks_read_whole_count_both_halves();
+    lane_reads_cross_halves();
+    exchanges_inside_a_branch_one_half_skips();
+    a_branch_on_the_scc_of_saveexec_skips_when_no_lane_is_left();
+    a_select_on_a_mask_held_as_a_number_runs_as_the_console();
+    loops_run_while_any_lane_of_the_console_wave_does();
+    dpp_row_masks_name_console_rows();
+    first_lane_reads_are_the_console_waves();
+    lane_writes_reach_lanes_outside_the_branch();
+    loops_with_an_exit_mask_grown_from_zero();
+    one_wave_shares_lds_in_instruction_order();
+    lds_order_holds_when_one_half_is_busy();
+    wave64_inclusive_prefix_joins_both_host_waves();
+    whole_wave_reductions_join_both_host_waves();
+    masked_whole_wave_sum_straddles_the_halves();
+    lds_written_and_read_in_different_masked_blocks();
+    backward_permute_wraps_within_each_half();
+    backward_permute_respects_both_exec_masks();
+    backward_permute_in_other_masks_groups_and_forms();
+    float_whole_wave_reductions_join_both_host_waves();
+    masked_and_prefix_float_sums_cross_the_halves();
+    selects_on_masks_held_as_numbers();
+    numeric_selects_beside_in_half_reads();
+    lane_reads_in_branches_beside_a_whole_wave_section();
+    a_lane_read_past_the_wave_reads_its_low_bits();
+    lds_in_a_group_of_48_threads_reads_both_halves();
+    DRY.with(|d| d.set(false));
 }

@@ -336,7 +336,7 @@ impl<'a> Lower<'a> {
             self.s.m.i32(0),
         );
         let at = self.s.m.bin(c, Bin::And, lane, k31);
-        let mine = self.read_lane(x, at);
+        let mine = self.read_lane_in_wave(x, at);
         let (x0, x1) = self.exchange(c, mine);
         let h = self.s.m.bin(c, Bin::LShr, lane, k5);
         let h = self.s.m.bin(c, Bin::And, h, one);
@@ -344,7 +344,29 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, low, x0, x1)
     }
 
+    /// `x` of lane `lane`. In compute, lanes are the console's: the
+    /// console takes a lane operand's low six bits (five in wave32), and a
+    /// host lane past the wave reads nothing defined, so the lane is
+    /// reduced to them (lane 70 of a wave64 is lane 6).
     pub(super) fn read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = if self.mask_data == MaskData::Console {
+            let wave = self.wave();
+            match self.s.m.int_value(lane) {
+                Some(k) if (k as u32) < wave => lane,
+                Some(k) => self.s.m.i32(k as u32 & (wave - 1)),
+                None => {
+                    let m = self.s.m.i32(wave - 1);
+                    self.s.m.bin(self.cur, Bin::And, lane, m)
+                }
+            }
+        } else {
+            lane
+        };
+        self.read_lane_in_wave(x, lane)
+    }
+
+    /// `x` of host lane `lane`, which is in the host wave.
+    fn read_lane_in_wave(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -449,7 +471,7 @@ impl<'a> Lower<'a> {
         let mut r = if mesh_quad {
             self.quad_pick(x, src)
         } else {
-            self.read_lane(x, src)
+            self.read_lane_in_wave(x, src)
         };
         let mut enable = None;
         if let Some(inside) = inside {
