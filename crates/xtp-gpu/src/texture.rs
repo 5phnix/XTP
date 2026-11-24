@@ -6,9 +6,17 @@
 //! copied into the host texture.
 //!
 //! "Changed" means a page of the memory was written since the last detiling
-//! ([`crate::watch`]), in write-watched memory; in physical-page views,
-//! which cannot be watched, a content hash of the whole memory at every
-//! submission that samples it.
+//! ([`crate::watch`]), in write-watched memory. Physical-page views cannot
+//! be watched: there the memory is guarded as buffer copies are
+//! (`watch::writes` with `guarded`), and a content hash of the whole memory
+//! tells a change only when a block of it was written since the last check
+//! (or cannot be guarded); a clean check costs a walk of its blocks, not a
+//! hash. Every writer of such memory opens the guards: the title's CPU by
+//! faulting, our copies and the kernel's reads (`watch::writing`), and
+//! DirectStorage's page destinations (xmem's report after its writes).
+//! `XTP_TEXTURE_GUARDS=0` hashes at every check, as before: a world frame
+//! checked the same textures about a hundred times
+//! (`docs/analysis/gpu-frame.md`).
 //!
 //! A texture whose host format stands in for the title's
 //! (`resource::format`) has its texels converted on the way.
@@ -74,13 +82,15 @@ pub(crate) struct Staging {
 }
 
 /// A texture's checks since the last summary (diagnostics): all of them,
-/// those again in a submission that had checked it, the bytes hashed, the
-/// changes found.
+/// those again in a submission that had checked it, those its guards found
+/// clean, the bytes hashed, the changes found.
 #[cfg(feature = "diagnostics")]
 #[derive(Default)]
 struct Seen {
     checks: AtomicU64,
     again: AtomicU64,
+    /// Found clean by the guards (no hash).
+    clean: AtomicU64,
     hashed: AtomicU64,
     changed: AtomicU64,
 }
@@ -256,10 +266,21 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 #[cfg(test)]
 static DECIDED: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
 
+/// Each hash taken in tests: its staging buffer.
+#[cfg(test)]
+static HASHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 /// GPU copies of staging buffers recorded, by whether they ran: count and
 /// bytes (staging sizes), since the last summary.
 static COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static COPIED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether texture memory in views is guarded, a hash taken only after a
+/// write (`XTP_TEXTURE_GUARDS`, on unless `0`).
+fn guards() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XTP_TEXTURE_GUARDS").is_none_or(|v| v != "0"))
+}
 
 /// Whether texture copies run under a predicate (`XTP_TEXTURE_PREDICATION`,
 /// on unless `0`).
@@ -529,6 +550,19 @@ impl Staging {
             }
             return size;
         }
+        // View memory: guarded, and hashed only after a write (or where a
+        // block cannot be guarded, which every asking reports written).
+        if guards()
+            && let Some((now, written)) = crate::watch::writes(start, start + size, true)
+        {
+            let clean = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            last.asked = now;
+            if clean {
+                #[cfg(feature = "diagnostics")]
+                self.seen.clean.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
+        }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
@@ -542,6 +576,11 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
+        #[cfg(test)]
+        HASHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(std::ptr::from_ref(self) as usize);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -778,6 +817,7 @@ fn summary_due() {
     struct Row {
         checks: f64,
         again: f64,
+        clean: f64,
         hashed_mb: f64,
         changes: f64,
         staging: u64,
@@ -791,6 +831,7 @@ fn summary_due() {
             .map(|s| Row {
                 checks: take(&s.seen.checks),
                 again: take(&s.seen.again),
+                clean: take(&s.seen.clean),
                 hashed_mb: mb(take(&s.seen.hashed)),
                 changes: take(&s.seen.changed),
                 staging: s.size,
@@ -813,10 +854,11 @@ fn summary_due() {
     let [skipped, ran] = [0, 1].map(|i| (take(&COPIES[i]), mb(take(&COPIED[i]))));
     let sum = |f: fn(&Row) -> f64| -> f64 { rows.iter().map(f).sum() };
     tracing::info!(
-        "texture checks per frame: {} textures checked {:.0} times ({:.0} again in a submission          that had checked them), {:.1} MB hashed, {:.1} changes; staging copies {:.0} ran          ({:.1} MB), {:.0} skipped ({:.1} MB)",
+        "texture checks per frame: {} textures checked {:.0} times ({:.0} again in a submission          that had checked them, {:.0} clean by their guards), {:.1} MB hashed, {:.1} changes;          staging copies {:.0} ran ({:.1} MB), {:.0} skipped ({:.1} MB)",
         rows.len(),
         sum(|r| r.checks),
         sum(|r| r.again),
+        sum(|r| r.clean),
         sum(|r| r.hashed_mb),
         sum(|r| r.changes),
         ran.0,
@@ -831,12 +873,13 @@ fn summary_due() {
     });
     for r in rows.iter().take(12) {
         tracing::info!(
-            "  texture at {:#x} ({}, staging {:.2} MB): {:.1} checks/frame ({:.1} again), {:.1}              MB hashed, {:.2} changes",
+            "  texture at {:#x} ({}, staging {:.2} MB): {:.1} checks/frame ({:.1} again, {:.1}              clean), {:.1} MB hashed, {:.2} changes",
             r.memory,
             r.desc,
             r.staging as f64 / 1e6,
             r.checks,
             r.again,
+            r.clean,
             r.hashed_mb,
             r.changes
         );
@@ -977,5 +1020,120 @@ mod tests {
         for r in [first, second] {
             assert_eq!(crate::object::slot::<Release>(r, 0x10)(r), 0);
         }
+    }
+
+    /// The times `staging` was hashed so far.
+    fn hashes(staging: &Arc<Staging>) -> usize {
+        let key = Arc::as_ptr(staging) as usize;
+        HASHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&k| k == key)
+            .count()
+    }
+
+    /// A texture in view memory (physical pages, which cannot be
+    /// write-watched) is guarded: checks without a write in between take no
+    /// hash and copy nothing; a write by the CPU (which faults), or one the
+    /// writer reports (as xmem does after DirectStorage writes through a
+    /// view of its own), is hashed, detiled and copied.
+    #[test]
+    fn a_texture_in_a_view_is_hashed_only_after_a_write() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+        let test = "texture::tests::a_texture_in_a_view_is_hashed_only_after_a_write";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !guards() || !predication() {
+            return;
+        }
+        const LEN: usize = 64 << 10;
+        // SAFETY: a fresh pagefile section mapped twice, read-write: the
+        // title's view and a writer's own (as xmem's is).
+        let (view, other) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value as usize;
+            let other = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value as usize;
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            assert!(view != 0 && other != 0);
+            (view, other)
+        };
+        let resource =
+            crate::resource::tests_support::at_address(view as u64, &sampled(16, 16, 28));
+        let started = std::time::Instant::now();
+        while crate::resource::host_resource(resource).is_none() {
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "the host copy never became resident"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let texture = crate::resource::host_resource(resource).unwrap();
+        let staging = staging(resource, texture).unwrap();
+        let size = staging.layout.size as usize;
+        assert!(size <= LEN);
+        let texels = || -> Vec<u8> {
+            let read = read_back(host, texture, COPY_DEST);
+            (0..16)
+                .flat_map(|y| read[y * 256..y * 256 + 64].to_vec())
+                .collect()
+        };
+        // SAFETY: bytes of the title's view, as its CPU writes them (a
+        // fault into the guards' handler where guarded).
+        let fill = |at: usize, byte: u8| unsafe { (at as *mut u8).write_bytes(byte, size) };
+
+        fill(view, 0x44);
+        sample_in(host, resource, 1);
+        assert_eq!((hashes(&staging), decided(&staging)), (1, vec![true]));
+        assert!(texels().iter().all(|&b| b == 0x44));
+
+        // Nothing written: no hash, no copy.
+        sample_in(host, resource, 2);
+        assert_eq!(
+            (hashes(&staging), decided(&staging)),
+            (1, vec![true, false, false])
+        );
+
+        // The CPU writes through the guarded view.
+        fill(view, 0x55);
+        sample_in(host, resource, 1);
+        assert_eq!(hashes(&staging), 2);
+        assert_eq!(decided(&staging).last(), Some(&true));
+        assert!(texels().iter().all(|&b| b == 0x55));
+
+        // A writer through its own view, which reports what it wrote.
+        fill(other, 0x66);
+        crate::watch::writing(view, size);
+        sample_in(host, resource, 1);
+        assert_eq!(hashes(&staging), 3);
+        assert_eq!(decided(&staging).last(), Some(&true));
+        assert!(texels().iter().all(|&b| b == 0x66));
+        assert_eq!(host.log_messages(), None);
+
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+        crate::watch::title_memory_remapped(view, LEN);
+        // SAFETY: our views, no longer used.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: other as *mut _,
+            });
+        }
+        crate::watch::title_memory_remapped(view, LEN);
     }
 }
