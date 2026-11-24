@@ -282,6 +282,19 @@ fn guards() -> bool {
     *ON.get_or_init(|| std::env::var_os("XTP_TEXTURE_GUARDS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a check the guards find clean is hashed too, and a change they
+/// missed counted and logged (`XTP_TEXTURE_GUARDS=verify`, diagnostics): a
+/// writer that opens no guard.
+#[cfg(feature = "diagnostics")]
+fn verify_guards() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XTP_TEXTURE_GUARDS").is_some_and(|v| v == "verify"))
+}
+
+/// Changes the guards missed (`verify_guards`), since the start.
+#[cfg(feature = "diagnostics")]
+static MISSED: AtomicU64 = AtomicU64::new(0);
+
 /// Whether texture copies run under a predicate (`XTP_TEXTURE_PREDICATION`,
 /// on unless `0`).
 fn predication() -> bool {
@@ -583,7 +596,31 @@ impl Staging {
             if clean {
                 #[cfg(feature = "diagnostics")]
                 self.seen.clean.fetch_add(1, Ordering::Relaxed);
-                return 0;
+                #[cfg(feature = "diagnostics")]
+                let verify = verify_guards();
+                #[cfg(not(feature = "diagnostics"))]
+                let verify = false;
+                if !verify {
+                    return 0;
+                }
+                // Verified: hashed below like an unguarded check, a change
+                // counted as missed.
+                #[cfg(feature = "diagnostics")]
+                if committed(self.memory, size) {
+                    // SAFETY: committed memory of the texture's layout size.
+                    let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+                    if last.hash.is_some_and(|h| h != blake3::hash(tiled)) {
+                        let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            tracing::warn!(
+                                memory = ?self.memory,
+                                size,
+                                missed = n,
+                                "a texture changed that its guards found clean"
+                            );
+                        }
+                    }
+                }
             }
         }
         if !committed(self.memory, size) {
@@ -875,9 +912,10 @@ fn summary_due() {
             .collect()
     };
     let [skipped, ran] = [0, 1].map(|i| (take(&COPIES[i]), mb(take(&COPIED[i]))));
+    let missed = MISSED.load(Ordering::Relaxed);
     let sum = |f: fn(&Row) -> f64| -> f64 { rows.iter().map(f).sum() };
     tracing::info!(
-        "texture checks per frame: {} textures checked {:.0} times ({:.0} again in a submission          that had checked them, {:.0} clean by their guards), {:.1} MB hashed, {:.1} changes;          staging copies {:.0} ran ({:.1} MB), {:.0} skipped ({:.1} MB)",
+        "texture checks per frame: {} textures checked {:.0} times ({:.0} again in a submission          that had checked them, {:.0} clean by their guards), {:.1} MB hashed, {:.1} changes;          staging copies {:.0} ran ({:.1} MB), {:.0} skipped ({:.1} MB); changes the guards          missed so far {missed} (verified only with XTP_TEXTURE_GUARDS=verify)",
         rows.len(),
         sum(|r| r.checks),
         sum(|r| r.again),
