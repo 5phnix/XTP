@@ -475,8 +475,10 @@ struct Call {
     context: usize,
     identity: usize,
     done: Mutex<bool>,
-    finished: Condvar,
 }
+
+/// Status publication, including after a call has left `CALLS` during cleanup.
+static STATUS_CHANGED: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 impl Call {
     /// Records the result (the first one wins), wakes waiters and queues
@@ -507,10 +509,12 @@ impl Call {
         if result < 0 || required_size == 0 {
             release(block);
         }
+        let changed = lock(&STATUS_CHANGED.0);
         size.store(required_size, Ordering::Release);
         status.store(result as u32 as usize, Ordering::Release);
         *done = true;
-        self.finished.notify_all();
+        STATUS_CHANGED.1.notify_all();
+        drop(changed);
         drop(done);
         if callback.is_some() {
             let task = Task::new(block.cast(), routine);
@@ -600,7 +604,6 @@ fn begin(
         context: context as usize,
         identity: identity as usize,
         done: Mutex::new(false),
-        finished: Condvar::new(),
     });
     lock(&CALLS).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
@@ -647,19 +650,22 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait {
-        while status(block) == E_PENDING {
-            if let Some(call) = call(block) {
-                let done = lock(&call.done);
-                drop(call.finished.wait_while(done, |d| !*d));
-            } else {
-                // Cleanup removes the call before publishing its result. A
-                // waiter arriving in between must not return that stale pending status.
-                std::thread::yield_now();
-            }
-        }
+    if !wait {
+        return status(block);
     }
-    status(block)
+    let mut changed = lock(&STATUS_CHANGED.0);
+    loop {
+        let result = status(block);
+        if result != E_PENDING {
+            return result;
+        }
+        // The status lock also covers calls removed during cleanup, so the
+        // next publication cannot be missed between this check and the wait.
+        changed = STATUS_CHANGED
+            .1
+            .wait(changed)
+            .unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
@@ -1281,8 +1287,8 @@ mod tests {
 
     #[test]
     fn a_status_wait_outlasts_provider_cleanup() {
-        static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
-        static CLEANUP_RELEASE: AtomicBool = AtomicBool::new(false);
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        type Cleanup = (Sender<()>, Receiver<()>);
         extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
             // SAFETY: the runtime passes valid provider data.
             let data = unsafe { &*data };
@@ -1290,29 +1296,32 @@ mod tests {
                 OP_BEGIN => XAsyncSchedule(data.block, 0),
                 OP_DO_WORK => E_ABORT,
                 OP_CLEANUP => {
-                    CLEANUP_STARTED.store(true, Ordering::SeqCst);
-                    while !CLEANUP_RELEASE.load(Ordering::SeqCst) {
-                        std::thread::yield_now();
-                    }
+                    // SAFETY: the test's channel pair outlives this worker.
+                    let (started, release) = unsafe { &*data.context.cast::<Cleanup>() };
+                    started.send(()).unwrap();
+                    let _ = release.recv_timeout(Duration::from_secs(10));
                     S_OK
                 }
                 _ => S_OK,
             }
         }
-        CLEANUP_STARTED.store(false, Ordering::SeqCst);
-        CLEANUP_RELEASE.store(false, Ordering::SeqCst);
+        let long = Duration::from_secs(10);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let cleanup: Cleanup = (started_tx, release_rx);
         let mut q = std::ptr::null();
         assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
-        let mut block = AsyncBlock {
+        // Leaked on failure so a late worker cannot dereference a freed block.
+        let block = Box::leak(Box::new(AsyncBlock {
             queue: q,
             context: std::ptr::null_mut(),
             callback: None,
             internal: [0; 4],
-        };
+        }));
         assert_eq!(
             XAsyncBegin(
-                &mut block,
-                std::ptr::null_mut(),
+                block,
+                (&raw const cleanup).cast_mut().cast(),
                 0x88 as *const c_void,
                 std::ptr::null(),
                 Some(provider)
@@ -1320,18 +1329,34 @@ mod tests {
             S_OK
         );
         let queue = q as usize;
-        let work = std::thread::spawn(move || XTaskQueueDispatch(queue as *const Queue, WORK, 0));
-        while !CLEANUP_STARTED.load(Ordering::SeqCst) {
-            std::thread::yield_now();
-        }
-        let release = std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(50));
-            CLEANUP_RELEASE.store(true, Ordering::SeqCst);
+        let (work_tx, work_rx) = channel();
+        std::thread::spawn(move || {
+            let ran = XTaskQueueDispatch(queue as *const Queue, WORK, 0);
+            work_tx.send(ran).unwrap();
         });
-        let result = XAsyncGetStatus(&mut block, true);
-        CLEANUP_RELEASE.store(true, Ordering::SeqCst);
+        started_rx
+            .recv_timeout(long)
+            .expect("provider cleanup started");
+        let (status_tx, status_rx) = channel();
+        let address = block as *mut AsyncBlock as usize;
+        std::thread::spawn(move || {
+            status_tx
+                .send(XAsyncGetStatus(address as *mut AsyncBlock, true))
+                .unwrap();
+        });
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            release_tx.send(()).unwrap();
+        });
+        let result = status_rx
+            .recv_timeout(long)
+            .expect("status waiter finished");
+        assert!(
+            work_rx
+                .recv_timeout(long)
+                .expect("work dispatcher finished")
+        );
         release.join().unwrap();
-        assert!(work.join().unwrap());
         XTaskQueueCloseHandle(q);
         assert_eq!(result, E_ABORT);
     }
