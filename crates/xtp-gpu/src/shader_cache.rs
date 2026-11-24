@@ -62,8 +62,8 @@ fn count<T, E>(counter: &AtomicU64, result: Result<T, E>) -> Result<T, E> {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (the loop limit and the loops'
+/// budget, which any build can change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -72,9 +72,17 @@ fn build() -> &'static [u8; 32] {
         if limit != xtp_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(limit, "XTP_SHADER_LOOP_LIMIT: translated loops stop sooner");
         }
+        let budget = xtp_shader::emit::loop_budget();
+        if budget != xtp_shader::emit::DEFAULT_LOOP_BUDGET {
+            tracing::warn!(
+                budget,
+                "XTP_SHADER_LOOP_BUDGET: back edges a lane may take in all loops together (0: no budget)"
+            );
+        }
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&budget.to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
