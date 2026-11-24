@@ -77,6 +77,7 @@ mod smem;
 mod spin;
 #[cfg(test)]
 mod tests;
+pub(crate) mod uniform;
 mod valu;
 mod valu16;
 
@@ -283,6 +284,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Mesh: which values are the same in every lane (`mesh_prologue`).
+    uniform: Option<uniform::Uniformity>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -320,6 +323,10 @@ struct Lower<'a> {
     /// Headers of counted loops: they stop at [`super::counted_loop_limit`]
     /// instead ([`flow::counted_loops`]).
     counted: HashSet<usize>,
+    /// Lanes that end keep passing group barriers ([`flow::Drain`]).
+    drain: flow::Drain,
+    /// The back edges of all loops together ([`flow::Budget`]).
+    budget: flow::Budget,
     /// See [`Lowered::loop_limits`].
     #[cfg(test)]
     limits: Vec<u32>,
@@ -696,6 +703,7 @@ impl<'a> Lower<'a> {
             xchg: None,
             flat: None,
             no_barrier,
+            uniform: None,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -726,6 +734,8 @@ impl<'a> Lower<'a> {
             abort: None,
             spin: HashSet::new(),
             counted: HashSet::new(),
+            drain: flow::Drain::default(),
+            budget: flow::Budget::default(),
             #[cfg(test)]
             limits: Vec::new(),
             #[cfg(test)]

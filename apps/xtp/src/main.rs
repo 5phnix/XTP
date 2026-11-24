@@ -38,6 +38,9 @@ enum Command {
         /// List every exported function.
         #[arg(long)]
         exports: bool,
+        /// Emit stable JSON instead of the text summary.
+        #[arg(long)]
+        json: bool,
     },
     /// Aggregate the imports of every PE image under the given paths and
     /// show which ones our runtime covers. Defaults to the configured
@@ -50,6 +53,9 @@ enum Command {
         /// List every missing `dll!function`, most used first.
         #[arg(long)]
         missing: bool,
+        /// Emit stable JSON instead of the text table.
+        #[arg(long)]
+        json: bool,
     },
     /// List the `dll!export` pairs an import library describes.
     LibExports {
@@ -121,7 +127,9 @@ enum Command {
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
-        exe: PathBuf,
+        /// A title executable or a package folder with a manifest or a single .exe.
+        #[arg(value_name = "EXE|FOLDER")]
+        target: PathBuf,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
         unimplemented: Unimplemented,
@@ -189,12 +197,14 @@ fn main() -> Result<()> {
             file,
             imports,
             exports,
-        } => inspect::run(&file, imports, exports),
+            json,
+        } => inspect::run(&file, imports, exports, json),
         Command::Census {
             paths,
             strict,
             missing,
-        } => census::run(paths, strict, missing),
+            json,
+        } => census::run(paths, strict, missing, json),
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
         Command::ShaderInfo {
             paths,
@@ -224,7 +234,7 @@ fn main() -> Result<()> {
             host_lanes,
         ),
         Command::Run {
-            exe,
+            target,
             unimplemented,
             strict,
             execute,
@@ -234,7 +244,7 @@ fn main() -> Result<()> {
         } => {
             let env = std::env::var("XTP_CONSOLE").ok();
             let console = Console::pick(console, env.as_deref())?;
-            run::run(&exe, unimplemented, strict, execute, console, autopilot)
+            run::run(&target, unimplemented, strict, execute, console, autopilot)
         }
         Command::Config => show_config(),
     }

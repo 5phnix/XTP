@@ -66,12 +66,27 @@ Run the title:
 
 ```powershell
 cargo build --release -p xtp
-target\release\xtp.exe run <game dir>\<the title's exe> --execute
+target\release\xtp.exe run "<game dir>" --execute
 ```
+
+With a folder, `xtp run` selects an existing executable named in
+`MicrosoftGame.config`. If none matches, it looks for a single `.exe` in
+the folder and reports why it skipped any named entries. When several match,
+it lists them so you can pass one explicitly.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\xtp\data`), derived
 data under the cache folder.
+
+Titles can read Windows caption colors, opacity, font, text size and high
+contrast mode. Captions initially follow Windows ShowSounds, under Control
+Panel > Ease of Access > Ease of Access Center > Use text or visual
+alternatives for sounds. A title can turn captions on or off immediately
+for its own session. XTP refreshes each host setting on demand at most
+once per second. Without preferences, captions are off, with white text on
+black, a transparent window, default font and edge, and 100% text size.
+High contrast defaults to off. An active theme reports light or dark based
+on its window background, or `Other` if Windows cannot supply that color.
 
 Input: XInput pads; Xbox One and Series pads get their trigger motors too
 (through Windows.Gaming.Input). The keyboard and mouse play as a pad while
@@ -104,15 +119,28 @@ inversion, and other bindings (see `xtp.example.toml`), by control:
 ## Commands
 
 ```
-xtp inspect <exe|dll> [--imports] [--exports]
-xtp census [paths...] [--missing] [--strict]
+xtp inspect <exe|dll> [--imports] [--exports] [--json]
+xtp census [paths...] [--missing] [--strict] [--json]
 xtp lib-exports <import.lib> [--list]
 xtp shader-info [paths...] [--verbose] [--disasm]
 xtp translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-xtp run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+xtp run <exe|folder> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-s|series-x] [-- <title arguments>]
 xtp config
 ```
+
+`xtp inspect --json` emits a stable JSON object (`"format": "xtp-inspect 1"`)
+with string fields `file`, `blake3`, `kind` (`"exe"` or `"dll"`), hex-string
+fields `machine`, `image_base` and `entry_rva`, numeric fields `subsystem` and
+`size_of_image`, and an `imports` array of `{dll, symbol, delay, resolution}`
+objects (`delay` is a boolean; `resolution` is `"hle"`, `"host"`, `"missing"`,
+with `"title"` reserved because static `inspect` does not map title-shipped
+DLLs, so those report as `"missing"`). `--json` ignores `--imports` and
+`--exports`. `xtp census --json` emits `"format": "xtp-census 1"` with numeric
+`images`, `unreadable`, `totals` (`{functions, hle, host, missing}`), a `dlls`
+array (`{dll, functions, hle, host, missing, images}`), and always includes the
+`missing` array (`{dll, symbol, images}`). The `format` version number
+increments on any breaking schema change.
 
 The title sees an Xbox Series S unless `--console series-x` or
 `XTP_CONSOLE=series-x` says otherwise: with Series S budgets the world
@@ -150,6 +178,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_ADAPTER=<index>\|<name>` | (every build) host GPU to run on: its index in the startup log's `host adapter` lines, or part of its name (`XTP_ADAPTER=radeon`); by default the first high-performance hardware adapter, a discrete GPU before an integrated one |
 | `XTP_PIPELINE_WAIT_MS=<graphics>,<compute>` | (every build) milliseconds per frame title threads may wait for pipelines being made before their draws and dispatches are dropped for that frame (default `2,8`) |
 | `XTP_SHADER_LOOP_LIMIT=<n>` | (every build) translated shader loops stop after `n` iterations per lane instead of 16384 (2^14, under the host GPU watchdog); loops that only reread memory until it changes (spin waits) after 4096, or `n` if lower (own shader cache entries); a lower `n` shows whether loops hitting the limit make world frames slow, a higher one whether a wrong result comes from a legitimate loop the default cut short |
+| `XTP_SHADER_LOOP_BUDGET=<n>` | (every build) a lane of a translated shader leaves, as at the loop limit, once it has gone back `n` times in all of its loops together instead of 1048576 (2^20; loops inside loops multiply their own limits); `0` turns the budget off (own shader cache entries) |
 | `XTP_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `XTP_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 | `XTP_WATCHDOG_HOOK=1` | every build: keeps the title's own watchdog from ending it after about 30 s without progress (slow world frames), and logs a warning (at most every 30 s) when it would have; a real deadlock then hangs for ever, with no `crashes.log` entry; known builds only (1.0.2.1), otherwise a warning and nothing patched |

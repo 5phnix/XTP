@@ -390,7 +390,7 @@ pub fn host_target() -> xtp_shader::emit::Target {
         );
         if !target.runs(64) {
             // VIctory #439's text. Mesh programs are the pipelines' to log,
-            // by the host's own lanes (`pipeline::host::wave64_mesh_allowed`):
+            // by the host's own lanes (`pipeline::host::wave64_mesh_refused`):
             // their translations declare no wave size.
             tracing::warn!(
                 "the host has no 64-lane waves: console wave64 compute programs that need \
