@@ -32,47 +32,56 @@ run the next pass, and where the last one stopped.
   and logins that carry the real name go to
   `E:\xtp-data\upstream-private.md`, outside the repository. Before
   committing, the name check written there must find nothing in
-  `docs/upstream`.
+  `docs/upstream`. Some logins carry it too: write "item 19's third
+  author" for the one the private notes name.
+- **Repositories can disappear.** On 2026-11-24 a DMCA notice from the
+  publisher's parent company disabled a recompilation project and its
+  network of 3,007 repositories (watch.md 0.3). A tracked repository that
+  answers 404 may be one of those: say so in the pass, and look for where
+  its authors went.
 
-## Marks: where pass 6 stopped (2026-11-24, 19:01 UTC)
+## Marks: where pass 7 stopped (2026-11-24, 19:44 UTC)
 
 Pass 1 stopped at 13:40 UTC, pass 2 at 16:25, pass 3 at 17:18, pass 4 at
-18:02 and pass 5 at 18:28; git keeps their marks. Pass 6 read everything
-created up to the highest numbers below by title. It searched both
-trackers by keyword (any date, updated since 18:28) for device-removal
-terms, wave64 mesh terms, FSR and FSPX, Series S, indirect arguments,
-dynamic slots and copy-back. It read the new comments on the tracked
-items and about 45 items, and XTP's own Series S sessions since 18:28
-first. Its triage is in watch.md section 0.
+18:02, pass 5 at 18:28 and pass 6 at 19:01; git keeps their marks. Pass 7
+read everything created up to the highest numbers below by title. Instead
+of the keyword searches, it listed every item updated and every comment
+made since 19:01 on both trackers (step 3's last two commands, four
+calls), and read the comments on the tracked items and on the new
+reports. It read about 50 items, and XTP's own Series S sessions since
+18:47 first. Its triage is in watch.md section 0.
 
 | Project | Default branch at the mark | Highest seen | Newest created | Notes |
 |---|---|---|---|---|
-| Marvisak/VIctory | `main` `ffe310e` (= XTP's import) | #1543 (PR) | 18:58 UTC | 36 new PRs and 12 issues (#1496–#1543), none merged; #1499 and #1522 closed. #1532–#1543 came at 18:51–18:58 and were triaged by title. |
-| xcl-dev/xcl (formerly ivall/xcl) | `main` `c160d86` (18:29 UTC, #1426) | #1666 | 18:59 UTC | 25 new PRs and 5 issues (#1637–#1666); #1637 was opened at 18:27, after pass 5's highest. #1657–#1666 were triaged by title. REST calls to `ivall/xcl` redirect; `gh search … -R ivall/xcl` fails, so use the new name. |
+| Marvisak/VIctory | `main` `ffe310e` (= XTP's import) | #1608 (PR) | 19:44 UTC | 52 new PRs and 13 issues (#1544–#1608), none merged; #1552 closed. #1589–#1608 came at 19:31–19:44 and were triaged by title, except #1595 and #1597 (read). |
+| xcl-dev/xcl (formerly ivall/xcl) | `main` `9039900` (19:43 UTC, #1693) | #1718 | 19:43 UTC | 46 new PRs and 6 issues (#1667–#1718). #1708–#1718 were triaged by title. REST calls to `ivall/xcl` redirect; `gh search … -R ivall/xcl` fails, so use the new name. |
 | simnJS/AnyPS5 | `AnyKyty` `7de61e3` (2026-11-22 23:46) | #292 | 06:15 UTC | process only; nothing new since pass 1 |
-| r4tedx/VIctory `integration/testers` | `4744af9` (18:33 UTC) | – | – | the testers' tree, update 10 (watch.md item 126) |
-| r4tedx/VIctory `shader/wave-per-group` | `88b38e8` (18:30 UTC) | – | – | the branch after #439; update 10 took it at `252a095`. Its indirect rewrite is the fork's PR #11 (item 115) |
-| VIctory issue #293 | – | last comments read: notquiteog and r4tedx, 18:36–18:45 UTC | – | the shader census |
+| r4tedx/VIctory `integration/testers` | `4744af9` (18:33 UTC) | – | – | the testers' tree, update 10 (watch.md item 126); not moved |
+| r4tedx/VIctory `shader/wave-per-group` | `88b38e8` (18:30 UTC) | – | – | the branch after #439; not moved. Its indirect rewrite is the fork's PR #11 (item 115) |
+| VIctory issue #293 | – | last comments read: crashbashash, c4k3ss and r4tedx, 19:04–19:10 UTC | – | the shader census; r4tedx's copy-back reading is in watch.md 0.9 |
 
-Other projects (watch.md sections 5, P2.5, P3.7, P4.8, P5.9 and 0.9),
-heads read at about 18:59 UTC:
+Other projects (watch.md sections 5, P2.5, P3.7, P4.8, P5.9, P6.9 and
+0.9), heads read at about 19:50 UTC:
 
-| Project | Default branch head | Commits since 18:28 | Read so far |
+| Project | Default branch head | Commits since 19:01 | Read so far |
 |---|---|---|---|
-| OpenCommunityEdition/OpenScarlett | `315ad41` (17:44) | 0 | titles; `47db0c7` and `2c27467` (13:47, 13:53) for item 45 |
-| ThatRecompDev/five-star-recomp | `f4388e9` (18:32) | 2 | both, and `b5fe3a7`, `48c08b8` behind the merge (item 120) |
+| OpenCommunityEdition/OpenScarlett | `bd1a488` (19:14) | 1 | `bd1a488` (item 133) |
+| ThatRecompDev/five-star-recomp | `65f02f2` (19:49, PR #10) | 17 | all by message; `6be24db`, `1ea5bce`, `126ea46`, `61c095b`, `7254343`, `052407d`, issue #9 and PR #10 in full (items 133, 136, 143). It now takes PRs: read them too |
 | fablinoo/palmwave | `fc216a5` (16:22) | 0 | – |
 | LooperSalty/AnyXboxX | `38cc0fa` (17:19) | 0 | – |
-| DesignWithTommy/Neonbridge | `abbe817` (18:57) | 22 | titles (ideas only: carries xcl code) |
-| R0Y00/Xbox2Windows | `ecc6e6c` (18:57) | 23 | titles |
-| ubiquitarianism/leonida | `6293c1c` (18:38) | 4 | titles |
+| DesignWithTommy/Neonbridge | `2d54125` (19:47) | 21 | titles; `cb6dbd3` (item 142) and `91cba0e` (item 136) by message (ideas only: carries xcl code) |
+| R0Y00/Xbox2Windows | `51b3e05` (19:50) | 57 | titles |
+| ubiquitarianism/leonida | `6293c1c` (18:38) | 0 | – |
 | Kajcsi/G6Recomp | `82ccaa5` (07:51) | 0 | – |
-| uiliannn/VItoriaBr | `1e11726` (18:53) | 3 | `783a957` (pass 5), `f95856d` and `1e11726` by message |
+| uiliannn/VItoriaBr | `f68b1f0` (19:06) | 1 | its files (watch.md 0.9) |
 | californiaAlmonds/OpenScarlett | `46d8e2c` (06:28) | 0 | – |
 
-Pass 6's searches found nothing new: only pass 5's lure (named in the
-private notes). The two port trackers had not changed since 16:46. Pass
-5's new ones (P5.8): JPTuba9/xlaunch-vi and that lure. Pass 4's (P4.7):
+Pass 7's searches found one new name, `RankRoadImagine/Leonida`, a
+probable lure (watch.md 0.8); the rest were the earlier passes' finds.
+`LeonidaReforge/Leonida` (watch.md 5.1) now answers 404. The two port
+trackers had not changed since 16:46. Pass 6's searches found only pass
+5's lure. Pass 5's new ones (P5.8): JPTuba9/xlaunch-vi and that lure.
+Pass 4's (P4.7):
 dankxylese/leotux. Pass 3's (P3.6):
 dare-devil1/XCL, dare-devil1/VICTORY, Defintelythijsss/Stellar-Project,
 and a port tracker's plugin (in the private notes). Pass 2's (item 79):
@@ -94,7 +103,7 @@ REST: `gh api "repos/OWNER/REPO/pulls?state=all&per_page=100" --paginate`.
 Set the mark once:
 
 ```sh
-SINCE=2026-11-24T19:01:00Z
+SINCE=2026-11-24T19:44:00Z
 ```
 
 Read every number above the marks' highest too, whatever its date: pass 2
@@ -105,7 +114,7 @@ missed #1185–#1202, opened in the 3 minutes before its mark.
 ```sh
 gh api repos/Marvisak/VIctory/compare/ffe310e...main \
   --jq '.total_commits, (.commits[] | [.sha[0:9], .commit.committer.date, (.commit.message | split("\n")[0])] | @tsv)'
-gh api repos/xcl-dev/xcl/compare/9e3831e...main \
+gh api repos/xcl-dev/xcl/compare/9039900...main \
   --jq '.total_commits, (.commits[] | [.sha[0:9], .commit.committer.date, (.commit.message | split("\n")[0])] | @tsv)'
 gh api "repos/simnJS/AnyPS5/commits?sha=AnyKyty&since=$SINCE" \
   --jq '.[] | [.sha[0:9], .commit.committer.date, (.commit.message | split("\n")[0])] | @tsv'
@@ -164,7 +173,8 @@ for n in 985 223 233 320 439 578 579 493 483 595 546 275 464 490 497 180 298 539
          1284 948 1162 1292 1225 1231 1276 1230 1264 1224 1215 1267 1277 1268 1228 1298 1296 1272 1279 1281 \
          189 1433 1385 1349 1392 1400 1414 1322 1388 1407 1420 1412 1402 1352 1405 1382 1356 1312 1336 \
          1463 1483 1448 1444 1446 1466 1449 1472 \
-         1540 1524 1507 1527 1510 1520 1523 1514 1505 1500 1525 1501 1516 1519 230 587; do
+         1540 1524 1507 1527 1510 1520 1523 1514 1505 1500 1525 1501 1516 1519 230 587 \
+         1587 1582 1563 1572 489 1077 1425 1578 1597 1546 1544 1551 1583 1556 1555 1574 1548; do
   gh pr view $n -R Marvisak/VIctory \
     --json number,state,isDraft,mergeable,headRefOid,updatedAt \
     --jq '[.number, .state, (if .isDraft then "draft" else "-" end), .mergeable, .headRefOid[0:9], .updatedAt] | @tsv'
@@ -182,7 +192,8 @@ for n in 847 736 841 876 850 877 878 776 783 407 880 853 840 785 798 293 71 \
          730 771 965 1286 1305 1226 \
          747 264 1317 1323 1347 1348 778 1001 \
          1440 1442 1479 1481 1482 1468 1117 \
-         1496 1498 1508 1509 1533 597; do
+         1496 1498 1508 1509 1533 597 \
+         1595 1581 1586 1573 1580 1579 1567 700 653; do
   gh issue view $n -R Marvisak/VIctory --json number,state,updatedAt,comments \
     --jq '[.number, .state, .updatedAt, (.comments | length)] | @tsv'
 done
@@ -195,6 +206,20 @@ done
 `gh pr view` and `gh issue view` use GraphQL. Passes 3 and 4 used REST for
 the lists (`gh api repos/R/pulls/N`, `gh api repos/R/issues/N`) and kept
 GraphQL for single reads.
+
+Pass 7 replaced the loops above and the keyword searches below with two
+listings per tracker: every item updated since the mark, and every
+comment made since it. Keep the output in a scratch folder outside the
+repository (`$SCRATCH`) and read the tracked numbers in it. `--paginate` prints one JSON array per page, so a
+script that reads the comments file must decode several arrays in a row.
+
+```sh
+for r in Marvisak/VIctory xcl-dev/xcl; do
+  gh api "repos/$r/issues?state=all&sort=updated&direction=desc&per_page=100&since=$SINCE" --paginate \
+    --jq '.[] | select(.created_at < "'$SINCE'") | [.number, (if .pull_request then "PR" else "iss" end), .state, .updated_at[11:16], .comments, .user.login, .title[0:80]] | @tsv'
+  gh api "repos/$r/issues/comments?since=$SINCE&per_page=100" --paginate > "$SCRATCH/comments-${r%%/*}.json"
+done
+```
 
 **Wave64 mesh, Series S, FSR4 and the title's own keywords.** Search both
 trackers, any date, sorted by update, then read what is new or updated
@@ -226,7 +251,9 @@ named FSR4's 20 refused programs (watch.md P3.1). In pass 4,
 "no dynamic slots" (watch.md item 97). In pass 5,
 `E:\xtp-data\cache\play\20261124-181140\run.log` held the device removal
 (watch.md P5.2, TDR). In pass 6, `20261124-184329` held a second one, and
-`20261124-184528` gave the refusals by reason (watch.md 0.2, item 128).
+`20261124-184528` gave the refusals by reason (watch.md P6.2, item 128).
+In pass 7, `20261124-190345` held DRED at compute `d3e44e754b3eb6aa` and
+its slots, and `-191411` the frame lines and refusals (watch.md 0.2).
 Other workers' sessions run while a pass reads: list the folder by time,
 and note that a log does not name XTP's commit.
 
@@ -236,7 +263,9 @@ translated and bound is a lead (watch.md item 108).
 
 ```sh
 for h in 4c0ac499ad613809 72f552f4553fb5f9 aaf7da7a94dc72a9 eeed82b877b44b5f \
-         c7feccae4e01e454 84eafa50504bc9ef 8bbcbda6008eaa37 5a801f1f568c7abd 51ff151f75cd5759; do
+         c7feccae4e01e454 84eafa50504bc9ef 8bbcbda6008eaa37 5a801f1f568c7abd 51ff151f75cd5759 \
+         d3e44e754b3eb6aa 42683eebec081520 776d835da5ffa646 b7a81f5b96f4ca93 43e24028d4a1faef \
+         04b9be3756e8f41c 1af4a50c7fb40c97 0e45e59e93b736e4 28918b7150a7aad5 65e969746fffdb7d e6a32775a6bb91c8; do
   echo "== $h"; grep "$h" run.log | head -3
 done
 ```
@@ -306,9 +335,11 @@ README's credits section says so. GitHub's search API allows about 30 requests a
   (80–93). Pass 4 renamed that one P3 and wrote its own section 0
   (94–106). Pass 5 renamed that one P4 and wrote its own section 0
   (107–119), with what changed in the old items (0.9). Pass 6 renamed
-  that one P5 and wrote its own section 0 (120–131). The next pass can
-  fold P2 to P5 and 0 into sections 4 and 5, keep only the open items,
-  and start a new section 0; or rename 0 to P6 as before.
+  that one P5 and wrote its own section 0 (120–131). Pass 7 renamed that
+  one P6 and wrote its own section 0 (132–143), with a section for what is
+  not a port (0.3). The next pass can fold P2 to P6 and 0 into sections 4
+  and 5, keep only the open items, and start a new section 0; or rename 0
+  to P7 as before.
 - A session log does not name XTP's commit: say so when a finding rests
   on one, rather than guess the build.
 - Update the marks above. Git keeps the history of earlier passes.
@@ -321,17 +352,22 @@ The goal is the world at 30 fps, in Series S mode first (the person's
 direction, roadmap #15). In order of what the measurements show blocks it:
 - First, staying in the Series S world on the 4080: NVIDIA device
   removals (TDR). XTP's session on `79fa391` hung 1 min 42 s into the
-  world (watch.md P5.2), and `20261124-184329` 1 min 48 s after its start
-  (0.2). Look for removals on NVIDIA with a similar workload, the programs
-  named at them (items 108, 123), what each fix changed in minutes held,
-  and the checks of XTP's own inherited code: loop limits and back edges,
-  dynamic heap slots, barriers after dropped work, list, heap and
-  resource state (items 107–114, 120–122).
+  world (watch.md P5.2), `20261124-184329` 1 min 48 s after its start
+  (P6.2), and 6 of the 12 sessions pass 7 read, with DRED at compute
+  `d3e44e754b3eb6aa` (0.2). Look for removals on NVIDIA with a similar
+  workload, the programs named at them (items 108, 123, 133, 134), what
+  each fix changed in minutes held, and the checks of XTP's own inherited
+  code: descriptor kinds read against what the heap holds (item 132),
+  constants that read 0 or old values (item 133), loop limits and back
+  edges (items 120, 134), dynamic heap slots, barriers after dropped
+  work, list, heap and resource state (items 107–114, 120–122). Tests
+  that pass on WARP can hang an NVIDIA card (item 143).
 0. The 3D world in Series S on the 4080: the title's 9,282 wave64 mesh
    programs in 128-lane groups, which XTP refuses on a 32-lane host (task
    mesh64). Look for proofs that a program needs no whole wave, forms for
    groups of several console waves (watch.md P4.3, items 115 and 126),
-   masks a proof must not call uniform (item 125), and what
+   masks a proof must not call uniform (item 125, and #1587's rule in
+   item 137), mesh outputs past 32 KiB (item 138), and what
    NVIDIA needs once they run: dynamic heap slots, mesh output counts,
    loop limits.
    For xcl, write the mechanism down in your own words, with the file it
