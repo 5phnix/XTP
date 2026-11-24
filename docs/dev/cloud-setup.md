@@ -367,10 +367,19 @@ tools\cloud\run-remote.ps1 -Game -Local -Repo E:\XTP -LocalRev main -Autopilot a
     -XtpArgs '--console series-s' -Env @{ XTP_SKIP_INTRO = '1'; XTP_WATCHDOG_HOOK = '1'; XTP_LOG = 'xtp_gpu=debug,info' }
 ```
 
-XTP develops and tests in **Series S mode** first (`--console series-s`):
-sessions on the VM use it unless you are comparing modes on purpose. In
-Series S mode the title also loads its FidelityFX upscaler (the log names
-`amd_fidelityfx_upscaler_xbox.dll`).
+XTP develops and tests in **Series S mode** first (`--console series-s`, the
+default on main): sessions on the VM use it unless you are comparing modes on
+purpose. In Series S mode the title maps its FidelityFX loader at start and
+loads its upscaler (`amd_fidelityfx_upscaler_xbox.dll`) when it first uses
+it.
+
+**Expect it slower than a desktop PC.** XTP runs the title's CPU work on the
+VM's CPUs, and G2's are slower than a recent desktop's: in our Series S
+session on main (2026-11-24) the front end ran at about 11 frames per second
+instead of 30, the L4 was busy 12 % of the time, and about 120 of the 140 ms
+of a frame went to work outside the GPU submissions. Give sessions time
+(`-Seconds 900` to reach the world) and compare a change against a run on
+the same VM, not against the PC.
 
 **Which code.** By default the VM's clone is put on `origin/main` (fetched
 first) or on `-Ref`. With `-Local` your current commit is sent as a git bundle
