@@ -4,7 +4,7 @@
 //! an untracked mask).
 
 use super::mask::{LANE_MASK, MaskData};
-use super::{Lower, Val, Why};
+use super::{Lower, UNTRACKED_SELECT, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, Operand};
@@ -480,9 +480,17 @@ impl<'a> Lower<'a> {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                     _ => None,
                 };
+                // A selector that derives from neither EXEC nor a compare
+                // (a constant, a number built from scalars) is a mask held as
+                // a number. The in-half form cannot test the high word, so
+                // defer the select there and retry only if its result is used.
+                let numeric_mask = self.console_lanes && (!self.split || self.console_cf);
                 let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
+                    .and_then(|m| {
+                        let others = numeric_mask.then(|| self.x.st.others.get(&m));
+                        self.x.st.masks.get(&m).or(others.flatten()).copied()
+                    })
+                    .ok_or(UNTRACKED_SELECT)?;
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
