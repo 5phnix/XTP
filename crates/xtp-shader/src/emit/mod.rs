@@ -84,6 +84,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
+mod image_tests;
+#[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 // IR to DXIL, one file per encoding or concern: which backlog item of
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
@@ -391,6 +393,8 @@ pub fn emit_for(
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
+            // Until a read says which mode (`lower`).
+            (28, _) => 2,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
@@ -547,6 +551,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
