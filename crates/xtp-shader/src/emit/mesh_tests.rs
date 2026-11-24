@@ -26,10 +26,12 @@ const RESTORE_EXEC: u32 = 0xBEFE_040A; // s_mov_b64 exec, s[10:11]
 const NVIDIA: Target = Target {
     lanes_min: 32,
     lanes_max: 32,
+    stride_table: false,
 };
 const RDNA: Target = Target {
     lanes_min: 32,
     lanes_max: 64,
+    stride_table: false,
 };
 
 /// A console wave64 mesh program of `threads` lanes with `lds_bytes` of

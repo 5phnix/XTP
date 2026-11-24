@@ -387,6 +387,7 @@ pub fn run(
     let target = host_lanes.map_or(emit::Target::ANY, |(lanes_min, lanes_max)| emit::Target {
         lanes_min,
         lanes_max,
+        stride_table: false,
     });
     if let Some(out) = &json {
         // Names of the title's programs stay out of the repository.

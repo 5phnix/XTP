@@ -182,6 +182,9 @@ struct Own {
     copied: u64,
     /// What the list's indirect rectangle draws are expanded into.
     rects: Option<crate::rectangles::Scratch>,
+    /// The holds on the raw views of the runtime stride tables the list's
+    /// shaders read, by view heap ([`State::stride_table`]).
+    strides: Vec<(usize, crate::descriptor::host::StrideHold)>,
 }
 
 struct Chunk {
@@ -1007,6 +1010,18 @@ impl State {
                     }
                 }
             }
+            if let Some(param) = stage.stride_table {
+                let gpu = self.stride_table(list)?;
+                // SAFETY: an open list; the table lives with its heap, which
+                // the list keeps, and the list keeps the table too.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
         }
         // Copies of the list's own made so far may now be stale.
         if compute
@@ -1020,6 +1035,29 @@ impl State {
             self.writes += 1;
         }
         Ok(())
+    }
+
+    /// The GPU address of the runtime stride table of the view heap set on
+    /// the host list, for a shader that reads one (VIctory #193 and #704):
+    /// the list keeps the table, and its recording holds the raw views the
+    /// table names ([`crate::descriptor::host::StrideHold`]) until its
+    /// submissions have run. Why not if that heap has no table (no view
+    /// heap of the title's, or `XTP_STRIDE_TABLE` off): the draw or
+    /// dispatch is dropped, as VIctory #193's head (`f99b792`) does, where
+    /// #704 still logged and ran with the table unbound.
+    fn stride_table(&mut self, list: &HostList) -> Result<u64, &'static str> {
+        const NONE: &str = "a shader reads the runtime stride table its view heap has not";
+        let heap = self.host_heaps[0];
+        let host = host_heap(heap).ok_or(NONE)?;
+        let (gpu, table) = host.stride_table().ok_or(NONE)?;
+        if !self.own.strides.iter().any(|&(h, _)| h == heap) {
+            let hold = host.stride_hold().ok_or(NONE)?;
+            // The hold goes with the recording (`State::recording`).
+            self.recording.lease(list);
+            self.own.strides.push((heap, hold));
+            list.keep(table);
+        }
+        Ok(gpu)
     }
 
     /// Binds a root SRV as a one-view table (see
@@ -2340,6 +2378,32 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.run();
             dst.words()[..WORDS].to_vec()
         }
+    }
+
+    /// A shader that reads the runtime stride table is dropped where the
+    /// view heap set on the list has none (XTP's own heap, or a title heap
+    /// made with `XTP_STRIDE_TABLE` off, as in tests): no root SRV of
+    /// another buffer, or none at all, is bound in its place.
+    #[test]
+    fn a_missing_stride_table_drops_the_draw() {
+        let test = "draw::tests::a_missing_stride_table_drops_the_draw";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let list = crate::testgpu::TitleList::new();
+        let l = list.host();
+        // No view heap of the title's: XTP's own, which has no table.
+        let mut own = state(std::ptr::null());
+        heaps(&mut own, l);
+        assert_eq!(own.host_heaps[0], crate::descriptor::OWN_VIEW_HEAP);
+        assert!(own.stride_table(l).is_err());
+        // A title heap whose host heap has no table.
+        let heap = crate::descriptor::TestHeap::views(4);
+        let mut titled = state(heap.0);
+        heaps(&mut titled, l);
+        assert_eq!(titled.host_heaps[0], heap.0 as usize);
+        assert!(titled.stride_table(l).is_err());
+        assert!(titled.own.strides.is_empty(), "nothing held");
     }
 
     /// A list's state with the title view heap `heap` bound (none: null).

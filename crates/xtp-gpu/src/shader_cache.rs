@@ -270,7 +270,9 @@ pub(crate) fn wave64_program(
     (container, native)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+/// A translation's entry: this, then [`encode`]'s words. 2: with whether it
+/// reads the runtime stride table (VIctory #193).
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A refusal's entry: this, then the text's length (little endian, 4 bytes),
 /// then a checksum of the text (4 bytes), then the error's text (UTF-8). The
 /// length tells a cut-short entry from a shorter error, and the checksum
@@ -384,6 +386,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.stride_table));
     out
 }
 
@@ -440,6 +443,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let stride_table = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -448,6 +456,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        stride_table,
     })
 }
 
@@ -520,6 +529,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            stride_table: true,
         }
     }
 
@@ -710,6 +720,7 @@ mod tests {
         let nvidia = Target {
             lanes_min: 32,
             lanes_max: 32,
+            stride_table: false,
         };
         let runs = AtomicU64::new(0);
         // Taken for 64-lane hosts, and by the rebuilt translator for any.
@@ -792,6 +803,7 @@ mod tests {
         let nvidia = Target {
             lanes_min: 32,
             lanes_max: 32,
+            stride_table: false,
         };
         let runs = AtomicU64::new(0);
         let get = |target: Target| {
@@ -815,6 +827,7 @@ mod tests {
         let rdna = Target {
             lanes_min: 32,
             lanes_max: 64,
+            stride_table: false,
         };
         assert_ne!(key(&build, nvidia), key(&build, rdna));
         assert_ne!(key(&build, rdna), key(&build, Target::ANY));

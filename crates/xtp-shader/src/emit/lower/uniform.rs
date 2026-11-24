@@ -1112,6 +1112,7 @@ mod tests {
             target: crate::emit::Target {
                 lanes_min: 32,
                 lanes_max: 32,
+                stride_table: false,
             },
             console_cf: false,
             per_lane_only: false,

@@ -1,13 +1,15 @@
 //! Vector memory: buffer loads, stores and atomics (MUBUF, MTBUF) with
 //! the GFX10 buffer formats, and global loads (`global_load_*`). Backlog
-//! R3 (structured buffers of unknown stride).
+//! R3 (structured buffers of unknown stride: through the host's runtime
+//! stride table, [`Lower::runtime_access`]).
 
+use super::descriptor::UNKNOWN_STRIDE;
 use super::{Lower, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Reg};
-use crate::native::ResourceType;
+use crate::native::{ResourceType, UsedResource};
 use crate::resource::{CODE, Source};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,16 +340,15 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
+            // (handle, coordinates); none: through the runtime stride table.
+            let static_view = match index {
+                Some(_) if self.runtime_stride(used)? => None,
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    Some((h, [index, off, iu]))
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => Some((self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu])),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -357,27 +358,45 @@ impl<'a> Lower<'a> {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
-            let r = if op == u32::MAX {
-                // cmpswap: data is (new, compare).
-                let mut args = vec![h];
-                args.extend(coords);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
-                    "atomicCompareExchange.i32",
-                    Attr::NoUnwind,
-                    i32t,
-                    79,
-                    &args,
-                )
-            } else {
-                let mut args = vec![h, self.s.m.i32(op)];
-                args.extend(coords);
-                args.push(vals[0]);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+            let atomic_op = |l: &mut Self, h: V, coords: [V; 3]| -> V {
+                if op == u32::MAX {
+                    // cmpswap: data is (new, compare).
+                    let mut args = vec![h];
+                    args.extend(coords);
+                    args.extend([vals[1], vals[0]]);
+                    l.s.op(
+                        l.cur,
+                        "atomicCompareExchange.i32",
+                        Attr::NoUnwind,
+                        i32t,
+                        79,
+                        &args,
+                    )
+                } else {
+                    let mut args = vec![h, l.s.m.i32(op)];
+                    args.extend(coords);
+                    args.push(vals[0]);
+                    l.s.op(l.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                }
+            };
+            let at = self.begin_guarded(guard);
+            let r = match (static_view, index) {
+                (Some((h, coords)), _) => atomic_op(self, h, coords),
+                (None, Some(index)) => {
+                    // Out of range the console returns 0.
+                    let done = self.runtime_access(src, index, off, 4, 11 | u, |l, h, byte| {
+                        vec![atomic_op(l, h, [byte, iu, iu])]
+                    });
+                    match done {
+                        Ok(r) => r[0],
+                        Err(why) => {
+                            self.end_guarded(at, &[]);
+                            return Err(why);
+                        }
+                    }
+                }
+                (None, None) => unreachable!("runtime strides are for accesses by element"),
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
@@ -422,11 +441,40 @@ impl<'a> Lower<'a> {
                 (69, "bufferStore.f32")
             } else {
                 match index {
+                    Some(index) if self.runtime_stride(used)? => {
+                        // The store in a block of its own under the guard:
+                        // made only where the table's range checks pass.
+                        let mask = (1u8 << count) - 1;
+                        let at = self.begin_guarded(guard);
+                        let done = self.runtime_access(
+                            src,
+                            index,
+                            off,
+                            4 * count,
+                            11 | u,
+                            |l, h, byte| {
+                                let mut args = vec![h, byte, iu];
+                                args.extend(&vals);
+                                args.resize(3 + 4, iu);
+                                args.push(l.s.m.i8(mask));
+                                args.push(l.s.m.i32(4));
+                                let void = l.s.t.void;
+                                l.s.op(
+                                    l.cur,
+                                    "rawBufferStore.i32",
+                                    Attr::NoUnwind,
+                                    void,
+                                    140,
+                                    &args,
+                                );
+                                Vec::new()
+                            },
+                        );
+                        self.end_guarded(at, &[]);
+                        return done.map(|_| ());
+                    }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
                     }
@@ -454,6 +502,7 @@ impl<'a> Lower<'a> {
         };
         // (What can stop the load is checked before its guarded block.)
         let stride = used.map_or(0, |u| u.stride);
+        let mut runtime = false;
         match *format {
             Some(_) if index.is_some() => return Err("a typed-format load by index"),
             Some(_) => {}
@@ -465,9 +514,7 @@ impl<'a> Lower<'a> {
                     self.s.flags |= flags::TYPED_UAV_LOADS;
                 }
             }
-            None if index.is_some() && (stride < 4 || !stride.is_multiple_of(4)) => {
-                return Err("a structured buffer of unknown stride");
-            }
+            None if index.is_some() => runtime = self.runtime_stride(used)?,
             None => {}
         }
         let xs = self.guarded_load(lane_guard, |l| {
@@ -491,6 +538,33 @@ impl<'a> Lower<'a> {
                 let mask = l.s.m.i8((1u8 << count) - 1);
                 let align = l.s.m.i32(4);
                 let (h, coords) = match index {
+                    Some(index) if runtime => {
+                        // Loads where the table's range checks fail read 0.
+                        return l.runtime_access(
+                            src,
+                            index,
+                            off,
+                            4 * count,
+                            11 | u,
+                            |l, h, byte| {
+                                let c = l.cur;
+                                let r = l.s.op(
+                                    c,
+                                    "rawBufferLoad.f32",
+                                    Attr::ReadOnly,
+                                    l.s.t.res_ret,
+                                    139,
+                                    &[h, byte, iu, mask, align],
+                                );
+                                (0..count)
+                                    .map(|k| {
+                                        let x = l.s.m.extract(c, r, k);
+                                        l.as_int(x)
+                                    })
+                                    .collect()
+                            },
+                        );
+                    }
                     Some(index) => (l.handle(site, src, false, (12 | u, stride))?, [index, off]),
                     None => (l.handle(site, src, false, (11 | u, 0))?, [off, iu]),
                 };
@@ -535,6 +609,46 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// Whether an access by element of a buffer whose used-resource entry
+    /// is `used` takes its stride from the host's runtime stride table: one
+    /// whose stride is not known here (0), on a target that has the table
+    /// ([`crate::emit::Target::stride_table`]). A known stride below 4 or
+    /// off a multiple of 4, or an unknown one without the table, is refused.
+    fn runtime_stride(&self, used: Option<&UsedResource>) -> Result<bool, Why> {
+        match used.map_or(0, |u| u.stride) {
+            s if s >= 4 && s.is_multiple_of(4) => Ok(false),
+            0 if self.x.target.stride_table => Ok(true),
+            _ => Err(UNKNOWN_STRIDE),
+        }
+    }
+
+    /// Runs `access` (with the raw handle and the byte in its view) on the
+    /// view the runtime stride table names for `src`'s slot, in the lanes
+    /// where an access of `width` bytes at byte `off` of element `index`
+    /// passes the table's range checks ([`Self::runtime_view`]); what it
+    /// gives is 0 in the others. `props` are the raw handle's (11, with
+    /// the UAV bit for unordered access). The caller's guard, if any, is
+    /// around it: nothing is read for a lane that must not access.
+    pub(super) fn runtime_access(
+        &mut self,
+        src: &Source,
+        index: V,
+        off: V,
+        width: u32,
+        props: u32,
+        access: impl FnOnce(&mut Self, V, V) -> Vec<V>,
+    ) -> Result<Vec<V>, Why> {
+        let (e, byte, valid) = self.runtime_view(src, index, off, width)?;
+        let at = self.begin_guarded(Some(valid));
+        let h = self
+            .s
+            .heap_handle(self.cur, e.raw, false, e.nonuniform, (props, 0));
+        let xs = access(self, h, byte);
+        let zero = self.s.m.i32(0);
+        let pairs: Vec<(V, V)> = xs.iter().map(|&x| (x, zero)).collect();
+        Ok(self.end_guarded(at, &pairs))
     }
 
     /// The dwords `load` gives, computed only in lanes where `guard` holds

@@ -375,7 +375,7 @@ pub fn host_target() -> xtp_shader::emit::Target {
     *TARGET.get_or_init(|| {
         let forced = std::env::var("XTP_HOST_LANES").ok();
         let lanes = host_wave_lanes();
-        let (target, forced) = match target_of(lanes, forced.as_deref()) {
+        let (mut target, forced) = match target_of(lanes, forced.as_deref()) {
             Ok(target) => (target, forced.is_some()),
             Err(text) => {
                 tracing::warn!(text, "XTP_HOST_LANES expects <min>-<max> lanes; ignored");
@@ -383,9 +383,11 @@ pub fn host_target() -> xtp_shader::emit::Target {
                 (host, false)
             }
         };
+        target.stride_table = stride_table_on();
         tracing::info!(
             lanes = format_args!("{} to {}", target.lanes_min, target.lanes_max),
             forced,
+            stride_table = target.stride_table,
             "shaders translated for waves of"
         );
         if !target.runs(64) {
@@ -399,6 +401,29 @@ pub fn host_target() -> xtp_shader::emit::Target {
             );
         }
         target
+    })
+}
+
+/// Whether host view heaps keep a runtime stride table, so that shaders
+/// reading a buffer by element without a stride known at translation
+/// translate ([`xtp_shader::emit::Target::stride_table`]; VIctory #193 and
+/// #704): `XTP_STRIDE_TABLE=1`. Off by default until a Series S session
+/// shows it runs without a device removal (no upstream run did: a
+/// `DEVICE_HUNG` after 111 s, zeros on NVIDIA with #193 alone). Read once.
+/// With it, each view heap holds a table of 8 bytes per slot in upload
+/// memory and 2^16 more slots for raw views (`descriptor::host`).
+#[cfg(windows)]
+pub fn stride_table_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XTP_STRIDE_TABLE").is_ok_and(|v| v == "1");
+        if on {
+            tracing::warn!(
+                "XTP_STRIDE_TABLE=1: buffers read by element of unknown stride translate, \
+                 through a runtime stride table in each view heap (experimental)"
+            );
+        }
+        on
     })
 }
 
@@ -416,6 +441,7 @@ pub(crate) fn target_of(
             Some((min, max)) if min > 0 && min <= max => Target {
                 lanes_min: min,
                 lanes_max: max,
+                stride_table: false,
             },
             _ => Target::ANY,
         });
@@ -434,6 +460,7 @@ pub(crate) fn target_of(
         (Some(min), Some(max)) if min <= max => Ok(Target {
             lanes_min: min,
             lanes_max: max,
+            stride_table: false,
         }),
         _ => Err(text.to_owned()),
     }
@@ -707,6 +734,7 @@ mod tests {
         let lanes = |lanes_min, lanes_max| Target {
             lanes_min,
             lanes_max,
+            stride_table: false,
         };
         assert_eq!(target_of(Some((32, 32)), None), Ok(lanes(32, 32)));
         assert_eq!(target_of(Some((32, 64)), None), Ok(lanes(32, 64)));
