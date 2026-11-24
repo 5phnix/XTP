@@ -640,6 +640,7 @@ impl<'a> Lower<'a> {
                 },
             ));
         }
+        self.exchange_fits().map_err(|w| unsupported(0, w))?;
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {

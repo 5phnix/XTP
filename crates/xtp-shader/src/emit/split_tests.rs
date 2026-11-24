@@ -292,6 +292,45 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
+/// The halves exchange through two group-shared dwords next to the
+/// program's own LDS. With 32 KiB of LDS, DXIL's limit, there is no room:
+/// the program stops with that reason rather than giving a module the
+/// validator refuses. 31.5 KiB leave room. (No device needed.)
+#[test]
+fn the_halves_exchange_must_fit_next_to_the_programs_lds() {
+    let body = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let with_lds = |granules: u32| {
+        let mut p = program(&body, 64);
+        let StageIo::Cs(io) = &mut p.io else {
+            unreachable!()
+        };
+        io.rsrc2 |= granules << 15;
+        p
+    };
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    assert_eq!(
+        emit_for(&with_lds(64), nvidia).err(),
+        Some(crate::ShaderError::Unsupported {
+            offset: 0,
+            what: "a wave64 program whose LDS leaves no room for its halves' exchange",
+        })
+    );
+    assert!(emit_for(&with_lds(63), nvidia).is_ok());
+    // A host with 64-lane waves exchanges nothing.
+    let rdna = super::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+    assert!(emit_for(&with_lds(64), rdna).is_ok());
+}
+
 /// A branch on the SCC of `s_and_saveexec` (some lane is left in the new
 /// EXEC), with no lane left: the console skips the block, so the scalar
 /// write inside never happens and every lane stores the 3 from before.

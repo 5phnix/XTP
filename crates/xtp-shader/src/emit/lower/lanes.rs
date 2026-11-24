@@ -578,6 +578,18 @@ impl<'a> Lower<'a> {
         (lane, half)
     }
 
+    /// Console flow in halves: whether the two group-shared dwords the
+    /// halves exchange through ([`Self::exchange`]) fit next to the
+    /// program's own LDS in DXIL's 32 KiB of group-shared memory. (A group
+    /// of 32 threads or fewer exchanges nothing.)
+    pub(super) fn exchange_fits(&self) -> Result<(), Why> {
+        let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if self.console_cf && self.split && threads > 32 && self.s.lds_dwords + 2 > 8192 {
+            return Err("a wave64 program whose LDS leaves no room for its halves' exchange");
+        }
+        Ok(())
+    }
+
     /// Console flow: each half gives `x` (the same in all its lanes) and
     /// both get (the lower half's, the upper half's): through two group-
     /// shared dwords between group barriers, which every thread of the
