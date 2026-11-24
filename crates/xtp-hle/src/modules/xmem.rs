@@ -14,14 +14,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, GetLastError, HANDLE, INVALID_HANDLE_VALUE, SetLastError,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_FREE,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
+    VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -29,8 +30,9 @@ use windows_sys::Win32::System::ProcessStatus::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
+use xtp_gpu::uma;
 
-use crate::{HleModule, hle_export};
+use crate::{HleExport, HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
@@ -153,6 +155,17 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() {
+        // Heaps over title memory (`xtp_gpu::uma`, with `XTP_UMA=1`) follow
+        // what the title reserves and commits. Placeholders are left out:
+        // the title maps physical pages there, and heaps over those sit on
+        // our own view of them (`Section`).
+        if constrained && kind & MEM_RESERVE_PLACEHOLDER == 0 {
+            uma::reserved(at as usize, size);
+        } else if kind & MEM_COMMIT != 0 {
+            uma::committed(at as usize, size);
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -314,13 +327,13 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
     }
+    if attributes & ALLOC_32BIT != 0 {
+        free(address, 0, MEM_RELEASE);
+        return;
+    }
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
-    // whole reservation, or a header-prefixed block.
+    // header-prefixed block.
     unsafe {
-        if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
-            return;
-        }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
         dealloc(
@@ -333,6 +346,87 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
 /// A retail console has no tools memory.
 pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
     0
+}
+
+// The memory API set's `VirtualAlloc` and `VirtualFree`, which the title's
+// exe imports: the host's, with the GPU side's heaps over title memory
+// (`xtp_gpu::uma`) kept in step. Nothing else changes; with `XTP_UMA` off,
+// nothing at all. The set's other functions still go to the host.
+
+/// The title's `VirtualAlloc`: what it commits of title memory gets heaps.
+pub extern "system" fn title_virtual_alloc(
+    address: *const c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+) -> *mut c_void {
+    // SAFETY: the title's own arguments, forwarded.
+    let at = unsafe { VirtualAlloc(address, size, kind, protect) };
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        let from = if address.is_null() {
+            at.cast_const()
+        } else {
+            address
+        };
+        uma::committed(from as usize, size);
+    }
+    at
+}
+
+/// The title's `VirtualFree`.
+pub extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    free(address, size, kind)
+}
+
+/// The host's `MEM_COALESCE_PLACEHOLDERS` (not in windows-sys).
+const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+
+/// `VirtualFree`, the heaps over the memory released first: the host
+/// refuses to decommit or release memory under an open heap (error 87).
+/// What is still committed there gets heaps again after.
+fn free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    // Splitting and merging placeholders changes no committed memory.
+    let placeholders = kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) != 0;
+    if !uma::enabled() || placeholders {
+        // SAFETY: the caller's own arguments, forwarded.
+        return unsafe { VirtualFree(address, size, kind) };
+    }
+    let (at, len) = match size {
+        // The whole allocation, as the host reads a size of 0.
+        0 => allocation(address as usize),
+        size => (address as usize, size),
+    };
+    let change = uma::changing(at, len);
+    // SAFETY: as above.
+    let done = change.call(|| unsafe { VirtualFree(address, size, kind) } != 0);
+    // SAFETY: plain calls; the caller reads the host's error after.
+    let error = unsafe { GetLastError() };
+    change.done(done && kind & MEM_RELEASE != 0);
+    // SAFETY: as above.
+    unsafe { SetLastError(error) };
+    done.into()
+}
+
+/// The allocation holding `at`: its base and its size, all its regions.
+fn allocation(at: usize) -> (usize, usize) {
+    let query = |at: usize| {
+        // SAFETY: plain data; zero is a valid value.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space into a sized structure.
+        let found = unsafe { VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+        (found != 0).then_some(info)
+    };
+    let Some(info) = query(at) else {
+        return (at, 0);
+    };
+    let base = info.AllocationBase as usize;
+    let mut end = base;
+    while let Some(region) =
+        query(end).filter(|r| r.AllocationBase as usize == base && r.State != MEM_FREE)
+    {
+        end = region.BaseAddress as usize + region.RegionSize;
+    }
+    (base, end - base)
 }
 
 // Physical pages: on the console, 64 KiB frames a title maps into its own
@@ -426,6 +520,9 @@ impl Section {
             return Err(error);
         }
         MAPS.fetch_add(1, Ordering::Relaxed);
+        // The GPU side's heaps over physical pages sit on this view, which
+        // nothing unmaps while the section lives (`xtp_gpu::uma`).
+        uma::mapped(base, size);
         Ok(Section {
             handle,
             base,
@@ -467,6 +564,7 @@ impl Section {
             for p in from..page {
                 self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::Release);
             }
+            uma::committed(self.at(from) as usize, (page - from) * PAGE);
         }
         true
     }
@@ -481,14 +579,18 @@ impl Drop for Section {
             commits = self.commits.load(Ordering::Relaxed),
             "physical pages released"
         );
+        // Heaps on our view go first: the host keeps a view mapped under one.
+        let change = uma::changing(self.base, self.pages * PAGE);
         // SAFETY: our view and handle; nothing refers to the section any more
         // (title views hold it through their slices).
-        unsafe {
+        change.call(|| unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                 Value: self.base as *mut c_void,
-            });
-            CloseHandle(self.handle);
-        }
+            }) != 0
+        });
+        // SAFETY: as above.
+        unsafe { CloseHandle(self.handle) };
+        change.done(true);
         UNMAPS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -944,7 +1046,9 @@ fn commit_limit_message(
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
-/// are mapped again outside it.
+/// are mapped again outside it. No GPU heap is ever open over these views
+/// (`xtp_gpu::uma` opens physical pages on our own view of them), so none
+/// holds them mapped.
 fn unmap(views: &mut Views, base: usize, len: usize) {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
@@ -1071,8 +1175,18 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
-        dlls: &["xmem.dll"],
+        // The memory API set for `VirtualAlloc` and `VirtualFree` alone;
+        // its other functions are not here, so they bind to the host's.
+        dlls: &["xmem.dll", "api-ms-win-core-memory-*"],
         exports: vec![
+            HleExport {
+                name: "VirtualAlloc",
+                address: title_virtual_alloc as *const () as usize,
+            },
+            HleExport {
+                name: "VirtualFree",
+                address: title_virtual_free as *const () as usize,
+            },
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
             hle_export!(XMemAllocDefault),
@@ -1623,6 +1737,144 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(a.len(), a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(b.len(), b.as_ptr()), 1);
+    }
+
+    /// With heaps open over title memory (`XTP_UMA=1`), the title's calls
+    /// that change it still succeed: xmem has the heaps released first, then
+    /// opened again over what remains. Physical pages get theirs on our own
+    /// view, so the title's views still unmap. Run alone in a child process:
+    /// with UMA on, other tests' plain host frees would fail under heaps.
+    #[test]
+    fn title_calls_succeed_under_open_heaps() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, MEM_FREE};
+        use xtp_gpu::uma::{lookup, settle};
+        const TEST: &str = "title_calls_succeed_under_open_heaps";
+        if !alone_with_uma(TEST) {
+            return;
+        }
+        if let Err(reason) = xtp_gpu::uma::ready() {
+            let strict =
+                std::env::var_os("XTP_REQUIRE_GPU").is_some_and(|v| !v.is_empty() && v != "0");
+            assert!(!strict, "{TEST} needs a host GPU: {reason}");
+            eprintln!("SKIPPED {TEST}: {reason}");
+            return;
+        }
+        const LEN: usize = 16 * PAGE;
+        let open = |at: *mut c_void, len: usize| lookup(at as usize, len).is_some();
+        let page = |at: *mut c_void, n: usize| at.wrapping_byte_add(n * PAGE);
+        let host_decommit = |at: *mut c_void, len: usize| {
+            // SAFETY: title memory of this test; refused under a heap.
+            unsafe { VirtualFree(at, len, MEM_DECOMMIT) != 0 }
+        };
+
+        // Reserved and committed at once, as the title's pools are.
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            LEN,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        settle();
+        assert!(open(a, LEN), "a heap over it");
+        assert!(!host_decommit(page(a, 1), PAGE), "the heap pins it");
+        // SAFETY: committed read-write.
+        unsafe { page(a, 8).cast::<u8>().write(0x5a) };
+        // The title decommits a page: done, and what remains opens again.
+        assert_eq!(title_virtual_free(page(a, 1), PAGE, MEM_DECOMMIT), 1);
+        assert_eq!(state(page(a, 1) as usize), MEM_RESERVE);
+        settle();
+        assert!(open(a, PAGE) && open(page(a, 2), LEN - 2 * PAGE));
+        assert!(!open(page(a, 1), 1));
+        // SAFETY: still committed.
+        assert_eq!(unsafe { page(a, 8).cast::<u8>().read() }, 0x5a);
+        // Commits it again (the memory API set's `VirtualAlloc`), then
+        // releases it all.
+        let again = title_virtual_alloc(page(a, 1), PAGE, MEM_COMMIT, PAGE_READWRITE);
+        assert_eq!(again, page(a, 1));
+        settle();
+        assert!(open(page(a, 1), PAGE));
+        assert_eq!(title_virtual_free(a, 0, MEM_RELEASE), 1);
+        assert_eq!(state(a as usize), MEM_FREE);
+        assert!(!open(a, 1));
+
+        // Reserved, then committed and decommitted by the title.
+        let b = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            LEN,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!b.is_null());
+        settle();
+        assert!(!open(b, 1));
+        assert_eq!(title_virtual_alloc(b, LEN, MEM_COMMIT, PAGE_READWRITE), b);
+        settle();
+        assert!(open(b, LEN));
+        assert_eq!(title_virtual_free(b, LEN, MEM_DECOMMIT), 1);
+        settle();
+        assert!(!open(b, 1));
+        assert_eq!(title_virtual_free(b, 0, MEM_RELEASE), 1);
+
+        // 32-bit memory, freed by `XMemFreeDefault`.
+        let c = XMemAllocDefault(4 * PAGE, ALLOC_32BIT);
+        assert!(!c.is_null());
+        settle();
+        assert!(open(c, 4 * PAGE));
+        XMemFreeDefault(c, ALLOC_32BIT);
+        assert_eq!(state(c as usize), MEM_FREE);
+
+        // Physical pages, all written (so committed): a heap on our view.
+        let pages = allocate(16);
+        let ours = slice(pages[0]).section.base;
+        assert!(write_physical(&pages, 0, &pattern(16 * PAGE)));
+        settle();
+        assert!(lookup(ours, 16 * PAGE).is_some(), "a heap on our view");
+        // The title maps them and unmaps them again.
+        let view = reserve(16);
+        assert_eq!(XMemMapPhysicalPages(view, 16, pages.as_ptr()), view);
+        assert_eq!(XMemMapPhysicalPages(view, 16, std::ptr::null()), view);
+        assert_eq!(
+            state(view as usize),
+            MEM_RESERVE,
+            "the title's view unmapped"
+        );
+        // Freeing them unmaps our view, its heap released first.
+        assert_eq!(XMemFreePhysicalPages(16, pages.as_ptr()), 1);
+        assert_eq!(state(ours), MEM_FREE);
+        assert!(lookup(ours, 1).is_none());
+    }
+
+    /// Runs test `name` of this module alone, in a child process with
+    /// `XTP_UMA=1`, and checks that it passed there. True in that child,
+    /// where the test then goes on.
+    fn alone_with_uma(name: &str) -> bool {
+        const CHILD: &str = "XTP_UMA_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(xtp_gpu::uma::enabled(), "XTP_UMA=1 in the child");
+            return true;
+        }
+        let module = module_path!();
+        let path = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let test = format!("{path}::{name}");
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("XTP_UMA", "1")
+            .output()
+            .expect("the child runs");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        println!("{text}");
+        assert!(out.status.success(), "{test} failed in its child process");
+        assert!(text.contains("1 passed"), "{test} did not run in its child");
+        false
     }
 
     /// Writes into physical pages as DirectStorage's workers make them:

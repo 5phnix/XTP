@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod conventions;
+mod play;
 mod policy;
 mod pr_check;
 
@@ -64,6 +65,24 @@ enum Cmd {
     },
     /// Point git at .githooks/: commits run the policy and message checks.
     InstallHooks,
+    /// Run the title from a copy of the golden data folder to gameplay with
+    /// the autopilot, then leave the controls to you (docs/dev/autopilot.md).
+    Play {
+        /// End the title after this many seconds of gameplay and print a
+        /// summary of its frame-rate lines.
+        #[arg(long, value_name = "SECONDS")]
+        measure: Option<u64>,
+        /// The autopilot script (default: autopilot/gameplay.txt).
+        #[arg(long)]
+        script: Option<PathBuf>,
+        /// The title executable (default: game_scarlett_master.exe in the
+        /// game folder).
+        #[arg(long)]
+        exe: Option<PathBuf>,
+        /// Run the diagnostics build as it is, without cargo build.
+        #[arg(long)]
+        no_build: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -107,6 +126,20 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Cmd::Play {
+            measure,
+            script,
+            exe,
+            no_build,
+        } => play::run(
+            &root,
+            &play::Options {
+                measure,
+                script,
+                exe,
+                no_build,
+            },
+        ),
     }
 }
 

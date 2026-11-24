@@ -338,6 +338,54 @@ impl HostHeap {
         };
     }
 
+    /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
+    /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
+    /// size, whose reads past it return zeros instead of reaching whatever
+    /// the host placed after the buffer.
+    ///
+    /// The last dword is whole even when `len` is not a multiple of 4 (host
+    /// copies are rounded up to 64 KiB, so it is inside `buffer`), and the
+    /// view stops at D3D12's 2^27 buffer view elements (512 MiB).
+    pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        const MAX_ELEMENTS: u64 = 1 << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
+        let Some(host) = host() else { return };
+        let elements = len.div_ceil(4).clamp(1, MAX_ELEMENTS) as u32;
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: elements,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live buffer covering the range.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+        };
+        self.keep(index, Some(buffer.clone()));
+    }
+
+    /// Makes slot `index` a raw buffer view that reads zeros.
+    pub(crate) fn null_raw_at(&self, index: u32) {
+        null_buffer_view(self.cpu(index));
+        self.keep(index, None);
+    }
+
+    /// The shader-visible handle of slot `index`.
+    pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: a live shader-visible heap.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: start + u64::from(index) * u64::from(self.step),
+        }
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
@@ -1003,5 +1051,107 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A root SRV's one-view table (VIctory #493): a shader reading 64
+    /// words through a raw view of 30 bytes from byte 16 of a host copy
+    /// gets words 4 to 11 (the partial last one whole) and zeros after
+    /// them, although the copy holds data there.
+    #[test]
+    fn root_srv_views_read_zeros_past_their_end() {
+        use crate::testgpu::{TitleBuffer, TitleList, pattern};
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(id.x * 4, src.Load(id.x * 4));
+}
+"#;
+        let test = "descriptor::host::tests::root_srv_views_read_zeros_past_their_end";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let heap = HostHeap::new(false, 4).expect("a host view heap");
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("root srv test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the test kernel compiles");
+        let code = code.expect("compiled code");
+        // SAFETY: the blob's own bytes, which hold the root signature.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: plain object creation from live bytes.
+        let (root, pso) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        let src = TitleBuffer::new(1 << 16);
+        src.set_words(pattern);
+        let dst = TitleBuffer::new(1 << 16);
+        dst.set_words(|_| 0xdead_beef);
+        let (from, to) = (src.shadow(), dst.shadow());
+        let slot = heap.dynamic(1).expect("a dynamic slot");
+        heap.raw_at(slot, &from.buffer, from.offset(src.address()) + 16, 30);
+
+        let list = TitleList::new();
+        let l = list.host();
+        from.refresh(l, src.address(), 256);
+        to.refresh(l, dst.address(), 256);
+        to.gpu_writes(l, dst.address(), 256);
+        l.keep(&root);
+        l.keep(&pso);
+        // SAFETY: an open list; live objects kept until it is reset; the
+        // slot is in the heap set on it.
+        unsafe {
+            l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.list.SetComputeRootSignature(&root);
+            l.list.SetPipelineState(&pso);
+            l.list
+                .SetComputeRootDescriptorTable(0, heap.gpu_handle(slot));
+            l.list
+                .SetComputeRootUnorderedAccessView(1, to.gpu(dst.address()));
+            l.list.Dispatch(1, 1, 1);
+        }
+        list.run();
+        let words = dst.words();
+        let wanted: Vec<u32> = (0..64)
+            .map(|i| if i < 8 { pattern(i + 4) } else { 0 })
+            .collect();
+        assert_eq!(words[..64], wanted[..]);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
