@@ -95,6 +95,7 @@ creates committed DEFAULT resources one after the other and times each call
 | 15:20 | A holds 6.0 GB, B allocates 64 MB buffers | B: 2.44 GB | 717–739 ms |
 | 15:22 | BC7 1.4 MB, `CREATE_NOT_ZEROED` | 8.28 GB | 308–1 395 ms |
 | 15:27 | BC7 1.4 MB, right after Windows Memory Cleaner emptied the RAM lists (free/zero pages 0.37 → 40.3 GB, standby 41 → 2.7 GB, modified 4.9 → 0.02 GB) | 8.13 GB | 325–577 ms; VidMm plateau 9.64 GB resident, 6.03 GB of free VRAM pages |
+| 15:34 | BC7 1.4 MB, right after `pnputil /restart-device` of the 4080 (new adapter LUID 0x197347a5, VidMm counters back to zero) | 8.0 GB | 0.19–1.3 s; 8.81 GB reached in 51 s; plateau 9.66 GB resident, 6.01 GB free |
 
 Below the threshold a call takes 0.3 ms (texture) to 2–7 ms (buffer).
 
@@ -135,6 +136,12 @@ nor the pipeline library, audio, TMP, focus or keys (run-world's
 bisection).
 
 ## 5. Why earlier sessions passed (not settled yet)
+
+Restarting the display device (15:34Z) reloaded the NVIDIA driver and gave
+VidMm a new adapter object, and the threshold stayed where it was (§3). The
+driver's state after the TDRs (lead d) is therefore not the cause, and
+explanation 2 below is now the more likely; only a full reboot can still
+tell it from a global Windows state.
 
 The same binary reached the world in C (13:25Z), test1 (13:20Z) and E
 (13:33Z). Their loads were already very slow: E presented frames 2.8 to
