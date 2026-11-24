@@ -72,7 +72,7 @@ Send-XtpVmToolFolder $cfg $zone
 # Who runs this, shown to whoever waits for the VM: the Hangar pane (or the
 # user) and the worktree.
 $who = if ($env:HANGAR_PANE_NAME) { $env:HANGAR_PANE_NAME } else { $env:USERNAME }
-$owner = "$who ($(Split-Path -Leaf $(if ($Repo) { $Repo } else { $script:XtpRepoRoot })), $env:COMPUTERNAME)"
+$owner = "$who ($(Split-Path -Leaf $(if ($Repo) { (Resolve-Path -LiteralPath $Repo).Path } else { $script:XtpRepoRoot })), $env:COMPUTERNAME)"
 
 # The code to build: a bundle of the local commit, or the VM clone's origin.
 $source = @{}
