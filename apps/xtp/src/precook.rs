@@ -143,9 +143,13 @@ fn precook(o: Options) -> Result<()> {
         .jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
         .max(1);
-    let pass = pass(&data, o.pipelines, threads, o.wait.then_some(&machine), |c, s, p| {
-        gpu::container(c, s, p).into()
-    });
+    let pass = pass(
+        &data,
+        o.pipelines,
+        threads,
+        o.wait.then_some(&machine),
+        |c, s, p| gpu::container(c, s, p).into(),
+    );
     gpu::finish();
     let counts = gpu::counts();
     let seconds = started.elapsed().as_secs_f64();
@@ -155,7 +159,14 @@ fn precook(o: Options) -> Result<()> {
         .with_context(|| format!("writing {}", note_path.display()))?;
     print!(
         "{}",
-        report(&pass, &counts, o.pipelines, threads, seconds, gpu::refusals())
+        report(
+            &pass,
+            &counts,
+            o.pipelines,
+            threads,
+            seconds,
+            gpu::refusals()
+        )
     );
     if let Some(out) = &o.list {
         std::fs::write(out, list(&pass)).with_context(|| format!("writing {}", out.display()))?;
@@ -248,8 +259,8 @@ impl From<xtp_gpu::pipeline::precook::Outcome> for Outcome {
 struct Item {
     offset: usize,
     name: Option<String>,
-    /// The first 8 bytes of the container's BLAKE3, as the pipeline log
-    /// prints them (`hash=`); empty for a corrupt record.
+    /// The container's BLAKE3 in hexadecimal (its first 16 digits are the
+    /// `hash=` of the pipeline log); empty for a corrupt record.
     hash: String,
     done: Done,
 }
@@ -275,13 +286,7 @@ fn container_bytes<'a>(source: &'a Source<'_>) -> Option<Cow<'a, [u8]>> {
 /// Precooks every container of the pack in `data` on `threads` threads with
 /// `cook` (container, stage, pipelines), pausing while `machine` says a
 /// title runs.
-fn pass<C>(
-    data: &[u8],
-    pipelines: bool,
-    threads: usize,
-    machine: Option<&Machine>,
-    cook: C,
-) -> Pass
+fn pass<C>(data: &[u8], pipelines: bool, threads: usize, machine: Option<&Machine>, cook: C) -> Pass
 where
     C: Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Outcome + Sync,
 {
@@ -352,8 +357,28 @@ where
     });
     // In the pack's order (`sources`'s), whichever thread took each.
     items.sort_by_key(|&(i, _)| i);
-    Pass {
-        items: items.into_iter().map(|(_, item)| item).collect(),
+    let mut items: Vec<Item> = items.into_iter().map(|(_, item)| item).collect();
+    first_takes_the_outcome(&mut items);
+    Pass { items }
+}
+
+/// Gives a repeated container's outcome to its first record in pack order:
+/// the thread that cooked it may have taken a later one.
+fn first_takes_the_outcome(items: &mut [Item]) {
+    let mut first = std::collections::HashMap::new();
+    for k in 0..items.len() {
+        if items[k].hash.is_empty() {
+            continue;
+        }
+        match first.get(&items[k].hash) {
+            None => {
+                first.insert(items[k].hash.clone(), k);
+            }
+            Some(&i) if items[k].done != Done::Repeated => {
+                items[i].done = std::mem::replace(&mut items[k].done, Done::Repeated);
+            }
+            Some(_) => {}
+        }
     }
 }
 
@@ -380,7 +405,7 @@ where
         };
     };
     let full = blake3::hash(&bytes);
-    let hash = full.to_hex()[..16].to_owned();
+    let hash = full.to_hex().to_string();
     let first = seen
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -559,7 +584,7 @@ fn list(pass: &Pass) -> String {
             "{:#x}\t{}\t{}\t{what}",
             item.offset,
             item.name.as_deref().unwrap_or("-"),
-            if item.hash.is_empty() { "-" } else { &item.hash }
+            item.hash.get(..16).unwrap_or("-")
         );
     }
     o
@@ -809,10 +834,43 @@ mod tests {
         let lines: Vec<&str> = list.lines().collect();
         assert_eq!(lines.len(), 4);
         let hash_a = &blake3::hash(&a).to_hex()[..16];
-        assert!(lines[0].contains("CS_A") && lines[0].contains(hash_a) && lines[0].ends_with("- ready"));
+        assert!(
+            lines[0].contains("CS_A") && lines[0].contains(hash_a) && lines[0].ends_with("- ready")
+        );
         assert!(lines[1].ends_with("- refused: a scalar memory read as data"));
         assert!(lines[2].contains("CS_A_again") && lines[2].ends_with("repeated"));
         assert!(lines[3].ends_with("corrupt"));
+    }
+
+    /// Whichever record a thread cooked, the first one in pack order shows
+    /// the outcome and the others are repeats.
+    #[test]
+    fn the_first_record_takes_a_repeated_containers_outcome() {
+        let item = |hash: &str, done| Item {
+            offset: 0,
+            name: None,
+            hash: hash.to_owned(),
+            done,
+        };
+        let mut items = vec![
+            item("aa", Done::Repeated),
+            item("", Done::Corrupt),
+            item("bb", Done::Cooked(None, Outcome::NoPipeline)),
+            item("aa", Done::Cooked(None, Outcome::Ready)),
+            item("aa", Done::Repeated),
+        ];
+        first_takes_the_outcome(&mut items);
+        let done: Vec<&Done> = items.iter().map(|i| &i.done).collect();
+        assert_eq!(
+            done,
+            [
+                &Done::Cooked(None, Outcome::Ready),
+                &Done::Corrupt,
+                &Done::Cooked(None, Outcome::NoPipeline),
+                &Done::Repeated,
+                &Done::Repeated,
+            ]
+        );
     }
 
     /// A container stored as is is cut where its header says it ends.

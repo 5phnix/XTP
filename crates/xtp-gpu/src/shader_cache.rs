@@ -893,11 +893,18 @@ mod tests {
         let changed = format!("{:032x}", fingerprint ^ 1);
         assert_eq!(get(build_of(&changed, ENCODING, settings)), Ok(shader()));
         assert_eq!(runs(), 2, "a changed translator translates again");
-        assert_ne!(build_of(xtp_shader::SOURCES, b"another encoding", settings), ours);
+        assert_ne!(
+            build_of(xtp_shader::SOURCES, b"another encoding", settings),
+            ours
+        );
         for i in 0..settings.len() {
             let mut other = settings;
             other[i] ^= 1;
-            assert_ne!(build_of(xtp_shader::SOURCES, ENCODING, other), ours, "setting {i}");
+            assert_ne!(
+                build_of(xtp_shader::SOURCES, ENCODING, other),
+                ours,
+                "setting {i}"
+            );
         }
     }
 

@@ -204,9 +204,9 @@ fn precook(xtp: &Path, game: &Path) -> Result<()> {
             "play: precook failed ({status}) after {seconds:.0} s; the title starts with the \
              cache as it is"
         ),
-        Err(e) => println!(
-            "play: precook did not start ({e}); the title starts with the cache as it is"
-        ),
+        Err(e) => {
+            println!("play: precook did not start ({e}); the title starts with the cache as it is")
+        }
     }
     Ok(())
 }

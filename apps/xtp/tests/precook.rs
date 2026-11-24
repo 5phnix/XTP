@@ -32,8 +32,7 @@ fn compute_container() -> Vec<u8> {
     r[0x14..0x18].copy_from_slice(&(1u32 << 5).to_le_bytes()); // wave32
     r[0x50..0x54].copy_from_slice(&(4u32 | 8 << 20).to_le_bytes()); // VGPRs, SGPRs
     let stage = RECORD;
-    r[stage + 0x28..stage + 0x34]
-        .copy_from_slice(&[64u32, 1, 1].map(u32::to_le_bytes).concat()); // threads
+    r[stage + 0x28..stage + 0x34].copy_from_slice(&[64u32, 1, 1].map(u32::to_le_bytes).concat()); // threads
     payload.extend_from_slice(&r);
     payload.extend_from_slice(&code);
 
@@ -207,7 +206,9 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     assert_eq!(figure(out, "from cache"), Some(0), "{out}");
     assert_eq!(figure(out, "refused"), Some(1), "{out}");
     assert!(
-        out.contains("compute      1 programs: 1 host pipelines made, 0 from the library, 0 without one"),
+        out.contains(
+            "compute      1 programs: 1 host pipelines made, 0 from the library, 0 without one"
+        ),
         "{out}\n{}",
         first.err
     );
@@ -216,11 +217,19 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     assert!(
         listed
             .lines()
-            .any(|l| l.contains("CS_Synthetic_0011aabb_Wrapped") && l.contains(hash) && l.ends_with("Cs ready")),
+            .any(|l| l.contains("CS_Synthetic_0011aabb_Wrapped")
+                && l.contains(hash)
+                && l.ends_with("Cs ready")),
         "{listed}"
     );
-    assert!(listed.contains("refused: malformed shader: no DXIL part"), "{listed}");
-    let library = dir.path().join("cache/pipelines/host-pipelines.bin").is_file();
+    assert!(
+        listed.contains("refused: malformed shader: no DXIL part"),
+        "{listed}"
+    );
+    let library = dir
+        .path()
+        .join("cache/pipelines/host-pipelines.bin")
+        .is_file();
 
     let second = precook(&xtp, dir.path(), &pack_path, &[]).unwrap();
     assert!(second.out.contains("up to date"), "{}", second.out);
@@ -244,7 +253,11 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     bytes.push(0);
     std::fs::write(&other, bytes).unwrap();
     let same = precook(&other, dir.path(), &pack_path, &[]).unwrap();
-    assert!(same.out.contains("up to date"), "the same key: {}", same.out);
+    assert!(
+        same.out.contains("up to date"),
+        "the same key: {}",
+        same.out
+    );
     let shared = precook(&other, dir.path(), &pack_path, &["--force"]).unwrap();
     assert_eq!(figure(&shared.out, "translated"), Some(0), "{}", shared.out);
     assert_eq!(figure(&shared.out, "from cache"), Some(1), "{}", shared.out);
