@@ -38,6 +38,14 @@
 //! is made of uniform atoms: SCC values that are uniform, and lane bits of
 //! compares and carries of uniform values ([`Tracer::lane_bit_uniform`]).
 //!
+//! Without uniformity, a first-lane read is still followed when the VGPR
+//! it reads is computed from constants and scalars only, in the read's
+//! block after its last EXEC write ([`Tracer::first_lane_folded`]): the
+//! first active lane ran each of those instructions, so the address is that
+//! sum, and it is traced as such, with no lane's VGPR left in it. The
+//! exposure passes compute their table index so (a clamp of constants)
+//! under a narrowed EXEC, where the console flow forbids the uniform claim.
+//!
 //! Not taken from upstream, each a claim that holds in no lowering:
 //! - `s_cbranch_execz` and `s_cbranch_execnz` as uniform branches. The
 //!   per-lane form branches on the lane's own EXEC bit there, so a value
