@@ -621,6 +621,15 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Work of XTP's own bound its heaps, root signature and pipeline on
+    /// the host list (`crate::list`'s upscale and UAV clears): the next draw
+    /// or dispatch binds the title's again.
+    pub(crate) fn forget_host(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
