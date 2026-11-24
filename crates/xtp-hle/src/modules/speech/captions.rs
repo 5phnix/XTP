@@ -1,3 +1,5 @@
+//! Windows caption preferences, the title's enabled override, and high-contrast mode.
+
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::{HRESULT, S_OK, This, put};
@@ -7,6 +9,7 @@ const FOLLOW_WINDOWS: u8 = 2;
 static ENABLED: AtomicU8 = AtomicU8::new(FOLLOW_WINDOWS);
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct Properties {
     background: [u8; 4],
     text: [u8; 4],
@@ -43,9 +46,10 @@ impl Properties {
 }
 
 pub(super) extern "system" fn properties(_: This, out: *mut Properties) -> HRESULT {
-    let settings = Properties::default();
     #[cfg(windows)]
-    let settings = host::captions(settings);
+    let settings = host::captions();
+    #[cfg(not(windows))]
+    let settings = Properties::default();
     settings.write(out, ENABLED.load(Ordering::Relaxed))
 }
 
@@ -65,12 +69,28 @@ pub(super) extern "system" fn high_contrast(_: This, out: *mut u32) -> HRESULT {
 #[cfg(windows)]
 mod host {
     use super::Properties;
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
     use windows::Media::ClosedCaptioning::{
         ClosedCaptionColor as Color, ClosedCaptionOpacity as Opacity,
         ClosedCaptionProperties as Captions, ClosedCaptionSize as Size,
     };
     use windows::UI::ViewManagement::{AccessibilitySettings, UIElementType, UISettings};
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHOWSOUNDS};
+
+    const REFRESH: Duration = Duration::from_secs(1);
+
+    fn cached<T: Copy>(cache: &Mutex<Option<(Instant, T)>>, read: impl FnOnce() -> T) -> T {
+        let mut entry = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((at, value)) = *entry
+            && at.elapsed() < REFRESH
+        {
+            return value;
+        }
+        let value = read();
+        *entry = Some((Instant::now(), value));
+        value
+    }
 
     // The caption ABI stores alpha first. Windows lets the user override the
     // color and opacity independently, including setting just one of them.
@@ -107,7 +127,13 @@ mod host {
         }
     }
 
-    pub(super) fn captions(defaults: Properties) -> Properties {
+    pub(super) fn captions() -> Properties {
+        static CAPTIONS: Mutex<Option<(Instant, Properties)>> = Mutex::new(None);
+        cached(&CAPTIONS, read_captions)
+    }
+
+    fn read_captions() -> Properties {
+        let defaults = Properties::default();
         // The Windows and title enums use the same values for font styles and edges.
         let style = Captions::FontStyle().unwrap_or_default().0;
         let edge = Captions::FontEffect().unwrap_or_default().0;
@@ -148,6 +174,11 @@ mod host {
     }
 
     pub(super) fn contrast() -> u32 {
+        static CONTRAST: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
+        cached(&CONTRAST, read_contrast)
+    }
+
+    fn read_contrast() -> u32 {
         if !AccessibilitySettings::new()
             .and_then(|s| s.HighContrast())
             .unwrap_or(false)
@@ -170,6 +201,15 @@ mod host {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn repeated_polls_reuse_the_value_until_refresh() {
+            let mut cache = Mutex::new(None);
+            assert_eq!(cached(&cache, || 1), 1);
+            assert_eq!(cached(&cache, || panic!("unexpected refresh")), 1);
+            *cache.get_mut().unwrap() = Some((Instant::now() - REFRESH, 1));
+            assert_eq!(cached(&cache, || 2), 2);
+        }
 
         #[test]
         fn independent_color_opacity_and_size_preferences() {
@@ -243,11 +283,11 @@ mod tests {
         assert_eq!(get(&OBJECT, std::ptr::null_mut()), E_INVALIDARG);
         assert_eq!(contrast(&OBJECT, std::ptr::null_mut()), E_INVALIDARG);
         let previous = ENABLED.load(Ordering::Relaxed);
-        for choice in [1, 0] {
+        for (choice, expected) in [(0, 0), (2, 1), (0, 0), (0xff, 1), (1, 1), (0, 0)] {
             let mut result = Properties::default();
             assert_eq!(set(&OBJECT, choice), S_OK);
             assert_eq!(get(&OBJECT, &mut result), S_OK);
-            assert_eq!(result.enabled, choice);
+            assert_eq!(result.enabled, expected);
         }
         ENABLED.store(previous, Ordering::Relaxed);
         let mut mode = u32::MAX;

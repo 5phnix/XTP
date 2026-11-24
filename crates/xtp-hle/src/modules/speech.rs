@@ -1,5 +1,5 @@
-//! Accessibility: caption preferences, high contrast and speech synthesis. No voice is
-//! installed here, and every stream is valid WAVE audio of no length, so
+//! Accessibility covers caption preferences, high contrast and speech synthesis.
+//! No voice is installed here. Each stream is a valid, empty WAVE file, so
 //! narration is silent.
 // shortcut: silent speech. The host's engine (SAPI through COM, or WinRT
 // speech synthesis) needs COM bindings this crate has only in diagnostics
@@ -101,9 +101,9 @@ static VTABLE: Methods<22> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    captions::properties as *const (),    // 0x18
+    captions::properties as *const (),    // 0x18 closed captions
     captions::set_enabled as *const (),   // 0x20
-    captions::high_contrast as *const (), // 0x28
+    captions::high_contrast as *const (), // 0x28 high contrast
     missing::<6> as *const (),            // 0x30 speech to text
     missing::<7> as *const (),            // 0x38
     enumerate_voices as *const (),        // 0x40

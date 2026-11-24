@@ -74,10 +74,14 @@ are kept under the data folder (default `%LOCALAPPDATA%\xtp\data`), derived
 data under the cache folder.
 
 Titles can read Windows caption colors, opacity, font, text size and high
-contrast mode. Captions initially follow Windows ShowSounds. A title can
-turn them on or off for its own session. Without preferences, captions are
-off, with white text on black, a transparent window, default font and edge,
-and 100% text size. High contrast defaults to off.
+contrast mode. Captions initially follow Windows ShowSounds, under Control
+Panel > Ease of Access > Ease of Access Center > Use text or visual
+alternatives for sounds. A title can turn captions on or off immediately
+for its own session. XTP refreshes each host setting on demand at most
+once per second. Without preferences, captions are off, with white text on
+black, a transparent window, default font and edge, and 100% text size.
+High contrast defaults to off. An active theme reports light or dark based
+on its window background, or `Other` if Windows cannot supply that color.
 
 Input: XInput pads; Xbox One and Series pads get their trigger motors too
 (through Windows.Gaming.Input). The keyboard and mouse play as a pad while

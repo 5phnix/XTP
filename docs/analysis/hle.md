@@ -175,7 +175,7 @@ Legend: ✔ implemented and tested, ◐ partial, ✘ missing, — not needed.
 | XGameUi: profile card, text entry (host dialog) | ✔ | → PC runtime | 1 / — | Keep XTP |
 | XGameUi message and error dialogs | ✘ | → PC runtime | — / — | **New work** (R5) |
 | Speech synthesis | ◐ valid empty WAVE | → PC runtime | 1 / — | **New work** (R6) |
-| Closed captions, high contrast | ✘ slots 0x18/0x28 | ✔ `accessibility.rs` | — / 3 | **Rewrite after xcl** (R7) |
+| Closed captions, high contrast | ✔ Windows settings and title override | ✔ `accessibility.rs` | 5 / 3 | Done (R7) |
 | XError callback and options | ✘ class absent | ✔ | — / — | After xcl, if the title asks (R9) |
 | Relaunch (`XLaunchNewGame`), restart on crash | ◐ relaunch untested live | ✔ both | 4 (lifecycle) / — | Verify (R10) |
 | HDR, URIs, deferrals, screenshots | ✔ | ◐ | 1 / — | Keep XTP |
@@ -385,10 +385,10 @@ shows the title calls them.
   with the recorded arguments, and only once.
 - **Depends on:** —
 
-### R7. Closed captions and high contrast — S
+### R7. Closed captions and high contrast — S (done)
 - **Goal:** answer the accessibility slots from the host: Windows
   closed-caption settings (enabled, colours, size) and high-contrast mode.
-- **Files:** `crates/xtp-hle/src/modules/speech.rs`.
+- **Files:** `crates/xtp-hle/src/modules/speech.rs` and `speech/captions.rs`.
 - **xcl ref:** `hle/xgameruntime/accessibility.rs` `XClosedCaptionGetProperties`,
   `XClosedCaptionSetEnabled`, `XHighContrastGetMode` (structure filled, defaults).
 - **Acceptance:** unit test: the structure is fully written with documented
@@ -512,7 +512,7 @@ shows the title calls them.
 | 9 | I2 mouse as right stick | M | I1 |
 | 10 | R5 message/error dialogs | M | (R1) |
 | 11 | R10 relaunch, restart on crash | S | — |
-| 12 | R7 closed captions, high contrast | S | — |
+| 12 | R7 closed captions, high contrast (done) | S | — |
 | 13 | R6 speech synthesis | M | — |
 | 14 | I3 trigger rumble | M | — |
 | 15 | K1 commit measurement | S | — |
