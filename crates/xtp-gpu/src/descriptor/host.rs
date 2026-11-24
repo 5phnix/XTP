@@ -634,10 +634,16 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        // The one it held goes after the lock: its last reference may free
+        // video memory, which can wait.
+        drop(self.swap_kept(index, resource));
+    }
+
+    /// [`HostHeap::keep`], handing back the resource the slot held.
+    fn swap_kept(&self, index: u32, resource: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            *slot = resource;
-        }
+        kept.get_mut(index as usize)
+            .and_then(|slot| std::mem::replace(slot, resource))
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
@@ -750,22 +756,48 @@ impl HostHeap {
                 .map_or(0, |t| t.as_raw() as usize),
             _ => 0,
         });
+        // Whether the slot is to be made again: another record, or another
+        // host texture. The host texture held by the slot cannot be
+        // another's (`kept` holds it), so the same address is the same one.
+        let stale = |made: &Made| {
+            made.keys[index as usize] != key
+                || texture.is_some_and(|t| made.placed.get(&index).copied() != Some(t))
+        };
+        // A buffer view's host copy, a resource (which can wait in the
+        // kernel, on video memory), is made before the lock too when the
+        // slot is to be made: under the lock, threads recording other lists
+        // only wait for descriptors to be written (VidMm waits there took
+        // nearly half the title's recording time in the world).
+        let resolved = placed.as_ref().and_then(Option::as_ref).or(view.as_ref());
+        if for_draw
+            && let Some((address, len)) = resolved.and_then(copy_range)
+            && stale(&self.made.lock().unwrap_or_else(|e| e.into_inner()))
+        {
+            let _ = crate::shadow::find(address, len);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            let mut old = None;
             if made.keys[index as usize] != 0 {
                 made.keys[index as usize] = 0;
                 made.placed.remove(&index);
-                self.make_null(index);
+                if self.sampler {
+                    self.null_sampler(index);
+                } else {
+                    null_view(self.cpu(index));
+                }
+                old = self.swap_kept(index, None);
             }
+            // A host resource the slot held goes after the lock.
+            drop(made);
+            drop(old);
             return None;
         };
-        // The host texture held by the slot cannot be another's (`kept`
-        // holds it), so the same address is the same texture.
-        let moved = texture.is_some_and(|t| made.placed.get(&index).copied() != Some(t));
-        let view = placed.flatten().unwrap_or(view);
-        if made.keys[index as usize] != key || moved {
+        let mut old = None;
+        if stale(&made) {
+            let view = placed.as_ref().and_then(Option::as_ref).unwrap_or(&view);
             let later = !for_draw && view.is_buffer();
             made.keys[index as usize] = if later { 0 } else { key };
             match texture {
@@ -775,14 +807,16 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                make(view, self.cpu(index))
             };
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+                null_for(view, self.cpu(index));
             }
-            self.keep(index, kept.flatten());
+            old = self.swap_kept(index, kept.flatten());
         }
-        Some(view)
+        drop(made);
+        drop(old);
+        Some(placed.flatten().unwrap_or(view))
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1160,6 +1194,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
+/// The title memory whose host copy [`make`] needs for `view` (address and
+/// length, as it asks [`crate::shadow::find`]): constant buffers and
+/// buffer views.
+fn copy_range(view: &View) -> Option<(u64, u64)> {
+    match view {
+        &View::Constant(address, size) => Some((address, u64::from(size))),
+        View::Shader(r, Some(_)) | View::Unordered(r, _, Some(_)) => {
+            crate::resource::buffer_bytes(*r as crate::object::This)
+                .map(|(data, len)| (data as u64, len))
+        }
+        View::Placed(_, resource, desc) if resource[0] == 1 => Some((
+            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+        )),
+        _ => None,
+    }
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
@@ -1466,6 +1518,42 @@ mod tests {
         heap.give_back(&[held]);
     }
 
+    /// A buffer view's slot is made, for a draw, over its buffer's host
+    /// copy, made first (outside the slot lock) when it is not yet; not
+    /// for a mere view creation.
+    #[test]
+    fn buffer_slots_get_their_host_copy_made_first() {
+        use crate::testgpu::TitleBuffer;
+        let test = "descriptor::host::tests::buffer_slots_get_their_host_copy_made_first";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let heap = crate::descriptor::TestHeap::views(4);
+        let host = crate::descriptor::heap(heap.0).host().expect("a host heap");
+        let buffer = TitleBuffer::new(1 << 16);
+        let address = buffer.address();
+        assert!(
+            crate::shadow::existing(address, 256).is_none(),
+            "no copy yet"
+        );
+        let handle = crate::descriptor::heap(heap.0).start + 2 * 32;
+        let words = [address as u32, (address >> 32) as u32, 256, 0];
+        crate::descriptor::create_cbv(std::ptr::null(), &words, handle);
+        assert!(
+            crate::shadow::existing(address, 256).is_none(),
+            "views wait for a draw"
+        );
+        assert_eq!(
+            host.mirror(2, handle, true),
+            Some(View::Constant(address, 256))
+        );
+        let copy = crate::shadow::existing(address, 256).expect("made for the draw");
+        let kept = host.kept.lock().unwrap_or_else(|e| e.into_inner())[2]
+            .as_ref()
+            .map(|b| b.as_raw() as usize);
+        assert_eq!(kept, Some(copy.buffer.as_raw() as usize));
+    }
+
     /// A slot viewing a texture the title placed itself follows the
     /// resource made for that memory: when a texture the GPU writes comes
     /// there (#643), the slot is made again over its copy, although the
@@ -1538,7 +1626,11 @@ mod tests {
             Some(View::Shader(..))
         ));
         let after = crate::resource::texture_at(address, &resource).unwrap();
-        assert_eq!(host_of(after), host_of(rt), "texture_at took the target's copy");
+        assert_eq!(
+            host_of(after),
+            host_of(rt),
+            "texture_at took the target's copy"
+        );
         assert_ne!(host_of(after), old_texture);
         assert_eq!(kept(host), host_of(after), "the slot views the replacement");
         // Nothing more changes: the slot stays as it is.
