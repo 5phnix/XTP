@@ -3,7 +3,7 @@
 //! formats PC D3D12 lacks (its own numbers 116, 117, 189, 190, 191) and
 //! uses a PC driver refuses: Grand Theft Auto VI's 2560x1440 B5G5R5A1 target
 //! that is also unordered access, and its B4G4R4A4 target (E_INVALIDARG on
-//! an NVIDIA driver, first run), and R9G9B9E5 targets (no PC GPU has them).
+//! an NVIDIA driver, first run), and R9G9B9E5 targets (GPUs have none).
 //!
 //! 1. [`TABLE`] lists the title formats the host may lack, each with its
 //!    stand-in: a host format holding the same values with as many bits or
@@ -197,8 +197,9 @@ const R8G8_UNORM: u32 = 49;
 
 /// The substitution table.
 pub(crate) const TABLE: [Entry; 9] = [
-    // PC D3D12 renders to and writes R9G9B9E5 on no GPU: the title's HDR
-    // scene and lighting targets fail without a stand-in (VIctory #492).
+    // GPUs neither render to nor write R9G9B9E5 (the RTX 4080 and the
+    // VIctory testers' cards; WARP does): the title's HDR scene and lighting
+    // targets fail there without a stand-in (VIctory #492).
     // RGBA16F holds every value exactly (xcl takes R11G11B10_FLOAT, which
     // rounds 9-bit mantissas to 6 and 5 bits), at twice the memory.
     Entry {
@@ -753,9 +754,9 @@ mod tests {
         );
     }
 
-    /// R9G9B9E5_SHAREDEXP (VIctory #492): no PC GPU renders to it or
-    /// writes it, so RGBA16F stands in for every texture, view, target and
-    /// clear value of it.
+    /// R9G9B9E5_SHAREDEXP (VIctory #492): where the host neither renders to
+    /// it nor writes it (GPUs; WARP does both), RGBA16F stands in for every
+    /// texture, view, target and clear value of it.
     #[test]
     fn shared_exponent_textures_stand_in_as_half_floats() {
         use uses::*;
@@ -769,8 +770,8 @@ mod tests {
         assert_eq!(choose(entry(67).unwrap(), |_| CONSOLE_USES), Choice::Own);
     }
 
-    /// The host device (WARP or a GPU) has a stand-in for 67 that it
-    /// renders to and writes.
+    /// The host device renders to and writes 67 itself (WARP), or has a
+    /// stand-in for it that it renders to and writes (the RTX 4080).
     #[cfg(windows)]
     #[test]
     fn the_host_renders_shared_exponent_targets_in_half_floats() {
@@ -779,7 +780,13 @@ mod tests {
         if crate::testgpu::device(test).is_none() {
             return;
         }
-        assert_eq!(HostCaps.host_format(67), R16G16B16A16_FLOAT);
+        let own = HostCaps.support1(67);
+        if own & CONSOLE_USES == CONSOLE_USES {
+            assert_eq!(HostCaps.host_format(67), 67, "{own:#x}");
+            eprintln!("{test}: the host has every use of R9G9B9E5 ({own:#x}): kept");
+            return;
+        }
+        assert_eq!(HostCaps.host_format(67), R16G16B16A16_FLOAT, "{own:#x}");
         let support = HostCaps.support1(R16G16B16A16_FLOAT);
         assert_eq!(support & CONSOLE_USES, CONSOLE_USES, "{support:#x}");
     }
