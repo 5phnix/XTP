@@ -2,11 +2,11 @@
 
 The autopilot drives the title through its screens by the title's own state,
 read from its memory and its presented frames, then hands control back to the
-player. It replaces `XTP_KEYS`, whose presses at fixed times break as soon as
+user. It replaces `XTP_KEYS`, whose presses at fixed times break as soon as
 start-up or loading gets faster or slower.
 
 ```text
-cargo xtask play                  # from the golden save to gameplay, then you play
+cargo xtask play                  # from the golden save to gameplay, then control returns to the user
 cargo xtask play --measure 60     # 60 s of gameplay, then a frame-rate summary
 xtp run <exe|folder> --execute --autopilot autopilot/gameplay.txt
 ```
@@ -23,7 +23,7 @@ it against the title) and `xtask/src/play.rs`. Scripts ship in `autopilot/`.
 2. Copies the golden data folder into a run folder of the cache,
    `<cache>/play/<YYYYMMDD-HHMMSS>/data` (UTC). The golden folder itself is
    never written.
-3. Runs `xtp run <game>/game_scarlett_master.exe --execute --autopilot
+3. Runs `xtp run <title folder>/<title executable> --execute --autopilot
    <run>/autopilot.txt` with `XTP_DATA_DIR` set to the copy; the rest of the
    configuration is yours (`XTP_CONFIG` or `./xtp.toml`, `[input]` included).
    `--exe` names another executable, `--script` another script (default

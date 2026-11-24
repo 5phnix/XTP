@@ -1104,6 +1104,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .state
         .file;
     let mut done = 0;
+    let mut again = true;
     loop {
         if done == out.len() {
             return Ok(());
@@ -1111,10 +1112,25 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => return Err(END_OF_FILE),
             Ok(n) => done += n,
+            // The destination turned read-only during the read. The write
+            // guards are held open for it (`Destination::write`), so this
+            // is not expected: once more, and said.
+            Err(error) if again && error.raw_os_error() == Some(INVALID_USER_BUFFER) => {
+                again = false;
+                tracing::warn!(
+                    offset = request.offset + done as u64,
+                    len = out.len() - done,
+                    "dstorage: a read was cut (ERROR_INVALID_USER_BUFFER); reading it again"
+                );
+            }
             Err(error) => return Err(from_win32(&error)),
         }
     }
 }
+
+/// `ERROR_INVALID_USER_BUFFER`: the kernel could not write the destination
+/// while it read.
+const INVALID_USER_BUFFER: i32 = 1784;
 
 /// A request's destination, with what writing it needs: the page numbers
 /// of a page destination, the worker's buffer for scattered pages, and
@@ -1160,8 +1176,10 @@ impl Destination<'_> {
         let request = self.request;
         if request.options & PAGE_DESTINATION == 0 {
             // Raw reads land through the kernel, which does not fault into
-            // the GPU side's guard on title buffers; open them first.
-            xtp_gpu::kernel_will_write(request.destination as usize, len);
+            // the GPU side's guard on title buffers: open them, and hold
+            // them open until the read is done (a copy guarding them again
+            // meanwhile cut reads: docs/analysis/archive-null.md).
+            let _writing = xtp_gpu::kernel_will_write(request.destination as usize, len);
             // SAFETY: the title's destination holds `destination_size`
             // bytes, at least `len`, and nothing else writes it until
             // completion.

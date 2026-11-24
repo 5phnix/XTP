@@ -1,29 +1,23 @@
 # XTP
 
-Runs BTP 6 (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+XTP is a compatibility layer for Xbox Series (GDK) titles on Windows. It
+runs a title's unmodified x86-64 code in its own process, reimplements the
+console system libraries, and translates D3D12.X commands and GFX10 shaders
+to host D3D12 and DXIL at run time. The repository contains no game code or
+data, no keys and no decryption, and XTP does not help anyone obtain title
+files.
 
-The title's x86-64 code runs unchanged inside our process; XTP supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
+Nothing derived from a title (translated shaders, converted data) is
+committed or distributed: it is made on first use and kept in the user's
+cache folder. See [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-23)
+## Status: experimental
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
-
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
+No title is usable yet.
 
 Tested on one machine: Windows 11, AMD RX 6700 XT.
 
-> **Warning.** Entering the world on a real GPU can currently hang it, and
+> **Warning.** 3D rendering can currently hang a real GPU, and
 > Windows then resets the display driver (every monitor goes black for a
 > moment). To look further, use a diagnostics build with
 > `XTP_D3D12_WARP=1`, which renders on the software adapter.
@@ -33,7 +27,7 @@ What each part does today and what it still needs:
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
 | Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
+| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog, text and SSML narration with installed Windows voices | Narration returns an empty WAVE for blank text or when Windows cannot produce audio. The dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads with trigger rumble, keyboard, keyboard and mouse as a pad (keys by place, mouse as the right stick) | Trigger rumble and the mouse are untested in play |
@@ -42,7 +36,7 @@ What each part does today and what it still needs:
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
 | Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode (the default) | The world loads in seconds and runs (150 s in a row measured, about 1.7 fps) | The world, as above |
+| Series S mode (the default) | Smaller memory budgets; scenes load in seconds | 3D rendering, as above |
 
 ## Getting started
 
@@ -62,11 +56,11 @@ cargo test --workspace                   # needs no game data
 cargo run -p xtp -- config           # check your paths
 ```
 
-Run the title:
+Run a title:
 
 ```powershell
 cargo build --release -p xtp
-target\release\xtp.exe run "<game dir>" --execute
+target\release\xtp.exe run "<title folder>" --execute
 ```
 
 With a folder, `xtp run` selects an existing executable named in
@@ -178,11 +172,15 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_ADAPTER=<index>\|<name>` | (every build) host GPU to run on: its index in the startup log's `host adapter` lines, or part of its name (`XTP_ADAPTER=radeon`); by default the first high-performance hardware adapter, a discrete GPU before an integrated one |
 | `XTP_PIPELINE_WAIT_MS=<graphics>,<compute>` | (every build) milliseconds per frame title threads may wait for pipelines being made before their draws and dispatches are dropped for that frame (default `2,8`) |
 | `XTP_SHADER_LOOP_LIMIT=<n>` | (every build) translated shader loops stop after `n` iterations per lane instead of 16384 (2^14, under the host GPU watchdog); loops that only reread memory until it changes (spin waits) after 4096, or `n` if lower (own shader cache entries); a lower `n` shows whether loops hitting the limit make world frames slow, a higher one whether a wrong result comes from a legitimate loop the default cut short |
+| `XTP_SHADER_LOOP_BUDGET=<n>` | (every build) a lane of a translated shader leaves, as at the loop limit, once it has gone back `n` times in all of its loops together instead of 1048576 (2^20; loops inside loops multiply their own limits); `0` turns the budget off (own shader cache entries) |
 | `XTP_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `XTP_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-| `XTP_WATCHDOG_HOOK=1` | every build: keeps the title's own watchdog from ending it after about 30 s without progress (slow world frames), and logs a warning (at most every 30 s) when it would have; a real deadlock then hangs for ever, with no `crashes.log` entry; known builds only (1.0.2.1), otherwise a warning and nothing patched |
-| `XTP_SKIP_INTRO=1` | every build: cuts the intro movie of the start-up front end (sent to its last frame when it starts), so the world starts loading about 13 s sooner (docs/analysis/intro-skip.md); known builds only (1.0.2.1), otherwise a warning and nothing changed |
+| `XTP_WATCHDOG_HOOK=1` | every build: keeps the title's own watchdog from ending it after about 30 s without progress (slow world frames), and logs a warning (at most every 30 s) when it would have; a real deadlock then hangs for ever, with no `crashes.log` entry; known builds only, otherwise a warning and nothing patched |
+| `XTP_TITLE_ASSERTS=continue` | every build: where the title's own assertion would end it because an entry of its archive store could not be made (`int3` at title+0x23d8f03; the entry's header was not read, docs/analysis/archive-null.md), it takes the title's own path for a null object instead, and logs how many times (at once, then at most every 10 s) and a census of that store; hides the failure, it does not fix it; known builds only, otherwise a warning and nothing patched |
+| `XTP_XMEM_LEDGER=1` | every build: counts what the title asks of XMem by category (`XMemAlloc` by allocator id and memory type, committed resources included, the share our `XMemAllocDefault` serves, physical pages, virtual reserves, commits and frees, the budget reported) and logs each category that changed every 10 s: calls, failures, frees, live and peak bytes, bytes asked in all |
+| `XTP_SKIP_INTRO=1` | every build: cuts the intro movie of the start-up front end (sent to its last frame when it starts), so the world starts loading about 13 s sooner (docs/analysis/intro-skip.md); known builds only, otherwise a warning and nothing changed |
 | `XTP_SKIP_CPU_CHECK=1` | every build: skips the host CPU feature check that `xtp run --execute` performs before starting the title |
+| `XTP_QUEUE_WAIT=0` | every build: a queue told to wait for a fence no signal has reached yet runs what it is given next at once, as before queues held it (to compare frame times); such waits are still counted on the `queue waits for fences so far` line |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder. The loader also prints the first 16 title C++ throws
@@ -193,8 +191,8 @@ and maps legacy debugger thread names to Windows thread descriptions.
 ## Contributing
 
 Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first: it
-has the rules every change must follow (nothing from the game, no keys, no
-console SDK material, nothing that circumvents DRM, GPL-3.0-or-later, no code
+has the rules every change must follow (nothing from any game, no keys, no
+console SDK material, no circumvention, GPL-3.0-or-later, no code
 from the projects we only use as references), the commit and pull request
 conventions and how review works. [docs/dev/START_HERE.md](docs/dev/START_HERE.md)
 maps the code and lists good first issues. Before opening a pull request, run
@@ -210,6 +208,6 @@ Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 
-XTP started from [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
-(commit `ffe310e`); see [NOTICE.md](NOTICE.md) for the origin of the code and
-the projects used as references only.
+XTP started from VIctory by Marvisak (GPL-3.0-or-later, commit `ffe310e`);
+see [NOTICE.md](NOTICE.md) for the origin of the code and the projects used
+as references only.

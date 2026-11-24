@@ -6,8 +6,16 @@
 //! with "token on time-out" (starting its next frame at once) and is paced
 //! by a blocking wait for the flip before each present.
 //!
+//! A console flips a presented frame once the GPU is done with it, so a
+//! blocking flip wait also ends only once the frame presented last has
+//! finished on the host GPU (with frames in flight it may still run when
+//! the present returns: `XTP_FRAMES_IN_FLIGHT`); then at the next tick.
+//!
 //! shortcut: event offsets are ignored (every event is at the tick); tie
 //! the clock to presentation if a title paces by them.
+//!
+//! shortcut: a flip wait with a time-out does not wait for the GPU (BTP 6's
+//! has none); it would need a host fence wait that gives up.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
@@ -20,6 +28,10 @@ use crate::object::{HRESULT, S_FALSE, S_OK, This};
 const TIMEOUT: HRESULT = S_FALSE;
 /// The frame-origin event: the one that starts frames and makes tokens.
 const ORIGIN: u32 = 0;
+/// The flip event: a presented frame reaches the display.
+const FLIP: u32 = 2;
+/// A wait's time-out when it has none.
+const INFINITE: u32 = u32::MAX;
 /// Make the frame's token even if the wait times out (the title starts the
 /// frame early).
 const TOKEN_ON_TIMEOUT: u32 = 2;
@@ -126,6 +138,13 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    #[cfg(windows)]
+    if kind == FLIP
+        && timeout_ms == INFINITE
+        && let Some(host) = crate::host::made()
+    {
+        host.flip();
+    }
     let (tick, wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
     let hr = if wait > limit {
@@ -216,7 +235,6 @@ mod tests {
         // blocking flip wait. Each flip takes its own tick, the next one
         // unless the thread woke late (a loaded machine oversleeps): then
         // it skips only the ticks that passed meanwhile.
-        const FLIP: u32 = 2;
         const INTERVAL: Duration = Duration::from_millis(5);
         // The test's own clock: the interval starts between `t0` and `t1`,
         // counting from the last tick handed out. Set again until they are
