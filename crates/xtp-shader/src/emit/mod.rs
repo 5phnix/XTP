@@ -87,9 +87,11 @@ pub mod host;
 mod image_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
+#[cfg(all(test, windows))]
+mod mesh_tests;
 // IR to DXIL, one file per encoding or concern: which backlog item of
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
-mod lower;
+pub(crate) mod lower;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
