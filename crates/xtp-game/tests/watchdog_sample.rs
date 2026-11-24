@@ -4,9 +4,11 @@
 //! watchdog_sample -- --nocapture` hashes the folder's
 //! `game_scarlett_master.exe`. For a build the hook knows, it lays the
 //! image out as mapped and checks that each site holds the bytes the hook
-//! expects at its offset and nowhere else in the image, and that the hook
-//! applies to that copy once. Without the variable it does nothing.
-//! Messages name offsets only, never the title's bytes.
+//! expects at its offset and nowhere else in the image, that each patch
+//! resumes right after an `int3`, that the counter lies in the unused end
+//! of a writable section, and that the hook applies to that copy once.
+//! Without the variable it does nothing. Messages name offsets only, never
+//! the title's bytes.
 
 use std::path::Path;
 
@@ -50,7 +52,31 @@ fn watchdog_sites_in_the_sample_game() {
                 && s.characteristics & 0x2000_0000 != 0 // IMAGE_SCN_MEM_EXECUTE
         });
         assert!(code, "{} at {:#x} is not in executable code", p.what, p.rva);
+        // The patch jumps over the handler call and the fallback fault: the
+        // byte before where it lands is that fault's `int3`.
+        assert_eq!(
+            image[p.resumes_at - 1],
+            0xCC,
+            "{}: no int3 before {:#x}",
+            p.what,
+            p.resumes_at
+        );
     }
+    // The counter: past the end of a writable section's data (its virtual
+    // size), still in that section's last page, and zero.
+    let slack = info.sections.iter().any(|s| {
+        let end = s.rva as usize + s.virtual_size as usize;
+        let page_end = end.next_multiple_of(0x1000);
+        s.characteristics & 0x8000_0000 != 0 // IMAGE_SCN_MEM_WRITE
+            && (end..page_end).contains(&hook.counter)
+            && hook.counter + 4 <= page_end
+    });
+    assert!(
+        slack,
+        "the counter at {:#x} is not in the unused end of a writable section",
+        hook.counter
+    );
+    assert_eq!(image[hook.counter..hook.counter + 4], [0; 4]);
     assert_eq!(hook.apply_to(&mut image), Ok(hook.patches.len()));
     for p in hook.patches {
         assert!(image[p.rva..p.rva + p.new.len()] == *p.new, "{}", p.what);

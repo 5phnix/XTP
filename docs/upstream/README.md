@@ -27,30 +27,37 @@ run the next pass, and where the last one stopped.
   "GTA-VI-Windows-Beta-PC" are bait for malware. Do not open their
   releases or links (section 5 of watch.md names those seen).
 
-## Marks: where pass 1 stopped (2026-11-24, 13:40 UTC)
+## Marks: where pass 2 stopped (2026-11-24, 16:25 UTC)
 
-| Project | Default branch at the mark | Highest PR seen | Newest PR created | Notes |
+Pass 1 stopped at 13:40 UTC; git keeps its marks. Pass 2 read everything
+created up to the highest numbers below, by title, and read about 45
+items. Its triage is in watch.md section 0.
+
+| Project | Default branch at the mark | Highest seen | Newest created | Notes |
 |---|---|---|---|---|
-| Marvisak/VIctory | `main` `ffe310e` (= XTP's import) | #710 (PRs); issues up to #884 (13:25 UTC) | 07:12 UTC | 612 PRs listed: 443 open. Items in watch.md checked at their heads of 13:00–13:40 UTC. New PRs are limited to collaborators since 07:12, and contributions come as issues linking fork branches: 174 issues since then, triaged by title. |
-| ivall/xcl | `main` `47efa2e` (= the analysis reference) | #1196 | 13:05 UTC | 910 PRs: 552 open. Triaged by title; about 90 read. |
-| simnJS/AnyPS5 | `AnyKyty` `7de61e3` (2026-11-22 23:46) | #292 | 06:15 UTC | process only |
-| r4tedx/VIctory `integration/testers` | `92bc27b` (08:43 UTC) | – | – | the testers' tree; `INTEGRATION.md` at its root |
-| VIctory issue #293 | – | last comment read: h0useadv, 13:10 UTC | – | the shader census |
+| Marvisak/VIctory | `main` `ffe310e` (= XTP's import) | PR #1183, issue #1184 | 16:22 UTC | PRs open to everyone again since about 14:12 UTC: about 170 new (#922–#1183), none merged; 92 issues since 13:40. Contributions still also come as issues linking fork branches. |
+| ivall/xcl | `main` `b7aa9f3` (15:58 UTC) | #1458 | 16:24 UTC | 50 commits since `47efa2e` (the analysis reference), 20 PRs merged. About 210 new PRs (#1244–#1458). |
+| simnJS/AnyPS5 | `AnyKyty` `7de61e3` (2026-11-22 23:46) | #292 | 06:15 UTC | process only; nothing new since pass 1 |
+| r4tedx/VIctory `integration/testers` | `94e0ea5` (16:16 UTC) | – | – | the testers' tree; `INTEGRATION.md` at its root, not re-read in pass 2 |
+| VIctory issue #293 | – | last comment read: h0useadv, 13:10 UTC | – | the shader census; not re-read in pass 2 |
 
-Other projects (watch.md section 5), heads read at about 13:35 UTC:
+Other projects (watch.md sections 5 and 0.5), heads read at about 16:35 UTC:
 
-| Project | Default branch head | Highest PR seen | Read so far |
+| Project | Default branch head | Commits since 13:40 | Read so far |
 |---|---|---|---|
-| OpenCommunityEdition/OpenScarlett | `7c85829` (13:04) | #1 | commits since 2026-11-22 |
-| ThatRecompDev/five-star-recomp | `main` `15219c4` (12:31) | none | `docs/shader-translation.md`, commits since 2026-11-22 |
-| fablinoo/palmwave | `5a54236` (12:05) | none | commits since 2026-11-22 |
-| LooperSalty/AnyXboxX | `b15d882` (11:41) | #139 | README, PR titles; branch `LooperSalty/victory` `anyxboxx/stable` |
-| DesignWithTommy/Neonbridge | `63daaa4` (13:32) | none | commits since 2026-11-22 (ideas only: carries xcl code) |
-| R0Y00/Xbox2Windows | `309cfed` (13:32) | #1522 | merged PRs up to #1503 by title; #327, #1114, #1316, #1348 read |
-| ubiquitarianism/leonida | `2d73c24` (13:10) | #763 | README, PR titles up to #739 |
-| Kajcsi/G6Recomp | `82ccaa5` (07:51) | none | commits since 2026-11-22 |
-| uiliannn/VItoriaBr | `dbff821` (10:10) | none | its 3 commits on `ffe310e` |
-| californiaAlmonds/OpenScarlett | `46d8e2c` (06:28) | #50 | README, commits |
+| OpenCommunityEdition/OpenScarlett | `765da8b` (15:42) | 10 | messages of `3da6373`, `f8238f6`, `0fbe1ce`, `2c27467` |
+| ThatRecompDev/five-star-recomp | `e761558` (16:29) | 61 | titles |
+| fablinoo/palmwave | `fc216a5` (16:22) | 2 | – |
+| LooperSalty/AnyXboxX | `49c605a` (15:34) | 11 | – |
+| DesignWithTommy/Neonbridge | `d481137` (16:27) | 48 | messages of `2fa28a9`, `d69cf7f`, `9d48cd8`, `6d94818` (ideas only: carries xcl code) |
+| R0Y00/Xbox2Windows | `4b84235` (16:26) | 100+ | titles of the memory ones |
+| ubiquitarianism/leonida | `3ed8e50` (16:25) | 59 | titles of the memory ones |
+| Kajcsi/G6Recomp | `82ccaa5` (07:51) | 0 | – |
+| uiliannn/VItoriaBr | `521e7f6` (16:12) | 4 | titles |
+| californiaAlmonds/OpenScarlett | `46d8e2c` (06:28) | 0 | – |
+
+New in pass 2's search, all ignored (watch.md item 79): itsF4LCON/Prodigy,
+Sicaduj/XboxCompatLayer, wqryx/Leonida.
 
 The rest of section 5.1 was read once at README level. Recheck it only if a
 tracker moves it past "first frames".
@@ -66,7 +73,7 @@ REST: `gh api "repos/OWNER/REPO/pulls?state=all&per_page=100" --paginate`.
 Set the mark once:
 
 ```sh
-SINCE=2026-11-24T13:40:00Z
+SINCE=2026-11-24T16:25:00Z
 ```
 
 **1. Has a default branch moved?**
@@ -74,7 +81,7 @@ SINCE=2026-11-24T13:40:00Z
 ```sh
 gh api repos/Marvisak/VIctory/compare/ffe310e...main \
   --jq '.total_commits, (.commits[] | [.sha[0:9], .commit.committer.date, (.commit.message | split("\n")[0])] | @tsv)'
-gh api repos/ivall/xcl/compare/47efa2e...main \
+gh api repos/ivall/xcl/compare/b7aa9f3...main \
   --jq '.total_commits, (.commits[] | [.sha[0:9], .commit.committer.date, (.commit.message | split("\n")[0])] | @tsv)'
 gh api "repos/simnJS/AnyPS5/commits?sha=AnyKyty&since=$SINCE" \
   --jq '.[] | [.sha[0:9], .commit.committer.date, (.commit.message | split("\n")[0])] | @tsv'
@@ -98,9 +105,11 @@ for r in Marvisak/VIctory ivall/xcl simnJS/AnyPS5; do
 done
 ```
 
-VIctory also needs its **issues**, since pull requests were closed to
-non-collaborators. Changes arrive as issues titled "[Ready to merge]",
-"fix on a fork" or "fix on a branch", each linking a fork's branch.
+VIctory also needs its **issues**. Pull requests were closed to
+non-collaborators from 07:12 to about 14:12 UTC, and changes still arrive
+as issues titled "[Ready to merge]", "fix on a fork" or "fix on a branch",
+each linking a fork's branch. Many PRs now carry such a branch with its
+author's commits (for example #1124, #1129, #1135).
 
 ```sh
 gh api "repos/Marvisak/VIctory/issues?state=all&sort=created&direction=desc&per_page=100&since=$SINCE" --paginate \
@@ -126,16 +135,19 @@ Triage by title prefix:
 still merges onto upstream `main`, head and last update:
 
 ```sh
-for n in 689 223 233 320 439 578 579 493 483 595 546 275 464 490 497 180 298 539 89 492 469 206 643 24 583 346 334 453 592 621 571 160 563 158 159 331 211 431 454 452 509 130 638 658 234 703 603 644 463 208 185 413 693 704 193; do
+for n in 985 223 233 320 439 578 579 493 483 595 546 275 464 490 497 180 298 539 89 492 469 206 643 24 583 346 334 453 592 621 571 160 563 158 159 331 211 431 454 452 509 130 638 658 234 703 603 644 463 208 185 413 693 704 193 \
+         1122 1124 1126 1127 952 982 1094 1129 1133 1135 1010 991 1024 1013 1081 1082 1130 1067 1009 961 970 1152 1041 956 1160 955; do
   gh pr view $n -R Marvisak/VIctory \
     --json number,state,isDraft,mergeable,headRefOid,updatedAt \
     --jq '[.number, .state, (if .isDraft then "draft" else "-" end), .mergeable, .headRefOid[0:9], .updatedAt] | @tsv'
 done
-for n in 869 1182 758 898 759 889 455 562 674 573 1163 1126 517 1193 1111 1090 825 640 1165 1150 935 1195 1124; do
+for n in 869 1182 758 898 759 889 455 562 674 573 1163 1126 517 1193 1111 1090 825 640 1165 1150 935 1195 1124 \
+         1248 1342 1386 1457 1323 1428 1273 1278 1288 1442; do
   gh pr view $n -R ivall/xcl --json number,state,isDraft,updatedAt \
     --jq '[.number, .state, (if .isDraft then "draft" else "-" end), .updatedAt] | @tsv'
 done
-for n in 847 736 841 876 850 877 878 776 783 407 880 853 840 785 798 293 71; do
+for n in 847 736 841 876 850 877 878 776 783 407 880 853 840 785 798 293 71 \
+         737 904 918 911 915 916 940 979 902 966 1054 1086 1089 1118 1132 1147 1184; do
   gh issue view $n -R Marvisak/VIctory --json number,state,updatedAt,comments \
     --jq '[.number, .state, .updatedAt, (.comments | length)] | @tsv'
 done
@@ -198,6 +210,10 @@ README's credits section says so. GitHub's search API allows about 30 requests a
   - states as they are now;
   - items that landed in XTP or upstream moved out;
   - new items ranked in.
+- Pass 2 put its new items in a section 0, numbered on from pass 1's
+  (49–79), and listed what changed in the old ones (0.7). With passes every
+  30 minutes, the next pass can fold section 0 into sections 4 and 5, keep
+  only the open items, and start a new section 0.
 - Update the marks above. Git keeps the history of earlier passes.
 - Check, as in the task: `test -s docs/upstream/watch.md`.
 
@@ -205,6 +221,12 @@ README's credits section says so. GitHub's search API allows about 30 requests a
 
 The goal is the world at 30 fps. In order of what the measurements show
 blocks it:
+0. Getting into the world at all: video memory and residency. How host
+   resources are created (pools, large heaps, tiled pages, sub-allocated
+   buffers), residency calls and priorities, the budget, Series S mode,
+   and the title's GPU-progress watchdog at `+0x23cf683`
+   ([stall.md](../analysis/stall.md), watch.md 0.3). For xcl, write the
+   mechanism down in your own words, with the file it is in.
 1. CPU preparation of title memory (shadows, refreshes, copy-back): the
    gpu Phase 3 direction (G15–G18), and anything that removes CPU work per
    submission.
