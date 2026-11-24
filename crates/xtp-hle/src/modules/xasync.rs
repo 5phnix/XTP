@@ -65,10 +65,11 @@ impl Mode {
 }
 
 /// A title callback and its context (addresses, so tasks can cross threads).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Task {
     context: usize,
     callback: usize,
+    owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Task {
@@ -76,11 +77,24 @@ impl Task {
         Task {
             context: context as usize,
             callback: callback as usize,
+            owner: None,
+        }
+    }
+
+    /// Keeps runtime-owned context alive through dispatch, or drops it if
+    /// submission fails or the queue closes without dispatching the task.
+    fn owned<T: Send + Sync + 'static>(context: T, callback: Callback) -> Task {
+        let owner = Arc::new(context);
+        Task {
+            context: Arc::as_ptr(&owner) as usize,
+            callback: callback as usize,
+            owner: Some(owner),
         }
     }
 
     fn run(self, canceled: bool) {
-        // SAFETY: built from a `Callback` in `new`.
+        let _owner = self.owner;
+        // SAFETY: built from a `Callback` in our constructors.
         let callback: Callback = unsafe { std::mem::transmute(self.callback) };
         callback(self.context as *mut c_void, canceled);
     }
@@ -467,23 +481,66 @@ const OP_GET_RESULT: u32 = 2;
 const OP_CANCEL: u32 = 3;
 const OP_CLEANUP: u32 = 4;
 
-/// One call in flight, until its result is taken or it fails. Until `done`,
-/// it is the one `CALLS` holds for its block (only completing it, with
-/// `done` locked, or taking its result, once done, removes it from there).
+#[derive(Default)]
+struct Completion {
+    result: Option<(HRESULT, usize)>,
+    providers: Vec<std::thread::ThreadId>,
+    defer: bool,
+    publishing: bool,
+    done: bool,
+}
+
+/// Active until cleanup or result retrieval. Completion state outlives the
+/// provider registration, so waiters can still find it during cleanup.
 struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
-    done: Mutex<bool>,
+    done: Mutex<Completion>,
     finished: Condvar,
 }
 
 impl Call {
+    fn wait(&self) -> HRESULT {
+        let done = lock(&self.done);
+        let done = self
+            .finished
+            .wait_while(done, |d| !d.done)
+            .unwrap_or_else(|e| e.into_inner());
+        done.result.unwrap().0
+    }
+
     /// Records the result (the first one wins), wakes waiters and queues
     /// the completion routine on the block's completion port. A call that
     /// is over already is left alone, and so is `block`: the title may have
     /// freed it, or begun another call on it, since.
     fn complete(&self, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+        if result == E_PENDING {
+            return;
+        }
+        let mut done = lock(&self.done);
+        if done.result.is_some() {
+            return;
+        }
+        done.result = Some((result, required_size));
+        // Completing from within a provider remains synchronous when no
+        // other thread is using its context. That provider must stop using
+        // the block/context after completing, as before. Other providers
+        // must return before cleanup can safely run.
+        let current = std::thread::current().id();
+        done.defer = done.providers.iter().any(|id| *id != current);
+        self.publish(block, done);
+    }
+
+    fn publish(&self, block: *mut AsyncBlock, mut done: MutexGuard<'_, Completion>) {
+        let Some((result, required_size)) = done.result else {
+            return;
+        };
+        if (done.defer && !done.providers.is_empty()) || done.publishing {
+            return;
+        }
+        done.publishing = true;
+        drop(done);
         extern "system" fn routine(block: *mut c_void, _canceled: bool) {
             let block = block.cast::<AsyncBlock>();
             // SAFETY: the title keeps the block until its completion
@@ -492,33 +549,80 @@ impl Call {
                 routine(block);
             }
         }
-        if result == E_PENDING {
-            return;
-        }
-        let mut done = lock(&self.done);
-        if *done {
-            return;
-        }
         // Read before publishing: once the status is set, the title may free
         // the block.
         // SAFETY: the call is in flight, so the title's block is valid.
         let (handle, callback) = unsafe { ((*block).queue, (*block).callback) };
-        let (status, size) = words(block);
-        if result < 0 || required_size == 0 {
-            release(block);
+        // Own the queue before publishing: the caller may close its handle
+        // once it observes completion, before we submit the callback.
+        let completion_queue = callback.and_then(|_| queue(handle));
+        let cleanup = result < 0 || required_size == 0;
+        if cleanup {
+            // Transfer visibility atomically, but remove the provider before
+            // cleanup. Reentrant provider operations must find no active call.
+            let mut registry = lock(&REGISTRY);
+            if let Some(call) = registry.remove_active(block, self) {
+                registry.completing.insert(block as usize, call);
+            }
+            drop(registry);
+            self.cleanup(block);
         }
+        // Begin cannot reuse this address until publication has finished.
+        // No callbacks run under the registry or completion mutex.
+        let mut registry = lock(&REGISTRY);
+        let (status, size) = words(block);
         size.store(required_size, Ordering::Release);
         status.store(result as u32 as usize, Ordering::Release);
-        *done = true;
+        // Publication's last block access. A configured completion routine
+        // keeps its existing lifetime guarantee (see `routine` above).
+        if cleanup
+            && registry
+                .completing
+                .get(&(block as usize))
+                .is_some_and(|c| std::ptr::eq(c.as_ref(), self))
+        {
+            registry.completing.remove(&(block as usize));
+        }
+        drop(registry);
+        let mut done = lock(&self.done);
+        done.done = true;
         self.finished.notify_all();
         drop(done);
         if callback.is_some() {
             let task = Task::new(block.cast(), routine);
-            match queue(handle) {
-                Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
+            match completion_queue {
+                Some(queue) if queue.submit(COMPLETION, 0, task.clone()) == S_OK => {}
                 _ => task.run(true),
             }
         }
+    }
+
+    fn cleanup(&self, block: *mut AsyncBlock) {
+        CLEANING.with(|blocks| blocks.borrow_mut().push(block as usize));
+        let _marker = CleanupMarker;
+        self.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+    }
+
+    /// Admit only pending provider operations. A completion racing another
+    /// provider thread is published when the last provider returns instead
+    /// of cleaning up a context that cancellation might still be using.
+    /// A provider requesting deferred completion must return, rather than
+    /// block on its own status: publication depends on that return. A
+    /// non-waiting query is safe and may still report E_PENDING.
+    fn invoke(&self, op: u32, block: *mut AsyncBlock) -> Option<HRESULT> {
+        let mut done = lock(&self.done);
+        if done.result.is_some() {
+            return None;
+        }
+        let current = std::thread::current().id();
+        done.providers.push(current);
+        drop(done);
+        let hr = self.provider(op, block, 0, std::ptr::null_mut());
+        let mut done = lock(&self.done);
+        let index = done.providers.iter().position(|id| *id == current).unwrap();
+        done.providers.swap_remove(index);
+        self.publish(block, done);
+        Some(hr)
     }
 
     fn provider(
@@ -538,11 +642,50 @@ impl Call {
     }
 }
 
-/// Calls by block address.
-static CALLS: LazyLock<Mutex<HashMap<usize, Arc<Call>>>> = LazyLock::new(Default::default);
+#[derive(Default)]
+struct Registry {
+    active: HashMap<usize, Arc<Call>>,
+    /// Wait-only entries: providers are inaccessible and begin is refused
+    /// until cleanup and publication finish. Both maps share one lock.
+    completing: HashMap<usize, Arc<Call>>,
+}
+impl Registry {
+    fn remove_active(&mut self, block: *mut AsyncBlock, expected: &Call) -> Option<Arc<Call>> {
+        if self
+            .active
+            .get(&(block as usize))
+            .is_some_and(|c| std::ptr::eq(c.as_ref(), expected))
+        {
+            self.active.remove(&(block as usize))
+        } else {
+            None
+        }
+    }
+}
+static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(Default::default);
+thread_local! {
+    static CLEANING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+struct CleanupMarker;
+impl Drop for CleanupMarker {
+    fn drop(&mut self) {
+        CLEANING.with(|blocks| {
+            blocks.borrow_mut().pop();
+        });
+    }
+}
 
 fn call(block: *mut AsyncBlock) -> Option<Arc<Call>> {
-    lock(&CALLS).get(&(block as usize)).cloned()
+    lock(&REGISTRY).active.get(&(block as usize)).cloned()
+}
+
+fn waiting_call(block: *mut AsyncBlock) -> Option<Arc<Call>> {
+    let registry = lock(&REGISTRY);
+    registry
+        .active
+        .get(&(block as usize))
+        .or_else(|| registry.completing.get(&(block as usize)))
+        .cloned()
 }
 
 /// The block's status and result-size words.
@@ -558,11 +701,11 @@ fn status(block: *mut AsyncBlock) -> HRESULT {
     words(block).0.load(Ordering::Acquire) as u32 as i32
 }
 
-fn release(block: *mut AsyncBlock) {
+fn release(block: *mut AsyncBlock, expected: &Call) {
     // Unlocked before the provider runs: it may call back into us.
-    let removed = lock(&CALLS).remove(&(block as usize));
+    let removed = lock(&REGISTRY).remove_active(block, expected);
     if let Some(call) = removed {
-        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+        call.cleanup(block);
     }
 }
 
@@ -589,7 +732,11 @@ fn begin(
     identity: *const c_void,
     provider: Provider,
 ) -> Result<Arc<Call>, HRESULT> {
-    if block.is_null() || call(block).is_some() {
+    let mut registry = lock(&REGISTRY);
+    if block.is_null()
+        || registry.active.contains_key(&(block as usize))
+        || registry.completing.contains_key(&(block as usize))
+    {
         return Err(E_INVALIDARG);
     }
     let (status, size) = words(block);
@@ -599,13 +746,15 @@ fn begin(
         provider,
         context: context as usize,
         identity: identity as usize,
-        done: Mutex::new(false),
+        done: Mutex::default(),
         finished: Condvar::new(),
     });
-    lock(&CALLS).insert(block as usize, call.clone());
+    registry.active.insert(block as usize, call.clone());
+    drop(registry);
     // A failed begin fails the call, so the completion routine still runs.
-    let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
-    if hr < 0 {
+    if let Some(hr) = call.invoke(OP_BEGIN, block)
+        && hr < 0
+    {
         call.complete(block, hr, 0);
     }
     Ok(call)
@@ -613,25 +762,35 @@ fn begin(
 
 /// Queues the provider's `DoWork` on the block's work port.
 pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
-    extern "system" fn work(block: *mut c_void, canceled: bool) {
-        let block = block.cast::<AsyncBlock>();
-        let Some(call) = call(block) else { return };
+    extern "system" fn work(context: *mut c_void, canceled: bool) {
+        // SAFETY: Task::owned retains this context for the whole callback.
+        let (address, call) = unsafe { &*context.cast::<(usize, Arc<Call>)>() };
+        let block = *address as *mut AsyncBlock;
         let hr = if canceled {
             E_ABORT
         } else {
-            call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut())
+            let Some(hr) = call.invoke(OP_DO_WORK, block) else {
+                return;
+            };
+            hr
         };
         if hr != E_PENDING {
-            XAsyncComplete(block, hr, 0);
+            call.complete(block, hr, 0);
         }
     }
-    if block.is_null() || call(block).is_none() {
+    let Some(call) = call(block) else {
+        return E_INVALIDARG;
+    };
+    let done = lock(&call.done);
+    if done.result.is_some() {
         return E_INVALIDARG;
     }
     // SAFETY: a block in flight is valid.
     let handle = unsafe { (*block).queue };
-    match queue(handle) {
-        Some(queue) => queue.submit(WORK, delay_ms, Task::new(block.cast(), work)),
+    let queue = queue(handle);
+    drop(done);
+    match queue {
+        Some(queue) => queue.submit(WORK, delay_ms, Task::owned((block as usize, call), work)),
         None => E_INVALIDARG,
     }
 }
@@ -643,13 +802,20 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     }
 }
 
+/// A blocking query stays with one call and waits through cleanup. Cleanup
+/// must not join a thread blocking on the same block: the API cannot infer
+/// this dependency, which is a provider bug. Such threads must use
+/// `wait = false`. A reentrant query of a block undergoing cleanup on this
+/// thread returns its current status instead, including in nested cleanup.
 pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+    if wait && CLEANING.with(|blocks| blocks.borrow().contains(&(block as usize))) {
+        return status(block);
+    }
+    if wait && let Some(call) = waiting_call(block) {
+        return call.wait();
     }
     status(block)
 }
@@ -672,7 +838,9 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// provider completed it first.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
-        call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
+        if call.invoke(OP_CANCEL, block).is_none() {
+            return;
+        }
         // This call: if the provider completed it, the title may have begun
         // another on the block since.
         call.complete(block, E_ABORT, 0);
@@ -713,7 +881,7 @@ pub fn XAsyncGetResult(
         // SAFETY: checked non-null.
         unsafe { used.write(size) };
     }
-    release(block);
+    release(block, &call);
     hr
 }
 
@@ -1077,6 +1245,658 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
+    /// Isolate deadlock-sensitive tests and verify that the exact child ran.
+    /// XTP_XASYNC_TEST is the child-only recursion guard set by this helper.
+    fn bounded_child(name: &str) -> bool {
+        if std::env::var("XTP_XASYNC_TEST").as_deref() == Ok(name) {
+            println!("xasync child: {name}");
+            return true;
+        }
+        let output = tempfile::tempfile().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                &format!("modules::xasync::tests::{name}"),
+                "--exact",
+                "--nocapture",
+            ])
+            .env("XTP_XASYNC_TEST", name)
+            .stdout(output.try_clone().unwrap())
+            .stderr(output.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        use std::io::{Read, Seek};
+        let mut output = output;
+        output.rewind().unwrap();
+        let mut text = String::new();
+        output.read_to_string(&mut text).unwrap();
+        assert!(
+            text.contains(&format!("xasync child: {name}")),
+            "child did not execute: {text}"
+        );
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "child failed or exceeded 20s: {text}"
+        );
+        false
+    }
+
+    #[test]
+    fn status_waiters_arriving_during_error_cleanup_receive_the_error() {
+        if !bounded_child("status_waiters_arriving_during_error_cleanup_receive_the_error") {
+            return;
+        }
+        use std::sync::mpsc::{TryRecvError, sync_channel};
+        struct Cleanup {
+            entered: std::sync::mpsc::SyncSender<()>,
+            resume: Mutex<std::sync::mpsc::Receiver<()>>,
+            count: AtomicU32,
+            timed_out: AtomicBool,
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                // SAFETY: the test retains the block and context until all threads join.
+                let data = unsafe { &*data };
+                // SAFETY: context points to the test's Cleanup.
+                let cleanup = unsafe { &*data.context.cast::<Cleanup>() };
+                cleanup.count.fetch_add(1, Ordering::SeqCst);
+                let _ = cleanup.entered.send(());
+                if lock(&cleanup.resume)
+                    .recv_timeout(Duration::from_secs(10))
+                    .is_err()
+                {
+                    cleanup.timed_out.store(true, Ordering::SeqCst);
+                }
+            }
+            S_OK
+        }
+        let (entered, cleaning) = sync_channel(1);
+        let (resume, permit) = sync_channel(1);
+        let cleanup: &Cleanup = Box::leak(Box::new(Cleanup {
+            entered,
+            resume: Mutex::new(permit),
+            count: AtomicU32::new(0),
+            timed_out: AtomicBool::new(false),
+        }));
+        // A failed assertion must not invalidate memory still used by a worker.
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }));
+        assert_eq!(
+            XAsyncBegin(
+                block,
+                (cleanup as *const Cleanup).cast_mut().cast(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(provider)
+            ),
+            S_OK
+        );
+        let retained = call(block).unwrap();
+        let address = block as usize;
+        let completing =
+            std::thread::spawn(move || XAsyncComplete(address as *mut AsyncBlock, E_ABORT, 0));
+        cleaning
+            .recv_timeout(Duration::from_secs(5))
+            .expect("completion did not enter cleanup");
+        assert!(
+            call(block).is_none(),
+            "provider registration must be removed before cleanup"
+        );
+        assert_eq!(
+            XAsyncGetStatus(block, false),
+            E_PENDING,
+            "cleanup must precede publication"
+        );
+        let mut waiters = Vec::new();
+        let mut results = Vec::new();
+        for _ in 0..3 {
+            let baseline = Arc::strong_count(&retained);
+            let (sent, received) = sync_channel(1);
+            waiters.push(std::thread::spawn(move || {
+                let hr = XAsyncGetStatus(address as *mut AsyncBlock, true);
+                sent.send(hr).unwrap();
+            }));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // An early return proves the old bug; a retained Call proves
+            // the query found this call while cleanup is still paused.
+            // No timeout or scheduling delay is used as evidence of waiting.
+            let early = loop {
+                match received.try_recv() {
+                    Ok(hr) => break Some(hr),
+                    Err(TryRecvError::Empty) if Arc::strong_count(&retained) > baseline => {
+                        break None;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(e) => panic!("waiter disconnected: {e}"),
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "waiter neither returned nor retained its call"
+                );
+                std::thread::yield_now();
+            };
+            results.push((early, received));
+        }
+        // Retaining the call must not let these operations reenter
+        // the provider while its context is being cleaned up.
+        XAsyncComplete(block, S_OK, 8);
+        XAsyncCancel(block);
+        assert_eq!(XAsyncSchedule(block, 0), E_INVALIDARG);
+        resume.send(()).unwrap();
+        completing.join().unwrap();
+        let results: Vec<_> = results
+            .into_iter()
+            .map(|(early, received)| {
+                early.unwrap_or_else(|| {
+                    received
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("waiter was not notified")
+                })
+            })
+            .collect();
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
+        assert!(
+            !cleanup.timed_out.load(Ordering::SeqCst),
+            "cleanup permit timed out"
+        );
+        assert_eq!(cleanup.count.load(Ordering::SeqCst), 1);
+        assert!(waiting_call(block).is_none());
+        assert_eq!(
+            results, [E_ABORT; 3],
+            "waiting queries must receive the final error"
+        );
+    }
+
+    #[test]
+    fn cleanup_can_query_status_and_join_a_nonwaiting_query() {
+        if !bounded_child("cleanup_can_query_status_and_join_a_nonwaiting_query") {
+            return;
+        }
+        static NESTED: AtomicBool = AtomicBool::new(false);
+        extern "system" fn nested(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                // SAFETY: both blocks remain valid until their cleanup returns.
+                let data = unsafe { &*data };
+                NESTED.store(
+                    XAsyncGetStatus(data.block, true) == E_PENDING
+                        && XAsyncGetStatus(data.context.cast(), true) == E_PENDING,
+                    Ordering::SeqCst,
+                );
+            }
+            S_OK
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                // SAFETY: the test leaks its block and flag until the child exits.
+                let data = unsafe { &*data };
+                let direct = XAsyncGetStatus(data.block, true);
+                let pending = XAsyncGetStatus(data.block, false);
+                let inner: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+                    queue: std::ptr::null(),
+                    context: std::ptr::null_mut(),
+                    callback: None,
+                    internal: [0; 4],
+                }));
+                let begun = XAsyncBegin(
+                    inner,
+                    data.block.cast(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    Some(nested),
+                );
+                XAsyncComplete(inner, E_ABORT, 0);
+                let restored = XAsyncGetStatus(data.block, true) == E_PENDING;
+                XAsyncComplete(data.block, S_OK, 0);
+                XAsyncCancel(data.block);
+                let address = data.block as usize;
+                let (sent, received) = std::sync::mpsc::sync_channel(1);
+                let worker = std::thread::spawn(move || {
+                    let block = address as *mut AsyncBlock;
+                    XAsyncComplete(block, S_OK, 0);
+                    XAsyncCancel(block);
+                    let observed = (
+                        XAsyncGetStatus(block, false),
+                        XAsyncSchedule(block, 0),
+                        call(block).is_none(),
+                    );
+                    let _ = sent.send(observed);
+                });
+                let observed = received.recv_timeout(Duration::from_secs(5));
+                // The subprocess watchdog also bounds join if a regression
+                // wedges an operation before the worker can send its result.
+                let joined = worker.join().is_ok();
+                // SAFETY: context points to the test's leaked AtomicBool.
+                unsafe { &*data.context.cast::<AtomicBool>() }.store(
+                    direct == E_PENDING
+                        && pending == E_PENDING
+                        && observed == Ok((E_PENDING, E_INVALIDARG, true))
+                        && joined
+                        && begun == S_OK
+                        && NESTED.load(Ordering::SeqCst)
+                        && restored,
+                    Ordering::SeqCst,
+                );
+            }
+            S_OK
+        }
+        let observed: &AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }));
+        assert_eq!(
+            XAsyncBegin(
+                block,
+                (observed as *const AtomicBool).cast_mut().cast(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(provider)
+            ),
+            S_OK
+        );
+        XAsyncComplete(block, E_ABORT, 0);
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "cleanup must return pending for a reentrant wait and permit a joined non-waiting query without exposing the provider"
+        );
+        assert_eq!(XAsyncGetStatus(block, true), E_ABORT);
+        assert!(waiting_call(block).is_none());
+        assert!(
+            CLEANING.with(|blocks| blocks.borrow().is_empty()),
+            "nested cleanup markers were not restored"
+        );
+    }
+
+    #[test]
+    fn a_wait_keeps_the_call_reused_by_its_completion_callback() {
+        if !bounded_child("a_wait_keeps_the_call_reused_by_its_completion_callback") {
+            return;
+        }
+        static BEGUN: AtomicBool = AtomicBool::new(false);
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_DO_WORK {
+                // SAFETY: the runtime passes valid provider data.
+                XAsyncComplete(unsafe { (*data).block }, E_ABORT, 0);
+            }
+            S_OK
+        }
+        extern "system" fn completed(block: *mut AsyncBlock) {
+            // SAFETY: this test retains the block until both calls are over.
+            unsafe { (*block).callback = None };
+            BEGUN.store(
+                XAsyncBegin(
+                    block,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    Some(provider),
+                ) == S_OK,
+                Ordering::SeqCst,
+            );
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 3, &mut q), S_OK);
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(completed),
+            internal: [0; 4],
+        }));
+        let old = begin(block, std::ptr::null_mut(), std::ptr::null(), provider).unwrap();
+        let old_released = Arc::downgrade(&old);
+        let (resume, permit) = std::sync::mpsc::sync_channel(1);
+        // Lookup has selected the old call. Force the rest of the wait path
+        // to run after its callback has begun the new call at this address.
+        let waiter = std::thread::spawn(move || {
+            permit
+                .recv_timeout(Duration::from_secs(5))
+                .expect("reuse callback did not finish");
+            old.wait()
+        });
+        assert_eq!(XAsyncSchedule(block, 0), S_OK);
+        assert_eq!(XAsyncSchedule(block, 0), S_OK);
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert!(BEGUN.load(Ordering::SeqCst));
+        assert_eq!(XAsyncGetStatus(block, false), E_PENDING);
+        assert!(
+            XTaskQueueDispatch(q, WORK, 0),
+            "old queued work was not dispatched"
+        );
+        assert_eq!(
+            XAsyncGetStatus(block, false),
+            E_PENDING,
+            "old queued work reached the new call"
+        );
+        resume.send(()).unwrap();
+        assert_eq!(
+            waiter.join().unwrap(),
+            E_ABORT,
+            "the wait followed the new call"
+        );
+        assert!(
+            old_released.upgrade().is_none(),
+            "dispatched work retained the old call"
+        );
+        XAsyncComplete(block, S_OK, 0);
+        assert_eq!(XAsyncGetStatus(block, true), S_OK);
+        assert!(waiting_call(block).is_none());
+        let last = begin(block, std::ptr::null_mut(), std::ptr::null(), provider).unwrap();
+        let discarded = Arc::downgrade(&last);
+        assert_eq!(XAsyncSchedule(block, 0), S_OK);
+        last.complete(block, E_ABORT, 0);
+        drop(last);
+        assert!(
+            discarded.upgrade().is_some(),
+            "queued work must retain its context"
+        );
+        XTaskQueueCloseHandle(q);
+        assert!(
+            discarded.upgrade().is_none(),
+            "closing the queue leaked undispatched work"
+        );
+    }
+
+    #[test]
+    fn completion_waits_for_an_active_cancel_provider() {
+        if !bounded_child("completion_waits_for_an_active_cancel_provider") {
+            return;
+        }
+        use std::sync::mpsc::sync_channel;
+        struct Cancel {
+            entered: std::sync::mpsc::SyncSender<()>,
+            resume: Mutex<std::sync::mpsc::Receiver<()>>,
+            cleanups: AtomicU32,
+            valid: AtomicBool,
+            requests: AtomicU32,
+            deferred: AtomicBool,
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the test keeps data's context alive through both joins.
+            let data = unsafe { &*data };
+            // SAFETY: context points to the test's Cancel.
+            let cancel = unsafe { &*data.context.cast::<Cancel>() };
+            if op == OP_CANCEL {
+                if cancel.requests.fetch_add(1, Ordering::SeqCst) != 0 {
+                    XAsyncComplete(data.block, E_ABORT, 0);
+                    // Do not block here: this invocation is one of the
+                    // providers whose return allows publication.
+                    cancel.deferred.store(
+                        XAsyncGetStatus(data.block, false) == E_PENDING,
+                        Ordering::SeqCst,
+                    );
+                    return S_OK;
+                }
+                let _ = cancel.entered.send(());
+                let resumed = lock(&cancel.resume)
+                    .recv_timeout(Duration::from_secs(10))
+                    .is_ok();
+                cancel.valid.store(
+                    resumed && cancel.cleanups.load(Ordering::SeqCst) == 0,
+                    Ordering::SeqCst,
+                );
+                // Supported reentrancy: a provider may complete its own call.
+                XAsyncComplete(data.block, S_OK, 0);
+            } else if op == OP_CLEANUP {
+                cancel.cleanups.fetch_add(1, Ordering::SeqCst);
+                XAsyncComplete(data.block, S_OK, 0);
+                XAsyncCancel(data.block);
+            }
+            S_OK
+        }
+        let (entered, waiting) = sync_channel(1);
+        let (resume, permit) = sync_channel(1);
+        let cancel: &Cancel = Box::leak(Box::new(Cancel {
+            entered,
+            resume: Mutex::new(permit),
+            cleanups: AtomicU32::new(0),
+            valid: AtomicBool::new(false),
+            requests: AtomicU32::new(0),
+            deferred: AtomicBool::new(false),
+        }));
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }));
+        assert_eq!(
+            XAsyncBegin(
+                block,
+                (cancel as *const Cancel).cast_mut().cast(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(provider)
+            ),
+            S_OK
+        );
+        let address = block as usize;
+        let cancelling = std::thread::spawn(move || XAsyncCancel(address as *mut AsyncBlock));
+        waiting
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancel provider did not start");
+        let completing = std::thread::spawn(move || XAsyncCancel(address as *mut AsyncBlock));
+        completing.join().unwrap();
+        assert!(
+            cancel.deferred.load(Ordering::SeqCst),
+            "a provider's non-waiting query must observe deferred completion without forming a cycle"
+        );
+        assert_eq!(XAsyncGetStatus(block, false), E_PENDING);
+        assert_eq!(cancel.cleanups.load(Ordering::SeqCst), 0);
+        resume.send(()).unwrap();
+        cancelling.join().unwrap();
+        assert!(
+            cancel.valid.load(Ordering::SeqCst),
+            "cleanup overlapped the cancel provider or the permit timed out"
+        );
+        assert_eq!(cancel.cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            XAsyncGetStatus(block, true),
+            E_ABORT,
+            "first completion wins"
+        );
+        assert!(waiting_call(block).is_none());
+    }
+
+    #[test]
+    fn completion_retains_its_queue_before_publishing_status() {
+        if !bounded_child("completion_retains_its_queue_before_publishing_status") {
+            return;
+        }
+        struct Context {
+            queue: std::sync::Weak<Queue>,
+            retained: AtomicBool,
+            completed: AtomicU32,
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                // SAFETY: the test retains its block and context through completion.
+                let data = unsafe { &*data };
+                // SAFETY: context points to the test's leaked Context.
+                let context = unsafe { &*data.context.cast::<Context>() };
+                let retained = context.queue.strong_count() >= 2;
+                context.retained.store(retained, Ordering::SeqCst);
+                // Close the caller's reference only when runtime ownership is
+                // established. The original implementation fails safely below,
+                // rather than incrementing an Arc through a dangling handle.
+                if retained {
+                    // SAFETY: the block is still pending and valid during cleanup.
+                    XTaskQueueCloseHandle(unsafe { (*data.block).queue });
+                }
+            }
+            S_OK
+        }
+        extern "system" fn completed(block: *mut AsyncBlock) {
+            // SAFETY: the test keeps both objects alive until this callback returns.
+            let context = unsafe { &*(*block).context.cast::<Context>() };
+            context.completed.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 3, &mut q), S_OK);
+        let weak = Arc::downgrade(&queue(q).unwrap());
+        let context: &Context = Box::leak(Box::new(Context {
+            queue: weak,
+            retained: AtomicBool::new(false),
+            completed: AtomicU32::new(0),
+        }));
+        let pointer = (context as *const Context).cast_mut().cast();
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: pointer,
+            callback: Some(completed),
+            internal: [0; 4],
+        }));
+        assert_eq!(
+            XAsyncBegin(
+                block,
+                pointer,
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(provider)
+            ),
+            S_OK
+        );
+        XAsyncComplete(block, E_ABORT, 0);
+        let retained = context.retained.load(Ordering::SeqCst);
+        if !retained {
+            XTaskQueueCloseHandle(q);
+        }
+        assert_eq!(context.completed.load(Ordering::SeqCst), 1);
+        assert!(
+            context.queue.upgrade().is_none(),
+            "completion leaked its queue reference"
+        );
+        assert!(
+            retained,
+            "completion must own the queue before cleanup and status publication"
+        );
+    }
+
+    #[test]
+    fn zero_size_completion_can_free_the_block_in_its_callback() {
+        if !bounded_child("zero_size_completion_can_free_the_block_in_its_callback") {
+            return;
+        }
+        struct Counts {
+            cleanups: AtomicU32,
+            callbacks: AtomicU32,
+            inline: AtomicBool,
+            work: AtomicU32,
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid data; Counts lives until begin returns.
+            let data = unsafe { &*data };
+            if op == OP_BEGIN {
+                XAsyncSchedule(data.block, 0);
+                XAsyncComplete(data.block, S_OK, 0);
+                // SAFETY: Counts is retained by the test even after
+                // the immediate callback has freed the block.
+                let counts = unsafe { &*data.context.cast::<Counts>() };
+                counts.inline.store(
+                    counts.callbacks.load(Ordering::SeqCst) == 1,
+                    Ordering::SeqCst,
+                );
+                XAsyncComplete(data.block, E_ABORT, 8);
+            } else if op == OP_DO_WORK {
+                // SAFETY: Counts is retained by this test until dispatch ends.
+                unsafe { &*data.context.cast::<Counts>() }
+                    .work
+                    .fetch_add(1, Ordering::SeqCst);
+            } else if op == OP_CLEANUP {
+                // SAFETY: the context points to this test's Counts.
+                unsafe { &*data.context.cast::<Counts>() }
+                    .cleanups
+                    .fetch_add(1, Ordering::SeqCst);
+                XAsyncComplete(data.block, E_ABORT, 0);
+                XAsyncCancel(data.block);
+            }
+            S_OK
+        }
+        extern "system" fn completed(block: *mut AsyncBlock) {
+            // SAFETY: the test allocated this block; this is its only callback.
+            let block = unsafe { Box::from_raw(block) };
+            // SAFETY: the test retains Counts until this immediate callback returns.
+            let counts = unsafe { &*block.context.cast::<Counts>() };
+            let mut size = usize::MAX;
+            let mut used = usize::MAX;
+            let block_ptr = (&*block as *const AsyncBlock).cast_mut();
+            let valid = XAsyncGetStatus(block_ptr, true) == S_OK
+                && XAsyncGetResultSize(block_ptr, &mut size) == S_OK
+                && size == 0
+                && XAsyncGetResult(
+                    block_ptr,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut used,
+                ) == S_OK
+                && used == 0
+                && counts.cleanups.load(Ordering::SeqCst) == 1;
+            counts
+                .callbacks
+                .fetch_add(u32::from(valid), Ordering::SeqCst);
+        }
+        let counts = Counts {
+            cleanups: AtomicU32::new(0),
+            callbacks: AtomicU32::new(0),
+            inline: AtomicBool::new(false),
+            work: AtomicU32::new(0),
+        };
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 3, &mut q), S_OK);
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: (&raw const counts).cast_mut().cast(),
+            callback: Some(completed),
+            internal: [0; 4],
+        }));
+        let old = begin(
+            block,
+            (&raw const counts).cast_mut().cast(),
+            std::ptr::null(),
+            provider,
+        )
+        .unwrap();
+        assert_eq!(counts.callbacks.load(Ordering::SeqCst), 1);
+        assert!(
+            counts.inline.load(Ordering::SeqCst),
+            "immediate completion must remain reentrant"
+        );
+        old.complete(block, E_ABORT, 0); // The address is now freed: no dereference is allowed.
+        assert_eq!(old.wait(), S_OK);
+        assert!(old.invoke(OP_CANCEL, block).is_none());
+        assert_eq!(counts.cleanups.load(Ordering::SeqCst), 1);
+        assert!(call(block).is_none());
+        assert!(
+            XTaskQueueDispatch(q, WORK, 0),
+            "old work was not dispatched"
+        );
+        assert_eq!(
+            counts.work.load(Ordering::SeqCst),
+            0,
+            "old work invoked a provider after the block was freed"
+        );
+        XTaskQueueCloseHandle(q);
+    }
+
     fn slot<F: Copy>(offset: usize) -> F {
         crate::modules::xgameruntime::method(&OBJECT, offset)
     }
@@ -1391,6 +2211,9 @@ mod tests {
     /// worker then wrote to, and the late result completed the second call.)
     #[test]
     fn a_cancelled_pending_call_leaves_the_reused_block_alone() {
+        if !bounded_child("a_cancelled_pending_call_leaves_the_reused_block_alone") {
+            return;
+        }
         use std::sync::mpsc::channel;
         static COMPLETED: AtomicU32 = AtomicU32::new(0);
         extern "system" fn completed(_: *mut AsyncBlock) {
@@ -1419,11 +2242,14 @@ mod tests {
         // to look at it).
         let slot = pending(block, first, move || {
             EXIT.with(|e| *e.borrow_mut() = Some(Exit(exited)));
-            let _ = wait_first.recv();
+            wait_first
+                .recv_timeout(long)
+                .expect("first worker was not released");
             Ok(b"first!".to_vec())
         })
         .expect("begun");
         assert_eq!(Arc::strong_count(&slot), 3, "us, the call, the worker");
+        let first_call = call(block).unwrap();
         assert_eq!(XAsyncGetStatus(block, false), E_PENDING);
 
         XAsyncCancel(block);
@@ -1435,10 +2261,16 @@ mod tests {
 
         let (go_second, wait_second) = channel::<()>();
         let hr = pending_with(block, second, move || {
-            let _ = wait_second.recv();
+            wait_second
+                .recv_timeout(long)
+                .expect("second worker was not released");
             Ok(b"second".to_vec())
         });
         assert_eq!(hr, S_OK);
+        first_call.complete(block, E_ABORT, 0);
+        assert_eq!(first_call.wait(), E_ABORT);
+        release(block, &first_call);
+        assert_eq!(XAsyncGetStatus(block, false), E_PENDING);
 
         // The first work ends; its thread is gone once `first_ended` hears.
         go_first.send(()).unwrap();
@@ -1471,7 +2303,7 @@ mod tests {
         let buffer = out.as_mut_ptr().cast();
         assert_eq!(XAsyncGetResult(block, second, 6, buffer, &mut used), S_OK);
         assert_eq!((&out, used), (b"second", 6));
-        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert!(XTaskQueueDispatch(q, COMPLETION, 5_000));
         assert_eq!(COMPLETED.load(Ordering::SeqCst), 2);
         assert!(call(block).is_none(), "the call ends with its result");
         XTaskQueueCloseHandle(q);
