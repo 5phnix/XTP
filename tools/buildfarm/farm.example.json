@@ -18,7 +18,7 @@
   "dailyCapUsd": 50,
   "maxBuildsPerVm": 2,
   "slotsPerVm": 6,
-  "maxRunMinutes": 120,
+  "maxRunMinutes": 30,
   "maxSendFileMB": 20,
   "stateDir": null,
   "tempDir": null

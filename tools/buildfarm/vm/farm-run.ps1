@@ -23,6 +23,9 @@ $ProgressPreference = 'SilentlyContinue'
 $Root = Get-FarmRoot
 $req = ConvertFrom-FarmBase64 $Request
 $t0 = Get-Date
+# The job's deadline, all its commands included (the client gives up a
+# little later).
+$deadline = $t0.AddMinutes([Math]::Max(1, [int] $req.maxMinutes))
 
 $version = (Get-Content -Raw (Join-Path $PSScriptRoot 'version.txt')).Trim()
 if ($req.v -and $req.v -ne $version) {
@@ -39,18 +42,24 @@ if ([int64] $req.bundle -gt 0) {
     $buf = New-Object byte[] 1048576
     # The client's .NET may put its console encoding's preamble (a UTF-8 BOM)
     # before the bundle: it says how many bytes that is.
+    # Nothing for 60 s: the connection is stuck. Give up (98, the client
+    # retries elsewhere) rather than wait for ever, which would also keep
+    # this VM from stopping when idle.
     $skip = [int] $req.skip
+    $stalled = $false
     while ($skip -gt 0) {
-        $n = $in.Read($buf, 0, $skip)
-        if ($n -le 0) { break }
+        $n = Read-FarmStream $in $buf $skip 60
+        if ($n -lt 0) { $stalled = $true; break }
+        if ($n -eq 0) { break }
         $skip -= $n
     }
     $fs = [IO.File]::Create($bundle)
+    $left = [int64] $req.bundle
     try {
-        $left = [int64] $req.bundle
-        while ($left -gt 0) {
-            $n = $in.Read($buf, 0, [int] [Math]::Min([int64] $buf.Length, $left))
-            if ($n -le 0) { break }
+        while (-not $stalled -and $left -gt 0) {
+            $n = Read-FarmStream $in $buf ([int] [Math]::Min([int64] $buf.Length, $left)) 60
+            if ($n -lt 0) { $stalled = $true; break }
+            if ($n -eq 0) { break }
             $fs.Write($buf, 0, $n)
             $left -= $n
         }
@@ -58,9 +67,11 @@ if ([int64] $req.bundle -gt 0) {
         $fs.Dispose()
     }
     if ($left -gt 0) {
-        Write-FarmErr "the bundle arrived incomplete ($left bytes missing)"
+        $why = $(if ($stalled) { 'nothing came for 60 s' } else { 'the stream ended' })
+        Write-FarmErr "the bundle arrived incomplete ($left of $($req.bundle) bytes missing: $why)"
         Remove-Item -Force $bundle -ErrorAction SilentlyContinue
-        exit 98
+        # A read may still be pending on stdin: leave without waiting for it.
+        [Environment]::Exit(98)
     }
 }
 
@@ -73,13 +84,14 @@ $code = 98
 try {
     # 3. The slot, one job at a time.
     $lockPath = Join-Path $Root "locks\$($req.slot).lock"
-    $deadline = (Get-Date).AddMinutes([int] $req.waitMinutes)
+    # Its own limit: $deadline stays the whole job's.
+    $lockDeadline = (Get-Date).AddMinutes([int] $req.waitMinutes)
     $said = $false
     while (-not $lock) {
         try {
             $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         } catch {
-            if ((Get-Date) -gt $deadline) { Write-FarmErr "slot $($req.slot) stayed busy for $($req.waitMinutes) minutes"; exit 99 }
+            if ((Get-Date) -gt $lockDeadline) { Write-FarmErr "slot $($req.slot) stayed busy for $($req.waitMinutes) minutes"; exit 99 }
             if (-not $said) { Write-FarmErr "slot $($req.slot) is busy: waiting"; $said = $true }
             Start-Sleep -Seconds 2
         }
@@ -145,7 +157,7 @@ try {
         $a = @(@($step.args) | ForEach-Object { "$_".Replace($token, $slotDir) })
         $last = $a
         if ($step.label) { [Console]::Out.WriteLine($step.label); [Console]::Out.Flush() }
-        $code = Invoke-FarmWatched -FilePath $cargo -ArgumentList $a -Environment $envs -WorkingDirectory $cwd -MaxMinutes ([int] $req.maxMinutes) -Watch $watch
+        $code = Invoke-FarmWatched -FilePath $cargo -ArgumentList $a -Environment $envs -WorkingDirectory $cwd -Deadline $deadline -Watch $watch
         if ($code -ne 0 -and (Test-FarmGoingAway)) {
             Write-FarmErr "$vmName is being stopped (Spot reclaim or stop): the client runs the job elsewhere"
             $code = 95

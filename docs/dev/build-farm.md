@@ -60,13 +60,30 @@ the arguments are rewritten to the slot's. Your `RUSTFLAGS`, `RUST_*`,
 paths of your PC (the game folder, caches). `CARGO_TARGET_DIR` and
 `CARGO_BUILD_JOBS` do not: the VM uses its slot's target and all its cores.
 cargo's stdout and stderr are the SSH connection's, so output streams as it
-comes. A run that exceeds `maxRunMinutes` (120) is stopped (exit 124).
+comes.
+
+**Time limits.** Nothing waits for ever. A job has `maxRunMinutes` (30) in
+all, its attempts included, or `XTP_FARM_JOB_MINUTES` (`xtp-check.ps1` sets
+12, so that a stuck farm still leaves time for the local check): the VM
+stops cargo at its deadline (exit 124), and the client gives up a little
+later on a VM that stopped answering. The bundle must go through with no
+pause longer than 60 s, on both sides; short commands (probes, file lists)
+get 3 minutes. On a timeout the client stops ssh and its IAP proxy, marks
+the VM unavailable for a few minutes and runs the job elsewhere, or on the
+PC (75). ssh's own keepalives (`ServerAliveInterval`) are not enough: a
+connection stuck in the IAP proxy blocks ssh itself. Each job also stops
+the farm's ssh processes and IAP proxies whose caller is gone (a
+cargo-remote killed in the middle of a job), never those of a caller still
+running. On the VM, the agent stops a run still there after 6 hours.
 
 **Artifacts.** After a successful `cargo build`, the client fetches the
 executables the build produced (and their `.pdb`) into your worktree's
 `target`, but only those that differ from your local copy (compared by
 SHA-256). So `cargo-slot.ps1 build --profile diag -p xtp` still leaves an
-up-to-date `target\diag\xtp.exe` for a game run. For other files:
+up-to-date `target\diag\xtp.exe` for a game run. If fetching fails after a
+successful build, the command fails with the reason and how to fetch again
+(`--farm-fetch`); it is never built again elsewhere or on the PC. For other
+files:
 
 ```powershell
 # after any successful command
@@ -279,7 +296,7 @@ the cap. Then point the tools at it:
 | `dailyCapUsd` | 50 | the daily budget cap |
 | `maxBuildsPerVm` | 2 | jobs on a VM before another one is started |
 | `slotsPerVm` | 6 | checkouts (with their target directory) per VM |
-| `maxRunMinutes` | 120 | longest job |
+| `maxRunMinutes` | 30 | longest job, all attempts included (`XTP_FARM_JOB_MINUTES` overrides it) |
 | `maxSendFileMB` | 20 | largest uncommitted file sent |
 | `stateDir`, `tempDir` | the config's folder, `<stateDir>\tmp` | where the ledger, keys and temporary files go |
 
@@ -366,6 +383,7 @@ disks, images, Cloud NAT and firewall rule, nothing else.
 | `Update-FarmPrices.ps1` | list prices from the Cloud Billing Catalog |
 | `Update-FarmAgent.ps1` | push the agent to running VMs |
 | `Remove-Farm.ps1` | delete the farm |
+| `Test-Farm.ps1` | offline checks of the helpers and time limits; `-Live`: a diagnostics build of `xtp` must bring `target\diag\xtp.exe` and its `.pdb` back, a job over its time must stop (124), a stuck command be cut off, an orphaned ssh be stopped |
 | `FarmCommon.ps1` | the PC side's shared code |
 | `vm\setup-toolchain.ps1` | toolchain installation (image builder's startup script) |
 | `vm\farm-agent.ps1` | boot tasks and the idle watcher |
@@ -412,7 +430,7 @@ from a worktree on the PC:
 | `xtp-check.ps1` again, after small changes | 28 s |
 | `cargo test -p xtp-gpu` after a one-line change in `crates/xtp-gpu` | 8.2 s (cargo 1.9 s) |
 | A stopped VM started on demand, until the job runs | 29 s |
-| A Spot reclaim during a job, until it runs again on another VM | about 1 minute |
+| A Spot reclaim during a job, until it runs again on another VM | 1 minute (measured once; bounded by the time limits) |
 | A failed job's extra check (is the VM going away?) | about 2 s |
 | An idle VM stopping itself (guest shutdown, then TERMINATED) | at its idle threshold, then 37 s |
 
@@ -427,5 +445,8 @@ from a worktree on the PC:
   farm's default, as for local tests). Hardware-only features and timing
   measurements belong on the PC.
 - **Snapshots.** A job sees the worktree as it was when the job started.
+- **IAP tunnels.** gcloud's tunnel sometimes stops passing data (seen: an
+  upload stalled at 0 or 100 KB). The time limits above turn that into a
+  retry elsewhere instead of a hang.
 - **Spot.** A reclaimed VM can take minutes to come back when its zone is
   short of capacity; the other VMs and the PC take over meanwhile.
