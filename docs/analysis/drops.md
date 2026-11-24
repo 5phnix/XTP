@@ -170,13 +170,31 @@ corners come from the vertex id. Since drops-fix (`d80e707`) those draw
 each record as the title wrote it: 3 vertices a rectangle, from the
 record's start vertex, on the indirect path and on the direct one. They
 drew 6 a rectangle from vertex 0 before, twice the title's vertices. Their
-vertex ids count from 0 in each record, as on the console (§5.1.1).
-shortcut: the fourth corner, which the console makes from the vertex
-shader's outputs, is not made; a vertex shader that reads its id past 2
-draws whatever it computes for it. The pipelines are logged once each
-("indirect rectangles without vertex inputs"). Making the fourth corner is
-left to do: VIctory #255's remap (the vertex shader run for the three
-corners), or a geometry stage as VIctory #1020 adds.
+vertex ids count from 0 in each record, as on the console (§5.1.1). The
+pipelines are logged once each ("indirect rectangles without vertex
+inputs").
+
+Their fourth corner, which the console makes from the vertex shader's
+outputs, is made since rects (task 7fead5db): a pipeline of the console's
+rectangle type whose vertex shader has no per-vertex input gets a geometry
+stage behind its translated vertex shader (`xtp_shader::emit::rect_gs`,
+added at the pipeline's creation in `pipeline/host.rs`, chosen in
+`rectangles/geometry.rs`). Reimplemented from the design in fxceless's
+study of their fork, no code of theirs. The corner is the vertex whose
+position shares x with one other vertex and y with the third; the fourth
+vertex is `a + b − corner` for the position and every float output, `v0`'s
+for the others (flat values are the first vertex's); three vertices with no
+such corner, or whose w differ, stay one triangle. The tiled lighting's
+rectangles come as top left, bottom left, top right: their corner is v0,
+which the input path's `v3 = v0 + v2 - v1` (corner v1) would get wrong; they
+have no vertex input, so they take the stage. WARP tests
+(`rectangles::geometry::tests`) draw the three vertex orders, three vertices
+with no corner and a corner whose w differ, directly and through the
+indirect rewrite, and check the coverage, the interpolated output and v0's
+flat value (culling back faces, then front faces: both triangles turn the
+same way); without the stage the same draw lights each first triangle only.
+A pipeline the driver refuses with the stage is made without it (a
+warning), and a pixel shader that reads `SV_PrimitiveID` gets none.
 
 #### 5.1.1 Where the start vertex and start instance arrive
 
@@ -296,7 +314,7 @@ programs, as OCE does: the maintainers' watch notes; not done).
 | Wave64 mesh programs on 32-lane hosts | 1,700 / 3,451 | mesh64 (0a31f0cb) |
 | Slow translator refusals holding the workers (lane masks) | most of "being made", 432 / 336 indirect | masks-fix; a slow lane in `make.rs` if it stays |
 | Shaders that do not translate | 691 / 992 | translator tasks (VIctory #193 + #704 need `descriptor/` too) |
-| Rectangles whose corners come from the vertex id (drawn, fourth corner not made; their vertex ids are the console's, §5.1.1) | 0 dropped | the fourth corner: VIctory #255's remap or #1020's geometry stage, not taken yet |
+| Rectangles whose corners come from the vertex id (drawn, the fourth corner made by a geometry stage since rects; their vertex ids are the console's, §5.1.1) | 0 dropped | rects (7fead5db): the world session's look at the tiled lighting |
 | Indexed rectangle lists | 1 | GPU layer, not done |
 | FidelityFX programs without DXIL | — | FidelityFX task |
 
