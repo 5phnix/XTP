@@ -47,6 +47,8 @@ pub fn run(
     let image = xtp_loader::load(&prepared, &images)?;
     // SAFETY: just mapped from the executable `hash` names; no title code has run.
     unsafe { xtp_game::watchdog::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
+    // SAFETY: as above.
+    unsafe { xtp_game::asserts::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
     xtp_hle::runtime::set_main_image(image.base());
     xtp_hle::runtime::set_image_path(image.base(), exe);
     println!(
