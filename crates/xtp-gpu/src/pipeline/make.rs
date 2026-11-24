@@ -48,7 +48,8 @@ pub(crate) struct Pending {
     /// it. Changed under the queues' lock.
     pool: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
-    /// Set by the call that made it.
+    /// Set by the call that made it, once what that call counts is in
+    /// place ([`Pending::make`]).
     finished: AtomicBool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
@@ -106,9 +107,13 @@ impl Pending {
         }
     }
 
-    /// Makes the host pipeline (once); true for the call that finished it.
-    fn make(&self) -> bool {
+    /// Makes the host pipeline (once); true for the call that made it,
+    /// which runs `counted` before signalling it finished: whoever sees
+    /// `finished` sees what `counted` counted.
+    fn make(&self, counted: impl FnOnce()) -> bool {
+        let mut first = false;
         self.made.get_or_init(|| {
+            first = true;
             #[cfg(feature = "diagnostics")]
             let _ = super::host::take_refusal();
             let started = Instant::now();
@@ -132,10 +137,13 @@ impl Pending {
             }
             made
         });
-        let first = !self.finished.swap(true, Ordering::Relaxed);
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
+        if first {
+            counted();
+            self.finished.store(true, Ordering::Release);
+            let (lock, done) = &DONE;
+            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            done.notify_all();
+        }
         first
     }
 
@@ -670,18 +678,21 @@ impl Pools {
         }
     }
 
-    /// Makes `p` and keeps the counts.
+    /// Makes `p` and keeps the counts, in place before `p` is signalled
+    /// finished.
     fn finish(&self, p: &Pending) {
         let started = Instant::now();
-        if !p.make() {
+        let made = p.make(|| {
+            let us = started.elapsed().as_micros() as u64;
+            let counts = &self.counts[p.pool()];
+            counts.made.fetch_add(1, Ordering::Relaxed);
+            counts.make_us.fetch_add(us, Ordering::Relaxed);
+            counts.longest_us.fetch_max(us, Ordering::Relaxed);
+            counts.waiting.fetch_sub(1, Ordering::Relaxed);
+        });
+        if !made {
             return;
         }
-        let us = started.elapsed().as_micros() as u64;
-        let counts = &self.counts[p.pool()];
-        counts.made.fetch_add(1, Ordering::Relaxed);
-        counts.make_us.fetch_add(us, Ordering::Relaxed);
-        counts.longest_us.fetch_max(us, Ordering::Relaxed);
-        counts.waiting.fetch_sub(1, Ordering::Relaxed);
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
         } else {
@@ -831,7 +842,7 @@ mod tests {
 
     fn until_finished(p: &Pending) {
         let started = Instant::now();
-        while !p.finished.load(Ordering::Relaxed) && started.elapsed() < Duration::from_secs(60) {
+        while !p.finished.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(60) {
             std::thread::yield_now();
         }
     }
@@ -960,7 +971,7 @@ mod tests {
         until_finished(&p);
         assert_eq!(p.queued.load(Ordering::Relaxed), MAKING);
         assert!(matches!(p.made.get(), Some(None)));
-        assert!(!p.make(), "already finished");
+        assert!(!p.make(|| {}), "already finished");
     }
 
     /// First uses come out first; a pipeline started early and then used
@@ -1207,6 +1218,9 @@ mod tests {
             matches!(heavy.made.get(), Some(Some(_))),
             "the heavy one is made too"
         );
+        // Each pool's counts are in place once its pipeline is finished
+        // (`ready` returns the cheap one as soon as it is made).
+        until_finished(&cheap);
         let [cheap_did, heavy_did] = split.counts.each_ref().map(Counts::take);
         assert_eq!(
             (heavy_did.made, heavy_did.unready, heavy_did.waiting),
