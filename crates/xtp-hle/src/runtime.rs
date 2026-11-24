@@ -71,7 +71,7 @@ pub fn load_title_dll(file: &str) -> Result<Option<usize>, String> {
     TITLE_DLL_LOADER.get().map_or(Ok(None), |load| load(file))
 }
 
-/// What the title's manifest (`MicrosoftGame.config` beside its executable)
+/// What the title's manifest (`MicrosoftGame.config` in its package root)
 /// says about it, and where its persistent local storage lives.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Title {
@@ -253,6 +253,17 @@ pub fn use_console_timers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_executable_names_only_in_the_package_list() {
+        let manifest = r#"<Game><Executable Name="outside.exe"/>
+            <ExecutableList><Executable Description="x > y" Name = 'R&amp;D Tools.exe'/>
+            <Executable Name="Second.exe"/></ExecutableList></Game>"#;
+        assert_eq!(
+            Title::from_manifest(manifest).executables,
+            ["R&D Tools.exe", "Second.exe"]
+        );
+    }
 
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {

@@ -71,7 +71,8 @@ target\release\xtp.exe run "<game dir>" --execute
 
 With a folder, `xtp run` selects an existing executable named in
 `MicrosoftGame.config`. If none matches, it looks for a single `.exe` in
-the folder. When several match, it lists them so you can pass one explicitly.
+the folder and reports why it skipped any named entries. When several match,
+it lists them so you can pass one explicitly.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\xtp\data`), derived

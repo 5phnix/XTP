@@ -19,8 +19,15 @@ fn resolve_target(path: &Path) -> Result<RunTarget<'_>> {
     } else {
         path.parent().unwrap_or(Path::new("."))
     };
-    let manifest =
-        std::fs::read_to_string(package_dir.join("MicrosoftGame.config")).unwrap_or_default();
+    let manifest_path = package_dir.join("MicrosoftGame.config");
+    let manifest = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            eprintln!("warning: could not read {}: {e}", manifest_path.display());
+            String::new()
+        }
+    };
     let title = xtp_hle::runtime::Title::from_manifest(&manifest);
     let exe = if folder {
         pick_executable(package_dir, &title.executables)?
@@ -35,28 +42,41 @@ fn resolve_target(path: &Path) -> Result<RunTarget<'_>> {
 }
 
 #[cfg(windows)]
-fn pick_executable(folder: &Path, configured: &[String]) -> Result<PathBuf> {
+fn configured_executable(root: &Path, name: &str) -> Result<PathBuf> {
     use std::path::Component;
 
-    let is_exe = |p: &Path| {
-        p.extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-    };
+    let path = Path::new(name);
+    anyhow::ensure!(is_exe(path), "expected an .exe extension");
+    anyhow::ensure!(
+        path.components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir)),
+        "expected a path inside the package"
+    );
+    let file = root.join(path).canonicalize()?;
+    let relative = file
+        .strip_prefix(root)
+        .context("resolves outside the package")?;
+    anyhow::ensure!(file.is_file(), "not a regular file");
+    Ok(relative.to_owned())
+}
+
+#[cfg(windows)]
+fn is_exe(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+}
+
+#[cfg(windows)]
+fn pick_executable(folder: &Path, configured: &[String]) -> Result<PathBuf> {
     let root = folder
         .canonicalize()
         .with_context(|| format!("opening {}", folder.display()))?;
     let mut candidates = Vec::new();
+    let mut skipped = Vec::new();
     for name in configured {
-        let path = Path::new(name);
-        if is_exe(path)
-            && path
-                .components()
-                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
-            && let Ok(file) = root.join(path).canonicalize()
-            && let Ok(relative) = file.strip_prefix(&root)
-            && file.is_file()
-        {
-            candidates.push(relative.to_owned());
+        match configured_executable(&root, name) {
+            Ok(path) => candidates.push(path),
+            Err(e) => skipped.push(format!("{name:?}: {e}")),
         }
     }
     if candidates.is_empty() {
@@ -67,6 +87,19 @@ fn pick_executable(folder: &Path, configured: &[String]) -> Result<PathBuf> {
             if is_exe(&entry.path()) && entry.file_type()?.is_file() {
                 candidates.push(PathBuf::from(entry.file_name()));
             }
+        }
+        if !skipped.is_empty() {
+            let details = skipped.join("\n  ");
+            if candidates.is_empty() {
+                anyhow::bail!(
+                    "no executable found in {}. MicrosoftGame.config entries skipped:\n  {details}",
+                    folder.display()
+                );
+            }
+            eprintln!(
+                "warning: using the top-level .exe search in {}. MicrosoftGame.config entries skipped:\n  {details}",
+                folder.display()
+            );
         }
     }
     candidates.sort();
@@ -494,11 +527,21 @@ mod tests {
         fs::write(dir.path().join("Outside.exe"), []).unwrap();
         fs::write(
             root.join("MicrosoftGame.config"),
-            r#"<Game><ExecutableList><Executable Name="../Outside.exe"/></ExecutableList></Game>"#,
+            r#"<Game><ExecutableList><Executable Name="../Outside.exe"/><Executable Name="readme.txt"/>
+                <Executable Name="missing.exe"/></ExecutableList></Game>"#,
         )
         .unwrap();
         let error = resolve_target(&root).err().unwrap().to_string();
         assert!(error.contains("no executable found"), "{error}");
+        for reason in [
+            "Outside.exe",
+            "inside the package",
+            "readme.txt",
+            ".exe extension",
+            "missing.exe",
+        ] {
+            assert!(error.contains(reason), "{error}");
+        }
         assert!(error.contains(root.to_str().unwrap()), "{error}");
     }
 

@@ -8,7 +8,7 @@ start-up or loading gets faster or slower.
 ```text
 cargo xtask play                  # from the golden save to gameplay, then you play
 cargo xtask play --measure 60     # 60 s of gameplay, then a frame-rate summary
-xtp run <exe> --execute --autopilot autopilot/gameplay.txt
+xtp run <exe|folder> --execute --autopilot autopilot/gameplay.txt
 ```
 
 The code is in `crates/xtp-hle/src/modules/autopilot/` (`script.rs` the

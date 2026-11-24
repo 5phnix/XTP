@@ -120,7 +120,8 @@ enum Command {
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
-        /// A title executable or the folder containing MicrosoftGame.config.
+        /// A title executable or a package folder with a manifest or a single .exe.
+        #[arg(value_name = "EXE|FOLDER")]
         target: PathBuf,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
