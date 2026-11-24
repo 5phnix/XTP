@@ -1239,4 +1239,50 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
+
+    /// Writes into physical pages as DirectStorage's workers make them:
+    /// 64 KiB each, from 1 and from 16 threads, in place through a window on
+    /// one allocation, as a copy, and as a copy across two allocations (half
+    /// a page in each). Prints MB/s; run it with
+    /// `cargo test -p xtp-hle --release --locked -- --ignored --nocapture physical_page_write_throughput`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn physical_page_write_throughput() {
+        const PAGES_PER_THREAD: usize = 64;
+        const PASSES: usize = 20;
+        let (a, b) = (allocate(16 * PAGES_PER_THREAD), allocate(16 * PAGES_PER_THREAD));
+        let data = vec![0x3c_u8; PAGE];
+        type Write<'a> = &'a (dyn Fn(usize) + Sync);
+        let run = |name: &str, threads: usize, passes: usize, write: Write| {
+            let started = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..threads {
+                    s.spawn(move || {
+                        for _ in 0..passes {
+                            for i in 0..PAGES_PER_THREAD {
+                                write(t * PAGES_PER_THREAD + i);
+                            }
+                        }
+                    });
+                }
+            });
+            let bytes = (threads * passes * PAGES_PER_THREAD * PAGE) as f64;
+            let mb_per_s = bytes / started.elapsed().as_secs_f64() / 1e6;
+            println!("{name:<34} {threads:>2} threads: {mb_per_s:>8.0} MB/s");
+        };
+        let window = |p: usize| {
+            let mut w = page_window(&a[p..=p], 0, PAGE).expect("one run");
+            w.bytes().fill(p as u8);
+        };
+        let copy = |p: usize| assert!(write_physical(&a[p..=p], 0, &data));
+        let across = |p: usize| assert!(write_physical(&[a[p], b[p]], PAGE / 2, &data));
+        run("window, first touch", 16, 1, &window);
+        for threads in [1, 16] {
+            run("window", threads, PASSES, &window);
+            run("copy", threads, PASSES, &copy);
+            run("copy across two allocations", threads, PASSES, &across);
+        }
+        assert_eq!(XMemFreePhysicalPages(a.len(), a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(b.len(), b.as_ptr()), 1);
+    }
 }
