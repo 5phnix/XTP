@@ -327,6 +327,11 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
+///
+/// The runtime tells us after it maps and before it unmaps, so a copy
+/// may have guarded the new view in between (or the old one may still be
+/// written before it goes): blocks still guarded get write access back,
+/// else the title's next write there would fault with nothing to take it.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     let range = blocks(at, len);
@@ -338,12 +343,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in views {
         g.views.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-    }
-    GUARDED.store(g.protected.len(), SeqCst);
+    open(&mut g, range);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -488,6 +488,27 @@ mod tests {
         assert_eq!(guard(view, view + 64 * BLOCK), Some(Vec::new()));
         unmapped(view, 64);
         assert_eq!(GUARDED.load(SeqCst), 0);
+    }
+
+    /// The runtime reports a mapping after it is made: a copy that guarded
+    /// the new view in between leaves it read-only, and the report gives
+    /// write access back (the title's next write there used to fault with
+    /// no guard to take it, and the process ended).
+    #[test]
+    fn remapped_memory_is_writable_again() {
+        let _serial = serial();
+        let view = mapped(2);
+        let all: Vec<usize> = (view / PAGE..view / PAGE + 2).collect();
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(all.clone()));
+        assert!(!writable(view) && !writable(view + BLOCK));
+        title_memory_remapped(view, 2 * BLOCK);
+        assert!(writable(view) && writable(view + BLOCK));
+        assert_eq!(GUARDED.load(SeqCst), 0);
+        // SAFETY: our view, read-write again.
+        unsafe { ((view + BLOCK + 8) as *mut u8).write_volatile(1) };
+        // New contents: reported again.
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(all));
+        unmapped(view, 2);
     }
 
     /// F5: a run of guarded blocks over two views (which one protection
