@@ -1361,7 +1361,8 @@ mod tests {
         second: &[i16; 15],
     ) -> Vec<u8> {
         let mut e = ctrl.to_le_bytes().to_vec();
-        rows.iter().for_each(|w| e.extend_from_slice(&w.to_le_bytes()));
+        rows.iter()
+            .for_each(|w| e.extend_from_slice(&w.to_le_bytes()));
         e.extend_from_slice(&bits);
         e.extend_from_slice(&bits);
         first
