@@ -248,10 +248,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let bytes = staging.size;
     list.defer_host((0, 0), move || {
         let due = target.as_ref().is_none_or(|t| staging.copy_due(t));
-        if let Some(p) = &predicate {
-            p.set(due);
-        }
-        let runs = due || predicate.is_none();
+        let runs = match &predicate {
+            Some(p) => p.decide(due, crate::timestamps::submissions()),
+            None => true,
+        };
         COPIES[usize::from(runs)].fetch_add(1, Ordering::Relaxed);
         COPIED[usize::from(runs)].fetch_add(bytes, Ordering::Relaxed);
         #[cfg(test)]
@@ -315,6 +315,9 @@ static PREDICATE_WORDS: OnceLock<Option<Predicates>> = OnceLock::new();
 struct Predicate {
     of: &'static Predicates,
     at: u32,
+    /// The submission being prepared (`timestamps::submissions`, plus one)
+    /// when the word was last set to run; 0: never.
+    ran_in: AtomicU64,
 }
 
 impl Predicate {
@@ -339,13 +342,33 @@ impl Predicate {
             once!("texture copy predicates ran out: copies run every time");
             return None;
         };
-        let p = Predicate { of, at };
+        let p = Predicate {
+            of,
+            at,
+            ran_in: AtomicU64::new(0),
+        };
         p.set(true);
         Some(p)
     }
 
     fn offset(&self) -> u64 {
         u64::from(self.at) * 8
+    }
+
+    /// At the list's submission (`submission`: the submissions made
+    /// before it): its copy runs if `due`, or if it was let run earlier in
+    /// the same submission, which names the list twice. Both runs read the
+    /// one word, so the second decision must not take the copy from the
+    /// first (VIctory #1500, by A6thGraderFr, handles that case too).
+    /// Returns whether the copy runs.
+    fn decide(&self, due: bool, submission: u64) -> bool {
+        let this = submission + 1;
+        let runs = due || self.ran_in.load(Ordering::Relaxed) == this;
+        if runs {
+            self.ran_in.store(this, Ordering::Relaxed);
+        }
+        self.set(runs);
+        runs
     }
 
     /// Before the list runs: whether its copy runs.
@@ -1135,5 +1158,49 @@ mod tests {
             });
         }
         crate::watch::title_memory_remapped(view, LEN);
+    }
+
+    /// A list named twice in one submission runs its copy in both runs if
+    /// the first needs it: both read its one predicate word.
+    #[test]
+    fn a_list_named_twice_in_a_submission_copies() {
+        let test = "texture::tests::a_list_named_twice_in_a_submission_copies";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !predication() {
+            return;
+        }
+        let resource = committed(&sampled(16, 16, 28));
+        let started = std::time::Instant::now();
+        while crate::resource::host_resource(resource).is_none() {
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "the host copy never became resident"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let texture = crate::resource::host_resource(resource).unwrap();
+        let (memory, _) = crate::resource::texture_memory(resource).unwrap();
+        let staging = staging(resource, texture).unwrap();
+        let size = staging.layout.size as usize;
+        // SAFETY: the texture's own title memory, `size` bytes.
+        unsafe { memory.cast_mut().write_bytes(0x11, size) };
+        sample_in(host, resource, 1);
+        // SAFETY: as above.
+        unsafe { memory.cast_mut().write_bytes(0x77, size) };
+        let list = host.new_list().unwrap();
+        upload(&list, resource, texture);
+        list.close();
+        host.execute(&[&list, &list]);
+        host.drain();
+        assert_eq!(decided(&staging), [true, true, true]);
+        let read = read_back(host, texture, COPY_DEST);
+        let texels: Vec<u8> = (0..16)
+            .flat_map(|y| read[y * 256..y * 256 + 64].to_vec())
+            .collect();
+        assert!(texels.iter().all(|&b| b == 0x77), "{:x?}", &texels[..16]);
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
     }
 }

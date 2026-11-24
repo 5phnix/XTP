@@ -564,9 +564,8 @@ struct Submission {
 static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 
 /// How many host submissions were made so far: while one is prepared, the
-/// number of those before it (diagnostics: `texture`'s checks per
-/// submission).
-#[cfg(feature = "diagnostics")]
+/// number of those before it (`texture` tells a list named twice in one
+/// submission by it).
 pub(crate) fn submissions() -> u64 {
     SUBMISSIONS.load(Ordering::Acquire)
 }
