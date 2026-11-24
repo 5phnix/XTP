@@ -28,7 +28,9 @@
 //! (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -137,6 +139,15 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     views: BTreeSet::new(),
 });
 
+/// How many blocks `Guards::protected` holds, set under the guards' lock,
+/// so that [`writing`] (called before every kernel write into title memory:
+/// file reads, DirectStorage) sees without the lock that nothing is
+/// guarded. Raised before blocks are made read-only and lowered after
+/// write access is back: when it reads 0, no block is read-only, and a
+/// guard that starts after that is one that would have started after
+/// `writing` took the lock.
+static GUARDED: AtomicUsize = AtomicUsize::new(0);
+
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -148,7 +159,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     install();
     let mut g = guards();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // Asked under the lock: a remap in between would leave a stale view.
+    // Asked under the lock, which `title_memory_remapped` takes. The runtime
+    // tells us before it unmaps a view, so a view noted just then may be
+    // gone: its blocks are placeholders (absent), and nothing can write
+    // there until a mapping, which tells us again.
     if !g.views.contains(&first) {
         if !view(start) {
             return None;
@@ -180,33 +194,43 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// block by block if they span views, leaving out any that fail, and
 /// noting placeholders absent.
 fn protect(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    let set = |from: usize, to: usize| {
-        let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        }
-    };
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
+    // Counted before they are read-only (see `GUARDED`); none of them is
+    // guarded yet.
+    GUARDED.store(g.protected.len() + (to - from), SeqCst);
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
-    if set(from, to) {
+    if set_protection(from..to, PAGE_READONLY) {
         note(g, from, to);
-        return;
-    }
-    for block in from..to {
-        if set(block, block + 1) {
-            note(g, block, block + 1);
-        } else if placeholder(block * BLOCK) {
-            g.absent.insert(block);
+    } else {
+        for block in from..to {
+            if set_protection(block..block + 1, PAGE_READONLY) {
+                note(g, block, block + 1);
+            } else if placeholder(block * BLOCK) {
+                g.absent.insert(block);
+            }
         }
+    }
+    GUARDED.store(g.protected.len(), SeqCst);
+}
+
+/// Sets the protection of `blocks` (title memory); false if it failed: not
+/// all mapped, or more than one view (whose protections change apart).
+fn set_protection(blocks: Range<usize>, protection: u32) -> bool {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    #[cfg(test)]
+    tests::PROTECTED.with(|n| n.set(n.get() + 1));
+    let mut old = 0;
+    // SAFETY: title view memory; only its protection changes.
+    unsafe {
+        VirtualProtect(
+            (blocks.start * BLOCK) as *const _,
+            blocks.len() * BLOCK,
+            protection,
+            &mut old,
+        ) != 0
     }
 }
 
@@ -256,23 +280,35 @@ fn placeholder(at: usize) -> bool {
     !watched
 }
 
-/// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded.
-fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+/// Gives write access back to the guarded blocks among `blocks` and notes
+/// them written; true if any was guarded. One protection change per run of
+/// neighbouring blocks (a kernel read into a big buffer opens hundreds),
+/// block by block where a run spans views.
+fn open(g: &mut Guards, blocks: Range<usize>) -> bool {
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    let blocks: Vec<usize> = g.protected.range(blocks).copied().collect();
+    for block in &blocks {
+        g.protected.remove(block);
+        g.clean.remove(block);
     }
+    for run in blocks.chunk_by(|a, b| a + 1 == *b) {
+        let (first, last) = (run[0], run[run.len() - 1]);
+        if !set_protection(first..last + 1, PAGE_READWRITE) && run.len() > 1 {
+            for &block in run {
+                set_protection(block..block + 1, PAGE_READWRITE);
+            }
+        }
+    }
+    // Lowered once write access is back (see `GUARDED`).
+    GUARDED.store(g.protected.len(), SeqCst);
     !blocks.is_empty()
+}
+
+/// The blocks `[at, at + len)` touches; the length is the title's
+/// (`fread`'s size times count, saturated), so the end is cut to the
+/// address space.
+fn blocks(at: usize, len: usize) -> Range<usize> {
+    at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -280,8 +316,12 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
-    // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    // Without the lock when nothing is guarded (the case outside the world:
+    // loading, menus), which many DirectStorage workers would contend for.
+    if GUARDED.load(SeqCst) == 0 {
+        return;
+    }
+    open(&mut guards(), blocks(at, len));
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -289,7 +329,7 @@ pub fn writing(at: usize, len: usize) {
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
-    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let range = blocks(at, len);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
@@ -303,6 +343,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+    GUARDED.store(g.protected.len(), SeqCst);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -328,7 +369,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if open(&mut g, at, at + 1) {
+        if open(&mut g, at / BLOCK..at / BLOCK + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -370,10 +411,183 @@ mod tests {
         /// The view queries `guard` made on this thread (each test runs on
         /// its own).
         pub(super) static QUERIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The protection changes made on this thread.
+        pub(super) static PROTECTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     fn queried() -> usize {
         QUERIED.with(|n| n.get())
+    }
+
+    fn protected() -> usize {
+        PROTECTED.with(|n| n.get())
+    }
+
+    /// Held by every test that guards blocks: the count of guarded blocks
+    /// is the process's, and some tests need it at 0 (each test gives its
+    /// guards back before it ends).
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A pagefile section of `blocks` blocks, mapped read-write: its view.
+    fn mapped(blocks: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a fresh section, mapped whole.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (blocks * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, blocks * BLOCK).Value;
+            // The view keeps the section.
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            view as usize
+        };
+        assert_ne!(view, 0);
+        view
+    }
+
+    /// Unmaps what [`mapped`] mapped, as the runtime does.
+    fn unmapped(view: usize, blocks: usize) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        title_memory_remapped(view, blocks * BLOCK);
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        };
+    }
+
+    /// F5: 64 neighbouring blocks of one view are guarded with one
+    /// protection change and opened by a kernel write over them with one.
+    #[test]
+    fn neighbouring_blocks_open_in_one_protection_change() {
+        let _serial = serial();
+        let view = mapped(64);
+        let all: Vec<usize> = (view / PAGE..view / PAGE + 64).collect();
+        let before = protected();
+        assert_eq!(guard(view, view + 64 * BLOCK), Some(all.clone()));
+        assert_eq!(protected() - before, 1, "guarded in one change");
+        assert_eq!(GUARDED.load(SeqCst), 64);
+        assert!((0..64).all(|b| !writable(view + b * BLOCK)));
+        let before = protected();
+        writing(view + 100, 64 * BLOCK - 200);
+        assert_eq!(protected() - before, 1, "opened in one change");
+        assert_eq!(GUARDED.load(SeqCst), 0);
+        assert!((0..64).all(|b| writable(view + b * BLOCK)));
+        // Opened means written: all reported again, and guarded again.
+        assert_eq!(guard(view, view + 64 * BLOCK), Some(all));
+        assert_eq!(guard(view, view + 64 * BLOCK), Some(Vec::new()));
+        unmapped(view, 64);
+        assert_eq!(GUARDED.load(SeqCst), 0);
+    }
+
+    /// F5: a run of guarded blocks over two views (which one protection
+    /// change cannot span) opens block by block.
+    #[test]
+    fn runs_over_two_views_open_block_by_block() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
+            VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let _serial = serial();
+        // SAFETY: a placeholder of four blocks, split in two, each half
+        // showing two blocks of one section.
+        let (p, views) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                4 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (4 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            VirtualFree(p as *mut _, 2 * BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let views = [0, 2].map(|block| {
+                let view = MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    (p + block * BLOCK) as *const _,
+                    (block * BLOCK) as u64,
+                    2 * BLOCK,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert_eq!(view.Value as usize, p + block * BLOCK);
+                view
+            });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            (p, views)
+        };
+        assert!(guard(p, p + 4 * BLOCK).is_some());
+        assert_eq!(GUARDED.load(SeqCst), 4);
+        assert!((0..4).all(|b| !writable(p + b * BLOCK)));
+        let before = protected();
+        writing(p, 4 * BLOCK);
+        assert_eq!(protected() - before, 5, "the run, then each block");
+        assert!((0..4).all(|b| writable(p + b * BLOCK)));
+        assert_eq!(GUARDED.load(SeqCst), 0);
+        title_memory_remapped(p, 4 * BLOCK);
+        // SAFETY: our views, back to free address space.
+        unsafe {
+            for view in views {
+                UnmapViewOfFile2(GetCurrentProcess(), view, 0);
+            }
+        }
+    }
+
+    /// F5: with nothing guarded, a kernel write does not wait for the
+    /// guards' lock (many DirectStorage workers call it); with a block
+    /// guarded it does.
+    #[test]
+    fn writing_takes_the_lock_only_when_something_is_guarded() {
+        use std::time::Duration;
+        let _serial = serial();
+        let plain = vec![0u8; PAGE];
+        let at = plain.as_ptr() as usize;
+        let returns = |lock_held_for: Duration| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let g = guards();
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    writing(at, PAGE);
+                    tx.send(()).unwrap();
+                });
+                let returned = rx.recv_timeout(lock_held_for).is_ok();
+                drop(g);
+                returned
+            })
+        };
+        assert_eq!(GUARDED.load(SeqCst), 0, "every test gives its guards back");
+        assert!(returns(Duration::from_secs(10)), "it waited for the lock");
+        let view = mapped(1);
+        assert!(guard(view, view + BLOCK).is_some());
+        assert_eq!(GUARDED.load(SeqCst), 1);
+        assert!(!returns(Duration::from_millis(200)), "it did not take the lock");
+        unmapped(view, 1);
     }
 
     /// A view is asked about once per block an asking starts in, again
@@ -384,6 +598,7 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             UnmapViewOfFile,
         };
+        let _serial = serial();
         // SAFETY: a pagefile section of two blocks, mapped read-write.
         let view = unsafe {
             let section = CreateFileMappingW(
@@ -469,6 +684,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
         };
+        let _serial = serial();
         // SAFETY: a pagefile section of two blocks, mapped read-write.
         let view = unsafe {
             let section = CreateFileMappingW(
@@ -614,6 +830,7 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             UnmapViewOfFile,
         };
+        let _serial = serial();
         const LEN: usize = 174 << 20;
         const SUBMISSIONS: usize = 30;
         const COPIES: usize = 200;
@@ -718,6 +935,7 @@ mod tests {
             VirtualAlloc2,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let _serial = serial();
         // SAFETY: a fresh placeholder of three blocks and a pagefile
         // section of two; block 0 shows the section's first block, as the
         // runtime maps physical pages.
@@ -804,6 +1022,7 @@ mod tests {
             VirtualAlloc2,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let _serial = serial();
         // SAFETY: a pagefile section of one block.
         let section = unsafe {
             CreateFileMappingW(
