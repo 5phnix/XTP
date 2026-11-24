@@ -1,7 +1,11 @@
 //! Diagnostics: where the submission copies of title memory go (which
 //! ranges, how often, of what memory) and what limits their rate, logged
 //! with the frame-rate line. `XTP_COPY_MODE=plain` copies without the
-//! mapped-page guard, `none` skips the copies (both for timing only).
+//! mapped-page guard, `none` skips the copies (both for timing only), and
+//! `kernel` has the host copies' refreshes and copy-backs go through the
+//! kernel's copy (`ReadProcessMemory`, `WriteProcessMemory`) as before W1,
+//! to time it against their plain copies (`XTP_SHADOW_ONCE=0` brings back
+//! all of W1's before).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -14,8 +18,29 @@ pub(crate) enum C {
     CopyBytes,
     Refreshes,
     RefreshBytes,
+    /// Host copy updates (merged per copy at each flush) that copied
+    /// nothing, and the bytes updates did not copy: current in the copy,
+    /// or written by GPU work in flight.
     Skipped,
     SkippedBytes,
+    /// Bytes of the ranges host copy updates covered; of those, the bytes
+    /// copied from title memory.
+    Updated,
+    Refreshed,
+    /// Of those, bytes read with plain loads, and bytes that could not be
+    /// read (zeros); the plain loads' time in nanoseconds (small copies
+    /// take less than a microsecond each).
+    Plain,
+    Zeroed,
+    PlainNs,
+    /// Copy-back: bytes of shader-written ranges compared with their
+    /// snapshot; bytes of title memory read where the GPU changed them,
+    /// and the copies (or kernel calls) that read them; runs of GPU bytes
+    /// written into title memory.
+    BackCompared,
+    BackRead,
+    BackReads,
+    BackRuns,
     Runs,
     RunUs,
     Queries,
@@ -45,19 +70,21 @@ pub(crate) enum C {
     TexHashed,
     TexChanged,
 }
-const COUNTERS: usize = 26;
+const COUNTERS: usize = 35;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
-/// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
+/// How copies run: 0 guarded (as always), 1 plain, 2 not at all, 3 the
+/// host copies' through the kernel.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("XTP_COPY_MODE").as_deref() {
         Ok("plain") => 1,
         Ok("none") => 2,
+        Ok("kernel") => 3,
         _ => 0,
     })
 }
@@ -106,7 +133,10 @@ pub(crate) fn log(frames: f64) {
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
-         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
+         updates over {:.1} MB copied {:.1} MB ({:.1} MB plain in {:.2} ms, {:.1} MB unreadable) \
+         and skipped \
+         {:.1} MB ({:.0} updates whole); copy-back compared {:.1} MB, read {:.1} MB in {:.0} \
+         reads, wrote {:.0} runs; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; guard {:.2} ms, {:.0} view queries, \
          {:.0} protection changes, {:.0} unmapped blocks skipped; textures {:.1} MB watched and \
@@ -116,8 +146,17 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::CopyBytes as usize]),
         c[C::Refreshes as usize],
         mb(c[C::RefreshBytes as usize]),
-        c[C::Skipped as usize],
+        mb(c[C::Updated as usize]),
+        mb(c[C::Refreshed as usize]),
+        mb(c[C::Plain as usize]),
+        c[C::PlainNs as usize] / 1e6,
+        mb(c[C::Zeroed as usize]),
         mb(c[C::SkippedBytes as usize]),
+        c[C::Skipped as usize],
+        mb(c[C::BackCompared as usize]),
+        mb(c[C::BackRead as usize]),
+        c[C::BackReads as usize],
+        c[C::BackRuns as usize],
         c[C::Runs as usize],
         ms(c[C::RunUs as usize]),
         c[C::Queries as usize],
