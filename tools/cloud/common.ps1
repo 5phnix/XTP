@@ -176,6 +176,11 @@ function Wait-XtpVmSsh($Cfg, [string]$Zone, [int]$TimeoutSeconds = 900) {
     while ($true) {
         $out = Invoke-XtpVm -Cfg $Cfg -Zone $Zone -Script 'Write-Output "ssh-ok $env:COMPUTERNAME"' -AllowFail
         if ($LASTEXITCODE -eq 0 -and ($out -match 'ssh-ok')) { return }
+        # A Spot VM can be taken back by Google at any time, a reboot included.
+        $status = Get-XtpVmStatus $Cfg $Zone
+        if ($status -in 'TERMINATED', 'STOPPED', 'STOPPING') {
+            throw "The VM stopped ($status) while waiting for SSH: a Spot VM taken back by Google? Start it again (start-vm.ps1) and rerun."
+        }
         if ((Get-Date) -gt $deadline) { throw "The VM did not answer over SSH within $TimeoutSeconds s:`n$global:XtpGcloudError" }
         Start-Sleep -Seconds 15
     }

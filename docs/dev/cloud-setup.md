@@ -234,7 +234,13 @@ run in parallel: with a quota of one GPU, an attempt in flight holds the
 quota and the others are refused by it instead of being answered on
 capacity. On 2026-11-24, after three hours without an L4 anywhere, a Spot
 g2-standard-16 came up in asia-east1-b. A Spot VM costs much less, and
-Google can stop it at any time (it keeps its disks; start it again later).
+Google can stop it at any time: ours was taken back after 19 minutes, in the
+middle of its setup. It keeps its disks; start it again later, and once it
+runs, setup and sessions go on where they stopped. A stopped VM's
+provisioning model can be changed (`gcloud compute instances set-scheduling
+<vm> --zone=<zone> --provisioning-model=STANDARD
+--clear-instance-termination-action`) so that, once started, it is not taken
+back.
 
 ## 3. Configuration file
 
