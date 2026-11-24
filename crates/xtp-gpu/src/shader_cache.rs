@@ -75,9 +75,9 @@ fn count<T, E>(counter: &AtomicU64, result: Result<T, E>) -> Result<T, E> {
 /// entries' encoding, [`ENCODING`]) and the translation settings it runs
 /// with (the loop limit, the loops' budget and the DXIL clean-up passes,
 /// which any build can change at run time). Not the whole executable:
-/// before, the least change
-/// anywhere (the HLE, a log line, another worker's branch) made every
-/// translation again, and each worktree's sessions started cold.
+/// before, the least change anywhere (the HLE, a log line, another
+/// worker's branch) made every translation again, and each worktree's
+/// sessions started cold.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {

@@ -187,6 +187,12 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     std::fs::write(&pack_path, &pack).unwrap();
     let xtp = PathBuf::from(env!("CARGO_BIN_EXE_xtp"));
     let list = dir.path().join("list.txt");
+    // The title pipelines earlier sessions start early: the precook saves
+    // the library beside them, and must keep them.
+    let pipelines = dir.path().join("cache/pipelines");
+    std::fs::create_dir_all(&pipelines).unwrap();
+    let early = "a title pipeline key\nanother one";
+    std::fs::write(pipelines.join("early-pipelines.txt"), early).unwrap();
 
     let Some(first) = precook(
         &xtp,
@@ -226,10 +232,15 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
         listed.contains("refused: malformed shader: no DXIL part"),
         "{listed}"
     );
-    let library = dir
-        .path()
-        .join("cache/pipelines/host-pipelines.bin")
-        .is_file();
+    let library = pipelines.join("host-pipelines.bin").is_file();
+    let kept = std::fs::read_to_string(pipelines.join("early-pipelines.txt")).unwrap();
+    let mut kept: Vec<&str> = kept.lines().collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        ["a title pipeline key", "another one"],
+        "the early list is kept"
+    );
 
     let second = precook(&xtp, dir.path(), &pack_path, &[]).unwrap();
     assert!(second.out.contains("up to date"), "{}", second.out);
