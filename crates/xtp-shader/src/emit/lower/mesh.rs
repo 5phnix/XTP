@@ -15,7 +15,8 @@
 //! * `v_readfirstlane_b32`: a value proven the same in every lane of the
 //!   console wave ([`super::uniform`]) is each lane's own (`valu.rs`); the
 //!   others need the console wave's first lane, which the host wave may not
-//!   hold;
+//!   hold: they go through group-shared memory between group barriers
+//!   (`mesh_first_lane`), where every lane of the group runs the block;
 //! * group barriers: on the console a wave reaches `s_barrier` whatever
 //!   its EXEC, here each lane only on its own path, and a host wave that
 //!   never gets there hangs the GPU; each barrier the lowering keeps must
@@ -28,13 +29,20 @@
 
 use super::uniform::{Level, Uniformity};
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Rmw, V, pred};
 use crate::native::StageIo;
 
 /// A wave64 mesh program's first-lane read of a value that may differ
-/// between the lanes of its console wave, on a host without 64-lane waves.
-pub(super) const MESH_FIRST_LANE: Why =
-    "a first-lane read of a value lanes may hold differently, in a wave64 mesh program on a host without 64-lane waves";
+/// between the lanes of its console wave, in a block that lanes of the
+/// group reach differently, on a host without 64-lane waves.
+pub(super) const MESH_FIRST_LANE: Why = "a first-lane read of a value lanes may hold differently, where lanes of a wave64 mesh group branch differently, on a host without 64-lane waves";
+
+/// A wave64 mesh program whose LDS leaves no room for the slots of its
+/// first-lane reads (two dwords per console wave), or would read them.
+pub(super) const MESH_NO_ROOM: Why = "LDS that leaves no room for the first-lane reads of a wave64 mesh program, on a host without 64-lane waves";
+
+/// D3D12's limit on a mesh shader's group-shared memory (28 KiB).
+const MESH_LDS_DWORDS: u32 = 28 * 1024 / 4;
 
 /// A wave64 mesh program's group barrier in a block that lanes of the group
 /// reach differently (or a different number of times), on a host without
@@ -125,6 +133,117 @@ impl<'a> Lower<'a> {
     pub(super) fn mesh_first_lane_uniform(&self, w: Option<crate::ir::Value>) -> bool {
         let level = w.and_then(|w| self.uniform.as_ref()?.first_lane(w));
         level.is_some_and(|l| l <= Level::Wave)
+    }
+
+    /// Mesh, on a host without 64-lane waves: `x` of the first lane in
+    /// EXEC of this lane's console wave (lane 0 when none), through
+    /// group-shared memory. `active`: the lane's EXEC bit here, `None`
+    /// when every lane that reaches the instruction has it.
+    ///
+    /// Every lane of the group must get here as often as the others: the
+    /// exchange is between group barriers ([`Uniformity::control`]). With
+    /// every lane active, the first lane is the console wave's lane 0,
+    /// which stores `x` for its wave: one barrier, then all read, then one
+    /// more before the slot can change. Otherwise lane 0 empties its wave's
+    /// slot, the active lanes take its minimum with their lane, and the
+    /// lane found (lane 0 when none) stores `x`: four barriers. The slots
+    /// are two dwords per console wave ([`Self::mesh_slots`]).
+    pub(super) fn mesh_first_lane(&mut self, x: V, active: Option<V>) -> Result<V, Why> {
+        let uniform = self.uniform.as_ref().expect("analysed");
+        if uniform.control(self.cur_ir) != Level::Group {
+            return Err(MESH_FIRST_LANE);
+        }
+        let slots = self.mesh_slots()?;
+        let c = self.cur;
+        let flat = self.mesh_thread();
+        let (k6, k63, one, zero) = (
+            self.s.m.i32(6),
+            self.s.m.i32(63),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let wave = self.s.m.bin(c, Bin::LShr, flat, k6);
+        let lane = self.s.m.bin(c, Bin::And, flat, k63);
+        let first = self.s.m.bin(c, Bin::Shl, wave, one);
+        let value = self.s.m.bin(c, Bin::Add, first, one);
+        let first = self.s.m.element(c, slots, first);
+        let value = self.s.m.element(c, slots, value);
+        let lead = self.s.m.cmp(c, pred::EQ, lane, zero);
+        let owner = match active {
+            None => lead,
+            Some(on) => {
+                let none = self.s.m.i32(u32::MAX);
+                let at = self.begin_guarded(Some(lead));
+                self.s.m.store(self.cur, first, none);
+                self.end_guarded(at, &[]);
+                self.group_sync();
+                let at = self.begin_guarded(Some(on));
+                self.s.m.atomic(self.cur, Rmw::UMin, first, lane);
+                self.end_guarded(at, &[]);
+                self.group_sync();
+                let c = self.cur;
+                let f = self.s.m.load(c, first);
+                let empty = self.s.m.cmp(c, pred::EQ, f, none);
+                let f = self.s.m.select(c, empty, zero, f);
+                self.s.m.cmp(c, pred::EQ, lane, f)
+            }
+        };
+        let at = self.begin_guarded(Some(owner));
+        self.s.m.store(self.cur, value, x);
+        self.end_guarded(at, &[]);
+        self.group_sync();
+        let r = self.s.m.load(self.cur, value);
+        // No lane stores the slot again before every lane has read it.
+        self.group_sync();
+        Ok(r)
+    }
+
+    /// Mesh: the group-shared slots of first-lane reads, two dwords per
+    /// console wave, made on first use ([`Lower::xchg`], which only the
+    /// compute halves' exchange uses otherwise). The container's
+    /// group-shared size counts them: `lds_dwords` grows by their size once
+    /// the program's own LDS array, if it uses one, has its size (LDS
+    /// accesses check their addresses against `lds_dwords` no more then:
+    /// none that the size could change is let through, see below).
+    fn mesh_slots(&mut self) -> Result<V, Why> {
+        if let Some(g) = self.xchg {
+            return Ok(g);
+        }
+        let StageIo::Ms(ms) = &self.x.native.io else {
+            unreachable!("mesh")
+        };
+        let (own, waves) = (ms.lds_bytes.div_ceil(4), ms.threads.div_ceil(64));
+        let ds: Vec<&str> = (self.x.p.blocks.iter().flat_map(|b| &b.insts))
+            .filter(|i| matches!(i.fields, crate::gfx10::Fields::Ds { .. }))
+            .map(|i| i.name())
+            .filter(|n| !n.starts_with("ds_swizzle") && *n != "ds_bpermute_b32")
+            .collect();
+        // Refused for LDS of their own: accesses without LDS (`lds.rs` would
+        // take them once `lds_dwords` grows), and halves that may straddle
+        // the end of the program's LDS (clamped to `lds_dwords`).
+        if own + 2 * waves > MESH_LDS_DWORDS
+            || own == 0 && !ds.is_empty()
+            || own > 0 && ds.iter().any(|n| n.contains("16"))
+        {
+            return Err(MESH_NO_ROOM);
+        }
+        if !ds.is_empty() {
+            // At the program's own size, before `lds_dwords` grows.
+            self.s.lds();
+        }
+        let arr = self.s.m.array(2 * waves, self.s.t.i32);
+        let g = self.s.m.global("first_lane", arr, 3);
+        self.s.lds_dwords = own + 2 * waves;
+        self.xchg = Some(g);
+        Ok(g)
+    }
+
+    /// A group barrier with a group-shared memory fence.
+    fn group_sync(&mut self) {
+        let void = self.s.t.void;
+        let mode = self.s.m.i32(1 | 8);
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and

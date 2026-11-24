@@ -590,7 +590,13 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 int(self, a)
             }
-            "v_readfirstlane_b32" if self.mesh_halves() => Err(super::mesh::MESH_FIRST_LANE),
+            "v_readfirstlane_b32" if self.mesh_halves() => {
+                // The console wave's first lane, which the host wave may not
+                // hold: through group-shared memory (`mesh.rs`).
+                let a = s(self, 0)?;
+                let r = self.mesh_first_lane(a, guard)?;
+                int(self, r)
+            }
             "v_readfirstlane_b32" if self.console_cf => {
                 // The console's first lane in EXEC (lane 0 when none).
                 let a = s(self, 0)?;
