@@ -101,6 +101,9 @@ pub(crate) struct State {
     recording: crate::descriptor::Recording,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// View heaps whose buffer views of slots picked at run time this
+    /// recording brought up to date ([`State::picked_buffers`]).
+    picked: Vec<usize>,
     /// Root SRVs bound as one-view tables in this list: (view heap, title
     /// address, host copy, 0 for a view in place or [`State::writes`] + 1
     /// for a copy of the list's own) → slot.
@@ -182,6 +185,9 @@ struct Own {
     copied: u64,
     /// What the list's indirect rectangle draws are expanded into.
     rects: Option<crate::rectangles::Scratch>,
+    /// The holds on the raw views of the runtime stride tables the list's
+    /// shaders read, by view heap ([`State::stride_table`]).
+    strides: Vec<(usize, crate::descriptor::host::StrideHold)>,
 }
 
 struct Chunk {
@@ -941,6 +947,13 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let picked = p
+            .stages
+            .iter()
+            .fold(0, |bits, s| bits | s.translated().host.run_time_buffers);
+        if picked != 0 && crate::device::run_time_views_on() {
+            self.picked_buffers(list, &p.name);
+        }
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
@@ -1011,6 +1024,18 @@ impl State {
                     }
                 }
             }
+            if let Some(param) = stage.stride_table {
+                let gpu = self.stride_table(list)?;
+                // SAFETY: an open list; the table lives with its heap, which
+                // the list keeps, and the list keeps the table too.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
         }
         // Copies of the list's own made so far may now be stale.
         if compute
@@ -1025,6 +1050,67 @@ impl State {
         }
         list.twins_written();
         Ok(())
+    }
+
+    /// The GPU address of the runtime stride table of the view heap set on
+    /// the host list, for a shader that reads one (VIctory #193 and #704):
+    /// the list keeps the table, and its recording holds the raw views the
+    /// table names ([`crate::descriptor::host::StrideHold`]) until its
+    /// submissions have run. Why not if that heap has no table (no view
+    /// heap of the title's, or `XTP_STRIDE_TABLE` off): the draw or
+    /// dispatch is dropped, as VIctory #193's head (`f99b792`) does, where
+    /// #704 still logged and ran with the table unbound.
+    fn stride_table(&mut self, list: &HostList) -> Result<u64, &'static str> {
+        const NONE: &str = "a shader reads the runtime stride table its view heap has not";
+        let heap = self.host_heaps[0];
+        let host = host_heap(heap).ok_or(NONE)?;
+        let (gpu, table) = host.stride_table().ok_or(NONE)?;
+        if !self.own.strides.iter().any(|&(h, _)| h == heap) {
+            let hold = host.stride_hold().ok_or(NONE)?;
+            // The hold goes with the recording (`State::recording`).
+            self.recording.lease(list);
+            self.own.strides.push((heap, hold));
+            list.keep(table);
+        }
+        Ok(gpu)
+    }
+
+    /// For shaders that pick buffer slots of the view heap when they run
+    /// (`name`: the pipeline's): every buffer view the title wrote in the
+    /// heap set on the host list made and the title memory they read
+    /// brought up to date at the submission of the frame's first list that
+    /// asks (within a budget: [`crate::descriptor::host::HostHeap::picked_spans`]).
+    /// Ported from Marvisak/VIctory#1544 (head 78fd990) by n-romanovich, and
+    /// once a frame from fxceless's VIctory fork's heap_buffers (578d459);
+    /// see `picked_spans` for what changed.
+    /// shortcut: what shaders write through such views stays in the host
+    /// copies (as for every directly indexed view): declaring every
+    /// unordered view of the heap written, once a recording, copied tens of
+    /// thousands of ranges back after each submission, and the first world
+    /// frame never ended (worldlight-16). Views the shader's tables name
+    /// are declared written as before (`readable`). Buffers only: textures
+    /// picked at run time are another matter (`texture.rs`).
+    fn picked_buffers(&mut self, list: &HostList, name: &str) {
+        let heap = self.host_heaps[0];
+        if heap == 0 || heap == crate::descriptor::OWN_VIEW_HEAP || self.picked.contains(&heap) {
+            return;
+        }
+        self.picked.push(heap);
+        counted!(
+            info,
+            pipeline = name,
+            "a draw or dispatch reads buffer views of slots picked at run time"
+        );
+        let title = crate::descriptor::heap(heap as This);
+        let Some(host) = title.host() else {
+            return;
+        };
+        // Once a frame, by the first list that asks (`picked_spans`).
+        if let Some(picked) = host.picked_spans(title.start) {
+            for (copy, from, to) in &picked.reads {
+                copy.refresh(list, *from, to - from);
+            }
+        }
     }
 
     /// Binds a root SRV as a one-view table (see
@@ -2350,6 +2436,255 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.run();
             dst.words()[..WORDS].to_vec()
         }
+    }
+
+    /// A shader that reads the runtime stride table is dropped where the
+    /// view heap set on the list has none (XTP's own heap, or a title heap
+    /// made with `XTP_STRIDE_TABLE` off, as in tests): no root SRV of
+    /// another buffer, or none at all, is bound in its place.
+    #[test]
+    fn a_missing_stride_table_drops_the_draw() {
+        let test = "draw::tests::a_missing_stride_table_drops_the_draw";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let list = crate::testgpu::TitleList::new();
+        let l = list.host();
+        // No view heap of the title's: XTP's own, which has no table.
+        let mut own = state(std::ptr::null());
+        heaps(&mut own, l);
+        assert_eq!(own.host_heaps[0], crate::descriptor::OWN_VIEW_HEAP);
+        assert!(own.stride_table(l).is_err());
+        // A title heap whose host heap has no table.
+        let heap = crate::descriptor::TestHeap::views(4);
+        let mut titled = state(heap.0);
+        heaps(&mut titled, l);
+        assert_eq!(titled.host_heaps[0], heap.0 as usize);
+        assert!(titled.stride_table(l).is_err());
+        assert!(titled.own.strides.is_empty(), "nothing held");
+    }
+
+    /// A compute program whose two thread groups each load a heap slot from
+    /// the buffer in table slot 0 (an index read at run time, as the
+    /// instance culling does), read `[lane, 4]` of the structured view of
+    /// 16 bytes there and store it at `[lane, 16 * group]` of the
+    /// structured view of 32 bytes in table slot 1 (strides known).
+    fn picking_program() -> xtp_shader::emit::HostShader {
+        use xtp_shader::native::{ComputeIo, StageIo};
+        use xtp_shader::{HwStage, NativeProgram, RootParam};
+        let words: &[u32] = &[
+            0xBE94_0304, // s_mov_b32 s20, s4
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0xF408_040A,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[20:21], 0x0
+            0x8F07_8205, // s_lshl_b32 s7, s5, 2
+            0xF420_0188,
+            0x0E00_0000, // s_buffer_load_dword s6, s[16:19], s7
+            0x8F06_8506, // s_lshl_b32 s6, s6, 5
+            0xF408_020A,
+            0x0C00_0000, // s_load_dwordx4 s[8:11], s[20:21], s6
+            0xF408_030A,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[20:21], 0x20
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x8F07_8405, // s_lshl_b32 s7, s5, 4
+            0x7E02_0207, // v_mov_b32 v1, s7
+            0xE070_3000,
+            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let used = |kind, table_offset_dwords, stride| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let param = |root, sgprs, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                param(RootType::Constants, 4, 0, 0),
+                param(RootType::Table, 1, 4, 1),
+            ],
+            used: vec![
+                used(ResourceType::Srv, 0, 16),
+                used(ResourceType::Uav, 8, 32),
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1 | 1 << 7,
+                threads: [4, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = xtp_shader::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = xtp_shader::structure::structure(&p).unwrap();
+        let res = xtp_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = xtp_shader::io::raise(&p, &native).unwrap();
+        // An empty container: the tag, a digest, version 1, its size.
+        let mut container = b"DXBC".to_vec();
+        container.extend([0; 16]);
+        container.extend([1u32, 32, 0].into_iter().flat_map(u32::to_le_bytes));
+        let c = xtp_shader::Container::parse(&container).unwrap();
+        xtp_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap()
+    }
+
+    /// Buffer views the title wrote into slots a shader picks when it runs
+    /// (watch.md item 170): no draw's table names them, so they stay null
+    /// and read zeros, and the program writes nothing; once
+    /// `picked_buffers` has made them and brought their memory up to date,
+    /// each group reads the bytes of the view in the slot it chose and its
+    /// writes reach title memory.
+    #[test]
+    fn buffer_views_of_slots_picked_at_run_time_are_made_and_read() {
+        use crate::testgpu::{TitleBuffer, TitleList};
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let test = "draw::tests::buffer_views_of_slots_picked_at_run_time_are_made_and_read";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let cs = picking_program();
+        assert_eq!(cs.run_time_buffers, xtp_shader::emit::RUN_TIME_READS);
+        // Root signature: the user data, the heaps indexed directly.
+        let params = [D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: xtp_shader::emit::USER_DATA_SPACE,
+                    Num32BitValues: cs.user_data_dwords(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        }];
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 1,
+                    pParameters: params.as_ptr(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+                },
+            },
+        };
+        // SAFETY: the descriptions point at live data; the blob is read
+        // before it goes.
+        let (root, pso) = unsafe {
+            let mut blob: Option<ID3DBlob> = None;
+            D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).unwrap();
+            let blob = blob.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: cs.dxil.as_ptr().cast(),
+                        BytecodeLength: cs.dxil.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        // The title's buffers and the views it writes in its heap (made
+        // null by the host: no draw named them).
+        let heap = crate::descriptor::TestHeap::views(8);
+        let title = crate::descriptor::heap(heap.0);
+        assert!(title.host().is_some(), "a host heap");
+        let (slots, out) = (TitleBuffer::new(1 << 12), TitleBuffer::new(1 << 12));
+        let (a, b) = (TitleBuffer::new(1 << 12), TitleBuffer::new(1 << 12));
+        slots.set_words(|i| [2, 3].get(i).copied().unwrap_or(0));
+        a.set_words(|i| 100 + i as u32);
+        b.set_words(|i| 200 + i as u32);
+        // Format, buffer, (mapping,) first element, count, stride, flags.
+        let srv = |format, count, stride, flags| {
+            let mut w = [0u32; 10];
+            (w[0], w[1], w[2], w[6], w[7], w[8]) = (format, 1, 0x1688, count, stride, flags);
+            w
+        };
+        let mut uav = [0u32; 10];
+        (uav[1], uav[4], uav[5]) = (1, 32, 32);
+        let at = |i: u64| title.start + i * 32;
+        let null = std::ptr::null();
+        crate::descriptor::create_srv(null, slots.resource(), &srv(39, 1024, 0, 1), at(0));
+        crate::descriptor::create_uav(null, out.resource(), null, &uav, at(1));
+        crate::descriptor::create_srv(null, a.resource(), &srv(0, 64, 16, 0), at(2));
+        crate::descriptor::create_srv(null, b.resource(), &srv(0, 64, 16, 0), at(3));
+        // A constant buffer view waits for no pass: buffer views only.
+        let cbv = [a.address() as u32, (a.address() >> 32) as u32, 256, 0];
+        crate::descriptor::create_cbv(null, &cbv, at(4));
+        assert_eq!(
+            title.host().unwrap().waiting(),
+            4,
+            "the four buffer views wait"
+        );
+        let run = |pick: bool| -> Vec<u32> {
+            out.set_words(|_| 0);
+            let list = TitleList::new();
+            let l = list.host();
+            let mut state = state(heap.0);
+            heaps(&mut state, l);
+            if pick {
+                state.picked_buffers(l, "test");
+            }
+            // The output is named by the program's table: declared written
+            // as `readable` does for it.
+            out.shadow().gpu_writes(l, out.address(), 1 << 12);
+            l.keep(&root);
+            l.keep(&pso);
+            let zeros = vec![0u32; cs.user_data_dwords() as usize];
+            // SAFETY: an open list with the heap and every root argument
+            // set; what it names outlives the run.
+            unsafe {
+                l.list.SetComputeRootSignature(&root);
+                l.list.SetPipelineState(&pso);
+                l.list.SetComputeRoot32BitConstants(
+                    0,
+                    zeros.len() as u32,
+                    zeros.as_ptr().cast(),
+                    0,
+                );
+                l.list.Dispatch(2, 1, 1);
+            }
+            drop(state);
+            list.run();
+            out.words()[..32].to_vec()
+        };
+        assert_eq!(
+            run(false),
+            vec![0; 32],
+            "null views: nothing read or written"
+        );
+        // Group g, lane l reads dword 4 l + 1 of its view and stores it at
+        // dword 8 l + 4 g.
+        let mut want = vec![0; 32];
+        for l in 0..4 {
+            want[8 * l] = 101 + 4 * l as u32;
+            want[8 * l + 4] = 201 + 4 * l as u32;
+        }
+        assert_eq!(run(true), want);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A list's state with the title view heap `heap` bound (none: null).

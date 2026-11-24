@@ -83,6 +83,10 @@ any title's files, and the tools refuse to write below it.
 
    For debugging aids, build `--profile diag --features diagnostics`; the
    README's Debugging section lists the `XTP_*` switches.
+   `xtp precook` translates every shader of the title's `shaders.rpf` (and
+   makes its compute pipelines) into the cache before a run, so the first
+   run after a translator change does not wait for them; `cargo xtask play`
+   does it before each session (`--no-precook` skips it).
 4. Tests that need real files skip unless their variable is set (each test's
    doc comment names it). For example, in PowerShell:
    `$env:XTP_XMA_STREAMS = '<dir>'; cargo test -p xtp-formats -- --ignored`.

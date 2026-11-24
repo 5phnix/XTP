@@ -24,6 +24,9 @@ use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
+#[cfg(any(test, feature = "diagnostics"))]
+mod capture;
+
 const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
@@ -35,6 +38,8 @@ const NOT_FOR_CONVOLUTION: u32 = 4;
 pub struct Dsp {
     max_streams: u32,
     active: Mutex<u32>,
+    #[cfg(any(test, feature = "diagnostics"))]
+    capture: Option<capture::Connection>,
 }
 
 /// What activation describes.
@@ -62,6 +67,8 @@ pub struct Stream {
     frames: u32,
     channels: u32,
     status: Box<Status>,
+    #[cfg(any(test, feature = "diagnostics"))]
+    capture: Option<capture::Capture>,
 }
 
 /// One block of work.
@@ -102,6 +109,8 @@ pub extern "system" fn XDspConnectWithMaximumStreamLimit(
     let dsp = Box::new(Dsp {
         max_streams,
         active: Mutex::new(0),
+        #[cfg(any(test, feature = "diagnostics"))]
+        capture: capture::Connection::open(ir_seconds, max_channels),
     });
     // SAFETY: checked non-null.
     unsafe { out.write(Box::into_raw(dsp)) };
@@ -155,11 +164,11 @@ pub extern "system" fn XDspActivate(
         channels,
         "audio DSP stream activated"
     );
+    // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
+    let connection = unsafe { &*dsp };
     {
-        // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
-        let dsp = unsafe { &*dsp };
-        let mut active = dsp.active.lock().unwrap_or_else(|e| e.into_inner());
-        if *active >= dsp.max_streams {
+        let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
+        if *active >= connection.max_streams {
             return E_OUTOFMEMORY;
         }
         *active += 1;
@@ -168,6 +177,11 @@ pub extern "system" fn XDspActivate(
         dsp,
         frames: desc.frames,
         channels: desc.channels,
+        #[cfg(any(test, feature = "diagnostics"))]
+        capture: connection.capture.as_ref().and_then(|capture| {
+            // SAFETY: the descriptor supplies the IR for the duration of activation.
+            unsafe { capture.activate(desc) }
+        }),
         status: Box::new(Status {
             submitted: 0,
             completed: 0,
@@ -206,10 +220,20 @@ pub extern "system" fn XDspSubmitCommand(
     }
     // SAFETY: a stream from `XDspActivate`, the title's command.
     let (stream, command) = unsafe { (&mut *stream, &*command) };
+    let samples = (stream.frames * stream.channels) as usize;
+    #[cfg(any(test, feature = "diagnostics"))]
+    let mut block = stream.capture.as_mut().and_then(|capture| {
+        // SAFETY: the caller supplies the input until completion.
+        unsafe { capture.begin_block(command, samples) }
+    });
     if !command.output.is_null() {
-        let samples = (stream.frames * stream.channels) as usize;
         // SAFETY: the title's output buffer holds one block of the stream.
         unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+    }
+    #[cfg(any(test, feature = "diagnostics"))]
+    if let Some(block) = &mut block {
+        // SAFETY: copy the initialized output before publishing completion.
+        block.output = unsafe { capture::copy_samples(command.output, samples) };
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
@@ -222,6 +246,10 @@ pub extern "system" fn XDspSubmitCommand(
     if !ticket.is_null() {
         // SAFETY: optional out parameter.
         unsafe { ticket.write(next) };
+    }
+    #[cfg(any(test, feature = "diagnostics"))]
+    if let Some(block) = block {
+        block.enqueue();
     }
     S_OK
 }

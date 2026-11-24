@@ -805,14 +805,18 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "miniz_oxide",
  "tempfile",
  "walkdir",
+ "windows-sys",
  "xtp-core",
  "xtp-game",
+ "xtp-gpu",
  "xtp-hle",
  "xtp-loader",
  "xtp-pe",
  "xtp-shader",
+ "xtp-testkit",
 ]
 
 [[package]]
@@ -870,6 +874,7 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-sys",
+ "xtp-core",
  "xtp-formats",
  "xtp-gpu",
  "xtp-loader",

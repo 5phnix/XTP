@@ -1,7 +1,9 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content, by the XTP build that
-//! translated it (the BLAKE3 of our executable), so a rebuilt translator
-//! never serves an old translation, and by the wave sizes it was made for
+//! cache folder, keyed by the container's content, by the translator that
+//! made it (the fingerprint of `xtp-shader`'s sources, [`xtp_shader::SOURCES`],
+//! and of this file, with the translation settings: [`build`]), so a
+//! changed translator never serves an old translation while a build that
+//! changed only elsewhere keeps them, and by the wave sizes it was made for
 //! (VIctory #223: a translation for a 32-lane host is not a 64-lane one's).
 //! Entries go through `xtp-pipeline`'s content-addressed cache, which
 //! writes them atomically; an entry that does not read back is translated
@@ -9,7 +11,7 @@
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! are ignored anyway: this file is part of the key).
 //!
 //! A container this build cannot translate for a target is cached under the
 //! same key as a translation. The disk cache verifies the payload's length
@@ -37,9 +39,16 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// The disk the cache may take, oldest entries out first. One translator's
+/// answers for the whole pack take 1.1 GiB (25,889 entries, `xtp precook`
+/// on the PC, 2026-11-25): more than the former 1 GiB, which evicted what
+/// the precook or the session before had made. Room for a few translators
+/// (switches on and off) side by side.
+const LIMIT: u64 = 8 << 30;
+
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
-    match Cache::open(dir) {
+    match Cache::open_with_limit(dir, LIMIT) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
         }
@@ -61,13 +70,17 @@ fn count<T, E>(counter: &AtomicU64, result: Result<T, E>) -> Result<T, E> {
     result
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit and the loops'
-/// budget, which any build can change at run time).
+/// What identifies the translator this build runs: the fingerprint of
+/// `xtp-shader`'s sources ([`xtp_shader::SOURCES`]), this file (the
+/// entries' encoding, [`ENCODING`]) and the translation settings it runs
+/// with (the loop limit, the loops' budget, the DXIL clean-up passes and
+/// the raw structured reads, which any build can change at run time). Not
+/// the whole executable: before, the least change anywhere (the HLE, a log
+/// line, another worker's branch) made every translation again, and each
+/// worktree's sessions started cold.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = xtp_shader::emit::loop_limit();
         if limit != xtp_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(limit, "XTP_SHADER_LOOP_LIMIT: translated loops stop sooner");
@@ -79,31 +92,42 @@ fn build() -> &'static [u8; 32] {
                 "XTP_SHADER_LOOP_BUDGET: back edges a lane may take in all loops together (0: no budget)"
             );
         }
-        // And the clean-up passes run over the translated code (none: the
-        // key stays what it was without them).
+        // And the clean-up passes run over the translated code.
         let passes = xtp_shader::emit::dxil_opt();
         if passes != 0 {
             tracing::info!(passes, "XTP_DXIL_OPT: clean-up passes run over translated shaders");
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.extend_from_slice(&budget.to_le_bytes());
-                if passes != 0 {
-                    bytes.extend_from_slice(&passes.to_le_bytes());
-                }
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
+        // And structured reads through raw handles (XTP_RAW_STRUCTURED).
+        let raw = u32::from(xtp_shader::emit::raw_structured());
+        build_of(xtp_shader::SOURCES, ENCODING, [limit, budget, passes, raw])
     })
+}
+
+/// This file: how entries are encoded and decoded, and which translation
+/// each holds, so a change to it is a new key.
+const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
+
+/// [`build`]'s key from its parts: the translator's sources, the entries'
+/// encoding and the settings (loop limit, loop budget, clean-up passes, raw
+/// structured reads).
+fn build_of(sources: &str, encoding: &[u8], settings: [u32; 4]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    for part in [sources.as_bytes(), encoding] {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    for setting in settings {
+        h.update(&setting.to_le_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
+/// The key this run's translations are kept under: this build and the
+/// host's target ([`crate::device::host_target`]). `xtp precook` notes it
+/// beside a complete pass, to know a pass for this key was made.
+#[cfg(windows)]
+pub(crate) fn host_key() -> [u8; 32] {
+    key(build(), crate::device::host_target())
 }
 
 /// The translation of a console shader container for a host that runs
@@ -279,7 +303,10 @@ pub(crate) fn wave64_program(
     (container, native)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+/// A translation's entry: this, then [`encode`]'s words. 2: with whether it
+/// reads the runtime stride table (VIctory #193) and the buffers it reads
+/// through slots picked at run time.
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A refusal's entry: this, then the text's length (little endian, 4 bytes),
 /// then a checksum of the text (4 bytes), then the error's text (UTF-8). The
 /// length tells a cut-short entry from a shorter error, and the checksum
@@ -393,6 +420,8 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.stride_table));
+    word(&mut out, u32::from(s.run_time_buffers));
     out
 }
 
@@ -449,6 +478,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let stride_table = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let run_time_buffers = u8::try_from(r.word()?).ok()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -457,6 +492,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        stride_table,
+        run_time_buffers,
     })
 }
 
@@ -529,6 +566,8 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            stride_table: true,
+            run_time_buffers: 3,
         }
     }
 
@@ -719,6 +758,7 @@ mod tests {
         let nvidia = Target {
             lanes_min: 32,
             lanes_max: 32,
+            stride_table: false,
         };
         let runs = AtomicU64::new(0);
         // Taken for 64-lane hosts, and by the rebuilt translator for any.
@@ -801,6 +841,7 @@ mod tests {
         let nvidia = Target {
             lanes_min: 32,
             lanes_max: 32,
+            stride_table: false,
         };
         let runs = AtomicU64::new(0);
         let get = |target: Target| {
@@ -824,11 +865,69 @@ mod tests {
         let rdna = Target {
             lanes_min: 32,
             lanes_max: 64,
+            stride_table: false,
         };
         assert_ne!(key(&build, nvidia), key(&build, rdna));
         assert_ne!(key(&build, rdna), key(&build, Target::ANY));
         assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
         assert_eq!(key(&build, nvidia), key(&build, nvidia));
+    }
+
+    /// The key is the translator's, not the executable's: this run's build
+    /// key is made from the fingerprint of `xtp-shader`'s sources, this
+    /// file and the settings alone, nothing else of the build. So two
+    /// builds that differ only outside the translator share their entries
+    /// (`apps/xtp/tests/precook.rs` runs two executables that do), and a
+    /// change to a file of the translator, to the encoding or to a setting
+    /// translates again.
+    #[test]
+    fn the_key_is_the_translators_not_the_executables() {
+        let _serial = serial();
+        let settings = [
+            xtp_shader::emit::loop_limit(),
+            xtp_shader::emit::loop_budget(),
+            xtp_shader::emit::dxil_opt(),
+            u32::from(xtp_shader::emit::raw_structured()),
+        ];
+        let ours = build_of(xtp_shader::SOURCES, ENCODING, settings);
+        assert_eq!(*build(), ours, "nothing but these parts");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"a console container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let get = |build: [u8; 32]| cached(&cache, &key(&build, Target::ANY), container, translate);
+        let runs = || runs.load(Ordering::Relaxed);
+        assert_eq!(get(ours), Ok(shader()));
+        // Another build of the same translator: the key is made again from
+        // the same parts, and finds the entry.
+        let rebuilt = build_of(xtp_shader::SOURCES, ENCODING, settings);
+        assert_eq!(get(rebuilt), Ok(shader()));
+        assert_eq!(runs(), 1, "shared by both builds");
+
+        // A file of the translator changed: its fingerprint does
+        // (`xtp_shader`'s fingerprint tests), and so does the key.
+        let fingerprint = u128::from_str_radix(xtp_shader::SOURCES, 16).unwrap();
+        let changed = format!("{:032x}", fingerprint ^ 1);
+        assert_eq!(get(build_of(&changed, ENCODING, settings)), Ok(shader()));
+        assert_eq!(runs(), 2, "a changed translator translates again");
+        assert_ne!(
+            build_of(xtp_shader::SOURCES, b"another encoding", settings),
+            ours
+        );
+        for i in 0..settings.len() {
+            let mut other = settings;
+            other[i] ^= 1;
+            assert_ne!(
+                build_of(xtp_shader::SOURCES, ENCODING, other),
+                ours,
+                "setting {i}"
+            );
+        }
     }
 
     #[test]

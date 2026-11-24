@@ -546,6 +546,7 @@ fn selects_from_independently_written_mask_words() {
         let wave32_only = crate::emit::Target {
             lanes_min: 32,
             lanes_max: 32,
+            stride_table: false,
         };
         for target in [wave32_only, crate::emit::Target::ANY] {
             let result = crate::emit::emit_for(&c, &native, &p, &st, &io, &res, target);

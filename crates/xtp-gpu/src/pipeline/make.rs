@@ -1216,10 +1216,10 @@ mod tests {
             (cheap_did.made, cheap_did.unready, cheap_did.waiting),
             (1, 0, 0)
         );
-        assert!(
-            heavy_did.longest_us > cheap_did.longest_us,
-            "{heavy_did:?} {cheap_did:?}"
-        );
+        // No comparison of the two pools' longest times: on a loaded check
+        // machine the cheap pipeline's creation can outlast the heavy one's
+        // (its hold ends as soon as `release` drops), and the order is
+        // already pinned by "the cheap one is ready first" above.
 
         // One worker, one queue: the cheap one waits behind.
         let one = pools([1, 0]);

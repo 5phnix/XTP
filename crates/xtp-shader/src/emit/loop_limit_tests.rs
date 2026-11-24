@@ -238,6 +238,7 @@ fn the_programs_translate_and_validate() {
             let target = Target {
                 lanes_min,
                 lanes_max,
+                stride_table: false,
             };
             let mut cs = emit(loops, above_the_limit(), target);
             if let Some(v) = validator.as_mut() {

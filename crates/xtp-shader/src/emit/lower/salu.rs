@@ -707,10 +707,12 @@ mod tests {
             Target {
                 lanes_min: 32,
                 lanes_max: 32,
+                stride_table: false,
             },
             Target {
                 lanes_min: 32,
                 lanes_max: 64,
+                stride_table: false,
             },
         ] {
             emit(&joined(), target);

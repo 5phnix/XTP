@@ -100,6 +100,8 @@ mod shader;
 mod smem_tests;
 #[cfg(all(test, windows))]
 mod split_tests;
+#[cfg(all(test, windows))]
+mod stride_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -114,7 +116,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::opt::dxil_opt;
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^14 (16,384), under the host's
 /// GPU watchdog (see `lower::LOOP_LIMIT`).
@@ -247,7 +251,51 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Whether the shader reads the host's runtime stride table (`t0` in
+    /// [`STRIDE_SPACE`], a [`StrideEntry`] per view-heap slot): only when
+    /// translated for a [`Target`] that has one.
+    pub stride_table: bool,
+    /// Whether the shader reads ([`RUN_TIME_READS`]) or may write
+    /// ([`RUN_TIME_WRITES`]) buffers through view-heap slots it picks when it
+    /// runs: a descriptor loaded at an address with a run-time part, or per
+    /// lane. No used-resource entry names such a slot, so the host makes and
+    /// refreshes its views another way (`xtp-gpu`'s `XTP_RUN_TIME_VIEWS`).
+    pub run_time_buffers: u8,
 }
+
+/// Whether buffers read by element with a stride known at translation are
+/// read through raw handles (`index * stride + offset`) instead of
+/// structured ones: `XTP_RAW_STRUCTURED=1`, read once. `xtp-gpu` then makes
+/// the title's structured views raw views of the same bytes where it can
+/// (Marvisak/VIctory#1762, after fxceless's VIctory fork's `raw_window`):
+/// on NVIDIA a raw read through a structured view returns other dwords or
+/// zeros (the lighting's pre-exposure, byte 4 of a 16-byte structured view,
+/// read 0: a black world; watch.md items 148, 160, 190), and a structured
+/// handle over a raw view reads zeros too, so both sides change together.
+/// With the runtime stride table such reads go through its raw views. Part
+/// of the translation: the shader cache keys on it.
+pub fn raw_structured() -> bool {
+    #[cfg(test)]
+    if let Some(on) = RAW_STRUCTURED_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`raw_structured`] for this thread's tests.
+    pub(crate) static RAW_STRUCTURED_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`HostShader::run_time_buffers`]: buffers read through slots picked at
+/// run time.
+pub const RUN_TIME_READS: u8 = 1;
+/// [`HostShader::run_time_buffers`]: unordered access views through slots
+/// picked at run time (they may be written).
+pub const RUN_TIME_WRITES: u8 = 2;
 
 impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a
@@ -291,18 +339,27 @@ pub struct UserData {
 /// compute shader that declares the console's wave size translates only
 /// for a host whose range holds it: NVIDIA's range is 32..32, so a console
 /// wave64 program that reads other lanes needs 64-lane waves it cannot get.
+///
+/// `stride_table`: the host binds a runtime stride table ([`StrideEntry`],
+/// `t0` in [`STRIDE_SPACE`]) to every shader that reads one and keeps it
+/// for its view heaps, so a buffer read by element without a stride known
+/// here translates (`xtp-gpu`'s `XTP_STRIDE_TABLE=1`). Without it such a
+/// program is refused, as before: a host that does not declare the table
+/// would refuse its pipeline instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Target {
     pub lanes_min: u32,
     pub lanes_max: u32,
+    pub stride_table: bool,
 }
 
 impl Target {
     /// No limit known: every wave size is taken to run (the host refuses
-    /// a pipeline it cannot run).
+    /// a pipeline it cannot run); no stride table.
     pub const ANY: Target = Target {
         lanes_min: 4,
         lanes_max: 128,
+        stride_table: false,
     };
 
     /// Whether the host runs waves of `lanes`.
@@ -310,11 +367,13 @@ impl Target {
         (self.lanes_min..=self.lanes_max).contains(&lanes)
     }
 
-    /// The range as bytes, for cache keys.
-    pub fn key(self) -> [u8; 8] {
-        let mut k = [0; 8];
+    /// The target as bytes, for cache keys: the range, then the stride
+    /// table.
+    pub fn key(self) -> [u8; 9] {
+        let mut k = [0; 9];
         k[..4].copy_from_slice(&self.lanes_min.to_le_bytes());
-        k[4..].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[4..8].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[8] = u8::from(self.stride_table);
         k
     }
 }
@@ -582,6 +641,8 @@ pub fn emit_for(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        stride_table: l.stride_table,
+        run_time_buffers: l.run_time_buffers,
     })
 }
 
@@ -864,6 +925,8 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            stride_table: false,
+            run_time_buffers: 0,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -874,6 +937,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                stride_table: false,
+                run_time_buffers: 0,
             })
         };
         let ps = file("XTP_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1086,10 +1151,12 @@ mod tests {
     const NVIDIA: Target = Target {
         lanes_min: 32,
         lanes_max: 32,
+        stride_table: false,
     };
     const RDNA: Target = Target {
         lanes_min: 32,
         lanes_max: 64,
+        stride_table: false,
     };
 
     #[test]
@@ -1170,11 +1237,11 @@ mod tests {
         }
     }
 
-    /// On every hardware adapter: a wave64 program that reads other lanes
-    /// translates in groups of one console wave (natively or in the console
-    /// flow) and the adapter takes it; in groups of two it translates
-    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
-    /// and an NVIDIA GPU this checks both answers.
+    /// On every hardware adapter with a supported wave path: a wave64 program
+    /// that reads other lanes translates in groups of one console wave (natively
+    /// or in the console flow) and the adapter takes it; in groups of two it
+    /// translates exactly when the adapter runs 64-lane waves. An adapter with
+    /// neither 64- nor 32-lane waves correctly refuses the one-wave program.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -1190,8 +1257,13 @@ mod tests {
             };
             let target = host.target();
             eprintln!("{name}: waves {}-{}", target.lanes_min, target.lanes_max);
-            let one =
-                emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let one = match emit_for(&compute(&words, true), target) {
+                Ok(one) => one,
+                Err(e) => {
+                    assert!(!target.runs(64) && !target.runs(32), "{name}: {e}");
+                    continue;
+                }
+            };
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             match emit_for(&compute_of(&words, true, 128), target) {
