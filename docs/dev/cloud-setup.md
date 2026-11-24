@@ -645,6 +645,10 @@ Keeping them down:
   their own project.
 - **Least access.** The VM's service account reads this one bucket and
   nothing else. Only you (the project owner) can change the project.
+- **Snapshots and images are copies too.** The data disk's snapshot (made by
+  `move-vm.ps1`) holds the game files: like the bucket, it stays in your
+  project, never shared with another project or account, never turned into
+  a public image. Delete it once you no longer need it.
 - **No public ports.** SSH and Remote Desktop only through IAP
   (`35.235.240.0/20`); nothing listens for the Internet. Do not add firewall
   rules from `0.0.0.0/0`.
@@ -692,6 +696,8 @@ gcloud compute resource-policies delete xtp-l4-daily-stop --region=$r --project=
 gcloud storage rm --recursive gs://<bucket>                                 # your copy of the game files
 gcloud iam service-accounts delete xtp-vm@$p.iam.gserviceaccount.com --project=$p
 gcloud compute firewall-rules delete xtp-allow-iap --project=$p            # if new-vm.ps1 created it
+gcloud compute snapshots delete xtp-l4-boot-move xtp-l4-data-move --project=$p   # if a move made them
+gcloud compute images delete xtp-l4-boot --project=$p                      # if you made one
 ```
 
 Or delete the whole project (`gcloud projects delete <your-project-id>`),
