@@ -42,6 +42,16 @@
 //! real deadlock then hangs for ever instead of ending the process, and
 //! leaves no entry in `crashes.log`: only those warnings say that the
 //! watchdog would have ended the title.
+//!
+//! These are the only two firing sites. The handler pointer is read
+//! nowhere else (its one other user is its setter, `0x22161f0`), and the
+//! loop's only faults are the two fallbacks the patches skip. A stop whose
+//! stack ends in `0x2215eca` is not the watchdog: that address follows the
+//! call into the thread's function in the title's common thread start
+//! (`0x2215ea0`), at the bottom of every title thread's stack.
+//!
+//! The patch machinery here (checked sites, a counter, a thread that logs
+//! it) also serves [`crate::asserts`].
 
 use std::fmt;
 
@@ -59,7 +69,8 @@ pub struct Patch {
     pub rva: usize,
     pub expect: &'static [u8],
     pub new: &'static [u8],
-    /// Where the patched code jumps: the title's own code after the firing.
+    /// Where the patched code jumps: the title's own code after what it
+    /// skips (the first place, when it can go to two).
     pub resumes_at: usize,
 }
 
@@ -87,7 +98,7 @@ pub const HOOKS: &[Hook] = &[Hook {
 const COUNTER_1_0_2_1: usize = 0xabceff8;
 
 /// `inc dword ptr [rip + disp32]` at `at`, on the `u32` at `counter`.
-const fn count_into(at: usize, counter: usize) -> [u8; 6] {
+pub(crate) const fn count_into(at: usize, counter: usize) -> [u8; 6] {
     let d = ((counter as isize) - (at as isize + 6)) as i32;
     let d = d.to_le_bytes();
     [0xFF, 0x05, d[0], d[1], d[2], d[3]]
@@ -151,7 +162,7 @@ pub enum NotApplied {
 impl fmt::Display for NotApplied {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::UnknownBuild => write!(f, "no watchdog offsets are known for this build"),
+            Self::UnknownBuild => write!(f, "no offsets are known for this build"),
             Self::Mismatch { what, rva } => write!(
                 f,
                 "the bytes at {rva:#x} ({what}) are not the expected ones; nothing written"
@@ -246,7 +257,12 @@ pub unsafe fn apply_if_asked(blake3_hex: &str, base: usize, size: u32) {
                 sites,
                 "title watchdog hook applied ({ENV})"
             );
-            report_firings(base + hook.counter);
+            watch_counter(base + hook.counter, "xtp-watchdog-log", 30, |fired| {
+                tracing::warn!(
+                    times = fired,
+                    "the title's watchdog would have ended it (no progress for 30 s, or a stale heartbeat); {ENV} kept it running"
+                );
+            });
         }
         Err(e) => tracing::warn!("title watchdog hook not applied ({ENV}): {e}"),
     }
@@ -259,7 +275,11 @@ pub unsafe fn apply_if_asked(blake3_hex: &str, base: usize, size: u32) {
 /// `base..base + size` is the mapped image `hook` was made for (or memory
 /// laid out like it), and no thread runs its patched code.
 #[cfg(windows)]
-unsafe fn apply_mapped(hook: &Hook, base: usize, size: usize) -> Result<usize, NotApplied> {
+pub(crate) unsafe fn apply_mapped(
+    hook: &Hook,
+    base: usize,
+    size: usize,
+) -> Result<usize, NotApplied> {
     // Only the sites and the counter are read: an image can have pages
     // that are not.
     hook.check(|rva, len| {
@@ -303,31 +323,34 @@ fn writable(at: usize, len: usize) -> bool {
         && at + len <= info.BaseAddress as usize + info.RegionSize
 }
 
-/// A thread that warns when the counter at `at` moves: at most one line
-/// every 30 s, with the total so far.
+/// A thread named `name` that calls `log` with the total so far when the
+/// counter at `at` moves: checked every second, then quiet for `quiet_s`
+/// seconds after each line.
 #[cfg(windows)]
-fn report_firings(at: usize) {
+pub(crate) fn watch_counter(
+    at: usize,
+    name: &str,
+    quiet_s: u64,
+    log: impl Fn(u32) + Send + 'static,
+) {
     let spawned = std::thread::Builder::new()
-        .name("xtp-watchdog-log".into())
+        .name(name.into())
         .spawn(move || {
             let mut logged = 0;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 // SAFETY: a u32 of the mapped image, checked writable when
                 // the hook was applied; the title increments it.
-                let fired = unsafe { (at as *const u32).read_volatile() };
-                if fired != logged {
-                    tracing::warn!(
-                        times = fired,
-                        "the title's watchdog would have ended it (no progress for 30 s, or a stale heartbeat); {ENV} kept it running"
-                    );
-                    logged = fired;
-                    std::thread::sleep(std::time::Duration::from_secs(29));
+                let now = unsafe { (at as *const u32).read_volatile() };
+                if now != logged {
+                    log(now);
+                    logged = now;
+                    std::thread::sleep(std::time::Duration::from_secs(quiet_s.saturating_sub(1)));
                 }
             }
         });
     if let Err(e) = spawned {
-        tracing::warn!("watchdog firings will not be logged: {e}");
+        tracing::warn!("{name}: the counter at {at:#x} will not be logged: {e}");
     }
 }
 

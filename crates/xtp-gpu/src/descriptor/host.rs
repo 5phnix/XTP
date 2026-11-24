@@ -2138,6 +2138,9 @@ fn make_with(
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
+            // A depth texture's unordered access is its colour twin's.
+            let twin = crate::resource::twin_view(resource, desc);
+            let (texture, mut desc) = twin.map_or((texture, desc.take()), |(t, v)| (t, Some(v)));
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }

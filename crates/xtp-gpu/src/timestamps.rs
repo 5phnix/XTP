@@ -384,6 +384,7 @@ pub(crate) fn open(list: &HostList) {
     // Its chunks go back outside the lock (unless a submission holds them).
     drop(old);
     stamp(list, BETWEEN);
+    crate::pipestats::open(list);
 }
 
 /// Just before a list is closed: its last timestamp, and the resolve of
@@ -394,6 +395,7 @@ pub(crate) fn close(list: &HostList) {
     }
     let Some(heap) = heap() else { return };
     stamp(list, BETWEEN);
+    crate::pipestats::close(list);
     let mut lists = LISTS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entry) = lists.as_mut().and_then(|l| l.get_mut(&key(list))) else {
         return;
@@ -429,6 +431,7 @@ pub(crate) struct Command<'a>(Option<&'a HostList>);
 impl Drop for Command<'_> {
     fn drop(&mut self) {
         if let Some(list) = self.0 {
+            crate::pipestats::end(list);
             stamp(list, BETWEEN);
         }
     }
@@ -447,6 +450,7 @@ pub(crate) fn command<'a>(
     }
     let program = pipeline.map_or(0, |p| program(&p.name, || wave64(p)));
     stamp(list, Label { what, program });
+    crate::pipestats::begin(list, what, pipeline);
     Command(Some(list))
 }
 
@@ -558,6 +562,9 @@ struct Submission {
     clock: Clock,
     /// Its lists' recordings, in order (`None`: not timed).
     lists: Vec<Option<(usize, Arc<Recording>)>>,
+    /// The thread that submitted it (tests: whose lists were timed).
+    #[cfg(test)]
+    thread: std::thread::ThreadId,
 }
 
 /// Host submissions made so far, timed or not.
@@ -573,6 +580,12 @@ pub(crate) fn submissions() -> u64 {
 /// Just after a submission of `runs` that signals `value` on `queue`: its
 /// timestamps are read once it has finished.
 pub(crate) fn submitted(queue: &ID3D12CommandQueue, runs: &[&HostList], value: u64, title: bool) {
+    // Counted whether timestamps are on or not, so before the check below:
+    // `texture` tells a list named twice in one submission from one
+    // submitted again in a later one by this count
+    // (`texture::Predicate::decide`), and timestamps are off by default.
+    // Counted after it, the second submission would run a copy that is not
+    // due (`submissions_are_counted_with_timestamps_off`).
     SUBMISSIONS.fetch_add(1, Ordering::Release);
     if !on() {
         return;
@@ -598,9 +611,12 @@ pub(crate) fn submitted(queue: &ID3D12CommandQueue, runs: &[&HostList], value: u
         frame: crate::frame::current(),
         clock,
         lists,
+        #[cfg(test)]
+        thread: std::thread::current().id(),
     };
     host.after(move || read(submission));
     log_due();
+    crate::pipestats::submitted(runs);
 }
 
 /// One list's timestamps, read: what each span went to and how long it
@@ -698,11 +714,14 @@ fn read(submission: Submission) {
         "GPU timestamps of a submission"
     );
     #[cfg(test)]
-    READ.lock().unwrap_or_else(|e| e.into_inner()).extend(
-        lists
-            .into_iter()
-            .map(|(key, s)| (key, s, recording_chunks(&submission, key))),
-    );
+    READ.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(lists.into_iter().map(|(key, spans)| ReadList {
+            thread: submission.thread,
+            key,
+            spans,
+            chunks: recording_chunks(&submission, key),
+        }));
 }
 
 #[cfg(test)]
@@ -716,9 +735,19 @@ fn recording_chunks(submission: &Submission, key: usize) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// Lists read in tests: their key, spans and chunks.
+/// A list read in tests: the thread that submitted it, its key, spans and
+/// chunks.
 #[cfg(test)]
-static READ: Mutex<Vec<(usize, Spans, Vec<u32>)>> = Mutex::new(Vec::new());
+struct ReadList {
+    thread: std::thread::ThreadId,
+    key: usize,
+    spans: Spans,
+    chunks: Vec<u32>,
+}
+
+/// Lists read in tests.
+#[cfg(test)]
+static READ: Mutex<Vec<ReadList>> = Mutex::new(Vec::new());
 
 /// A sum of GPU ticks and of what they were counted over.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -1098,14 +1127,45 @@ mod tests {
         assert_eq!(lines.len(), 4);
     }
 
-    /// The lists `key` was read as in tests, in order.
+    /// The lists `key` was read as, in order, of those this thread
+    /// submitted. A key is a D3D12 list's address, which a list made after
+    /// another was released may take: another test's lists read under the
+    /// same key (CI, PR #31: `a_title_list_is_timed_per_command` found the
+    /// two reads of `a_list_reset_after_its_submission_is_timed_again`'s
+    /// list with its own). Each test runs on a thread of its own, and a
+    /// thread's id is never reused.
     fn read_as(key: usize) -> Vec<(Spans, Vec<u32>)> {
+        let thread = std::thread::current().id();
         READ.lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|(k, ..)| *k == key)
-            .map(|(_, s, c)| (s.clone(), c.clone()))
+            .filter(|r| r.thread == thread && r.key == key)
+            .map(|r| (r.spans.clone(), r.chunks.clone()))
             .collect()
+    }
+
+    /// Submissions are counted with timestamps off (the default) too:
+    /// `texture` tells a list named twice in one submission from one
+    /// submitted again in a later one by the count.
+    #[test]
+    fn submissions_are_counted_with_timestamps_off() {
+        if std::env::var_os("XTP_GPU_TIMESTAMPS").is_some() {
+            return;
+        }
+        let Some(host) = device("timestamps::tests::submissions_are_counted_with_timestamps_off")
+        else {
+            return;
+        };
+        assert!(!on());
+        let list = host.new_list().unwrap();
+        list.close();
+        for _ in 0..2 {
+            // Others' submissions may come in between: at least ours.
+            let before = submissions();
+            host.execute(&[&list]);
+            assert!(submissions() > before);
+            host.drain();
+        }
     }
 
     /// A title list with two marked dispatches is timed end to end: its

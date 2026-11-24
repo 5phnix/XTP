@@ -551,6 +551,7 @@ impl From<&'static str> for Unready {
 /// not run on the host for `why` (diagnostics).
 #[cfg(feature = "diagnostics")]
 fn note_unready(path: &str, pipeline: usize, why: Unready) {
+    crate::passdump::dropped(path, pipeline, &why);
     match why {
         Unready::NoPipeline => crate::pipeline::note_drop(path, pipeline as This),
         Unready::Because(why) => crate::pipeline::note_why(format!("{path}: {why}")),
@@ -744,6 +745,8 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        crate::passdump::targets(list, &self.targets, self.depth);
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -859,6 +862,7 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
+            list.twin_use(self.depth as This, false, true);
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
         }
         Ok(())
@@ -1044,6 +1048,7 @@ impl State {
         {
             self.writes += 1;
         }
+        list.twins_written();
         Ok(())
     }
 
@@ -1339,8 +1344,8 @@ impl State {
     /// runs, direct or indirect, starts with a global UAV barrier. From Marvisak/VIctory#1392 by
     /// kunalkhude99, for issue #1347: an RTX 4060 lost its device on a
     /// dispatch of `4c0ac499ad613809` right after three dropped ones, and
-    /// an RTX 3060 Ti named the same program (docs/upstream/watch.md, items
-    /// 99 and 108).
+    /// an RTX 3060 Ti named the same program (the maintainers' private
+    /// watch notes).
     /// The PR's reason does not hold here as such: XTP records the title's
     /// own barriers (`list::barrier`, `list::barrier_groups`) and a dropped
     /// dispatch records nothing, so no barrier the title asked for goes
@@ -2146,6 +2151,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             {
                 crate::texture::upload(list, *resource as This, t);
             }
+            crate::resource::alias_copy(list, *resource as This);
+            list.twin_use(*resource as This, false, false);
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
@@ -2163,6 +2170,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            #[cfg(feature = "diagnostics")]
+            crate::passdump::written(list, *resource as This);
+            list.twin_use(*resource as This, true, true);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}

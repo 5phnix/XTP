@@ -8,6 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+xtp-core = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 xtp-gpu.workspace = true
 xtp-loader.workspace = true
 xtp-pe.workspace = true
@@ -34,18 +36,25 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Input_XboxController",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Trigger motors (`modules::gameinput::triggers`) and Windows accessibility
-# settings (`modules::speech::captions`). Diagnostics adds `modules::audio::capture`.
-windows = { workspace = true, features = ["Gaming_Input", "Media_ClosedCaptioning", "UI_ViewManagement"] }
+# Trigger motors, accessibility settings and in-memory speech synthesis.
+windows = { workspace = true, features = [
+    "Gaming_Input", "Media_ClosedCaptioning", "UI_ViewManagement",
+    "Media_Core", "Media_MediaProperties", "Media_SpeechSynthesis",
+    "Data_Xml_Dom", "Media_Transcoding", "Storage_Streams", "Win32_Foundation",
+] }
 # `#[implement]` names it.
 windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
+xtp-core.workspace = true
 tempfile.workspace = true
+xtp-testkit.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = [
+    "dep:xtp-core",
+    "dep:tempfile",
     "xtp-gpu/diagnostics",
     "xtp-loader/diagnostics",
     "windows/Win32_Media_Audio",

@@ -1,5 +1,5 @@
 //! A lane the iteration limit stops, in a loop followed by a store and a
-//! group barrier (docs/upstream/watch.md, item 111), and the budget of all
+//! group barrier (the maintainers' private watch notes), and the budget of all
 //! loops together.
 //!
 //! Lane t of a group of 64 runs its loops to small bounds, except lane

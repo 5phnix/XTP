@@ -870,10 +870,12 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-sys",
+ "xtp-core",
  "xtp-formats",
  "xtp-gpu",
  "xtp-loader",
  "xtp-pe",
+ "xtp-testkit",
 ]
 
 [[package]]

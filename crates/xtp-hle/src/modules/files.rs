@@ -1682,7 +1682,91 @@ pub extern "C" fn _fsopen(path: *const c_char, mode: *const c_char, share: i32) 
 // fail there instead of faulting into its handler; BTP 6's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first.
+// is opened first, and held open until the read is done: a copy guarding it
+// again meanwhile cut reads (docs/analysis/archive-null.md). An overlapped
+// read still under way when `ReadFile` returns keeps it open until it
+// completes.
+
+/// `ERROR_INVALID_USER_BUFFER`: the kernel could not write the destination
+/// while it read.
+const INVALID_USER_BUFFER: u32 = 1784;
+const IO_PENDING: u32 = 997;
+
+/// Overlapped reads into title memory still under way: the `OVERLAPPED`
+/// each was given, and the announcement that holds its destination open
+/// (and, once it drops, notes it written).
+static PENDING_READS: Mutex<Vec<(usize, xtp_gpu::KernelWrite)>> = Mutex::new(Vec::new());
+static READS_PENDING: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Holds the destination of overlapped read `overlapped` open until it
+/// completes. A thread of ours looks every millisecond while some are
+/// pending, so that copies take their pages soon after the device wrote
+/// them, not only at the title's next read (BTP 6 calls none of the
+/// completion functions we could hook).
+fn hold_until_done(overlapped: usize, writing: xtp_gpu::KernelWrite) {
+    static WATCHER: std::sync::Once = std::sync::Once::new();
+    WATCHER.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("xtp-overlapped-reads".into())
+            .spawn(|| {
+                loop {
+                    {
+                        let mut pending = PENDING_READS.lock().unwrap_or_else(|e| e.into_inner());
+                        while pending.is_empty() {
+                            pending = READS_PENDING
+                                .wait(pending)
+                                .unwrap_or_else(|e| e.into_inner());
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    finish_overlapped_reads();
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "overlapped reads are let go only at the next read: no thread to watch them ({e})"
+            );
+        }
+    });
+    PENDING_READS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((overlapped, writing));
+    READS_PENDING.notify_one();
+}
+
+/// Lets go of the destinations of the overlapped reads that completed: the
+/// kernel replaces the `OVERLAPPED`'s status (its first field,
+/// `STATUS_PENDING` meanwhile) when it completes one. Read with
+/// `ReadProcessMemory`: the title may free the structure once its read is
+/// done, and one that cannot be read is taken as done.
+fn finish_overlapped_reads() {
+    const STATUS_PENDING: usize = 0x103;
+    let mut pending = PENDING_READS.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.is_empty() {
+        return;
+    }
+    pending.retain(|&(overlapped, _)| read_own_usize(overlapped) == Some(STATUS_PENDING));
+}
+
+/// The `usize` at `at` in our own memory, or `None` where it cannot be read.
+fn read_own_usize(at: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let (mut value, mut read) = (0usize, 0usize);
+    // SAFETY: reads into a local; the call fails, rather than faults, on
+    // memory that cannot be read.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            at as *const c_void,
+            (&raw mut value).cast(),
+            size_of::<usize>(),
+            &mut read,
+        )
+    };
+    (ok != 0 && read == size_of::<usize>()).then_some(value)
+}
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -1691,15 +1775,36 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    xtp_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
+    let host = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
+    finish_overlapped_reads();
+    let writing = xtp_gpu::kernel_will_write(buffer as usize, len as usize);
+    let mut done = host(file, buffer, len, read, overlapped);
+    // SAFETY: plain reads and writes of this thread's last error.
+    let mut error = unsafe { GetLastError() };
+    if done == 0 && error == INVALID_USER_BUFFER {
+        // Not expected with the destination held open: once more, and said.
+        tracing::warn!(
+            len,
+            "ReadFile: a read was cut (ERROR_INVALID_USER_BUFFER); reading it again"
+        );
+        done = host(file, buffer, len, read, overlapped);
+        // SAFETY: as above.
+        error = unsafe { GetLastError() };
+    }
+    if done == 0 && error == IO_PENDING && !overlapped.is_null() {
+        hold_until_done(overlapped as usize, writing);
+    } else {
+        drop(writing);
+    }
+    // SAFETY: as above; the title reads the read's error, not ours.
+    unsafe { SetLastError(error) };
+    done
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    xtp_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+    finish_overlapped_reads();
+    let _writing = xtp_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
     host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     )
@@ -2024,6 +2129,29 @@ mod tests {
             0
         );
         assert_eq!((&out, n), (b"0123456789", 10));
+    }
+
+    /// An overlapped read still under way keeps its destination open until
+    /// the kernel sets the `OVERLAPPED`'s status; then the watching thread
+    /// lets it go, without another read.
+    #[test]
+    fn overlapped_reads_hold_their_destination_until_they_complete() {
+        let mut status: usize = 0x103; // STATUS_PENDING
+        let at = (&raw mut status) as usize;
+        let destination = [0u8; 64];
+        let writing = xtp_gpu::kernel_will_write(destination.as_ptr() as usize, 64);
+        hold_until_done(at, writing);
+        let held = || PENDING_READS.lock().unwrap().iter().any(|&(o, _)| o == at);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        finish_overlapped_reads();
+        assert!(held(), "still pending");
+        // SAFETY: our local, as the kernel writes the status on completion.
+        unsafe { (&raw mut status).write_volatile(0) };
+        let waited = std::time::Instant::now();
+        while held() && waited.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!held(), "completed: let go by the watching thread");
     }
 
     fn text(v: &[u16]) -> String {

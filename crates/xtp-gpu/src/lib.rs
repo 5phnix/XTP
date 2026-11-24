@@ -34,7 +34,11 @@ mod host;
 mod indirect;
 pub mod list;
 pub mod object;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod passdump;
 pub mod pipeline;
+#[cfg(windows)]
+mod pipestats;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -65,5 +69,6 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
-    copy_asks, guarding, set_alias_lookup, title_memory_remapped, writing as kernel_will_write,
+    KernelWrite, copy_asks, guarding, kernel_writing as kernel_will_write, set_alias_lookup,
+    title_memory_remapped, writing as kernel_wrote,
 };

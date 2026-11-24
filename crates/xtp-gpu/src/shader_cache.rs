@@ -79,10 +79,19 @@ fn build() -> &'static [u8; 32] {
                 "XTP_SHADER_LOOP_BUDGET: back edges a lane may take in all loops together (0: no budget)"
             );
         }
+        // And the clean-up passes run over the translated code (none: the
+        // key stays what it was without them).
+        let passes = xtp_shader::emit::dxil_opt();
+        if passes != 0 {
+            tracing::info!(passes, "XTP_DXIL_OPT: clean-up passes run over translated shaders");
+        }
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.extend_from_slice(&budget.to_le_bytes());
+                if passes != 0 {
+                    bytes.extend_from_slice(&passes.to_le_bytes());
+                }
                 // Structured reads through raw handles (none: the key stays).
                 if xtp_shader::emit::raw_structured() {
                     bytes.extend_from_slice(b"raw structured");

@@ -383,7 +383,11 @@ the same VM, not against the PC.
 
 **Which code.** By default the VM's clone is put on `origin/main` (fetched
 first) or on `-Ref`. With `-Local` your current commit is sent as a git bundle
-(only committed work: the script warns about local changes). The VM keeps one
+(only committed work: the script warns about local changes), under a name of
+its own, and the VM stops unless the commit it checked out is the one sent:
+the log's `commit` line names it (before, callers waiting for the VM in turn
+read one shared bundle, and a run could build another worker's commit,
+[hardware-tests](../analysis/hardware-tests.md)). The VM keeps one
 clone and one `target` folder, so builds are incremental; one build runs at a
 time and a second caller waits.
 
@@ -397,6 +401,42 @@ the SSH session: some tests need a desktop. For example `xtp-hle`'s
 `display::tests::sdr_and_display_deferrals` asks Windows to keep the display
 on, which fails with `ERROR_NOT_SUPPORTED` (0x80070032) in an SSH session and
 passes in the desktop session.
+
+### GPU tests on the L4
+
+On the PC and the [build farm](build-farm.md), XTP's GPU tests run on WARP
+(`XTP_TEST_ADAPTER=warp`). WARP runs waves one after the other and, at a
+group barrier, does not wait for a thread that has returned, so a program
+that hangs a hardware GPU can pass there. The hardware set runs the same
+tests on the L4 (NVIDIA Ada, 32-lane waves, like an RTX 4080); a GPU hang
+there does not touch your PC. What it found is in
+[hardware-tests](../analysis/hardware-tests.md).
+
+```powershell
+tools\cloud\run-remote.ps1 -GpuTests -Local                  # xtp-shader and xtp-gpu on the L4
+tools\cloud\run-remote.ps1 -GpuTests -Local -Adapter warp    # the same tests on WARP, on the VM, to compare
+tools\cloud\run-remote.ps1 -GpuTests -Local -Filter split_tests -TestTimeout 60
+tools\cloud\run-remote.ps1 -Cargo 'test -p xtp-shader -p xtp-gpu --locked' -Local -Env @{ XTP_TEST_ADAPTER = 'hardware'; XTP_REQUIRE_GPU = '1' }
+```
+
+`-GpuTests` ([`vm\test-each.ps1`](../../tools/cloud/vm/test-each.ps1))
+builds the test binaries of `-Packages` (default `xtp-shader`, `xtp-gpu`)
+and runs each test in a process of its own, 8 at a time (`-Parallel`), with
+`XTP_TEST_ADAPTER=hardware` (or `-Adapter warp`) and `XTP_REQUIRE_GPU=1`. On
+hardware it adds the tests marked `#[ignore = "hardware: ..."]`, which need a
+hardware adapter and are kept out of everyday runs. A test still running
+after `-TestTimeout` seconds (default 300) is stopped with its processes, so
+one hang does not lose the rest; each test that did not pass runs again
+alone, which tells a test that fails by itself from one that failed beside
+another (a GPU reset takes the tests running at that moment with it). A test
+that passes after printing "skipped" counts as a skip: xtp-shader's tests
+return early without their device. The summary lists the GPU resets Windows
+logged (System event 4101) with the tests that were running then. Back on
+your PC, `<date-time>-tests\` holds `run.log`, `results.csv` (each test's
+outcome and time) and `output\` (the output of each test that did not pass).
+The plain `-Cargo` form runs the tests as `cargo test` does, threads in one
+process on one device; without `XTP_REQUIRE_GPU`, a test without its device
+passes after printing `SKIPPED`.
 
 ### Game runs and the desktop session
 

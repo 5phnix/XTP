@@ -1,9 +1,9 @@
 # HLE system libraries: what XTP keeps from VIctory, what it rewrites after xcl
 
-Status: analysis, 2026-11-24. Inputs: XTP at the VIctory import (VIctory
+Status: analysis. Inputs: XTP at the VIctory import (VIctory
 `ffe310e`, crates since renamed `victory-*` → `xtp-*`), xcl at `47efa2e`
-(`E:/xtp-refs/xcl`), and the import tables of the user's dump
-(`game_scarlett_master.exe` and the DLLs beside it, read-only).
+(`E:/xtp-refs/xcl`), and the import tables of a title folder
+(the title executable and the DLLs beside it, read-only).
 
 xcl is GPL-2.0-only and XTP GPL-3.0-or-later: nothing below is to be copied
 from xcl. Each xcl reference names a file and a function so a worker can read
@@ -74,15 +74,15 @@ title end to end.
 | Media Foundation helpers | `hle/mfplat.rs` | 364 | 3 |
 
 Integration: `tests/testtitle` (a console title of xcl's own, run by
-`crates/xcl/tests/e2e.rs`), `tests/pls_quota.rs`, opt-in tests on the user's
-files (`XCL_SAMPLE_DLLS`: the game's libHttpClient initialises through the
+`crates/xcl/tests/e2e.rs`), `tests/pls_quota.rs`, opt-in tests on real
+inputs (`XCL_SAMPLE_DLLS`: the game's libHttpClient initialises through the
 thunks; `XCL_SAMPLE_AWC`: a game sound decodes). Docs read:
-`docs/specs/2026-11-20-xcl-design.md`, `docs/xnetworking-rust-review.md`,
+xcl's design notes (`docs/specs/`), `docs/xnetworking-rust-review.md`,
 `HANDOFF.md` (sections on XGameRuntime, audio, retail bring-up).
 
 ## 2. What the title asks for
 
-Console-only DLLs in the import tables of the dump (static and delay-load):
+Console-only DLLs in the import tables of the title folder (static and delay-load):
 
 | DLL | Imported by | Functions | XTP | xcl |
 |-----|-------------|-----------|-----|-----|
@@ -174,7 +174,7 @@ Legend: ✔ implemented and tested, ◐ partial, ✘ missing, — not needed.
 | XNetworking: stack up, reaches nothing | ✔ | ✔ real hints, CryptoAPI certificate checks | 1 / 7 | Keep XTP (offline by design) |
 | XGameUi: profile card, text entry (host dialog) | ✔ | → PC runtime | 1 / — | Keep XTP |
 | XGameUi message and error dialogs | ✘ | → PC runtime | — / — | **New work** (R5) |
-| Speech synthesis | ◐ valid empty WAVE | → PC runtime | 1 / — | **New work** (R6) |
+| Speech synthesis | ✔ Windows voices, text and SSML to 48 kHz PCM | → PC runtime | 4 / — | Done (R6) |
 | Closed captions, high contrast | ✔ Windows settings and title override | ✔ `accessibility.rs` | 5 / 3 | Done (R7) |
 | XError callback and options | ✘ class absent | ✔ | — / — | After xcl, if the title asks (R9) |
 | Relaunch (`XLaunchNewGame`), restart on crash | ◐ relaunch untested live | ✔ both | 4 (lifecycle) / — | Verify (R10) |
@@ -193,7 +193,7 @@ Legend: ✔ implemented and tested, ◐ partial, ✘ missing, — not needed.
 | DSP convolution (reverb) | ✘ silent, IR layout unknown | ✘ | 1 / 1 | **New work** (A2, A3) |
 | XAudio2 | host pass-through | wrapped: Opus/XMA voices, console flags dropped | — / 9 | Keep XTP (Bink's voices are PCM; see Q6) |
 | Media Foundation | host + local-only resolver | host + device manager helper | 2 / 3 | Keep XTP |
-| Capture for diagnosis | ✔ `XTP_AUDIO_CAPTURE`, `XTP_XMA_DUMP` | ◐ `XCL_TRACE_APU` | — | Keep XTP |
+| Capture for diagnosis | ✔ `XTP_AUDIO_CAPTURE`, `XTP_XMA_DUMP`, `XTP_DSP_DUMP` | ◐ `XCL_TRACE_APU` | — | Keep XTP |
 
 ### 4.4 Input
 
@@ -395,15 +395,13 @@ shows the title calls them.
   defaults when the host has no setting; set-enabled is read back.
 - **Depends on:** —
 
-### R6. Speech synthesis through the host — M
+### R6. Speech synthesis through the host — M (done)
 - **Goal:** narration speaks: voices enumerated from the host's speech
   synthesizer, text and SSML streams rendered to 48 kHz WAVE in memory.
-- **Files:** `crates/xtp-hle/src/modules/speech.rs`, `crates/xtp-hle/Cargo.toml`
-  (WinRT speech or SAPI features).
+- **Files:** `crates/xtp-hle/src/modules/speech.rs` and `speech/narrator.rs`.
 - **xcl ref:** none (xcl forwards speech to the PC runtime). New work.
-- **Acceptance:** Windows test: a stream for "test" is a valid WAVE file
-  with non-zero length; with no voice installed the current empty-stream
-  behaviour remains.
+- **Acceptance:** Windows tests check PCM output for text and SSML, and the
+  empty WAVE for blank text, an unavailable voice, or a failed host engine.
 - **Depends on:** —
 
 ### I3. Trigger rumble — M
@@ -445,9 +443,10 @@ shows the title calls them.
 - **Depends on:** K1 showing a gain.
 
 ### A2. Capture the DSP's impulse responses — S
-- **Goal:** `XTP_DSP_DUMP=<dir>` saves each activated stream's parameters,
-  impulse-response block and a few input/output blocks, to work out the
-  partitioned frequency-domain layout offline.
+- **Diagnostic:** Set `XTP_DSP_DUMP` to an absolute directory outside the repository.
+  The first 32 streams per process record connection and stream parameters, an
+  impulse response up to 4 MiB and four commands' gains and input/output blocks
+  for offline study of the partitioned frequency-domain layout.
 - **Files:** `crates/xtp-hle/src/modules/dsp.rs`.
 - **xcl ref:** `hle/acphal.rs` XDsp functions (`XDspConnectWithMaximumStreamLimit`,
   `XDspActivate`: argument meaning as observed).
@@ -513,7 +512,7 @@ shows the title calls them.
 | 10 | R5 message/error dialogs | M | (R1) |
 | 11 | R10 relaunch, restart on crash | S | — |
 | 12 | R7 closed captions, high contrast (done) | S | — |
-| 13 | R6 speech synthesis | M | — |
+| 13 | R6 speech synthesis (done) | M | — |
 | 14 | I3 trigger rumble | M | — |
 | 15 | K1 commit measurement | S | — |
 | 16 | K2 lazy commit | M | K1 |
@@ -571,7 +570,7 @@ richer), xcl's XGameSave storage (XTP's is crash-safe).
   `xgameruntime.lib` (names, GUIDs, slot numbers)? The person decides; R1's
   design depends on it.
 - **Q2.** Which runtime classes and slots does the title actually call past
-  the first mission? Only a run with R1's census answers it; R8, R9, R2 and
+  the first 3D scene? Only a run with R1's census answers it; R8, R9, R2 and
   the unset XPackage/XStore slots wait for that list.
 - **Q3.** Does any path in the title (crash reporter, telemetry, Bink, the
   BVH or FSR libraries) reach the network through COM or a host DLL today?

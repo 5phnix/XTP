@@ -273,7 +273,7 @@ pipeline cache:
 The queue drains about as late as in series-s's run (78 s): what is left
 in it in the world is mostly the 16 slow refusals, which only the
 translator can shorten (or a separate set of workers for known-slow
-programs, as OCE does: `docs/upstream/watch.md` item 43; not done).
+programs, as OCE does: the maintainers' watch notes; not done).
 
 ### 5.4 How to read the before and after
 

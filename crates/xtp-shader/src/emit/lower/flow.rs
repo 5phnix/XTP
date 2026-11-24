@@ -176,7 +176,7 @@ pub(super) fn barrier_after_loop(
 /// the variable starts past the bound (a bound of 0 read from a buffer the
 /// host has not written, or the console's own guard left out), it never
 /// equals it before wrapping around, so the loop runs to its limit in every
-/// lane (watch item 134, VIctory #71's pixel loop). It keeps the general
+/// lane (VIctory #71's pixel loop). It keeps the general
 /// limit.
 // shortcut: the bound itself may come from such data (a count in a buffer
 // the host has not written), and then the loop runs to the higher limit.
@@ -834,11 +834,13 @@ impl<'a> Lower<'a> {
     /// program where a group barrier can follow a loop. Not the console
     /// flow in halves: there both halves of the group's one console wave
     /// follow one flow (the limit stops them together), and their
-    /// exchanges add barriers that no block counts.
-    // shortcut: nor a program whose LDS leaves no room in DXIL's 32 KiB for
-    // the two counts (6 compute programs of the pack, of 32 KiB): a lane the
-    // limit stops there returns, as before, rather than the program being
-    // refused.
+    /// exchanges add barriers that no block counts. Nor a wave64 mesh
+    /// program on a host without 64-lane waves: its first-lane exchanges
+    /// (`mesh.rs`) add barriers that no block counts either.
+    // shortcut: nor a program whose LDS leaves no room in DXIL's 32 KiB (a
+    // mesh program's 28 KiB) for the two counts (6 compute programs of the
+    // pack, of 32 KiB): a lane the limit stops there returns, as before,
+    // rather than the program being refused.
     fn drains(&mut self) -> bool {
         if let Some(on) = self.drain.on {
             return on;
@@ -846,7 +848,13 @@ impl<'a> Lower<'a> {
         let on = self.s.threads.is_some()
             && !self.s.pixel
             && !(self.console_cf && self.split)
-            && self.s.lds_dwords + 2 <= 8192
+            && !self.mesh_halves()
+            && self.s.lds_dwords + 2
+                <= if self.s.mesh.is_some() {
+                    super::mesh::MESH_LDS_DWORDS
+                } else {
+                    8192
+                }
             && barrier_after_loop(self.x.p, self.counters.keys().copied(), |b| {
                 self.barriers_in(b) > 0
             });
@@ -951,6 +959,8 @@ impl<'a> Lower<'a> {
         }
         let arr = self.s.m.array(2, self.s.t.i32);
         let g = self.s.m.global("ended", arr, 3);
+        // A mesh program's group-shared size (its PSV) counts them.
+        self.s.shared_extra += 8;
         self.drain.ended = Some(g);
         g
     }

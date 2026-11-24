@@ -21,6 +21,9 @@ const V_MOV_V9_S5: u32 = 0x7E12_0205; // v_mov_b32 v9, s5
 const SAVE_EXEC: u32 = 0xBE8A_047E; // s_mov_b64 s[10:11], exec
 /// `ds_write_b32 v0, v1`: the program uses its LDS.
 const DS_WRITE: [u32; 2] = [0xD834_0000, 0x0000_0100];
+/// `ds_read_b32 v2, v0`.
+const DS_READ: [u32; 2] = [0xD8D8_0000, 0x0200_0000];
+const S_BARRIER: u32 = 0xBF8A_0000;
 const RESTORE_EXEC: u32 = 0xBEFE_040A; // s_mov_b64 exec, s[10:11]
 
 const NVIDIA: Target = Target {
@@ -32,6 +35,11 @@ const RDNA: Target = Target {
     lanes_min: 32,
     lanes_max: 64,
     stride_table: false,
+};
+/// WARP on this PC: waves of 4 lanes.
+const WARP: Target = Target {
+    lanes_min: 4,
+    lanes_max: 4,
 };
 
 /// A console wave64 mesh program of `threads` lanes with `lds_bytes` of
@@ -89,6 +97,8 @@ fn translate(
 const FIRST_LANE: &str = "a first-lane read of a value lanes may hold differently";
 const BARRIER: &str = "a group barrier lanes of a wave64 mesh group reach differently";
 const LDS_IN_ONE_WAVE: &str = "LDS shared within one wave64 mesh wave";
+const LDS_ORDER: &str =
+    "LDS read after a write, or written after a read, with no group barrier between";
 
 fn refusal(native: &NativeProgram, target: Target) -> Option<&'static str> {
     match translate(native, &empty(), target) {
@@ -210,19 +220,132 @@ fn barriers_and_lds_of_wave64_mesh_groups() {
     assert_eq!(refusal(&one_wave, RDNA), None);
 }
 
+/// A group of one console wave spans several host waves as soon as it has
+/// more lanes than the host's smallest wave: 32 lanes are one NVIDIA wave,
+/// but eight of WARP's.
+#[test]
+fn lds_in_one_wave_counts_the_hosts_smallest_wave() {
+    let p = mesh(&[DS_WRITE[0], DS_WRITE[1], 0x7E12_0280], 32, 256); // v_mov_b32 v9, 0
+    assert_eq!(refusal(&p, NVIDIA), None);
+    assert!(refusal(&p, WARP).is_some_and(|w| w.starts_with(LDS_IN_ONE_WAVE)));
+}
+
+/// One console wave's LDS accesses run in order, two host waves' do not:
+/// in a group of several console waves, an LDS read after a write, or a
+/// write after a read, needs a group barrier between them on a host
+/// without 64-lane waves, else the program is refused. On the console's
+/// paths: the next iteration of a loop, and the two sides of a branch
+/// lanes take apart (which no lane runs both of, but the console wave
+/// runs one after the other). Writes after writes, then a barrier, then
+/// reads (BTP 6's five mesh programs with LDS) translate.
+#[test]
+fn lds_order_within_a_console_wave() {
+    let p = |words: &[u32]| mesh(&[words, &[0x7E12_0280]].concat(), 128, 256); // v_mov_b32 v9, 0
+    let ordered = p(&[&DS_WRITE[..], &DS_WRITE, &[S_BARRIER], &DS_READ].concat());
+    let (_, ops) = translate(&ordered, &empty(), NVIDIA).unwrap();
+    assert!(ops.contains("barrier"), "{ops}");
+    let read_after_write = p(&[DS_WRITE, DS_READ].concat());
+    let write_after_read = p(&[DS_READ, DS_WRITE].concat());
+    let iteration = |barrier_after_read: bool| {
+        let mut words = vec![0xBE84_0380]; // s_mov_b32 s4, 0
+        words.extend(DS_WRITE); // loop:
+        words.push(S_BARRIER);
+        words.extend(DS_READ);
+        if barrier_after_read {
+            words.push(S_BARRIER);
+        }
+        words.extend([
+            0x8104_8104, // s_add_i32 s4, s4, 1
+            0xBF0A_8404, // s_cmp_lt_u32 s4, 4
+            if barrier_after_read {
+                0xBF85_FFF7 // s_cbranch_scc1 loop
+            } else {
+                0xBF85_FFF8 // s_cbranch_scc1 loop
+            },
+        ]);
+        p(&words)
+    };
+    let sides = p(&[
+        LANE[0],
+        LANE[1],
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0002, // s_cbranch_execz else
+        DS_WRITE[0],
+        DS_WRITE[1],
+        0x8AFE_7E0A, // else: s_andn2_b64 exec, s[10:11], exec
+        0xBF88_0002, // s_cbranch_execz end
+        DS_READ[0],
+        DS_READ[1],
+        0x88FE_0A7E, // end: s_or_b64 exec, exec, s[10:11]
+    ]);
+    let text = |p: &NativeProgram| -> Vec<String> {
+        crate::gfx10::decode(&p.code)
+            .unwrap()
+            .iter()
+            .map(|i| i.text(p.wave64))
+            .collect()
+    };
+    for (p, want) in [
+        (
+            &ordered,
+            &["ds_write_b32 v0, v1", "s_barrier", "ds_read_b32 v2, v0"][..],
+        ),
+        (&iteration(false), &["s_cbranch_scc1 label_0004"]),
+        (&iteration(true), &["s_cbranch_scc1 label_0004"]),
+        (
+            &sides,
+            &[
+                "s_cbranch_execz label_001C",
+                "s_andn2_b64 exec, s[10:11], exec",
+                "s_cbranch_execz label_002C",
+            ],
+        ),
+    ] {
+        let t = text(p);
+        for w in want {
+            assert!(t.iter().any(|x| x == w), "{w}: {t:#?}");
+        }
+    }
+    assert_eq!(refusal(&iteration(true), NVIDIA), None);
+    for (p, what) in [
+        (&read_after_write, "a read after a write"),
+        (&write_after_read, "a write after a read"),
+        (&iteration(false), "the next iteration's write"),
+        (&sides, "the two sides of a lane branch"),
+    ] {
+        assert!(
+            refusal(p, NVIDIA).is_some_and(|w| w.starts_with(LDS_ORDER)),
+            "{what}: {:?}",
+            refusal(p, NVIDIA)
+        );
+        assert!(
+            refusal(p, WARP).is_some_and(|w| w.starts_with(LDS_ORDER)),
+            "{what}"
+        );
+        assert_eq!(refusal(p, RDNA), None, "{what}");
+    }
+}
+
 /// The program [`wave64_mesh_reads_draw_the_console_waves_values`] draws.
 /// Thread t of the group (console wave w = t / 64, lane l = t % 64)
 /// exports vertex t at x = t / 2 of 63 columns, at the top when t is even
 /// and the bottom when odd, and triangle (t, t + 1, t + 2) below 126: a
 /// strip in which texel (k, row r) shows vertex 2k + r (the provoking
-/// vertex). Its attribute is what four first-lane reads give:
-/// * 7, a value of the group's (read as the lane's own);
-/// * w, the console wave's index (the wave's);
-/// * l + 100 from the console wave's first lane: 100 (an exchange, EXEC
-///   full);
-/// * 3 l + 7 with EXEC holding lanes 10 to 63 only: 37 (an exchange, EXEC
-///   narrowed; VIctory issue #1132's case, where the host wave's own first
-///   lane gave lanes 32-63 the wrong value).
+/// vertex). Its attribute is what five first-lane reads give, the
+/// exchanged values made from the thread, so that each console wave's
+/// first lane gives its own:
+/// * 7 + 16 w: 7, a value of the group's (read as the lane's own), and w,
+///   the console wave's index (the wave's), added on the scalar side;
+/// * t + 100 from the console wave's first lane: 64 w + 100 (an exchange,
+///   EXEC full);
+/// * 2 t + 1, right after it: 128 w + 1 (a second exchange, back to back
+///   with the first, through the same slots);
+/// * 3 t + 7 with EXEC holding the lanes above 9 + 20 w only, lane 10 of
+///   wave 0 and lane 30 of wave 1 first: 37 and 289 (an exchange, EXEC
+///   narrowed differently in each console wave; VIctory issue #1132's
+///   case, where the host wave's own first lane gave lanes 32-63 the wrong
+///   value).
 fn drawn_mesh() -> NativeProgram {
     let words = [
         0xD765_0000,
@@ -239,19 +362,26 @@ fn drawn_mesh() -> NativeProgram {
         0x7E0A_0501, // v_readfirstlane_b32 s5, v1
         0x7E02_0202, // v_mov_b32 v1, s2
         0x7E0C_0501, // v_readfirstlane_b32 s6, v1
-        0x4A04_06FF,
-        0x0000_0064, // v_add_nc_u32 v2, lit(100), v3
-        0x7E0E_0502, // v_readfirstlane_b32 s7, v2
+        0x4A04_00FF,
+        0x0000_0064, // v_add_nc_u32 v2, lit(100), v0
         0xD543_0004,
-        0x021D_0703, // v_mad_u32_u24 v4, v3, 3, 7
-        SAVE_EXEC,
-        0x7DA2_0689, // v_cmpx_lt_u32 exec, 9, v3
+        0x0205_0500, // v_mad_u32_u24 v4, v0, 2, 1
+        0x7E0E_0502, // v_readfirstlane_b32 s7, v2
         0x7E10_0504, // v_readfirstlane_b32 s8, v4
+        0x930C_9402, // s_mul_i32 s12, s2, 20
+        0x800C_890C, // s_add_u32 s12, s12, 9
+        0xD543_0001,
+        0x021D_0700, // v_mad_u32_u24 v1, v0, 3, 7
+        SAVE_EXEC,
+        0x7DA2_060C, // v_cmpx_lt_u32 exec, s12, v3
+        0x7E12_0501, // v_readfirstlane_b32 s9, v1
         RESTORE_EXEC,
-        0x7E14_0C05, // v_cvt_f32_u32 v10, s5
-        0x7E16_0C06, // v_cvt_f32_u32 v11, s6
-        0x7E18_0C07, // v_cvt_f32_u32 v12, s7
-        0x7E1A_0C08, // v_cvt_f32_u32 v13, s8
+        0x8F0D_8406, // s_lshl_b32 s13, s6, 4
+        0x800D_0D05, // s_add_u32 s13, s5, s13
+        0x7E14_0C0D, // v_cvt_f32_u32 v10, s13
+        0x7E16_0C07, // v_cvt_f32_u32 v11, s7
+        0x7E18_0C08, // v_cvt_f32_u32 v12, s8
+        0x7E1A_0C09, // v_cvt_f32_u32 v13, s9
         0x2C0A_0081, // v_lshrrev_b32 v5, 1, v0
         0x7E0A_0D05, // v_cvt_f32_u32 v5, v5
         0x100A_0AFF,
@@ -360,15 +490,23 @@ fn the_programs_decode_as_written() {
         (0, "v_mbcnt_lo_u32_b32 v0, -1, 0"),
         (3, "s_bfe_u32 s2, s3, lit(0x00040018)"),
         (4, "v_lshl_add_u32 v0, s2, 6, v0"),
-        (12, "v_mad_u32_u24 v4, v3, 3, 7"),
-        (14, "v_cmpx_lt_u32 exec, 9, v3"),
-        (15, "v_readfirstlane_b32 s8, v4"),
-        (31, "exp pos0, v5, v6, v7, v8 done"),
-        (32, "exp param0, v10, v11, v12, v13"),
-        (35, "v_lshl_or_b32 v9, v14, 10, v0"),
-        (37, "v_cmp_lt_u32 vcc, lit(0x0000007d), v0"),
-        (39, "v_cndmask_b32 v9, v9, v16, vcc"),
-        (40, "exp prim, v9, off, off, off done"),
+        (10, "v_add_nc_u32 v2, lit(0x00000064), v0"),
+        (11, "v_mad_u32_u24 v4, v0, 2, 1"),
+        (12, "v_readfirstlane_b32 s7, v2"),
+        (13, "v_readfirstlane_b32 s8, v4"),
+        (14, "s_mul_i32 s12, s2, 20"),
+        (15, "s_add_u32 s12, s12, 9"),
+        (16, "v_mad_u32_u24 v1, v0, 3, 7"),
+        (18, "v_cmpx_lt_u32 exec, s12, v3"),
+        (19, "v_readfirstlane_b32 s9, v1"),
+        (21, "s_lshl_b32 s13, s6, 4"),
+        (22, "s_add_u32 s13, s5, s13"),
+        (37, "exp pos0, v5, v6, v7, v8 done"),
+        (38, "exp param0, v10, v11, v12, v13"),
+        (41, "v_lshl_or_b32 v9, v14, 10, v0"),
+        (43, "v_cmp_lt_u32 vcc, lit(0x0000007d), v0"),
+        (45, "v_cndmask_b32 v9, v9, v16, vcc"),
+        (46, "exp prim, v9, off, off, off done"),
     ] {
         assert_eq!(ms[at], want, "{ms:#?}");
     }
@@ -377,13 +515,14 @@ fn the_programs_decode_as_written() {
     assert_eq!(ps[4], "exp mrt0, v0, v1, v2, v3 done vm");
 }
 
-/// [`drawn_mesh`] drawn into 63 x 2 texels on the test adapter, for the
-/// adapter's waves: every texel has the console waves' values.
-#[test]
-fn wave64_mesh_reads_draw_the_console_waves_values() {
+/// The mesh program `native`, whose one attribute is TEXCOORD in row 1,
+/// drawn with [`flat_pixel`] into `size` texels on the test adapter (WARP
+/// on this PC), translated for the adapter's waves: the target, the mesh
+/// module's operations and the texels. `None` without an SM 6.6 device.
+fn draw_flat(native: &NativeProgram, size: (u32, u32)) -> Option<(Target, String, Vec<[f32; 4]>)> {
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 device; skipped");
-        return;
+        return None;
     };
     let target = host.target();
     let ms_sig = crate::dxbc::build(&[(
@@ -414,10 +553,7 @@ fn wave64_mesh_reads_draw_the_console_waves_values() {
     ]);
     let ms_c = crate::Container::parse(&ms_sig).unwrap();
     let ps_c = crate::Container::parse(&ps_sig).unwrap();
-    let (ms, ops) = translate(&drawn_mesh(), &ms_c, target).unwrap();
-    if !target.runs(64) {
-        assert!(ops.contains("barrier"), "exchanges on {target:?}: {ops}");
-    }
+    let (ms, ops) = translate(native, &ms_c, target).unwrap();
     let (ps, _) = translate(&flat_pixel(), &ps_c, target).unwrap();
     let (root, pso) = host.mesh_pipeline(&ms, &ps).unwrap();
     let texels = host
@@ -430,17 +566,32 @@ fn wave64_mesh_reads_draw_the_console_waves_values() {
                 samplers: &[],
                 vertices: &[],
                 stride: 0,
-                size: (63, 2),
+                size,
                 mesh_groups: 1,
             },
         )
         .unwrap();
     eprintln!("{target:?}: {} texels drawn", texels.len());
+    Some((target, ops, texels))
+}
+
+/// [`drawn_mesh`] drawn into 63 x 2 texels on the test adapter, for the
+/// adapter's waves: every texel has the console waves' values.
+#[test]
+fn wave64_mesh_reads_draw_the_console_waves_values() {
+    let Some((target, ops, texels)) = draw_flat(&drawn_mesh(), (63, 2)) else {
+        return;
+    };
+    if !target.runs(64) {
+        assert!(ops.contains("barrier"), "exchanges on {target:?}: {ops}");
+    }
     let mut wrong = Vec::new();
     for (n, t) in texels.iter().enumerate() {
         let (k, row) = (n % 63, n / 63);
         let v = 2 * k + row;
-        let want = [7.0, (v / 64) as f32, 100.0, 37.0];
+        let w = (v / 64) as u32;
+        let narrowed = [37, 289][w as usize];
+        let want = [7 + 16 * w, 64 * w + 100, 128 * w + 1, narrowed].map(|x| x as f32);
         if *t != want {
             wrong.push(format!(
                 "texel ({k}, {row}), vertex {v}: {t:?}, not {want:?}"
@@ -454,4 +605,158 @@ fn wave64_mesh_reads_draw_the_console_waves_values() {
         texels.len(),
         wrong[..wrong.len().min(16)].join("\n")
     );
+}
+
+/// The loop limit's drain (`lower/flow.rs`: lanes the limit ends keep
+/// passing group barriers) on mesh programs. Its counts of ended threads
+/// are group-shared memory of their own, which the mesh PSV must count
+/// with the program's LDS (dxil.dll checks it, [`translate`]): with
+/// 64-lane waves the program below drains. A wave64 mesh program in halves
+/// on a host without 64-lane waves does not: its first-lane exchanges add
+/// barriers that no block counts (a debug assertion of the drain). The
+/// program reads a lane's value from the first lane (an exchange on 32-lane
+/// hosts), then runs the loop of [`lds_order_within_a_console_wave`]:
+/// write, barrier, read, barrier.
+#[test]
+fn the_loop_limit_drain_of_mesh_programs() {
+    let words = [
+        LANE[0],
+        LANE[1],
+        0x7E0A_0500, // v_readfirstlane_b32 s5, v0
+        0xBE84_0380, // s_mov_b32 s4, 0
+        DS_WRITE[0], // loop: ds_write_b32 v0, v1
+        DS_WRITE[1],
+        S_BARRIER,
+        DS_READ[0], // ds_read_b32 v2, v0
+        DS_READ[1],
+        S_BARRIER,
+        0x8104_8104, // s_add_i32 s4, s4, 1
+        0xBF0A_8404, // s_cmp_lt_u32 s4, 4
+        0xBF85_FFF7, // s_cbranch_scc1 loop
+        V_MOV_V9_S5,
+    ];
+    let p = mesh(&words, 128, 256);
+    let text: Vec<String> = crate::gfx10::decode(&p.code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect();
+    assert_eq!(text[9], "s_cbranch_scc1 label_0010", "{text:#?}");
+    let (_, ops) = translate(&p, &empty(), NVIDIA).unwrap();
+    assert!(!ops.contains("waveReadLaneFirst"), "an exchange: {ops}");
+    let (_, ops) = translate(&p, &empty(), RDNA).unwrap();
+    assert!(ops.contains("waveReadLaneFirst"), "{ops}");
+}
+
+/// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
+const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+/// The corners' edge flags (bits 9, 19 and 29).
+const EDGE_FLAGS: u32 = 1 << 9 | 1 << 19 | 1 << 29;
+/// The culling bit.
+const CULL: u32 = 1 << 31;
+
+/// Ported from Marvisak/VIctory#1718 (head c0228d9) by tjthebigbearcat-hub:
+/// a wave32 mesh program of 32 lanes, each exporting primitive `prim` and,
+/// as vertex `lane`, the position (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1,
+/// 0.5, 1), so that triangle (0, 1, 2) covers the whole target, with the
+/// attribute (1, 0.5, 0.25, 1).
+fn triangle_mesh(prim: u32) -> NativeProgram {
+    let words = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x3604_0281, // v_and_b32 v2, 1, v1
+        0x3606_0282, // v_and_b32 v3, 2, v1
+        0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+        0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+        0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+        0x0608_08F3, // v_add_f32 v4, -1.0, v4
+        0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+        0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+        0x7E0C_02F0, // v_mov_b32 v6, 0.5
+        0x7E0E_02F2, // v_mov_b32 v7, 1.0
+        0x7E14_02F2, // v_mov_b32 v10, 1.0
+        0x7E16_02F0, // v_mov_b32 v11, 0.5
+        0x7E18_02FF,
+        0x3E80_0000, // v_mov_b32 v12, lit(0.25)
+        0x7E1A_02F2, // v_mov_b32 v13, 1.0
+        0xF800_08CF,
+        0x0706_0504, // exp pos0, v4, v5, v6, v7 done
+        0xF800_020F,
+        0x0D0C_0B0A, // exp param0, v10, v11, v12, v13
+        0x7E12_02FF,
+        prim, // v_mov_b32 v9, prim
+        0xF800_0941,
+        0x0000_0009, // exp prim, v9, off, off, off done
+        S_ENDPGM,
+    ];
+    NativeProgram {
+        stage: crate::HwStage::Ms,
+        wave64: false,
+        vgprs: 16,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ms(MeshIo {
+            outputs: vec![VsOutput {
+                usage: Usage::Generic,
+                row: 1,
+                param: 0,
+                fp16: false,
+                pack2: false,
+            }],
+            clip_cntl: 0,
+            threads: 32,
+            max_vertices: 32,
+            max_primitives: 32,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// Ported from Marvisak/VIctory#1718 (head c0228d9) by tjthebigbearcat-hub
+/// (`edge_flagged_triangles_draw_as_unflagged_ones`): a primitive export's
+/// corners are 9-bit indices, and the edge flag above each is no part of
+/// it. On the test adapter, triangle (0, 1, 2) covers the target with its
+/// corners' edge flags set as without them; with the culling bit, nothing
+/// is lit. (A 10-bit mask read the flagged corners as vertices 512 to 514,
+/// past the program's 32.) Each module is checked by dxil.dll where it is.
+#[test]
+fn edge_flagged_triangles_draw_as_unflagged_ones() {
+    let text: Vec<String> = crate::gfx10::decode(&triangle_mesh(TRIANGLE).code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(false))
+        .collect();
+    for (at, want) in [
+        (5, "v_mul_f32 v4, 4.0, v2"),
+        (13, "v_mov_b32 v12, lit(0x3e800000)"),
+        (15, "exp pos0, v4, v5, v6, v7 done"),
+        (16, "exp param0, v10, v11, v12, v13"),
+        (18, "exp prim, v9, off, off, off done"),
+    ] {
+        assert_eq!(text[at], want, "{text:#?}");
+    }
+    for (prim, culled) in [
+        (TRIANGLE, false),
+        (TRIANGLE | EDGE_FLAGS, false),
+        (TRIANGLE | EDGE_FLAGS | CULL, true),
+    ] {
+        let Some((target, _, texels)) = draw_flat(&triangle_mesh(prim), (16, 16)) else {
+            return;
+        };
+        let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+        if culled {
+            assert_eq!(
+                lit, 0,
+                "{target:?}, {prim:#x}: a culled triangle lit texels"
+            );
+            continue;
+        }
+        assert!(
+            texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+            "{target:?}, {prim:#x}: {lit} of {} texels lit",
+            texels.len()
+        );
+    }
 }
