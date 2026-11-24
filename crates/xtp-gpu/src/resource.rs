@@ -2148,6 +2148,31 @@ pub(crate) mod tests_support {
         }
     }
 
+    /// A `width` x `height` texture in `format` that shaders only sample
+    /// (the title fills it), in the layout library's pick.
+    pub(crate) fn sampled(width: u64, height: u32, format: u32) -> ResourceDesc {
+        ResourceDesc {
+            flags: 0,
+            ..target(width, height, format)
+        }
+    }
+
+    /// A title resource described by `desc` over memory at `address`.
+    pub(crate) fn at_address(address: u64, desc: &ResourceDesc) -> This {
+        let mut out = std::ptr::null();
+        let made = create_at_address(
+            std::ptr::null(),
+            address,
+            desc,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        );
+        assert_eq!(made, S_OK);
+        out
+    }
+
     /// A committed title resource described by `desc`.
     pub(crate) fn committed(desc: &ResourceDesc) -> This {
         let null = std::ptr::null();

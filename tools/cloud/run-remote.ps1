@@ -81,10 +81,14 @@ if ($what -ne 'device') {
         $repoDir = if ($Repo) { (Resolve-Path -LiteralPath $Repo).Path } else { $script:XtpRepoRoot }
         $head = (& git -C $repoDir rev-parse --short $LocalRev)
         if (-not $head) { throw "No commit $LocalRev in $repoDir" }
+        $full = (& git -C $repoDir rev-parse $LocalRev)
         if ($LocalRev -eq 'HEAD' -and (& git -C $repoDir status --porcelain --untracked-files=no)) {
             Write-Warning "Local changes in $repoDir are not sent: only commit $head is."
         }
-        $bundle = Join-Path $out 'src.bundle'
+        # A name of its own: callers wait for the VM's lock in turn, and a
+        # shared name let a later caller's bundle replace a waiting one's.
+        $bundleName = "src-$(Split-Path -Leaf $out)-$PID.bundle"
+        $bundle = Join-Path $out $bundleName
         $ErrorActionPreference = 'Continue'
         & git -C $repoDir bundle create $bundle $LocalRev 2>&1 | Out-Null
         $ErrorActionPreference = 'Stop'
@@ -92,9 +96,10 @@ if ($what -ne 'device') {
         Write-Step "Sending commit $head ($([Math]::Round((Get-Item $bundle).Length / 1MB, 1)) MB bundle)"
         Send-XtpVmFile -Cfg $cfg -Zone $zone -Path @($bundle) -Destination 'C:\xtp\jobs'
         Remove-Item -LiteralPath $bundle
-        $source = @{ Bundle = 'C:\xtp\jobs\src.bundle' }
+        # The VM checks that it builds this commit (vm\lib.ps1, Set-XtpSource).
+        $source = @{ Bundle = "C:\xtp\jobs\$bundleName"; Commit = $full }
     }
-    if ($Ref) { $source['Ref'] = $Ref }
+    if ($Ref) { $source['Ref'] = $Ref; $source.Remove('Commit') }
     $source['Owner'] = $owner
     $source['NoWait'] = $NoWait.IsPresent
 }

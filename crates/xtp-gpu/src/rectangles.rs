@@ -58,12 +58,14 @@
 //! that makes its corners from the vertex id) draws each rectangle's first
 //! triangle: the record as the title wrote it, with `3 * rects` vertices, as
 //! a direct rectangle draw of such a pipeline does. Its fourth corner is not
-//! made, and its shader sees the host's vertex ids, which count from 0 in
-//! every record (D3D12's `SV_VertexID` leaves out the start vertex: a test
-//! draws a record from vertex 6 with ids 0 to 2), until the translator adds
-//! the start and the remap (VIctory #255). With inputs, the vertex id is the
-//! expanded one, from an allocated start whose order between records may
-//! change from run to run.
+//! made (VIctory #255's remap would run the vertex shader for it). Its
+//! shader sees vertex ids that count from 0 in every record, as on the
+//! console: D3D12's `SV_VertexID` leaves out the start vertex (a test draws
+//! a record from vertex 6 with ids 0 to 2), and so does the console's v0,
+//! the start reaching a program only through a user SGPR that none of the
+//! title's vertex programs read (docs/analysis/drops.md §5.1.1). With inputs,
+//! the vertex id is the expanded one, from an allocated start whose order
+//! between records may change from run to run.
 //! Vertex strides not a multiple of 4 are padded to 4 bytes in the scratch
 //! (and bound with that stride), so that no two threads share a word.
 //!

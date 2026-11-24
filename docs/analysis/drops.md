@@ -31,7 +31,8 @@ the repository (§7).
   and #704, which also need `descriptor/`).
 - **Indirect rectangle lists**, 130 to 256 a frame in every world frame
   before, are now drawn (VIctory #346, ported): **0** dropped after. The
-  title's rectangles make their corners from the vertex id (§5.1).
+  title's rectangles make their corners from the vertex id, which counts
+  from 0 in each record on the console as on the host (§5.1).
 - The frame report now gives every drop a cause, where it was recorded
   (draw, dispatch, mesh dispatch, indirect kind …) and why, with each
   cause's total first (§2).
@@ -165,14 +166,71 @@ the counter not reset (36 vertices instead of 18).
 What the title's rectangles are: session A counted them all under "no
 vertex inputs", and session B logged at least 10 such pipelines in its
 first second of world (`[vertex 167501e87c356551, pixel 9727fc3c51b2f11c]`, …): their
-corners come from the vertex id. Those get 6 vertices a rectangle from
-vertex 0, as a direct rectangle draw of such a pipeline already does.
+corners come from the vertex id. Since drops-fix (`d80e707`) those draw
+each record as the title wrote it: 3 vertices a rectangle, from the
+record's start vertex, on the indirect path and on the direct one. They
+drew 6 a rectangle from vertex 0 before, twice the title's vertices. Their
+vertex ids count from 0 in each record, as on the console (§5.1.1).
 shortcut: the fourth corner, which the console makes from the vertex
 shader's outputs, is not made; a vertex shader that reads its id past 2
 draws whatever it computes for it. The pipelines are logged once each
-("indirect rectangles without vertex inputs"), for the translator's side
-(VIctory #255's vertex id remap: the vertex shader run for the three
-corners).
+("indirect rectangles without vertex inputs"). Making the fourth corner is
+left to do: VIctory #255's remap (the vertex shader run for the three
+corners), or a geometry stage as VIctory #1020 adds.
+
+#### 5.1.1 Where the start vertex and start instance arrive
+
+Under D3D12, `SV_VertexID` leaves out the draw's start vertex and
+`SV_InstanceID` its start instance. A WARP test draws a record
+`(3, 1, 6, 0)` with ids 0 to 2: cell 0 of four, not cell 2
+(`draw::tests::indirect_rectangles_without_vertex_inputs_draw_their_first_triangles`).
+The console does the same for the title's programs, so XTP adds neither
+start to the ids. A start added by the translator would draw that record
+in cell 2, where the console draws cell 0. Checked on 2026-11-24:
+
+- **The hardware.** On AMD GPUs the vertex id (v0 of a hardware VS) and the
+  instance id (v3) count from 0. The start vertex and start instance reach
+  a program only in user SGPRs. For a direct draw the driver writes them
+  there: `DRAW_INDEX_AUTO` has a vertex count and no start. For an indirect
+  draw the command processor writes each record's start vertex and start
+  instance into the two user SGPRs that the `DRAW_INDIRECT` packet names.
+  A shader that needs a start adds that SGPR itself. The public reference
+  is Mesa's RADV (`main` `6c103024`, 2026-11-24):
+  - `ac_nir.c` sets `vertex_id_zero_based`, and nothing sets
+    `instance_id_includes_base_index`;
+  - `nir_lower_system_values.c` therefore makes the API's vertex index
+    `load_vertex_id_zero_base + load_first_vertex`, and its instance index
+    `load_instance_id + load_base_instance`;
+  - `ac_nir_lower_intrinsics_to_args.c` reads the first of each pair from
+    the vertex id and instance id VGPRs, and the second from the
+    `base_vertex` and `start_instance` arguments, which `radv_shader_args.c`
+    declares as user data (SGPRs);
+  - `radv_cmd_buffer.c` writes those SGPRs for direct draws, and names them
+    in `DRAW_INDIRECT` (`vertex_offset_reg`, `start_instance_reg`) for
+    indirect ones.
+- **The title's vertex programs read no such SGPR.** `xtp shader-info
+  --disasm` lists 2,041 containers with a native VS program in
+  `shaders.rpf`. Of those programs, 1,424 read v0 and 494 read v3. Their
+  root parameters start at user SGPR 8; s0 to s7 are the console runtime's.
+  - 632 programs read a user SGPR outside their root parameters:
+    - 630 read only `s[4:5]`, with `s_swappc_b64`: the call into the fetch
+      shader the runtime makes from the input layout (on the host the input
+      assembler fetches the attributes, start applied);
+    - 1 reads `s7` in an exec mask (`s_and_b64 exec, s[6:7], s[4:5]`);
+    - 1 is the filter's mistake: the carry out of `v_subrev_co_ci_u32` is a
+      destination.
+  - None adds a runtime SGPR to v0 or v3, and the translator refuses no VS
+    program for "a hardware SGPR input". So the start never reaches their
+    code: v0 and v3 count from 0, as D3D12's ids do.
+- **The title passes its own offsets as root constants.** `VS_ImGui` fetches
+  its vertices itself and adds root constant `s11` (root parameter 2) to v0
+  (`v_add_nc_u32 v0, s11, v0`). `VS_TiledLighting`, whose rectangles take
+  their tile and corner from v0, reads root constant `s10` alongside it.
+
+The listings and the filter that counted them are in
+`E:\xtp-data\tmp\vstart\` (`vs_ids.py`, `vs-ids.txt`, `vs-dump.txt`), not in
+the repository. Nothing of the translation changes, so a shader survey
+before and after this check is the same by construction.
 
 ### 5.2 Wave64 mesh programs refused before their translation
 
@@ -238,7 +296,7 @@ programs, as OCE does: `docs/upstream/watch.md` item 43; not done).
 | Wave64 mesh programs on 32-lane hosts | 1,700 / 3,451 | mesh64 (0a31f0cb) |
 | Slow translator refusals holding the workers (lane masks) | most of "being made", 432 / 336 indirect | masks-fix; a slow lane in `make.rs` if it stays |
 | Shaders that do not translate | 691 / 992 | translator tasks (VIctory #193 + #704 need `descriptor/` too) |
-| Rectangles whose corners come from the vertex id (drawn, fourth corner not made) | 0 dropped | translator (vertex id remap) |
+| Rectangles whose corners come from the vertex id (drawn, fourth corner not made; their vertex ids are the console's, §5.1.1) | 0 dropped | the fourth corner: VIctory #255's remap or #1020's geometry stage, not taken yet |
 | Indexed rectangle lists | 1 | GPU layer, not done |
 | FidelityFX programs without DXIL | — | FidelityFX task |
 

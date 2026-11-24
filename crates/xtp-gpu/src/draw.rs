@@ -1237,6 +1237,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        let _timed = crate::timestamps::command(list, crate::timestamps::What::Dispatch, Some(p));
         // SAFETY: an open list with everything set; the barrier names no
         // resource.
         unsafe {
@@ -1315,6 +1316,11 @@ impl State {
                 .map_err(|_| "no mesh dispatch on the host list")?;
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("mesh {x}"), false));
+            let _timed = crate::timestamps::command(
+                list,
+                crate::timestamps::What::Mesh,
+                crate::pipeline::host_pipeline(self.pipeline as This),
+            );
             // SAFETY: an open list with everything set.
             unsafe { l6.DispatchMesh(x, 1, 1) };
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1577,6 +1583,11 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            let _timed = crate::timestamps::command(
+                list,
+                crate::timestamps::What::Draw,
+                crate::pipeline::host_pipeline(self.pipeline as This),
+            );
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1668,6 +1679,11 @@ impl State {
             Ok(()) => {
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+                let _timed = crate::timestamps::command(
+                    list,
+                    crate::timestamps::What::Indexed,
+                    crate::pipeline::host_pipeline(self.pipeline as This),
+                );
                 // SAFETY: an open list with everything set.
                 unsafe {
                     list.list
@@ -1685,9 +1701,10 @@ impl State {
 /// they were expanded into (`expanded`); for a pipeline without per-vertex
 /// inputs (corners from the vertex id), each rectangle's first triangle:
 /// the title's draw, with whole rectangles.
-/// shortcut: such a rectangle misses its fourth corner, and its shader sees
-/// the host's vertex ids (D3D12's leave out the start vertex), until the
-/// translator adds the start and the remap (VIctory #255).
+/// Its shader sees vertex ids from 0, the start left out, on the host as on
+/// the console (docs/analysis/drops.md §5.1.1).
+/// shortcut: such a rectangle misses its fourth corner (VIctory #255's
+/// remap would run the vertex shader for it).
 fn rectangle_vertices(vertices: u32, first: u32, expanded: bool) -> (u32, u32) {
     let rects = vertices / 3;
     if expanded {
@@ -1779,9 +1796,11 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
+        let clamping = crate::timestamps::command(list, crate::timestamps::What::Clamp, None);
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             return fail("not bounded (no clamp, or arguments not 4-byte aligned)".into());
         }
+        drop(clamping);
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -1805,6 +1824,11 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        let _timed = crate::timestamps::command(
+            list,
+            crate::timestamps::What::Indirect(kind),
+            crate::pipeline::host_pipeline(self.pipeline as This),
+        );
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached;
         // the barrier names no resource.
@@ -1887,8 +1911,11 @@ impl State {
     ) -> Result<(), Unready> {
         // The rewritten records: draw arguments, 16 bytes apart.
         let signature = host_signature(0, 16).ok_or("no host signature")?;
+        let expanding =
+            crate::timestamps::command(list, crate::timestamps::What::RectangleExpansion, None);
         let prepared =
             self.expand_rectangles(list, inputs, (stride, max), (args, arguments), counter)?;
+        drop(expanding);
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         bind(self, list)?;
@@ -1900,6 +1927,11 @@ impl State {
                 false,
             )
         });
+        let _timed = crate::timestamps::command(
+            list,
+            crate::timestamps::What::Rectangles,
+            crate::pipeline::host_pipeline(self.pipeline as This),
+        );
         // SAFETY: an open list with everything set; the arguments and their
         // count are the list's own, in the indirect argument state (records
         // past the title's count do not run); the signature is cached.
@@ -1941,9 +1973,9 @@ impl State {
 }
 
 /// Logs a pipeline whose indirect rectangles make their corners from the
-/// vertex id (see [`crate::rectangles`]), once each, for the translator's
-/// side. Cheap on every draw: a recording thread looks in its own set
-/// first, so the shared one is locked once per thread and pipeline.
+/// vertex id (see [`crate::rectangles`]), once each: their fourth corners
+/// are not made. Cheap on every draw: a recording thread looks in its own
+/// set first, so the shared one is locked once per thread and pipeline.
 fn note_vertex_id_rectangles(p: &HostPipeline) {
     thread_local! {
         /// The host pipelines this thread has seen, by address.
@@ -1959,8 +1991,8 @@ fn note_vertex_id_rectangles(p: &HostPipeline) {
         seen.push(p.name.clone());
         tracing::info!(
             pipeline = %p.name,
-            "indirect rectangles without vertex inputs: each rectangle's first triangle, with the \
-             host's vertex ids (no start vertex)"
+            "indirect rectangles without vertex inputs: each rectangle's first triangle, no fourth \
+             corner (vertex ids from 0 in each record, as on the console)"
         );
     }
 }
@@ -3061,10 +3093,12 @@ float4 ps(V v) : SV_Target { return v.color; }
 
     /// A pipeline without vertex inputs draws each rectangle's first
     /// triangle, without its fourth corner: one rectangle from vertex 6 and
-    /// two from vertex 9. The host's vertex ids count from 0 in each record
-    /// (D3D12's `SV_VertexID` leaves out the start vertex), so they are
-    /// cells 0, then 0 and 1. They drew twice the vertices before: cells 0
-    /// to 3.
+    /// two from vertex 9. The vertex ids count from 0 in each record, so
+    /// they are cells 0, then 0 and 1: what the console draws. D3D12's
+    /// `SV_VertexID` leaves out the start vertex, and so does the console's
+    /// v0; the start reaches a console program only through a user SGPR,
+    /// which none of the title's vertex programs read (docs/analysis/drops.md
+    /// §5.1.1). They drew twice the vertices before: cells 0 to 3.
     #[test]
     fn indirect_rectangles_without_vertex_inputs_draw_their_first_triangles() {
         let _pool = crate::rectangles::POOL_TESTS
