@@ -80,7 +80,24 @@ impl<'a> Lower<'a> {
         } else {
             None
         };
-        let srv = matches!(kind, Some(u) if u.kind == ResourceType::Srv);
+        // A raw view where the slot holds one: the entry says SRV or UAV,
+        // or no entry says (a descriptor loaded from the heap at an index
+        // the program read) and the program's vector accesses of the same
+        // descriptor read it raw. A slot holds one view, and a handle of
+        // another kind than the view's is undefined on the GPU: through a
+        // constant-buffer handle, these loads of d3e44e754b3eb6aa and its
+        // batch read raw views, and WARP removes its device on that shape
+        // (docs/analysis/hang.md).
+        // shortcut: with no entry, a constant buffer the program also reads
+        // per lane (a dynamically indexed array) is read raw here too, as
+        // `buffer.rs` reads it per lane: one kind for the slot either way.
+        let raw = match kind {
+            Some(u) if u.kind == ResourceType::Srv => Some(11),
+            Some(u) if u.kind == ResourceType::Uav => Some(11 | 0x1000),
+            Some(_) => None,
+            None if matches!(src, Source::Built { .. } | Source::Constant(_)) => None,
+            None => self.raw_kind_of_vector_accesses(src),
+        };
         let constant = match addr {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
@@ -92,8 +109,8 @@ impl<'a> Lower<'a> {
         let xs = self.guarded_load(guard, |l| {
             let c = l.cur;
             let mut xs = Vec::new();
-            if srv {
-                let h = l.handle(site, src, false, (11, 0))?;
+            if let Some(kind) = raw {
+                let h = l.handle(site, src, false, (kind, 0))?;
                 for k in 0..count {
                     let off = l.s.m.i32(4 * k);
                     let a = l.s.m.bin(c, Bin::Add, addr, off);
@@ -395,6 +412,49 @@ impl<'a> Lower<'a> {
             _ => false,
         };
         ia.name() == ib.name() && oa == ob && same_base && same_soffset
+    }
+
+    /// The raw view kind `buffer.rs` gives the vector buffer accesses of
+    /// descriptor `src` (or of a twin load of its dwords): 11, with 0x1000
+    /// where one of them writes. None where the program makes none, or
+    /// one that does not read the slot raw (typed, by index, into LDS),
+    /// or uses the descriptor otherwise (an image).
+    fn raw_kind_of_vector_accesses(&self, src: &Source) -> Option<u32> {
+        let same = |other: &Source| {
+            other == src
+                || matches!(
+                    (other, src),
+                    (
+                        Source::Loaded { load: a, first: fa },
+                        Source::Loaded { load: b, first: fb },
+                    ) if fa == fb && self.twin_loads(*a, *b)
+                )
+        };
+        let mut kind = None;
+        for d in &self.x.res.descriptors {
+            if d.role != Role::Resource || !same(&d.source) {
+                continue;
+            }
+            let inst: &Inst = &self.x.p.blocks[d.site.0].insts[d.site.1];
+            let (idxen, format, lds) = match inst.fields {
+                Fields::Smem { .. } => continue,
+                Fields::Buffer {
+                    idxen, format, lds, ..
+                } => (idxen, format, lds),
+                _ => return None,
+            };
+            let name = inst.name();
+            // `buffer_load_format_*` / `buffer_store_format_*` take a typed
+            // view; `tbuffer_*` (a format in the instruction) a raw one.
+            let typed = format.is_none() && name.contains("_format_");
+            if idxen || lds || typed {
+                return None;
+            }
+            let writes = name.contains("store") || name.contains("atomic");
+            let k = if writes { 11 | 0x1000 } else { 11 };
+            kind = Some(kind.map_or(k, |j: u32| j | k));
+        }
+        kind
     }
 
     /// The instruction that writes `v`.
@@ -820,5 +880,167 @@ mod tests {
         };
         assert_eq!(translate(&twin(0), ResourceType::Srv, 4, 4), Ok(()));
         assert!(only_data(translate(&twin(0x10), ResourceType::Srv, 4, 4)));
+    }
+
+    /// d3e44e754b3eb6aa's shape (docs/analysis/hang.md), in groups of 32:
+    /// the table at s0 holds a raw buffer whose dword 0 is a heap index, and
+    /// the program loads the descriptor at that index of the resource heap
+    /// (s1). It reads that buffer with a scalar load at byte 4 and with a
+    /// vector load at byte 4 x lane, and lane t stores the sum at dword t
+    /// of the UAV at table entry 8.
+    fn heap_slot_read_two_ways() -> crate::NativeProgram {
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null (the index)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8F0C_850C, // s_lshl_b32 s12, s12, 5
+            0xBE82_0301, // s_mov_b32 s2, s1
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0401,
+            0x1800_0000, // s_load_dwordx4 s[16:19], s[2:3], s12
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF420_0508,
+            0xFA00_0004, // s_buffer_load_dword s20, s[16:19], 0x4
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xE030_1000,
+            0x8004_0201, // buffer_load_dword v2, v1, s[16:19], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A04_0414, // v_add_nc_u32 v2, s20, v2
+            0xF408_0602,
+            0xFA00_0020, // s_load_dwordx4 s[24:27], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE070_1000,
+            0x8006_0201, // buffer_store_dword v2, v1, s[24:27], 0 offen
+            S_ENDPGM,
+        ];
+        let mut p = program(
+            &words,
+            vec![
+                entry(ResourceType::Srv, 0, 4, 1),
+                entry(ResourceType::Uav, 8, 4, 1),
+            ],
+        );
+        p.layout.push(RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 1,
+            slot: 0,
+        });
+        p.io = StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [32, 1, 1],
+        });
+        p
+    }
+
+    /// A heap slot reached by an index the program reads is read raw by
+    /// its scalar loads too: one kind of view for the slot, the raw buffer
+    /// the title made there. Through the constant-buffer handle they took
+    /// before, WARP removes its device ("suspended"); on the host GPU it is
+    /// undefined (the Series S world hang).
+    #[test]
+    fn a_heap_slot_read_by_scalar_and_vector_loads_is_read_raw_both_ways() {
+        let cs = emit_for(&heap_slot_read_two_ways(), crate::emit::Target::ANY).unwrap();
+        #[cfg(windows)]
+        {
+            use crate::emit::host::{Dispatch, Host, Root, Stride, View};
+            let Ok(host) = Host::new(true) else {
+                eprintln!("no WARP device; skipped");
+                return;
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            // Heap slot 0: the table's raw buffer, holding the index 2.
+            let index = [2u32, 0, 0, 0];
+            let data: Vec<u32> = (0..64).map(|t| 1000 + t).collect();
+            let views = [
+                View::Buffer {
+                    data: &index,
+                    stride: Stride::Raw,
+                },
+                View::RawUav(32),
+                View::Buffer {
+                    data: &data,
+                    stride: Stride::Raw,
+                },
+            ];
+            let user = vec![0; (cs.user_data_dwords() as usize).max(2)];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(user))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let want: Vec<u32> = (0..32).map(|t| data[t] + data[1]).collect();
+            assert_eq!(out[0], want);
+        }
+    }
+
+    /// A UAV entry of the table read by a scalar load goes through a raw
+    /// unordered-access handle, not a constant-buffer one: every lane
+    /// stores 7 at dword 1 of the UAV, reads dword 1 back with a scalar
+    /// load, and stores it plus its lane number at dword 2 + lane.
+    #[test]
+    fn a_uav_entry_read_by_a_scalar_load_is_read_raw() {
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0x7E02_0287, // v_mov_b32 v1, 7
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE070_0004,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0 offset:4
+            0xF420_0304,
+            0xFA00_0004, // s_buffer_load_dword s12, s[8:11], 0x4
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A06_000C, // v_add_nc_u32 v3, s12, v0
+            0xE070_1008,
+            0x8002_0302, // buffer_store_dword v3, v2, s[8:11], 0 offen offset:8
+            S_ENDPGM,
+        ];
+        let mut p = program(&words, vec![entry(ResourceType::Uav, 0, 4, 1)]);
+        p.io = StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [32, 1, 1],
+        });
+        let cs = emit_for(&p, crate::emit::Target::ANY).unwrap();
+        #[cfg(windows)]
+        {
+            use crate::emit::host::{Dispatch, Host, Root, View};
+            let Ok(host) = Host::new(true) else {
+                eprintln!("no WARP device; skipped");
+                return;
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let user = vec![0; (cs.user_data_dwords() as usize).max(1)];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(user))],
+                        views: &[View::RawUav(34)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let want: Vec<u32> = [0, 7].into_iter().chain(7..39).collect();
+            assert_eq!(out[0], want);
+        }
     }
 }
