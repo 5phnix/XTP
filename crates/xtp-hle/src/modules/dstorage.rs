@@ -759,44 +759,37 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 const PAGE: usize = 64 * 1024;
 
 /// A read as queued: the title's request and, for a page destination, its
-/// page numbers as they were when it was enqueued.
+/// page numbers once it runs.
 struct Read {
     request: Request,
-    /// The title may build its page array on a stack frame it leaves once
-    /// the request is enqueued, so it is copied then. An entry still 0
-    /// there is read again when the request runs: titles fill some in
-    /// after enqueueing, before they submit.
+    /// Read from the title's array when the request runs, as the console's
+    /// DMA reads it: the title writes its page numbers there after it
+    /// enqueues the request and before it submits it, over what the
+    /// array's previous use left (0 or other pages). A copy taken at
+    /// enqueue sent BTP 6's textures into pages it had since given to
+    /// models (docs/analysis/series-s.md).
     pages: Box<[usize]>,
 }
 
 impl Read {
     fn new(request: Request) -> Read {
-        let pages = if request.options & PAGE_DESTINATION != 0 && !request.destination.is_null() {
-            // SAFETY: the title passes a page number per 64 KiB of
-            // destination.
-            unsafe {
-                std::slice::from_raw_parts(
-                    request.destination.cast::<usize>(),
-                    page_count(&request),
-                )
-            }
-            .into()
-        } else {
-            Box::default()
-        };
-        Read { request, pages }
+        Read {
+            request,
+            pages: Box::default(),
+        }
     }
 
-    /// The destination's page numbers, those left 0 at enqueue read again
-    /// from the title's array (empty if the destination is an address).
+    /// The destination's page numbers (empty if the destination is an
+    /// address).
     fn pages(&mut self) -> &[usize] {
-        let array = self.request.destination.cast::<usize>();
-        for (i, page) in self.pages.iter_mut().enumerate() {
-            if *page == 0 {
-                // SAFETY: as in `new`; an array filled in late is still the
-                // title's until the request completes.
-                *page = unsafe { array.add(i).read() };
+        let request = &self.request;
+        if request.options & PAGE_DESTINATION != 0 && !request.destination.is_null() {
+            // SAFETY: the title passes a page number per 64 KiB of
+            // destination, its array until the request completes.
+            self.pages = unsafe {
+                std::slice::from_raw_parts(request.destination.cast::<usize>(), page_count(request))
             }
+            .into();
         }
         &self.pages
     }
@@ -2051,10 +2044,11 @@ mod tests {
         free(&b);
     }
 
-    /// The title may reuse its page array (a stack frame) once a request is
-    /// enqueued: the request lands where the array said then.
+    /// The title enqueues a request with its page array still holding the
+    /// pages of the array's last use, then writes this request's pages
+    /// there before it submits: the request lands in those.
     #[test]
-    fn page_arrays_are_copied_at_enqueue() {
+    fn page_arrays_are_read_when_the_request_runs() {
         let (a, b) = (allocate(2), allocate(2));
         let plain = pattern(100);
         let (queue, array) = (new_queue(1), status_array(1));
@@ -2069,15 +2063,15 @@ mod tests {
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(page_bytes(&a)[PAGE - 40..PAGE + 60], plain);
-        assert!(page_bytes(&b).iter().all(|&x| x == 0));
+        assert_eq!(page_bytes(&b)[PAGE - 40..PAGE + 60], plain);
+        assert!(page_bytes(&a).iter().all(|&x| x == 0), "the old pages");
         void(queue, 0x40);
         free(&a);
         free(&b);
     }
 
-    /// An entry still 0 when the request is enqueued is read again when it
-    /// runs: the title fills it in before it submits.
+    /// An entry still 0 when the request is enqueued is read when it runs:
+    /// the title fills it in before it submits.
     #[test]
     fn a_page_filled_in_after_enqueue_is_read_again() {
         let (a, b) = (allocate(1), allocate(1));
