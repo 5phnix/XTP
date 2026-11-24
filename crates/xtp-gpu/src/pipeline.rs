@@ -106,6 +106,11 @@ pub(crate) struct Translated {
     /// compiler leaves out the barriers between lanes, which a host that
     /// runs the wave as two 32-lane waves needs (see `host::Needs`).
     pub(crate) mesh_lds_in_one_wave: bool,
+    /// Whether it is a wave64 mesh program that reads its console wave's
+    /// first lane ([`mesh_first_lane_reads`]); looked at only with
+    /// `XTP_WAVE64_MESH=allow` (`None` otherwise: every such program is
+    /// refused on hosts without 64-lane waves then).
+    pub(crate) mesh_first_lane_reads: Option<bool>,
 }
 
 #[cfg(windows)]
@@ -161,6 +166,10 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             host,
             wave64: p.wave64,
             mesh_lds_in_one_wave: mesh_lds_in_one_wave(&p),
+            mesh_first_lane_reads: (p.stage == HwStage::Ms
+                && p.wave64
+                && host::wave64_mesh_allowed())
+            .then(|| mesh_first_lane_reads(&p)),
             used: p.used,
         },
         None => Translated {
@@ -168,8 +177,47 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             used: Vec::new(),
             wave64: false,
             mesh_lds_in_one_wave: false,
+            mesh_first_lane_reads: None,
         },
     })
+}
+
+/// Whether `p` reads a console lane other than its own with
+/// `v_readfirstlane_b32`. In mesh code the translator makes it the host
+/// wave's first lane, without the wave-size check compute code gets
+/// (`xtp-shader` `emit/lower/valu.rs`): in the upper 32-lane half of a
+/// console wave64 that is lane 32's value, not lane 0's. Two reads are the
+/// same in every lane and do not count: the mesh group id (`v5` on entry,
+/// the only way mesh code may read it) and the waterfall reads of
+/// descriptors (each lane's own, `resource::Waterfall`). A program the
+/// front end does not take counts as reading.
+#[cfg(windows)]
+fn mesh_first_lane_reads(p: &xtp_shader::NativeProgram) -> bool {
+    use xtp_shader::ir::Reg;
+    let Ok(ir) = xtp_shader::ir::build(&p.patched_code(), p.wave64, p.vgprs) else {
+        return true;
+    };
+    let st = xtp_shader::structure::structure(&ir);
+    let Ok(res) = xtp_shader::resource::track(&ir, &p.layout, p.stage, st.as_ref().ok()) else {
+        return true;
+    };
+    let group = ir
+        .inputs
+        .iter()
+        .find(|(r, _)| *r == Reg::V(5))
+        .map(|&(_, v)| v);
+    ir.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| i.name() == "v_readfirstlane_b32")
+        .any(|i| {
+            let waterfall = i
+                .writes
+                .first()
+                .is_some_and(|w| res.waterfall.reads.contains(&w.1));
+            let group_id = group.is_some_and(|g| i.reads.contains(&(Reg::V(5), g)));
+            !waterfall && !group_id
+        })
 }
 
 /// Whether `p` is a mesh program whose group is one console wave of more

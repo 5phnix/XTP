@@ -168,8 +168,8 @@ pub(crate) fn wave64_in_half_program() -> (xtp_shader::Container<'static>, xtp_s
 /// for a host without 64-lane waves it runs as two 32-lane waves and
 /// declares `WaveSize(32)`, else `WaveSize(64)`. Without, thread t stores
 /// t and the translation runs in waves of any size. The code is the wave64
-/// port's own test program (`emit/split_tests.rs`, from VIctory #233 by
-/// r4tedx).
+/// port's own test program (`emit/split_tests.rs`): ported from
+/// Marvisak/VIctory#233 (d1fecaa) by r4tedx.
 #[cfg(test)]
 pub(crate) fn wave64_program(
     in_half: bool,

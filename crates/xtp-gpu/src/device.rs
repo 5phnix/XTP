@@ -375,26 +375,27 @@ pub fn host_target() -> xtp_shader::emit::Target {
     *TARGET.get_or_init(|| {
         let forced = std::env::var("XTP_HOST_LANES").ok();
         let lanes = host_wave_lanes();
-        let target = match target_of(lanes, forced.as_deref()) {
-            Ok(target) => target,
+        let (target, forced) = match target_of(lanes, forced.as_deref()) {
+            Ok(target) => (target, forced.is_some()),
             Err(text) => {
                 tracing::warn!(text, "XTP_HOST_LANES expects <min>-<max> lanes; ignored");
-                target_of(lanes, None).unwrap_or(xtp_shader::emit::Target::ANY)
+                let host = target_of(lanes, None).unwrap_or(xtp_shader::emit::Target::ANY);
+                (host, false)
             }
         };
         tracing::info!(
             lanes = format_args!("{} to {}", target.lanes_min, target.lanes_max),
-            forced = forced.is_some(),
+            forced,
             "shaders translated for waves of"
         );
         if !target.runs(64) {
-            // VIctory #439's text, and #578's mesh programs as XTP narrows
-            // them (`pipeline::host::Needs::wave64_mesh`).
+            // VIctory #439's text. Mesh programs are the pipelines' to log,
+            // by the host's own lanes (`pipeline::host::wave64_mesh_allowed`):
+            // their translations declare no wave size.
             tracing::warn!(
                 "the host has no 64-lane waves: console wave64 compute programs that need \
                  their whole wave run as two 32-lane waves where there is a form for them; \
-                 the rest do not translate, and their dispatches are dropped; wave64 mesh \
-                 programs that share LDS within one wave are refused"
+                 the rest do not translate, and their dispatches are dropped"
             );
         }
         target
