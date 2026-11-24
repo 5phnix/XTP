@@ -104,8 +104,8 @@ inversion, and other bindings (see `xtp.example.toml`), by control:
 ## Commands
 
 ```
-xtp inspect <exe|dll> [--imports] [--exports]
-xtp census [paths...] [--missing] [--strict]
+xtp inspect <exe|dll> [--imports] [--exports] [--json]
+xtp census [paths...] [--missing] [--strict] [--json]
 xtp lib-exports <import.lib> [--list]
 xtp shader-info [paths...] [--verbose] [--disasm]
 xtp translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
