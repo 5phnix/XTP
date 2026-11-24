@@ -34,7 +34,7 @@ pub(crate) struct HeapDesc {
     nodes: u32,
 }
 
-/// Newer titles (Grand Theft Auto VI) pass the description followed by
+/// Newer titles (BTP 6) pass the description followed by
 /// memory of their own for the descriptors: an address and its size in
 /// bytes, or a null address to have the heap allocate (inferred from the
 /// title's call sites; older titles pass the plain description).
@@ -73,7 +73,7 @@ impl Heap {
     }
 
     /// The host heap, made on first use from what the title wrote so far.
-    /// Made late because a host view heap the size of Grand Theft Auto VI's
+    /// Made late because a host view heap the size of BTP 6's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
@@ -149,16 +149,219 @@ fn mirror(handle: u64) {
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap still exists: what a recording leases with
+/// [`crate::host::HostList::keep_dynamic`], once it has gone. A
+/// [`Recording`]'s lease (`heap` [`BATCH`]) gives back all it holds.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
+    if heap == BATCH {
+        return batch_gone(u64::from(first) | u64::from(n) << 32);
     }
+    give_back(&mut Held {
+        ranges: vec![(heap, first, n)],
+        shared: Vec::new(),
+    });
+}
+
+/// The lease key of [`Recording`]s (no title heap is at this address).
+#[cfg(windows)]
+const BATCH: usize = usize::MAX - 1;
+
+/// What one recording of a list holds: dynamic slots, holds on shared
+/// views, and memory of the list's own its commands use (dropped with it).
+/// It all goes back in one batch, per heap one lock, once both the list's
+/// state is done with the recording (reset or released) and the recording
+/// has gone: at the host list's reset, or, for a list reset while it runs,
+/// once that submission has finished. A recording leases one entry of
+/// [`crate::host::HostList::keep_dynamic`] for it all.
+#[cfg(windows)]
+#[derive(Default)]
+pub(crate) struct Recording {
+    /// Its batch, from the first thing it holds on.
+    id: Option<u64>,
+    held: Held,
+}
+
+/// A recording's batch: what its state handed over, and whether the state
+/// is done with it and whether the recording has gone.
+#[cfg(windows)]
+#[derive(Default)]
+struct Batch {
+    held: Held,
+    memory: Vec<Box<dyn Send>>,
+    finished: bool,
+    gone: bool,
+}
+
+#[cfg(windows)]
+static BATCHES: std::sync::Mutex<Option<std::collections::HashMap<u64, Batch>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn batches() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<u64, Batch>>> {
+    BATCHES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(windows)]
+impl Recording {
+    /// Leases the recording's batch in `list`, once.
+    pub(crate) fn lease(&mut self, list: &crate::host::HostList) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        if self.id.is_some() {
+            return;
+        }
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        batches()
+            .get_or_insert_with(Default::default)
+            .insert(id, Batch::default());
+        list.keep_dynamic(BATCH, id as u32, (id >> 32) as u32);
+        self.id = Some(id);
+    }
+
+    /// `n` dynamic slots from `first` of `heap`'s host heap, held until the
+    /// recording has gone.
+    pub(crate) fn range(&mut self, list: &crate::host::HostList, heap: usize, first: u32, n: u32) {
+        self.lease(list);
+        self.held.ranges.push((heap, first, n));
+    }
+
+    /// A hold on shared view `slot` of `heap`'s host heap (see
+    /// [`host::HostHeap::shared_raw`]), given back once the recording has
+    /// gone.
+    pub(crate) fn shared(&mut self, list: &crate::host::HostList, heap: usize, slot: u32) {
+        self.lease(list);
+        self.held.shared.push((heap, slot));
+    }
+
+    /// The state is done with the recording: what it holds goes, now or
+    /// once the recording has gone, with `memory`.
+    pub(crate) fn finish(&mut self, memory: Box<dyn Send>) {
+        let Some(id) = self.id.take() else {
+            // Nothing held, nothing the recording's commands use.
+            return;
+        };
+        let mut all = batches();
+        let Some(batch) = all.as_mut().and_then(|b| b.get_mut(&id)) else {
+            return;
+        };
+        batch.held.ranges.append(&mut self.held.ranges);
+        batch.held.shared.append(&mut self.held.shared);
+        batch.memory.push(memory);
+        batch.finished = true;
+        if batch.gone {
+            let batch = all.as_mut().and_then(|b| b.remove(&id));
+            drop(all);
+            if let Some(mut batch) = batch {
+                give_back(&mut batch.held);
+            }
+        }
+    }
+
+    /// What the recording holds (tests).
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> &Held {
+        &self.held
+    }
+}
+
+/// Recording `id` has gone: its batch goes back once its state is done
+/// with it.
+#[cfg(windows)]
+fn batch_gone(id: u64) {
+    let mut all = batches();
+    let Some(batch) = all.as_mut().and_then(|b| b.get_mut(&id)) else {
+        return;
+    };
+    batch.gone = true;
+    if batch.finished {
+        let batch = all.as_mut().and_then(|b| b.remove(&id));
+        drop(all);
+        if let Some(mut batch) = batch {
+            give_back(&mut batch.held);
+        }
+    }
+}
+
+/// What a list holds in host view heaps, by heap: the title heap's
+/// address, or [`OWN_VIEW_HEAP`].
+#[cfg(windows)]
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct Held {
+    /// Dynamic slot ranges of its own: heap, first, count.
+    pub(crate) ranges: Vec<(usize, u32, u32)>,
+    /// Shared views it holds (see [`host::HostHeap::shared_raw`]): heap,
+    /// slot.
+    pub(crate) shared: Vec<(usize, u32)>,
+}
+
+/// The key of XTP's own view heap in [`Held`] (no title heap is at this
+/// address).
+#[cfg(windows)]
+pub(crate) const OWN_VIEW_HEAP: usize = usize::MAX;
+
+/// Dynamic slots in XTP's own view heap: root SRV tables of lists that
+/// bind no view heap.
+#[cfg(windows)]
+const OWN_DYNAMIC: u32 = 1 << 14;
+
+/// XTP's own view heap (made on first use), for lists that bind no view
+/// heap of the title's but read root SRVs, which are bound as tables.
+#[cfg(windows)]
+pub(crate) fn own_view_heap() -> Option<&'static host::HostHeap> {
+    static OWN: std::sync::OnceLock<Option<host::HostHeap>> = std::sync::OnceLock::new();
+    OWN.get_or_init(|| host::HostHeap::own(OWN_DYNAMIC))
+        .as_ref()
+}
+
+/// Gives back what a list held, in one batch per heap: each host heap is
+/// locked once, not once per range. Heaps the title released since are
+/// passed over (their slots went with them).
+#[cfg(windows)]
+pub(crate) fn give_back(held: &mut Held) {
+    if held.ranges.is_empty() && held.shared.is_empty() {
+        return;
+    }
+    // Usually one heap or two.
+    let mut keys: Vec<usize> = held
+        .ranges
+        .iter()
+        .map(|r| r.0)
+        .chain(held.shared.iter().map(|s| s.0))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    // Held throughout: a heap's drop waits for it, so a live one stays so.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for key in keys {
+        let host = if key == OWN_VIEW_HEAP {
+            own_view_heap()
+        } else if heaps.iter().any(|&(_, _, h)| h == key) {
+            // SAFETY: registered heaps are live (removed when dropped).
+            unsafe { &*(key as *const Heap) }
+                .host
+                .get()
+                .and_then(Option::as_ref)
+        } else {
+            None
+        };
+        let Some(host) = host else { continue };
+        let ranges: Vec<(u32, u32)> = held
+            .ranges
+            .iter()
+            .filter(|r| r.0 == key)
+            .map(|&(_, first, n)| (first, n))
+            .collect();
+        host.release_all(&ranges);
+        let shared: Vec<u32> = held
+            .shared
+            .iter()
+            .filter(|s| s.0 == key)
+            .map(|s| s.1)
+            .collect();
+        host.give_back(&shared);
+    }
+    held.ranges.clear();
+    held.shared.clear();
 }
 
 #[cfg(windows)]
@@ -666,6 +869,44 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+/// A shader-visible title view heap for tests, released when dropped.
+#[cfg(all(test, windows))]
+pub(crate) struct TestHeap(pub(crate) This);
+
+#[cfg(all(test, windows))]
+impl TestHeap {
+    /// A heap of `count` view slots, made as the title makes one.
+    pub(crate) fn views(count: u32) -> TestHeap {
+        /// What newer titles pass, so that reading the placement stays
+        /// inside the value.
+        #[repr(C)]
+        struct Extended(HeapDesc, Placement);
+        let extended = Extended(
+            HeapDesc {
+                kind: VIEWS_KIND,
+                count,
+                flags: SHADER_VISIBLE,
+                nodes: 0,
+            },
+            Placement {
+                address: 0,
+                size: 0,
+            },
+        );
+        let mut out = std::ptr::null();
+        let made = create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut out);
+        assert_eq!(made, crate::object::S_OK, "a title view heap");
+        TestHeap(out)
+    }
+}
+
+#[cfg(all(test, windows))]
+impl Drop for TestHeap {
+    fn drop(&mut self) {
+        release(self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,7 +1001,7 @@ mod tests {
         assert_ne!(old, new, "a new generation");
     }
 
-    /// Grand Theft Auto VI places its shader-visible heap in its own memory
+    /// BTP 6 places its shader-visible heap in its own memory
     /// and checks that the heap starts there.
     #[test]
     fn placed_heaps_start_at_the_title_memory() {

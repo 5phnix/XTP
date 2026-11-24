@@ -4,7 +4,7 @@
 # XTP_CONFIG selects a different config file.
 
 [paths]
-# Your own dump of Grand Theft Auto VI.     env: XTP_GAME_DIR
+# Your own dump of BTP 6.     env: XTP_GAME_DIR
 game_dir = 'D:\xtp-data\game'
 
 # Derived data. Default: %LOCALAPPDATA%\xtp\cache.   env: XTP_CACHE_DIR
@@ -17,3 +17,30 @@ game_dir = 'D:\xtp-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: XTP_TEST_TITLES (separated by ';')
 test_titles = []
+
+# A data folder `cargo xtask play` copies for each run and never writes (a
+# save in the world, say).   env: XTP_GOLDEN_DATA
+# golden_data = 'D:\xtp-data\golden'
+
+[input]
+# The keyboard and mouse play as a pad: a stand-in pad while none is
+# connected, on top of the first pad otherwise.
+# keyboard_mouse = true
+
+# Mouse to right stick: 2 turns twice as fast for the same hand movement.
+# mouse_sensitivity = 1.0
+# Shape of that curve: 1 is linear, above 1 finer slow aiming, below 1
+# coarser (to undo a title's own stick curve).
+# mouse_curve = 1.0
+# Deflection the slowest movement starts at, past the title's dead zone.
+# mouse_dead_zone = 0.2
+# Moving the mouse up looks down.
+# invert_y = false
+
+# Pad controls given other inputs than their defaults (README, Input).
+# Keys are places named by their US label (W is the key in W's place on
+# any layout); mouse: MouseLeft, MouseRight, MouseMiddle, MouseBack,
+# MouseForward, WheelUp, WheelDown. An empty list unbinds the control.
+# [input.bindings]
+# a = ["Enter", "Space"]
+# left_stick_click = ["LeftShift"]

@@ -353,6 +353,28 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Per block and instruction: the lane's EXEC bit at each vector
+    /// instruction, whatever path the lane took (`None` for scalar ones).
+    /// What a program run as the console runs it, every lane through every
+    /// block, guards its vector instructions with ([`structure_console`]).
+    pub execs: Vec<Vec<Option<Bool>>>,
+    /// The lane's bit of values read as masks that derive from neither
+    /// EXEC nor a VALU result (constants, uniform selects, opaque ones), by
+    /// low dword. What a mask join takes on an edge such a value arrives by:
+    /// a loop's exit mask starts as a constant 0 before lanes are added.
+    pub others: HashMap<Value, Bool>,
+    /// The high dword read with each low dword of a wave64 mask in
+    /// [`Self::masks`] or [`Self::others`], where the two are different
+    /// values: the halves of a mask held as a number need not come from
+    /// one instruction.
+    pub pairs: HashMap<Value, Value>,
+    /// The SCC of each lane-mask operation as the console wave sets it:
+    /// whether some lane has the lane bit given, negated where the flag
+    /// says. A mask operation's SCC is "the result is not zero" (for
+    /// `s_and_saveexec` and the like, the new EXEC's, not the saved one's);
+    /// `s_cmp_eq` of two masks is "no lane differs", `s_cmp_lg` "some lane
+    /// does". What the console flow branches on (`s_cbranch_scc*`).
+    pub sccs: HashMap<Value, (Bool, bool)>,
 }
 
 impl Structured {
@@ -367,9 +389,25 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+    run(Lanes::new(program, false)?)
+}
+
+/// The same for a program run as the console runs it: every lane of the
+/// console wave through every block, the branches taken wave-wide. Masks
+/// joined at a block are never resolved from what the lanes arriving there
+/// know, since lanes outside EXEC arrive too: each join that differs
+/// between edges is a phi ([`Atom::Phi`]). Guard vector instructions with
+/// [`Structured::execs`] and ignore [`Structured::exits`]' conditions.
+pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
+    run(Lanes::new(program, true)?)
+}
+
+fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
+        while let Some(key) = l.console_pending.pop() {
+            l.mask(key);
+        }
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -386,6 +424,9 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// See [`structure_console`].
+    console: bool,
+    console_pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -405,6 +446,8 @@ struct Lanes<'a> {
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
+    /// See [`Structured::sccs`].
+    scc_wave: Map<Value, (Bool, bool)>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -437,7 +480,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, console: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -462,6 +505,8 @@ impl<'a> Lanes<'a> {
         }
         Ok(Lanes {
             p,
+            console,
+            console_pending: Vec::new(),
             order,
             index,
             incoming,
@@ -472,6 +517,7 @@ impl<'a> Lanes<'a> {
             masks: Map::default(),
             other: Map::default(),
             scc_lane: Map::default(),
+            scc_wave: Map::default(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
@@ -484,6 +530,7 @@ impl<'a> Lanes<'a> {
         self.masks.clear();
         self.other.clear();
         self.scc_lane.clear();
+        self.scc_wave.clear();
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
@@ -632,15 +679,25 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
+            active: self.active,
+            bools: self.b,
+            exits,
+            guards,
+            execs: execs.to_vec(),
+            others: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            pairs: self
+                .masks
+                .keys()
+                .chain(self.other.keys())
+                .filter(|(lo, hi)| lo != hi)
+                .copied()
+                .collect(),
+            sccs: self.scc_wave.into_iter().collect(),
             paired_masks: if self.p.wave64 {
                 self.masks
             } else {
                 Map::default()
             },
-            active: self.active,
-            bools: self.b,
-            exits,
-            guards,
             reach: cond.to_vec(),
         })
     }
@@ -752,7 +809,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.console && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -770,6 +827,9 @@ impl<'a> Lanes<'a> {
                     return Some((m, derived));
                 }
             }
+        }
+        if self.console {
+            self.console_pending.extend(args);
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
@@ -945,6 +1005,7 @@ impl<'a> Lanes<'a> {
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
                         self.scc_lane.insert(scc, m);
+                        self.scc_wave.insert(scc, (m, false));
                     }
                 }
                 // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.
@@ -960,12 +1021,10 @@ impl<'a> Lanes<'a> {
                         (self.operand(inst, a), self.operand(inst, c))
                 {
                     let ne = self.b.xor(a, c);
-                    let m = if rest.starts_with("eq") {
-                        self.b.not(ne)
-                    } else {
-                        ne
-                    };
+                    let eq = rest.starts_with("eq");
+                    let m = if eq { self.b.not(ne) } else { ne };
                     self.scc_lane.insert(scc, m);
+                    self.scc_wave.insert(scc, (ne, eq));
                 }
             }
             Fields::Valu(v) => {
@@ -1214,6 +1273,47 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    /// The SCC a mask operation sets is its result's: after
+    /// `s_and_saveexec`, the new EXEC's ("some lane is left"), not that of
+    /// the old EXEC it saves first. A console flow branching on it skips
+    /// the block when no lane is left (wave64, both forms).
+    #[test]
+    fn the_scc_of_a_saveexec_is_the_new_execs() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+                0xBF84_0001, // s_cbranch_scc0 -> 20
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x88FE_0A7E, // 20: s_or_b64 exec, exec, s[10:11]
+                0xBF12_7E6A, // s_cmp_eq_u64 vcc, exec
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let saveexec = &p.blocks[0].insts[1];
+        let scc = saveexec.write(Reg::Scc).unwrap();
+        let saved = saveexec.write(Reg::S(10)).unwrap();
+        let exec = saveexec.write(Reg::S(EXEC)).unwrap();
+        let cmp = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "s_cmp_eq_u64")
+            .unwrap();
+        let eq = cmp.write(Reg::Scc).unwrap();
+        let vcc = cmp.read(Reg::S(VCC)).unwrap();
+        let exec_after = cmp.read(Reg::S(EXEC)).unwrap();
+        for s in [structure(&p).unwrap(), structure_console(&p).unwrap()] {
+            assert_ne!(s.masks[&exec], s.masks[&saved]);
+            assert_eq!(s.sccs.get(&scc), Some(&(s.masks[&exec], false)));
+            // `s_cmp_eq` of two masks: no lane differs.
+            let mut b = s.bools.clone();
+            let ne = b.xor(s.masks[&vcc], s.masks[&exec_after]);
+            assert_eq!(s.sccs.get(&eq), Some(&(ne, true)));
+        }
     }
 
     #[test]

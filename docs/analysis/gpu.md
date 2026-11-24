@@ -188,7 +188,7 @@ for the world.
 
 | Sub-area | Verdict | Why |
 |---|---|---|
-| Object model, vtables, DXGI, console model | **Keep VIctory** | Reaches GTA VI's world. xcl's generated table is useful for naming slots in logs; optional (backlog G21). |
+| Object model, vtables, DXGI, console model | **Keep VIctory** | Reaches BTP 6's world. xcl's generated table is useful for naming slots in logs; optional (backlog G21). |
 | Recording via method calls | **Keep VIctory** | Same as xcl. xcl's record/replay list buys nothing for this title. |
 | Root signature and draw binding | **Keep VIctory** | Tied to VIctory's shader ABI (shader report). xcl's raw-descriptor ABI only together with a shader ABI change. |
 | Pipelines (workers, library, preload) | **Keep VIctory**, retune the wait | Already off-thread with a disk library. Change the drop-after-budget policy (G12). |
@@ -620,10 +620,10 @@ staleness; one after G12 does the same for speed and hangs.
 2. How many draws and dispatches per world frame are dropped, and for which
    reason (no translation, budget, signature)? The log exists; the numbers
    are not recorded.
-3. Does GTA VI present more than one plane (for example HUD and world), given
+3. Does BTP 6 present more than one plane (for example HUD and world), given
    that only plane 0 is shown? The title card renders and the scene after it
    does not.
-4. Which resources does GTA VI's world read through directly indexed heaps
+4. Which resources does BTP 6's world read through directly indexed heaps
    versus tables? This decides how much G5 and G6 alone recover.
 5. Can xmem's physical-page views be imported (G15)? If not, which pools does
    the title place there?

@@ -1,7 +1,7 @@
 //! The console's DirectStorage (`XCRDAPI.dll`): a factory that opens files
 //! and creates request queues and status arrays the title polls. Its
 //! interfaces have grown since 2020 (new interface ids, new slots); the
-//! slots here are the ones Grand Theft Auto VI calls, read from its call
+//! slots here are the ones BTP 6 calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
 //! Submitted requests of every queue run on one pool of workers, as the
@@ -14,24 +14,32 @@
 //! in order: a status entry is written once every request enqueued before
 //! it on its queue has finished, with the first failure (in queue order)
 //! since the previous status entry, or success.
+//!
+//! Every 5 s a debug line sums up what the workers did: requests, bytes,
+//! and their time split by stage (read, inflate, BCPack, destination,
+//! completion), with the address-space changes physical pages cost meanwhile
+//! (xmem's views mapped and unmapped, commits). Page destinations are copied
+//! into xmem's permanent views of their allocations, and each worker keeps
+//! its buffers across requests (docs/analysis/formats.md, F2 to F4).
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use xtp_formats::bcpack::{self, Tables};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
+use super::xmem;
 use crate::{HleModule, hle_export};
 
-/// The factory interface Grand Theft Auto VI asks for.
+/// The factory interface BTP 6 asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
     0xd45f,
@@ -171,7 +179,7 @@ extern "system" fn create_status_array(
 }
 
 /// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field Grand Theft Auto VI sets to 1.
+/// name), plus a field BTP 6 sets to 1.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
@@ -216,7 +224,7 @@ extern "system" fn create_queue(
     )
 }
 
-/// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
+/// BTP 6 asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
@@ -289,7 +297,7 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
         .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
 }
 
-/// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
+/// BTP 6 polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
     status_result(this, index) != E_PENDING
@@ -350,13 +358,37 @@ struct Lanes {
     now: u64,
     lane_now: [u64; 3],
     /// Since the last debug summary: requests, bytes written, time spent
-    /// running them.
-    done: (u64, u64, std::time::Duration),
+    /// running them, staging waits and BCPack bytes written.
+    done: (u64, u64, Duration),
     refused: u64,
-    /// BCPack bytes written and time spent on them.
-    bcpack: (u64, std::time::Duration),
-    since: Option<std::time::Instant>,
+    bcpack: u64,
+    since: Option<Instant>,
+    /// Time workers spent per stage since the process started; that, and
+    /// xmem's activity, at the last debug summary.
+    spent: Spent,
+    logged: (Spent, xmem::Activity),
 }
+
+/// What a request's time goes to, as the debug summary splits it.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// Reading the source from its file, or a raw read's copy from memory.
+    Read,
+    Inflate,
+    Bcpack,
+    /// Reaching title memory, besides decoding into it: opening guarded
+    /// blocks, looking pages up and committing them, copying the bytes for
+    /// scattered pages.
+    Destination,
+    /// After it: taking the scheduler's lock back and writing status
+    /// entries.
+    Completion,
+}
+
+const STAGES: usize = 5;
+
+/// Time per stage.
+type Spent = [Duration; STAGES];
 
 /// A queue's requests in the scheduler.
 struct Lane {
@@ -368,7 +400,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, Read)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -384,7 +416,7 @@ unsafe impl Send for Lane {}
 struct Job {
     lane: u64,
     seq: u64,
-    request: Request,
+    read: Read,
     staging: u64,
 }
 
@@ -411,8 +443,10 @@ fn scheduler() -> Option<&'static Scheduler> {
                     lane_now: [0; 3],
                     done: Default::default(),
                     refused: 0,
-                    bcpack: Default::default(),
+                    bcpack: 0,
                     since: None,
+                    spent: Spent::default(),
+                    logged: Default::default(),
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -442,9 +476,10 @@ impl Scheduler {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    let mut worker = Worker::default();
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler
                 .work
                 .wait(lanes)
@@ -452,11 +487,14 @@ fn work(scheduler: &'static Scheduler) {
             continue;
         };
         drop(lanes);
-        let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let started = Instant::now();
+        let result = execute(&mut job.read, &mut worker);
+        worker.trim();
+        let finishing = Instant::now();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
-        lanes.count(&job, started);
+        worker.spent[Stage::Completion as usize] += finishing.elapsed();
+        lanes.count(&job, started, std::mem::take(&mut worker.spent));
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }
@@ -465,37 +503,65 @@ fn work(scheduler: &'static Scheduler) {
 }
 
 impl Lanes {
-    /// Counts a finished request; every 5 s a debug line sums them up.
-    fn count(&mut self, job: &Job, started: std::time::Instant) {
+    /// Counts a finished request and the time its stages took; every 5 s a
+    /// debug line sums them up. Time is given in workers: seconds spent per
+    /// second elapsed.
+    fn count(&mut self, job: &Job, started: Instant, spent: Spent) {
+        let request = &job.read.request;
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
-        *bytes += u64::from(job.request.destination_size);
+        *bytes += u64::from(request.destination_size);
         *busy += started.elapsed();
-        if job.request.options & BCPACK != 0 {
-            self.bcpack.0 += u64::from(job.request.destination_size);
-            self.bcpack.1 += started.elapsed();
+        if request.options & BCPACK != 0 {
+            self.bcpack += u64::from(request.destination_size);
         }
+        for (total, stage) in self.spent.iter_mut().zip(spent) {
+            *total += stage;
+        }
+        let us = |stage: Stage| spent[stage as usize].as_micros();
+        tracing::trace!(
+            options = format_args!("{:#x}", request.options),
+            offset = request.offset,
+            size = request.destination_size,
+            read_us = us(Stage::Read),
+            inflate_us = us(Stage::Inflate),
+            bcpack_us = us(Stage::Bcpack),
+            destination_us = us(Stage::Destination),
+            completion_us = us(Stage::Completion),
+            "dstorage: request done"
+        );
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
+            let seconds = elapsed.as_secs_f64();
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
-            let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let (before, was) = self.logged;
+            let workers = |stage: Stage| {
+                let i = stage as usize;
+                (self.spent[i] - before[i]).as_secs_f64() / seconds
+            };
+            let now = xmem::activity();
             tracing::debug!(
                 requests = *requests,
-                mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
-                busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
-                reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
+                mb_per_s = format_args!("{:.1}", *bytes as f64 / seconds / 1e6),
+                busy_workers = format_args!("{:.2}", busy.as_secs_f64() / seconds),
+                read_workers = format_args!("{:.2}", workers(Stage::Read)),
+                inflate_workers = format_args!("{:.2}", workers(Stage::Inflate)),
+                bcpack_workers = format_args!("{:.2}", workers(Stage::Bcpack)),
+                destination_workers = format_args!("{:.2}", workers(Stage::Destination)),
+                completion_workers = format_args!("{:.2}", workers(Stage::Completion)),
+                views_mapped = now.maps - was.maps,
+                views_unmapped = now.unmaps - was.unmaps,
+                commits = now.commits - was.commits,
                 staging_waits = std::mem::take(&mut self.refused),
-                bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers =
-                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_mb = self.bcpack / 1_000_000,
                 waiting,
-                "dstorage: last {:.1} s",
-                elapsed.as_secs_f64()
+                "dstorage: last {seconds:.1} s"
             );
             self.done = Default::default();
-            self.bcpack = Default::default();
+            self.bcpack = 0;
             self.since = None;
+            self.logged = (self.spent, now);
         }
     }
 
@@ -510,16 +576,16 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, read) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
+        let request = &read.request;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
@@ -528,7 +594,7 @@ impl Lanes {
         Some(Job {
             lane: id,
             seq,
-            request,
+            read,
             staging,
         })
     }
@@ -675,7 +741,7 @@ struct Request {
     source_size: u32,
     /// Compressed size between two decompression stages; unused here.
     intermediate_size: u32,
-    /// Matched by cancellation; Grand Theft Auto VI leaves it 0.
+    /// Matched by cancellation; BTP 6 leaves it 0.
     tag: u64,
     name: *const c_char,
 }
@@ -688,12 +754,63 @@ const BCPACK: u64 = 0xf << 1;
 const PAGE_DESTINATION: u64 = 1 << 21;
 const MEMORY_SOURCE: u64 = 1 << 22;
 // Bits 5-20 select a further transform, bit 23 a source in physical pages;
-// Grand Theft Auto VI's packages need neither, so requests with them fail.
+// BTP 6's packages need neither, so requests with them fail.
 
 const PAGE: usize = 64 * 1024;
 
+/// A read as queued: the title's request and, for a page destination, its
+/// page numbers as they were when it was enqueued.
+struct Read {
+    request: Request,
+    /// The title may build its page array on a stack frame it leaves once
+    /// the request is enqueued, so it is copied then. An entry still 0
+    /// there is read again when the request runs: titles fill some in
+    /// after enqueueing, before they submit.
+    pages: Box<[usize]>,
+}
+
+impl Read {
+    fn new(request: Request) -> Read {
+        let pages = if request.options & PAGE_DESTINATION != 0 && !request.destination.is_null() {
+            // SAFETY: the title passes a page number per 64 KiB of
+            // destination.
+            unsafe {
+                std::slice::from_raw_parts(
+                    request.destination.cast::<usize>(),
+                    page_count(&request),
+                )
+            }
+            .into()
+        } else {
+            Box::default()
+        };
+        Read { request, pages }
+    }
+
+    /// The destination's page numbers, those left 0 at enqueue read again
+    /// from the title's array (empty if the destination is an address).
+    fn pages(&mut self) -> &[usize] {
+        let array = self.request.destination.cast::<usize>();
+        for (i, page) in self.pages.iter_mut().enumerate() {
+            if *page == 0 {
+                // SAFETY: as in `new`; an array filled in late is still the
+                // title's until the request completes.
+                *page = unsafe { array.add(i).read() };
+            }
+        }
+        &self.pages
+    }
+}
+
+/// The page numbers a page destination's bytes reach, from where in the
+/// first page it starts.
+fn page_count(request: &Request) -> usize {
+    let offset = (request.page_offset & 0xffff) as usize;
+    (offset + request.destination_size as usize).div_ceil(PAGE)
+}
+
 enum Command {
-    Read(Request),
+    Read(Read),
     Status(Status),
 }
 
@@ -721,7 +838,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(Read::new(request)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -785,14 +902,57 @@ extern "system" fn submit(this: QueueRef) {
 
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
-/// finished. Grand Theft Auto VI calls this, not `Release`.
+/// finished. BTP 6 calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+/// What a worker keeps from one request to the next: fresh heap buffers
+/// for each request cost a demand-zero fault per 4 KiB touched, and big
+/// ones a map and an unmap, which flushes every core's TLB.
+#[derive(Default)]
+struct Worker {
+    /// A compressed source read from its file.
+    source: Vec<u8>,
+    /// zlib's output on its way to BCPack.
+    intermediate: Vec<u8>,
+    /// What goes to pages that are not consecutive pages of one allocation,
+    /// before it is copied run by run.
+    scatter: Vec<u8>,
+    /// The current request's time per stage.
+    spent: Spent,
+}
+
+/// A buffer is given back after a request that grew it past this, so 32
+/// workers do not each keep their largest request's worth (commit charge).
+/// Above it the request's own work dwarfs what a fresh buffer costs.
+const KEEP: usize = 8 << 20;
+
+impl Worker {
+    fn trim(&mut self) {
+        for buffer in [&mut self.source, &mut self.intermediate, &mut self.scatter] {
+            if buffer.len() > KEEP {
+                *buffer = Vec::new();
+            }
+        }
+    }
+}
+
+/// The first `len` bytes of `buffer`, which keeps what it held: its users
+/// read only what they wrote. Grown to exactly `len`, zeroed, if shorter.
+fn room(buffer: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if buffer.len() < len {
+        *buffer = vec![0; len];
+    }
+    &mut buffer[..len]
+}
+
+/// Reads, inflates and/or unpacks, and writes one request, with the
+/// worker's buffers, timing each stage.
+fn execute(read: &mut Read, worker: &mut Worker) -> Result<(), HRESULT> {
+    let request = read.request;
+    let request = &request;
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -816,12 +976,28 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
+    let pages = read.pages();
+    let Worker {
+        source,
+        intermediate,
+        scatter,
+        spent,
+    } = worker;
+    let mut to = Destination {
+        request,
+        pages,
+        scatter,
+        spent,
+    };
     if options & (ZLIB | BCPACK) == 0 {
         if request.source_size > request.destination_size {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+        return to
+            .fill(size, Stage::Read, |out| {
+                read_into(request, out).map(|()| size)
+            })
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 {
@@ -829,29 +1005,30 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         None
     };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let started = Instant::now();
+    let source = read_source(request, source);
+    to.spent[Stage::Read as usize] += started.elapsed();
+    let source = source.map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let started = Instant::now();
+        let packed = room(intermediate, request.intermediate_size as usize);
+        let n = inflate(source, packed);
+        to.spent[Stage::Inflate as usize] += started.elapsed();
+        &packed[..n.map_err(|hr| fail(hr, "zlib"))?]
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
-    tracing::trace!(
-        options = format_args!("{options:#x}"),
-        offset = request.offset,
-        size,
-        "dstorage: request done"
-    );
-    Ok(())
+    match tables {
+        Some(tables) => to.fill(size, Stage::Bcpack, |out| {
+            bcpack::decode(bc, source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string()))
+        }),
+        None => to.fill(size, Stage::Inflate, |out| {
+            inflate(source, out).map_err(|hr| fail(hr, "zlib"))
+        }),
+    }
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
@@ -907,22 +1084,18 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// A compressed request's source: in memory, or read from the file into
+/// `buffer`.
+fn read_source<'a>(request: &Request, buffer: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    let bytes = room(buffer, size);
+    read_into(request, bytes)?;
+    Ok(bytes)
 }
-
-/// Nanoseconds workers spent reading files, for the debug summary.
-static READING: AtomicU64 = AtomicU64::new(0);
 
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
@@ -937,66 +1110,90 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .file;
-    let started = std::time::Instant::now();
     let mut done = 0;
-    let result = loop {
+    loop {
         if done == out.len() {
-            break Ok(());
+            return Ok(());
         }
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
+            Ok(0) => return Err(END_OF_FILE),
             Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
+            Err(error) => return Err(from_win32(&error)),
         }
-    };
-    READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    result
-}
-
-/// Runs `fill` on the destination's first `len` bytes; `fill` returns how
-/// many it produced. GPU-visible destinations are host memory like the
-/// rest (GPU address = CPU address), so an address is written in place;
-/// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
-fn into_destination(
-    request: &Request,
-    len: usize,
-    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
-) -> Result<(), HRESULT> {
-    if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        xtp_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
-        let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
-    }
-    let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
-    // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
-    }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        Err(E_INVALIDARG)
     }
 }
 
-/// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
-/// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
+/// A request's destination, with what writing it needs: the page numbers
+/// of a page destination, the worker's buffer for scattered pages, and
+/// where its time goes.
+struct Destination<'a> {
+    request: &'a Request,
+    pages: &'a [usize],
+    scatter: &'a mut Vec<u8>,
+    spent: &'a mut Spent,
+}
+
+impl Destination<'_> {
+    /// Runs `fill` on the destination's first `len` bytes; `fill` returns
+    /// how many it produced. Its time counts for `stage`, the rest for the
+    /// destination. GPU-visible destinations are host memory like the rest
+    /// (GPU address = CPU address), so an address is written in place;
+    /// physical pages are too when they are consecutive pages of one
+    /// allocation, and otherwise go through the buffer.
+    fn fill(
+        &mut self,
+        len: usize,
+        stage: Stage,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+    ) -> Result<(), HRESULT> {
+        let started = Instant::now();
+        let mut filling = Duration::ZERO;
+        let result = self.write(len, |out: &mut [u8]| {
+            let started = Instant::now();
+            let n = fill(out);
+            filling = started.elapsed();
+            n
+        });
+        self.spent[stage as usize] += filling;
+        self.spent[Stage::Destination as usize] += started.elapsed().saturating_sub(filling);
+        result
+    }
+
+    fn write(
+        &mut self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+    ) -> Result<(), HRESULT> {
+        let request = self.request;
+        if request.options & PAGE_DESTINATION == 0 {
+            // Raw reads land through the kernel, which does not fault into
+            // the GPU side's guard on title buffers; open them first.
+            xtp_gpu::kernel_will_write(request.destination as usize, len);
+            // SAFETY: the title's destination holds `destination_size`
+            // bytes, at least `len`, and nothing else writes it until
+            // completion.
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+            return fill(out).map(drop);
+        }
+        let offset = (request.page_offset & 0xffff) as usize;
+        // Consecutive pages of one allocation (the usual case): written in
+        // place in xmem's view of it.
+        if let Some(mut window) = xmem::page_window(self.pages, offset, len) {
+            return fill(window.bytes()).map(drop);
+        }
+        let data = room(self.scatter, len);
+        let n = fill(data)?;
+        if xmem::write_physical(self.pages, offset, &data[..n]) {
+            Ok(())
+        } else {
+            Err(E_INVALIDARG)
+        }
+    }
+}
+
+/// Slots by the 2020 order, which the argument shapes at BTP 6
+///'s call sites match (0x18, 0x20, 0x30 and 0x40 are called).
 static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
@@ -1281,8 +1478,10 @@ mod tests {
             lane_now: [0; 3],
             done: Default::default(),
             refused: 0,
-            bcpack: Default::default(),
+            bcpack: 0,
             since: None,
+            spent: Spent::default(),
+            logged: Default::default(),
         }
     }
 
@@ -1290,7 +1489,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(Read::new(r)));
     }
 
     #[test]
@@ -1461,6 +1660,75 @@ mod tests {
         assert_eq!(out, [0; 16]);
     }
 
+    /// DirectStorage requests into physical pages, end to end: four queues
+    /// of 256 KiB raw reads into consecutive pages of one allocation (how
+    /// the title streams), from memory and from a file: a generated one, or
+    /// the one `XTP_DSTORAGE_BENCH_FILE` names (only read; at least 256
+    /// MiB). Prints MB/s; run it with
+    /// `cargo test -p xtp-hle --release --locked -- --ignored --nocapture page_request_throughput`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn page_request_throughput() {
+        use crate::modules::xmem;
+        const PAGES: usize = 4096;
+        const SIZE: usize = 256 << 10;
+        const QUEUES: usize = 4;
+        let (mut pages, mut n) = (vec![0usize; PAGES], PAGES);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        let memory = pattern(PAGES * PAGE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = match std::env::var_os("XTP_DSTORAGE_BENCH_FILE") {
+            Some(path) => std::path::PathBuf::from(path),
+            None => {
+                let path = dir.path().join("data.bin");
+                std::fs::write(&path, &memory).unwrap();
+                path
+            }
+        };
+        let file = open(&path) as usize;
+        let run = |name: &str, passes: usize, in_memory: bool| {
+            let started = Instant::now();
+            std::thread::scope(|s| {
+                for q in 0..QUEUES {
+                    let (pages, memory) = (&pages, &memory);
+                    s.spawn(move || {
+                        let (queue, array) = (new_queue(in_memory.into()), status_array(1));
+                        let per = PAGES * PAGE / SIZE / QUEUES;
+                        for _ in 0..passes {
+                            for k in 0..per {
+                                let at = (q * per + k) * SIZE;
+                                let to = pages[at / PAGE..].as_ptr().cast_mut().cast();
+                                let r = if in_memory {
+                                    let from = memory[at..].as_ptr().cast();
+                                    let options = PAGE_DESTINATION | MEMORY_SOURCE;
+                                    request(options, to, SIZE, from, 0, SIZE)
+                                } else {
+                                    let from = file as *const c_void;
+                                    request(PAGE_DESTINATION, to, SIZE, from, at as u64, SIZE)
+                                };
+                                enqueue(queue, &r);
+                            }
+                        }
+                        enqueue_status(queue, array, 0);
+                        void(queue, 0x30);
+                        assert_eq!(wait(array, 0), S_OK);
+                        void(queue, 0x40);
+                    });
+                }
+            });
+            let bytes = (passes * PAGES * PAGE) as f64;
+            let mb_per_s = bytes / started.elapsed().as_secs_f64() / 1e6;
+            println!("{name:<28} {mb_per_s:>8.0} MB/s");
+        };
+        run("from memory, first touch", 1, true);
+        run("from memory", 4, true);
+        run("from the file", 4, false);
+        assert_eq!(xmem::XMemFreePhysicalPages(PAGES, pages.as_ptr()), 1);
+    }
+
     #[test]
     fn physical_page_destinations() {
         use crate::modules::xmem;
@@ -1560,5 +1828,391 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// `n` pages of one new allocation.
+    fn allocate(n: usize) -> Vec<usize> {
+        let (mut pages, mut given) = (vec![0usize; n], n);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
+            1
+        );
+        pages
+    }
+
+    /// A reservation of 64 KiB pages, as titles make them for mapping.
+    fn reserve(n: usize) -> *mut c_void {
+        let p = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!p.is_null());
+        p
+    }
+
+    /// The bytes of `pages`, through a title view mapped for the purpose.
+    fn page_bytes(pages: &[usize]) -> Vec<u8> {
+        let view = reserve(pages.len());
+        let len = pages.len() * PAGE;
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(view, pages.len(), pages.as_ptr()),
+            view
+        );
+        // SAFETY: the pages are mapped read-write there.
+        let bytes = unsafe { std::slice::from_raw_parts(view.cast::<u8>(), len) }.to_vec();
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(view, pages.len(), std::ptr::null()),
+            view
+        );
+        bytes
+    }
+
+    fn free(pages: &[usize]) {
+        assert_eq!(xmem::XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    fn spent() -> Spent {
+        scheduler().unwrap().lock().spent
+    }
+
+    /// Each stage's time shows in the totals behind the debug summary: zlib
+    /// reads from a file into memory, BCPack, and raw copies into physical
+    /// pages (several of each, so that none rounds down to nothing).
+    #[test]
+    fn each_stage_is_timed() {
+        with_test_tables();
+        let plain = pattern(100_000);
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let mut contents = packed.clone();
+        contents.extend_from_slice(&BC4_STREAM);
+        let (_dir, file) = file_with(&contents);
+        let pages = allocate(1);
+        let before = spent();
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut outs = vec![vec![0u8; plain.len()]; 10];
+        let mut blocks = [[0u8; 16]; 10];
+        let mut arrays = vec![pages.clone(); 10];
+        for i in 0..10 {
+            let at = outs[i].as_mut_ptr().cast();
+            enqueue(
+                queue,
+                &request(ZLIB, at, plain.len(), file, 0, packed.len()),
+            );
+            let at = blocks[i].as_mut_ptr().cast();
+            let offset = packed.len() as u64;
+            enqueue(
+                queue,
+                &request(4 << 1, at, 16, file, offset, BC4_STREAM.len()),
+            );
+            let (options, at) = (PAGE_DESTINATION | MEMORY_SOURCE, arrays[i].as_mut_ptr());
+            let mut r = request(options, at.cast(), 100, plain.as_ptr().cast(), 0, 100);
+            r.page_offset = (i * 100) as u64;
+            enqueue(queue, &r);
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert!(outs.iter().all(|out| *out == plain));
+        assert!(blocks.iter().all(|b| *b == bc4_blocks()));
+        assert_eq!(page_bytes(&pages)[..1000], plain[..100].repeat(10));
+        let after = spent();
+        for stage in [
+            Stage::Read,
+            Stage::Inflate,
+            Stage::Bcpack,
+            Stage::Destination,
+            Stage::Completion,
+        ] {
+            let i = stage as usize;
+            assert!(after[i] > before[i], "stage {i}");
+        }
+        void(queue, 0x40);
+        free(&pages);
+    }
+
+    /// Ten thousand requests into pages map no view and commit nothing once
+    /// each page has been written once: they copy into xmem's view of the
+    /// allocation.
+    #[test]
+    fn page_requests_map_nothing_once_pages_are_committed() {
+        const PAGES: usize = 16;
+        const REQUESTS: usize = 10_000;
+        let pages = allocate(PAGES);
+        let plain = pattern(PAGES * PAGE);
+        let (queue, array) = (new_queue(1), status_array(2));
+        let options = PAGE_DESTINATION | MEMORY_SOURCE;
+        // A first request per page commits it.
+        let mut first = pages.clone();
+        for p in 0..PAGES {
+            let (at, from) = (first[p..].as_mut_ptr(), plain[p * PAGE..].as_ptr());
+            enqueue(queue, &request(options, at.cast(), 8, from.cast(), 0, 8));
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        let committed = xmem::section_activity(pages[0]).unwrap();
+        assert_eq!(committed, (1, PAGES as u64), "our view, a commit per page");
+        // Then every request writes bytes of its own, some across two pages.
+        let chunk = PAGES * PAGE / REQUESTS;
+        let mut arrays = pages.clone();
+        for k in 0..REQUESTS {
+            let at = k * chunk;
+            let to = arrays[at / PAGE..].as_mut_ptr().cast();
+            let mut r = request(options, to, chunk, plain[at..].as_ptr().cast(), 0, chunk);
+            r.page_offset = (at % PAGE) as u64;
+            enqueue(queue, &r);
+        }
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), S_OK);
+        assert_eq!(xmem::section_activity(pages[0]), Some(committed));
+        let seen = page_bytes(&pages);
+        assert_eq!(seen[..REQUESTS * chunk], plain[..REQUESTS * chunk]);
+        void(queue, 0x40);
+        free(&pages);
+    }
+
+    /// One worker's buffers across requests of growing, then shrinking,
+    /// sizes: they only grow, and serve scattered pages over two
+    /// allocations too. Past `KEEP` they are given back.
+    #[test]
+    fn a_worker_keeps_its_buffers() {
+        with_test_tables();
+        let mut worker = Worker::default();
+        let capacities = |w: &Worker| {
+            [
+                w.source.capacity(),
+                w.intermediate.capacity(),
+                w.scatter.capacity(),
+            ]
+        };
+        let mut last = capacities(&worker);
+        let mut check = |w: &Worker| {
+            let now = capacities(w);
+            assert!(
+                now.iter().zip(last).all(|(&n, l)| n >= l),
+                "{now:?} after {last:?}"
+            );
+            last = now;
+        };
+        let mut streams = Vec::new();
+        let mut contents = Vec::new();
+        for size in [1_000, 30_000, 200_000, 50_000, 2_000] {
+            let plain = pattern(size);
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            streams.push((plain, contents.len() as u64, packed.len()));
+            contents.extend_from_slice(&packed);
+        }
+        let (_dir, file) = file_with(&contents);
+        for (plain, offset, packed) in &streams {
+            let mut out = vec![0u8; plain.len()];
+            let to = out.as_mut_ptr().cast();
+            let r = request(ZLIB, to, out.len(), file, *offset, *packed);
+            assert_eq!(execute(&mut Read::new(r), &mut worker), Ok(()));
+            assert_eq!(out, *plain);
+            check(&worker);
+        }
+        assert_eq!(worker.source.capacity(), streams[2].2, "the largest source");
+        // zlib, then BCPack: through the intermediate buffer.
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&BC4_STREAM, 6);
+        let mut blocks = [0u8; 16];
+        let options = ZLIB | 4 << 1 | MEMORY_SOURCE;
+        let (to, from) = (blocks.as_mut_ptr().cast(), packed.as_ptr().cast());
+        let mut r = request(options, to, 16, from, 0, packed.len());
+        r.intermediate_size = BC4_STREAM.len() as u32;
+        assert_eq!(execute(&mut Read::new(r), &mut worker), Ok(()));
+        assert_eq!(blocks, bc4_blocks());
+        check(&worker);
+        // Scattered pages, more then fewer bytes, over two allocations.
+        let (a, b) = (allocate(2), allocate(2));
+        for (size, offset) in [(PAGE + 100, 70), (300, PAGE - 150)] {
+            let plain = pattern(size);
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            let mut pages = [a[1], b[0], b[1]];
+            let options = ZLIB | PAGE_DESTINATION | MEMORY_SOURCE;
+            let (to, from) = (pages.as_mut_ptr().cast(), packed.as_ptr().cast());
+            let mut r = request(options, to, size, from, 0, packed.len());
+            r.page_offset = offset as u64;
+            assert_eq!(execute(&mut Read::new(r), &mut worker), Ok(()));
+            assert_eq!(page_bytes(&pages)[offset..offset + size], plain);
+            check(&worker);
+        }
+        assert_eq!(worker.scatter.capacity(), PAGE + 100);
+        // What grew past the limit is given back after its request.
+        worker.source = vec![0; KEEP + 1];
+        worker.scatter = vec![0; KEEP];
+        worker.trim();
+        assert_eq!(worker.source.capacity(), 0);
+        assert_eq!(worker.scatter.capacity(), KEEP);
+        free(&a);
+        free(&b);
+    }
+
+    /// The title may reuse its page array (a stack frame) once a request is
+    /// enqueued: the request lands where the array said then.
+    #[test]
+    fn page_arrays_are_copied_at_enqueue() {
+        let (a, b) = (allocate(2), allocate(2));
+        let plain = pattern(100);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let mut frame = a.clone();
+        let options = PAGE_DESTINATION | MEMORY_SOURCE;
+        let (to, from) = (frame.as_mut_ptr().cast(), plain.as_ptr().cast());
+        let mut r = request(options, to, 100, from, 0, 100);
+        r.page_offset = (PAGE - 40) as u64; // across the page boundary
+        enqueue(queue, &r);
+        // Nothing runs before the submission (half the queue is 64).
+        frame.copy_from_slice(&b);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(page_bytes(&a)[PAGE - 40..PAGE + 60], plain);
+        assert!(page_bytes(&b).iter().all(|&x| x == 0));
+        void(queue, 0x40);
+        free(&a);
+        free(&b);
+    }
+
+    /// An entry still 0 when the request is enqueued is read again when it
+    /// runs: the title fills it in before it submits.
+    #[test]
+    fn a_page_filled_in_after_enqueue_is_read_again() {
+        let (a, b) = (allocate(1), allocate(1));
+        let plain = pattern(100);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let mut pages = [a[0], 0];
+        let options = PAGE_DESTINATION | MEMORY_SOURCE;
+        let entries = pages.as_mut_ptr();
+        let mut r = request(options, entries.cast(), 100, plain.as_ptr().cast(), 0, 100);
+        r.page_offset = (PAGE - 40) as u64;
+        enqueue(queue, &r);
+        // SAFETY: our array, which the request reads only once submitted.
+        unsafe { entries.add(1).write(b[0]) };
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(page_bytes(&a)[PAGE - 40..], plain[..40]);
+        assert_eq!(page_bytes(&b)[..60], plain[40..]);
+        void(queue, 0x40);
+        free(&a);
+        free(&b);
+    }
+
+    /// Bytes unique to one destination.
+    fn chunk(seed: usize, n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i * 7 + seed * 13 + i / 251) as u8)
+            .collect()
+    }
+
+    /// Every worker at once, from four queues on four threads: requests
+    /// into pages a title view shows read-only (as the GPU side's copies
+    /// guard views), pages a title view shows read-write, pages no view
+    /// shows, across two allocations, and into title memory at an address.
+    /// Each lands, and the guard stays.
+    #[test]
+    fn many_workers_into_guarded_and_unguarded_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
+        };
+        const PAGES: usize = 256;
+        const HALF: usize = PAGES / 2;
+        const THREADS: usize = 4;
+        const BLOCK: usize = 4096;
+        let (a, b) = (allocate(PAGES), allocate(PAGES));
+        // The first half of each allocation is mapped; `a`'s guarded.
+        let (guarded, unguarded) = (reserve(HALF), reserve(HALF));
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(guarded, HALF, a.as_ptr()),
+            guarded
+        );
+        let mapped = xmem::XMemMapPhysicalPages(unguarded, HALF, b.as_ptr());
+        assert_eq!(mapped, unguarded);
+        let mut old = 0;
+        // SAFETY: our title view; only its protection changes.
+        let protected = unsafe { VirtualProtect(guarded, HALF * PAGE, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0);
+        let contents = pattern(PAGES * BLOCK);
+        let (_dir, file) = file_with(&contents);
+        let file = file as usize;
+        let mut memory = vec![0u8; PAGES * BLOCK];
+        let memory_at = memory.as_mut_ptr() as usize;
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let (a, b) = (&a, &b);
+                s.spawn(move || {
+                    let (queue, array) = (new_queue(t as u64 % 2), status_array(1));
+                    // Sources and page arrays live until completion.
+                    let (mut sources, mut arrays) = (Vec::new(), Vec::new());
+                    for p in (t..PAGES).step_by(THREADS) {
+                        // Half of `a[p]`, in place: zlib or a raw copy.
+                        let plain = chunk(2 * p, PAGE / 2);
+                        let (options, source) = if p % 2 == 0 {
+                            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 1);
+                            (ZLIB | PAGE_DESTINATION | MEMORY_SOURCE, packed)
+                        } else {
+                            (PAGE_DESTINATION | MEMORY_SOURCE, plain)
+                        };
+                        arrays.push(Box::new([a[p], b[p]]));
+                        let to = arrays.last_mut().unwrap().as_mut_ptr().cast();
+                        let from = source.as_ptr().cast();
+                        enqueue(
+                            queue,
+                            &request(options, to, PAGE / 2, from, 0, source.len()),
+                        );
+                        sources.push(source);
+                        // The other half of `a[p]` and half of `b[p]`.
+                        let plain = chunk(2 * p + 1, PAGE);
+                        let options = PAGE_DESTINATION | MEMORY_SOURCE;
+                        arrays.push(Box::new([a[p], b[p]]));
+                        let to = arrays.last_mut().unwrap().as_mut_ptr().cast();
+                        let mut r = request(options, to, PAGE, plain.as_ptr().cast(), 0, PAGE);
+                        r.page_offset = (PAGE / 2) as u64;
+                        enqueue(queue, &r);
+                        sources.push(plain);
+                        // A block of title memory, from the file.
+                        let to = (memory_at + p * BLOCK) as *mut c_void;
+                        let (from, offset) = (file as *const c_void, (p * BLOCK) as u64);
+                        enqueue(queue, &request(0, to, BLOCK, from, offset, BLOCK));
+                    }
+                    enqueue_status(queue, array, 0);
+                    void(queue, 0x30);
+                    assert_eq!(wait(array, 0), S_OK);
+                    void(queue, 0x40);
+                });
+            }
+        });
+        let (seen_a, seen_b) = (page_bytes(&a), page_bytes(&b));
+        for p in 0..PAGES {
+            let page = &seen_a[p * PAGE..(p + 1) * PAGE];
+            assert_eq!(page[..PAGE / 2], chunk(2 * p, PAGE / 2), "page {p}");
+            let across = chunk(2 * p + 1, PAGE);
+            assert_eq!(page[PAGE / 2..], across[..PAGE / 2], "page {p}");
+            let next = &seen_b[p * PAGE..][..PAGE / 2];
+            assert_eq!(next, &across[PAGE / 2..], "page {p}");
+        }
+        assert_eq!(memory, contents);
+        // Through the title's views too; the guarded one still read-only.
+        // SAFETY: both views are mapped, readable.
+        unsafe {
+            let view = std::slice::from_raw_parts(guarded.cast::<u8>(), HALF * PAGE);
+            assert_eq!(view, &seen_a[..HALF * PAGE]);
+            let view = std::slice::from_raw_parts(unguarded.cast::<u8>(), HALF * PAGE);
+            assert_eq!(view, &seen_b[..HALF * PAGE]);
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(guarded, &mut info, size_of_val(&info)) };
+        assert_eq!(info.Protect, PAGE_READONLY);
+        for view in [guarded, unguarded] {
+            let unmapped = xmem::XMemMapPhysicalPages(view, HALF, std::ptr::null());
+            assert_eq!(unmapped, view);
+        }
+        free(&a);
+        free(&b);
     }
 }

@@ -110,8 +110,8 @@ pub extern "system" fn CreateWindowExA(
     hwnd
 }
 
-/// A console title sizes its window to its render target (Grand Theft
-/// Auto VI: 3840x2160 on a Series X), which can exceed the host's screen.
+/// A console title sizes its window to its render target (BTP 6
+///: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches).
@@ -160,6 +160,7 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
+    super::gameinput::window_created(hwnd);
 }
 
 extern "system" fn window_proc(
@@ -177,11 +178,16 @@ extern "system" fn window_proc(
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
     // title then stops (no frames, no input) until a key ends the loop, and
-    // nothing shows it, since the window has no menu bar; Grand Theft Auto
-    // VI aborts itself about half a minute later. A console has no window
+    // nothing shows it, since the window has no menu bar; BTP 6
+    // aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    // The mouse as the right stick: Raw Input, the cursor held while the
+    // window is active, the cursor hidden.
+    if let Some(answer) = super::gameinput::window_message(hwnd, message, wparam, lparam) {
+        return answer;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
@@ -286,6 +292,8 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    // A held cursor would outlive us.
+    super::gameinput::release_mouse();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     xtp_gpu::pipeline::save_pipeline_cache();

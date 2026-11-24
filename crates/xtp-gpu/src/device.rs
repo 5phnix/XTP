@@ -29,7 +29,7 @@ pub static IID: Iid = guid(
 );
 
 /// The levels the device answers to, as on PC: `ID3D12Device1` to
-/// `ID3D12Device8`, and `ID3D12Device11`, which Grand Theft Auto VI creates
+/// `ID3D12Device8`, and `ID3D12Device11`, which BTP 6 creates
 /// its device as. Each level's table is the one before plus its methods.
 const LEVEL_IIDS: [Iid; 9] = [
     guid(
@@ -94,7 +94,7 @@ pub(crate) fn is_device(iid: *const Iid) -> bool {
 }
 
 /// The interface version these layouts were checked against (2.4). Both
-/// Minecraft (March 2022) and Grand Theft Auto VI (April 2026) pass it.
+/// Minecraft (March 2022) and BTP 6 (April 2026) pass it.
 pub const CHECKED_VERSION: u32 = 0x0002_0004;
 
 /// Feature level 12_2, what the console hardware supports.
@@ -160,7 +160,7 @@ pub extern "system" fn create(
 /// queues then have the newer layouts (two more methods each; see
 /// `list` and `queue`), although the interface version stays 2.4.
 /// shortcut: the creation interface is the only sign of the newer layouts
-/// we have (Grand Theft Auto VI, April 2026, versus Minecraft, March 2022);
+/// we have (BTP 6, April 2026, versus Minecraft, March 2022);
 /// look for a better one if a title breaks the rule.
 static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -346,6 +346,194 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// The host GPU's wave lane range (`WaveLaneCountMin`, `WaveLaneCountMax`),
+/// asked once and logged; `None` without a host device. A translation that
+/// needs the console's 64-lane waves (`WaveSize(64)`) runs only where 64 is
+/// in it (an NVIDIA GPU has 32 only); shaders are translated for it
+/// ([`host_target`]), and the shader cache keeps translations per target.
+#[cfg(windows)]
+pub fn host_wave_lanes() -> Option<(u32, u32)> {
+    host_shaders().map(|s| s.lanes)
+}
+
+/// The wave sizes shaders are translated for (VIctory #223): the host's
+/// lane range ([`host_wave_lanes`]), or `XTP_HOST_LANES=<min>-<max>` (one
+/// number: both) in its place; any ([`Target::ANY`]) without a host device.
+/// On a host without 64-lane waves (NVIDIA: 32 to 32), a console wave64
+/// compute program that needs its whole wave becomes two 32-lane waves
+/// where the translator has a form for it, declaring `WaveSize(32)`.
+/// Decided once and logged, with a warning when 64-lane waves are missing.
+///
+/// The override is for tests and diagnostics: pipelines are still checked
+/// against the host's own lanes, so a target the host does not run gets
+/// its pipelines refused.
+///
+/// [`Target::ANY`]: xtp_shader::emit::Target::ANY
+#[cfg(windows)]
+pub fn host_target() -> xtp_shader::emit::Target {
+    static TARGET: std::sync::OnceLock<xtp_shader::emit::Target> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let forced = std::env::var("XTP_HOST_LANES").ok();
+        let lanes = host_wave_lanes();
+        let (target, forced) = match target_of(lanes, forced.as_deref()) {
+            Ok(target) => (target, forced.is_some()),
+            Err(text) => {
+                tracing::warn!(text, "XTP_HOST_LANES expects <min>-<max> lanes; ignored");
+                let host = target_of(lanes, None).unwrap_or(xtp_shader::emit::Target::ANY);
+                (host, false)
+            }
+        };
+        tracing::info!(
+            lanes = format_args!("{} to {}", target.lanes_min, target.lanes_max),
+            forced,
+            "shaders translated for waves of"
+        );
+        if !target.runs(64) {
+            // VIctory #439's text. Mesh programs are the pipelines' to log,
+            // by the host's own lanes (`pipeline::host::wave64_mesh_allowed`):
+            // their translations declare no wave size.
+            tracing::warn!(
+                "the host has no 64-lane waves: console wave64 compute programs that need \
+                 their whole wave run as two 32-lane waves where there is a form for them; \
+                 the rest do not translate, and their dispatches are dropped"
+            );
+        }
+        target
+    })
+}
+
+/// The target for a host with waves of `lanes` (min, max; none: unknown),
+/// or for `forced` (`<min>-<max>`, or one number) in their place; the
+/// forced text back if it is not a range of powers of two from 4 to 128.
+#[cfg(windows)]
+pub(crate) fn target_of(
+    lanes: Option<(u32, u32)>,
+    forced: Option<&str>,
+) -> Result<xtp_shader::emit::Target, String> {
+    use xtp_shader::emit::Target;
+    let Some(text) = forced else {
+        return Ok(match lanes {
+            Some((min, max)) if min > 0 && min <= max => Target {
+                lanes_min: min,
+                lanes_max: max,
+            },
+            _ => Target::ANY,
+        });
+    };
+    let lane = |n: &str| {
+        n.trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
+    };
+    let (min, max) = match text.split_once('-') {
+        Some((min, max)) => (lane(min), lane(max)),
+        None => (lane(text), lane(text)),
+    };
+    match (min, max) {
+        (Some(min), Some(max)) if min <= max => Ok(Target {
+            lanes_min: min,
+            lanes_max: max,
+        }),
+        _ => Err(text.to_owned()),
+    }
+}
+
+/// The host GPU's highest shader model, as (major, minor); `None` without a
+/// host device.
+#[cfg(windows)]
+pub fn host_shader_model() -> Option<(u32, u32)> {
+    host_shaders().map(|s| s.model)
+}
+
+/// What the host's shaders can be.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct HostShaders {
+    lanes: (u32, u32),
+    model: (u32, u32),
+}
+
+#[cfg(windows)]
+fn host_shaders() -> Option<HostShaders> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static SHADERS: std::sync::OnceLock<Option<HostShaders>> = std::sync::OnceLock::new();
+    *SHADERS.get_or_init(|| {
+        let device = &crate::host::host()?.device;
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes its own structure of the given size.
+        unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .ok()?;
+        // The runtime answers only for models it knows: ask from the newest
+        // down.
+        let model = (D3D_SHADER_MODEL_6_0.0..=D3D_SHADER_MODEL_6_9.0)
+            .rev()
+            .find_map(|asked| {
+                let mut data = D3D12_FEATURE_DATA_SHADER_MODEL {
+                    HighestShaderModel: D3D_SHADER_MODEL(asked),
+                };
+                // SAFETY: as above.
+                let ok = unsafe {
+                    device.CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut data).cast(),
+                        size_of_val(&data) as u32,
+                    )
+                };
+                ok.is_ok().then_some(data.HighestShaderModel.0 as u32)
+            })
+            .unwrap_or(0x51);
+        let shaders = HostShaders {
+            lanes: (options.WaveLaneCountMin, options.WaveLaneCountMax),
+            model: (model >> 4, model & 0xf),
+        };
+        tracing::info!(
+            lanes = format_args!("{} to {}", shaders.lanes.0, shaders.lanes.1),
+            wave_ops = options.WaveOps.as_bool(),
+            shader_model = format_args!("{}.{}", shaders.model.0, shaders.model.1),
+            "host shaders"
+        );
+        if shaders.lanes.1 < 32 {
+            // WARP: 4 to 4 (VIctory #578 logs it too).
+            tracing::warn!(
+                "the host's waves are narrower than the console's 32 lanes (a software \
+                 adapter such as WARP): pipelines whose shaders declare a wave size are refused"
+            );
+        }
+        Some(shaders)
+    })
+}
+
+/// The device's line of the frame report (every few seconds): pipeline
+/// waits per title frame since the last line, pipelines being made, and
+/// what the host refused, or made in a stand-in format, since the start.
+#[cfg(windows)]
+pub(crate) fn log_frame() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = frame::current();
+    let frames = now.saturating_sub(LAST.swap(now, Ordering::Relaxed)).max(1) as f64;
+    let [graphics, compute] = pipeline::take_wait_us().map(|us| us as f64 / 1000.0 / frames);
+    let mut line = format!(
+        "pipeline waits {graphics:.1} ms/frame graphics, {compute:.1} compute ({} being made)",
+        pipeline::making()
+    );
+    for part in [pipeline::refusals(), resource::format::report()]
+        .into_iter()
+        .flatten()
+    {
+        line.push_str("; ");
+        line.push_str(&part);
+    }
+    tracing::info!("{line}");
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -435,7 +623,7 @@ mod tests {
 
     #[test]
     fn newer_device_levels_are_the_same_device() {
-        // ID3D12Device11, as Grand Theft Auto VI asks for it.
+        // ID3D12Device11, as BTP 6 asks for it.
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
         assert_eq!((hr, device), (S_OK, super::device()));
         let mut same = std::ptr::null();
@@ -491,6 +679,45 @@ mod tests {
             let mut device: Option<ID3D12Device5> = None;
             assert!(fence.GetDevice(&mut device).is_ok());
             assert!(device.is_some());
+        }
+    }
+
+    /// The host's wave lanes and shader model are read (32 to 32 lanes and
+    /// 6.8 on an RTX 4080).
+    #[cfg(windows)]
+    #[test]
+    fn the_hosts_wave_lanes_are_known() {
+        if crate::testgpu::device("device::tests::the_hosts_wave_lanes_are_known").is_none() {
+            return;
+        }
+        let (Some((min, max)), Some(model)) = (host_wave_lanes(), host_shader_model()) else {
+            panic!("a host device without wave lanes or shader model");
+        };
+        eprintln!("host waves: {min} to {max} lanes, shader model {model:?}");
+        assert!(min.is_power_of_two() && max.is_power_of_two() && 4 <= min && min <= max);
+        assert!(model >= (6, 0));
+    }
+
+    /// Translations are made for the host's lanes, or for the forced ones:
+    /// WARP's 4 to 4 forced to an NVIDIA host's 32 to 32.
+    #[cfg(windows)]
+    #[test]
+    fn the_target_is_the_hosts_lanes_or_the_forced_ones() {
+        use xtp_shader::emit::Target;
+        let lanes = |lanes_min, lanes_max| Target {
+            lanes_min,
+            lanes_max,
+        };
+        assert_eq!(target_of(Some((32, 32)), None), Ok(lanes(32, 32)));
+        assert_eq!(target_of(Some((32, 64)), None), Ok(lanes(32, 64)));
+        assert_eq!(target_of(Some((4, 4)), None), Ok(lanes(4, 4)));
+        assert_eq!(target_of(None, None), Ok(Target::ANY));
+        assert_eq!(target_of(Some((0, 0)), None), Ok(Target::ANY));
+        assert_eq!(target_of(Some((4, 4)), Some("32-32")), Ok(lanes(32, 32)));
+        assert_eq!(target_of(None, Some(" 64 ")), Ok(lanes(64, 64)));
+        assert_eq!(target_of(None, Some("32-64")), Ok(lanes(32, 64)));
+        for bad in ["64-32", "33", "2-4", "256", "wide", ""] {
+            assert_eq!(target_of(Some((32, 32)), Some(bad)), Err(bad.to_owned()));
         }
     }
 

@@ -23,7 +23,7 @@ reason (today they are `VICTORY_*`).
 | CI | `.github/workflows/ci.yml`: `windows-latest`, clippy without and with `--all-features`, `cargo test --workspace --locked` |
 | Runtime tooling | `crates/xtp-core/src/{config.rs,logging.rs,policy.rs}`, `crates/xtp-loader/src/{crash.rs,stacks.rs,thunks.rs}`, the diagnostics switches listed in `README.md` ("Debugging") |
 | CLI | `apps/xtp/src/{main.rs,inspect.rs,census.rs,shader.rs,translate.rs,run.rs}` |
-| Game-specific layer | `crates/xtp-game/src/lib.rs` (`KnownBuild`, `KNOWN_BUILDS` (empty), `identify`), `crates/xtp-game/src/sgd5.rs` (the engine's shader file) |
+| Game-specific layer | `crates/xtp-game/src/lib.rs` (`KnownBuild`, `KNOWN_BUILDS` (1.0.2.1), `identify`), `crates/xtp-game/src/sgd5.rs` (the engine's shader file), `crates/xtp-game/src/watchdog.rs` (the opt-in watchdog hook) |
 | Policy | `docs/asset-policy.md`, `xtp.example.toml` |
 
 ### xcl (E:/xtp-refs/xcl, read only)
@@ -270,7 +270,7 @@ task. CI is covered in 5.6.
 
 ### 4.14 The game-specific layer: keep the separation, build it out (new work)
 
-`xtp-game` is the one crate that knows Grand Theft Auto VI. Today it holds the SGD5 shader-file
+`xtp-game` is the one crate that knows BTP 6. Today it holds the SGD5 shader-file
 reader (with tests on synthetic records) and an empty table of known builds looked up by BLAKE3;
 `xtp run` prints the build. `docs/asset-policy.md` already says what may live there: build
 identities, per-build offsets of the functions we hook under names we choose, byte signatures,

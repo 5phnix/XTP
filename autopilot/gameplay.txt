@@ -1,0 +1,24 @@
+# From the golden save to gameplay (cargo xtask play, docs/dev/autopilot.md).
+# BTP 6, Xbox Series build; RVAs of game_scarlett_master.exe,
+# found by the run-world analysis (task 1383180b, docs/analysis/run-keys.md).
+build b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93
+
+# Start-up: the title's init is done and its front end (profile screen,
+# intro, logo) is up.
+wait u8 0x74e007c == 1 and u32 0x74e2c1c == 1 timeout 60s
+
+# About 10 s after the start the profile screen asks for A ("PLAYER (A)").
+# The title accepts it once its start-up work allows (17.6 to 46 s in the
+# runs so far); left alone, the front end ends later (up to 116 s). Every
+# run that reached the world also had presses during the world's loading,
+# and every run without them stalled there (run-world, sessions F to K),
+# so press A every 2.5 s until the world's first frame, then stop: A in the
+# world is a game control.
+repeat a every 2500ms until u32 0xab43664 == 0 and u32 0x9e58138 == 0 and u8 0x74dfa9d == 1 timeout 300s
+
+# The save loads into the world: the loading screen (0xab43664 = 0xe) gives
+# way to the world's first frame, where the start-up flag 0x9e58138 drops
+# and the in-game byte 0x74dfa9d is set.
+wait u32 0xab43664 == 0 and u32 0x9e58138 == 0 and u8 0x74dfa9d == 1 timeout 180s
+
+release

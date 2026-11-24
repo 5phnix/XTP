@@ -94,7 +94,7 @@ generated "carrier DLL" per TLS image so Windows owns a TLS slot, and
 KERNELBASE hooks so file calls from system DLLs reach its VFS.
 
 The Windows-loader design needs fewer hooks, shows title frames to every
-tool, and VIctory already runs Grand Theft Auto VI's executable and its
+tool, and VIctory already runs BTP 6's executable and its
 DLLs on it through the menus into the world. **XTP keeps it as the
 foundation.** xcl is ahead in what surrounds the mapping: stub policy,
 fast-fail visibility, the command line, the VFS overlay, and the memory and
@@ -573,7 +573,7 @@ files are never modified.
 2. Stub default: keep `Trap` (VIctory: fail at the cause) or switch to the
    database values (xcl: keep going)? L-04 keeps `Trap` and makes the table
    opt-in; the person decides whether to flip it.
-3. Does Grand Theft Auto VI read its command line or `argv` at all? If not,
+3. Does BTP 6 read its command line or `argv` at all? If not,
    L-09 can wait.
 4. Which console bits does the title pass to `VirtualAlloc` and
    `SetThreadGroupAffinity`, and with what masks? Answered by logging first

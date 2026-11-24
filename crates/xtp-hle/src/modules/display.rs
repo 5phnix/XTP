@@ -36,7 +36,7 @@ pub const CAPTURE_PROVIDER: Guid = Guid::new(
     0x4485,
     [0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27],
 );
-/// As Grand Theft Auto VI (2026) asks for it; it calls 0x28 (take a
+/// As BTP 6 (2026) asks for it; it calls 0x28 (take a
 /// screenshot) with the public API's arguments.
 pub const CAPTURE_IID_2026: Guid = Guid::new(
     0x22e6_72d7,
@@ -100,6 +100,14 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     // SAFETY: the request we just created.
     if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
         let hr = last_error();
+        // A session without a desktop (a service, an SSH session on a build
+        // machine) refuses display requests with ERROR_NOT_SUPPORTED: there is
+        // no display to keep on, so there is nothing to defer. The title still
+        // gets a handle, which `close_deferral` releases as usual.
+        const NOT_SUPPORTED: HRESULT = 0x8007_0032_u32 as i32;
+        if hr == NOT_SUPPORTED {
+            return put(out, request);
+        }
         // SAFETY: as above; not handed out.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
         return hr;

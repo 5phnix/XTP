@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+mod survey;
 mod translate;
 
 use std::path::PathBuf;
@@ -75,12 +76,44 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
+        /// Also create a host D3D12 pipeline for each emitted shader
+        /// (translated for this host's wave sizes unless --host-lanes says).
         #[arg(long)]
         pipelines: bool,
+        /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
+        /// NVIDIA, 32-64 for AMD RDNA): shaders that need another wave size
+        /// are listed as failures. Default: any wave size.
+        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
+        host_lanes: Option<(u32, u32)>,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
+    /// Survey a shader pack (your own `shaders.rpf`): every program through
+    /// the translator, counted once under its first blocker and grouped by
+    /// the backlog item that removes it (docs/analysis/shader.md, S0).
+    /// Defaults to `XTP_SAMPLE_SHADERS`, else `shaders.rpf` in the
+    /// configured game folder.
+    ShaderSurvey {
+        pack: Option<PathBuf>,
+        /// Also write the survey as stable JSON (one program per line, with
+        /// the hash of its translation), to compare two runs as text.
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+        /// Check every translation with dxil.dll's validator (`XTP_DXIL`,
+        /// else the newest Windows SDK's).
+        #[arg(long)]
+        validate: bool,
+        /// Validate the translations of every Nth record only.
+        #[arg(long, value_name = "N")]
+        validate_every: Option<usize>,
+        /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
+        /// NVIDIA, 32-64 for AMD RDNA). Default: any wave size.
+        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
+        host_lanes: Option<(u32, u32)>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -100,6 +133,9 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Drive the title by this script (autopilot/, docs/dev/autopilot.md).
+        #[arg(long, value_name = "SCRIPT")]
+        autopilot: Option<PathBuf>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -152,17 +188,50 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+            host_lanes,
+        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+        Command::ShaderSurvey {
+            pack,
+            json,
+            validate,
+            validate_every,
+            host_lanes,
+            jobs,
+        } => survey::run(
+            pack,
+            json,
+            validate_every.or(validate.then_some(1)),
+            jobs,
+            host_lanes,
+        ),
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
             console,
+            autopilot,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => run::run(&exe, unimplemented, strict, execute, console, autopilot),
         Command::Config => show_config(),
     }
+}
+
+/// `MIN-MAX` lanes per wave, or one size `N`.
+fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let n = |x: &str| {
+        x.trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
+            .ok_or_else(|| format!("{x:?} is not a wave size (4 to 128, a power of two)"))
+    };
+    let (a, b) = (n(a)?, n(b)?);
+    if a > b {
+        return Err(format!("{a} is more than {b}"));
+    }
+    Ok((a, b))
 }
 
 fn show_config() -> Result<()> {

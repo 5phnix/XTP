@@ -1,0 +1,8 @@
+# Import census of a title folder (xtp-loader `Census::expectation`).
+# Names and counts only. Regenerate with XTP_CENSUS_BLESS=1, see
+# crates/xtp-loader/tests/census_sample.rs.
+build 4cafcc49d6149c9cfcc33c092bcd415b912fdf550ea17f272e59928b0ceba590
+images 18
+imports 1924 hle 227 host 1623 title 72 stubbed 2 missing 0
+stubbed oleaut32.dll!#4
+stubbed oleaut32.dll!#6

@@ -32,7 +32,7 @@ const ALLOCATOR_IIDS: [Iid; 4] = [
 
 /// The list interfaces up to `ID3D12GraphicsCommandList6` (the table has
 /// all their slots): those whose ids are the same as on PC, the console's
-/// own List5 and List6 (Grand Theft Auto VI asks for List6), then the
+/// own List5 and List6 (BTP 6 asks for List6), then the
 /// device child's.
 const LIST_IIDS: [Iid; 10] = [
     guid(
@@ -106,7 +106,7 @@ struct List {
     graphics_root_headers: [u32; 128],
     compute_root_headers: [u32; 128],
     pipeline_shadow: [u32; 8],
-    /// Newer titles' lists are larger: Grand Theft Auto VI's state flush
+    /// Newer titles' lists are larger: BTP 6's state flush
     /// (title+0x32786) copies a pipeline's 32 bytes to +0x544..+0x564 and
     /// tests +0x548, so its layout runs past 0x560. Its size is unknown;
     /// this keeps our fields clear of whatever the title writes there.
@@ -120,6 +120,17 @@ struct List {
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
+#[cfg(windows)]
+impl Drop for List {
+    /// The GPU may still read its upload memory, which goes before the host
+    /// list (which waits for its submission too).
+    fn drop(&mut self) {
+        if let Some(host) = &self.host {
+            host.settle();
+        }
+    }
+}
+
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
@@ -262,10 +273,21 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let mut uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());
+    // Memory the list's running submission may still use goes once it has
+    // finished (the host list hands over its own in `reset`).
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && list.running()
+        && let Some(host) = crate::host::made()
+    {
+        let old = std::mem::take(&mut *uploads);
+        host.after(move || drop(old));
+    }
+    uploads.clear();
+    drop(uploads);
     #[cfg(windows)]
     with_state(this, |host, state| {
         host.reset();
@@ -416,7 +438,18 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// A copy of `len` bytes of title memory from `src` to `dst` in `list`: on
+/// the GPU, in list order, when either side has a host copy (shaders may
+/// write the source before it or read the destination after it); else of
+/// title memory on the CPU when the list is submitted.
+#[cfg(windows)]
+fn copy_title(list: &crate::host::HostList, dst: *mut u8, src: *const u8, len: u64) {
+    if !crate::shadow::copy(list, dst as u64, src as u64, len) {
+        list.defer_copy(dst, src, len as usize);
+    }
+}
+
+/// Buffer to buffer (see [`copy_title`]).
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -430,7 +463,7 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        copy_title(list, to, from, len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -460,7 +493,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            copy_title(list, to, from, a.min(b));
         }
     }
     #[cfg(not(windows))]
@@ -511,6 +544,20 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        // A destination whose host format stands in for the title's.
+        if src.kind == FOOTPRINT
+            && crate::texture::copy_converted(
+                list,
+                dst.resource,
+                dst.footprint.offset as u32,
+                [x, y, z],
+                src.resource,
+                &src.footprint,
+                source_box,
+            )
+        {
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -768,20 +815,23 @@ extern "system" fn clear_dsv(
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
-/// are title memory, copied at submission like buffer copies (if mapped).
+/// are title memory, copied like buffer copies (see [`copy_title`]); on the
+/// CPU only if both ranges are mapped.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
+        && !crate::shadow::copy(list, dst, src, len)
     {
         let len = len as usize;
-        list.defer(move || {
+        list.defer((dst as usize, len), (src as usize, len), move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
                 // SAFETY: both ranges are committed title memory.
                 unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                crate::host::moved(crate::host::Moved::CpuCopy, len);
             }
         });
     }
@@ -875,8 +925,8 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
+/// their own work and submissions run in order on one host queue, so there
+/// is nothing to do.
 extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
@@ -887,7 +937,7 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
 /// owns until it is reset, which the CPU writes and the GPU reads at the
-/// same address; null on failure. Grand Theft Auto VI's BVH builder puts
+/// same address; null on failure. BTP 6's BVH builder puts
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
@@ -1152,7 +1202,7 @@ extern "system" fn draw(_: This) {
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
+/// offset)`. BTP 6's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
 /// (12), mesh dispatch (12), and the console's single-pass dispatch, type
 /// 105 (stride 12: the three group counts; its flags live in the
@@ -1266,8 +1316,10 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
-/// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
-/// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
+/// 64 bits: into title memory when the list has run, as the GPU would, and
+/// into the address's host copy at once in the list, for its later
+/// commands ([`crate::shadow::write`]). Flag 1 writes the GPU timestamp
+/// instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
     defer_write(this, address, Written::Value(u64::from(value)), 4);
 }
@@ -1288,6 +1340,9 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     }
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
+        if let Written::Value(value) = what {
+            crate::shadow::write(list, address, value, bytes);
+        }
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
@@ -1372,7 +1427,7 @@ const MORE_METHODS: [(usize, *const ()); 9] = [
 /// base list, after the clears (0x198/0x1a0 as before) and before
 /// ExecuteIndirect, which moved from 0x1d8 to 0x1e8: every slot from 0x1d8
 /// on is two later (taken here as starting exactly at 0x1d8). Inferred from
-/// Grand Theft Auto VI's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
+/// BTP 6's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
 /// writes 0x238/0x240, waits 0x248/0x250, depth bounds 0x230, shading rate
 /// 0x3f0/0x400, syncs 0x418/0x420, ResetX 0x458 (asserts on failure).
 const fn newer_slot(slot: usize) -> usize {
@@ -1382,7 +1437,7 @@ const fn newer_slot(slot: usize) -> usize {
 /// Methods only newer titles' lists have. 0x490: the enhanced barrier
 /// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
 /// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
-/// called from Grand Theft Auto VI's state flush with its result unused.
+/// called from BTP 6's state flush with its result unused.
 /// shortcut: 0x470's purpose is unknown; ignored until a title shows it
 /// matters.
 const NEWER_METHODS: [(usize, *const ()); 3] = [
@@ -1439,7 +1494,7 @@ mod tests {
             (at(0x18), at(0x28), at(0x30))
         };
         assert!(put >= draw_limit && put >= api_limit);
-        // The console's ID3D12GraphicsCommandList6, as Grand Theft Auto VI asks.
+        // The console's ID3D12GraphicsCommandList6, as BTP 6 asks.
         let mut same = null;
         assert_eq!(list_query(list, &LIST_IIDS[7], &mut same), S_OK);
         assert_eq!(same, list);
@@ -1469,5 +1524,112 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// The list's copies and memory writes on the host GPU, in list order
+    /// (backlog G3, G4), with kernels standing in for the title's passes.
+    #[cfg(windows)]
+    mod gpu {
+        use super::*;
+        use crate::testgpu::{KERNEL_BYTES, Kernel, Pass, TitleBuffer, TitleList, device, pattern};
+
+        /// The words a fill writes.
+        fn filled(words: std::ops::Range<usize>) -> Vec<u32> {
+            words.map(pattern).collect()
+        }
+
+        /// A dispatch writes A, a copy takes A to B, a dispatch copies B to
+        /// C, in one submission: C holds what the first dispatch wrote (a
+        /// copy run before the GPU work would take the title's old A).
+        #[test]
+        fn buffer_copies_run_between_dispatches_in_list_order() {
+            let test = "list::tests::gpu::buffer_copies_run_between_dispatches_in_list_order";
+            let Some(host) = device(test) else { return };
+            let kernel = Kernel::new(host);
+            let [a, b, c] = [(); 3].map(|()| TitleBuffer::new(256));
+            a.set_words(|i| 0xdead_0000 + i as u32);
+            let list = TitleList::new();
+            kernel.dispatch(list.host(), Pass::Fill, a.address(), a.address());
+            copy_buffer_region(list.this(), b.resource(), 0, a.resource(), 0, KERNEL_BYTES);
+            kernel.dispatch(list.host(), Pass::Copy, b.address(), c.address());
+            list.run();
+            assert_eq!(
+                c.words(),
+                filled(0..64),
+                "the second dispatch reads the copy"
+            );
+            assert_eq!(
+                b.words(),
+                filled(0..64),
+                "the copy's destination is written back"
+            );
+            assert_eq!(a.words(), filled(0..64));
+        }
+
+        /// Whole-buffer and memory copies of GPU-written data run on the
+        /// GPU too, also within one buffer, overlapping ranges as if the
+        /// source were read whole first.
+        #[test]
+        fn resource_and_memory_copies_run_on_the_gpu() {
+            let test = "list::tests::gpu::resource_and_memory_copies_run_on_the_gpu";
+            let Some(host) = device(test) else { return };
+            let kernel = Kernel::new(host);
+            let (d, e) = (TitleBuffer::new(512), TitleBuffer::new(512));
+            let at = d.address();
+            let list = TitleList::new();
+            kernel.dispatch(list.host(), Pass::Fill, at, at);
+            // Words 0..64 to 16..80 (overlapping), then 0..16 to 112..128.
+            copy_memory(list.this(), at + 64, at, 256, 0);
+            copy_memory(list.this(), at + 448, at, 64, 0);
+            copy_resource(list.this(), e.resource(), d.resource());
+            list.run();
+            let mut want = filled(0..16);
+            want.extend(filled(0..64));
+            want.extend([0; 32]);
+            want.extend(filled(0..16));
+            assert_eq!(d.words(), want);
+            assert_eq!(e.words(), want);
+        }
+
+        /// With no host copy on either side the copy stays a copy of title
+        /// memory at submission, and makes none.
+        #[test]
+        fn copies_without_host_copies_stay_on_the_cpu() {
+            let test = "list::tests::gpu::copies_without_host_copies_stay_on_the_cpu";
+            if device(test).is_none() {
+                return;
+            }
+            let (a, b) = (TitleBuffer::new(256), TitleBuffer::new(256));
+            a.set_words(|i| 3 * i as u32);
+            let list = TitleList::new();
+            copy_buffer_region(list.this(), b.resource(), 0, a.resource(), 0, 256);
+            let copied = |t: &TitleBuffer| crate::shadow::existing(t.address(), 256).is_some();
+            assert!(!copied(&a) && !copied(&b));
+            list.run();
+            assert_eq!(b.words(), (0..64).map(|i| 3 * i).collect::<Vec<u32>>());
+        }
+
+        /// Memory writes of a list reach its later commands (and title
+        /// memory once it has run).
+        #[test]
+        fn memory_writes_reach_later_commands_of_the_list() {
+            let test = "list::tests::gpu::memory_writes_reach_later_commands_of_the_list";
+            let Some(host) = device(test) else { return };
+            let kernel = Kernel::new(host);
+            let (w, c) = (TitleBuffer::new(256), TitleBuffer::new(256));
+            w.set_words(|_| 0x1111_1111);
+            // An earlier frame's draw made its host copy.
+            w.shadow();
+            let list = TitleList::new();
+            write64(list.this(), w.address(), 0x0123_4567_89ab_cdef, 0, 0);
+            write32(list.this(), w.address() + 8, 0x5555_aaaa, 0, 0);
+            kernel.dispatch(list.host(), Pass::Copy, w.address(), c.address());
+            list.run();
+            let written = [0x89ab_cdef, 0x0123_4567, 0x5555_aaaa];
+            let got = c.words();
+            assert_eq!(got[..3], written, "the dispatch reads the written words");
+            assert_eq!(got[3..], [0x1111_1111; 61]);
+            assert_eq!(w.words()[..3], written);
+        }
     }
 }

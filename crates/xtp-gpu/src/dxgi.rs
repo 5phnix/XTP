@@ -1,7 +1,16 @@
 //! The DXGI side of the device: one adapter with one output, reached from
 //! the device by interface query. Tables follow the PC interfaces' order
-//! (IUnknown, the object methods, then each interface's methods).
+//! (IUnknown, the object methods, then each interface's methods). The host
+//! adapter our own device is made on is chosen in [`adapter`]; the planes
+//! of a present are composed in [`planes`].
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+#[cfg(windows)]
+mod adapter;
+#[cfg(windows)]
+pub(crate) mod planes;
+#[cfg(windows)]
+pub(crate) use adapter::{host_adapter, video_memory};
 
 use crate::object::{
     self, ADAPTER, DXGI_DEVICE, E_INVALIDARG, FACTORY, HRESULT, Iid, MORE_DATA, NOT_FOUND, OUTPUT,
@@ -219,7 +228,7 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
+/// The console's mode list: one 4K mode at 60 Hz (BTP 6 looks
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
