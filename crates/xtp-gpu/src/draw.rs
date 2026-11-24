@@ -1685,9 +1685,10 @@ impl State {
 /// they were expanded into (`expanded`); for a pipeline without per-vertex
 /// inputs (corners from the vertex id), each rectangle's first triangle:
 /// the title's draw, with whole rectangles.
-/// shortcut: such a rectangle misses its fourth corner, and its shader sees
-/// the host's vertex ids (D3D12's leave out the start vertex), until the
-/// translator adds the start and the remap (VIctory #255).
+/// Its shader sees vertex ids from 0, the start left out, on the host as on
+/// the console (docs/analysis/drops.md §5.1.1).
+/// shortcut: such a rectangle misses its fourth corner (VIctory #255's
+/// remap would run the vertex shader for it).
 fn rectangle_vertices(vertices: u32, first: u32, expanded: bool) -> (u32, u32) {
     let rects = vertices / 3;
     if expanded {
@@ -1941,9 +1942,9 @@ impl State {
 }
 
 /// Logs a pipeline whose indirect rectangles make their corners from the
-/// vertex id (see [`crate::rectangles`]), once each, for the translator's
-/// side. Cheap on every draw: a recording thread looks in its own set
-/// first, so the shared one is locked once per thread and pipeline.
+/// vertex id (see [`crate::rectangles`]), once each: their fourth corners
+/// are not made. Cheap on every draw: a recording thread looks in its own
+/// set first, so the shared one is locked once per thread and pipeline.
 fn note_vertex_id_rectangles(p: &HostPipeline) {
     thread_local! {
         /// The host pipelines this thread has seen, by address.
@@ -1959,8 +1960,8 @@ fn note_vertex_id_rectangles(p: &HostPipeline) {
         seen.push(p.name.clone());
         tracing::info!(
             pipeline = %p.name,
-            "indirect rectangles without vertex inputs: each rectangle's first triangle, with the \
-             host's vertex ids (no start vertex)"
+            "indirect rectangles without vertex inputs: each rectangle's first triangle, no fourth \
+             corner (vertex ids from 0 in each record, as on the console)"
         );
     }
 }
@@ -3061,10 +3062,12 @@ float4 ps(V v) : SV_Target { return v.color; }
 
     /// A pipeline without vertex inputs draws each rectangle's first
     /// triangle, without its fourth corner: one rectangle from vertex 6 and
-    /// two from vertex 9. The host's vertex ids count from 0 in each record
-    /// (D3D12's `SV_VertexID` leaves out the start vertex), so they are
-    /// cells 0, then 0 and 1. They drew twice the vertices before: cells 0
-    /// to 3.
+    /// two from vertex 9. The vertex ids count from 0 in each record, so
+    /// they are cells 0, then 0 and 1: what the console draws. D3D12's
+    /// `SV_VertexID` leaves out the start vertex, and so does the console's
+    /// v0; the start reaches a console program only through a user SGPR,
+    /// which none of the title's vertex programs read (docs/analysis/drops.md
+    /// §5.1.1). They drew twice the vertices before: cells 0 to 3.
     #[test]
     fn indirect_rectangles_without_vertex_inputs_draw_their_first_triangles() {
         let _pool = crate::rectangles::POOL_TESTS
