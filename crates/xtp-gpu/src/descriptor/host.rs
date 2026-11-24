@@ -633,13 +633,15 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    /// host cannot. True if the host made the view.
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> bool {
         let kept = make(view, self.cpu(index));
-        if kept.is_none() {
+        let made = kept.is_some();
+        if !made {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
+        made
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -1093,6 +1095,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         *format = d.Format;
     }
     true
+}
+
+/// Makes the host descriptor for `view` at `at`, a slot of a heap of the
+/// caller's (a CPU-only one: the second handle `ClearUnorderedAccessView*`
+/// takes, which a shader-visible heap cannot give): the host resource it
+/// views, or `None` if the host cannot make it (or it views none).
+pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    make(view, at).flatten()
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
