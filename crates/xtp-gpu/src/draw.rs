@@ -545,6 +545,7 @@ impl From<&'static str> for Unready {
 /// not run on the host for `why` (diagnostics).
 #[cfg(feature = "diagnostics")]
 fn note_unready(path: &str, pipeline: usize, why: Unready) {
+    crate::passdump::dropped(path, pipeline, &why);
     match why {
         Unready::NoPipeline => crate::pipeline::note_drop(path, pipeline as This),
         Unready::Because(why) => crate::pipeline::note_why(format!("{path}: {why}")),
@@ -738,6 +739,8 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        crate::passdump::targets(list, &self.targets, self.depth);
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -2045,6 +2048,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            #[cfg(feature = "diagnostics")]
+            crate::passdump::written(list, *resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}

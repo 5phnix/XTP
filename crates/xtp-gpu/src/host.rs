@@ -1096,6 +1096,8 @@ impl Host {
     /// Runs a title submission (the lists of one `ExecuteCommandLists`),
     /// counted for the frame-rate line once it has finished.
     pub(crate) fn submit(&self, runs: &[&HostList]) {
+        #[cfg(feature = "diagnostics")]
+        crate::passdump::submitted(runs);
         self.run(runs, true);
     }
 
@@ -1764,6 +1766,8 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
+        crate::passdump::closed(self);
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
                 (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1946,6 +1950,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
+        let what = crate::passdump::op(self, what);
         if dred_on() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps()
