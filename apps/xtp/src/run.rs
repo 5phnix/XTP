@@ -17,6 +17,10 @@ pub fn run(
     use xtp_hle::{HleResolver, HostPolicy};
     use xtp_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    if execute {
+        crate::preflight::check_cpu()?;
+    }
+
     // A title that relaunched itself: the old process must be gone first.
     xtp_hle::modules::lifecycle::wait_for_previous();
     let cfg = xtp_core::Config::load()?;
