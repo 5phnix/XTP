@@ -125,6 +125,12 @@ impl Bools {
         (v != TERMINAL).then(|| (self.atoms[v as usize], lo, hi))
     }
 
+    /// The boolean that is `atom` itself, if some boolean tests it.
+    pub fn var(&self, atom: Atom) -> Option<Bool> {
+        let &v = self.ids.get(&atom)?;
+        self.unique.get(&(v, Bool::FALSE, Bool::TRUE)).copied()
+    }
+
     /// The atoms `b` depends on, in variable order.
     pub fn support(&self, b: Bool) -> Vec<Atom> {
         let mut vars = self.vars(b);
@@ -353,10 +359,21 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Masks (low dwords) whose value comes from a mask join resolved to a
+    /// constant ("every lane arriving here has its bit clear", or set),
+    /// itself or through mask operations. Their per-lane bits hold in the
+    /// lanes that reach where they are read, not in the others: a loop's
+    /// exit mask is 0 in every lane still in the loop, but holds the lanes
+    /// that left it. None of them is in [`Self::active`]; read as data they
+    /// need every lane of the wave (the console flow). EXEC is never one:
+    /// it holds only the lanes that run where it is read.
+    pub resolved: HashSet<Value>,
     /// Per block and instruction: the lane's EXEC bit at each vector
-    /// instruction, whatever path the lane took (`None` for scalar ones).
-    /// What a program run as the console runs it, every lane through every
-    /// block, guards its vector instructions with ([`structure_console`]).
+    /// instruction and scalar memory read, whatever path the lane took
+    /// (`None` for other scalar instructions). What a program run as the
+    /// console runs it, every lane through every block, guards its vector
+    /// instructions with ([`structure_console`]); a scalar read through a
+    /// descriptor that differs between lanes needs it too.
     pub execs: Vec<Vec<Option<Bool>>>,
     /// The lane's bit of values read as masks that derive from neither
     /// EXEC nor a VALU result (constants, uniform selects, opaque ones), by
@@ -456,6 +473,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::resolved`].
+    resolved: HashSet<Key>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -475,6 +494,8 @@ struct SopMasks {
     derived: bool,
     /// For branches: SCC ("result is not zero") per lane.
     scc: Option<Bool>,
+    /// `dst` comes from a join resolved to a constant ([`Structured::resolved`]).
+    resolved: bool,
 }
 
 const MAX_ROUNDS: usize = 256;
@@ -522,6 +543,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            resolved: HashSet::new(),
         })
     }
 
@@ -535,6 +557,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.resolved.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -553,6 +576,12 @@ impl<'a> Lanes<'a> {
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
+        // EXEC's values (low and high dword, where known) at the end of each
+        // block, for the scalar memory reads, which do not read it.
+        type Halves = (Option<Value>, Option<Value>);
+        let high = if p.wave64 { EXEC + 1 } else { EXEC };
+        let entry: Halves = (input(Reg::S(EXEC)), input(Reg::S(high)));
+        let mut exec_out: Vec<Halves> = vec![(None, None); p.blocks.len()];
         for n in 0..self.order.len() {
             let b = self.order[n];
             let mut c = if n == 0 { Bool::TRUE } else { Bool::FALSE };
@@ -570,6 +599,20 @@ impl<'a> Lanes<'a> {
                     self.active.insert(phi.value);
                 }
             }
+            // EXEC's values entering the block: its phis', else those a
+            // forward predecessor leaves with (they all agree then).
+            let half = |reg: u8, pick: fn(Halves) -> Option<Value>| {
+                let phi = p.blocks[b].phis.iter().find(|q| q.reg == Reg::S(reg));
+                match phi {
+                    Some(phi) => Some(phi.value),
+                    None if n == 0 => pick(entry),
+                    None => self.incoming[b]
+                        .iter()
+                        .filter(|&&(q, _)| self.index[q] < n)
+                        .find_map(|&(q, _)| pick(exec_out[q])),
+                }
+            };
+            let mut values: Halves = (half(EXEC, |h| h.0), half(high, |h| h.1));
             // EXEC where known in this block (read or written so far).
             let mut now = None;
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
@@ -577,12 +620,22 @@ impl<'a> Lanes<'a> {
                     let e = self.exec(inst);
                     execs[b][i] = Some(e);
                     now = Some(e);
+                } else if matches!(inst.fields, Fields::Smem { .. })
+                    && let (Some(lo), Some(hi)) = values
+                {
+                    execs[b][i] = Some(self.mask((lo, hi)).0);
                 }
                 self.step(inst, now);
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
+                // A write of one dword keeps the other's value.
+                values = (
+                    inst.write(Reg::S(EXEC)).or(values.0),
+                    inst.write(Reg::S(high)).or(values.1),
+                );
             }
+            exec_out[b] = values;
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
@@ -680,6 +733,7 @@ impl<'a> Lanes<'a> {
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
             active: self.active,
+            resolved: self.resolved.iter().map(|k| k.0).collect(),
             bools: self.b,
             exits,
             guards,
@@ -742,10 +796,14 @@ impl<'a> Lanes<'a> {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
                 let m = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => def(lo)
-                        .and_then(|i| self.sop(i))
-                        .and_then(|r| r.dst)
-                        .map(|d| d.1),
+                    (Some(at), Some(hi)) if at == hi => {
+                        def(lo).and_then(|i| self.sop(i)).and_then(|r| {
+                            if r.resolved {
+                                self.resolved.insert(k);
+                            }
+                            r.dst.map(|d| d.1)
+                        })
+                    }
                     _ => None,
                 };
                 // What an EXEC write the pass does not follow leaves there.
@@ -791,7 +849,15 @@ impl<'a> Lanes<'a> {
             .map(|n| (arg(lo, k.0, n), arg(hi, k.1, n)))
             .collect();
         let id = lo.map_or(k.1, |_| k.0);
+        // EXEC holds only the lanes that run where it is read: what holds in
+        // every lane arriving here is all of it (see `Structured::resolved`).
+        let exec = [lo, hi]
+            .into_iter()
+            .flatten()
+            .any(|(_, i)| matches!(target.phis[i].reg, Reg::S(c) if c == EXEC || c == EXEC + 1));
         let mut derived = false;
+        // Some mask coming in is one of `Structured::resolved`.
+        let mut pinned = false;
         // (edge condition, mask) per forward edge; back edges come later.
         let mut forward = Vec::new();
         for (n, &a) in args.iter().enumerate() {
@@ -799,6 +865,7 @@ impl<'a> Lanes<'a> {
             if self.index[q] < self.index[block] {
                 let (m, d) = self.mask(a);
                 derived |= d;
+                pinned |= self.resolved.contains(&a);
                 let e = self.edge(self.first[q], q, taken);
                 forward.push((e, m));
             }
@@ -807,6 +874,9 @@ impl<'a> Lanes<'a> {
             && let Some(&(_, m)) = forward.first()
             && forward.iter().all(|f| f.1 == m)
         {
+            if pinned && !exec {
+                self.resolved.insert(k);
+            }
             return Some((m, derived));
         }
         if !self.console && !self.unresolved.contains(&id) {
@@ -823,6 +893,9 @@ impl<'a> Lanes<'a> {
                         value,
                         args,
                     });
+                    if !exec {
+                        self.resolved.insert(k);
+                    }
                     let m = if value { Bool::TRUE } else { Bool::FALSE };
                     return Some((m, derived));
                 }
@@ -893,11 +966,16 @@ impl<'a> Lanes<'a> {
             let exec = self.exec(inst);
             let new = self.combine(f, s, exec)?;
             let saved = if saveexec { exec } else { new };
+            // The saved EXEC is EXEC; a new one ANDed with EXEC keeps no lane
+            // outside it.
+            let resolved =
+                !saveexec && !matches!(f, "and" | "andn1") && self.pinned(inst, src.first());
             return Some(SopMasks {
                 dst: dst.map(|d| (d, saved)),
                 exec: exec_out.map(|e| (e, new)),
                 derived,
                 scc: Some(new),
+                resolved,
             });
         }
         let (result, scc) = match op {
@@ -928,12 +1006,34 @@ impl<'a> Lanes<'a> {
                 (r, Some(r))
             }
         };
+        // ANDed with EXEC itself, a mask has no lane outside EXEC, which
+        // every lane that runs here holds: its bits are right in every lane.
+        let exec_src =
+            |n: usize| matches!(src.get(n), Some(&Operand::Scalar { code, .. }) if code == EXEC);
+        let masked = match op {
+            "and" => exec_src(0) || exec_src(1),
+            "andn2" => exec_src(0),
+            _ => false,
+        };
+        let resolved = dst != exec_out && !masked && src.iter().any(|o| self.pinned(inst, Some(o)));
         Some(SopMasks {
             dst: dst.map(|d| (d, result)),
             exec: exec_out.map(|e| (e, result)),
             derived,
             scc,
+            resolved,
         })
+    }
+
+    /// Whether operand `op` of `inst` reads a mask of
+    /// [`Structured::resolved`].
+    fn pinned(&self, inst: &Inst, op: Option<&Operand>) -> bool {
+        match op {
+            Some(&Operand::Scalar { code, .. }) if code != NULL => self
+                .key(|r| inst.read(r), code)
+                .is_some_and(|k| self.resolved.contains(&k)),
+            _ => false,
+        }
     }
 
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
@@ -994,12 +1094,18 @@ impl<'a> Lanes<'a> {
                 if (takes_mask || touches_exec)
                     && let Some(r) = self.sop(inst).filter(|r| r.derived)
                 {
+                    let pinned = r.dst.map(|d| d.0).filter(|_| r.resolved);
                     for (k, m) in r.dst.into_iter().chain(r.exec) {
                         self.masks.insert(k, m);
-                        // EXEC itself holds the lanes that run here.
-                        if r.exec.is_some_and(|e| e.0 == k)
+                        if pinned == Some(k) {
+                            // Its bits are right only in the lanes here
+                            // (see `Structured::resolved`): no ballot here
+                            // holds the others'.
+                            self.resolved.insert(k);
+                        } else if r.exec.is_some_and(|e| e.0 == k)
                             || exec.is_some_and(|e| self.b.implies(m, e))
                         {
+                            // EXEC itself holds the lanes that run here.
                             self.active.insert(k.0);
                         }
                     }
@@ -1254,6 +1360,66 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(_), Bool::TRUE, Bool::FALSE))
         ));
+    }
+
+    /// A loop's exit mask grown from 0: its join at the header resolves to
+    /// "no lane" (every lane still in the loop has its bit clear), but the
+    /// mask holds the lanes that left. What the loop makes of it is no mask
+    /// the lanes there hold whole: `resolved`, not `active`. EXEC stays
+    /// active, and the console form resolves no join.
+    #[test]
+    fn a_loop_exit_mask_is_resolved_not_active() {
+        let p = build(
+            &[
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x4A00_0081, // 4: v_add_nc_u32 v0, 1, v0
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+                0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+                0xBF89_FFFB, // s_cbranch_execnz -> 4
+                0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let body = &p.blocks[1].insts;
+        assert_eq!(body[2].name(), "s_or_b64");
+        let exit = body[2].write(Reg::S(2)).unwrap();
+        assert!(s.resolved.contains(&exit), "{:?}", s.resolved);
+        assert!(!s.active.contains(&exit));
+        let exec = body[3].write(Reg::S(EXEC)).unwrap();
+        assert!(s.active.contains(&exec));
+        assert!(!s.resolved.contains(&exec));
+        assert!(structure_console(&p).unwrap().resolved.is_empty());
+    }
+
+    /// In wave64 a write of EXEC's low dword alone keeps the high one: the
+    /// lanes after it are the pair (new low, old high), a mask held as a
+    /// number whose high dword is EXEC's from before, for vector
+    /// instructions and scalar memory reads alike.
+    #[test]
+    fn a_write_of_exec_lo_keeps_exec_hi() {
+        let p = build(
+            &[
+                0xBEFE_0380, // s_mov_b32 exec_lo, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xF400_0100,
+                0xFA00_0000, // s_load_dword s4, s[0:1], 0x0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        let lo = insts[0].write(Reg::S(EXEC)).unwrap();
+        assert_eq!(insts[0].write(Reg::S(EXEC + 1)), None);
+        let hi = p.inputs.iter().find(|i| i.0 == Reg::S(EXEC + 1)).unwrap().1;
+        assert_eq!(insts[1].read(Reg::S(EXEC + 1)), Some(hi));
+        let e = s.execs[0][1].unwrap();
+        assert_eq!(s.bools.support(e), [Atom::Opaque(lo)]);
+        assert_eq!(s.pairs.get(&lo), Some(&hi));
+        assert_eq!(s.execs[0][2], Some(e));
     }
 
     #[test]

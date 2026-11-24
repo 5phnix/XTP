@@ -275,6 +275,32 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The lanes that may run scalar memory read `(b, i)` through a
+    /// descriptor that differs between lanes (a heap index per lane): its
+    /// lanes' EXEC there, where some lane outside EXEC can get there (every
+    /// lane in the console flow; per lane, those a narrowed EXEC left
+    /// without a branch). [`Self::guard`] has none for scalar instructions,
+    /// which run once per console wave; through a per-lane handle such a
+    /// lane would read with whatever its index holds (past the heap: a
+    /// fault, the device removed). None where EXEC is not known there
+    /// (never written: every lane).
+    pub(super) fn scalar_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        let st = self.x.st;
+        let Some(e) = st.execs[b].get(i).copied().flatten() else {
+            return Ok(None);
+        };
+        // (Per lane: whether some lane reaching the block has EXEC clear.)
+        if e == Bool::TRUE || !self.console_cf && !st.bools.meet(&[(st.reach[b], true), (e, false)])
+        {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        {
+            self.scalar_guards += 1;
+        }
+        Ok(Some(self.boolean(e, self.cur)?))
+    }
+
     pub(super) fn set(&mut self, v: Option<Value>, val: Val) {
         if let Some(v) = v {
             self.vals.insert(v, val);
