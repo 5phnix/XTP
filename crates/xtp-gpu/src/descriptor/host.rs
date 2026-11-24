@@ -5,13 +5,16 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::core::Interface;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::shadow::Shadow;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -30,10 +33,67 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// The dynamic slots: which are taken (by lists not yet reset, or by
+    /// `shared`), where the search starts, and how many are in use.
+    slots: Mutex<Slots>,
+    /// Raw views of host copies that every list naming the same range
+    /// shares (root SRVs), in chunks of dynamic slots. Locked before
+    /// `slots` when both are.
+    shared: Mutex<Shared>,
+    /// A raw view that reads zeros, in a dynamic slot of its own (made on
+    /// first use, kept for the heap's life).
+    null_raw: OnceLock<Option<u32>>,
 }
+
+/// Dynamic slot bookkeeping.
+struct Slots {
+    next: u32,
+    taken: Vec<bool>,
+    /// Slots taken now, and the most ever taken at once.
+    used: u32,
+    peak: u32,
+}
+
+/// Slots per chunk the shared views take at once.
+pub(crate) const SHARED_CHUNK: u32 = 256;
+
+/// Shared views no list holds that are kept for lists to come; past it the
+/// least recently held half goes.
+const IDLE_SHARED: usize = 4096;
+
+/// A range of a host copy: the copy, the byte offset, the length.
+type SharedKey = (usize, u64, u64);
+
+/// Shared raw views of host copies (see [`HostHeap::shared_raw`]).
+#[derive(Default)]
+struct Shared {
+    index: HashMap<SharedKey, u32>,
+    entries: HashMap<u32, SharedView>,
+    /// Chunks of dynamic slots: first slot, the free slots in it.
+    chunks: Vec<(u32, Vec<u32>)>,
+    /// Entries no list holds.
+    idle: usize,
+    /// Counts lists giving views back, to tell how long ago an entry was
+    /// last held.
+    tick: u64,
+}
+
+struct SharedView {
+    key: SharedKey,
+    /// The lists holding it (not yet reset).
+    holders: u32,
+    /// When it was last given back.
+    last: u64,
+    /// The host copy it views: an entry whose copy is gone (the title
+    /// released the buffer) goes first.
+    copy: Weak<Shadow>,
+}
+
+// SAFETY: D3D12 descriptor heaps and resources are free-threaded; the rest
+// of the state is behind mutexes. Needed for XTP's own view heap, a static.
+unsafe impl Send for HostHeap {}
+// SAFETY: as above.
+unsafe impl Sync for HostHeap {}
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
@@ -128,6 +188,43 @@ impl HostHeap {
                 }
             }
         };
+        Self::from_heap(heap, kind, sampler, count, extra)
+    }
+
+    /// XTP's own view heap of `dynamic` dynamic slots and no title slots,
+    /// for lists that bind no view heap but read root SRVs.
+    pub(crate) fn own(dynamic: u32) -> Option<Self> {
+        let host = host()?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        // SAFETY: plain heap creation.
+        let made = unsafe {
+            host.device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: dynamic,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+        };
+        match made {
+            Ok(heap) => Self::from_heap(heap, kind, false, 0, dynamic),
+            Err(e) => {
+                tracing::warn!(error = %e, dynamic, "no view heap of XTP's own");
+                None
+            }
+        }
+    }
+
+    /// A host heap around `heap`: `count` title slots, then `extra`
+    /// dynamic ones, every slot made null.
+    fn from_heap(
+        heap: ID3D12DescriptorHeap,
+        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+        sampler: bool,
+        count: u32,
+        extra: u32,
+    ) -> Option<Self> {
+        let host = host()?;
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -135,7 +232,7 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
+        tracing::debug!(count, extra, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -153,7 +250,14 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            slots: Mutex::new(Slots {
+                next: 0,
+                taken: vec![false; extra as usize],
+                used: 0,
+                peak: 0,
+            }),
+            shared: Mutex::default(),
+            null_raw: OnceLock::new(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -236,16 +340,51 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// [`HostHeap::release`]: the first's index. When none are free, the
+    /// shared views no list holds give theirs back first.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        if let Some(first) = self.take(n) {
+            return Some(first);
+        }
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        {
+            let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            let idle = shared.idle;
+            if idle > 0 {
+                self.evict(&mut shared, idle);
+            }
+        }
+        let first = self.take(n);
+        if first.is_none() {
+            static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let failed = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if failed.is_power_of_two() {
+                let (used, peak) = self.dynamic_use();
+                tracing::warn!(
+                    n,
+                    used,
+                    peak,
+                    of = self.dynamic,
+                    failed,
+                    "no free dynamic descriptor slots: a table or view is not made"
+                );
+            }
+        }
+        first
+    }
+
+    /// [`HostHeap::dynamic`] without taking shared views' slots back.
+    fn take(&self, n: u32) -> Option<u32> {
+        if self.sampler || n == 0 || n > self.dynamic {
+            return None;
+        }
+        let mut guard = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let s = &mut *guard;
         let n = n as usize;
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        let starts = (s.next as usize..self.dynamic as usize).chain(0..s.next as usize);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -255,22 +394,35 @@ impl HostHeap {
                 run = 0;
             }
             last = at;
-            run = if taken[at] { 0 } else { run + 1 };
+            run = if s.taken[at] { 0 } else { run + 1 };
             if run == n {
                 found = Some(at + 1 - n);
                 break;
             }
         }
-        let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
-            });
-            return None;
-        };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
+        let first = found?;
+        s.taken[first..first + n].fill(true);
+        s.next = ((first + n) % self.dynamic as usize) as u32;
+        s.used += n as u32;
+        if s.used > s.peak {
+            // Logged at each new eighth of the range.
+            let eighth = |v: u32| u64::from(v) * 8 / u64::from(self.dynamic);
+            if eighth(s.used) > eighth(s.peak) {
+                tracing::info!(
+                    peak = s.used,
+                    of = self.dynamic,
+                    "dynamic descriptor slots: a new peak in use"
+                );
+            }
+            s.peak = s.used;
+        }
         Some(self.count + first as u32)
+    }
+
+    /// The dynamic slots taken now, and the most ever taken at once.
+    pub(crate) fn dynamic_use(&self) -> (u32, u32) {
+        let s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        (s.used, s.peak)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -283,15 +435,168 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[cfg(test)]
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
+        self.release_all(&[(first, n)]);
+    }
+
+    /// Gives back each range `(first, n)` of dynamic slots (indices
+    /// [`HostHeap::dynamic`] returned), under one lock.
+    pub(crate) fn release_all(&self, ranges: &[(u32, u32)]) {
+        if ranges.is_empty() {
             return;
-        };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
         }
+        let mut guard = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let s = &mut *guard;
+        for &(first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end = (at.saturating_add(n)).min(self.dynamic) as usize;
+            if let Some(slots) = s.taken.get_mut(at as usize..end) {
+                let freed = slots.iter().filter(|&&t| t).count() as u32;
+                slots.fill(false);
+                s.used -= freed;
+            }
+        }
+    }
+
+    /// A raw view of `len` bytes of `copy` from byte `offset` (a multiple
+    /// of 16; see [`HostHeap::raw_at`]): its slot, shared by every list
+    /// that asks for the same range and held once more for the caller
+    /// until [`HostHeap::give_back`]. Shared views are made once, not once
+    /// per list, which spares the dynamic slots: a capped heap (NVIDIA) has
+    /// 2^16 of them for every list's fresh tables too. `None` if no slot is
+    /// free.
+    pub(crate) fn shared_raw(&self, copy: &Arc<Shadow>, offset: u64, len: u64) -> Option<u32> {
+        let key = (copy.buffer.as_raw() as usize, offset, len);
+        let mut guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let s = &mut *guard;
+        if let Some(&slot) = s.index.get(&key)
+            && let Some(entry) = s.entries.get_mut(&slot)
+        {
+            if entry.holders == 0 {
+                s.idle -= 1;
+            }
+            entry.holders += 1;
+            return Some(slot);
+        }
+        let slot = match self.shared_slot(s) {
+            Some(slot) => slot,
+            None => {
+                let idle = s.idle;
+                self.evict(s, idle);
+                self.shared_slot(s)?
+            }
+        };
+        self.raw_at(slot, &copy.buffer, offset, len);
+        s.index.insert(key, slot);
+        s.entries.insert(
+            slot,
+            SharedView {
+                key,
+                holders: 1,
+                last: s.tick,
+                copy: Arc::downgrade(copy),
+            },
+        );
+        Some(slot)
+    }
+
+    /// A free slot of the shared views' chunks, taking a new chunk if
+    /// they have none.
+    fn shared_slot(&self, s: &mut Shared) -> Option<u32> {
+        if let Some(slot) = s.chunks.iter_mut().find_map(|(_, free)| free.pop()) {
+            return Some(slot);
+        }
+        let first = self.take(SHARED_CHUNK)?;
+        // Handed out from the chunk's start.
+        s.chunks
+            .push((first, (first + 1..first + SHARED_CHUNK).rev().collect()));
+        Some(first)
+    }
+
+    /// The lists giving back shared views they held (slots
+    /// [`HostHeap::shared_raw`] returned), under one lock. Views no list
+    /// holds stay for later lists, up to [`IDLE_SHARED`] of them.
+    pub(crate) fn give_back(&self, slots: &[u32]) {
+        if slots.is_empty() {
+            return;
+        }
+        let mut guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let s = &mut *guard;
+        s.tick += 1;
+        for slot in slots {
+            if let Some(entry) = s.entries.get_mut(slot)
+                && entry.holders > 0
+            {
+                entry.holders -= 1;
+                if entry.holders == 0 {
+                    entry.last = s.tick;
+                    s.idle += 1;
+                }
+            }
+        }
+        if s.idle > IDLE_SHARED {
+            let n = s.idle - IDLE_SHARED / 2;
+            self.evict(s, n);
+        }
+    }
+
+    /// Drops `n` shared views no list holds: those whose host copy is gone
+    /// first, then the least recently held. Chunks left empty go back to
+    /// the dynamic slots.
+    fn evict(&self, s: &mut Shared, n: usize) {
+        let mut idle: Vec<(bool, u64, u32)> = s
+            .entries
+            .iter()
+            .filter(|(_, e)| e.holders == 0)
+            .map(|(&slot, e)| (e.copy.strong_count() > 0, e.last, slot))
+            .collect();
+        idle.sort_unstable();
+        for &(_, _, slot) in idle.iter().take(n) {
+            let Some(entry) = s.entries.remove(&slot) else {
+                continue;
+            };
+            s.index.remove(&entry.key);
+            s.idle -= 1;
+            // Nothing reads it (every list that held it was reset): made
+            // null, it no longer holds the host copy.
+            self.null_raw_at(slot);
+            if let Some((_, free)) = s
+                .chunks
+                .iter_mut()
+                .find(|(first, _)| (*first..*first + SHARED_CHUNK).contains(&slot))
+            {
+                free.push(slot);
+            }
+        }
+        let mut empty = Vec::new();
+        s.chunks.retain(|(first, free)| {
+            let whole = free.len() == SHARED_CHUNK as usize;
+            if whole {
+                empty.push((*first, SHARED_CHUNK));
+            }
+            !whole
+        });
+        self.release_all(&empty);
+    }
+
+    /// The shared views (all, and those no list holds).
+    #[cfg(test)]
+    pub(crate) fn shared_count(&self) -> (usize, usize) {
+        let s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        (s.entries.len(), s.idle)
+    }
+
+    /// A slot holding a raw view that reads zeros, the same for every list
+    /// (never given back); `None` if no slot is free.
+    pub(crate) fn null_raw(&self) -> Option<u32> {
+        *self.null_raw.get_or_init(|| {
+            let slot = self.dynamic(1)?;
+            self.null_raw_at(slot);
+            Some(slot)
+        })
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1051,6 +1356,74 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// The peak of dynamic slots in use is kept, and ranges go back in one
+    /// batch.
+    #[test]
+    fn dynamic_slots_count_their_peak_and_go_back_in_a_batch() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let a = heap.dynamic(10).unwrap();
+        let b = heap.dynamic(1).unwrap();
+        let c = heap.dynamic(5).unwrap();
+        assert_eq!(heap.dynamic_use(), (16, 16));
+        heap.release_all(&[(a, 10), (c, 5)]);
+        assert_eq!(heap.dynamic_use(), (1, 16));
+        // Given back twice, or past the end: counted once.
+        heap.release_all(&[(b, 1), (b, 1), (4 + heap.dynamic - 1, 5)]);
+        assert_eq!(heap.dynamic_use(), (0, 16));
+        assert_eq!(
+            heap.dynamic(16),
+            Some(c + 5),
+            "the search goes on from the last"
+        );
+    }
+
+    /// A shared raw view is made once per range and host copy; views no
+    /// list holds stay for later lists and give their slots back when a
+    /// table needs room.
+    #[test]
+    fn shared_views_are_made_once_and_make_room_when_slots_run_out() {
+        use crate::testgpu::TitleBuffer;
+        let test =
+            "descriptor::host::tests::shared_views_are_made_once_and_make_room_when_slots_run_out";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let heap = HostHeap::new(false, 4).expect("a host view heap");
+        let buffer = TitleBuffer::new(1 << 16);
+        let copy = buffer.shadow();
+        let a = heap.shared_raw(&copy, 0, 64).unwrap();
+        assert_eq!(heap.shared_raw(&copy, 0, 64), Some(a), "the same range");
+        let b = heap.shared_raw(&copy, 16, 48).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(heap.shared_count(), (2, 0));
+        // One chunk taken for both.
+        assert_eq!(heap.dynamic_use().0, SHARED_CHUNK);
+        heap.give_back(&[a, b]);
+        assert_eq!(heap.shared_count(), (2, 1), "a is held once more");
+        heap.give_back(&[a]);
+        assert_eq!(heap.shared_count(), (2, 2));
+        assert_eq!(
+            heap.shared_raw(&copy, 0, 64),
+            Some(a),
+            "kept for later lists"
+        );
+        heap.give_back(&[a]);
+        // Every other slot taken: the next table takes the idle views' chunk.
+        let rest = heap.dynamic(heap.dynamic - SHARED_CHUNK).unwrap();
+        assert_eq!(heap.dynamic(SHARED_CHUNK), Some(4));
+        assert_eq!(heap.shared_count(), (0, 0));
+        assert_eq!(heap.dynamic_use().0, heap.dynamic);
+        heap.release_all(&[(rest, heap.dynamic - SHARED_CHUNK), (4, SHARED_CHUNK)]);
+        // A view a list holds is never taken back.
+        let held = heap.shared_raw(&copy, 0, 64).unwrap();
+        while heap.take(SHARED_CHUNK).is_some() {}
+        assert_eq!(heap.dynamic(SHARED_CHUNK), None);
+        assert_eq!(heap.shared_count(), (1, 0));
+        heap.give_back(&[held]);
     }
 
     /// A root SRV's one-view table (VIctory #493): a shader reading 64

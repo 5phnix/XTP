@@ -148,17 +148,86 @@ fn mirror(handle: u64) {
     }
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// What a list holds in host view heaps, by heap: the title heap's
+/// address, or [`OWN_VIEW_HEAP`].
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
+#[derive(Default)]
+pub(crate) struct Held {
+    /// Dynamic slot ranges of its own: heap, first, count.
+    pub(crate) ranges: Vec<(usize, u32, u32)>,
+    /// Shared views it holds (see [`host::HostHeap::shared_raw`]): heap,
+    /// slot.
+    pub(crate) shared: Vec<(usize, u32)>,
+}
+
+/// The key of XTP's own view heap in [`Held`] (no title heap is at this
+/// address).
+#[cfg(windows)]
+pub(crate) const OWN_VIEW_HEAP: usize = usize::MAX;
+
+/// Dynamic slots in XTP's own view heap: root SRV tables of lists that
+/// bind no view heap.
+#[cfg(windows)]
+const OWN_DYNAMIC: u32 = 1 << 14;
+
+/// XTP's own view heap (made on first use), for lists that bind no view
+/// heap of the title's but read root SRVs, which are bound as tables.
+#[cfg(windows)]
+pub(crate) fn own_view_heap() -> Option<&'static host::HostHeap> {
+    static OWN: std::sync::OnceLock<Option<host::HostHeap>> = std::sync::OnceLock::new();
+    OWN.get_or_init(|| host::HostHeap::own(OWN_DYNAMIC))
+        .as_ref()
+}
+
+/// Gives back what a list held, in one batch per heap: each host heap is
+/// locked once, not once per range. Heaps the title released since are
+/// passed over (their slots went with them).
+#[cfg(windows)]
+pub(crate) fn give_back(held: &mut Held) {
+    if held.ranges.is_empty() && held.shared.is_empty() {
+        return;
     }
+    // Usually one heap or two.
+    let mut keys: Vec<usize> = held
+        .ranges
+        .iter()
+        .map(|r| r.0)
+        .chain(held.shared.iter().map(|s| s.0))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    // Held throughout: a heap's drop waits for it, so a live one stays so.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for key in keys {
+        let host = if key == OWN_VIEW_HEAP {
+            own_view_heap()
+        } else if heaps.iter().any(|&(_, _, h)| h == key) {
+            // SAFETY: registered heaps are live (removed when dropped).
+            unsafe { &*(key as *const Heap) }
+                .host
+                .get()
+                .and_then(Option::as_ref)
+        } else {
+            None
+        };
+        let Some(host) = host else { continue };
+        let ranges: Vec<(u32, u32)> = held
+            .ranges
+            .iter()
+            .filter(|r| r.0 == key)
+            .map(|&(_, first, n)| (first, n))
+            .collect();
+        host.release_all(&ranges);
+        let shared: Vec<u32> = held
+            .shared
+            .iter()
+            .filter(|s| s.0 == key)
+            .map(|s| s.1)
+            .collect();
+        host.give_back(&shared);
+    }
+    held.ranges.clear();
+    held.shared.clear();
 }
 
 #[cfg(windows)]
@@ -665,6 +734,44 @@ static FUNCTIONS: Table<24> = {
     f[10] = start as *const (); // 0x50 GPU
     Table(f)
 };
+
+/// A shader-visible title view heap for tests, released when dropped.
+#[cfg(all(test, windows))]
+pub(crate) struct TestHeap(pub(crate) This);
+
+#[cfg(all(test, windows))]
+impl TestHeap {
+    /// A heap of `count` view slots, made as the title makes one.
+    pub(crate) fn views(count: u32) -> TestHeap {
+        /// What newer titles pass, so that reading the placement stays
+        /// inside the value.
+        #[repr(C)]
+        struct Extended(HeapDesc, Placement);
+        let extended = Extended(
+            HeapDesc {
+                kind: VIEWS_KIND,
+                count,
+                flags: SHADER_VISIBLE,
+                nodes: 0,
+            },
+            Placement {
+                address: 0,
+                size: 0,
+            },
+        );
+        let mut out = std::ptr::null();
+        let made = create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut out);
+        assert_eq!(made, crate::object::S_OK, "a title view heap");
+        TestHeap(out)
+    }
+}
+
+#[cfg(all(test, windows))]
+impl Drop for TestHeap {
+    fn drop(&mut self) {
+        release(self.0);
+    }
+}
 
 #[cfg(test)]
 mod tests {

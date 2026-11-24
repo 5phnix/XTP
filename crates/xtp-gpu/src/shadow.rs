@@ -486,6 +486,19 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// The title buffers holding `address`, innermost first (the one [`find`]
+/// copies), as (start, length); none for memory outside every buffer,
+/// which [`find`] copies in windows. For logs: it makes no copy.
+pub(crate) fn holders(address: u64) -> Vec<(u64, u64)> {
+    buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .filter(|(_, e)| e.end > address)
+        .map(|(k, e)| (k.0, e.end - k.0))
+        .collect()
+}
+
 /// The copy [`find`] gives `[address, address + len)`, if it is made
 /// already.
 pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
