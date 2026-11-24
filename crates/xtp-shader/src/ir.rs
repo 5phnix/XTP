@@ -14,12 +14,20 @@
 //! M0-relative VGPR access (`v_movrels/d/sd_b32`, `v_swaprel_b32`) names its
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
+//!
+//! Scalars the console compiler parks in lanes of a VGPR come back as
+//! scalar moves to registers past the machine's ([`PARKED`]), where that
+//! keeps what every lane reads (`unspill`).
+
+mod unspill;
 
 use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
-/// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
+/// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC. Codes from
+/// [`PARKED`] up are scalars the compiler parked in VGPR lanes (`unspill`):
+/// no machine instruction names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Reg {
     S(u8),
@@ -30,6 +38,8 @@ pub enum Reg {
 pub const VCC: u8 = 106;
 pub const M0: u8 = 124;
 pub const EXEC: u8 = 126;
+/// The first scalar code past the machine's (0-127): see [`Reg`].
+pub const PARKED: u8 = 128;
 
 /// An SSA value: the content of one register dword (SCC: one bit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -124,9 +134,6 @@ impl Inst {
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
     let list = gfx10::decode(code)?;
-    let lanes = 1 + u8::from(wave64);
-    let isa = |offset, reason| ShaderError::Isa { offset, reason };
-
     let mut flows = Vec::with_capacity(list.len());
     let mut leaders = vec![0];
     for (i, inst) in list.iter().enumerate() {
@@ -145,6 +152,43 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     }
     leaders.sort_unstable();
     leaders.dedup();
+
+    // Parked scalars as scalar moves; the lanes where that would change
+    // what a lane reads stay parked, and the program is built again
+    // without them (each round parks at least one more lane back).
+    let mut kept = Vec::new();
+    loop {
+        let mut moved = list.clone();
+        let parked = unspill::rewrite(&mut moved, &leaders, wave64, vgprs, &kept);
+        if parked.moves.is_empty() {
+            break;
+        }
+        let Ok(p) = assemble(moved, &flows, &leaders, &parked.moves, wave64, vgprs) else {
+            break;
+        };
+        let unsound = unspill::unsound(&p, &parked);
+        if unsound.is_empty() {
+            return Ok(p);
+        }
+        kept.extend(unsound);
+    }
+    assemble(list, &flows, &leaders, &[], wave64, vgprs)
+}
+
+/// The SSA form of the decoded `list`, whose control flow `flows` and
+/// block `leaders` give; the instructions `moves` names are parked
+/// scalars' moves (`unspill`), whose register codes the machine word may
+/// not hold.
+fn assemble(
+    list: Vec<Instruction>,
+    flows: &[Flow],
+    leaders: &[usize],
+    moves: &[unspill::Move],
+    wave64: bool,
+    vgprs: u16,
+) -> Result<Program, ShaderError> {
+    let lanes = 1 + u8::from(wave64);
+    let isa = |offset, reason| ShaderError::Isa { offset, reason };
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
@@ -164,13 +208,16 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
-    for ((machine, flow), next) in list.into_iter().zip(flows).zip(next_offsets) {
+    for (n, ((machine, &flow), next)) in list.into_iter().zip(flows).zip(next_offsets).enumerate() {
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
         })?;
-        let fields = machine.fields(wave64);
+        let mut fields = machine.fields(wave64);
+        if let Ok(k) = moves.binary_search_by_key(&n, |m| m.at) {
+            moves[k].put(&mut fields);
+        }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
         let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
         if ends {
@@ -272,23 +319,23 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
-/// SGPR codes 0-127, SCC, VGPRs 0-255.
-const REGS: usize = 128 + 1 + 256;
+/// Scalar codes 0-255 (from [`PARKED`] up: parked scalars), SCC, VGPRs 0-255.
+const REGS: usize = 256 + 1 + 256;
 type RegSet = [u64; REGS.div_ceil(64)];
 
 fn index(reg: Reg) -> usize {
     match reg {
         Reg::S(c) => usize::from(c),
-        Reg::Scc => 128,
-        Reg::V(r) => 129 + usize::from(r),
+        Reg::Scc => 256,
+        Reg::V(r) => 257 + usize::from(r),
     }
 }
 
 fn reg_at(i: usize) -> Reg {
     match i {
-        0..128 => Reg::S(i as u8),
-        128 => Reg::Scc,
-        _ => Reg::V((i - 129) as u8),
+        0..256 => Reg::S(i as u8),
+        256 => Reg::Scc,
+        _ => Reg::V((i - 257) as u8),
     }
 }
 
@@ -1007,11 +1054,13 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
     match *op {
         Operand::Scalar { code, .. } if code == gfx10::NULL => {}
         Operand::Scalar { code, dwords } => {
+            // A machine operand ends within the machine's codes, a parked
+            // scalar's within those past them (the last one stays free).
             let end = u16::from(code) + u16::from(dwords);
-            if end > 128 {
+            if end > if code < PARKED { 128 } else { 255 } {
                 return Err(());
             }
-            out.extend((code..end as u8).map(Reg::S));
+            out.extend((u16::from(code)..end).map(|c| Reg::S(c as u8)));
         }
         Operand::Vector { reg, dwords } => {
             if u16::from(reg) + u16::from(dwords) > 256 {
