@@ -803,7 +803,7 @@ fn writable(at: usize) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -830,7 +830,7 @@ mod tests {
     /// is the process's, and some tests need it at 0. Each test gives its
     /// guards back before it ends; what one that failed left guarded is
     /// given back here, so that none depends on the others.
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: Mutex<()> = Mutex::new(());
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         title_memory_remapped(0, usize::MAX);

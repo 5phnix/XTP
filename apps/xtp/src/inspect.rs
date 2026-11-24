@@ -1,13 +1,25 @@
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use xtp_hle::{HleResolver, HostPolicy};
+use xtp_loader::Provenance;
 use xtp_pe::implib::ImportLibrary;
 use xtp_pe::{ImageInfo, layout};
 
-pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
+use crate::survey::quote;
+
+pub fn run(file: &Path, list_imports: bool, list_exports: bool, json: bool) -> Result<()> {
     let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let info = ImageInfo::parse(&data).with_context(|| format!("parsing {}", file.display()))?;
+
+    if json {
+        let blake3 = blake3::hash(&data).to_hex().to_string();
+        let resolver = HleResolver::new(HostPolicy::default());
+        print!("{}", to_json(file, &blake3, &info, &resolver));
+        return Ok(());
+    }
 
     println!("file           {}", file.display());
     println!("blake3         {}", blake3::hash(&data).to_hex());
@@ -150,4 +162,67 @@ fn dll_flags(v: u16) -> String {
     } else {
         format!("  ({})", set.join(", "))
     }
+}
+
+fn resolution_name(class: Option<Provenance>) -> &'static str {
+    match class {
+        Some(Provenance::Hle) => "hle",
+        Some(Provenance::Host) => "host",
+        Some(Provenance::Title) => "title",
+        None => "missing",
+    }
+}
+
+/// Stable JSON summary of one PE image and how each import resolves.
+fn to_json(file: &Path, blake3: &str, info: &ImageInfo, resolver: &HleResolver) -> String {
+    let mut o = String::new();
+    let _ = writeln!(o, "{{");
+    let _ = writeln!(o, "  \"format\": \"xtp-inspect 1\",");
+    let _ = writeln!(o, "  \"file\": {},", quote(&file.display().to_string()));
+    let _ = writeln!(o, "  \"blake3\": {},", quote(blake3));
+    let _ = writeln!(
+        o,
+        "  \"kind\": {},",
+        quote(if info.is_dll() { "dll" } else { "exe" })
+    );
+    let _ = writeln!(o, "  \"machine\": \"{:#06x}\",", info.machine);
+    let _ = writeln!(o, "  \"subsystem\": {},", info.subsystem);
+    let _ = writeln!(o, "  \"image_base\": \"{:#x}\",", info.image_base);
+    let _ = writeln!(o, "  \"size_of_image\": {},", info.size_of_image);
+    let _ = writeln!(o, "  \"entry_rva\": \"{:#x}\",", info.entry_rva);
+
+    let mut rows: Vec<(String, String, bool, &'static str)> = Vec::new();
+    for (delay, list) in [(false, &info.imports), (true, &info.delay_imports)] {
+        for module in list {
+            for entry in &module.entries {
+                let res = resolution_name(resolver.classify(&module.dll, &entry.symbol));
+                rows.push((module.dll.clone(), entry.symbol.to_string(), delay, res));
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.0.to_ascii_lowercase()
+            .cmp(&b.0.to_ascii_lowercase())
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+
+    if rows.is_empty() {
+        let _ = writeln!(o, "  \"imports\": []");
+    } else {
+        let _ = writeln!(o, "  \"imports\": [");
+        for (i, (dll, sym, delay, res)) in rows.iter().enumerate() {
+            let comma = if i + 1 < rows.len() { "," } else { "" };
+            let _ = writeln!(
+                o,
+                "    {{\"dll\": {}, \"symbol\": {}, \"delay\": {delay}, \"resolution\": {}}}{comma}",
+                quote(dll),
+                quote(sym),
+                quote(res),
+            );
+        }
+        let _ = writeln!(o, "  ]");
+    }
+    let _ = writeln!(o, "}}");
+    o
 }

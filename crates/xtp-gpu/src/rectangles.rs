@@ -10,8 +10,9 @@
 //!    vertices `start..start + 3 * rects` reach past a bound per-vertex
 //!    vertex buffer draw nothing), allocates `rects * 6` vertices from the
 //!    list's scratch with an atomic counter, and writes a rewritten record
-//!    into the list's own arguments buffer. The title's arguments are left
-//!    as the clamp made them.
+//!    into the list's own arguments buffer. Its thread 0 writes the record
+//!    count there too: the title's, at most `max`. The title's arguments
+//!    are left as the clamp made them.
 //! 2. `rect_expand` runs once per per-vertex input slot and writes
 //!    `(v0, v1, v2, v0, v2, v3)` into that slot's scratch region, with
 //!    `v3 = v0 + v2 - v1` for the formats and in-stride components that
@@ -19,8 +20,8 @@
 //!    conversions, rounding: a test compares both byte for byte).
 //!
 //! `ExecuteIndirect` then reads only the list's own buffers: our arguments,
-//! in which records at or past the title's count are empty draws (so no
-//! count buffer, and no title buffer changes state), and the expanded
+//! with our record count as its count buffer (so records past the title's
+//! count do not run, and no title buffer changes state), and the expanded
 //! vertices. A list's scratch ([`Scratch`]) is reused by each of its
 //! indirect rectangle draws, and by later lists once its recording has
 //! gone.
@@ -32,13 +33,17 @@
 //! Ported from Marvisak/VIctory#346 (head 8ef6bfe) by BastienRodz, with
 //! fuzeofficlal's half rounding (`primitive.rs`). Changes in the port:
 //! - the list's memory is draw state's ([`crate::draw`]'s list memory),
-//!   not the host list's: one scratch per recording, pooled;
+//!   not the host list's: one scratch per recording, pooled, its buffers
+//!   made as draws need them (the vertex scratch for the first draw with a
+//!   per-vertex slot);
 //! - the allocation counter is the arguments buffer's first word, zeroed
 //!   in the list before each draw's rewrite pass (`WriteBufferImmediate`),
 //!   not by the CPU at submission: two rectangle draws of one list each
 //!   start from zero, whichever order the GPU sees the CPU's writes in;
-//! - a source vertex buffer is read 4 bytes short of its host copy's end:
-//!   an unaligned read takes the next word, and a root view has no bounds;
+//! - the record count is the arguments buffer's second word, so
+//!   `ExecuteIndirect` runs only the live records;
+//! - a source vertex buffer is read up to 4 bytes short of its host copy's
+//!   end (a margin: a root view has no bounds);
 //! - the fourth corner is computed `precise` (no reassociation), as the
 //!   CPU does it.
 //!
@@ -50,12 +55,19 @@
 //! vertex inputs, not vertex shader outputs; formats unknown to
 //! [`crate::primitive::components`] and components past the vertex stride
 //! keep the first vertex's bytes. A pipeline without per-vertex inputs (one
-//! that makes its corners from the vertex id) gets `6 * rects` vertices from
-//! 0, as a direct rectangle draw does. With inputs, the vertex id is the
-//! expanded one, from an allocated start whose order between records may
-//! change from run to run. Vertex strides not a multiple of 4 are padded to
-//! 4 bytes in the scratch (and bound with that stride), so that no two
-//! threads share a word.
+//! that makes its corners from the vertex id) draws each rectangle's first
+//! triangle: the record as the title wrote it, with `3 * rects` vertices, as
+//! a direct rectangle draw of such a pipeline does. Its fourth corner is not
+//! made (VIctory #255's remap would run the vertex shader for it). Its
+//! shader sees vertex ids that count from 0 in every record, as on the
+//! console: D3D12's `SV_VertexID` leaves out the start vertex (a test draws
+//! a record from vertex 6 with ids 0 to 2), and so does the console's v0,
+//! the start reaching a program only through a user SGPR that none of the
+//! title's vertex programs read (docs/analysis/drops.md §5.1.1). With inputs,
+//! the vertex id is the expanded one, from an allocated start whose order
+//! between records may change from run to run.
+//! Vertex strides not a multiple of 4 are padded to 4 bytes in the scratch
+//! (and bound with that stride), so that no two threads share a word.
 //!
 //! The rewrite pass bounds counts and instances itself, as the clamp does,
 //! so it stays safe whether or not the clamp wrote its results in place.
@@ -82,12 +94,24 @@ const MAX_RECORDS: u32 = 65535 * 64;
 /// Thread groups per dispatch dimension (D3D12's limit).
 const MAX_GROUPS_PER_DIM: u32 = 65535;
 
-/// The arguments buffer's first bytes: the allocation counter (one word,
-/// the rest padding); the rewritten records follow.
+/// The arguments buffer's first bytes: the allocation counter (a word), the
+/// record count `ExecuteIndirect` reads (a word at [`COUNT_OFFSET`]),
+/// padding; the rewritten records follow.
 const COUNTER_BYTES: u64 = 16;
 
-/// The arguments buffer's smallest size: 4,095 records.
-const ARGS_MIN: u64 = 64 << 10;
+/// Where the record count is in the arguments buffer.
+const COUNT_OFFSET: u64 = 4;
+
+/// The arguments buffer's smallest size (255 records), and the step it
+/// grows by.
+const ARGS_MIN: u64 = 4 << 10;
+
+/// The arguments buffer's largest size: [`MAX_RECORDS`] records.
+const ARGS_MAX: u64 = COUNTER_BYTES + MAX_RECORDS as u64 * 16;
+
+/// Arguments buffers larger than this are not pooled: they serve the list
+/// that needed them only.
+const ARGS_POOLED: u64 = 1 << 20;
 
 /// Scratches kept for later lists when no list holds them.
 const POOLED: usize = 16;
@@ -226,6 +250,12 @@ pub(crate) fn max_source_vertices(bounds: &[(u64, u32)]) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+/// The bytes of a source vertex buffer the expansion reads at most from
+/// `offset` in its host copy of `width` bytes: 4 short of the copy's end.
+pub(crate) fn readable_in(width: u64, offset: u64) -> u64 {
+    width.saturating_sub(offset).saturating_sub(4)
+}
+
 /// A dispatch grid `(x, y)` of at least `records` groups, each dimension
 /// within D3D12's limit.
 pub(crate) fn dispatch_grid(records: u32) -> (u32, u32) {
@@ -252,6 +282,8 @@ cbuffer Params : register(b0) {
 // attribute, so the root signatures are made in code.
 RWStructuredBuffer<uint> src_args : register(u0);
 RWStructuredBuffer<uint> count_buf : register(u1);
+// The arguments buffer's first words: the allocation counter, then the
+// record count ExecuteIndirect reads.
 RWStructuredBuffer<uint> alloc : register(u2);
 RWStructuredBuffer<uint> dst_args : register(u3);
 
@@ -265,14 +297,18 @@ void store4(uint at, uint4 v) {
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint r = id.x;
+    uint live = records;
+    if (has_count != 0u) {
+        live = min(count_buf[0], records);
+    }
+    if (r == 0u) {
+        alloc[1] = live;
+    }
     if (r >= records) return;
     uint dst_at = r * 4u;
-    if (has_count != 0u) {
-        uint live = count_buf[0];
-        if (r >= live) {
-            store4(dst_at, uint4(0u, 0u, 0u, 0u));
-            return;
-        }
+    if (r >= live) {
+        store4(dst_at, uint4(0u, 0u, 0u, 0u));
+        return;
     }
     uint at = r * (src_stride / 4u);
     uint4 rec = uint4(src_args[at], src_args[at + 1u], src_args[at + 2u], src_args[at + 3u]);
@@ -282,23 +318,24 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint rects = rec.x / 3u;
     uint src_verts = rects * 3u;
     uint out_verts = rects * 6u;
-    uint out_start = 0u;
+    // Empty unless it draws.
+    uint4 res = uint4(0u, rec.y, 0u, rec.w);
     if (rects == 0u || rec.y == 0u || rec.z > max_src_verts || src_verts > max_src_verts - rec.z) {
-        out_verts = 0u;
-    } else if (need_verts != 0u) {
-        if (out_verts > vert_capacity) {
-            out_verts = 0u;
-        } else {
-            uint before;
-            InterlockedAdd(alloc[0], out_verts, before);
-            if (before >= vert_capacity || out_verts > vert_capacity - before) {
-                out_verts = 0u;
-            } else {
-                out_start = before;
-            }
+        // Nothing, or vertices past a bound vertex buffer.
+    } else if (need_verts == 0u) {
+        // No per-vertex input, so the corners come from the vertex id: each
+        // rectangle's first triangle, from the title's start.
+        res.x = src_verts;
+        res.z = rec.z;
+    } else if (out_verts <= vert_capacity) {
+        uint before;
+        InterlockedAdd(alloc[0], out_verts, before);
+        if (before < vert_capacity && out_verts <= vert_capacity - before) {
+            res.x = out_verts;
+            res.z = before;
         }
     }
-    store4(dst_at, uint4(out_verts, rec.y, out_start, rec.w));
+    store4(dst_at, res);
 }
 "#;
 
@@ -662,19 +699,56 @@ fn make() -> windows::core::Result<Shaders> {
 }
 
 /// What one recording's indirect rectangle draws are expanded into: the
-/// vertex scratch, and the arguments buffer (the allocation counter, then
-/// the rewritten records). Taken by a list's draw state on its first such
-/// draw, given back ([`give_back`]) once the recording has gone.
+/// vertex scratch, and the arguments buffer (the allocation counter and
+/// the record count, then the rewritten records). Taken by a list's draw
+/// state on its first such draw, given back ([`give_back`]) once the
+/// recording has gone. Its buffers are made as draws need them.
 pub(crate) struct Scratch {
-    vertices: ID3D12Resource,
-    args: ID3D12Resource,
-    args_len: u64,
-    /// The states the list's commands so far leave them in: common when a
+    /// [`SCRATCH_BYTES`], made by the first draw with a per-vertex slot.
+    vertices: Option<Buffer>,
+    /// Made larger when a draw has more records.
+    args: Option<Buffer>,
+}
+
+/// One buffer of a [`Scratch`].
+struct Buffer {
+    resource: ID3D12Resource,
+    len: u64,
+    /// The state the list's commands so far leave it in: common when a
     /// recording starts (buffers decay to it when a submission ends).
-    vertices_state: D3D12_RESOURCE_STATES,
-    args_state: D3D12_RESOURCE_STATES,
-    /// Whether the host list keeps them (until its reset).
+    state: D3D12_RESOURCE_STATES,
+    /// Whether the host list keeps it (until its reset).
     kept: bool,
+}
+
+impl Buffer {
+    fn new(len: u64, what: &str) -> Option<Buffer> {
+        Some(Buffer {
+            resource: uav_buffer(len, what)?,
+            len,
+            state: D3D12_RESOURCE_STATE_COMMON,
+            kept: false,
+        })
+    }
+
+    /// Kept by `list` until its reset, once.
+    fn keep(&mut self, list: &HostList) {
+        if !self.kept {
+            list.keep(&self.resource);
+            self.kept = true;
+        }
+    }
+
+    /// Moves it to `to` (nothing if it is there).
+    fn to(&mut self, barriers: &mut Vec<D3D12_RESOURCE_BARRIER>, to: D3D12_RESOURCE_STATES) {
+        to_state(barriers, &self.resource, &mut self.state, to);
+    }
+
+    /// Its GPU address.
+    fn gpu(&self) -> u64 {
+        // SAFETY: a live buffer.
+        unsafe { self.resource.GetGPUVirtualAddress() }
+    }
 }
 
 // SAFETY: D3D12 resources are free-threaded.
@@ -683,12 +757,45 @@ unsafe impl Send for Scratch {}
 /// Scratches no list holds.
 static POOL: Mutex<Vec<Scratch>> = Mutex::new(Vec::new());
 
+/// Serializes the tests that look into [`POOL`] or take from it.
+#[cfg(test)]
+pub(crate) static POOL_TESTS: Mutex<()> = Mutex::new(());
+
+/// Whether `resource` is a buffer of a pooled scratch (tests).
+#[cfg(test)]
+pub(crate) fn pooled(resource: &ID3D12Resource) -> bool {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.iter()
+        .flat_map(|s| [&s.vertices, &s.args])
+        .flatten()
+        .any(|b| b.resource == *resource)
+}
+
+#[cfg(test)]
+impl Scratch {
+    /// Its arguments buffer, once made.
+    pub(crate) fn arguments(&self) -> Option<&ID3D12Resource> {
+        self.args.as_ref().map(|b| &b.resource)
+    }
+}
+
 /// Gives a recording's scratch back for later lists: its submissions have
-/// run, so its buffers are back in the common state.
+/// run, so its buffers are back in the common state. A large arguments
+/// buffer goes.
 pub(crate) fn give_back(mut scratch: Scratch) {
-    scratch.vertices_state = D3D12_RESOURCE_STATE_COMMON;
-    scratch.args_state = D3D12_RESOURCE_STATE_COMMON;
-    scratch.kept = false;
+    for b in [&mut scratch.vertices, &mut scratch.args]
+        .into_iter()
+        .flatten()
+    {
+        b.state = D3D12_RESOURCE_STATE_COMMON;
+        b.kept = false;
+    }
+    if scratch.args.as_ref().is_some_and(|a| a.len > ARGS_POOLED) {
+        scratch.args = None;
+    }
+    if scratch.vertices.is_none() && scratch.args.is_none() {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     if pool.len() < POOLED {
         pool.push(scratch);
@@ -738,40 +845,45 @@ fn uav_buffer(size: u64, what: &str) -> Option<ID3D12Resource> {
     Some(buffer)
 }
 
-/// The list's scratch, with room for `args_len` bytes of arguments: the one
-/// it holds, one from [`POOL`], or a new one.
+/// The size an arguments buffer of `len` bytes grows to for `needed`:
+/// twice as large at least (few remakes), in steps of [`ARGS_MIN`], at most
+/// [`ARGS_MAX`] (rounded up to a step).
+fn args_growth(len: u64, needed: u64) -> u64 {
+    needed
+        .max(len.saturating_mul(2))
+        .clamp(ARGS_MIN, ARGS_MAX.max(needed))
+        .next_multiple_of(ARGS_MIN)
+}
+
+/// The list's scratch, with room for `args_len` bytes of arguments and, if
+/// `vertices`, the vertex scratch: the one it holds, one from [`POOL`], or
+/// a new one.
 fn take_scratch<'a>(
     list: &HostList,
     held: &'a mut Option<Scratch>,
     args_len: u64,
+    vertices: bool,
 ) -> Option<&'a mut Scratch> {
-    if held.is_none() {
-        let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
-        *held = match pooled {
-            Some(s) => Some(s),
-            None => Some(Scratch {
-                vertices: uav_buffer(SCRATCH_BYTES, "vertices")?,
-                args: uav_buffer(ARGS_MIN, "arguments")?,
-                args_len: ARGS_MIN,
-                vertices_state: D3D12_RESOURCE_STATE_COMMON,
-                args_state: D3D12_RESOURCE_STATE_COMMON,
-                kept: false,
-            }),
-        };
+    let s = match held {
+        Some(s) => s,
+        None => {
+            let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            held.insert(pooled.unwrap_or(Scratch {
+                vertices: None,
+                args: None,
+            }))
+        }
+    };
+    let have = s.args.as_ref().map_or(0, |a| a.len);
+    if have < args_len {
+        // The list keeps a smaller one it used until its reset.
+        s.args = Some(Buffer::new(args_growth(have, args_len), "arguments")?);
     }
-    let s = held.as_mut()?;
-    if !s.kept {
-        list.keep(&s.vertices);
-        list.keep(&s.args);
-        s.kept = true;
+    if vertices && s.vertices.is_none() {
+        s.vertices = Some(Buffer::new(SCRATCH_BYTES, "vertices")?);
     }
-    if s.args_len < args_len {
-        // The list keeps the smaller one until its reset (it may have used it).
-        let len = args_len.next_power_of_two();
-        s.args = uav_buffer(len, "arguments")?;
-        s.args_len = len;
-        s.args_state = D3D12_RESOURCE_STATE_COMMON;
-        list.keep(&s.args);
+    for b in [&mut s.vertices, &mut s.args].into_iter().flatten() {
+        b.keep(list);
     }
     Some(s)
 }
@@ -791,10 +903,12 @@ fn to_state(
 
 /// An expanded indirect rectangle draw, ready for `ExecuteIndirect`.
 pub(crate) struct Prepared {
-    /// The rewritten records (stride 16, no count buffer) and where they
-    /// start.
+    /// The rewritten records (stride 16), at most `max`, and where they
+    /// start; the record count is in the same buffer, at `count_offset`.
     pub(crate) args: ID3D12Resource,
     pub(crate) offset: u64,
+    pub(crate) count_offset: u64,
+    pub(crate) max: u32,
     /// The expanded per-vertex slots.
     views: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>,
 }
@@ -828,8 +942,9 @@ struct Source {
 /// bytes, stride) by slot) expanded. On success the compute root signature
 /// and pipeline are ours: the caller binds its draw, then
 /// [`Prepared::bind_vertices`], then runs `ExecuteIndirect` on
-/// [`Prepared::args`] with stride 16 and no count buffer. On error nothing
-/// was recorded.
+/// [`Prepared::args`] with stride 16, the same buffer as its count buffer.
+/// The list's recording must hold `held` until it has gone. On error
+/// nothing was recorded.
 pub(crate) fn expand(
     list: &HostList,
     held: &mut Option<Scratch>,
@@ -863,10 +978,15 @@ pub(crate) fn expand(
         let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
             return Err("rectangle vertex buffer outside title buffers");
         };
-        // An unaligned read takes the next word: 4 bytes short of the host
-        // copy's end, past which a root view reads anything.
+        // Within the view, and in the host copy, which is larger than the
+        // title buffer (rounded up to 64 KiB): every word the expansion
+        // reads holds a byte of the vertices it needs, so the copy's end
+        // would do; 4 bytes short of it are a margin, as a root view has
+        // no bounds.
+        // SAFETY: a live buffer.
+        let width = unsafe { shadow.buffer.GetDesc() }.Width;
         let readable = u64::from(size)
-            .min(shadow.left(address).saturating_sub(4))
+            .min(readable_in(width, shadow.offset(address)))
             .min(u64::from(u32::MAX - 3));
         bounds.push((readable, slot_stride));
         sources.push(Source {
@@ -887,7 +1007,12 @@ pub(crate) fn expand(
         return Err("no rectangle expander");
     };
     let records_len = u64::from(max.max(1)) * 16;
-    let Some(scratch) = take_scratch(list, held, COUNTER_BYTES + records_len) else {
+    let need_vertices = !sources.is_empty();
+    let Some(scratch) = take_scratch(list, held, COUNTER_BYTES + records_len, need_vertices) else {
+        return Err("no scratch for rectangles");
+    };
+    let (Some(args_buffer), vertices_buffer) = (scratch.args.as_mut(), scratch.vertices.as_mut())
+    else {
         return Err("no scratch for rectangles");
     };
     // The element tables, written now; the GPU reads them when it runs.
@@ -925,13 +1050,7 @@ pub(crate) fn expand(
         return Err("not bounded (no clamp)");
     }
 
-    // SAFETY: live buffers.
-    let (args_gpu, vertices_gpu) = unsafe {
-        (
-            scratch.args.GetGPUVirtualAddress(),
-            scratch.vertices.GetGPUVirtualAddress(),
-        )
-    };
+    let args_gpu = args_buffer.gpu();
     let (counter, records) = (args_gpu, args_gpu + COUNTER_BYTES);
     let count_gpu = count.map_or(src_args, |(s, at)| s.gpu(at));
     let rewrite = [
@@ -940,25 +1059,18 @@ pub(crate) fn expand(
         u32::from(count.is_some()),
         max_src_verts,
         capacity,
-        u32::from(!sources.is_empty()),
+        u32::from(need_vertices),
         0,
         0,
     ];
     let mut barriers = Vec::new();
-    let copy_dest = D3D12_RESOURCE_STATE_COPY_DEST;
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    to_state(
-        &mut barriers,
-        &scratch.args,
-        &mut scratch.args_state,
-        copy_dest,
-    );
-    to_state(
-        &mut barriers,
-        &scratch.vertices,
-        &mut scratch.vertices_state,
-        uav,
-    );
+    args_buffer.to(&mut barriers, D3D12_RESOURCE_STATE_COPY_DEST);
+    let mut vertices = None;
+    if need_vertices && let Some(v) = vertices_buffer {
+        v.to(&mut barriers, uav);
+        vertices = Some(v);
+    }
     let l = &list.list;
     // SAFETY: an open list; our passes and buffers the list keeps (the
     // title's host copies through their refresh).
@@ -976,7 +1088,7 @@ pub(crate) fn expand(
             None,
         );
         barriers.clear();
-        to_state(&mut barriers, &scratch.args, &mut scratch.args_state, uav);
+        args_buffer.to(&mut barriers, uav);
         l.ResourceBarrier(&barriers);
         l.SetComputeRootSignature(&passes.rewrite.root);
         l.SetPipelineState(&passes.rewrite.pso);
@@ -988,7 +1100,8 @@ pub(crate) fn expand(
         l.Dispatch(max.div_ceil(64), 1, 1);
     }
     let mut views = Vec::with_capacity(sources.len());
-    if !sources.is_empty() {
+    if let Some(v) = &vertices {
+        let vertices_gpu = v.gpu();
         let (grid_x, grid_y) = dispatch_grid(max);
         // SAFETY: as above.
         unsafe {
@@ -1028,29 +1141,21 @@ pub(crate) fn expand(
         }
     }
     barriers.clear();
-    let (arguments_state, vertex_state) = (
-        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-    );
-    to_state(
-        &mut barriers,
-        &scratch.args,
-        &mut scratch.args_state,
-        arguments_state,
-    );
-    if !sources.is_empty() {
-        to_state(
+    // The records and their count, for `ExecuteIndirect`.
+    args_buffer.to(&mut barriers, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    if let Some(v) = vertices {
+        v.to(
             &mut barriers,
-            &scratch.vertices,
-            &mut scratch.vertices_state,
-            vertex_state,
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
         );
     }
     // SAFETY: an open list and buffers it keeps.
     unsafe { l.ResourceBarrier(&barriers) };
     Ok(Prepared {
-        args: scratch.args.clone(),
+        args: args_buffer.resource.clone(),
         offset: COUNTER_BYTES,
+        count_offset: COUNT_OFFSET,
+        max,
         views,
     })
 }
@@ -1058,6 +1163,7 @@ pub(crate) fn expand(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testgpu::{TitleBuffer, TitleList};
 
     fn input(slot: u32, offset: u32, format: u32, per_instance: bool) -> Input {
         Input {
@@ -1133,6 +1239,24 @@ mod tests {
         assert_eq!(max_source_vertices(&[]), u32::MAX);
         assert_eq!(max_source_vertices(&[(120, 12), (80, 16)]), 5);
         assert_eq!(max_source_vertices(&[(100, 0), (80, 16)]), 0);
+        // A view is read up to 4 bytes short of its host copy's end, not of
+        // its title buffer's: 72 bytes of vertices in a 64 KiB copy are all
+        // readable, from its start or from 8 bytes short of its end.
+        let width = 64 << 10;
+        assert_eq!(readable_in(width, 0).min(72), 72);
+        assert_eq!(readable_in(width, width - 8), 4);
+        assert_eq!(readable_in(width, width - 2), 0);
+    }
+
+    /// The arguments buffer starts small, doubles at least when it grows,
+    /// and stops at what the most records take.
+    #[test]
+    fn arguments_buffers_grow_by_doubling_up_to_the_most_records() {
+        assert_eq!(args_growth(0, COUNTER_BYTES + 16), ARGS_MIN);
+        assert_eq!(args_growth(ARGS_MIN, ARGS_MIN + 16), 2 * ARGS_MIN);
+        assert_eq!(args_growth(ARGS_MIN, 5 * ARGS_MIN + 1), 6 * ARGS_MIN);
+        assert_eq!(args_growth(48 << 20, 48 << 20 | 16), 64 << 20, "capped");
+        assert_eq!(args_growth(0, ARGS_MAX), 64 << 20);
     }
 
     #[test]
@@ -1260,52 +1384,173 @@ mod tests {
         ]
     }
 
+    /// The word `i` of `bytes` (zeros past them).
+    fn word(bytes: &[u8], i: usize) -> u32 {
+        let mut w = [0u8; 4];
+        for (k, b) in w.iter_mut().enumerate() {
+            *b = bytes.get(i * 4 + k).copied().unwrap_or(0);
+        }
+        u32::from_le_bytes(w)
+    }
+
+    /// A title buffer of `len` bytes starting with `bytes`, and its host
+    /// copy.
+    fn title_bytes(len: usize, bytes: &[u8]) -> (TitleBuffer, Arc<Shadow>) {
+        let buffer = TitleBuffer::new(len);
+        buffer.set_words(|i| word(bytes, i));
+        let copy = buffer.shadow();
+        (buffer, copy)
+    }
+
+    /// Title arguments holding `records`, and their host copy.
+    fn title_records(records: &[[u32; 4]]) -> (TitleBuffer, Arc<Shadow>) {
+        let bytes: Vec<u8> = records
+            .iter()
+            .flatten()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        title_bytes(bytes.len().max(256), &bytes)
+    }
+
+    /// What a list's indirect rectangle draws left in its scratch, read
+    /// back once the list has run.
+    struct Left {
+        /// The allocation counter and the record count `ExecuteIndirect`
+        /// reads.
+        counter: u32,
+        count: u32,
+        /// The first rewritten records.
+        records: Vec<[u32; 4]>,
+        /// The vertex scratch's bytes in the ranges asked for; none if it
+        /// was not made.
+        vertices: Option<Vec<Vec<u8>>>,
+    }
+
+    /// Runs `list` with copies of its scratch `held`: the first `records`
+    /// rewritten records and the vertex scratch's `ranges` (offset, bytes).
+    fn run_and_read(
+        list: &TitleList,
+        held: &mut Option<Scratch>,
+        records: usize,
+        ranges: &[(u64, usize)],
+    ) -> Left {
+        let host = host().expect("a device");
+        let l = list.host();
+        let scratch = held.as_mut().expect("the list's scratch");
+        let args_bytes = COUNTER_BYTES + 16 * records as u64;
+        let (out_args, out_args_data) = host.shared_buffer(args_bytes).expect("readback");
+        let mut barriers = Vec::new();
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let args = scratch.args.as_mut().expect("an arguments buffer");
+        args.to(&mut barriers, source);
+        let vertices = scratch.vertices.as_mut().map(|v| {
+            v.to(&mut barriers, source);
+            v.resource.clone()
+        });
+        let outs: Vec<(ID3D12Resource, *mut u8)> = match &vertices {
+            Some(_) => ranges
+                .iter()
+                .map(|&(_, len)| host.shared_buffer(len as u64).expect("readback"))
+                .collect(),
+            None => Vec::new(),
+        };
+        // SAFETY: an open list; live buffers, ranges inside them.
+        unsafe {
+            l.list.ResourceBarrier(&barriers);
+            l.list
+                .CopyBufferRegion(&out_args, 0, &args.resource, 0, args_bytes);
+            if let Some(v) = &vertices {
+                for (&(at, len), (out, _)) in ranges.iter().zip(&outs) {
+                    l.list.CopyBufferRegion(out, 0, v, at, len as u64);
+                }
+            }
+        }
+        list.run();
+        // SAFETY: the list has run; mapped buffers of these sizes.
+        unsafe {
+            let words = std::slice::from_raw_parts(out_args_data.cast::<u32>(), 4 + 4 * records);
+            Left {
+                counter: words[0],
+                count: words[1],
+                records: words[4..]
+                    .chunks(4)
+                    .map(|c| c.try_into().unwrap())
+                    .collect(),
+                vertices: vertices.map(|_| {
+                    ranges
+                        .iter()
+                        .zip(&outs)
+                        .map(|(&(_, len), &(_, data))| {
+                            std::slice::from_raw_parts(data, len).to_vec()
+                        })
+                        .collect()
+                }),
+            }
+        }
+    }
+
+    /// Gives the test's scratch back, as its recording's going would.
+    fn done(held: &mut Option<Scratch>) {
+        if let Some(s) = held.take() {
+            give_back(s);
+        }
+    }
+
+    /// Checks the six vertices a rectangle each of `rects` rectangles from
+    /// source vertex `from` became, starting at expanded vertex `at` of a
+    /// region with `dst_stride`-byte vertices, against
+    /// [`primitive::expand_rects`] (the first `stride` bytes of each).
+    fn check_expanded(
+        region: &[u8],
+        dst_stride: usize,
+        at: usize,
+        (source, stride, elements): (&[u8], usize, &[(u32, u32)]),
+        (from, rects): (usize, usize),
+        what: &str,
+    ) {
+        let mut expected = vec![0u8; rects * 6 * stride];
+        let src = &source[from * stride..(from + rects * 3) * stride];
+        primitive::expand_rects(src, &mut expected, stride, elements);
+        for (k, want) in expected.chunks(stride).enumerate() {
+            let got = &region[(at + k) * dst_stride..][..stride];
+            assert_eq!(got, want, "{what}: expanded vertex {k}");
+        }
+    }
+
     /// The whole expansion as a draw records it, on title buffers: clamp,
     /// counter, rewrite and expansion, twice in one list (the second draw's
     /// allocations start from zero again), compared with
     /// [`primitive::expand_rects`] byte for byte. Records: two rectangles
     /// from vertex 0; one from vertex 6 with 3 instances from 7; one past
     /// the vertex buffer; one without instances; one past the title's
-    /// count (4).
+    /// count (4), which is the count `ExecuteIndirect` reads.
     #[test]
     fn expansion_on_the_gpu_matches_the_cpus() {
-        use crate::testgpu::{TitleBuffer, TitleList};
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let test = "rectangles::tests::expansion_on_the_gpu_matches_the_cpus";
-        let Some(host) = crate::testgpu::device(test) else {
+        if crate::testgpu::device(test).is_none() {
             return;
-        };
+        }
         let source = rectangle_vertices();
-        let records: [[u32; 4]; 5] = [
+        let (args, args_copy) = title_records(&[
             [6, 1, 0, 0],
             [3, 3, 6, 7],
             [3, 1, 8, 0],
             [3, 0, 0, 0],
             [3, 1, 0, 0],
-        ];
-        let args = TitleBuffer::new(256);
-        let count = TitleBuffer::new(256);
-        let vertices = TitleBuffer::new(4096);
-        let words: Vec<u32> = records.iter().flatten().copied().collect();
-        args.set_words(|i| words.get(i).copied().unwrap_or(0));
-        count.set_words(|i| if i == 0 { 4 } else { 0 });
-        vertices.set_words(|i| {
-            source
-                .get(i * 4..i * 4 + 4)
-                .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
-        });
-        let (args_copy, count_copy) = (args.shadow(), count.shadow());
-        let _vertex_copy = vertices.shadow();
+        ]);
+        let (count, count_copy) = title_bytes(256, &4u32.to_le_bytes());
+        let (vertices, _vertex_copy) = title_bytes(4096, &source);
         let inputs = rectangle_inputs();
         let mut bound = [(0u64, 0u32, 0u32); 32];
         bound[0] = (vertices.address(), source.len() as u32, STRIDE as u32);
 
         let list = TitleList::new();
-        let l = list.host();
         let mut held = None;
-        let draw = |held: &mut Option<Scratch>| {
+        let mut draw = || {
             expand(
-                l,
-                held,
+                list.host(),
+                &mut held,
                 &inputs,
                 &bound,
                 (&args_copy, args.address(), 16, 5),
@@ -1313,56 +1558,24 @@ mod tests {
             )
             .expect("expanded")
         };
-        let first = draw(&mut held);
-        let second = draw(&mut held);
-        assert_eq!(first.offset, COUNTER_BYTES);
+        let first = draw();
+        let second = draw();
+        assert_eq!(
+            (first.offset, first.count_offset, first.max),
+            (COUNTER_BYTES, COUNT_OFFSET, 5)
+        );
         assert_eq!(first.views.len(), 1);
         assert_eq!(first.views[0].0, 0);
         assert_eq!(first.views[0].1.StrideInBytes, STRIDE as u32);
-        let scratch = held.as_mut().expect("the list's scratch");
-        // Read back what the second draw left.
-        let (out_args, out_args_data) = host.shared_buffer(256).expect("readback");
-        let (out_vertices, out_vertices_data) = host.shared_buffer(4096).expect("readback");
-        let mut barriers = Vec::new();
-        let source_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        to_state(
-            &mut barriers,
-            &scratch.args,
-            &mut scratch.args_state,
-            source_state,
-        );
-        to_state(
-            &mut barriers,
-            &scratch.vertices,
-            &mut scratch.vertices_state,
-            source_state,
-        );
-        // SAFETY: an open list; live buffers within their sizes.
-        unsafe {
-            l.list.ResourceBarrier(&barriers);
-            l.list
-                .CopyBufferRegion(&out_args, 0, &scratch.args, 0, COUNTER_BYTES + 5 * 16);
-            l.list
-                .CopyBufferRegion(&out_vertices, 0, &scratch.vertices, 0, 18 * STRIDE as u64);
-        }
-        list.run();
-        // SAFETY: the list has run; both are mapped buffers of these sizes.
-        let (counter, rewritten, expanded) = unsafe {
-            let words = std::slice::from_raw_parts(out_args_data.cast::<u32>(), 4 + 5 * 4);
-            let rewritten: Vec<[u32; 4]> = words[4..]
-                .chunks(4)
-                .map(|c| c.try_into().unwrap())
-                .collect();
-            (
-                words[0],
-                rewritten,
-                std::slice::from_raw_parts(out_vertices_data, 18 * STRIDE).to_vec(),
-            )
-        };
+        drop((first, second));
+        // What the second draw left.
+        let left = run_and_read(&list, &mut held, 5, &[(0, 18 * STRIDE)]);
         assert_eq!(
-            counter, 18,
+            left.counter, 18,
             "12 + 6 vertices, from zero for the second draw"
         );
+        assert_eq!(left.count, 4, "the title's count");
+        let rewritten = &left.records;
         assert_eq!(rewritten[0][0], 12);
         assert_eq!(rewritten[0][1], 1);
         assert_eq!(rewritten[0][3], 0);
@@ -1372,21 +1585,231 @@ mod tests {
         assert_eq!(rewritten[2][0], 0, "past the vertex buffer");
         assert_eq!(rewritten[3][0], 0, "no instance");
         assert_eq!(rewritten[4], [0; 4], "past the count");
+        let expanded = &left.vertices.expect("a vertex scratch")[0];
         let elements: Vec<(u32, u32)> = inputs.iter().map(|i| (i.offset, i.format)).collect();
         for (record, from, rects) in [(0, 0, 2), (1, 6, 1)] {
-            let mut expected = vec![0u8; rects * 6 * STRIDE];
-            let src = &source[from * STRIDE..(from + rects * 3) * STRIDE];
-            primitive::expand_rects(src, &mut expected, STRIDE, &elements);
-            let at = rewritten[record][2] as usize * STRIDE;
-            assert_eq!(
-                &expanded[at..at + rects * 6 * STRIDE],
-                &expected[..],
-                "record {record}"
+            check_expanded(
+                expanded,
+                STRIDE,
+                rewritten[record][2] as usize,
+                (&source, STRIDE, &elements),
+                (from, rects),
+                &format!("record {record}"),
             );
         }
-        drop(second);
-        if let Some(s) = held.take() {
-            give_back(s);
+        done(&mut held);
+    }
+
+    /// A vertex buffer of exactly three vertices draws its rectangle: the
+    /// source is bounded by its host copy (rounded up to 64 KiB), not 4
+    /// bytes short of the title buffer's end, which dropped the record.
+    #[test]
+    fn a_buffer_of_three_vertices_draws_its_rectangle() {
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let test = "rectangles::tests::a_buffer_of_three_vertices_draws_its_rectangle";
+        if crate::testgpu::device(test).is_none() {
+            return;
         }
+        let source = rectangle_vertices()[..3 * STRIDE].to_vec();
+        let (vertices, copy) = title_bytes(3 * STRIDE, &source);
+        // SAFETY: a live buffer.
+        let width = unsafe { copy.buffer.GetDesc() }.Width;
+        assert!(
+            width >= 3 * STRIDE as u64 + 4,
+            "a host copy of {width} bytes"
+        );
+        let (args, args_copy) = title_records(&[[3, 1, 0, 0]]);
+        let inputs = rectangle_inputs();
+        let mut bound = [(0u64, 0u32, 0u32); 32];
+        bound[0] = (vertices.address(), source.len() as u32, STRIDE as u32);
+        let list = TitleList::new();
+        let mut held = None;
+        expand(
+            list.host(),
+            &mut held,
+            &inputs,
+            &bound,
+            (&args_copy, args.address(), 16, 1),
+            None,
+        )
+        .expect("expanded");
+        let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
+        assert_eq!(left.records[0], [6, 1, 0, 0], "drawn");
+        assert_eq!(left.count, 1, "no title count: every record");
+        let elements: Vec<(u32, u32)> = inputs.iter().map(|i| (i.offset, i.format)).collect();
+        check_expanded(
+            &left.vertices.expect("a vertex scratch")[0],
+            STRIDE,
+            0,
+            (&source, STRIDE, &elements),
+            (0, 1),
+            "the rectangle",
+        );
+        done(&mut held);
+    }
+
+    /// A pipeline without per-vertex inputs (corners from the vertex id):
+    /// each live record draws its rectangles' first triangles, the record
+    /// as the title wrote it with `3 * rects` vertices (it was `6 * rects`
+    /// from vertex 0), no vertex scratch is made (a fresh scratch here, not
+    /// a pooled one that may have one), and the record count is the
+    /// title's, at most `max`.
+    #[test]
+    fn records_without_vertex_inputs_keep_their_start() {
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let test = "rectangles::tests::records_without_vertex_inputs_keep_their_start";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let (args, args_copy) = title_records(&[
+            [6, 2, 9, 1],
+            [4, 1, 30, 0],
+            [2, 1, 0, 0],
+            [3, 0, 4, 0],
+            [3, 1, 0, 0],
+        ]);
+        let (count, count_copy) = title_bytes(256, &9u32.to_le_bytes());
+        // Per instance only: the slot is not expanded, nor bounded.
+        let inputs = [input(1, 0, 16, true)];
+        let list = TitleList::new();
+        let mut held = Some(Scratch {
+            vertices: None,
+            args: None,
+        });
+        let prepared = expand(
+            list.host(),
+            &mut held,
+            &inputs,
+            &[(0, 0, 0); 32],
+            (&args_copy, args.address(), 16, 4),
+            Some((&count_copy, count.address())),
+        )
+        .expect("expanded");
+        assert!(prepared.views.is_empty());
+        assert!(
+            held.as_ref().is_some_and(|s| s.vertices.is_none()),
+            "no vertex scratch"
+        );
+        let left = run_and_read(&list, &mut held, 4, &[]);
+        assert!(left.vertices.is_none());
+        assert_eq!(
+            left.records,
+            [[6, 2, 9, 1], [3, 1, 30, 0], [0, 1, 0, 0], [0, 0, 0, 0]]
+        );
+        assert_eq!((left.count, left.counter), (4, 0), "9 at most 4");
+        done(&mut held);
+    }
+
+    /// Bytes of `n` vertices of one slot of the several-slot test, the
+    /// formats of [`several_slot_inputs`]: halves, unorm16 and unorm8 in
+    /// slot 0 (10-byte vertices), a half and unorm8 in slot 2 (6 bytes).
+    fn slot_vertices(slot: u32, n: usize) -> Vec<u8> {
+        const HALVES: [u16; 12] = [
+            0x3c00, 0x4000, 0x3800, 0xb800, 0x4200, 0x3555, 0x4b00, 0x2e66, 0xc100, 0x3e00, 0x0400,
+            0x5640,
+        ];
+        let half = |i: usize, j: usize| HALVES[(i * 5 + j * 7) % HALVES.len()].to_le_bytes();
+        let mut out = Vec::new();
+        for i in 0..n {
+            if slot == 0 {
+                out.extend(half(i, 0));
+                out.extend(half(i, 1));
+                out.extend(((i * 9973 + 1234) as u16).to_le_bytes());
+                out.extend(((i * 31337 + 4321) as u16).to_le_bytes());
+                out.extend([(i * 37 + 11) as u8, (i * 91 + 7) as u8]);
+            } else {
+                out.extend(half(i, 2));
+                out.extend([(i * 53) as u8, (i * 17 + 200) as u8, 255, (i * 3) as u8]);
+            }
+        }
+        out
+    }
+
+    /// Slot 0: R16G16_FLOAT at 0, R16G16_UNORM at 4, R8G8B8A8_UNORM at 8
+    /// (two components inside 10 bytes); slot 1 per instance; slot 2:
+    /// R16_FLOAT at 0, R8G8B8A8_UNORM at 2.
+    fn several_slot_inputs() -> Vec<Input> {
+        vec![
+            input(0, 0, 34, false),
+            input(0, 4, 35, false),
+            input(0, 8, 28, false),
+            input(1, 0, 16, true),
+            input(2, 0, 54, false),
+            input(2, 2, 28, false),
+        ]
+    }
+
+    /// Two per-vertex slots of strides 10 and 6 (padded to 12 and 8 in the
+    /// scratch), whose views start 2 and 1 bytes past a word, and a per
+    /// instance slot between them: each slot is expanded into its own
+    /// region, as [`primitive::expand_rects`] makes it.
+    #[test]
+    fn unaligned_slots_with_padded_strides_expand_as_on_the_cpu() {
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let test = "rectangles::tests::unaligned_slots_with_padded_strides_expand_as_on_the_cpu";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let (a, b) = (slot_vertices(0, 6), slot_vertices(2, 6));
+        let mut bytes = vec![0u8; 256];
+        bytes[2..2 + a.len()].copy_from_slice(&a);
+        bytes[97..97 + b.len()].copy_from_slice(&b);
+        let (vertices, _copy) = title_bytes(256, &bytes);
+        let (args, args_copy) = title_records(&[[3, 1, 3, 0], [6, 2, 0, 1]]);
+        let inputs = several_slot_inputs();
+        let mut bound = [(0u64, 0u32, 0u32); 32];
+        bound[0] = (vertices.address() + 2, a.len() as u32, 10);
+        bound[2] = (vertices.address() + 97, b.len() as u32, 6);
+        let list = TitleList::new();
+        let mut held = None;
+        let prepared = expand(
+            list.host(),
+            &mut held,
+            &inputs,
+            &bound,
+            (&args_copy, args.address(), 16, 2),
+            None,
+        )
+        .expect("expanded");
+        let (_, layouts) = scratch_layout(&[(0, 10), (2, 6)], SCRATCH_BYTES).expect("a layout");
+        let slots: Vec<(u32, u32)> = prepared
+            .views
+            .iter()
+            .map(|(slot, v)| (*slot, v.StrideInBytes))
+            .collect();
+        assert_eq!(slots, [(0, 12), (2, 8)]);
+        let ranges: Vec<(u64, usize)> = layouts
+            .iter()
+            .map(|l| (l.dst_offset, 18 * l.dst_stride as usize))
+            .collect();
+        let left = run_and_read(&list, &mut held, 2, &ranges);
+        assert_eq!(left.count, 2, "no title count: every record");
+        assert_eq!(left.counter, 18);
+        assert_eq!([left.records[0][0], left.records[1][0]], [6, 12]);
+        assert_eq!([left.records[0][1], left.records[1][1]], [1, 2]);
+        assert_eq!([left.records[0][3], left.records[1][3]], [0, 1]);
+        let regions = left.vertices.expect("a vertex scratch");
+        let elements = |slot: u32| -> Vec<(u32, u32)> {
+            inputs
+                .iter()
+                .filter(|i| i.slot == slot && !i.per_instance)
+                .map(|i| (i.offset, i.format))
+                .collect()
+        };
+        for (region, (source, stride, slot, dst_stride)) in
+            regions.iter().zip([(&a, 10, 0, 12), (&b, 6, 2, 8)])
+        {
+            for (record, from, rects) in [(0, 3, 1), (1, 0, 2)] {
+                check_expanded(
+                    region,
+                    dst_stride,
+                    left.records[record][2] as usize,
+                    (source, stride, &elements(slot)),
+                    (from, rects),
+                    &format!("slot {slot}, record {record}"),
+                );
+            }
+        }
+        done(&mut held);
     }
 }

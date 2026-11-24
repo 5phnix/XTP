@@ -5,8 +5,125 @@ use anyhow::{Context, Result};
 use crate::{Console, Unimplemented};
 
 #[cfg(windows)]
+struct RunTarget<'a> {
+    exe: PathBuf,
+    package_dir: &'a Path,
+    title: xtp_hle::runtime::Title,
+}
+
+#[cfg(windows)]
+fn resolve_target(path: &Path) -> Result<RunTarget<'_>> {
+    let folder = path.is_dir();
+    let package_dir = if folder {
+        path
+    } else {
+        path.parent().unwrap_or(Path::new("."))
+    };
+    let manifest_path = package_dir.join("MicrosoftGame.config");
+    let manifest = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            eprintln!("warning: could not read {}: {e}", manifest_path.display());
+            String::new()
+        }
+    };
+    let title = xtp_hle::runtime::Title::from_manifest(&manifest);
+    let exe = if folder {
+        pick_executable(package_dir, &title.executables)?
+    } else {
+        path.to_owned()
+    };
+    Ok(RunTarget {
+        exe,
+        package_dir,
+        title,
+    })
+}
+
+#[cfg(windows)]
+fn configured_executable(root: &Path, name: &str) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let path = Path::new(name);
+    anyhow::ensure!(is_exe(path), "expected an .exe extension");
+    anyhow::ensure!(
+        path.components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir)),
+        "expected a path inside the package"
+    );
+    let file = root.join(path).canonicalize()?;
+    let relative = file
+        .strip_prefix(root)
+        .context("resolves outside the package")?;
+    anyhow::ensure!(file.is_file(), "not a regular file");
+    Ok(relative.to_owned())
+}
+
+#[cfg(windows)]
+fn is_exe(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+}
+
+#[cfg(windows)]
+fn pick_executable(folder: &Path, configured: &[String]) -> Result<PathBuf> {
+    let root = folder
+        .canonicalize()
+        .with_context(|| format!("opening {}", folder.display()))?;
+    let mut candidates = Vec::new();
+    let mut skipped = Vec::new();
+    for name in configured {
+        match configured_executable(&root, name) {
+            Ok(path) => candidates.push(path),
+            Err(e) => skipped.push(format!("{name:?}: {e}")),
+        }
+    }
+    if candidates.is_empty() {
+        for entry in std::fs::read_dir(folder)
+            .with_context(|| format!("listing executables in {}", folder.display()))?
+        {
+            let entry = entry?;
+            if is_exe(&entry.path()) && entry.file_type()?.is_file() {
+                candidates.push(PathBuf::from(entry.file_name()));
+            }
+        }
+        if !skipped.is_empty() {
+            let details = skipped.join("\n  ");
+            if candidates.is_empty() {
+                anyhow::bail!(
+                    "no executable found in {}. MicrosoftGame.config entries skipped:\n  {details}",
+                    folder.display()
+                );
+            }
+            eprintln!(
+                "warning: using the top-level .exe search in {}. MicrosoftGame.config entries skipped:\n  {details}",
+                folder.display()
+            );
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [exe] => Ok(folder.join(exe)),
+        [] => anyhow::bail!("no executable found in {}", folder.display()),
+        _ => {
+            let names = candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>();
+            anyhow::bail!(
+                "multiple executables in {}. Pass one to xtp run:\n  {}",
+                folder.display(),
+                names.join("\n  ")
+            )
+        }
+    }
+}
+
+#[cfg(windows)]
 pub fn run(
-    exe: &Path,
+    target: &Path,
     unimplemented: Unimplemented,
     strict: bool,
     execute: bool,
@@ -34,7 +151,12 @@ pub fn run(
         bindings: input.bindings.clone(),
     })
     .map_err(|e| anyhow::anyhow!("[input] in the config: {e}"))?;
-    let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let RunTarget {
+        exe,
+        package_dir,
+        title,
+    } = resolve_target(target)?;
+    let original = std::fs::read(&exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = xtp_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match xtp_game::identify(&hash) {
@@ -50,7 +172,7 @@ pub fn run(
     // SAFETY: as above.
     unsafe { xtp_game::asserts::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
     xtp_hle::runtime::set_main_image(image.base());
-    xtp_hle::runtime::set_image_path(image.base(), exe);
+    xtp_hle::runtime::set_image_path(image.base(), &exe);
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -63,10 +185,6 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
-    // A missing manifest leaves id 0 and no storage quota.
-    let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
-    let title = xtp_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
         "title          {:08X}, storage {} ({} MB)",
@@ -75,7 +193,7 @@ pub fn run(
         title.storage_bytes >> 20
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
-    xtp_hle::modules::files::mount_at('G', title_dir);
+    xtp_hle::modules::files::mount_at('G', package_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     xtp_hle::modules::files::mount_at('T', &temp);
     xtp_hle::runtime::set_title(xtp_hle::runtime::Title { storage, ..title });
@@ -333,7 +451,105 @@ impl LoaderLock {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use std::fs;
     use std::sync::{Arc, Mutex};
+
+    use super::resolve_target;
+
+    #[test]
+    fn folder_prefers_the_configured_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("bin")).unwrap();
+        let selected = root.join("bin").join("Title & Tools.exe");
+        fs::write(&selected, []).unwrap();
+        fs::write(root.join("Helper.exe"), []).unwrap();
+        fs::write(
+            root.join("MicrosoftGame.config"),
+            r#"<Game><TitleId>2A</TitleId>
+              <!-- <ExecutableList><Executable Name="Helper.exe"/></ExecutableList> -->
+              <Other><Executable Name="Helper.exe"/></Other>
+              <ExecutableList><Executable DisplayName="A > B" Name = 'bin/Title &amp; Tools.exe'/>
+              </ExecutableList></Game>"#,
+        )
+        .unwrap();
+        let target = resolve_target(root).unwrap();
+        assert_eq!(target.exe, selected);
+        assert_eq!(target.package_dir, root);
+        assert_eq!(target.title.id, 42);
+    }
+
+    #[test]
+    fn folder_falls_back_to_its_only_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let exe = root.join("Only.EXE");
+        fs::write(&exe, []).unwrap();
+        fs::create_dir(root.join("not-a-file.exe")).unwrap();
+        assert_eq!(resolve_target(root).unwrap().exe, exe);
+        fs::write(
+            root.join("MicrosoftGame.config"),
+            r#"<Game><ExecutableList><Executable Name="missing.exe"/></ExecutableList></Game>"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_target(root).unwrap().exe, exe);
+    }
+
+    #[test]
+    fn ambiguous_folder_lists_candidates_and_accepts_an_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["B.exe", "A.exe"] {
+            fs::write(root.join(name), []).unwrap();
+        }
+        let error = resolve_target(root).err().unwrap().to_string();
+        assert!(error.ends_with("\n  A.exe\n  B.exe"), "{error}");
+        let exe = root.join("B.exe");
+        assert_eq!(resolve_target(&exe).unwrap().exe, exe);
+    }
+
+    #[test]
+    fn several_configured_executables_list_only_the_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["Tool.exe", "A.exe", "B.exe"] {
+            fs::write(root.join(name), []).unwrap();
+        }
+        fs::write(
+            root.join("MicrosoftGame.config"),
+            r#"<Game><ExecutableList><Executable Name="B.exe"/><Executable Name="A.exe"/>
+              <Executable Name="B.exe"/></ExecutableList></Game>"#,
+        )
+        .unwrap();
+        let error = resolve_target(root).err().unwrap().to_string();
+        assert!(error.ends_with("\n  A.exe\n  B.exe"), "{error}");
+    }
+
+    #[test]
+    fn empty_folder_does_not_follow_a_manifest_outside_the_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("package");
+        fs::create_dir(&root).unwrap();
+        fs::write(dir.path().join("Outside.exe"), []).unwrap();
+        fs::write(
+            root.join("MicrosoftGame.config"),
+            r#"<Game><ExecutableList><Executable Name="../Outside.exe"/><Executable Name="readme.txt"/>
+                <Executable Name="missing.exe"/></ExecutableList></Game>"#,
+        )
+        .unwrap();
+        let error = resolve_target(&root).err().unwrap().to_string();
+        assert!(error.contains("no executable found"), "{error}");
+        for reason in [
+            "Outside.exe",
+            "inside the package",
+            "readme.txt",
+            ".exe extension",
+            "missing.exe",
+        ] {
+            assert!(error.contains(reason), "{error}");
+        }
+        assert!(error.contains(root.to_str().unwrap()), "{error}");
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
