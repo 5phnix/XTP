@@ -18,8 +18,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, GetLastError, HANDLE, INVALID_HANDLE_VALUE, SetLastError,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_FREE,
-    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT, MEM_EXTENDED_PARAMETER,
+    MEM_FREE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
@@ -156,6 +156,7 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    note_virtual(kind, size, !at.is_null());
     if !at.is_null() {
         // Heaps over title memory (`xtp_gpu::uma`, with `XTP_UMA=1`) follow
         // what the title reserves and commits. Placeholders are left out:
@@ -271,18 +272,24 @@ fn hooks() -> [usize; 2] {
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
-    match hooks()[0] {
+    let block = match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
             // SAFETY: the title's own routine of this type.
             let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
             alloc(size, attributes)
         }
-    }
+    };
+    let kind = ledger::Kind::of_attributes(attributes, false);
+    ledger::note(|l| l.handed_out(kind, size as u64, block as usize));
+    block
 }
 
 /// See [`XMemAlloc`].
 pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
+    if !address.is_null() {
+        ledger::note(|l| l.given_back(false, address as usize));
+    }
     match hooks()[1] {
         0 => XMemFreeDefault(address, attributes),
         hook => {
@@ -295,6 +302,13 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+    let block = alloc_default(size, attributes);
+    let kind = ledger::Kind::of_attributes(attributes, true);
+    ledger::note(|l| l.handed_out(kind, size as u64, block as usize));
+    block
+}
+
+fn alloc_default(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
         return XMemVirtualAlloc(
             std::ptr::null_mut(),
@@ -332,6 +346,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
     }
+    ledger::note(|l| l.given_back(true, address as usize));
     if attributes & ALLOC_32BIT != 0 {
         free(address, 0, MEM_RELEASE);
         return;
@@ -383,6 +398,7 @@ pub extern "system" fn title_virtual_alloc(
 ) -> *mut c_void {
     // SAFETY: the title's own arguments, forwarded.
     let at = unsafe { VirtualAlloc(address, size, kind, protect) };
+    note_virtual(kind, size, !at.is_null());
     if !at.is_null() {
         let from = if address.is_null() {
             at.cast_const()
@@ -400,6 +416,18 @@ pub extern "system" fn title_virtual_alloc(
 /// The title's `VirtualFree`.
 pub extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     free(address, size, kind)
+}
+
+/// For the ledger: `size` bytes reserved or committed (host `kind`).
+fn note_virtual(kind: u32, size: usize, ok: bool) {
+    ledger::note(|l| {
+        if kind & MEM_RESERVE != 0 {
+            l.flowed(ledger::Kind::Reserve, size as u64, ok);
+        }
+        if kind & MEM_COMMIT != 0 {
+            l.flowed(ledger::Kind::Commit, size as u64, ok);
+        }
+    });
 }
 
 /// The host's `MEM_COALESCE_PLACEHOLDERS` (not in windows-sys).
@@ -433,6 +461,16 @@ fn free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     };
     if done {
         remapped(at, len);
+    }
+    if !placeholders {
+        ledger::note(|l| {
+            if kind & MEM_DECOMMIT != 0 {
+                l.flowed(ledger::Kind::Decommit, len as u64, done);
+            }
+            if kind & MEM_RELEASE != 0 {
+                l.flowed(ledger::Kind::Release, len as u64, done);
+            }
+        });
     }
     done.into()
 }
@@ -856,7 +894,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // BTP 6 asks for 6.1 GiB at once, which a busy host often
     // cannot commit (error 1450): pages are committed when first mapped or
     // written (`Section::commit`).
-    let section = match Section::new(n) {
+    let section = Section::new(n);
+    let bytes = (n * PAGE) as u64;
+    ledger::note(|l| l.handed_out(ledger::Kind::PhysicalPages, bytes, section.is_ok().into()));
+    let section = match section {
         Ok(section) => Arc::new(section),
         Err(error) => {
             tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -909,6 +950,8 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
             .filter_map(|p| table.table.remove(p))
             .collect()
     };
+    let bytes = (freed.len() * PAGE) as u64;
+    ledger::note(|l| l.freed(ledger::Kind::PhysicalPages, bytes));
     // Out of the lock: the last page of an allocation unmaps our view.
     drop(freed);
     1
@@ -1334,6 +1377,13 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
+    ledger::note(|l| {
+        l.budget = (
+            l.budget.0 + 1,
+            stats.title_limit as u64,
+            stats.title_used as u64,
+        )
+    });
     // SAFETY: checked non-null; the title passes room for the structure.
     unsafe { out.write(stats) };
     1
@@ -1358,6 +1408,229 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
             })
             .is_ok();
     moved.into()
+}
+
+/// The XMem ledger, a debugging aid off by default: with
+/// `XTP_XMEM_LEDGER=1`, what the title asks of XMem is counted by category
+/// (`XMemAlloc` by allocator id and memory type, the share our
+/// `XMemAllocDefault` serves, physical pages, virtual memory, the budget we
+/// report), and a line per category that changed is logged every 10 s: its
+/// calls, failures, frees, live and peak bytes, and bytes asked in all.
+/// `XMemAlloc` includes the committed resources of the title's device (its
+/// allocator id 128), whose memory comes from the title's own allocator
+/// hooks. Without the variable nothing is counted.
+pub(crate) mod ledger {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{LazyLock, Mutex};
+
+    /// Set (e.g. `XTP_XMEM_LEDGER=1`) to keep the ledger.
+    pub const ENV: &str = "XTP_XMEM_LEDGER";
+
+    /// What a line counts.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Kind {
+        /// `XMemAlloc`, whatever serves it (the title's hooks, else ours).
+        Alloc {
+            allocator: u8,
+            memory: u8,
+        },
+        /// What reaches our `XMemAllocDefault`, by the same keys.
+        Default {
+            allocator: u8,
+            memory: u8,
+        },
+        /// `XMemAllocatePhysicalPages`, in bytes of 64 KiB pages.
+        PhysicalPages,
+        /// `XMemVirtualAlloc` and the title's `VirtualAlloc`, reserved and
+        /// committed; `VirtualFree` decommits and releases.
+        Reserve,
+        Commit,
+        Decommit,
+        Release,
+    }
+
+    impl Kind {
+        /// `XMemAlloc` attributes: allocator id at bit 16 (8 bits), memory
+        /// type at bit 29 (4 bits).
+        pub fn of_attributes(attributes: u64, default: bool) -> Kind {
+            let allocator = (attributes >> 16) as u8;
+            let memory = (attributes >> 29 & 0xf) as u8;
+            if default {
+                Kind::Default { allocator, memory }
+            } else {
+                Kind::Alloc { allocator, memory }
+            }
+        }
+
+        fn name(self) -> String {
+            match self {
+                Kind::Alloc { allocator, memory } => {
+                    format!("XMemAlloc allocator {allocator} memory {memory}")
+                }
+                Kind::Default { allocator, memory } => {
+                    format!("XMemAllocDefault allocator {allocator} memory {memory}")
+                }
+                Kind::PhysicalPages => "physical pages".into(),
+                Kind::Reserve => "virtual reserve".into(),
+                Kind::Commit => "virtual commit".into(),
+                Kind::Decommit => "virtual decommit".into(),
+                Kind::Release => "virtual release".into(),
+            }
+        }
+    }
+
+    /// Running totals of one kind.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Totals {
+        pub calls: u64,
+        pub failed: u64,
+        pub frees: u64,
+        /// Bytes handed out and not yet freed, and their highest.
+        pub live: u64,
+        pub peak: u64,
+        /// Bytes asked for in all.
+        pub asked: u64,
+    }
+
+    /// Every kind's totals, and the live blocks that a free gives back, by
+    /// route (ours: `XMemAllocDefault`) and address: the title's hooks can
+    /// hand on a block of ours, which is then live in both.
+    #[derive(Debug, Default)]
+    pub struct Ledger {
+        totals: BTreeMap<Kind, Totals>,
+        blocks: HashMap<(bool, usize), (Kind, u64)>,
+        /// Frees of blocks the ledger did not see handed out.
+        pub unknown_frees: u64,
+        /// The budget last reported (`XMemGetWorkingSetStatistics`):
+        /// calls, limit and use.
+        pub budget: (u64, u64, u64),
+    }
+
+    impl Ledger {
+        /// `size` bytes asked of `kind`; `at` is the block, 0 if refused.
+        /// Physical pages pass any other value: they are freed by count.
+        pub fn handed_out(&mut self, kind: Kind, size: u64, at: usize) {
+            let t = self.totals.entry(kind).or_default();
+            t.calls += 1;
+            t.asked += size;
+            if at == 0 {
+                t.failed += 1;
+                return;
+            }
+            t.live += size;
+            t.peak = t.peak.max(t.live);
+            if kind != Kind::PhysicalPages {
+                let ours = matches!(kind, Kind::Default { .. });
+                self.blocks.insert((ours, at), (kind, size));
+            }
+        }
+
+        /// The block at `at` is given back, to our `XMemFreeDefault` if
+        /// `ours`, else to `XMemFree`.
+        pub fn given_back(&mut self, ours: bool, at: usize) {
+            match self.blocks.remove(&(ours, at)) {
+                Some((kind, size)) => self.freed(kind, size),
+                None => self.unknown_frees += 1,
+            }
+        }
+
+        /// `size` bytes of `kind` are given back.
+        pub fn freed(&mut self, kind: Kind, size: u64) {
+            let t = self.totals.entry(kind).or_default();
+            t.frees += 1;
+            t.live = t.live.saturating_sub(size);
+        }
+
+        /// A flow without a live amount (decommits, releases).
+        pub fn flowed(&mut self, kind: Kind, size: u64, ok: bool) {
+            let t = self.totals.entry(kind).or_default();
+            t.calls += 1;
+            t.asked += size;
+            if !ok {
+                t.failed += 1;
+            }
+        }
+
+        #[cfg(test)]
+        pub fn totals(&self, kind: Kind) -> Totals {
+            self.totals.get(&kind).copied().unwrap_or_default()
+        }
+
+        /// Every kind's totals now, to compare later ones with.
+        pub fn snapshot(&self) -> BTreeMap<Kind, Totals> {
+            self.totals.clone()
+        }
+
+        /// One line per kind whose totals differ from `before`'s.
+        pub fn changes(&self, before: &BTreeMap<Kind, Totals>) -> Vec<String> {
+            const MIB: f64 = (1 << 20) as f64;
+            self.totals
+                .iter()
+                .filter(|(k, t)| before.get(k) != Some(t))
+                .map(|(k, t)| {
+                    format!(
+                        "{}: {} calls ({} failed), {} frees, live {:.1} MiB (peak {:.1}), {:.1} MiB asked in all",
+                        k.name(),
+                        t.calls,
+                        t.failed,
+                        t.frees,
+                        t.live as f64 / MIB,
+                        t.peak as f64 / MIB,
+                        t.asked as f64 / MIB
+                    )
+                })
+                .collect()
+        }
+    }
+
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os(ENV).is_some());
+    static LEDGER: LazyLock<Mutex<Ledger>> = LazyLock::new(|| {
+        start_logging();
+        Mutex::default()
+    });
+
+    /// Runs `f` on the ledger when it is kept.
+    pub fn note(f: impl FnOnce(&mut Ledger)) {
+        if *ON {
+            f(&mut LEDGER.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+
+    /// Every 10 s, the kinds that changed.
+    fn start_logging() {
+        let spawned = std::thread::Builder::new()
+            .name("xtp-xmem-ledger".into())
+            .spawn(|| {
+                let mut before = BTreeMap::new();
+                let mut budget = (0, 0, 0);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    let ledger = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
+                    let lines = ledger.changes(&before);
+                    let (calls, limit, used) = ledger.budget;
+                    let new_budget = ledger.budget != budget;
+                    let unknown = ledger.unknown_frees;
+                    before = ledger.snapshot();
+                    budget = ledger.budget;
+                    drop(ledger);
+                    for line in lines {
+                        tracing::info!("xmem ledger: {line}");
+                    }
+                    if new_budget {
+                        tracing::info!(
+                            calls,
+                            limit_mib = limit >> 20,
+                            used_mib = used >> 20,
+                            unknown_frees = unknown,
+                            "xmem ledger: budget reported (XMemGetWorkingSetStatistics)"
+                        );
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("{ENV}: the ledger will not be logged: {e}");
+        }
+    }
 }
 
 pub(crate) fn module() -> HleModule {
@@ -1482,6 +1755,77 @@ mod tests {
         let mut after = WorkingSet::default();
         XMemGetWorkingSetStatistics(0x2000_0001, &mut after);
         assert_eq!(before.title_limit - after.title_limit, 128 * MIB);
+    }
+
+    #[test]
+    fn the_ledger_counts_live_blocks_by_route() {
+        use ledger::{Kind, Ledger};
+        let mut l = Ledger::default();
+        // A committed resource's attributes (xtp_gpu::resource): allocator
+        // 128, write-combined, 4 KiB aligned.
+        let gpu = Kind::of_attributes(128 << 16 | 12 << ALIGNMENT_SHIFT | 1 << 29, false);
+        assert_eq!(
+            gpu,
+            Kind::Alloc {
+                allocator: 128,
+                memory: 1
+            }
+        );
+        l.handed_out(gpu, 4096, 0x1000);
+        l.handed_out(gpu, 8192, 0x3000);
+        l.handed_out(gpu, MIB as u64, 0);
+        // The title's hook handing on a block of ours: live on both routes.
+        let ours = Kind::of_attributes(128 << 16 | 1 << 29, true);
+        l.handed_out(ours, 4096, 0x1000);
+        l.given_back(false, 0x1000);
+        let t = l.totals(gpu);
+        assert_eq!(
+            (t.calls, t.failed, t.frees, t.live, t.peak),
+            (3, 1, 1, 8192, 12288)
+        );
+        assert_eq!(t.asked, 4096 + 8192 + MIB as u64);
+        assert_eq!(l.totals(ours).live, 4096);
+        l.given_back(true, 0x1000);
+        assert_eq!(l.totals(ours).live, 0);
+        l.given_back(false, 0x9000);
+        assert_eq!(l.unknown_frees, 1);
+        // Physical pages are freed by count; flows have no live amount.
+        l.handed_out(Kind::PhysicalPages, 3 * PAGE as u64, 1);
+        l.freed(Kind::PhysicalPages, PAGE as u64);
+        assert_eq!(l.totals(Kind::PhysicalPages).live, 2 * PAGE as u64);
+        l.flowed(Kind::Commit, MIB as u64, true);
+        l.flowed(Kind::Commit, MIB as u64, false);
+        let c = l.totals(Kind::Commit);
+        assert_eq!(
+            (c.calls, c.failed, c.live, c.asked),
+            (2, 1, 0, 2 * MIB as u64)
+        );
+    }
+
+    #[test]
+    fn the_ledger_logs_what_changed() {
+        use ledger::{Kind, Ledger};
+        let mut l = Ledger::default();
+        l.handed_out(Kind::PhysicalPages, MIB as u64, 1);
+        l.flowed(Kind::Reserve, 2 * MIB as u64, true);
+        let all = l.changes(&Default::default());
+        assert_eq!(
+            all,
+            [
+                "physical pages: 1 calls (0 failed), 0 frees, live 1.0 MiB (peak 1.0), 1.0 MiB asked in all",
+                "virtual reserve: 1 calls (0 failed), 0 frees, live 0.0 MiB (peak 0.0), 2.0 MiB asked in all",
+            ]
+        );
+        let before = l.snapshot();
+        assert!(l.changes(&before).is_empty());
+        l.freed(Kind::PhysicalPages, MIB as u64);
+        let one = l.changes(&before);
+        assert_eq!(one.len(), 1);
+        assert!(
+            one[0].starts_with(
+                "physical pages: 1 calls (0 failed), 1 frees, live 0.0 MiB (peak 1.0)"
+            )
+        );
     }
 
     #[test]

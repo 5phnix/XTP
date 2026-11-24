@@ -5,11 +5,12 @@
 //! What the title does (1.0.2.1, by RVA). A request worker thread
 //! (`0x2592c50`) moves each of its requests through states (`0x2593560`; a
 //! request's state is 5 bits that `0x2591de0` writes). From state `0xc` to
-//! `0xd` it asks an "Archive" object (vtable `0x61cf360`, built at
-//! `0x5b55850`) for the memory of one of its entries: slot 3 of that
-//! vtable, `0x23d8e70`, finds the entry by handle (the low 22 bits; entries
-//! of `0x30` bytes) and calls the entry's allocator. When the allocator
-//! gives a null pointer, `0x23d8e70` breaks (`int3` at `0x23d8f03`), and
+//! `0xd` it asks the "Archive" store (vtable `0x61cf360`, built at
+//! `0x5b55850`; the archives of files that streaming mounts) for the object
+//! of one of its entries: slot 3 of that vtable, `0x23d8e70`, finds the
+//! entry by handle (the low 22 bits; entries of `0x30` bytes) and has the
+//! entry's definition make it. When that gives a null pointer (the object
+//! could not be allocated), `0x23d8e70` breaks (`int3` at `0x23d8f03`), and
 //! only then empties the entry's slot (releasing the object it held, as
 //! `0x23d8ef0` does) and returns. Its caller does not look at the result:
 //! for an Archive, the next two calls it makes (vtable `0x20` and `0xd0`)
@@ -34,16 +35,28 @@
 //! uses). A thread of ours reads it and logs when it moves: the first time
 //! at once, then at most every 10 s, with the total.
 //!
+//! 60 s after it is applied, and at the first skip, the hook logs a census
+//! of the Archive store, to tell which allocator its entries use. The
+//! store (the title's pointer at `0x8fdce30`) keeps its entries at
+//! `+0x70`, `0x30` bytes apart (`+0x88`), `+0x78` of them; an entry holds
+//! its definition object at `+0x08` (whose vtable's second function makes
+//! the entry's object), the loaded object at `+0x10` and the one being
+//! placed at `+0x20`. The census counts definitions by vtable, with that
+//! function, and the entries loaded and being placed. Title memory is read
+//! with `ReadProcessMemory`, so a moved store cannot fault our thread.
+//!
 //! The trade-off: the hook hides an allocation that failed. The request
 //! completes with the entry's slot empty, as the title's own code after the
 //! `int3` leaves it; what the title does later with that empty entry is not
 //! known (a null it tests, or a fault elsewhere). It is a way for test
 //! sessions to go on, not a fix: the cause is in archive-null.md.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fmt;
 
-use crate::BUILD_1_0_2_1;
 use crate::watchdog::{Hook, NotApplied, Patch, count_into};
+use crate::{BUILD_1_0_2_1, KnownBuild};
 
 /// `XTP_TITLE_ASSERTS=continue` applies the hook.
 pub const ENV: &str = "XTP_TITLE_ASSERTS";
@@ -127,6 +140,142 @@ pub fn apply_to(blake3_hex: &str, image: &mut [u8]) -> Result<usize, NotApplied>
     hook_for(blake3_hex)?.apply_to(image)
 }
 
+/// Where one build keeps its Archive store: the RVA of its pointer to it.
+#[derive(Debug, Clone, Copy)]
+pub struct Store {
+    pub build: &'static KnownBuild,
+    pub pointer: usize,
+}
+
+pub const STORES: &[Store] = &[Store {
+    build: &BUILD_1_0_2_1,
+    pointer: 0x8fdce30,
+}];
+
+// The store's fields, and an entry's (the module doc).
+const ENTRIES: u64 = 0x70;
+const COUNT: u64 = 0x78;
+const STRIDE: u64 = 0x88;
+const DEFINITION: u64 = 0x08;
+const LOADED: u64 = 0x10;
+const PLACING: u64 = 0x20;
+
+/// What a census of the Archive store found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Census {
+    pub slots: u64,
+    /// Entries with a definition, loaded, and being placed.
+    pub defined: u64,
+    pub loaded: u64,
+    pub placing: u64,
+    /// Definitions by vtable RVA: how many, and the RVA of the vtable's
+    /// second function (0 if it is not in the image).
+    pub classes: BTreeMap<usize, (u64, usize)>,
+    /// Definitions whose vtable could not be read or is not in the image.
+    pub odd: u64,
+}
+
+impl fmt::Display for Census {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} slots, {} defined, {} loaded, {} being placed; definitions by vtable:",
+            self.slots, self.defined, self.loaded, self.placing
+        )?;
+        for (vtable, (n, makes)) in &self.classes {
+            write!(f, " {vtable:#x} x{n} (makes with {makes:#x})")?;
+        }
+        if self.odd != 0 {
+            write!(f, "; {} unreadable", self.odd)?;
+        }
+        Ok(())
+    }
+}
+
+/// The census of the store at `store`, reading 8 bytes at an address with
+/// `read` (`None` where it cannot), RVAs taken in the image at
+/// `base..base + size`. `None` if the store's own fields do not look like
+/// one.
+pub fn census(
+    store: u64,
+    base: usize,
+    size: usize,
+    read: impl Fn(u64) -> Option<u64>,
+) -> Option<Census> {
+    let entries = read(store + ENTRIES)?;
+    let count = read(store + COUNT)? & 0xffff_ffff;
+    let stride = read(store + STRIDE)?;
+    if !(PLACING + 8..=0x1000).contains(&stride) || count > 1 << 20 {
+        return None;
+    }
+    let rva = |v: u64| {
+        usize::try_from(v)
+            .ok()?
+            .checked_sub(base)
+            .filter(|&r| r < size)
+    };
+    let mut c = Census {
+        slots: count,
+        ..Census::default()
+    };
+    for i in 0..count {
+        let entry = entries + i * stride;
+        let field = |at: u64| read(entry + at).unwrap_or(0);
+        c.loaded += u64::from(field(LOADED) != 0);
+        c.placing += u64::from(field(PLACING) != 0);
+        let definition = field(DEFINITION);
+        if definition == 0 {
+            continue;
+        }
+        c.defined += 1;
+        let class = read(definition)
+            .and_then(|vtable| Some((rva(vtable)?, read(vtable + 8).and_then(rva))));
+        match class {
+            Some((vtable, makes)) => {
+                c.classes.entry(vtable).or_insert((0, makes.unwrap_or(0))).0 += 1;
+            }
+            None => c.odd += 1,
+        }
+    }
+    Some(c)
+}
+
+/// Eight bytes of our own memory, or `None` where they cannot be read.
+#[cfg(windows)]
+fn read_own(at: u64) -> Option<u64> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let (mut value, mut read) = (0u64, 0usize);
+    // SAFETY: reads into a local; the call fails, rather than faults, on
+    // memory that cannot be read.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            at as usize as *const _,
+            (&raw mut value).cast(),
+            8,
+            &mut read,
+        )
+    };
+    (ok != 0 && read == 8).then_some(value)
+}
+
+/// Logs the census of the Archive store of `build`, mapped at `base`;
+/// `when` says at which point.
+#[cfg(windows)]
+fn log_census(build: &KnownBuild, base: usize, size: usize, when: &str) {
+    let Some(store) = STORES.iter().find(|s| s.build.blake3 == build.blake3) else {
+        return;
+    };
+    let taken = read_own((base + store.pointer) as u64)
+        .filter(|&at| at != 0)
+        .and_then(|at| census(at, base, size, read_own));
+    match taken {
+        Some(c) => tracing::info!("Archive store census ({ENV}, {when}): {c}"),
+        None => tracing::info!("Archive store census ({ENV}, {when}): the store could not be read"),
+    }
+}
+
 /// Applies the hook to the mapped title when [`ENV`] asks for it, and logs
 /// the outcome; then logs the assertions it skips. Does nothing otherwise.
 ///
@@ -158,12 +307,24 @@ pub unsafe fn apply_if_asked(blake3_hex: &str, base: usize, size: u32) {
                 "title assertion hook applied ({ENV}={CONTINUE})"
             );
             let at = hook.patches[0].rva;
+            let size = size as usize;
+            let first = std::sync::Once::new();
             crate::watchdog::watch_counter(base + hook.counter, "xtp-asserts-log", 10, move |n| {
                 tracing::warn!(
                     times = n,
                     "title assertion at {at:#x} skipped {n} times (an Archive entry's allocation gave no memory; the title took its own null path)"
                 );
+                first.call_once(|| log_census(hook.build, base, size, "at the first skip"));
             });
+            let spawned = std::thread::Builder::new()
+                .name("xtp-asserts-census".into())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    log_census(hook.build, base, size, "60 s in");
+                });
+            if let Err(e) = spawned {
+                tracing::warn!("{ENV}: no census at 60 s: {e}");
+            }
         }
         Err(e) => tracing::warn!("title assertion hook not applied ({ENV}): {e}"),
     }
@@ -350,6 +511,45 @@ mod tests {
             assert_eq!(second.apply_to(&mut img), Ok(second.patches.len()));
             assert_eq!(img, image(&[ours, watchdog], |p| p.new));
         }
+    }
+
+    /// A store of four slots in synthetic memory: two definitions of one
+    /// class, one of another, one whose vtable is outside the image, one
+    /// empty slot; one entry loaded, one being placed.
+    #[test]
+    fn census_counts_definitions_by_class() {
+        use std::collections::HashMap;
+        let (base, size) = (0x1_4000_0000usize, 0x100_0000usize);
+        let mut mem: HashMap<u64, u64> = HashMap::new();
+        let (store, entries) = (0x9000_0000u64, 0x9100_0000u64);
+        mem.insert(store + ENTRIES, entries);
+        mem.insert(store + COUNT, 0xdead_0000_0000_0005); // the high half is not the count
+        mem.insert(store + STRIDE, 0x30);
+        let (vt_a, vt_b) = (base as u64 + 0x61_0000, base as u64 + 0x62_0000);
+        mem.insert(vt_a + 8, base as u64 + 0x23_0000);
+        mem.insert(vt_b + 8, 0x7fff_0000_0000); // not in the image
+        for (i, vtable) in [(0, vt_a), (1, vt_a), (2, vt_b), (4, 0x1234)] {
+            let def = 0x9200_0000 + i * 0x60;
+            mem.insert(entries + i * 0x30 + DEFINITION, def);
+            mem.insert(def, vtable);
+        }
+        mem.insert(entries + LOADED, 0x9300_0000);
+        mem.insert(entries + 0x30 + PLACING, 0x9300_1000);
+        let read = |at: u64| mem.get(&at).copied();
+        let c = census(store, base, size, read).unwrap();
+        assert_eq!(
+            (c.slots, c.defined, c.loaded, c.placing, c.odd),
+            (5, 4, 1, 1, 1)
+        );
+        assert_eq!(
+            c.classes.into_iter().collect::<Vec<_>>(),
+            [(0x61_0000, (2, 0x23_0000)), (0x62_0000, (1, 0))]
+        );
+        // Not a store: a stride too small, or nothing to read.
+        let mut bad = mem.clone();
+        bad.insert(store + STRIDE, 8);
+        assert_eq!(census(store, base, size, |at| bad.get(&at).copied()), None);
+        assert_eq!(census(store, base, size, |_| None), None);
     }
 
     /// Against a real dump, when `XTP_SAMPLE_GAME` names its folder: for a
