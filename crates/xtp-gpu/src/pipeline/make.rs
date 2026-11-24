@@ -401,12 +401,24 @@ fn worker(i: usize) -> std::thread::Builder {
         .stack_size(PIPELINE_STACK)
 }
 
-/// The workers (half the logical processors, 2 to 8), started on first
-/// use: how many there are.
+/// Pipeline workers at most.
+///
+/// One translation can hold a worker for seconds: in the Series S world
+/// 16 compute programs took 20 to 28 s each before the translator refused
+/// them (lane masks read as data; docs/analysis/drops.md), and with eight
+/// workers a few of them held most of the pool while cheap pipelines
+/// waited, with 8 to 10 of the process's threads running on 32 logical
+/// processors. The workers run below the title's threads.
+const MAX_WORKERS: usize = 16;
+
+/// The workers (half the logical processors, 2 to [`MAX_WORKERS`]),
+/// started on first use: how many there are.
 fn workers() -> usize {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     *WORKERS.get_or_init(|| {
-        let wanted = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let wanted = std::thread::available_parallelism()
+            .map_or(2, |n| (n.get() / 2).clamp(2, MAX_WORKERS));
+        tracing::info!(workers = wanted, "pipeline workers");
         (0..wanted)
             .filter(|&i| {
                 let spawned = worker(i).spawn(work);
