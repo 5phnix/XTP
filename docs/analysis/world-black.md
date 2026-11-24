@@ -46,9 +46,13 @@ repository. Times are local (UTC+1) unless a log line says otherwise.
   578d459): such depth textures get colour twins. The refusal is gone.
 - **Still black (§6.3).** With both fixes, and with smemraw's and
   mesh-fix's branches merged for the sessions, the scene colour still
-  holds 0 after every pass that writes it (worldlight-11 and -15). With
-  stride's stride table and run-time views switched on, the world's first
-  frame never completes (§6.2).
+  holds 0 after every pass that writes it (worldlight-11, -15, -16, -19):
+  the lighting rectangles, the sky compute and the sky dome draws alike.
+  With stride's run-time views switched on (`XTP_RUN_TIME_VIEWS=1`), the
+  world's first frame never completes (§6.2, stride's task).
+- **The 3D world on screen, unlit (§6.2, worldlight-18).**
+  `XTP_PRESENT_TARGET=1280x720:f28@f0c91b4d2578f5bf` shows the material
+  resolve's RGBA8 G-buffer target in the window: the game's street moving.
 - **Tooling (§3).** A per-pass view of a frame (`XTP_PASS_DUMP`), and
   `XTP_PRESENT_TARGET` to put any target the frame writes on screen: the
   person watched the world's street move, as an R8 material target, in two
@@ -298,6 +302,10 @@ flags=2" in every session) and the classes went nowhere. Ported:
 | worldlight-12 | everything (mine, smemraw, stride with its switches, mesh-fix) | world at 49 s, then no frame in 40 s: thousands of new translations, cold caches |
 | worldlight-13, -14 | the same, a 150 s warm-up, then with `XTP_STACKS` | world at 64 and 25 s, then no frame at all, every pipeline made: not a cold cache; the title's main thread waits in the title, nothing of XTP's is blocked |
 | worldlight-15 | the same, `XTP_STRIDE_TABLE=0`, `XTP_RUN_TIME_VIEWS=0` | frames again (world at 47 s, 1 fps); scene colour 0 (`frame-1349.png` black) |
+| worldlight-16 | the same, `XTP_STRIDE_TABLE=1` alone | frames (0.2 fps, 3,306 draws a frame); the material resolve's RGBA8 target covers 100 % of the screen instead of ~20 %; scene colour 0 |
+| worldlight-17 | the same, `XTP_RUN_TIME_VIEWS=1` alone | world at 25 s, then no frame: the run-time views alone keep the world's first frame from completing (stride's task) |
+| worldlight-18 | the same as -15, `XTP_PRESENT_TARGET=1280x720:f28@f0c91b4d2578f5bf` | the window shows the material resolve's RGBA8 G-buffer target: the game's 3D street (poles, wires, scaffolding, awnings) moving, unlit |
+| worldlight-19 | the same as -15, `XTP_SKIP_PIPELINES=731a39171b568298,577248728544d74b` | the two passes that rewrite the scene colour last, skipped: scene colour still 0 after its writers; presented image unchanged |
 
 ### 6.3 What still keeps the lighting black
 
@@ -314,10 +322,22 @@ flags=2" in every session) and the classes went nowhere. Ported:
   title memory, which misses constants the GPU writes in the same frame)
   and buffers.
 - Watch item 183 (another tester): the combined deferred pass multiplies
-  the lit scene by a 960×540 transmittance texture that nothing writes. In
-  the per-pass views no op reads a 960×540 texture and writes the scene
-  colour: the pass is dropped or reads through computed heap indices. Not
-  found yet; `XTP_SKIP_PIPELINES=<hash>` (diagnostics) skips one once it is.
+  the lit scene by a 960×540 transmittance texture that nothing writes.
+  On the Series S (1280×720 inside), the half-resolution textures are
+  640×360: the last compute that rewrites the scene colour before
+  FidelityFX, `731a39171b568298` (an indirect dispatch), reads three
+  640×360 R9G9B9E5 views; `577248728544d74b` reads the 480×272 volume.
+  Skipping both (`XTP_SKIP_PIPELINES`, which already drops a pipeline by
+  program hash in diagnostics builds) changes nothing (worldlight-19): the
+  scene colour is already 0 right after the lighting rectangles, the sky
+  compute (`348e1e8c414c7eca`) and the sky dome draws (`3ae25b11290cadde`),
+  before either of them runs. Here it is not the first black pass.
+- The sky's view LUTs: `26b8bbb2e7ae4dc6` (one 6×54 dispatch) writes four
+  unordered access views of 192×108 R32 textures, which the sky reads as
+  R9G9B9E5 (decoded). The views land on two textures; one of them holds 0
+  everywhere after the dispatch, in every session (-11, -15). The
+  transmittance LUT (256×64) and the multiple-scattering LUT (32×32) are
+  written. Not explained yet.
 - Watch item 181: on NVIDIA the view heap is capped at 1,000,000 slots
   (1,245,184 asked, 737,856 mirrored, 262,144 dynamic): 41 % of the
   title's slots have no host slot and read zeros.
