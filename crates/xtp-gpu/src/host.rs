@@ -820,7 +820,8 @@ struct Pending {
     /// The destinations of its GPU buffer copies (host copy, address,
     /// bytes), merged per host copy.
     copied: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// The ranges its shaders write (host copy, address, bytes), each once.
+    /// The ranges its shaders write (host copy, address, bytes), merged
+    /// per host copy.
     back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Its bottom-of-pipe writes, in list order: address, what, bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -843,11 +844,7 @@ impl Pending {
             let deferred = list.deferred();
             for step in &deferred.copies {
                 match step {
-                    Step::GpuWrite(shadow, address, len)
-                        if !back.iter().any(|(s, a, l)| {
-                            std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                        }) =>
-                    {
+                    Step::GpuWrite(shadow, address, len) => {
                         back.push((shadow.clone(), *address, *len));
                     }
                     Step::GpuCopy(shadow, address, len) => {
@@ -875,6 +872,13 @@ impl Pending {
         // thousands of small copies, often side by side: each write opens
         // the guard of its title memory).
         let copied = merge_ranges(copied, |s| std::sync::Arc::as_ptr(s) as usize);
+        // Shader-written ranges merged per host copy too, those that overlap
+        // or touch into one: each byte is compared and goes back once. The
+        // world's passes declare the same big ranges dozens of times, and
+        // overlapping views of its 174 MB heap; only identical ranges were
+        // merged before, and a second range over bytes the first had put
+        // back wrote older title bytes over newer ones.
+        let back = merge_ranges(back, |s| std::sync::Arc::as_ptr(s) as usize);
         // What the GPU writes through host copies, each range once (later
         // steps look them up one by one).
         let through = |ranges: &Ranges| -> Vec<(usize, usize, usize)> {
@@ -1387,9 +1391,9 @@ impl Host {
         // What the GPU wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done. GPU copies first: all of
         // each destination; shader-written ranges then add what differs
-        // from their snapshot, each range once per submission, however
-        // many dispatches declared it (the world's passes declare the same
-        // big ranges dozens of times).
+        // from their snapshot, each byte once per submission, however many
+        // dispatches declared ranges over it (the world's passes declare the
+        // same big ranges dozens of times).
         let copying = std::time::Instant::now();
         for (shadow, address, len) in &p.copied {
             let written = shadow.write_back(p.submission, *address, *len);
