@@ -352,7 +352,20 @@ static QUEUES: (Mutex<Queues>, Condvar) = (Mutex::new(Queues::new()), Condvar::n
 
 /// Stack of each pipeline worker: room for the driver's shader compiler,
 /// which runs on it (reserved address space; committed only as used).
+/// Every title pipeline is compiled by [`Pending::make`], from [`finish`]:
+/// on a worker, or, when none could start, on the title's thread with the
+/// title's stack.
 const PIPELINE_STACK: usize = 64 << 20;
+
+/// A pipeline worker's thread, before it starts: its name and its stack.
+fn worker(i: usize) -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name(format!("xtp-pipelines-{i}"))
+        // The driver compiles pipelines on this thread, recursively:
+        // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
+        // on a world compute program and refused it as out of memory.
+        .stack_size(PIPELINE_STACK)
+}
 
 /// The workers (half the logical processors, 2 to 8), started on first
 /// use: how many there are.
@@ -361,14 +374,8 @@ fn workers() -> usize {
     *WORKERS.get_or_init(|| {
         let wanted = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         (0..wanted)
-            .filter(|i| {
-                let spawned = std::thread::Builder::new()
-                    .name(format!("xtp-pipelines-{i}"))
-                    // The driver compiles pipelines on this thread, recursively:
-                    // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
-                    // on a world compute program and refused it as out of memory.
-                    .stack_size(PIPELINE_STACK)
-                    .spawn(work);
+            .filter(|&i| {
+                let spawned = worker(i).spawn(work);
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
                 }
@@ -476,6 +483,51 @@ mod tests {
         // Compute pipelines have their own.
         assert_eq!(frames.left(8, 1, budget), Duration::from_millis(60));
         assert!(take_wait_us()[0] >= 60_000);
+    }
+
+    /// A worker's stack, as the thread itself sees it, is the 64 MiB kept
+    /// for the driver's compiler, not Rust's default 2 MiB (VIctory #1129),
+    /// and only reserved: what is committed at its start is less than the
+    /// whole default stack.
+    #[test]
+    fn workers_have_room_for_the_drivers_compiler() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
+        let (reserved, committed) = worker(99)
+            .spawn(|| {
+                let (mut low, mut high) = (0, 0);
+                // SAFETY: two out-pointers to this thread's own locals.
+                unsafe {
+                    windows::Win32::System::Threading::GetCurrentThreadStackLimits(
+                        &mut low, &mut high,
+                    );
+                }
+                let (mut at, mut committed) = (low, 0);
+                while at < high {
+                    // SAFETY: a query of our own stack's pages into a local.
+                    let info = unsafe {
+                        let mut info = std::mem::zeroed::<MEMORY_BASIC_INFORMATION>();
+                        let n = VirtualQuery(at as *const _, &mut info, size_of_val(&info));
+                        assert_ne!(n, 0, "VirtualQuery");
+                        info
+                    };
+                    let end = (info.BaseAddress as usize + info.RegionSize).min(high);
+                    if info.State == MEM_COMMIT {
+                        committed += end - at;
+                    }
+                    at = end;
+                }
+                (high - low, committed)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(reserved >= PIPELINE_STACK, "{reserved} bytes reserved");
+        assert!(
+            committed < 2 << 20,
+            "{committed} bytes committed at the start"
+        );
     }
 
     #[test]
