@@ -588,47 +588,40 @@ const SLOT: u64 = 512;
 
 /// Records copies of a grid of pixels of `texture` (8-bit color, in the
 /// copy-source state) into a readback buffer, to tell black frames.
+///
+/// The buffer is made once per presenting thread and device, then reused:
+/// the present drains its copies before [`black`] reads it, and the next
+/// probe only records after that. Creating one per present cost a video
+/// memory admission each frame, 0.4 s or more once VidMm throttles
+/// (docs/analysis/stall.md).
 pub(crate) fn probe(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<ID3D12Resource> {
+    use windows::core::Interface;
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Option<(usize, ID3D12Resource)>> =
+            const { std::cell::RefCell::new(None) };
+    }
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     if !matches!(d.Format.0, 27..=29 | 87 | 90 | 91) {
         return None;
     }
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: SLOT * u64::from(GRID * GRID),
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
-    };
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_READBACK,
-        ..Default::default()
-    };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation; an open list; locations naming live resources.
+    let key = device.as_raw() as usize;
+    let buffer = BUFFER.with_borrow_mut(|cached| {
+        if let Some((k, b)) = cached.as_ref()
+            && *k == key
+        {
+            return Some(b.clone());
+        }
+        let b = probe_buffer(device)?;
+        *cached = Some((key, b.clone()));
+        Some(b)
+    })?;
+    // SAFETY: an open list; locations naming live resources.
     unsafe {
-        device
-            .CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
-            .ok()?;
-        let buffer = buffer?;
         for i in 0..GRID * GRID {
             let (x, y) = (
                 (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),
@@ -667,8 +660,44 @@ pub(crate) fn probe(
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&pixel));
         }
-        Some(buffer)
     }
+    Some(buffer)
+}
+
+/// The readback buffer [`probe`] copies its grid into.
+fn probe_buffer(device: &ID3D12Device) -> Option<ID3D12Resource> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: SLOT * u64::from(GRID * GRID),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation.
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+    }
+    buffer
 }
 
 /// Whether every pixel [`probe`] read is (near) black.
