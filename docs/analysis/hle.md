@@ -193,7 +193,7 @@ Legend: ✔ implemented and tested, ◐ partial, ✘ missing, — not needed.
 | DSP convolution (reverb) | ✘ silent, IR layout unknown | ✘ | 1 / 1 | **New work** (A2, A3) |
 | XAudio2 | host pass-through | wrapped: Opus/XMA voices, console flags dropped | — / 9 | Keep XTP (Bink's voices are PCM; see Q6) |
 | Media Foundation | host + local-only resolver | host + device manager helper | 2 / 3 | Keep XTP |
-| Capture for diagnosis | ✔ `XTP_AUDIO_CAPTURE`, `XTP_XMA_DUMP` | ◐ `XCL_TRACE_APU` | — | Keep XTP |
+| Capture for diagnosis | ✔ `XTP_AUDIO_CAPTURE`, `XTP_XMA_DUMP`, `XTP_DSP_DUMP` | ◐ `XCL_TRACE_APU` | — | Keep XTP |
 
 ### 4.4 Input
 
@@ -443,9 +443,10 @@ shows the title calls them.
 - **Depends on:** K1 showing a gain.
 
 ### A2. Capture the DSP's impulse responses — S
-- **Goal:** `XTP_DSP_DUMP=<dir>` saves each activated stream's parameters,
-  impulse-response block and a few input/output blocks, to work out the
-  partitioned frequency-domain layout offline.
+- **Diagnostic:** Set `XTP_DSP_DUMP` to an absolute directory outside the repository.
+  The first 32 streams per process record connection and stream parameters, an
+  impulse response up to 4 MiB and four commands' gains and input/output blocks
+  for offline study of the partitioned frequency-domain layout.
 - **Files:** `crates/xtp-hle/src/modules/dsp.rs`.
 - **xcl ref:** `hle/acphal.rs` XDsp functions (`XDspConnectWithMaximumStreamLimit`,
   `XDspActivate`: argument meaning as observed).
