@@ -132,10 +132,12 @@ impl Shader {
     }
 }
 
+/// The translation of `container` for the host's wave sizes
+/// ([`crate::device::host_target`]).
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use xtp_shader::{Container, FourCC, HwStage};
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = crate::shader_cache::host_shader(container, crate::device::host_target())?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let (used, wave64) = match c.part(FourCC::DXIL) {
         Some(part) => xtp_shader::native_programs(part.data)
@@ -533,6 +535,51 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// The acceptance test of the wave64 wiring (VIctory #223): on the
+    /// test's device (WARP with `XTP_TEST_ADAPTER=warp`, whose waves are 4
+    /// lanes), the target forced to an NVIDIA host's 32 to 32 (as
+    /// `XTP_HOST_LANES=32-32` does) translates a console wave64 compute
+    /// program as two 32-lane waves, `WaveSize(32)`. Its host pipeline is
+    /// made where the device runs 32-lane waves (an RTX 4080), and refused
+    /// for that reason, before any driver call, where it does not (WARP).
+    #[cfg(windows)]
+    #[test]
+    fn wave64_compute_is_translated_for_a_forced_32_lane_target() {
+        let test = "pipeline::tests::wave64_compute_is_translated_for_a_forced_32_lane_target";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let lanes = crate::device::host_wave_lanes().expect("the device's lanes");
+        let target = crate::device::target_of(Some(lanes), Some("32-32")).unwrap();
+        let (c, native) = crate::shader_cache::wave64_in_half_program();
+        let translated = xtp_shader::emit::translate_program_for(&c, &native, target)
+            .unwrap_or_else(|(step, e)| panic!("{}: {e}", step.name()));
+        let needs = host::Needs::of(&translated.dxil).unwrap();
+        assert_eq!(needs.lanes, (32, 32), "WaveSize(32)");
+        let shader = Arc::new(Shader {
+            stage: "compute",
+            hash: "forced32-wave64".into(),
+            container: Vec::new(),
+            translated: OnceLock::from(Some(Translated {
+                host: translated,
+                used: native.used.clone(),
+                wave64: native.wave64,
+            })),
+        });
+        let made = host::HostPipeline::new(&[shader], None);
+        if lanes.0 <= 32 && 32 <= lanes.1 {
+            assert!(made.is_some(), "a 32-lane host makes it ({lanes:?})");
+        } else {
+            assert!(made.is_none(), "{lanes:?}");
+            let why = format!(
+                "compute shader needs 32-lane waves; the host has {} to {}",
+                lanes.0, lanes.1
+            );
+            let refused = refusals().unwrap_or_default();
+            assert!(refused.contains(&why), "{refused}");
+        }
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
