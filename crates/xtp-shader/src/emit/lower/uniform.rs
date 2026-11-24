@@ -200,7 +200,10 @@ impl<'a> Run<'a> {
             let n = i.name();
             matches!(
                 i.fields,
-                Fields::Smem { .. } | Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. }
+                Fields::Smem { .. }
+                    | Fields::Buffer { .. }
+                    | Fields::Image { .. }
+                    | Fields::Flat { .. }
             ) && (n.contains("store") || n.contains("atomic"))
         });
         let mut run = Run {
@@ -303,7 +306,8 @@ impl<'a> Run<'a> {
     /// NEXT, exit edges to a node OUT, and both to END.
     fn loop_branches(&self, h: usize, body: &[bool]) -> (Vec<usize>, Vec<usize>) {
         let inside: Vec<usize> = (0..body.len()).filter(|&b| body[b]).collect();
-        let index: HashMap<usize, usize> = inside.iter().enumerate().map(|(k, &b)| (b, k)).collect();
+        let index: HashMap<usize, usize> =
+            inside.iter().enumerate().map(|(k, &b)| (b, k)).collect();
         let (next, out, end) = (inside.len(), inside.len() + 1, inside.len() + 2);
         let mut succ: Vec<Vec<usize>> = inside
             .iter()
@@ -532,8 +536,9 @@ impl<'a> Run<'a> {
             .into_iter()
             .map(|a| match a {
                 Atom::Uniform(v) => self.read(v, at),
-                Atom::Lane(v) if self.has_bit[v.0 as usize] => self.bit[v.0 as usize]
-                    .max(self.leaving(self.def[v.0 as usize], at)),
+                Atom::Lane(v) if self.has_bit[v.0 as usize] => {
+                    self.bit[v.0 as usize].max(self.leaving(self.def[v.0 as usize], at))
+                }
                 _ => Level::Lane,
             })
             .max()

@@ -47,8 +47,7 @@ const MESH_LDS_DWORDS: u32 = 28 * 1024 / 4;
 /// A wave64 mesh program's group barrier in a block that lanes of the group
 /// reach differently (or a different number of times), on a host without
 /// 64-lane waves.
-pub(super) const MESH_BARRIER: Why =
-    "a group barrier lanes of a wave64 mesh group reach differently, on a host without 64-lane waves";
+pub(super) const MESH_BARRIER: Why = "a group barrier lanes of a wave64 mesh group reach differently, on a host without 64-lane waves";
 
 /// A wave64 mesh program whose group is one console wave of more than 32
 /// lanes, with LDS, on a host without 64-lane waves.

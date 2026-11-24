@@ -1290,10 +1290,16 @@ mod tests {
         let early = refused.contains("mesh shader is a mesh program written for 64-lane waves")
             || refused.contains("mesh shader is a mesh program translated for 64-lane waves");
         if Needs::mesh_switches() == (false, false) {
-            assert!(ms.translated.get().is_some(), "the mesh shader was translated");
+            assert!(
+                ms.translated.get().is_some(),
+                "the mesh shader was translated"
+            );
             assert!(!early, "{refused}");
         } else {
-            assert!(ms.translated.get().is_none(), "the mesh shader was not translated");
+            assert!(
+                ms.translated.get().is_none(),
+                "the mesh shader was not translated"
+            );
             assert!(ps.translated.get().is_none(), "nor the pixel shader");
             assert!(early, "{refused}");
         }
@@ -1410,7 +1416,10 @@ mod tests {
         let refused = needs.refusal((32, 32), (6, 8)).unwrap_or_default();
         assert!(refused.starts_with("is a mesh program"), "{refused}");
         assert_eq!(needs.refusal((32, 64), (6, 5)), None, "nor anything else");
-        assert_eq!(Needs::translated_with("mesh", &unsaid, (false, false)), None);
+        assert_eq!(
+            Needs::translated_with("mesh", &unsaid, (false, false)),
+            None
+        );
     }
 
     #[test]

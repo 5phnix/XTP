@@ -440,7 +440,9 @@ fn wave64_mesh_reads_draw_the_console_waves_values() {
         let v = 2 * k + row;
         let want = [7.0, (v / 64) as f32, 100.0, 37.0];
         if *t != want {
-            wrong.push(format!("texel ({k}, {row}), vertex {v}: {t:?}, not {want:?}"));
+            wrong.push(format!(
+                "texel ({k}, {row}), vertex {v}: {t:?}, not {want:?}"
+            ));
         }
     }
     assert!(
