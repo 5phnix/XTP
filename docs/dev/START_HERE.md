@@ -91,6 +91,26 @@ any title's files, and the tools refuse to write below it.
    doc comment names it). For example, in PowerShell:
    `$env:XTP_XMA_STREAMS = '<dir>'; cargo test -p xtp-formats -- --ignored`.
 
+### A/B a switch
+
+To compare a switch's two values on the same scene in one session, set it
+to `ab` instead of `0` or `1` (`XTP_FRAMES_IN_FLIGHT=ab`), or to
+`ab:<phase s>:<settle s>` (`ab:30:5`). Phase A runs its `0`, phase B its
+`1`, in turn, 20 s each by default, switched at presents; the first 3 s of
+each settle and are not measured. Each frame-rate line is tagged with the
+phase it measured (`[A/B B1]`, `[A/B A2 settling]`), each phase ends with a
+line of its settled presents and frame rate, and `cargo xtask play` ends
+with the median per arm of the lines past settling. Switches set to `ab`
+together alternate together. A switch takes `ab` once it is read through
+`xtp_core::ab::switch` and listed in `xtp_core::ab::SWITCHES`; any other
+`XTP_*` set to `ab` stops the run at start. Switches that change how shaders
+are translated or pipelines made (`XTP_DXIL_OPT`, the shader loop limit and
+budget, `XTP_STRIDE_TABLE`, `XTP_HOST_LANES`, `XTP_WAVE64_MESH`,
+`XTP_ROOT_SRV_DIRECT`) cannot alternate: a program is translated once per
+run and the shader cache keys on them, so phase B would run A's
+translations, or translate everything again in the middle of the run.
+Compare two sessions for those.
+
 ### Run report
 
 Bug reports and compatibility reports ask for this block. Every line is

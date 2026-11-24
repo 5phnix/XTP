@@ -184,6 +184,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_SKIP_INTRO=1` | every build: cuts the intro movie of the start-up front end (sent to its last frame when it starts), so the world starts loading about 13 s sooner (docs/analysis/intro-skip.md); known builds only, otherwise a warning and nothing changed |
 | `XTP_SKIP_CPU_CHECK=1` | every build: skips the host CPU feature check that `xtp run --execute` performs before starting the title |
 | `XTP_QUEUE_WAIT=0` | every build: a queue told to wait for a fence no signal has reached yet runs what it is given next at once, as before queues held it (to compare frame times); such waits are still counted on the `queue waits for fences so far` line |
+| `XTP_FRAMES_IN_FLIGHT=ab[:<phase s>[:<settle s>]]` | every build: one frame in flight off (phase A) and on (phase B) in turn within one run, phases of 20 s by default, the first 3 s of each not measured; each frame-rate line is tagged with its phase and `cargo xtask play` ends with the median per phase (docs/dev/START_HERE.md, "A/B a switch"); `1` on, `0` or unset off |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder. The loader also prints the first 16 title C++ throws

@@ -384,6 +384,8 @@ impl Outcome {
             (None, None) => lines.push("gameplay not reached".into()),
         }
         lines.extend(summary(&self.frame_rates));
+        // In an A/B run (`XTP_*=ab`), the same figures per arm.
+        lines.extend(xtp_core::ab::summary(&self.frame_rates, &FIGURES));
         lines.push(match self.code {
             Some(code) => format!("title exit code {code}"),
             None => "title ended without an exit code".into(),
@@ -495,25 +497,27 @@ fn after(line: &str, label: &str) -> Option<f64> {
 /// Reads one figure of a frame-rate line.
 type Figure = fn(&str) -> Option<f64>;
 
+/// The figures of a frame-rate line the end table gives.
+const FIGURES: [(&str, Figure); 7] = [
+    ("fps", |l| before(l, " fps,")),
+    ("ms/frame", |l| before(l, " ms/frame")),
+    ("ms preparing", |l| before(l, " preparing")),
+    ("ms on the GPU", |l| before(l, " on the GPU")),
+    ("ms copying back", |l| before(l, " copying back")),
+    ("draws/frame", |l| before(l, " draws/frame")),
+    ("dropped/frame", |l| after(l, "dropped ")),
+];
+
 /// Median, lowest and highest of each figure of the frame-rate lines.
 fn summary(lines: &[String]) -> Vec<String> {
     if lines.is_empty() {
         return vec!["no frame-rate line in gameplay (one comes every 5 s)".into()];
     }
-    let figures: [(&str, Figure); 7] = [
-        ("fps", |l| before(l, " fps,")),
-        ("ms/frame", |l| before(l, " ms/frame")),
-        ("ms preparing", |l| before(l, " preparing")),
-        ("ms on the GPU", |l| before(l, " on the GPU")),
-        ("ms copying back", |l| before(l, " copying back")),
-        ("draws/frame", |l| before(l, " draws/frame")),
-        ("dropped/frame", |l| after(l, "dropped ")),
-    ];
     let mut out = vec![format!(
         "{} frame-rate lines in gameplay (median, lowest, highest):",
         lines.len()
     )];
-    for (name, read) in figures {
+    for (name, read) in FIGURES {
         let mut values: Vec<f64> = lines.iter().filter_map(|l| read(l)).collect();
         if values.is_empty() {
             continue;
@@ -597,6 +601,57 @@ mod tests {
         outcome.see(&stop, Duration::from_secs(125));
         assert_eq!(outcome.stopped.as_deref(), Some(stop.as_str()));
         assert_eq!(outcome.report()[0], format!("autopilot stopped: {stop}"));
+    }
+
+    /// Frame-rate lines tagged with their A/B phase (`xtp_core::ab`): the
+    /// end table adds the median per arm of those past settling.
+    #[test]
+    fn play_gives_an_ab_runs_medians_per_arm() {
+        let tagged = |tag: &str, fps: &str| {
+            WORLD
+                .replace("xtp_gpu::host: ", &format!("xtp_gpu::host: {tag} "))
+                .replace("1.4 fps", &format!("{fps} fps"))
+        };
+        let mut outcome = Outcome {
+            gameplay: Some(Duration::from_secs(30)),
+            ..Outcome::default()
+        };
+        for (tag, fps) in [
+            ("[A/B A0 settling]", "9.0"),
+            ("[A/B A0]", "1.4"),
+            ("[A/B A0]", "1.2"),
+            ("[A/B B1 settling]", "9.0"),
+            ("[A/B B1]", "2.1"),
+        ] {
+            outcome.see(&tagged(tag, fps), Duration::from_secs(40));
+        }
+        assert_eq!(outcome.frame_rates.len(), 5);
+        let report = outcome.report();
+        let at = report
+            .iter()
+            .position(|l| l.starts_with("A/B, median per arm"))
+            .expect("an A/B table");
+        assert_eq!(
+            report[at],
+            "A/B, median per arm of the frame lines past settling (2 A, 1 B; 2 settling left out):"
+        );
+        assert_eq!(
+            report[at + 2],
+            "  fps                   1.4      2.1   +50.0%"
+        );
+        assert_eq!(
+            report[at + 3],
+            "  ms/frame            714.3    714.3    +0.0%"
+        );
+        // Seven figures, then the exit code.
+        assert_eq!(report.len(), at + 2 + 7 + 1);
+        // Without tags, no A/B table.
+        let plain = Outcome {
+            gameplay: Some(Duration::from_secs(30)),
+            frame_rates: vec![WORLD.into()],
+            ..Outcome::default()
+        };
+        assert!(!plain.report().iter().any(|l| l.starts_with("A/B")));
     }
 
     #[test]
