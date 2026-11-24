@@ -26,8 +26,9 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    /// The record (view index and generation) each slot was last made from,
+    /// and for a texture the title placed, the host texture.
+    made: Mutex<Made>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -43,6 +44,15 @@ pub(crate) struct HostHeap {
     /// A raw view that reads zeros, in a dynamic slot of its own (made on
     /// first use, kept for the heap's life).
     null_raw: OnceLock<Option<u32>>,
+}
+
+/// What each title slot of a host heap was made from.
+struct Made {
+    /// The record (view index and generation; 0 when not made).
+    keys: Vec<u64>,
+    /// For a texture the title placed itself, the host texture the slot
+    /// views (see [`HostHeap::mirror`]).
+    placed: HashMap<u32, usize>,
 }
 
 /// Dynamic slot bookkeeping.
@@ -248,7 +258,10 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: Mutex::new(Made {
+                keys: vec![0; count as usize],
+                placed: HashMap::new(),
+            }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             slots: Mutex::new(Slots {
                 next: 0,
@@ -720,20 +733,45 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        // A texture the title placed itself is viewed through the resource
+        // made for its memory, which another replaces when a texture the
+        // GPU writes comes there (#643): the record stays the same, so the
+        // slot is made again when the host texture changes. Resolved
+        // before the lock, since making the resource can wait.
+        let placed = match &view {
+            Some(v @ View::Placed(false, resource, _)) if for_draw && resource[0] != 1 => {
+                Some(placed_texture(v))
+            }
+            _ => None,
+        };
+        let texture = placed.as_ref().map(|p| match p {
+            Some(View::Shader(r, _)) => crate::resource::host_resource(*r as crate::object::This)
+                .map_or(0, |t| t.as_raw() as usize),
+            _ => 0,
+        });
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if made.keys[index as usize] != 0 {
+                made.keys[index as usize] = 0;
+                made.placed.remove(&index);
                 self.make_null(index);
             }
             return None;
         };
-        if made[index as usize] != key {
+        // The host texture held by the slot cannot be another's (`kept`
+        // holds it), so the same address is the same texture.
+        let moved = texture.is_some_and(|t| made.placed.get(&index).copied() != Some(t));
+        let view = placed.flatten().unwrap_or(view);
+        if made.keys[index as usize] != key || moved {
             let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
+            made.keys[index as usize] = if later { 0 } else { key };
+            match texture {
+                Some(t) if !later => made.placed.insert(index, t),
+                _ => made.placed.remove(&index),
+            };
             let kept = if later {
                 None
             } else {
@@ -756,6 +794,7 @@ impl HostHeap {
             .made
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .keys
             .get(index as usize)?;
         if key == 0 {
             return Some("null".into());
@@ -1425,6 +1464,90 @@ mod tests {
         assert_eq!(heap.dynamic(SHARED_CHUNK), None);
         assert_eq!(heap.shared_count(), (1, 0));
         heap.give_back(&[held]);
+    }
+
+    /// A slot viewing a texture the title placed itself follows the
+    /// resource made for that memory: when a texture the GPU writes comes
+    /// there (#643), the slot is made again over its copy, although the
+    /// title's record has not changed.
+    #[test]
+    fn placed_texture_slots_follow_their_replacement() {
+        use crate::object::{S_OK, This, guid, slot};
+        use crate::resource::tests_support::target;
+        let test = "descriptor::host::tests::placed_texture_slots_follow_their_replacement";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        const KIB_64: u64 = 1 << 16;
+        // Freed only once nothing is placed in it any more (a failing
+        // assertion leaks it rather than leave textures over freed memory).
+        let memory =
+            std::mem::ManuallyDrop::new(crate::resource::Memory::zeroed(KIB_64, KIB_64).unwrap());
+        let address = memory.address();
+        // A 16x16 RGBA8 texture placed there, and a shader view of it.
+        let drawn = target(16, 16, 28);
+        // SAFETY: a description is 56 bytes, 14 words.
+        let mut resource: [u32; 14] = unsafe { std::mem::transmute_copy(&drawn) };
+        resource[12] = 0; // not a render target: the title fills it
+        let mut view = [0u32; 16];
+        // Format, 2D, the default mapping, then (from word 4, 8-byte
+        // aligned) the first mip and the mip count.
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let heap = crate::descriptor::TestHeap::views(4);
+        let host = crate::descriptor::heap(heap.0).host().expect("a host heap");
+        let handle = crate::descriptor::heap(heap.0).start + 32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &view, handle);
+        let kept = |h: &HostHeap| {
+            h.kept.lock().unwrap_or_else(|e| e.into_inner())[1]
+                .as_ref()
+                .map(|t| t.as_raw() as usize)
+        };
+        let host_of = |r: This| crate::resource::host_resource(r).map(|t| t.as_raw() as usize);
+        assert!(matches!(
+            host.mirror(1, handle, true),
+            Some(View::Shader(..))
+        ));
+        let before = crate::resource::texture_at(address, &resource).unwrap();
+        // Taken now: once replaced, `before` may be released at any time
+        // (and its address reused); its copy stays while this holds it.
+        let old = crate::resource::host_copy(before).expect("a host copy");
+        let old_texture = Some(old.texture.as_raw() as usize);
+        assert_eq!(kept(host), old_texture);
+        // A render target comes to the same memory: the view's texture is
+        // replaced by one over the target's copy.
+        const RESOURCE: crate::object::Iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut rt = std::ptr::null();
+        let made = crate::resource::create_at_address(
+            std::ptr::null(),
+            address,
+            &drawn,
+            0,
+            std::ptr::null(),
+            &RESOURCE,
+            &mut rt,
+        );
+        assert_eq!(made, S_OK);
+        assert!(matches!(
+            host.mirror(1, handle, true),
+            Some(View::Shader(..))
+        ));
+        let after = crate::resource::texture_at(address, &resource).unwrap();
+        assert_eq!(host_of(after), host_of(rt), "texture_at took the target's copy");
+        assert_ne!(host_of(after), old_texture);
+        assert_eq!(kept(host), host_of(after), "the slot views the replacement");
+        // Nothing more changes: the slot stays as it is.
+        host.mirror(1, handle, true);
+        assert_eq!(kept(host), host_of(after));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(rt, 0x10)(rt), 0);
+        drop(heap);
+        crate::resource::memory_remapped(address as usize, KIB_64 as usize);
+        drop(std::mem::ManuallyDrop::into_inner(memory));
     }
 
     /// A root SRV's one-view table (VIctory #493): a shader reading 64
