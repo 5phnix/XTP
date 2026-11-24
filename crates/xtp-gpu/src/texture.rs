@@ -10,6 +10,9 @@
 //! which cannot be watched, a content hash of the whole memory at every
 //! submission that samples it.
 //!
+//! A texture whose host format stands in for the title's
+//! (`resource::format`) has its texels converted on the way.
+//!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
@@ -22,6 +25,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
+use crate::resource::format::Convert;
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -41,6 +45,9 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: xtp_formats::texture::Layout,
+    /// How texels convert into the host format, if it stands in for the
+    /// title's.
+    convert: Option<Convert>,
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
@@ -169,6 +176,131 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// A buffer-to-texture copy into subresource `sub` of `dst` at `at`, from
+/// title buffer `src` laid out as `footprint` (title format), when `dst`'s
+/// host format stands in for the footprint's: recorded here, the title
+/// bytes converted into an upload buffer at submission. False when the
+/// formats agree (the caller copies as it is).
+#[allow(clippy::too_many_arguments)] // the copy's own arguments
+pub(crate) fn copy_converted(
+    list: &HostList,
+    dst: This,
+    sub: u32,
+    at: [u32; 3],
+    src: This,
+    footprint: &crate::resource::PlacedFootprint,
+    source_box: *const [u32; 6],
+) -> bool {
+    let Some(to) = crate::resource::host_resource(dst) else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let host_format = unsafe { to.GetDesc() }.Format;
+    let Some(convert) =
+        crate::resource::format::conversion(footprint.format(), host_format.0 as u32)
+    else {
+        return false;
+    };
+    let Some(convert) = convert else {
+        once!(
+            format = footprint.format(),
+            "buffer-to-texture copy into a stand-in without a conversion dropped"
+        );
+        return true;
+    };
+    let (Some(host), Some(bytes), Some((data, size))) = (
+        host(),
+        footprint.bytes(),
+        crate::resource::buffer_bytes(src),
+    ) else {
+        return true;
+    };
+    if footprint
+        .offset
+        .checked_add(bytes)
+        .is_none_or(|end| end > size)
+    {
+        tracing::warn!(
+            offset = footprint.offset,
+            bytes,
+            size,
+            "copy outside its buffer"
+        );
+        return true;
+    }
+    let (width, height, depth, title_pitch) = footprint.shape();
+    let (from, to_bytes) = convert.bytes();
+    let lines = height as usize * depth as usize;
+    let host_pitch = (width as usize * to_bytes).next_multiple_of(256);
+    let host_bytes = host_pitch * lines.saturating_sub(1) + width as usize * to_bytes;
+    let Some((buffer, mapped)) = list.upload(host, host_bytes as u64) else {
+        return true;
+    };
+    // At submission, when the title has written the buffer.
+    let (title, mapped) = (data as usize + footprint.offset as usize, mapped as usize);
+    list.defer_host(move || {
+        let mut texels = vec![0u8; width as usize * from];
+        for line in 0..lines {
+            let row = (title + line * title_pitch as usize) as *const u8;
+            if !crate::host::read_into(row, &mut texels) {
+                texels.fill(0);
+            }
+            // SAFETY: row `line` of the mapped upload buffer, `width`
+            // texels of the host format.
+            let out = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (mapped + line * host_pitch) as *mut u8,
+                    width as usize * to_bytes,
+                )
+            };
+            convert.row(&texels, out);
+        }
+    });
+    const COPY_DEST: u32 = 0x400;
+    crate::list::ensure_state(list, dst, COPY_DEST);
+    host_written(dst);
+    let to_location = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(to) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: sub,
+        },
+    };
+    let from_location = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(&buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: host_format,
+                    Width: width,
+                    Height: height,
+                    Depth: depth,
+                    RowPitch: host_pitch as u32,
+                },
+            },
+        },
+    };
+    let source_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+    // SAFETY: an open list; both locations name live resources (the upload
+    // buffer lives until the list is reset); the box is the title's (the
+    // host's layout, in texels of either format).
+    unsafe {
+        list.list.CopyTextureRegion(
+            &to_location,
+            at[0],
+            at[1],
+            at[2],
+            &from_location,
+            source_box,
+        )
+    };
+    true
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
@@ -228,6 +360,10 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        if let Some(convert) = self.convert {
+            self.detile_converted(tiled, convert);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -251,6 +387,42 @@ impl Staging {
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
+            }
+        }
+    }
+}
+
+impl Staging {
+    /// As [`Staging::detile`], into a stand-in format: each subresource
+    /// detiled in the title's format, then converted row by row.
+    fn detile_converted(&self, tiled: &[u8], convert: Convert) {
+        let (from, to) = convert.bytes();
+        let mut title = Vec::new();
+        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let f = footprint.Footprint;
+            let width = f.Width as usize;
+            let (pitch, lines) = (width * from, rows as usize * f.Depth as usize);
+            title.clear();
+            title.resize(pitch * lines, 0);
+            if let Err(e) =
+                self.layout
+                    .detile(tiled, mip, slice, &mut title, pitch, pitch * rows as usize)
+            {
+                tracing::warn!(?e, mip, slice, "texture not detiled");
+                return;
+            }
+            let host_pitch = f.RowPitch as usize;
+            for (line, texels) in title.chunks_exact(pitch).enumerate() {
+                // SAFETY: row `line` of the subresource's part of the mapped
+                // staging buffer, `width` texels of the host format.
+                let row = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.data.add(footprint.Offset as usize + line * host_pitch),
+                        width * to,
+                    )
+                };
+                convert.row(texels, row);
             }
         }
     }
@@ -298,6 +470,17 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let convert = match crate::resource::format::conversion(desc.format(), d.Format.0 as u32) {
+        Some(None) => {
+            once!(
+                ?desc,
+                "texture contents in a format whose stand-in has no conversion not uploaded"
+            );
+            return None;
+        }
+        Some(convert) => convert,
+        None => None,
+    };
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -335,6 +518,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         footprints,
         rows,
         layout,
+        convert,
         mips: u32::from(d.MipLevels),
         memory,
         last: Mutex::default(),
