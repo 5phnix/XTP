@@ -8,6 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+xtp-core = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 xtp-gpu.workspace = true
 xtp-loader.workspace = true
 xtp-pe.workspace = true
@@ -44,12 +46,15 @@ windows = { workspace = true, features = [
 windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
+xtp-core.workspace = true
 tempfile.workspace = true
 xtp-testkit.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = [
+    "dep:xtp-core",
+    "dep:tempfile",
     "xtp-gpu/diagnostics",
     "xtp-loader/diagnostics",
     "windows/Win32_Media_Audio",

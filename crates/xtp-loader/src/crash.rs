@@ -540,9 +540,9 @@ const MAX_CATCHABLE_TYPES: usize = 32;
 const MAX_STRING: usize = 256;
 static FIRST_CHANCE: AtomicUsize = AtomicUsize::new(0);
 
-/// Copies exception-controlled memory through the kernel. Unlike a direct
-/// dereference, this reports free, reserved, no-access and guard pages.
-fn read_memory(address: usize, dst: &mut [u8]) -> bool {
+/// Copies readable memory in the current process through the kernel. Returns
+/// false for unmapped, reserved, no-access or guard pages.
+pub fn read_memory(address: usize, dst: &mut [u8]) -> bool {
     if dst.is_empty() {
         return true;
     }
