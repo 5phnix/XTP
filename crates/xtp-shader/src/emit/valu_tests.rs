@@ -338,6 +338,55 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
+/// RDNA2's maximums and minimums give the number beside a (quiet) NaN, and
+/// NaN only when every operand is one: chosen by XTP, not left to the
+/// host's FMax/FMin, whose NaN behavior differs between drivers (#34).
+#[test]
+fn min_and_max_give_the_number_beside_a_nan() {
+    let nan = f32::NAN.to_bits();
+    let f = f32::to_bits;
+    let two: &[([u32; 4], Option<f32>, Option<f32>)] = &[
+        // (operands, minimum, maximum)
+        ([f(-2.0), f(3.0), 0, 0], Some(-2.0), Some(3.0)),
+        ([nan, f(1.0), 0, 0], Some(1.0), Some(1.0)),
+        ([f(1.0), nan, 0, 0], Some(1.0), Some(1.0)),
+        ([nan, f(-0.5), 0, 0], Some(-0.5), Some(-0.5)),
+        ([nan, nan, 0, 0], None, None),
+    ];
+    let three: &[([u32; 4], Option<f32>, Option<f32>)] = &[
+        ([nan, f(1.0), f(2.0), 0], Some(1.0), Some(2.0)),
+        ([f(2.0), nan, f(1.0), 0], Some(1.0), Some(2.0)),
+        ([f(3.0), f(1.0), nan, 0], Some(1.0), Some(3.0)),
+        ([nan, nan, f(4.0), 0], Some(4.0), Some(4.0)),
+        ([nan, f(4.0), nan, 0], Some(4.0), Some(4.0)),
+        ([f(-4.0), nan, nan, 0], Some(-4.0), Some(-4.0)),
+        ([nan, nan, nan, 0], None, None),
+    ];
+    let ops = [
+        ("v_min_f32", 0x10F, two, false),
+        ("v_max_f32", 0x110, two, true),
+        ("v_min3_f32", 0x151, three, false),
+        ("v_max3_f32", 0x154, three, true),
+    ];
+    for (name, op, cases, max) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = if max { cases[i].2 } else { cases[i].1 };
+            let got_f = f32::from_bits(got);
+            let ok = want.map_or(got_f.is_nan(), |w| got_f == w);
+            assert!(
+                ok,
+                "{backend}: {name}({:?}, {:?}, {:?}) = {got_f} ({got:#010x}), want {}",
+                f32::from_bits(inp[0]),
+                f32::from_bits(inp[1]),
+                f32::from_bits(inp[2]),
+                want.map_or("NaN".to_owned(), |w| w.to_string()),
+            );
+        });
+    }
+}
+
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)

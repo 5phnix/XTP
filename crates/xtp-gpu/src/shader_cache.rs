@@ -73,8 +73,9 @@ fn count<T, E>(counter: &AtomicU64, result: Result<T, E>) -> Result<T, E> {
 /// What identifies the translator this build runs: the fingerprint of
 /// `xtp-shader`'s sources ([`xtp_shader::SOURCES`]), this file (the
 /// entries' encoding, [`ENCODING`]) and the translation settings it runs
-/// with (the loop limit and the loops' budget, which any build can change
-/// at run time). Not the whole executable: before, the least change
+/// with (the loop limit, the loops' budget and the DXIL clean-up passes,
+/// which any build can change at run time). Not the whole executable:
+/// before, the least change
 /// anywhere (the HLE, a log line, another worker's branch) made every
 /// translation again, and each worktree's sessions started cold.
 fn build() -> &'static [u8; 32] {
@@ -91,7 +92,12 @@ fn build() -> &'static [u8; 32] {
                 "XTP_SHADER_LOOP_BUDGET: back edges a lane may take in all loops together (0: no budget)"
             );
         }
-        build_of(xtp_shader::SOURCES, ENCODING, limit, budget)
+        // And the clean-up passes run over the translated code.
+        let passes = xtp_shader::emit::dxil_opt();
+        if passes != 0 {
+            tracing::info!(passes, "XTP_DXIL_OPT: clean-up passes run over translated shaders");
+        }
+        build_of(xtp_shader::SOURCES, ENCODING, [limit, budget, passes])
     })
 }
 
@@ -100,15 +106,16 @@ fn build() -> &'static [u8; 32] {
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
 /// [`build`]'s key from its parts: the translator's sources, the entries'
-/// encoding and the settings.
-fn build_of(sources: &str, encoding: &[u8], limit: u32, budget: u32) -> [u8; 32] {
+/// encoding and the settings (loop limit, loop budget, clean-up passes).
+fn build_of(sources: &str, encoding: &[u8], settings: [u32; 3]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     for part in [sources.as_bytes(), encoding] {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
-    h.update(&limit.to_le_bytes());
-    h.update(&budget.to_le_bytes());
+    for setting in settings {
+        h.update(&setting.to_le_bytes());
+    }
     *h.finalize().as_bytes()
 }
 
@@ -855,11 +862,12 @@ mod tests {
     #[test]
     fn the_key_is_the_translators_not_the_executables() {
         let _serial = serial();
-        let (limit, budget) = (
+        let settings = [
             xtp_shader::emit::loop_limit(),
             xtp_shader::emit::loop_budget(),
-        );
-        let ours = build_of(xtp_shader::SOURCES, ENCODING, limit, budget);
+            xtp_shader::emit::dxil_opt(),
+        ];
+        let ours = build_of(xtp_shader::SOURCES, ENCODING, settings);
         assert_eq!(*build(), ours, "nothing but these parts");
 
         let dir = tempfile::tempdir().unwrap();
@@ -875,21 +883,21 @@ mod tests {
         assert_eq!(get(ours), Ok(shader()));
         // Another build of the same translator: the key is made again from
         // the same parts, and finds the entry.
-        let rebuilt = build_of(xtp_shader::SOURCES, ENCODING, limit, budget);
+        let rebuilt = build_of(xtp_shader::SOURCES, ENCODING, settings);
         assert_eq!(get(rebuilt), Ok(shader()));
         assert_eq!(runs(), 1, "shared by both builds");
 
         // A file of the translator changed: its fingerprint does
         // (`xtp_shader`'s fingerprint tests), and so does the key.
-        let changed = format!("{:032x}", u128::from_str_radix(xtp_shader::SOURCES, 16).unwrap() ^ 1);
-        assert_eq!(get(build_of(&changed, ENCODING, limit, budget)), Ok(shader()));
+        let fingerprint = u128::from_str_radix(xtp_shader::SOURCES, 16).unwrap();
+        let changed = format!("{:032x}", fingerprint ^ 1);
+        assert_eq!(get(build_of(&changed, ENCODING, settings)), Ok(shader()));
         assert_eq!(runs(), 2, "a changed translator translates again");
-        for other in [
-            build_of(xtp_shader::SOURCES, b"another encoding", limit, budget),
-            build_of(xtp_shader::SOURCES, ENCODING, limit + 1, budget),
-            build_of(xtp_shader::SOURCES, ENCODING, limit, budget + 1),
-        ] {
-            assert_ne!(other, ours);
+        assert_ne!(build_of(xtp_shader::SOURCES, b"another encoding", settings), ours);
+        for i in 0..settings.len() {
+            let mut other = settings;
+            other[i] ^= 1;
+            assert_ne!(build_of(xtp_shader::SOURCES, ENCODING, other), ours, "setting {i}");
         }
     }
 
