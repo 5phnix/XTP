@@ -30,7 +30,9 @@
 //! the whole budget, before). A texture whose memory no longer hashes as
 //! what was detiled is hashed at its next check whatever its guards say,
 //! refreshed if it changed, and logged once (with the count of such changes
-//! so far).
+//! so far). Its budget costs at most 0.65 ms a frame on a build-farm CPU
+//! (`tests::net_costs`), 0.86 ms on the L4 VM's; not measured in the world
+//! yet.
 //!
 //! A check hashes and detiles one snapshot of the memory: hashed in place
 //! and detiled after the wait for an earlier copy, a title write during the
@@ -1691,6 +1693,75 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
             assert!(view != 0 && other != 0);
             (view, other)
+        }
+    }
+
+    /// What the safety net's work costs a frame, out of the game: its
+    /// budget read through the kernel a slice at a time and hashed, over a
+    /// 64 MiB view (more than the CPU's caches, as the title's texture pool
+    /// is), against hashing it in place; and a check's snapshot (copied,
+    /// then hashed) against the hash in place it replaces where the guards
+    /// report a write. Best of three passes. Run with
+    /// `cargo test --release -p xtp-gpu -- --ignored --nocapture net_costs`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn net_costs() {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        const LEN: usize = 64 << 20;
+        let (view, other) = section_views(LEN);
+        // SAFETY: the view, `LEN` bytes, ours alone.
+        let memory = unsafe { std::slice::from_raw_parts_mut(view as *mut u8, LEN) };
+        for (i, b) in memory.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(2_654_435_761) >> 13) as u8;
+        }
+        let budget = net_budget_of(None) as usize;
+        let rounds = LEN / budget;
+        // Milliseconds per budget's bytes, the best of three passes over
+        // the view.
+        let time = |f: &mut dyn FnMut(usize)| -> f64 {
+            (0..3)
+                .map(|_| {
+                    let started = Instant::now();
+                    for r in 0..rounds {
+                        f(view + r * budget);
+                    }
+                    started.elapsed().as_secs_f64() * 1e3 / rounds as f64
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let mut read = vec![0u8; NET_SLICE];
+        let net = time(&mut |at| {
+            let mut hasher = blake3::Hasher::new();
+            for off in (0..budget).step_by(NET_SLICE) {
+                assert!(crate::host::read_into((at + off) as *const u8, &mut read));
+                hasher.update(&read);
+            }
+            std::hint::black_box(hasher.finalize());
+        });
+        let in_place = time(&mut |at| {
+            // SAFETY: inside the view.
+            let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, budget) };
+            std::hint::black_box(blake3::hash(bytes));
+        });
+        let mut snapshot = vec![0u8; budget];
+        let snap = time(&mut |at| {
+            crate::host::copy_mapped(snapshot.as_mut_ptr(), at as *const u8, budget, false);
+            std::hint::black_box(blake3::hash(&snapshot));
+        });
+        eprintln!(
+            "texture safety net, per {} MiB (its budget a frame): {net:.3} ms read through the \
+             kernel and hashed ({:.0} MB/s), {in_place:.3} ms hashed in place; a check's \
+             snapshot, copied and hashed: {snap:.3} ms",
+            budget >> 20,
+            budget as f64 / 1e3 / net
+        );
+        for at in [view, other] {
+            // SAFETY: views mapped above, not used after.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut _,
+                })
+            };
         }
     }
 
