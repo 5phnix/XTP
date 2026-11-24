@@ -3,9 +3,13 @@
 //!
 //! Values are symbolic while the module is built ([`V`]) and numbered when
 //! it is written: functions, then constants (all at module level), then the
-//! instructions of `main` in block order.
+//! instructions of `main` in block order. The clean-up passes `XTP_DXIL_OPT`
+//! turns on run as it is written ([`opt`]).
 
 use std::collections::HashMap;
+
+pub(crate) mod census;
+pub(crate) mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -33,6 +37,7 @@ pub(crate) enum V {
 }
 
 /// A global variable declaration (thread-group shared memory).
+#[derive(Clone)]
 struct Global {
     name: String,
     ty: Ty,
@@ -178,6 +183,7 @@ pub(crate) enum Attr {
     NoDuplicate = 4,
 }
 
+#[derive(Clone)]
 struct Func {
     name: String,
     ty: Ty,
@@ -189,13 +195,14 @@ struct Func {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Md(u32);
 
+#[derive(Clone)]
 enum MdDef {
     Str(String),
     Value(Ty, V),
     Node(Vec<Option<Md>>),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
     type_ids: HashMap<TypeDef, u32>,
@@ -518,7 +525,29 @@ impl Module {
         live
     }
 
+    /// The module as bitcode, after the clean-up passes `XTP_DXIL_OPT` turns
+    /// on ([`opt::dxil_opt`]; none by default). A module the passes would
+    /// change a declared feature of is written as it is
+    /// ([`Module::cleaned`]).
     pub fn write(&self) -> Vec<u8> {
+        let passes = opt::dxil_opt();
+        let outcome = (passes != 0).then(|| self.cleaned(passes));
+        let cleaned = match &outcome {
+            Some(Ok(m)) => Some(m),
+            _ => None,
+        };
+        if census::enabled() {
+            let lost = match &outcome {
+                Some(Err(lost)) => lost.as_slice(),
+                _ => &[],
+            };
+            census::note(passes, self, cleaned, lost);
+        }
+        cleaned.unwrap_or(self).encode()
+    }
+
+    /// The module as bitcode, as it is.
+    fn encode(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -1180,7 +1209,7 @@ mod tests {
             ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
             ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
         ] {
-            let bytes = synthetic(regs, stages, read).write();
+            let bytes = synthetic(regs, stages, read).encode();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
     }
@@ -1190,11 +1219,11 @@ mod tests {
     fn bench_write() {
         for (regs, stages, read) in [(64, 64, 64), (128, 256, 32), (256, 512, 256)] {
             let m = synthetic(regs, stages, read);
-            let bytes = m.write();
+            let bytes = m.encode();
             let runs = 5;
             let t = std::time::Instant::now();
             for _ in 0..runs {
-                std::hint::black_box(m.write());
+                std::hint::black_box(m.encode());
             }
             let per = t.elapsed() / runs;
             println!(
