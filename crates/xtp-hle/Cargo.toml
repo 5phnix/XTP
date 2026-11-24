@@ -38,7 +38,7 @@ windows-sys = { workspace = true, features = [
 windows = { workspace = true, features = [
     "Gaming_Input", "Media_ClosedCaptioning", "UI_ViewManagement",
     "Media_Core", "Media_MediaProperties", "Media_SpeechSynthesis",
-    "Media_Transcoding", "Storage_Streams", "Win32_Foundation",
+    "Data_Xml_Dom", "Media_Transcoding", "Storage_Streams", "Win32_Foundation",
 ] }
 # `#[implement]` names it.
 windows-core = { workspace = true, optional = true }

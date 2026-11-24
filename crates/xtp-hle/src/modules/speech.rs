@@ -38,6 +38,7 @@ const SILENCE: [u8; 44] =
     *b"RIFF\x24\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data\0\0\0\0";
 
 type This = *const Object;
+const STREAM_NOT_FOUND: HRESULT = 0x8007_0490_u32 as i32; // HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
 
 enum Synthesizer {
     Silent,
@@ -77,7 +78,10 @@ extern "system" fn create(_: This, out: Option<&mut *mut Synthesizer>) -> HRESUL
     let synth = match narrator::open() {
         Ok(Some(engine)) => Synthesizer::Windows(engine),
         Ok(None) => Synthesizer::Silent,
-        Err(e) => return e.code().0,
+        Err(error) => {
+            tracing::warn!(%error, "could not open Windows speech synthesizer; using silence");
+            Synthesizer::Silent
+        }
     };
     #[cfg(not(windows))]
     let synth = Synthesizer::Silent;
@@ -137,7 +141,7 @@ extern "system" fn create_stream<const SSML: bool>(
     S_OK
 }
 extern "system" fn stream_size(_: This, stream: Option<&Vec<u8>>, out: *mut usize) -> HRESULT {
-    stream.map_or(E_INVALIDARG, |wav| put(out, wav.len()))
+    stream.map_or(STREAM_NOT_FOUND, |wav| put(out, wav.len()))
 }
 extern "system" fn stream_data(
     _: This,
@@ -147,7 +151,7 @@ extern "system" fn stream_data(
     used: *mut usize,
 ) -> HRESULT {
     let Some(wav) = stream else {
-        return E_INVALIDARG;
+        return STREAM_NOT_FOUND;
     };
     if buffer.is_null() || size < wav.len() {
         return E_NOT_SUFFICIENT_BUFFER;
@@ -226,6 +230,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn null_stream_is_not_found() {
+        assert_eq!(stream_size(&OBJECT, None, &mut 0), STREAM_NOT_FOUND);
+        assert_eq!(
+            stream_data(&OBJECT, None, 0, std::ptr::null_mut(), std::ptr::null_mut()),
+            STREAM_NOT_FOUND
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn installed_voice_speaks_text_and_ssml() {
@@ -250,6 +263,9 @@ mod tests {
         assert_eq!(create(&OBJECT, Some(&mut handle)), S_OK);
         // SAFETY: create returned a live handle which this test owns until close.
         let synth = unsafe { &*handle };
+        for blank in [c"", c" \t\r\n"] {
+            assert_eq!(wave(synth, 0x68, blank), SILENCE);
+        }
         let Some((id, language)) = voice else {
             assert_eq!(wave(synth, 0x68, c"test"), SILENCE);
             assert_eq!(close(&OBJECT, handle), S_OK);
@@ -261,7 +277,7 @@ mod tests {
             set_custom_voice(&OBJECT, Some(synth), c"missing-test-voice".as_ptr()),
             E_INVALIDARG
         );
-        let ssml = CString::new(format!(r#"<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="{language}"><s>test</s></speak>"#)).unwrap();
+        let ssml = CString::new(format!(r#"<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="{language}"><audio src="unused.wav"><s>test</s></audio></speak>"#)).unwrap();
         let spoken_ssml = wave(synth, 0xa8, &ssml);
         let mut invalid = std::ptr::null_mut();
         assert_ne!(
@@ -271,6 +287,13 @@ mod tests {
         assert!(invalid.is_null());
         assert_eq!(set_default_voice(&OBJECT, Some(synth)), S_OK);
         let spoken_text = wave(synth, 0x68, c"test");
+        // Simulate losing the host service after the title has acquired its handle.
+        let Synthesizer::Windows(engine) = synth else {
+            panic!("expected a Windows voice")
+        };
+        engine.Close().unwrap();
+        assert_eq!(wave(synth, 0x68, c"test"), SILENCE);
+        assert_eq!(wave(synth, 0xa8, &ssml), SILENCE);
         assert_eq!(close(&OBJECT, handle), S_OK);
         for wav in [spoken_text, spoken_ssml] {
             let size = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
@@ -290,7 +313,10 @@ mod tests {
                 chunks = &chunks[8 + len + (len % 2)..];
             }
             let fmt = format.unwrap();
+            assert_eq!(u16::from_le_bytes(fmt[0..2].try_into().unwrap()), 1); // PCM
             assert_eq!(size(&fmt[4..8]), 48_000);
+            assert_eq!(size(&fmt[8..12]), 96_000);
+            assert_eq!(u16::from_le_bytes(fmt[12..14].try_into().unwrap()), 2);
             assert_eq!(u16::from_le_bytes(fmt[2..4].try_into().unwrap()), 1);
             assert_eq!(u16::from_le_bytes(fmt[14..16].try_into().unwrap()), 16);
             assert!(samples.unwrap().iter().any(|&byte| byte != 0));
