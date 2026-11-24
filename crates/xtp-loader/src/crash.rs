@@ -1,6 +1,7 @@
 //! Names the faulting code when title code crashes.
 //!
-//! A vectored handler sees every exception first, so it only prints the
+//! A vectored handler observes the first 16 title C++ throws and translates
+//! debugger thread-name notifications to host descriptions. It also prints the
 //! kinds that end a process (access violations and the like, and
 //! breakpoints: titles assert with `int3`, fatal without a debugger) as
 //! first-chance, since a handler may still take them (ntdll's loader does
@@ -11,21 +12,27 @@
 //! often states the reason. Panics of ours go to the crash log too.
 
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
+    CloseHandle, EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, EXCEPTION_RECORD, M128A,
+    ReadProcessMemory, RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter,
+    UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, GetCurrentThreadStackLimits,
+    GetProcessIdOfThread, OpenThread, SetThreadDescription, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SET_LIMITED_INFORMATION,
+};
 
 use crate::insn;
 
@@ -125,21 +132,24 @@ fn title_output() -> String {
 
 /// Installs the handlers, and the reports of failures no handler sees
 /// (`fastfail`: CRT invalid parameters, the process ending with a
-/// failure status); call once before running title code.
+/// failure status). Idempotent through `Once`; call before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
-    // SAFETY: registers handlers that only read the exception they are
-    // given; the title's own filter, once it sets one, takes the place of
-    // ours and calls `report_unhandled` first.
-    unsafe {
-        AddVectoredExceptionHandler(0, Some(handler));
-        SetUnhandledExceptionFilter(Some(filter));
-    }
-    crate::fastfail::install();
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        // SAFETY: registers handlers that only read the exception they are
+        // given; the title's own filter, once it sets one, takes the place of
+        // ours and calls `report_unhandled` first.
+        unsafe {
+            AddVectoredExceptionHandler(0, Some(handler));
+            SetUnhandledExceptionFilter(Some(filter));
+        }
+        crate::fastfail::install();
+    });
 }
 
 /// What the vectored handler reports as it happens.
@@ -475,10 +485,21 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    let (record, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
+    match record.ExceptionCode {
+        CPP_EXCEPTION => observe_cpp(record, context),
+        THREAD_NAME_EXCEPTION => {
+            let count = (record.NumberParameters as usize).min(record.ExceptionInformation.len());
+            name_thread(&record.ExceptionInformation[..count]);
+        }
+        _ => {}
+    }
+    if FATAL.contains(&record.ExceptionCode) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
     }
+    // Observing a throw or a debugger thread-name notification must not
+    // consume it: the debugger and the title's own SEH handlers come next.
     EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -508,45 +529,380 @@ unsafe fn instruction_bytes(at: usize) -> String {
     hex.join(" ")
 }
 
-/// MSVC's code for a C++ `throw`, and its magic first parameter.
+/// MSVC's code for a C++ `throw`, and the three EH_MAGIC values its x64
+/// ThrowInfo layout accepts. The debugger's legacy thread-name notification
+/// is deliberately different: its parameters are the packed struct's words.
 const CPP_EXCEPTION: i32 = 0xE06D_7363_u32 as i32;
-const CPP_MAGIC: usize = 0x1993_0520;
+const CPP_MAGICS: [usize; 3] = [0x1993_0520, 0x1993_0521, 0x1993_0522];
+const THREAD_NAME_EXCEPTION: i32 = 0x406D_1388;
+const FIRST_CHANCE_LIMIT: usize = 16;
+const MAX_CATCHABLE_TYPES: usize = 32;
+const MAX_STRING: usize = 256;
+static FIRST_CHANCE: AtomicUsize = AtomicUsize::new(0);
 
-/// What a C++ throw threw: the decorated name of its type, then its value
-/// where that names the cause (an integer, e.g. an HRESULT; a standard
-/// exception's message).
-///
-/// # Safety
-/// `p` are the parameters of a live MSVC throw (`p[0]` the magic).
-unsafe fn thrown(p: &[usize]) -> String {
-    // SAFETY: the throw's ThrowInfo, its RVAs relative to `p[3]`: catchable
-    // type array at +12 (count, then type RVAs), each type's descriptor at
-    // +4, whose decorated name starts at +16; the object is at `p[1]`.
+/// Copies exception-controlled memory through the kernel. Unlike a direct
+/// dereference, this reports free, reserved, no-access and guard pages.
+fn read_memory(address: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    let Some(end) = address.checked_add(dst.len() - 1).filter(|_| address != 0) else {
+        return false;
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut at = address;
+    loop {
+        // SAFETY: a zeroed query buffer is valid; VirtualQuery reads bookkeeping.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: writes our buffer without dereferencing `at`.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
+        {
+            return false;
+        }
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
+            return false;
+        };
+        if next > end {
+            break;
+        }
+        if next <= at {
+            return false;
+        }
+        at = next;
+    }
+    let mut done = 0;
+    // SAFETY: `dst` is writable for its length; the kernel validates the
+    // complete source range in this process instead of faulting on it.
     unsafe {
-        let rva = |at: usize| (at as *const u32).read_unaligned() as usize;
-        let types = p[3] + rva(p[2] + 12);
-        let name = |i: usize| {
-            let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
-            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char).to_string_lossy()
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const _,
+            dst.as_mut_ptr().cast(),
+            dst.len(),
+            &mut done,
+        ) != 0
+            && done == dst.len()
+    }
+}
+
+fn read_array<const N: usize>(address: usize) -> Option<[u8; N]> {
+    let mut bytes = [0; N];
+    read_memory(address, &mut bytes).then_some(bytes)
+}
+
+fn read_u32(address: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(read_array(address)?))
+}
+
+fn read_usize(address: usize) -> Option<usize> {
+    Some(usize::from_ne_bytes(read_array(address)?))
+}
+
+/// A bounded C string, including a useful prefix when the next page is
+/// unreadable. Reading page by page permits strings crossing readable pages.
+fn bounded_cstr(address: usize, limit: usize) -> Result<String, (String, &'static str)> {
+    let mut bytes = Vec::new();
+    while bytes.len() < limit {
+        let Some(at) = address.checked_add(bytes.len()) else {
+            break;
         };
-        let first = name(0);
-        let value = match &*first {
-            // int, unsigned, long (HRESULT), unsigned long
-            ".H" | ".I" | ".J" | ".K" if p[1] != 0 => {
-                format!(" = {:#010x}", (p[1] as *const u32).read_unaligned())
-            }
-            // std::exception keeps its message after the table pointer.
-            _ if (0..rva(types)).any(|i| name(i) == ".?AVexception@std@@") => {
-                let message = (p[1] as *const *const std::ffi::c_char).add(1).read();
-                if message.is_null() {
-                    String::new()
-                } else {
-                    format!(": {}", std::ffi::CStr::from_ptr(message).to_string_lossy())
+        let mut chunk = [0u8; MAX_STRING];
+        let n = (limit - bytes.len())
+            .min(0x1000 - (at & 0xfff))
+            .min(chunk.len());
+        if at == 0 || !read_memory(at, &mut chunk[..n]) {
+            let prefix = String::from_utf8_lossy(&bytes).into_owned();
+            return Err((prefix, "unreadable"));
+        }
+        if let Some(end) = chunk[..n].iter().position(|&b| b == 0) {
+            bytes.extend_from_slice(&chunk[..end]);
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    Err((String::from_utf8_lossy(&bytes).into_owned(), "unterminated"))
+}
+
+/// SizeOfImage from a loaded PE32+ header, all read fallibly. This also
+/// handles host runtime metadata without acquiring the title registry again.
+fn image_size(base: usize) -> Option<usize> {
+    if read_array::<2>(base)? != *b"MZ" {
+        return None;
+    }
+    let pe = base.checked_add(read_u32(base.checked_add(0x3c)?)? as usize)?;
+    if read_array::<4>(pe)? != *b"PE\0\0" {
+        return None;
+    }
+    let optional = pe.checked_add(24)?;
+    if read_array::<2>(optional)? != 0x20bu16.to_ne_bytes() {
+        return None;
+    }
+    Some(read_u32(optional.checked_add(56)?)? as usize)
+}
+
+fn image_address(base: usize, size: usize, rva: usize, len: usize) -> Option<usize> {
+    if rva.checked_add(len).is_none_or(|end| end > size) {
+        return None;
+    }
+    base.checked_add(rva.checked_add(len)?)?;
+    base.checked_add(rva)
+}
+
+/// Only these CRT families may intervene before a title frame. Match a DLL
+/// basename and suffix boundary, never an arbitrary path substring.
+fn runtime_family(module: &str) -> bool {
+    let module = module.to_ascii_lowercase();
+    let Some(stem) = module.strip_suffix(".dll") else {
+        return false;
+    };
+    ["vcruntime140", "msvcp140"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|tail| {
+            tail.is_empty()
+                || tail == "d"
+                || tail.strip_prefix('_').is_some_and(|version| {
+                    !version.is_empty()
+                        && version
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                })
+        })
+    })
+}
+
+fn throw_machinery(address: usize) -> bool {
+    crate::fastfail::in_module(address, &["ntdll.dll", "kernelbase.dll", "ucrtbase.dll"])
+        || module_of(address).and_then(|module| {
+            module
+                .rsplit_once('+')
+                .map(|(name, _)| runtime_family(name))
+        }) == Some(true)
+}
+
+fn title_frame<const N: usize>(frames: &[usize; N]) -> Option<usize> {
+    let title = crate::threads::title_membership(frames)?
+        .iter()
+        .position(|&is_title| is_title)?;
+    frames[..title]
+        .iter()
+        .all(|&pc| throw_machinery(pc))
+        .then_some(frames[title])
+}
+
+/// Walk in dispatch order. A host/HLE/unknown caller stops classification;
+/// finding a title farther down cannot attribute that host exception to it.
+fn throw_site(record: &EXCEPTION_RECORD, context: &CONTEXT) -> Option<usize> {
+    let mut frames = [0; MAX_FRAMES + 1];
+    frames[0] = record.ExceptionAddress as usize;
+    for (slot, pc) in frames[1..].iter_mut().zip(unwind(*context)) {
+        *slot = pc as usize;
+    }
+    title_frame(&frames)
+}
+
+fn claim_first_chance() -> bool {
+    FIRST_CHANCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            (used < FIRST_CHANCE_LIMIT).then_some(used + 1)
+        })
+        .is_ok()
+}
+
+#[cfg(test)]
+static FIRST_CHANCE_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn observe_cpp(record: &EXCEPTION_RECORD, context: &CONTEXT) {
+    if crate::threads::exiting() {
+        return;
+    }
+    thread_local! { static OBSERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    struct ObserveGuard;
+    impl Drop for ObserveGuard {
+        fn drop(&mut self) {
+            OBSERVING.set(false);
+        }
+    }
+    if OBSERVING.replace(true) {
+        return;
+    }
+    let _guard = ObserveGuard;
+    let p = &record.ExceptionInformation;
+    if FIRST_CHANCE.load(Ordering::Relaxed) >= FIRST_CHANCE_LIMIT
+        || record.NumberParameters != 4
+        || !CPP_MAGICS.contains(&p[0])
+    {
+        return;
+    }
+    let Some(site) = throw_site(record, context) else {
+        return;
+    };
+    // Each verified title event, including a rethrow, claims one slot.
+    if !claim_first_chance() {
+        return;
+    }
+    let line = format!(
+        "XTP: first-chance C++ {} at {}",
+        thrown(&p[..4]),
+        locate(site)
+    );
+    // Match crash reports' stderr output, but never panic on an I/O error.
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
+    #[cfg(test)]
+    FIRST_CHANCE_LINES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(line);
+}
+
+/// Applies a legacy Visual Studio THREADNAME_INFO notification. On x64 its
+/// first three words contain { type, padding }, { name }, { id, flags }.
+/// Legacy DWORD-count samples provide extra words; reserved flags are ignored.
+fn name_thread(p: &[usize]) -> bool {
+    if crate::threads::exiting() {
+        return false;
+    }
+    if p.len() < 3 || p[0] as u32 != 0x1000 {
+        return false;
+    }
+    let name = match bounded_cstr(p[1], MAX_STRING) {
+        Ok(name) | Err((name, "unterminated")) => name,
+        Err(_) => return false,
+    };
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let id = p[2] as u32;
+    // SAFETY: the sentinel names this thread; otherwise open only its ID.
+    let thread = unsafe {
+        if id == u32::MAX {
+            GetCurrentThread()
+        } else if id == 0 {
+            return false;
+        } else {
+            OpenThread(
+                THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                id,
+            )
+        }
+    };
+    if thread.is_null() {
+        return false;
+    }
+    // SAFETY: `thread` is current or open. Check ownership before naming,
+    // then close every owned handle below, including rejected foreign ones.
+    let ours = unsafe { GetProcessIdOfThread(thread) == GetCurrentProcessId() };
+    // SAFETY: `wide` is NUL-terminated; only this process's threads are named.
+    let result = ours && unsafe { SetThreadDescription(thread, wide.as_ptr()) } >= 0;
+    if id != u32::MAX {
+        // SAFETY: this branch opened `thread`; the current-thread pseudo
+        // handle is never closed.
+        unsafe { CloseHandle(thread) };
+    }
+    result
+}
+
+/// What a C++ throw threw. Every pointer and RVA comes from the exception,
+/// so every access is bounded and fallible; no exception-object method runs.
+fn thrown(p: &[usize]) -> String {
+    if p.len() != 4 || !CPP_MAGICS.contains(&p[0]) {
+        return "<invalid MSVC exception parameters>".into();
+    }
+    if p[1] == 0 && p[2] == 0 {
+        return "<rethrow>".into();
+    }
+    let Some(size) = image_size(p[3]) else {
+        return "<unreadable C++ image metadata>".into();
+    };
+    let Some(info_rva) = p[2].checked_sub(p[3]) else {
+        return "<invalid ThrowInfo address>".into();
+    };
+    let Some(info) = image_address(p[3], size, info_rva, 16) else {
+        return "<invalid ThrowInfo RVA>".into();
+    };
+    let Some(types_rva) = read_u32(info + 12).map(|rva| rva as usize) else {
+        return "<unreadable ThrowInfo>".into();
+    };
+    let Some(types) = image_address(p[3], size, types_rva, 4) else {
+        return "<invalid catchable-type array RVA>".into();
+    };
+    let Some(count) = read_u32(types).map(|n| n as usize) else {
+        return "<unreadable catchable-type count>".into();
+    };
+    if count == 0 || count > MAX_CATCHABLE_TYPES {
+        return format!("<invalid catchable-type count {count}>");
+    }
+    let Some(array_bytes) = count.checked_mul(4).and_then(|n| n.checked_add(4)) else {
+        return "<overflowing catchable-type array>".into();
+    };
+    if image_address(p[3], size, types_rva, array_bytes).is_none() {
+        return "<truncated catchable-type array>".into();
+    }
+    let mut names = Vec::with_capacity(count);
+    let mut standard_base = None;
+    for i in 0..count {
+        let entry = types + 4 + i * 4;
+        let Some(catchable_rva) = read_u32(entry).map(|rva| rva as usize) else {
+            return "<unreadable catchable-type entry>".into();
+        };
+        let Some(catchable) = image_address(p[3], size, catchable_rva, 28) else {
+            return "<invalid catchable-type RVA>".into();
+        };
+        let Some(descriptor_rva) = read_u32(catchable + 4).map(|rva| rva as usize) else {
+            return "<unreadable type descriptor RVA>".into();
+        };
+        let Some(descriptor) = image_address(p[3], size, descriptor_rva, 17) else {
+            return "<invalid type descriptor RVA>".into();
+        };
+        let room = size - descriptor_rva - 16;
+        match bounded_cstr(descriptor + 16, MAX_STRING.min(room)) {
+            Ok(name) => {
+                if name == ".?AVexception@std@@" {
+                    // PMD: a non-virtual base is at mdisp; do not guess a
+                    // virtual base's layout or invoke its vtable.
+                    standard_base = read_u32(catchable + 12)
+                        .filter(|&pdisp| pdisp == u32::MAX)
+                        .and_then(|_| read_u32(catchable + 8))
+                        .map(|d| d as i32);
                 }
+                names.push(name);
             }
-            _ => String::new(),
+            Err((_, reason)) => return format!("<{reason} C++ type name>"),
+        }
+    }
+    let first = &names[0];
+    if matches!(first.as_str(), ".H" | ".I" | ".J" | ".K") {
+        return match read_u32(p[1]) {
+            Some(value) => format!("{first} = {value:#010x}"),
+            None if p[1] == 0 => first.clone(),
+            None => format!("{first} = <unreadable value>"),
         };
-        format!("{first}{value}")
+    }
+    if !names.iter().any(|name| name == ".?AVexception@std@@") {
+        return first.clone();
+    }
+    let Some(offset) = standard_base else {
+        return format!("{first}: <unsupported std::exception base>");
+    };
+    // MSVC x64 std::exception stores its message after the base's vftable.
+    let Some(message) = p[1]
+        .checked_add_signed(offset as isize)
+        .and_then(|base| base.checked_add(size_of::<usize>()))
+        .and_then(read_usize)
+    else {
+        return format!("{first}: <unreadable exception object>");
+    };
+    if message == 0 {
+        return format!("{first}: <null what()>");
+    }
+    match bounded_cstr(message, MAX_STRING) {
+        Ok(message) => format!("{first}: {message}"),
+        Err((prefix, reason)) if prefix.is_empty() => format!("{first}: <{reason} what()>"),
+        Err((prefix, reason)) => {
+            format!("{first}: <{reason} what() after {:?}>", prefix)
+        }
     }
 }
 
@@ -565,9 +921,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
             _ => "execute",
         };
         format!(" ({kind} {:#x}: {})", p[1], memory_at(p[1]))
-    } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
-        // SAFETY: a live MSVC throw.
-        format!(" (C++ {} thrown)", unsafe { thrown(&p) })
+    } else if code == CPP_EXCEPTION {
+        let count = (record.NumberParameters as usize).min(p.len());
+        format!(" (C++ {} thrown)", thrown(&p[..count]))
     } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
         // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
         format!(" (code {})", unsafe { instruction_bytes(at) })
@@ -764,9 +1120,15 @@ fn memory_at(address: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, AtomicUsize as TestAtomicUsize};
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        RaiseException, RemoveVectoredExceptionHandler,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
     #[test]
     #[inline(never)]
@@ -1341,5 +1703,981 @@ mod tests {
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
         assert_eq!(SEEN.load(Ordering::SeqCst), 1);
+    }
+    static SWALLOW_THREAD: AtomicU32 = AtomicU32::new(0);
+    static SWALLOW_CODE: TestAtomicUsize = TestAtomicUsize::new(0);
+    static SWALLOW_SEEN: AtomicUsize = AtomicUsize::new(0);
+    static SWALLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static SWALLOW_PARAMS: [AtomicUsize; 15] = [const { AtomicUsize::new(0) }; 15];
+
+    fn child_ran(out: &std::process::Output, name: &str) -> bool {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        out.status.success()
+            && stdout
+                .lines()
+                .any(|line| line == format!("test crash::tests::{name} ... ok"))
+            && stdout.contains("test result: ok. 1 passed; 0 failed;")
+    }
+
+    fn isolated(name: &str) -> bool {
+        if std::env::var("XTP_EXCEPTION_CHILD").as_deref() == Ok(name) {
+            return false;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("crash::tests::{name}"), "--nocapture"])
+            .env("XTP_EXCEPTION_CHILD", name)
+            .output()
+            .unwrap();
+        assert!(
+            child_ran(&out, name),
+            "{name}: status {:?}\n{}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if name.starts_with("unreadable_what") {
+            assert!(String::from_utf8_lossy(&out.stderr).contains("<unreadable what()>"));
+        }
+        true
+    }
+
+    fn lines() -> Vec<String> {
+        FIRST_CHANCE_LINES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    unsafe extern "system" fn swallow_test_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: Windows passes a live exception record; the thread-ID query
+        // has no preconditions.
+        let (record, current) = unsafe { (&*(*info).ExceptionRecord, GetCurrentThreadId()) };
+        let mine = current == SWALLOW_THREAD.load(Ordering::Relaxed);
+        let count = SWALLOW_COUNT.load(Ordering::Relaxed);
+        let expected = record.NumberParameters as usize == count
+            && count <= SWALLOW_PARAMS.len()
+            && record.ExceptionInformation[..count]
+                .iter()
+                .zip(&SWALLOW_PARAMS)
+                .all(|(&p, expected)| p == expected.load(Ordering::Relaxed));
+        if mine && expected && record.ExceptionCode as usize == SWALLOW_CODE.load(Ordering::Relaxed)
+        {
+            SWALLOW_SEEN.fetch_add(1, Ordering::Relaxed);
+            -1
+        } else {
+            EXCEPTION_CONTINUE_SEARCH
+        }
+    }
+
+    /// Raises through Windows and handles only this test's exception after
+    /// the production first-chance observer has declined to handle it.
+    fn raise(code: i32, p: &[usize]) {
+        raise_from(None, code, p);
+    }
+
+    fn raise_from(image: Option<&SyntheticThrow>, code: i32, p: &[usize]) {
+        report_crashes();
+        // SAFETY: a plain query of the calling thread.
+        SWALLOW_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+        SWALLOW_CODE.store(code as usize, Ordering::Relaxed);
+        assert!(p.len() <= SWALLOW_PARAMS.len());
+        SWALLOW_COUNT.store(p.len(), Ordering::Relaxed);
+        for (expected, &value) in SWALLOW_PARAMS.iter().zip(p) {
+            expected.store(value, Ordering::Relaxed);
+        }
+        // SAFETY: installs a handler for the continuable exception below.
+        let swallow = unsafe { AddVectoredExceptionHandler(0, Some(swallow_test_exception)) };
+        assert!(!swallow.is_null());
+        let before = SWALLOW_SEEN.load(Ordering::Relaxed);
+        // SAFETY: `p` remains live throughout dispatch; the test handler
+        // consumes this continuable exception after observation.
+        unsafe {
+            if let Some(image) = image {
+                let call: unsafe extern "system" fn(u32, u32, u32, *const usize) =
+                    std::mem::transmute(image.base + SyntheticThrow::CODE);
+                call(code as u32, 0, p.len() as u32, p.as_ptr());
+            } else {
+                RaiseException(code as u32, 0, p.len() as u32, p.as_ptr());
+            }
+        };
+        // SAFETY: `swallow` is the registration returned above.
+        unsafe { RemoveVectoredExceptionHandler(swallow) };
+        SWALLOW_THREAD.store(0, Ordering::Relaxed);
+        assert_eq!(
+            SWALLOW_SEEN.load(Ordering::Relaxed),
+            before + 1,
+            "observer must continue to the next VEH"
+        );
+    }
+
+    fn forwarding_code(target: usize) -> Vec<u8> {
+        let mut code = vec![0x48, 0x83, 0xec, 0x28, 0x48, 0xb8]; // sub rsp,40; mov rax,imm64
+        code.extend_from_slice(&target.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x28, 0xc3]);
+        code
+    }
+
+    /// Our PE mapped by Windows directly, deliberately absent from the title registry.
+    struct HostCaller {
+        module: HMODULE,
+        _dir: tempfile::TempDir,
+    }
+    impl HostCaller {
+        fn new(name: &str) -> Self {
+            use std::os::windows::ffi::OsStrExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            let prepared = crate::prepare(&SyntheticThrow::fixture()).unwrap();
+            std::fs::write(&path, prepared.bytes).unwrap();
+            let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: the synthetic DLL has no entry point, callbacks or imports.
+            let module = unsafe {
+                windows_sys::Win32::System::LibraryLoader::LoadLibraryExW(
+                    wide.as_ptr(),
+                    null_mut(),
+                    0,
+                )
+            };
+            assert!(!module.is_null(), "{}", std::io::Error::last_os_error());
+            let code = forwarding_code(RaiseException as *const () as usize);
+            // SAFETY: this fixture's .test section is writable, and owns the code range.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    code.as_ptr(),
+                    (module as usize + SyntheticThrow::CODE) as *mut u8,
+                    code.len(),
+                )
+            };
+            Self { module, _dir: dir }
+        }
+        fn code(&self) -> usize {
+            self.module as usize + SyntheticThrow::CODE
+        }
+    }
+    impl Drop for HostCaller {
+        fn drop(&mut self) {
+            // SAFETY: owns the load reference; no calls remain in flight.
+            unsafe { windows_sys::Win32::Foundation::FreeLibrary(self.module) };
+        }
+    }
+
+    struct SyntheticThrow {
+        image: crate::LoadedImage,
+        _dir: tempfile::TempDir,
+        base: usize,
+        size: usize,
+    }
+
+    impl SyntheticThrow {
+        const INFO: usize = 0x1200;
+        const TYPES: usize = 0x1300;
+        const CATCHABLE: usize = 0x1400;
+        const DESCRIPTOR: usize = 0x1600;
+        const CODE: usize = 0x2200;
+        const BACK: usize = Self::CODE + 16;
+
+        fn fixture() -> Vec<u8> {
+            // Original minimal PE32+ DLL: one writable/executable section,
+            // no imports, and unwind data for a tiny RaiseException caller.
+            let mut pe = vec![0u8; 0x2200];
+            let put = |pe: &mut [u8], at: usize, bytes: &[u8]| {
+                pe[at..at + bytes.len()].copy_from_slice(bytes)
+            };
+            put(&mut pe, 0, b"MZ");
+            put(&mut pe, 0x3c, &0x80u32.to_le_bytes());
+            put(&mut pe, 0x80, b"PE\0\0");
+            put(&mut pe, 0x84, &0x8664u16.to_le_bytes());
+            put(&mut pe, 0x86, &1u16.to_le_bytes());
+            put(&mut pe, 0x94, &240u16.to_le_bytes());
+            put(&mut pe, 0x96, &0x2022u16.to_le_bytes());
+            let o = 0x98;
+            for (at, value) in [
+                (0, 0x20bu32),
+                (24, 0x80000000),
+                (28, 1),
+                (32, 0x1000),
+                (36, 0x200),
+                (40, 6),
+                (48, 6),
+                (56, 0x3000),
+                (60, 0x200),
+                (68, 3),
+                (108, 16),
+                (112 + 24, 0x2420),
+                (116 + 24, 12),
+            ] {
+                put(&mut pe, o + at, &value.to_le_bytes());
+            }
+            let section = o + 240;
+            put(&mut pe, section, b".test");
+            for (at, value) in [
+                (8, 0x2000u32),
+                (12, 0x1000),
+                (16, 0x2000),
+                (20, 0x200),
+                (36, 0xe0000060),
+            ] {
+                put(&mut pe, section + at, &value.to_le_bytes());
+            }
+            // UWOP_ALLOC_SMALL(40), prologue length 4, one unwind slot.
+            put(&mut pe, 0x1600, &[1, 4, 1, 0, 4, 0x42, 0, 0]); // RVA 0x2400
+            for (i, v) in [Self::CODE as u32, Self::CODE as u32 + 21, 0x2400]
+                .iter()
+                .enumerate()
+            {
+                put(&mut pe, 0x1620 + i * 4, &v.to_le_bytes());
+            }
+            pe
+        }
+
+        fn new(names: &[&[u8]]) -> Self {
+            let prepared = crate::prepare(&Self::fixture()).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let image = crate::load(&prepared, dir.path()).unwrap();
+            let this = Self {
+                base: image.base(),
+                size: image.info().size_of_image as usize,
+                image,
+                _dir: dir,
+            };
+            this.put(Self::INFO + 12, Self::TYPES as u32);
+            this.put(Self::TYPES, names.len() as u32);
+            for (i, name) in names.iter().enumerate() {
+                let catchable = Self::CATCHABLE + i * 0x20;
+                let descriptor = Self::DESCRIPTOR + i * 0x100;
+                this.put(Self::TYPES + 4 + i * 4, catchable as u32);
+                this.put(catchable + 4, descriptor as u32);
+                this.put(catchable + 12, u32::MAX); // non-virtual base
+                this.bytes(descriptor + 16, name);
+                this.bytes(descriptor + 16 + name.len(), &[0]);
+            }
+            this.bytes(
+                Self::CODE,
+                &forwarding_code(RaiseException as *const () as usize),
+            );
+            assert_eq!(
+                crate::threads::image_at(this.base + Self::BACK),
+                Some((this.base, this.size))
+            );
+            this
+        }
+
+        fn put<T: Copy>(&self, offset: usize, value: T) {
+            assert!(
+                offset
+                    .checked_add(size_of::<T>())
+                    .is_some_and(|end| end <= self.size)
+            );
+            // SAFETY: all callers use offsets and sizes inside our image.
+            unsafe { ((self.base + offset) as *mut T).write_unaligned(value) };
+        }
+
+        fn bytes(&self, offset: usize, bytes: &[u8]) {
+            assert!(
+                offset
+                    .checked_add(bytes.len())
+                    .is_some_and(|end| end <= self.size)
+            );
+            // SAFETY: all callers keep the copy inside our allocated image.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    (self.base + offset) as *mut u8,
+                    bytes.len(),
+                )
+            };
+        }
+
+        fn raise(&self, object: usize) {
+            raise_from(Some(self), CPP_EXCEPTION, &self.params(object));
+        }
+
+        fn params(&self, object: usize) -> [usize; 4] {
+            [CPP_MAGICS[0], object, self.base + Self::INFO, self.base]
+        }
+    }
+
+    impl Drop for SyntheticThrow {
+        fn drop(&mut self) {
+            // SAFETY: no calls are in flight and the synthetic image was never attached.
+            unsafe { self.image.clone().unload() };
+        }
+    }
+
+    fn description(thread: HANDLE) -> String {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::System::Threading::GetThreadDescription;
+        let mut name = std::ptr::null_mut();
+        // SAFETY: asks Windows to allocate this thread's description.
+        assert!(unsafe { GetThreadDescription(thread, &mut name) } >= 0);
+        assert!(!name.is_null());
+        // SAFETY: Windows returns a NUL-terminated string owned by LocalAlloc.
+        let text = unsafe {
+            let len = (0..1024).take_while(|&i| *name.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(name, len))
+        };
+        // SAFETY: frees the string returned by GetThreadDescription.
+        unsafe { LocalFree(name.cast()) };
+        text
+    }
+
+    #[test]
+    fn debugger_exception_names_the_host_thread() {
+        if isolated("debugger_exception_names_the_host_thread") {
+            return;
+        }
+        // SAFETY: a current-thread pseudo handle needs no open or close.
+        let current = unsafe { GetCurrentThread() };
+        let name = b"XTP acceptance thread\0";
+        #[repr(C)]
+        struct ThreadName {
+            kind: u32,
+            padding: u32,
+            name: *const u8,
+            id: u32,
+            flags: u32,
+        }
+        let params = |id| {
+            let info = ThreadName {
+                kind: 0x1000,
+                padding: 0,
+                name: name.as_ptr(),
+                id,
+                flags: 0,
+            };
+            assert_eq!(size_of::<ThreadName>(), 3 * size_of::<usize>());
+            assert_eq!(std::mem::offset_of!(ThreadName, id), 16);
+            // SAFETY: every byte is initialized, including explicit padding.
+            unsafe {
+                std::ptr::from_ref(&info)
+                    .cast::<[usize; 3]>()
+                    .read_unaligned()
+            }
+        };
+        let p = params(u32::MAX);
+        raise(THREAD_NAME_EXCEPTION, &p);
+        assert_eq!(description(current), "XTP acceptance thread");
+        let (send, recv) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            // SAFETY: both APIs query the current thread.
+            send.send(unsafe { GetCurrentThreadId() }).unwrap();
+            wait.recv().unwrap();
+            // SAFETY: a current-thread pseudo handle is always valid.
+            description(unsafe { GetCurrentThread() })
+        });
+        raise(THREAD_NAME_EXCEPTION, &params(recv.recv().unwrap()));
+        go.send(()).unwrap();
+        assert_eq!(other.join().unwrap(), "XTP acceptance thread");
+    }
+
+    #[test]
+    fn unreadable_what_is_logged_when_windows_raises_the_exception() {
+        if isolated("unreadable_what_is_logged_when_windows_raises_the_exception") {
+            return;
+        }
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        let image = SyntheticThrow::new(&[b".?AVexception@std@@"]);
+        // SAFETY: allocates one deliberately inaccessible test page.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_NOACCESS,
+            )
+        };
+        assert!(!page.is_null());
+        let object = [0, page as usize];
+        image.raise(object.as_ptr() as usize);
+        let logged = lines().join("\n");
+        assert!(logged.contains(".?AVexception@std@@"), "{logged}");
+        assert!(logged.contains("<unreadable what()>"), "{logged}");
+        let expected = format!(" at {}", locate(image.base + SyntheticThrow::BACK));
+        assert!(logged.contains(&expected), "{logged}");
+        assert!(logged.contains("+0x2210"), "{logged}");
+        // SAFETY: releases the page allocated above.
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn readable_messages_invalid_utf8_and_scalar_values_survive() {
+        if isolated("readable_messages_invalid_utf8_and_scalar_values_survive") {
+            return;
+        }
+        let image = SyntheticThrow::new(&[b".?AVderived@@", b".?AVexception@std@@"]);
+        image.put(SyntheticThrow::CATCHABLE + 0x20 + 8, 16u32);
+        let message = b"readable message\0";
+        let object = [0, 1, 0, message.as_ptr() as usize];
+        image.raise(object.as_ptr() as usize);
+        assert!(lines()[0].contains(": readable message"), "{:?}", lines());
+        let invalid = [0xff, 0];
+        let object = [0, 1, 0, invalid.as_ptr() as usize];
+        image.raise(object.as_ptr() as usize);
+        assert!(lines()[1].contains('\u{fffd}'), "{:?}", lines());
+        image.put(SyntheticThrow::CATCHABLE + 0x20 + 12, 0u32);
+        assert!(thrown(&image.params(0)).contains("unsupported std::exception base"));
+        drop(image);
+        let scalar = SyntheticThrow::new(&[b".J"]);
+        let value = 0x8000_4001u32;
+        scalar.raise((&raw const value) as usize);
+        assert!(lines()[2].contains(".J = 0x80004001"), "{:?}", lines());
+    }
+
+    #[test]
+    fn invalid_payloads_are_logged_but_bad_parameter_headers_do_not_consume_budget() {
+        if isolated("invalid_payloads_are_logged_but_bad_parameter_headers_do_not_consume_budget") {
+            return;
+        }
+        let image = SyntheticThrow::new(&[b".?AVexception@std@@"]);
+        let null_what = [0usize, 0];
+        image.raise(null_what.as_ptr() as usize);
+        image.raise(0);
+        let mut bad_info = image.params(0);
+        bad_info[1] = 1; // object non-null: not a rethrow
+        bad_info[2] = 0;
+        raise_from(Some(&image), CPP_EXCEPTION, &bad_info);
+        let logged = lines();
+        assert!(logged[0].contains("<null what()>"), "{logged:?}");
+        assert!(
+            logged[1].contains("<unreadable exception object>"),
+            "{logged:?}"
+        );
+        assert!(logged[2].contains("<invalid ThrowInfo"), "{logged:?}");
+        let used = FIRST_CHANCE.load(Ordering::Relaxed);
+        let p = image.params(0);
+        raise_from(Some(&image), CPP_EXCEPTION, &p[..3]);
+        let mut wrong_magic = p;
+        wrong_magic[0] = 0x1993_0000;
+        raise_from(Some(&image), CPP_EXCEPTION, &wrong_magic);
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), used);
+        assert_eq!(lines().len(), 3);
+    }
+
+    #[test]
+    fn invalid_rvas_and_excessive_type_counts_have_diagnostics() {
+        if isolated("invalid_rvas_and_excessive_type_counts_have_diagnostics") {
+            return;
+        }
+        let image = SyntheticThrow::new(&[b".?AVexception@std@@"]);
+        image.put(SyntheticThrow::INFO + 12, 0x2fffu32);
+        image.raise(0);
+        image.put(SyntheticThrow::INFO + 12, SyntheticThrow::TYPES as u32);
+        image.put(SyntheticThrow::TYPES, (MAX_CATCHABLE_TYPES + 1) as u32);
+        image.raise(0);
+        let logged = lines();
+        assert!(logged[0].contains("catchable-type array RVA"), "{logged:?}");
+        assert!(
+            logged[1].contains("invalid catchable-type count 33"),
+            "{logged:?}"
+        );
+        assert_eq!(image_address(usize::MAX - 3, 8, 2, 4), None);
+        assert_eq!(image_address(1, usize::MAX, usize::MAX, 8), None);
+        image.put(SyntheticThrow::TYPES, 1u32);
+        image.put(SyntheticThrow::CATCHABLE + 4, 0x2fefu32);
+        image.bytes(0x2fff, b"x");
+        assert!(thrown(&image.params(0)).contains("unterminated C++ type name"));
+        // Range lookup is half-open; contention is tested separately.
+        assert!(crate::threads::image_at(image.base - 1).is_none());
+        assert!(crate::threads::image_at(image.base + image.size).is_none());
+    }
+
+    #[test]
+    fn cross_page_and_unterminated_strings_are_bounded() {
+        if isolated("cross_page_and_unterminated_strings_are_bounded") {
+            return;
+        }
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        let image = SyntheticThrow::new(&[b".?AVexception@std@@"]);
+        // SAFETY: owns two pages; only the second is made inaccessible.
+        unsafe {
+            let pages = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!pages.is_null());
+            pages
+                .add(0xff8)
+                .copy_from_nonoverlapping(c"crossing-page".as_ptr().cast(), 14);
+            assert_eq!(
+                bounded_cstr(pages.add(0xff8) as usize, MAX_STRING).unwrap(),
+                "crossing-page"
+            );
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(pages.add(0x1000).cast(), 0x1000, PAGE_NOACCESS, &mut old),
+                0
+            );
+            pages
+                .add(0xff8)
+                .copy_from_nonoverlapping(b"abcdefgh".as_ptr(), 8);
+            let object = [0, pages.add(0xff8) as usize];
+            image.raise(object.as_ptr() as usize);
+            assert!(
+                lines()[0].contains(r#"unreadable what() after "abcdefgh""#),
+                "{:?}",
+                lines()
+            );
+            pages.write_bytes(b'x', 0x1000);
+            let error = bounded_cstr(pages as usize, 32).unwrap_err();
+            assert_eq!(error, ("x".repeat(32), "unterminated"));
+            VirtualFree(pages.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn memory_reads_reject_guard_pages_and_overflow() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
+        };
+        assert_eq!(read_u32(usize::MAX), None);
+        assert_eq!(read_usize(1), None);
+        // SAFETY: fresh guarded allocation; query its protection without touching it.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE | PAGE_GUARD,
+            );
+            assert!(!page.is_null());
+            assert_eq!(read_u32(page as usize), None);
+            assert_eq!(read_u32(page as usize), None);
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(page, &mut info, size_of_val(&info)), 0);
+            assert_ne!(
+                info.Protect & PAGE_GUARD,
+                0,
+                "observer must preserve the guard"
+            );
+            VirtualFree(page, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn invalid_thread_name_parameters_are_ignored() {
+        let name = b"ignored\0";
+        for params in [
+            vec![],
+            vec![0, name.as_ptr() as usize, u32::MAX as usize],
+            vec![0x1000, name.as_ptr() as usize, 1usize << 32],
+            vec![0x1000, name.as_ptr() as usize, 0],
+            vec![0x1000, 0, u32::MAX as usize],
+        ] {
+            assert!(!name_thread(&params));
+        }
+    }
+
+    #[test]
+    fn first_chance_budget_is_exact_and_concurrent() {
+        if isolated("first_chance_budget_is_exact_and_concurrent") {
+            return;
+        }
+        let image = SyntheticThrow::new(&[b".?AVexception@std@@"]);
+        let message = b"budget\0";
+        let object = [0, message.as_ptr() as usize];
+        for _ in 0..18 {
+            image.raise(object.as_ptr() as usize);
+        }
+        assert_eq!(lines().len(), FIRST_CHANCE_LIMIT);
+        FIRST_CHANCE.store(0, Ordering::Relaxed);
+        FIRST_CHANCE_LINES.lock().unwrap().clear();
+        let params = image.params(object.as_ptr() as usize);
+        let site = image.base + SyntheticThrow::BACK;
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    // SAFETY: valid empty record; the fixture and object outlive all workers.
+                    let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+                    record.ExceptionCode = CPP_EXCEPTION;
+                    record.ExceptionAddress = site as *mut _;
+                    record.NumberParameters = 4;
+                    record.ExceptionInformation[..4].copy_from_slice(&params);
+                    for _ in 0..32 {
+                        observe_cpp(&record, &context());
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(lines().len(), FIRST_CHANCE_LIMIT);
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), FIRST_CHANCE_LIMIT);
+    }
+
+    #[test]
+    fn unrelated_and_unhandled_exceptions_keep_their_existing_behaviour() {
+        if isolated("unrelated_and_unhandled_exceptions_keep_their_existing_behaviour") {
+            return;
+        }
+        let image = SyntheticThrow::new(&[b".?AVexception@std@@"]);
+        let message = b"still reported\0";
+        let object = [0, message.as_ptr() as usize];
+        let mut unrelated = image.params(object.as_ptr() as usize);
+        unrelated[3] = 1;
+        raise(CPP_EXCEPTION, &unrelated);
+        raise(0xe0420001u32 as i32, &[]);
+        // A registered metadata base also cannot turn a host throw into a title throw.
+        raise(CPP_EXCEPTION, &image.params(object.as_ptr() as usize));
+        assert!(lines().is_empty());
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), 0);
+        FIRST_CHANCE.store(FIRST_CHANCE_LIMIT, Ordering::Relaxed);
+        // SAFETY: zero is a valid initial record; only its fields are set.
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = CPP_EXCEPTION;
+        record.NumberParameters = 4;
+        record.ExceptionInformation[..4].copy_from_slice(&image.params(object.as_ptr() as usize));
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("crashes.log");
+        log_crashes_to(log.clone());
+        let mut context = context();
+        let mut pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut context,
+        };
+        // SAFETY: live synthetic record/context; the exhausted observer must continue dispatch.
+        assert_eq!(unsafe { handler(&mut pointers) }, EXCEPTION_CONTINUE_SEARCH);
+        // SAFETY: both records remain live while the unhandled report reads them.
+        unsafe { report_unhandled(&pointers) };
+        assert!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .contains("still reported")
+        );
+    }
+    #[test]
+    fn review_rethrows_use_throw_site_and_event_budget() {
+        if isolated("review_rethrows_use_throw_site_and_event_budget") {
+            return;
+        }
+        let image = SyntheticThrow::new(&[]);
+        let rethrow = [CPP_MAGICS[0], 0, 0, 0];
+        raise(CPP_EXCEPTION, &rethrow); // host caller
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), 0);
+        raise_from(Some(&image), CPP_EXCEPTION, &rethrow);
+        let expected = format!(
+            "XTP: first-chance C++ <rethrow> at {}",
+            locate(image.base + SyntheticThrow::BACK)
+        );
+        assert_eq!(lines().as_slice(), std::slice::from_ref(&expected));
+        raise_from(Some(&image), CPP_EXCEPTION, &rethrow);
+        assert_eq!(
+            FIRST_CHANCE.load(Ordering::Relaxed),
+            2,
+            "rethrows are separate events"
+        );
+        for bad in [[0, 0, 0, 0], [CPP_MAGICS[0], 0, 0, 0]] {
+            let params = if bad[0] == 0 { &bad[..] } else { &bad[..3] };
+            raise_from(Some(&image), CPP_EXCEPTION, params);
+            assert!(thrown(params).contains("invalid MSVC exception parameters"));
+        }
+        assert_eq!(lines(), [expected.clone(), expected]);
+        assert!(!thrown(&[CPP_MAGICS[0], 1, 0, 0]).contains("rethrow"));
+        assert!(!thrown(&[CPP_MAGICS[0], 0, 1, 0]).contains("rethrow"));
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), 2);
+    }
+
+    unsafe extern "system" fn hle_raise(code: u32, flags: u32, count: u32, params: *const usize) {
+        // SAFETY: forwards the live parameters supplied by the fixture caller.
+        unsafe { RaiseException(code, flags, count, params) };
+    }
+    unsafe extern "system" fn hle_panics(_: u32, _: u32, _: u32, _: *const usize) {
+        assert!(std::panic::catch_unwind(|| panic!("synthetic HLE panic")).is_err());
+    }
+
+    #[test]
+    fn review_only_throw_machinery_may_precede_a_title_frame() {
+        if isolated("review_only_throw_machinery_may_precede_a_title_frame") {
+            return;
+        }
+        let title = SyntheticThrow::new(&[b".H"]);
+        let value = 7u32;
+        title.raise((&raw const value) as usize); // real KernelBase -> title
+        let expected = format!(" at {}", locate(title.base + SyntheticThrow::BACK));
+        assert!(lines()[0].ends_with(&expected));
+        for name in ["msvcp140_xtp_review.dll", "VCRUNTIME140_123_XTP.dll"] {
+            let runtime = HostCaller::new(name);
+            assert!(throw_machinery(runtime.code()));
+            title.bytes(SyntheticThrow::CODE, &forwarding_code(runtime.code()));
+            title.raise((&raw const value) as usize);
+            assert!(lines().last().unwrap().ends_with(&expected));
+        }
+        assert_eq!(
+            lines().len(),
+            3,
+            "both runtime DLL callers must emit a new diagnostic"
+        );
+        let used = FIRST_CHANCE.load(Ordering::Relaxed);
+        assert_eq!(used, 3);
+        let host = HostCaller::new("xtp-unrelated-host.dll");
+        assert!(!throw_machinery(host.code()));
+        title.bytes(SyntheticThrow::CODE, &forwarding_code(host.code()));
+        title.raise((&raw const value) as usize);
+        title.bytes(
+            SyntheticThrow::CODE,
+            &forwarding_code(hle_raise as *const () as usize),
+        );
+        title.raise((&raw const value) as usize);
+        title.bytes(
+            SyntheticThrow::CODE,
+            &forwarding_code(hle_panics as *const () as usize),
+        );
+        // SAFETY: our forwarding stub calls hle_panics, which catches its own panic.
+        // No swallowing VEH: Rust's real catch_unwind must receive this exception.
+        unsafe {
+            let call: unsafe extern "system" fn(u32, u32, u32, *const usize) =
+                std::mem::transmute(title.base + SyntheticThrow::CODE);
+            call(0, 0, 0, std::ptr::null());
+        }
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), used);
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            IMAGE_RUNTIME_FUNCTION_ENTRY, IMAGE_RUNTIME_FUNCTION_ENTRY_0, RtlAddFunctionTable,
+            RtlDeleteFunctionTable,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: fresh executable fixture and matching unwind table, removed before freeing it.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let code = forwarding_code(RaiseException as *const () as usize);
+            page.copy_from_nonoverlapping(code.as_ptr(), code.len());
+            page.add(0x100)
+                .copy_from_nonoverlapping([1, 4, 1, 0, 4, 0x42, 0, 0].as_ptr(), 8);
+            let entry = IMAGE_RUNTIME_FUNCTION_ENTRY {
+                BeginAddress: 0,
+                EndAddress: 21,
+                Anonymous: IMAGE_RUNTIME_FUNCTION_ENTRY_0 { UnwindData: 0x100 },
+            };
+            assert!(RtlAddFunctionTable(&entry, 1, page as u64));
+            assert!(module_of(page as usize).is_none());
+            title.bytes(SyntheticThrow::CODE, &forwarding_code(page as usize));
+            title.raise((&raw const value) as usize);
+            assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), used);
+            assert!(RtlDeleteFunctionTable(&entry));
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+        // An unknown frame must stop before a later title PC, even if readable.
+        assert_eq!(title_frame(&[1, title.base + SyntheticThrow::BACK]), None);
+        assert_eq!(
+            title_frame(&[host.code(), title.base + SyntheticThrow::BACK]),
+            None
+        );
+        assert_eq!(
+            title_frame(&[title.base + SyntheticThrow::BACK]),
+            Some(title.base + SyntheticThrow::BACK)
+        );
+        for name in [
+            "vcruntime140.dll",
+            "VCRUNTIME140_1D.DLL",
+            "msvcp140_atomic_wait.dll",
+        ] {
+            assert!(runtime_family(name));
+        }
+        for name in [
+            "other-msvcp140.dll",
+            "vcruntime140fake.dll",
+            "msvcp140.exe",
+            "ucrtbase-extra.dll",
+            "msvcp140_.dll",
+        ] {
+            assert!(!runtime_family(name));
+        }
+    }
+
+    #[test]
+    fn review_invalid_child_selector_is_rejected() {
+        let name = "this_child_test_does_not_exist";
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("crash::tests::{name}"), "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "libtest returns success for zero matches"
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("0 passed"));
+        assert!(!child_ran(&out, name));
+    }
+
+    #[test]
+    fn review_legacy_names_accept_flags_extra_words_and_truncation() {
+        if isolated("review_legacy_names_accept_flags_extra_words_and_truncation") {
+            return;
+        }
+        // SAFETY: current-thread pseudo handle requires no ownership.
+        let current = unsafe { GetCurrentThread() };
+        let name = c"legacy name";
+        let p = [
+            0x1000,
+            name.as_ptr() as usize,
+            u32::MAX as usize | (42usize << 32),
+            0,
+            0,
+            0,
+        ];
+        raise(THREAD_NAME_EXCEPTION, &p); // sizeof(THREADNAME_INFO)/sizeof(DWORD) = 6
+        assert_eq!(description(current), "legacy name");
+        let long = vec![b'x'; MAX_STRING + 64];
+        raise(
+            THREAD_NAME_EXCEPTION,
+            &[0x1000, long.as_ptr() as usize, u32::MAX as usize],
+        );
+        assert_eq!(description(current), "x".repeat(MAX_STRING));
+        assert!(!name_thread(&[0x1000, 1, u32::MAX as usize]));
+    }
+
+    #[test]
+    fn review_foreign_thread_child() {
+        if std::env::var_os("XTP_FOREIGN_THREAD_CHILD").is_none() {
+            return;
+        }
+        use std::io::{BufRead, Write};
+        // SAFETY: queries this child's calling thread.
+        println!("XTP FOREIGN THREAD {}", unsafe { GetCurrentThreadId() });
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().lock().read_line(&mut input).unwrap();
+        assert_eq!(input.trim(), "finish");
+        // SAFETY: a live current-thread pseudo handle.
+        let current = unsafe { GetCurrentThread() };
+        assert_ne!(description(current), "foreign rename forbidden");
+        println!("XTP FOREIGN NAME UNCHANGED");
+    }
+
+    #[test]
+    fn review_explicit_thread_id_must_belong_to_this_process() {
+        if isolated("review_explicit_thread_id_must_belong_to_this_process") {
+            return;
+        }
+        use std::io::{BufRead, Write};
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash::tests::review_foreign_thread_child",
+                "--nocapture",
+            ])
+            .env("XTP_FOREIGN_THREAD_CHILD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let id = loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "foreign child ended before readiness"
+            );
+            if let Some((_, id)) = line.trim().split_once("XTP FOREIGN THREAD ") {
+                break id.parse::<u32>().unwrap();
+            }
+        };
+        // Prove Windows granted this foreign handle, rather than testing only OpenThread failure.
+        // SAFETY: requesting limited access to the controlled child's live thread.
+        let handle = unsafe {
+            OpenThread(
+                THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                id,
+            )
+        };
+        assert!(!handle.is_null());
+        // SAFETY: live opened handle; this query precedes its close.
+        assert_eq!(unsafe { GetProcessIdOfThread(handle) }, child.id());
+        // SAFETY: owns this real handle.
+        unsafe { CloseHandle(handle) };
+        assert!(!name_thread(&[
+            0x1000,
+            c"foreign rename forbidden".as_ptr() as usize,
+            id as usize
+        ]));
+        writeln!(child.stdin.take().unwrap(), "finish").unwrap();
+        use std::io::Read;
+        let mut rest = String::new();
+        output.read_to_string(&mut rest).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{rest}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(rest.contains("XTP FOREIGN NAME UNCHANGED"), "{rest}");
+    }
+
+    #[test]
+    fn review_exit_observers_child() {
+        if std::env::var_os("XTP_OBSERVER_EXIT_CHILD").is_none() {
+            return;
+        }
+        // Prepare everything before actual shutdown ends the harness's other threads.
+        let image = SyntheticThrow::new(&[]);
+        report_crashes();
+        let mut record = EXCEPTION_RECORD {
+            ExceptionCode: CPP_EXCEPTION,
+            NumberParameters: 4,
+            ExceptionAddress: (image.base + SyntheticThrow::BACK) as *mut _,
+            ..Default::default()
+        };
+        record.ExceptionInformation[..4].copy_from_slice(&[CPP_MAGICS[0], 0, 0, 0]);
+        let mut context = context();
+        let mut info = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut context,
+        };
+        let name = [
+            0x1000,
+            c"must not name during exit".as_ptr() as usize,
+            u32::MAX as usize,
+        ];
+        crate::threads::detach_all();
+        assert!(crate::threads::exiting());
+        observe_cpp(&record, &context);
+        assert!(!name_thread(&name));
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), 0);
+        // SAFETY: pointers are live; shutdown observers must continue dispatch.
+        assert_eq!(unsafe { handler(&mut info) }, EXCEPTION_CONTINUE_SEARCH);
+        println!("XTP EXIT OBSERVERS SKIPPED");
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn review_exit_skips_both_observers() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash::tests::review_exit_observers_child",
+                "--nocapture",
+            ])
+            .env("XTP_OBSERVER_EXIT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("XTP EXIT OBSERVERS SKIPPED"),
+            "status {:?}\n{}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

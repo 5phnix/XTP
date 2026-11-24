@@ -51,11 +51,6 @@ const FORBIDDEN_NAMES_REVERSED: &[&str] = &[
     "ratskcor",
 ];
 
-/// Paths whose text the name check skips until they are rewritten.
-// shortcut: docs/upstream/ is rewritten by the watch pass that owns it;
-// remove this entry once it lands.
-const NAME_CHECK_PENDING: &[&str] = &["docs/upstream/"];
-
 /// The forbidden names found in `content`, lower-case.
 fn forbidden_names(content: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(content).to_lowercase();
@@ -205,7 +200,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     {
         problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
     }
-    if !content.contains(&0) && !NAME_CHECK_PENDING.iter().any(|p| path.starts_with(p)) {
+    if !content.contains(&0) {
         let found = forbidden_names(content);
         if !found.is_empty() {
             problems.push(format!(
@@ -265,10 +260,7 @@ mod tests {
         let text = format!("// as {} does\n", name.to_uppercase());
         assert!(!check("crates/x/src/lib.rs", text.as_bytes()).is_empty());
         assert!(check("crates/x/src/lib.rs", b"// as BTP 6 does\n").is_empty());
-        assert!(
-            check("docs/upstream/watch.md", text.as_bytes()).is_empty(),
-            "pending path skipped"
-        );
+        assert!(!check("docs/upstream/watch.md", text.as_bytes()).is_empty());
     }
 
     #[test]

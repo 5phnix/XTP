@@ -130,9 +130,12 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
-        console: Console,
+        /// The console model the title sees (device type, memory); else
+        /// `XTP_CONSOLE`; else Series S, whose smaller budgets keep the
+        /// host GPU's memory manager out of the long stalls Series X hits
+        /// (docs/analysis/series-s.md).
+        #[arg(long, value_enum)]
+        console: Option<Console>,
         /// Drive the title by this script (autopilot/, docs/dev/autopilot.md).
         #[arg(long, value_name = "SCRIPT")]
         autopilot: Option<PathBuf>,
@@ -151,10 +154,25 @@ enum Unimplemented {
     Zero,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+impl Console {
+    /// `--console`, else `XTP_CONSOLE` (`series-x` or `series-s`), else
+    /// Series S.
+    fn pick(flag: Option<Console>, env: Option<&str>) -> Result<Console> {
+        if let Some(console) = flag {
+            return Ok(console);
+        }
+        match env.map(str::trim).filter(|v| !v.is_empty()) {
+            None => Ok(Console::SeriesS),
+            Some(value) => Console::from_str(value, true)
+                .map_err(|_| anyhow::anyhow!("XTP_CONSOLE={value}: expected series-x or series-s")),
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -212,7 +230,11 @@ fn main() -> Result<()> {
             console,
             autopilot,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console, autopilot),
+        } => {
+            let env = std::env::var("XTP_CONSOLE").ok();
+            let console = Console::pick(console, env.as_deref())?;
+            run::run(&exe, unimplemented, strict, execute, console, autopilot)
+        }
         Command::Config => show_config(),
     }
 }
@@ -278,4 +300,40 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see xtp.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn console_of(args: &[&str]) -> Option<Console> {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Run { console, .. } = cli.command else {
+            panic!("not run");
+        };
+        console
+    }
+
+    #[test]
+    fn series_s_unless_told() {
+        let flag = console_of(&["xtp", "run", "game.exe"]);
+        assert_eq!(flag, None);
+        assert_eq!(Console::pick(flag, None).unwrap(), Console::SeriesS);
+        assert_eq!(Console::pick(flag, Some(" ")).unwrap(), Console::SeriesS);
+    }
+
+    #[test]
+    fn the_flag_then_the_variable_bring_series_x_back() {
+        let flag = console_of(&["xtp", "run", "game.exe", "--console", "series-x"]);
+        assert_eq!(flag, Some(Console::SeriesX));
+        assert_eq!(
+            Console::pick(flag, Some("series-s")).unwrap(),
+            Console::SeriesX
+        );
+        assert_eq!(
+            Console::pick(None, Some("Series-X")).unwrap(),
+            Console::SeriesX
+        );
+        assert!(Console::pick(None, Some("one")).is_err());
+    }
 }
