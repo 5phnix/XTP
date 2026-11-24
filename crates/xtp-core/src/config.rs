@@ -1,4 +1,4 @@
-//! Where the user's files live.
+//! The paths XTP reads and writes.
 //!
 //! Resolution order for each value: environment variable, then the config
 //! file (`XTP_CONFIG`, else `./xtp.toml`), then the default.
@@ -14,7 +14,7 @@ use crate::policy::ensure_outside_repo;
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
-    /// The user's dump of BTP 6.
+    /// The title folder to run.
     pub game_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,

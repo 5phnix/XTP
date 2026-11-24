@@ -302,7 +302,7 @@ struct Tracer<'a> {
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
     /// Which values every lane holds alike ([`uniform`]).
-    uniformity: uniform::Uniformity,
+    uniformity: uniform::AddressUniformity,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -364,7 +364,7 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
-            uniformity: uniform::Uniformity::new(n),
+            uniformity: uniform::AddressUniformity::new(n),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -2219,7 +2219,9 @@ pub(crate) mod tests {
     /// `s_cbranch_execz` is a branch on each lane's own EXEC bit in the
     /// per-lane form: the lanes the `s_and_saveexec` left out skip the write
     /// and reach the join with the old v7. (VIctory#1231 took the branch as
-    /// uniform and traced this.)
+    /// uniform. The write runs under a narrowed EXEC in the console flow,
+    /// which refuses it too: the execz rule alone is pinned by
+    /// `a_scalar_set_on_one_side_of_an_execz_skip_is_per_lane`.)
     #[test]
     fn a_value_joined_after_an_execz_skip_is_per_lane() {
         let words = code_table_at_v7(&[
@@ -2233,9 +2235,29 @@ pub(crate) mod tests {
         assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(68));
     }
 
+    /// The same with a scalar: s9 is 3 in the lanes the `s_and_saveexec`
+    /// let in and 0 in the others, which skip the block on their own EXEC
+    /// bit. In the console flow the wave skips the block or not as one and
+    /// s9 is uniform, so only the per-lane rule for execz refuses this.
+    /// (VIctory#1231 took the branch as uniform and traced it.)
+    #[test]
+    fn a_scalar_set_on_one_side_of_an_execz_skip_is_per_lane() {
+        let words = code_table_at_v7(&[
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0: lanes 0 to 4
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_0001, // s_cbranch_execz over the next instruction
+            0xBE89_0383, // s_mov_b32 s9, 3
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8 (the join)
+            0x7E0E_0209, // v_mov_b32 v7, s9
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(72));
+    }
+
     /// A write under EXEC narrowed by a per-lane compare, without a branch:
     /// lanes 0 to 4 hold 3, the others 0. (VIctory#1231 took it as uniform
-    /// because its old value is.)
+    /// because its old value is. The console flow refuses it too; the
+    /// per-lane rule alone is pinned by `uniform::tests`.)
     #[test]
     fn a_guarded_write_of_a_uniform_value_is_per_lane() {
         let words = code_table_at_v7(&[
@@ -2246,6 +2268,63 @@ pub(crate) mod tests {
             0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
         ]);
         assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(64));
+    }
+
+    /// The review's program: s5 decides whether every lane runs the write
+    /// of 12 to v7 or none does, so v7 is the same in every lane, but the
+    /// address is read from the operands of the instructions that compute
+    /// it, which is 12 only where the lanes ran it: for s5 != 0 the console
+    /// reads entry 0. b8714dd took the write as uniform (its condition and
+    /// its old value are) and traced code + 4 + 0xddc + 12.
+    #[test]
+    fn a_write_no_lane_runs_is_not_read_from_its_operands() {
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7E12_0205, // v_mov_b32 v9, s5
+            0x7D84_1280, // v_cmp_eq_u32 vcc_lo, 0, v9
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0x7E0E_028C, // v_mov_b32 v7, 12
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+            0xD70F_6A01,
+            0x0000_0107, // v_add_co_u32 v1, vcc_lo, v7, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ];
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(64));
+    }
+
+    /// An SDWA move of a word keeps the high half of v7, each lane's own
+    /// input. b8714dd took v7 as uniform (its operand is) and traced the
+    /// address, whose computed term the lanes then compute apart.
+    #[test]
+    fn an_sdwa_write_of_a_word_keeps_per_lane_bits() {
+        let words = code_table_at_v7(&[
+            0x7E10_0283, // v_mov_b32 v8, 3
+            0x7E0E_02F9,
+            0x0006_1408, // v_mov_b32_sdwa v7, v8 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(56));
+    }
+
+    /// EXEC named as an operand is a lane mask read as a number, which the
+    /// per-lane form builds with a ballot of the lanes there: no value of
+    /// EXEC is uniform. b8714dd skipped every read of EXEC, this one too,
+    /// and took v7 as uniform.
+    #[test]
+    fn an_exec_operand_is_not_uniform() {
+        let words = code_table_at_v7(&[
+            0x7E0E_027E, // v_mov_b32 v7, exec_lo
+        ]);
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(48));
     }
 
     /// A carry-in is read lane by lane: from a mask copied out of an SGPR,
@@ -2260,6 +2339,38 @@ pub(crate) mod tests {
             0x01AA_0E80, // v_add_co_ci_u32 v7, vcc_lo, 0, v7, vcc_lo
         ]);
         assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+    }
+
+    /// The other half of that rule: a branch on VCC copied from an SGPR.
+    /// The loop of `code_table_loop`, with the exit test VCC = s5 shifted
+    /// right once per pass: per lane, each lane leaves when its own bit is
+    /// clear, so the counter v7 differs between lanes. (VIctory#1231 took
+    /// the branch as uniform because the SGPR value is.)
+    #[test]
+    fn a_loop_left_on_the_lane_bits_of_an_sgpr_is_per_lane() {
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x3402_0E82, // loop: v_lshlrev_b32 v1, 2, v7
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7
+            0x9005_8105, // s_lshr_b32 s5, s5, 1
+            0xBEEA_0305, // s_mov_b32 vcc_lo, s5
+            0xBF87_FFF2, // s_cbranch_vccnz loop
+            S_ENDPGM,
+        ];
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(48));
     }
 
     /// A DPP move reads another lane's v8; the first lane of each row has

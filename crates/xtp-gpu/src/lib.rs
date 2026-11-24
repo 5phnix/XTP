@@ -55,6 +55,8 @@ mod testgpu;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod timestamps;
+#[cfg(windows)]
 pub mod uma;
 #[cfg(windows)]
 mod watch;
@@ -63,5 +65,6 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
-    copy_asks, guarding, set_alias_lookup, title_memory_remapped, writing as kernel_will_write,
+    KernelWrite, copy_asks, guarding, kernel_writing as kernel_will_write, set_alias_lookup,
+    title_memory_remapped, writing as kernel_wrote,
 };

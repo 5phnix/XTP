@@ -7,7 +7,7 @@ Report it **privately**, through GitHub:
 Do not open a public issue, pull request or discussion about it.
 
 Include what is affected (commit, file, workflow), how to reproduce it, and
-what an attacker gains. Attach nothing from the game: describe the input
+what an attacker gains. Attach nothing from any game: describe the input
 instead (see [docs/asset-policy.md](docs/asset-policy.md)).
 
 What to expect:
@@ -29,8 +29,9 @@ land there.
 
 XTP is **not a sandbox**. It runs the title's own machine code natively, in
 its process, with the rights of the user who starts it. That the title's code
-can do anything the user can is how XTP works, not a vulnerability. XTP is
-meant to run only the user's own dump of a title they own.
+can do anything the user can is how XTP works, not a vulnerability. Run
+only software you trust: XTP gives a title's code the rights of the user who
+starts it.
 
 In scope, for example:
 

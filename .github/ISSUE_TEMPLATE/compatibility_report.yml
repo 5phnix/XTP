@@ -1,0 +1,65 @@
+name: Compatibility report
+description: How a given XTP commit behaves on your hardware (start-up, rendering, frame rate, input, sound)
+title: 'compat: <what works or fails> on <GPU>'
+labels: [compatibility, needs triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A compatibility report tells us how XTP behaves on hardware other than ours.
+        One report per machine and commit; for a new commit, comment on your report.
+        **Describe platform behaviour, don't capture**: no screenshots, video or files
+        from any game, no title names and no local game paths
+        ([asset policy](https://github.com/MiamiGame/XTP/blob/main/docs/asset-policy.md),
+        [writing about titles](https://github.com/MiamiGame/XTP/blob/main/CONTRIBUTING.md#writing-about-titles)).
+  - type: dropdown
+    id: result
+    attributes:
+      label: How far XTP got
+      options:
+        - Does not start (error before the first frame)
+        - Presents frames (2D only)
+        - Renders 3D scenes (partly)
+        - Renders 3D scenes without visible errors
+        - Crashes or hangs after start-up
+    validations:
+      required: true
+  - type: input
+    id: fps
+    attributes:
+      label: Frame rate
+      description: As shown in the window caption.
+      placeholder: '2D 30 fps, 3D 0.8 s per frame'
+  - type: textarea
+    id: seen
+    attributes:
+      label: What XTP does
+      description: What renders and what is missing or wrong, in platform terms (draws, shaders, device removals), and how sound and input behave.
+    validations:
+      required: true
+  - type: textarea
+    id: run-report
+    attributes:
+      label: Run report
+      description: The block described in docs/dev/START_HERE.md, "Run report".
+      render: text
+      value: |
+        xtp commit    :
+        build         : release | diag
+        title build   : known | unknown
+        console mode  : series-x | series-s
+        windows       :
+        cpu, memory   :
+        gpu, driver   :
+        command       :
+        result        :
+        crashes.log   :
+    validations:
+      required: true
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Rules
+      options:
+        - label: Nothing attached comes from any game or is derived from it.
+          required: true

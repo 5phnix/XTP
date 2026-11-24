@@ -17,6 +17,7 @@ pub mod display;
 pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
+pub mod ffx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
@@ -71,5 +72,9 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // AMD's FidelityFX DLLs, unless `XTP_FSR4=1` asks for them.
+    if ffx::stands_in() {
+        all.push(ffx::module());
+    }
     all
 }

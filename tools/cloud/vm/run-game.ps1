@@ -24,6 +24,8 @@ param(
     [switch]$Build,
     [string]$Bundle = '',
     [string]$Ref = '',
+    # The commit sent (run-remote.ps1 -Local): the build fails unless it is the one checked out.
+    [string]$Commit = '',
     [string]$Exe = 'C:\xtp\src\target\diag\xtp.exe',
     # XTP_KEYS syntax; '-' for none. Default: Enter every 2.5 s from 5 s to 50 s.
     [string]$Keys = '',
@@ -51,7 +53,7 @@ if (-not (Test-XtpSession $SessionUser)) { throw "$SessionUser is not logged on 
 Enter-XtpLock 'src' -NoWait:$NoWait
 try {
     if ($Build) {
-        Set-XtpSource $Bundle $Ref
+        Set-XtpSource $Bundle $Ref $Commit
         $log = Join-Path 'C:\xtp\logs' ("{0}-build.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
         $code = Invoke-XtpSessionJob -Exe "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
             -Arguments '-NoProfile -ExecutionPolicy Bypass -File C:\xtp\tools\vm\cargo-steps.ps1 -Mode build' -Log $log -User $SessionUser

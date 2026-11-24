@@ -1,0 +1,308 @@
+# Wave64 mesh programs on 32-lane hosts
+
+How XTP runs BTP 6's mesh programs on NVIDIA, whose waves have 32 lanes
+when every one of these programs was written for the console's 64. What the
+translator proves, what it exchanges through group-shared memory, and what
+it still refuses, measured over the title's shader pack before and after.
+Task mesh64 (0a31f0cb), on the person's PC (RTX 4080 SUPER,
+Series S mode). The title is BTP 6. Logs and the pack stay under
+`E:\xtp-data\` and the title folder, none in the repository.
+
+## 1. Summary
+
+- **Before:** the translator made 8,726 of the pack's 9,282 mesh programs
+  for a 32-lane host, and the runtime refused every one of them (VIctory
+  #578): the world lost the geometry
+  these programs draw.
+- **After:** 8,725 translate and run on NVIDIA by default. dxil.dll refuses
+  none that it did not refuse before. 11 are refused, each for a precise
+  reason (§5). `XTP_WAVE64_MESH=refuse` restores #578's refusal, for an A/B
+  in game.
+- The one wave-size hazard of the title's mesh code is `v_readfirstlane_b32`
+  (§2):
+  - 7,540 programs need no more than a proof that the value read is the
+    same in every lane of the console wave, so each lane reads its own;
+  - 1,185 read a value only the data makes uniform (the counts of the
+    meshlet a group's first lane draws). They get the console's first lane
+    through group-shared memory, between group barriers (§3.2).
+- Tests: unit tests of the proof (`emit/lower/uniform.rs`), translation
+  tests of every rule, and a program drawn on WARP whose 4-lane waves split
+  each console wave into 16 (`emit/mesh_tests.rs`). The old lowering gets
+  all 126 texels of that draw wrong; the new one, none.
+- World sessions (§6): three on NVIDIA with the mesh programs running, and
+  no device removal. In the third, 150 s in the world, the G-buffer holds
+  the world's geometry. The presented image stays dark, for another reason
+  than the mesh programs.
+
+## 2. What depends on whole console waves in mesh code
+
+XTP lowers mesh programs per lane. Their lanes are numbered from the flat
+thread id, whatever the host's waves are: console lane = id % 64
+(`v_mbcnt`, `lane_index`), console wave = id / 64 (the merged wave info in
+`s3`). Mesh code reads no other lane except within quads (DPP quad
+permutations, `ds_swizzle` in quad mode); every other cross-lane operation,
+mask read as a number and whole-wave reduction is refused there, as before.
+What remained, against the four hazards the task listed:
+
+| Hazard | What XTP does now |
+|---|---|
+| 1. `v_readfirstlane_b32` of a value the console wave's lanes hold differently: lowered as the host's `WaveReadLaneFirst`, the upper 32-lane half read lane 32. | A value proven the same in every lane of the console wave is each lane's own (no wave operation). Any other one, where every lane of the group runs the block, goes through group-shared memory (§3.2). Elsewhere: refused. |
+| 2. An `s_barrier` in a block one host wave skips: a hang. | The lowering keeps barriers only in programs with LDS (unchanged). Each one kept must be in a block every lane of the group runs as often as the others (§3.1); otherwise the program is refused. |
+| 3. LDS one console wave shares across its two host halves. | A group of one console wave with LDS is refused (no program of the pack). Groups of several console waves (all of BTP 6's: 128 lanes) order their LDS with the barriers HLSL makes the program write. The compiler cannot drop those between two waves. |
+| 4. Output counts set once per group. | Already so: `setMeshOutputCounts` with the declared maxima, once, in the entry block (`mesh_prologue`). The console's own counts (`GS_ALLOC_REQ`) are not passed; the first-lane reads that only feed them are dead code here. |
+
+## 3. Design
+
+### 3.1 The proof (`emit/lower/uniform.rs`)
+
+A forward analysis over the IR gives each value a level: the same in every
+lane of the **group**, in every lane of a console **wave**, or per **lane**.
+"The same" is about two lanes that run the same console instance of the
+definition. It starts optimistic (everything the group's) and raises levels
+until nothing changes.
+
+- Inputs: user data and the group id (`v5`, read only through
+  `v_readfirstlane`) are the group's; the merged wave info (`s3`) is the
+  wave's; VGPRs the hardware does not load read as zero.
+- Instructions: the highest level of their operands. A VGPR written under a
+  guard (EXEC narrowed with no branch) adds the guard's level and the old
+  value's; so does a partial write (accumulators, 16-bit halves, DPP rows,
+  SDWA). Lane masks read by VALU (selects, carries) count by their lane
+  bit, from structurisation's booleans: a select on `s_cselect_b64 …, exec,
+  0` of a scalar compare is the group's. Lane numbers, lane reads, LDS,
+  atomics and the clock are the lane's.
+- Memory: a load at the group's address is the group's, unless the
+  program stores to memory or runs atomics on it. Two host waves then read
+  at different times, and a store could fall between them; every load is
+  then the lane's. No mesh program of the pack writes memory.
+- Joins: a phi where two paths from the two sides of a branch first meet
+  takes the branch's level (forward labelling from the branch's out-edges,
+  as SSA phi placement does). Loop headers are not such joins, so a loop
+  counter stays the group's inside its loop.
+- Loops: a value the loop defines and a block after it reads takes the
+  level of the loop's branches whose two sides meet again only after the
+  loop (lanes leave at different iterations or by different exits: one
+  iteration's post-dominators, with back edges and exits as sinks). Phis
+  where several exit edges meet take it too, and so do header phis with
+  several back edges, for branches that meet only at the next iteration.
+- Control: a block's level is the highest level of the branches it is
+  control dependent on, transitively (post-dominators of the whole graph).
+  A group barrier needs the group's.
+
+What it assumes:
+- the per-lane form itself: a lane in EXEC at a vector instruction has
+  reached it, holding the console's registers;
+- no other dispatch changing the memory it reads meanwhile;
+- lanes that skip a block not reading the scalars it sets, as
+  structurisation already assumes.
+
+### 3.2 First-lane reads (`emit/lower/mesh.rs`, `valu.rs`)
+
+On a host without 64-lane waves:
+
+- **Proven** (the group's or the wave's): the lane's own value. Correct for
+  any host wave, in any layout of the group's threads; no wave operation.
+- **Otherwise, where the block's control level is the group's**: an
+  exchange in two group-shared dwords per console wave (after the
+  program's LDS; the container's group-shared size counts them).
+  - With EXEC full in every lane that gets there, the console's first lane
+    is lane 0 of each console wave. It stores the value, and after a group
+    barrier every lane of the wave reads it. A second barrier comes before
+    the slot can change.
+  - With EXEC narrowed:
+    1. lane 0 empties its wave's slot;
+    2. barrier;
+    3. the active lanes take the slot's minimum with their lane (an atomic);
+    4. barrier;
+    5. the lane found (lane 0 when none is active, as on the console)
+       stores the value;
+    6. barrier; every lane reads it; barrier.
+  - The result is the console's in every lane, whichever host waves the
+    lanes sit in (WARP's 4-lane waves included).
+- **Otherwise**: refused ("a first-lane read of a value lanes may hold
+  differently, where lanes of a wave64 mesh group branch differently, …").
+  The refusal reaches the program only if an effect uses the value.
+
+With 64-lane waves (AMD, or a target that holds 64), a proven read is the
+lane's own and any other keeps `WaveReadLaneFirst`, as before.
+
+### 3.3 The runtime (`xtp-gpu` `pipeline/host.rs`, `pipeline.rs`)
+
+The translator decides. `Needs::mesh_reason` no longer refuses a wave64
+mesh program translated for the host's own target. Two cases remain:
+
+- `XTP_WAVE64_MESH=refuse`: #578's refusal, before translation as drops
+  made it (`native_refusal`);
+- a target with 64-lane waves forced (`XTP_HOST_LANES`) on a host without
+  them, whose translations take the console waves to be whole.
+
+The runtime's own scans (`mesh_first_lane_reads`, `mesh_lds_in_one_wave`)
+are gone: the translator now does both, with the proof. The old opt-in
+`XTP_WAVE64_MESH=allow` means nothing any more.
+
+## 4. Tests
+
+- `emit::lower::uniform::tests`: inputs and what they compute, selects on
+  masks, joins and guards, loops lanes leave apart (inside: the group's;
+  after: the lane's), loads of memory the program writes, barriers in
+  blocks lanes enter apart, and VIctory issue #1498's program (by r4tedx,
+  wave64 form: an exit mask counted after the loop is the lane's).
+- `emit::mesh_tests` (translation for 32-32, 32-64 and any host, each
+  module checked by dxil.dll where it is installed):
+  - proven reads call no wave operation and no barrier;
+  - other reads exchange (barriers, no `WaveReadLaneFirst`) on 32-lane
+    hosts and keep `WaveReadLaneFirst` with 64-lane waves;
+  - reads where lanes branch apart are refused on 32-lane hosts only;
+  - barriers in a lane branch are refused, after the join kept;
+  - one-wave LDS is refused.
+- `emit::mesh_tests::wave64_mesh_reads_draw_the_console_waves_values`: a
+  128-lane program draws a strip into 63 x 2 texels on the test adapter
+  (WARP here, 4-lane waves), with in each vertex four first-lane reads:
+  - a value of the group's;
+  - the console wave's index;
+  - lane + 100 from the console wave's first lane (100);
+  - 3 lane + 7 with EXEC holding lanes 10 to 63 (37, VIctory issue #1132's
+    case).
+
+  All 126 texels are right. With the exchange turned off (a mutation, not
+  committed), all 126 are wrong: the host wave's first lane gives 104,
+  108, …, and the narrowed read gives 7, lane 0's value outside EXEC.
+- `xtp-gpu` `pipeline::host::tests`: the early refusal and the refusal after
+  translation agree for real mesh translations (32-32, 4-4 and 32-64; they
+  declare no wave size), for every switch and host; the refusal texts; a
+  WARP pipeline is translated, not refused before, by default.
+
+## 5. Survey of the pack
+
+Every MS program of `<title folder>\shaders.rpf`, translated for a 32-32 host and
+checked by dxil.dll, with a tool outside the repository
+(`E:\xtp-data\tmp\mesh64\measure`). Before: main at `c135f4c`, this
+branch's base after its last merge.
+
+| | before | after |
+|---|---|---|
+| MS programs | 9,282 | 9,282 |
+| translated for 32-32 | 8,726 | 8,725 |
+| … that the runtime lets run on NVIDIA | 0 | 8,725 |
+| … reading their first lanes as their own (§3.1) | — | 7,540 |
+| … with an exchange (§3.2) | — | 1,185 |
+| refused for a first-lane read (this task) | — | 11 |
+| refused for other reasons (unchanged causes) | 556 | 546 |
+| translations dxil.dll refuses | 62 | the same 62 |
+
+- The 11 refused: their reads are in loops that index VGPRs (`v_movrels`
+  with the first lane's index in M0, a waterfall) inside branches lanes
+  take apart. Each lane's own index would be right there (a waterfall that
+  runs each lane once); proving that shape is left for later.
+- One of them translated before. The other 10 failed for another reason
+  before (a lane mask read as data, a scalar memory read as data, a
+  structured buffer of unknown stride); they now stop at their first-lane
+  read first.
+- The 62 invalid translations are not this task's: 53 have more than 32 KiB
+  of vertex and primitive outputs (VIctory #1385's case),
+  9 have signature mismatches.
+- The reasons the other 546 stop: a scalar memory read as data (383), a lane
+  mask read as data (101), per-lane descriptors (34 + 12 + 6 + 3), a
+  descriptor read only as data (5), a cross-lane operation (2).
+
+## 6. World sessions
+
+Series S, `E:\tools\stall-probe\session.ps1`, autopilot from the golden
+save, `XTP_SKIP_INTRO=1`, `XTP_WATCHDOG_HOOK=1`, `XTP_D3D12_DRED=1`,
+captures at `E:\xtp-data\runs\frames-mesh*`. All three ran the same binary
+(this branch at `f6af110`, mesh programs running) and none lost the device.
+
+- **A** (19:13 UTC):
+  - the world's gameplay reached at 44 s: 1.2 fps, 1,289 draws a frame,
+    924 dropped;
+  - 154 mesh translations (median 15 ms, at most 237 ms), 223 mesh
+    pipelines made, none refused;
+  - **no device removal**;
+  - the title stopped 8 s later on an `int3` (title+0x23d8f03), reached
+    from its progress watchdog's thread (title+0x2215eca), a firing path
+    `XTP_WATCHDOG_HOOK` does not patch (its two sites are 0x2215c27 and
+    0x2215d9b);
+  - in the 7 s before, at once: main's new FSR4 path (every pass "falling
+    back"), a 510 ms submission, and about 200 mesh pipelines made;
+  - the captures stop at the opening credits, before the world.
+- **B** (19:30 UTC, the autopilot ending the title 30 s into gameplay):
+  - gameplay at 22 s, 237 mesh pipelines made, none refused;
+  - no stop, so the stop of A does not come with every run of the mesh
+    programs (the third watchdog path is task 54cb7617's);
+  - the run ends at frame 598, as the world starts. Its first world frame
+    (3,932 draws) is presented black, and the captured frames are the
+    opening credits and their fade.
+- **C** (19:51 UTC, 150 s in the world):
+  - 25 frame-rate lines: 0.7 fps median (0.3 to 6.2), 2,525 draws a frame
+    (up to 5,956), 985 dropped;
+  - 523 mesh pipelines made, none refused. The mesh dispatches still
+    dropped are of programs that do not translate for other reasons: a
+    scalar memory read as data, a descriptor read from the first lane of
+    computed VGPRs;
+  - the render targets of frames 949, 979 and 1009 dumped
+    (`XTP_DUMP_TARGETS=1280`). **Frame 1009's 1280 x 720 targets hold a
+    street of the world in 3D**: fences, poles, parasols, facades, objects
+    on the ground, whole and in place;
+  - the presented frame shows the introduction's credits over a nearly
+    black scene, and frames 949 and 979 are black: what darkens the image
+    lies past the geometry (lighting, composition, upscaling, exposure),
+    not in the mesh programs.
+
+## 7. Upstream, reviewed
+
+- **VIctory #940** (host-lane numbering of wave64 mesh, `ed9afc0`): not
+  taken. It numbers mesh lanes by the host's lane so that host ballots and
+  lane numbers agree. XTP reads no mask as a number in mesh code, and its
+  console numbering from the flat id is right on any host wave; #940's
+  would give lanes 32-63 the numbers 0-31.
+- **VIctory issue #1132** (a lone `v_readfirstlane` under a partial EXEC):
+  its case is a test here (§4). It also applies to XTP's compute path: a
+  wave64 compute program whose only cross-lane operation is
+  `v_readfirstlane` declares no wave size and keeps `WaveReadLaneFirst`
+  (`Lower::new` does not count it among the reads that need the console
+  flow). That is `lower/mod.rs`'s, not this task's: follow-up below.
+- **VIctory #1133** (barrier rule): not taken. It keeps the memory fence
+  and drops the group sync of barriers lanes reach apart. That trades a
+  hang for silently unordered LDS. XTP refuses such programs instead, and
+  the pack has none among those that keep barriers.
+- **VIctory #1433** (console flow for groups of several console waves,
+  barriers paired by count): the general form, for compute. Mesh programs
+  here need no console flow: their only wave hazard is the first-lane read
+  (§2), which the proof and the exchange cover.
+- **five-star-recomp** (window analysis, supersteps): measured on the
+  same pack, 6,217 of 8,765 mesh programs need no whole wave there. Its
+  first reason against the rest is a first-lane read of a per-lane value
+  "in an output or in GS_ALLOC_REQ" (1,338). XTP drops `GS_ALLOC_REQ`'s
+  counts, and exchanges the reads that outputs need.
+- **xcl #1193** (no exchange for a `v_readfirstlane` of a proven uniform
+  value): the same idea as §3.1, for its own split form. xcl is
+  GPL-2.0-only: ideas only, nothing taken.
+- **Kyty's lane pairs** (AnyPS5's study: one host wave of 32 holds lanes i
+  and i + 32): not needed. It would rewrite the mesh lowering, double the
+  register pressure and the compile time, for 11 programs.
+- **VIctory issue #1498** (a mask counted after a loop whose lanes leave
+  apart): its program is a test of the proof. In mesh code such counts are
+  refused as masks read as data, as before.
+- **VIctory #1385** (mesh output counts from `GS_ALLOC_REQ`, under 32 KiB of
+  outputs): not taken here. It concerns the 53 programs dxil.dll refuses
+  for their output size, which are not this task's.
+
+## 8. Known risks and follow-ups
+
+- **Compute, #1132:** a lone `v_readfirstlane` of a per-lane value in a
+  wave64 compute program on NVIDIA still reads its host wave's first lane.
+  The proof could tell those that need the console flow; the routing is in
+  `lower/mod.rs` (`Lower::new`).
+- **Value waterfalls** (the 11 programs of §5): a proof that a read's
+  result only feeds compares with its own source and work under them.
+- **A lane stopped by the loop limit** (`LOOP_LIMIT`) leaves the program.
+  If a group barrier follows, the other lanes wait for it: a hang where
+  the console would only have been slow. The title's mesh programs that
+  keep barriers are those with LDS (5); the exchanges sit where every lane
+  runs the block. Not measured.
+- **Cost:** each exchange is two or four group barriers. In the title the
+  reads are once per group, outside loops; not measured on the 4080 yet.
+- **LDS a mesh program allocates but never accesses** makes the
+  container's group-shared size count bytes that no array holds, which
+  dxil.dll refuses. No program of the pack does this. Exchanges leave
+  such LDS out of the count.

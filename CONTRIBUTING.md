@@ -1,18 +1,18 @@
 # Contributing to XTP
 
-Thank you for helping. XTP runs the Xbox Series build of BTP 6
-natively on Windows, from files each user supplies. Many people work on it at
-once, so the process below is strict and mostly automatic: a pull request that
+Thank you for helping. XTP is a compatibility layer that runs Xbox Series
+(GDK) titles on Windows. Many people work on it at once, so the process below is strict and mostly automatic: a pull request that
 follows it is labelled, checked and routed to a reviewer without anyone
 having to ask.
 
 New to the code? Read [docs/dev/START_HERE.md](docs/dev/START_HERE.md) first.
 
 Contents: [the rules](#the-rules) ·
+[writing about titles](#writing-about-titles) ·
 [setup](#setup) · [build and test](#build-and-test) ·
 [commits and PR titles](#commits-and-pull-request-titles) ·
 [pull requests](#pull-requests) · [review](#review) ·
-[code](#code) · [reporting](#reporting-bugs-progress-and-vulnerabilities)
+[code](#code) · [reporting](#reporting-bugs-compatibility-and-vulnerabilities)
 
 ## The rules
 
@@ -20,7 +20,7 @@ These are not negotiable. A pull request that breaks one is closed, and if
 something slipped into `main`, history is rewritten (see
 [docs/asset-policy.md](docs/asset-policy.md), "If something slips through").
 
-1. **Nothing from the game.** No assets, no part of the executable, nothing
+1. **Nothing from any game.** No assets, no part of the executable, nothing
    derived from them (converted data, disassembly, shader dumps, extracted
    tables, captures, screenshots), in any form: files, string literals, test
    fixtures, snapshots, docs, or attachments to commits. What *is* allowed is
@@ -34,9 +34,9 @@ something slipped into `main`, history is rewritten (see
    or samples from the Microsoft GDK for Xbox or any other console SDK, and
    nothing transcribed from them. Interfaces are written from what the title
    does and from public documentation.
-4. **Nothing that circumvents DRM.** XTP runs the user's own decrypted dump.
-   It does not decrypt, unpack, crack or bypass licence checks of any
-   protection; code that does is not accepted.
+4. **No circumvention.** XTP contains no code that decrypts, unpacks, cracks
+   or bypasses any protection or licence check, and accepts none. It never
+   obtains, prepares or writes to a title's files.
 5. **Licence: GPL-3.0-or-later.** Everything you contribute is licensed under
    the GNU General Public License, version 3 or any later version (see
    [LICENSE](LICENSE)). By opening a pull request you agree to that and confirm
@@ -48,8 +48,8 @@ something slipped into `main`, history is rewritten (see
    implementation; say in the pull request what you read.
 7. **State where your code comes from.** Every pull request ticks a box under
    [Provenance](#provenance). The "PR conventions" check fails without it.
-8. **Tests never need game files to pass.** A test that needs the title or
-   other real files reads the paths of *your own* files from an `XTP_*`
+8. **Tests never need game files to pass.** A test that needs a title or
+   other real inputs reads the paths of its inputs from an `XTP_*`
    environment variable and skips cleanly when it is unset, which is always
    the case in CI. See [Tests](#tests).
 
@@ -70,12 +70,33 @@ Also say in the description whether an AI tool wrote part of the change.
 That is allowed; you answer for every line, its provenance included, as if
 you had typed it.
 
+## Writing about titles
+
+Docs, code comments, commit messages, issues and pull requests describe what
+the platform does: an API call and its arguments, a GPU behaviour, a frame
+time, a memory budget. Commercial titles and their publishers are not named
+in this repository: when a title shows a behaviour, say "a title" and
+describe the behaviour. Leave out:
+
+- the names of commercial titles, their publishers and their settings;
+- inventories of a title folder (file lists, archive names and sizes) and
+  local paths to game files;
+- strings copied from a title (asset names, shader entry names, on-screen
+  text, save names);
+- leak or release dates;
+- notes about streaming or sharing a session;
+- "playable", "first mission" and other progress-through-the-game framing.
+
+`cargo xtask policy` refuses a file that names a title or its publisher; it
+does not read commit messages, issues or pull requests, so reread them
+before you post.
+
 ## Setup
 
 You need:
 
-- Windows 10 or 11, x64, a CPU with AVX2, and for running the title a
-  Direct3D 12 GPU with shader model 6.6 (mesh shaders for the world).
+- Windows 10 or 11, x64, a CPU with AVX2, and for running a title a
+  Direct3D 12 GPU with shader model 6.6 (mesh shaders for 3D scenes).
   Building and the tests need no GPU.
 - [rustup](https://rustup.rs). The toolchain version, the
   `x86_64-pc-windows-msvc` target and the `rustfmt` and `clippy` components
@@ -91,7 +112,7 @@ git clone https://github.com/<you>/XTP.git      # your fork
 cd XTP
 git remote add upstream https://github.com/MiamiGame/XTP.git
 cargo xtask install-hooks                        # policy check + commit message check
-copy xtp.example.toml xtp.toml                   # then point it at your files, outside the repo
+copy xtp.example.toml xtp.toml                   # then set its paths, outside the repo
 ```
 
 `install-hooks` points git at `.githooks/`: `pre-commit` runs the asset policy
@@ -103,7 +124,7 @@ xtask is built. Do not bypass them with `--no-verify`: CI runs the same checks.
 
 ```powershell
 cargo build                                       # debug build
-cargo build --release -p xtp                      # what you run the title with
+cargo build --release -p xtp                      # what you run a title with
 cargo build --profile diag -p xtp --features diagnostics   # with debugging aids
 cargo test --workspace                            # needs no game data
 cargo xtask pr-check                              # everything CI checks, before you push
@@ -259,8 +280,8 @@ added automatically:
   closed; reopen it when you come back.
 
 Reviewers check, beyond the code: the [rules](#the-rules) and the provenance
-statement, that the change is generic platform code (only `xtp-game` knows
-the title), tests, and docs.
+statement, that the change is generic platform code (only `xtp-game` holds
+title-specific code), tests, and docs.
 
 ## Code
 
@@ -269,8 +290,8 @@ the title), tests, and docs.
   (the `undocumented_unsafe_blocks` lint); `unsafe fn` bodies use explicit
   `unsafe` blocks.
 - Platform code (every crate but `xtp-game`) must work for any Xbox Series
-  title. What only BTP 6 needs (formats, build identities,
-  hooks) goes in `xtp-game`.
+  title. What a single title needs (formats, build identities, hooks) goes
+  in `xtp-game`.
 - Log with `tracing`; return errors (with `anyhow` or `thiserror`, as the
   crate already does) rather than panicking on bad input.
 - Anything that writes derived data calls `xtp_core::ensure_outside_repo`.
@@ -279,11 +300,11 @@ the title), tests, and docs.
 - Update the docs in the same pull request: `README.md` (status, commands,
   variables), `docs/architecture.md` when the structure changes.
 
-## Reporting bugs, progress and vulnerabilities
+## Reporting bugs, compatibility and vulnerabilities
 
-- Bugs, game progress and feature requests: use the
+- Bugs, compatibility reports and feature requests: use the
   [issue forms](https://github.com/MiamiGame/XTP/issues/new/choose). They ask
   for a run report (see [docs/dev/START_HERE.md](docs/dev/START_HERE.md#run-report)).
-  Attach nothing from the game.
+  Attach nothing from any game.
 - Security vulnerabilities: privately, as described in [SECURITY.md](SECURITY.md).
 - Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).

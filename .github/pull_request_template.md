@@ -20,13 +20,13 @@ Depends on: <!-- #PR, or none -->
 <!--
 What you ran and what you checked. Tests that need game files read them from
 XTP_* variables and skip when unset: name the variables and what you ran
-them on (title build, Series X or S mode), not the files themselves.
-"Not tested on the title" is a valid answer: say so.
+them on (console mode, GPU), not the files themselves.
+"Not tested on a title" is a valid answer: say so.
 -->
 
 - [ ] `cargo xtask pr-check` passes on my machine
 - [ ] New or changed behaviour has tests that need no game files, or I explain below why it cannot
-- Ran on the title: <!-- what you ran, the stage reached, GPU and driver; or "no" -->
+- Ran on a title: <!-- what you ran, the result, GPU and driver; or "no" -->
 
 ## Provenance
 
