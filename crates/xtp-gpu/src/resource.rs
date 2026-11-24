@@ -822,6 +822,10 @@ struct Resource {
     /// from (0: not looked yet): it looks again only after a change.
     #[cfg(windows)]
     beside: std::sync::atomic::AtomicU64,
+    /// For a depth texture the title also writes through unordered
+    /// access, the colour texture shaders write instead ([`Twin`]).
+    #[cfg(windows)]
+    twin: Option<Arc<Twin>>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1480,6 +1484,12 @@ fn hand_out_resource(
             (host_texture(&desc, state, clear).map(Arc::new), false)
         }
     };
+    // A depth texture shaders also write: its colour twin.
+    #[cfg(windows)]
+    let twin = host
+        .as_ref()
+        .filter(|_| !shared)
+        .and_then(|h| twin_texture(&desc, &h.texture));
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1492,6 +1502,8 @@ fn hand_out_resource(
         shared,
         #[cfg(windows)]
         beside: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(windows)]
+        twin,
     });
     #[cfg(windows)]
     {
@@ -2691,6 +2703,290 @@ pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
     true
 }
 
+/// The colour twin of a depth texture the title also writes through
+/// unordered access. The console allows both on one texture; the host
+/// gives a depth texture no unordered access (`host_flags`), so shaders
+/// write a colour texture of the same size and format family instead, and
+/// one side is copied into the other when it is used after the other was
+/// written (`HostList::twin_use`).
+/// shortcut: whole textures are copied, not the mips and slices written.
+/// A depth texture with a stencil plane gets a twin for each plane: BTP 6's
+/// tiled lighting writes each pixel's material class into the depth plane
+/// and masks into the stencil plane, then draws each class with the depth
+/// test "equal". The stencil plane's twin is copied through a buffer; the
+/// depth plane's is drawn into the plane by a pass of ours
+/// (`HostList::pass_plane`). Unordered access views of a multisampled
+/// texture stay null.
+///
+/// Ported from fxceless's VIctory fork (commit 578d459).
+#[cfg(windows)]
+pub(crate) struct Twin {
+    /// The colour texture and the state it is in, as a host copy's.
+    pub(crate) colour: Arc<HostTexture>,
+    /// Which side lacks what the other was written last, after the lists
+    /// submitted so far: bit 0 the depth texture, bit 1 the twin.
+    pub(crate) behind: std::sync::atomic::AtomicU32,
+    /// For a depth texture with a stencil plane, `colour` is the twin of
+    /// that plane (8 bits a texel) and this the buffer the two are copied
+    /// through: no colour format shares a family with a depth-stencil
+    /// format, but the host copies between a buffer and one plane.
+    pub(crate) through: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    /// For a depth texture with a stencil plane: the twin of its depth
+    /// plane, 16 bits a texel for the console's 16-bit depth-stencil
+    /// formats and a 32-bit float otherwise. No host colour format holds
+    /// the bits of a 24-bit depth plane, so the two are not copied: a pass
+    /// draws the twin into the plane.
+    pub(crate) plane: Option<Arc<HostTexture>>,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+#[cfg(windows)]
+unsafe impl Send for Twin {}
+// SAFETY: as above.
+#[cfg(windows)]
+unsafe impl Sync for Twin {}
+
+/// A host texture of ours (not a title resource's copy) in `state`:
+/// resident, unpooled, counted as alive while it lives.
+#[cfg(windows)]
+fn own_texture(
+    texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+) -> HostTexture {
+    format::note_texture(true, 0, 0, false);
+    HostTexture {
+        texture,
+        state: state.into(),
+        bytes: 0,
+        extra: 0,
+        residency: Arc::new(residency::Residency::resident()),
+        slot: None,
+    }
+}
+
+/// Whether depth twins are made (`XTP_DEPTH_TWINS=0`: none, such views
+/// stay null, as before; `stencil`: only for formats with a stencil plane;
+/// `nodepth`: none for the depth planes of such formats).
+#[cfg(windows)]
+fn twins_asked() -> &'static str {
+    static ASKED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ASKED.get_or_init(|| std::env::var("XTP_DEPTH_TWINS").unwrap_or_default())
+}
+
+/// The colour twin for a texture described by `desc` whose host copy is
+/// `depth`, if the title asks for depth and unordered access both and the
+/// host can copy between the two: the same size, mips and slices in the
+/// depth format's typeless family (R16 for 16-bit depth, R32 for 32-bit),
+/// or R8 for the stencil plane of a format that has one, with unordered
+/// access only. A format with a stencil plane gets a twin for its depth
+/// plane too, R16 for the console's 16-bit depth-stencil formats and R32
+/// otherwise.
+#[cfg(windows)]
+fn twin_texture(
+    desc: &ResourceDesc,
+    depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> Option<Arc<Twin>> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    const DEPTH_AND_UNORDERED: u32 = 6;
+    const UNORDERED: u32 = 4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    // R32 and R16 typeless: the families of the depth formats of one plane.
+    const ONE_PLANE: [u32; 2] = [39, 53];
+    // R32G8X24 and R24G8 typeless: depth with a stencil plane, whose twin
+    // is R8 typeless.
+    const WITH_STENCIL: [u32; 2] = [19, 44];
+    const R8_TYPELESS: u32 = 60;
+    if desc.dimension == BUFFER
+        || desc.flags & DEPTH_AND_UNORDERED != DEPTH_AND_UNORDERED
+        || twins_asked() == "0"
+    {
+        return None;
+    }
+    let typeless = family(pc_format(desc.format));
+    let stencil = WITH_STENCIL.contains(&typeless);
+    if !stencil && twins_asked() == "stencil" {
+        return None;
+    }
+    if !(stencil || ONE_PLANE.contains(&typeless)) || desc.sample_count > 1 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let mut d = *desc;
+    d.layout = 0;
+    d.alignment = 0;
+    d.flags = UNORDERED;
+    d.format = if stencil { R8_TYPELESS } else { typeless };
+    let make = |d: &ResourceDesc, what: &str| -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: the description has the host layout, as in
+        // `host_texture`; the out pointer is ours.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(d).cast(),
+                D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
+                None,
+                &mut texture,
+            )
+        };
+        if let Err(e) = made {
+            tracing::warn!(error = %e, desc = ?d, what, "no twin for a depth texture");
+        }
+        let texture = texture?;
+        crate::host::name(&texture, || {
+            format!("{what} {}x{} f{}", d.width, d.height, d.format)
+        });
+        Some(texture)
+    };
+    let texture = make(&d, "depth twin")?;
+    // The buffer a stencil plane and its twin are copied through: as big
+    // as the plane's mips and slices laid out for a copy (they follow the
+    // depth plane's in the texture's subresources).
+    let through = if stencil {
+        // SAFETY: a live texture.
+        let of = unsafe { depth.GetDesc() };
+        let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
+        let mut bytes = 0;
+        // SAFETY: a plain query; the out pointer is ours.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &of,
+                planes,
+                planes,
+                0,
+                None,
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        Some(device_buffer(host, bytes, false)?)
+    } else {
+        None
+    };
+    // The twin of the depth plane of a format with a stencil plane: R16
+    // typeless (53) for the console's 16-bit depth-stencil formats (118 to
+    // 120), whose shaders write 16-bit steps, R32 typeless (39) otherwise.
+    let plane = if stencil && twins_asked() != "nodepth" {
+        d.format = if (118..=120).contains(&desc.format) {
+            53
+        } else {
+            39
+        };
+        make(&d, "depth plane twin").map(|t| Arc::new(own_texture(t, UNORDERED_ACCESS)))
+    } else {
+        None
+    };
+    tracing::debug!(desc = ?desc, stencil, plane = plane.is_some(), "a depth texture's colour twin");
+    Some(Arc::new(Twin {
+        colour: Arc::new(own_texture(texture, UNORDERED_ACCESS)),
+        behind: std::sync::atomic::AtomicU32::new(0),
+        through,
+        plane,
+    }))
+}
+
+/// The colour twin of title texture `this`, if it has one.
+#[cfg(windows)]
+pub(crate) fn twin(this: This) -> Option<Arc<Twin>> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    r.twin.clone()
+}
+
+/// The texture and view for the title's unordered access view `desc` of
+/// `this`, a depth texture with a colour twin: the twin's (or, for a view
+/// of the depth plane of a texture with a stencil plane, that plane's
+/// twin's), in the colour format of the twin's family for a depth or
+/// typeless format (R16_UNORM for 16-bit depth, R32_FLOAT for 32-bit; the
+/// bits are the same). Without a description: mip 0 of every slice. The
+/// twin of a stencil plane (R8) stands for the views of that plane only,
+/// which become R8_UINT views of its one plane. `None` for a texture
+/// without a twin (`descriptor/host.rs` makes the view as before).
+#[cfg(windows)]
+pub(crate) fn twin_view(
+    this: This,
+    desc: Option<windows::Win32::Graphics::Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+) -> Option<(
+    &'static windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    windows::Win32::Graphics::Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC,
+)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let twin = twin(this)?;
+    let view = |texture: &ID3D12Resource| {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        let mut desc = desc.unwrap_or_else(|| {
+            let mut all = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            if d.DepthOrArraySize > 1 {
+                all.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                all.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                    ..Default::default()
+                };
+            }
+            all
+        });
+        // A stencil plane's twin (R8 typeless, 60): the title's view is of
+        // the stencil plane if it names plane 1 or a stencil view format.
+        if d.Format.0 == 60 {
+            let mut plane = 0;
+            match desc.ViewDimension {
+                D3D12_UAV_DIMENSION_TEXTURE2D => {
+                    // SAFETY: the member the dimension names.
+                    let mut v = unsafe { desc.Anonymous.Texture2D };
+                    plane = std::mem::take(&mut v.PlaneSlice);
+                    desc.Anonymous.Texture2D = v;
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                    // SAFETY: the member the dimension names.
+                    let mut v = unsafe { desc.Anonymous.Texture2DArray };
+                    plane = std::mem::take(&mut v.PlaneSlice);
+                    desc.Anonymous.Texture2DArray = v;
+                }
+                _ => {}
+            }
+            if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
+                return None;
+            }
+            desc.Format.0 = 62;
+            return Some(desc);
+        }
+        // None, typeless and depth formats (R16: 0, 53, 55; R32: 0, 39,
+        // 40), and those of a depth-stencil format's depth plane (19 to 21,
+        // 44 to 46), for the twin of such a plane.
+        desc.Format.0 = match (desc.Format.0, d.Format.0) {
+            (0 | 53 | 55 | 19..=21 | 44..=46, 53) => 56,
+            (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
+            (other, _) => other,
+        };
+        Some(desc)
+    };
+    // SAFETY: the twin lives as long as the resource's, which the title
+    // holds while it makes views of it.
+    let colour: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&twin.colour.texture) };
+    if let Some(v) = view(colour) {
+        return Some((colour, v));
+    }
+    let plane = twin.plane.as_ref()?;
+    // SAFETY: as above.
+    let plane: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&plane.texture) };
+    view(plane).map(|v| (plane, v))
+}
+
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,
@@ -2869,6 +3165,15 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 pub(crate) mod tests_support {
     use super::*;
     use windows::Win32::Graphics::Direct3D12::*;
+
+    /// A `width` x `height` depth texture in `format` that the title also
+    /// asks unordered access for (it gets a colour twin).
+    pub(crate) fn depth_unordered(width: u64, height: u32, format: u32) -> ResourceDesc {
+        ResourceDesc {
+            flags: 6,
+            ..target(width, height, format)
+        }
+    }
 
     /// A `width` x `height` render target in `format`.
     pub(crate) fn target(width: u64, height: u32, format: u32) -> ResourceDesc {

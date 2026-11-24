@@ -856,6 +856,7 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
+            list.twin_use(self.depth as This, false, true);
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
         }
         Ok(())
@@ -1022,6 +1023,7 @@ impl State {
         {
             self.writes += 1;
         }
+        list.twins_written();
         Ok(())
     }
 
@@ -2064,6 +2066,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
                 crate::texture::upload(list, *resource as This, t);
             }
             crate::resource::alias_copy(list, *resource as This);
+            list.twin_use(*resource as This, false, false);
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
@@ -2083,6 +2086,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             crate::capture::note_target(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::passdump::written(list, *resource as This);
+            list.twin_use(*resource as This, true, true);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
