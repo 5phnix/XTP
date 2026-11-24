@@ -1679,7 +1679,7 @@ pub extern "C" fn _fsopen(path: *const c_char, mode: *const c_char, share: i32) 
 
 // Kernel reads into title memory. The GPU side leaves blocks of title GPU
 // buffers read-only to see the title's next write, and the kernel's writes
-// fail there instead of faulting into its handler; Grand Theft Auto VI's
+// fail there instead of faulting into its handler; BTP 6's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
 // is opened first.

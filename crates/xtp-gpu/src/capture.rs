@@ -7,7 +7,7 @@
 //! draw: `XTP_CAPTURE_WORLD=<draws>[:<after>[:<count>[:<every>]]]` lists
 //! `count` frames (3 by default), `every` frames apart (30), starting
 //! `after` frames (30) after the first frame that ran at least `draws`
-//! draws. A world frame of Grand Theft Auto VI runs 900 to 6 000 draws,
+//! draws. A world frame of BTP 6 runs 900 to 6 000 draws,
 //! its menus and loading screens a few dozen, and the frame the world
 //! starts at varies by a thousand between runs.
 

@@ -4,7 +4,7 @@
 //! which the console's display composes, plane 0 at the bottom. Each
 //! plane's parameters start with the frame token (u64), the resource count
 //! (u32 at 8) and the resource array (at 0x10); planes are [`STRIDE`] bytes
-//! apart. In Series S mode Grand Theft Auto VI presents a 1080p scene plane
+//! apart. In Series S mode BTP 6 presents a 1080p scene plane
 //! and a 2160p interface plane (VIctory #211).
 //!
 //! Plane 0 is shown as before (`queue::present`). With more planes, each
