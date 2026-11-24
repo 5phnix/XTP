@@ -25,9 +25,12 @@
 //! guarded textures checked since it last hashed them, round-robin by
 //! resource, within a budget a frame (`XTP_TEXTURE_NET`, 2 MiB by default,
 //! taken from a texture a slice at a time; a budget a second where frames
-//! do not advance). A texture whose memory no longer hashes as what was
-//! detiled is hashed at its next check whatever its guards say, refreshed
-//! if it changed, and logged once (with the count of such changes so far).
+//! do not advance), a lap every 2 s at most (a few textures are not hashed
+//! again at every frame: 0.86 ms a frame of an L4 VM's CPU for six of them,
+//! the whole budget, before). A texture whose memory no longer hashes as
+//! what was detiled is hashed at its next check whatever its guards say,
+//! refreshed if it changed, and logged once (with the count of such changes
+//! so far).
 //!
 //! A check hashes and detiles one snapshot of the memory: hashed in place
 //! and detiled after the wait for an earlier copy, a title write during the
@@ -447,6 +450,16 @@ impl Allowance {
 /// what is left of a budget is hashed over several.
 const NET_SLICE: usize = 256 << 10;
 
+/// The shortest time from one lap of the safety net to the next: textures
+/// that take less than its budget are not hashed again at every frame.
+const NET_LAP: Duration = Duration::from_secs(2);
+
+/// Whether the safety net may begin a lap at `now`, the last one begun at
+/// `last`.
+fn lap_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= NET_LAP)
+}
+
 /// The safety net (module doc): its budget, where its walk is, the texture
 /// it is hashing.
 #[derive(Default)]
@@ -454,6 +467,8 @@ struct Net {
     allowance: Allowance,
     /// The resource it last looked at: the walk goes on after it.
     cursor: usize,
+    /// When it last went round from the last resource to the first.
+    lap: Option<Instant>,
     hashing: Option<Hashing>,
     /// Room for what it reads.
     read: Vec<u8>,
@@ -487,46 +502,53 @@ static NET: Mutex<Option<Net>> = Mutex::new(None);
 /// summary (diagnostics).
 static NET_SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// Frames for the safety net's budget: the title's, and in tests those a
-/// test adds ([`NET_FRAMES`]).
-fn net_frame() -> u64 {
-    let frame = crate::frame::current();
+/// Frames and time for the safety net's budget and laps: the title's
+/// frames and the clock, and in tests what a test adds ([`NET_LATER`]).
+fn net_clock() -> (u64, Instant) {
+    let (frame, now) = (crate::frame::current(), Instant::now());
     #[cfg(test)]
-    let frame = frame + NET_FRAMES.load(Ordering::Relaxed);
-    frame
+    let (frame, now) = {
+        let [frames, ms] = NET_LATER.each_ref().map(|a| a.load(Ordering::Relaxed));
+        (frame + frames, now + Duration::from_millis(ms))
+    };
+    (frame, now)
 }
 
-/// Frames tests add for the safety net: the title's frame counter is
-/// `frame`'s tests' to advance.
+/// Frames and milliseconds tests add for the safety net: the title's frame
+/// counter is `frame`'s tests' to advance, and tests do not wait for laps.
 #[cfg(test)]
-static NET_FRAMES: AtomicU64 = AtomicU64::new(0);
+static NET_LATER: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The safety net's turn, at a check (module doc): hashes what its budget
 /// allows of the guarded textures checked since it last hashed them, in
-/// resource order from where it stopped, and marks suspect those whose
-/// memory no longer hashes as what was detiled.
+/// resource order from where it stopped, a lap every [`NET_LAP`] at most,
+/// and marks suspect those whose memory no longer hashes as what was
+/// detiled.
 fn net_walk() {
     let budget = net_budget();
     if budget == 0 {
         return;
     }
     let started = Instant::now();
+    let (frame, now) = net_clock();
     let mut net = NET.lock().unwrap_or_else(|e| e.into_inner());
     let Net {
         allowance,
         cursor,
+        lap,
         hashing,
         read,
     } = net.get_or_insert_with(Net::default);
-    allowance.renew(budget, net_frame(), started);
+    allowance.renew(budget, frame, now);
     // Textures looked at in this walk: a lap at most.
     let mut looked = 0;
     let mut hashed = 0;
     while allowance.left > 0 {
         let Some(h) = hashing else {
-            *hashing = next_sampled(cursor, &mut looked);
+            *hashing = next_sampled(cursor, &mut looked, lap, now);
             if hashing.is_none() {
-                // Nothing left to hash: the rest waits for the next budget.
+                // Nothing left to hash, or the next lap is not due: the
+                // rest waits for the next budget.
                 allowance.left = 0;
             }
             continue;
@@ -556,10 +578,16 @@ fn net_walk() {
     NET_SEEN[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// The next texture after `cursor` (wrapping round) checked through its
-/// guards since the safety net last hashed it; `looked` counts the textures
-/// looked at, a lap at most.
-fn next_sampled(cursor: &mut usize, looked: &mut usize) -> Option<Hashing> {
+/// The next texture after `cursor` checked through its guards since the
+/// safety net last hashed it, going round to the first resource if a lap is
+/// due (`lap`: when the last one began); `looked` counts the textures looked
+/// at, a lap at most.
+fn next_sampled(
+    cursor: &mut usize,
+    looked: &mut usize,
+    lap: &mut Option<Instant>,
+    now: Instant,
+) -> Option<Hashing> {
     use std::ops::Bound::{Excluded, Unbounded};
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.as_ref()?;
@@ -568,11 +596,15 @@ fn next_sampled(cursor: &mut usize, looked: &mut usize) -> Option<Hashing> {
         if *looked >= map.len() {
             return None;
         }
-        *looked += 1;
         if resource <= *cursor {
             // Round again.
+            if !lap_due(*lap, now) {
+                return None;
+            }
+            *lap = Some(now);
             NET_SEEN[2].fetch_add(1, Ordering::Relaxed);
         }
+        *looked += 1;
         *cursor = resource;
         if s.sampled.swap(false, Ordering::Relaxed) {
             return Some(Hashing {
@@ -1604,7 +1636,8 @@ mod tests {
     }
 
     /// The safety net's budget comes once a frame, whatever is spent of it,
-    /// and once a second where frames do not advance.
+    /// and once a second where frames do not advance; its laps come two
+    /// seconds apart at least.
     #[test]
     fn the_net_is_given_its_budget_once_a_frame() {
         let t0 = Instant::now();
@@ -1624,6 +1657,16 @@ mod tests {
         assert_eq!(a.left, 0);
         a.renew(100, 8, t0 + Duration::from_millis(1_600));
         assert_eq!(a.left, 100);
+        // Laps: the first at once, the next one not before `NET_LAP`.
+        assert!(lap_due(None, t0));
+        assert!(!lap_due(Some(t0), t0 + NET_LAP / 2));
+        assert!(lap_due(Some(t0), t0 + NET_LAP));
+    }
+
+    /// The next frame for the safety net, a lap after the last.
+    fn net_next_frame() {
+        NET_LATER[0].fetch_add(1, Ordering::Relaxed);
+        NET_LATER[1].fetch_add(NET_LAP.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Two read-write views of one fresh pagefile section of `len` bytes:
@@ -1764,8 +1807,9 @@ mod tests {
         // Through the other view, reported to no one.
         fill(other, 0x99);
         let missed = MISSED.load(Ordering::Relaxed);
-        // Each check in a frame of its own, the net's budget given anew.
-        // The walk at a check hashes the texture if a check found it clean
+        // Each check in a frame of its own a lap after the last, the net's
+        // budget given anew. The walk at a check hashes the texture if a
+        // check found it clean
         // since the net last hashed it: the last one did, unless another
         // test's walk (every check walks) hashed it before the write; then
         // this check finds it clean and the next walk hashes it. Changed,
@@ -1774,7 +1818,7 @@ mod tests {
         while !texels_of(host, texture).iter().all(|&b| b == 0x99) {
             frames += 1;
             assert!(frames <= 2, "not refreshed in {} frames", frames - 1);
-            NET_FRAMES.fetch_add(1, Ordering::Relaxed);
+            net_next_frame();
             sample_in(host, resource, 1);
         }
         assert_eq!(staging.missed.load(Ordering::Relaxed), 1);
@@ -1784,7 +1828,7 @@ mod tests {
         // Hashed again by the net, it is not suspect: its checks stay clean.
         let hashed = hashes(&staging);
         for _ in 0..2 {
-            NET_FRAMES.fetch_add(1, Ordering::Relaxed);
+            net_next_frame();
             sample_in(host, resource, 1);
         }
         assert_eq!(hashes(&staging), hashed);
