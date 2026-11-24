@@ -561,7 +561,7 @@ impl Call {
     }
 
     fn cleanup(&self, block: *mut AsyncBlock) {
-        CLEANING.with(|blocks| blocks.borrow_mut().push(block as usize));
+        let _ = CLEANING.try_with(|blocks| blocks.borrow_mut().push(block as usize));
         let _marker = CleanupMarker;
         self.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
@@ -610,7 +610,7 @@ thread_local! {
 struct CleanupMarker;
 impl Drop for CleanupMarker {
     fn drop(&mut self) {
-        CLEANING.with(|blocks| {
+        let _ = CLEANING.try_with(|blocks| {
             blocks.borrow_mut().pop();
         });
     }
@@ -733,15 +733,22 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 }
 
 /// A blocking query stays with one call and waits through cleanup. Cleanup
-/// must not join a thread blocking on the same block: the API cannot infer
-/// this dependency, which is a provider bug. Such threads must use
+/// must not wait, directly or indirectly through a join, lock or event, on
+/// a thread blocking with `wait = true` on the same block: the API cannot
+/// infer this dependency, which is a provider bug. Such threads must use
 /// `wait = false`. A reentrant query of a block undergoing cleanup on this
 /// thread returns its current status instead, including in nested cleanup.
 pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && CLEANING.with(|blocks| blocks.borrow().contains(&(block as usize))) {
+    // After TLS destruction, cleanup tracking is unavailable: avoid a
+    // potentially reentrant wait and return the current status instead.
+    if wait
+        && CLEANING
+            .try_with(|blocks| blocks.borrow().contains(&(block as usize)))
+            .unwrap_or(true)
+    {
         return status(block);
     }
     if wait && let Some(call) = waiting_call(block) {
@@ -1342,6 +1349,16 @@ mod tests {
         XAsyncComplete(block, S_OK, 8);
         XAsyncCancel(block);
         assert_eq!(XAsyncSchedule(block, 0), E_INVALIDARG);
+        assert_eq!(
+            XAsyncBegin(
+                block,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(idle)
+            ),
+            E_INVALIDARG
+        );
         resume.send(()).unwrap();
         completing.join().unwrap();
         // Dispatch only after every public waiter acquired the original call.
