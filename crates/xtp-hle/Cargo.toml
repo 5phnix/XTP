@@ -29,18 +29,14 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Power",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_XboxController",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Diagnostics only: recording our own audio (`modules::audio::capture`).
-windows = { workspace = true, optional = true, features = [
-    "Win32_Media_Audio",
-    "Win32_System_Com",
-    "Win32_System_Com_StructuredStorage",
-    "Win32_System_Threading",
-    "Win32_System_Variant",
-] }
+# Pads' trigger motors (`modules::gameinput::triggers`); diagnostics builds
+# add what recording our own audio needs (`modules::audio::capture`).
+windows = { workspace = true, features = ["Gaming_Input"] }
 # `#[implement]` names it.
 windows-core = { workspace = true, optional = true }
 
@@ -49,7 +45,16 @@ tempfile.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
-diagnostics = ["xtp-gpu/diagnostics", "xtp-loader/diagnostics", "dep:windows", "dep:windows-core"]
+diagnostics = [
+    "xtp-gpu/diagnostics",
+    "xtp-loader/diagnostics",
+    "windows/Win32_Media_Audio",
+    "windows/Win32_System_Com",
+    "windows/Win32_System_Com_StructuredStorage",
+    "windows/Win32_System_Threading",
+    "windows/Win32_System_Variant",
+    "dep:windows-core",
+]
 
 [lints]
 workspace = true
