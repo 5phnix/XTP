@@ -38,6 +38,8 @@ pub mod object;
 mod passdump;
 pub mod pipeline;
 #[cfg(windows)]
+mod pipestats;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
