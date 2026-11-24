@@ -30,6 +30,8 @@ pub(crate) struct GraphicsState {
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
+    /// The targets' title formats ([`blend_without_alpha`]).
+    title_targets: D3D12_RT_FORMAT_ARRAY,
     depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
 }
@@ -80,6 +82,7 @@ impl Default for GraphicsState {
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
             targets: D3D12_RT_FORMAT_ARRAY::default(),
+            title_targets: D3D12_RT_FORMAT_ARRAY::default(),
             depth_format: DXGI_FORMAT_UNKNOWN,
             samples: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -100,7 +103,10 @@ impl GraphicsState {
         unsafe {
             let data = at.add(4);
             match kind {
-                8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
+                8 => {
+                    self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned();
+                    blend_without_alpha(&mut self.blend, &self.title_targets);
+                }
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
                 11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
@@ -155,6 +161,10 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
+                    // The blend and the formats come in either order: each
+                    // applies it, and twice changes nothing more.
+                    self.title_targets = self.targets;
+                    blend_without_alpha(&mut self.blend, &self.title_targets);
                     for f in &mut self.targets.RTFormats {
                         f.0 = crate::resource::pc_format(f.0 as u32) as i32;
                     }
@@ -290,6 +300,59 @@ pub(crate) struct Input {
 /// The console's own primitive topology types.
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
+
+/// A pipeline's blending for render targets of title formats `targets`,
+/// with those whose stand-in has an alpha the title's format lacks
+/// ([`crate::resource::format::alpha_one`]: R9G9B9E5 as RGBA16F, B5G6R5
+/// as RGBA8) neither writing alpha nor blending with the target's alpha,
+/// as on the console, where that alpha reads one: in the colour factors,
+/// destination alpha becomes one, its inverse zero, and saturated source
+/// alpha (`min(As, 1 - Ad)`) zero. The alpha factors stay: what they make
+/// is not written. Applied as a stream is read, so pipeline names in the
+/// library change with it (the review of the #492 port, from dark-world).
+fn blend_without_alpha(blend: &mut D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) {
+    blend_without(blend, targets, crate::resource::format::alpha_one);
+}
+
+/// [`blend_without_alpha`] for the title formats `lacks_alpha` names. One
+/// blending for every target stays one where every target lacks alpha
+/// (D3D12 takes no logic operation with blending per target), and becomes
+/// one per target where some target keeps its alpha.
+fn blend_without(
+    blend: &mut D3D12_BLEND_DESC,
+    targets: &D3D12_RT_FORMAT_ARRAY,
+    lacks_alpha: impl Fn(u32) -> bool,
+) {
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let bound = || (0..count).filter(|&i| targets.RTFormats[i].0 != 0);
+    let lacking: Vec<usize> = bound()
+        .filter(|&i| lacks_alpha(targets.RTFormats[i].0 as u32))
+        .collect();
+    if lacking.is_empty() {
+        return;
+    }
+    let keeping = bound().any(|i| !lacks_alpha(targets.RTFormats[i].0 as u32));
+    if !blend.IndependentBlendEnable.as_bool() && keeping {
+        blend.IndependentBlendEnable = true.into();
+        blend.RenderTarget = [blend.RenderTarget[0]; 8];
+    }
+    let slots = if blend.IndependentBlendEnable.as_bool() {
+        lacking
+    } else {
+        vec![0]
+    };
+    let factor = |f: D3D12_BLEND| match f {
+        D3D12_BLEND_DEST_ALPHA => D3D12_BLEND_ONE,
+        D3D12_BLEND_INV_DEST_ALPHA | D3D12_BLEND_SRC_ALPHA_SAT => D3D12_BLEND_ZERO,
+        other => other,
+    };
+    for i in slots {
+        let t = &mut blend.RenderTarget[i];
+        t.SrcBlend = factor(t.SrcBlend);
+        t.DestBlend = factor(t.DestBlend);
+        t.RenderTargetWriteMask &= !(D3D12_COLOR_WRITE_ENABLE_ALPHA.0 as u8);
+    }
+}
 
 /// Whether root SRVs are bound as one-view tables of the buffer's host
 /// copy (reads past its end return zeros) rather than root descriptors
@@ -1231,6 +1294,78 @@ mod tests {
             inputs.refusal(&HOST).as_deref(),
             Some("vertex format 86: not a vertex buffer format")
         );
+    }
+
+    /// A target whose stand-in has an alpha the title's format lacks
+    /// neither writes alpha nor blends with it; the others keep their
+    /// blending, per target only where some target keeps its alpha
+    /// (dark-world's test from the review of the #492 port, extended).
+    #[test]
+    fn targets_without_alpha_blend_with_alpha_one() {
+        let target = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            SrcBlend: D3D12_BLEND_INV_DEST_ALPHA,
+            DestBlend: D3D12_BLEND_DEST_ALPHA,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_SRC_ALPHA_SAT,
+            DestBlendAlpha: D3D12_BLEND_SRC_ALPHA,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            RenderTargetWriteMask: 0xf,
+            ..Default::default()
+        };
+        let shared = D3D12_BLEND_DESC {
+            RenderTarget: [target; 8],
+            ..Default::default()
+        };
+        let formats = |list: &[i32]| {
+            let mut formats = [DXGI_FORMAT(0); 8];
+            for (f, &title) in formats.iter_mut().zip(list) {
+                f.0 = title;
+            }
+            D3D12_RT_FORMAT_ARRAY {
+                RTFormats: formats,
+                NumRenderTargets: list.len() as u32,
+            }
+        };
+        let lacks = |f| f == 67 || f == 85;
+        let text = |b: &D3D12_BLEND_DESC| format!("{b:?}");
+
+        // Nothing to change for formats with their own alpha.
+        let mut same = shared;
+        blend_without(&mut same, &formats(&[28, 0]), lacks);
+        assert_eq!(text(&same), text(&shared));
+
+        // A target keeping its alpha beside one without: per target.
+        let mut mixed = shared;
+        blend_without(&mut mixed, &formats(&[28, 67]), lacks);
+        assert!(mixed.IndependentBlendEnable.as_bool());
+        let (kept, changed) = (mixed.RenderTarget[0], mixed.RenderTarget[1]);
+        assert_eq!(
+            text(&D3D12_BLEND_DESC {
+                RenderTarget: [kept; 8],
+                ..shared
+            }),
+            text(&shared)
+        );
+        assert_eq!(changed.SrcBlend, D3D12_BLEND_ZERO);
+        assert_eq!(changed.DestBlend, D3D12_BLEND_ONE);
+        assert_eq!(
+            changed.SrcBlendAlpha, D3D12_BLEND_SRC_ALPHA_SAT,
+            "not written"
+        );
+        assert_eq!(changed.RenderTargetWriteMask, 0x7);
+        // The blend and the formats come in either order: twice is once.
+        let mut twice = mixed;
+        blend_without(&mut twice, &formats(&[28, 67]), lacks);
+        assert_eq!(text(&twice), text(&mixed));
+
+        // Every bound target without alpha: still one blending for all.
+        let mut alone = shared;
+        blend_without(&mut alone, &formats(&[67, 0, 85]), lacks);
+        assert!(!alone.IndependentBlendEnable.as_bool());
+        assert_eq!(alone.RenderTarget[0].SrcBlend, D3D12_BLEND_ZERO);
+        assert_eq!(alone.RenderTarget[0].DestBlend, D3D12_BLEND_ONE);
+        assert_eq!(alone.RenderTarget[0].RenderTargetWriteMask, 0x7);
     }
 
     /// The acceptance test of the wave64 wiring (VIctory #223), on the
