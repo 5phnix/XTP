@@ -50,8 +50,10 @@ repository. Times are local (UTC+1) unless a log line says otherwise.
   the lighting rectangles, the sky compute and the sky dome draws alike.
   With stride's run-time views switched on (`XTP_RUN_TIME_VIEWS=1`), the
   world's first frame never completes (§6.2, stride's task).
-- **Suite (§8).** The open question, the lead (the sky's view LUTs), the
-  scene colour's writers, what is set aside and the exact commands.
+- **Suite (§8).** The open question, the leads (the sky's view LUTs; the
+  exposure buffer read through a raw handle on a structured view on NVIDIA,
+  watch item 190; a refused first writer, item 191), the scene colour's
+  writers, what is set aside and the exact commands.
 - **The 3D world on screen, unlit (§6.2, worldlight-18).**
   `XTP_PRESENT_TARGET=1280x720:f28@f0c91b4d2578f5bf` shows the material
   resolve's RGBA8 G-buffer target in the window: the game's street moving.
@@ -466,11 +468,37 @@ of them is the zero texture, the sky's light is multiplied or replaced by
    as its writer gets the previous frame's texels. One frame late, not 0,
    but a transient texture the frame reuses may hold anything by then.
 
-### 8.4 Already set aside
+### 8.4 Two more leads (watch pass 12, items 190 and 191)
 
-- Exposure: the 16-byte exposure buffer is written every frame and is not
-  0 ([1.57, 0.636, 8, 0.125] in worldlight-3, [12.07, 0.083, 8, 0.125] in
-  -16 as the auto-exposure pushes up against a black scene) (§4.3).
+- **Item 190: a raw handle on a structured view, on NVIDIA.** There, a
+  raw access through a structured view reads element `byte / 4 × stride`
+  instead of the byte asked for. Read through such a view, byte 4 of the
+  16-byte exposure buffer lands past its end and reads 0, and a scene
+  colour multiplied by it is 0. This fits §8.1's "input they share": the
+  sky (`348e1e8c414c7eca`, `Srv s0+16`), the lighting rectangles
+  (`1cd9bc634417a981`, `Srv s0+168`), the volume apply
+  (`577248728544d74b`, `Srv s0+48`) and the sky dome (`3ae25b11290cadde`,
+  `Srv s0+16`) all read a 16-byte buffer, the exposure buffer
+  (`buffer Some((<address>, 16))` in their op texts). §4.3 checked the
+  buffer's bytes ([1.57, 0.636, 8, 0.125]), not what the shaders read from
+  it. stride's task carries the fix (the fork's `raw_window`, VIctory
+  #1762) and tests it in its second session. To check it here: a session
+  with that fix, then the scene colour after P403 (sky) in the pass view.
+- **Item 191: `2da4beb386509b77` is refused** ("a descriptor neither
+  loaded nor built"). It is the first writer of a 1280×720
+  R11G11B10_FLOAT target (host format 26; worldlight-15's frame 1349 has
+  two such targets): a pass that should fill an input is dropped. Find
+  it with `grep 2da4beb386509b77` in the run's log (the refusal) and in
+  the pass view's `DROPPED` lines, then see which scene colour writer
+  reads that target.
+
+### 8.5 Already set aside
+
+- Exposure, as bytes: the 16-byte exposure buffer is written every frame
+  and its bytes are not 0 ([1.57, 0.636, 8, 0.125] in worldlight-3, [12.07,
+  0.083, 8, 0.125] in -16 as the auto-exposure pushes up against a black
+  scene) (§4.3). What the shaders read from it is not checked: item 190
+  (§8.4) reopens it.
 - Dropped scene colour writers: none of the sky, volume and last passes is
   dropped; the lighting rectangles all ran (232/232, 235/235, 172/172,
   11/11) (§4.3, §8.2).
@@ -492,7 +520,7 @@ of them is the zero texture, the sky's light is multiplied or replaced by
 - smemraw's branch (de9f4f3): no GPU removal in seven sessions with
   `XTP_D3D12_DRED=1`.
 
-### 8.5 How the sessions were run
+### 8.6 How the sessions were run
 
 The integration build: a local branch merging this branch, smemraw's
 (de9f4f3), stride's (a8f280b) and mesh-fix's (44931a5) on `main` afc81fc
