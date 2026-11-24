@@ -47,6 +47,26 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
+/// Where half `h` of a pixel input packing rows `a` and `b` comes from
+/// ([`packed_half`]), or `None` for the padding of a second row the metadata
+/// names (`explicit_second_row`). With a partner found by
+/// [`half_input_partners`] a half no element holds stays an error: the
+/// guess must not turn real data into zeros.
+fn packed_input_half(
+    elements: &[SigElement],
+    a: u8,
+    b: Option<u8>,
+    h: u8,
+    explicit_second_row: bool,
+) -> Result<Option<(u8, u8)>, Why> {
+    let half = packed_half(elements, a, b, h);
+    if half.is_none() && !explicit_second_row {
+        Err("a packed input half no element holds")
+    } else {
+        Ok(half)
+    }
+}
+
 impl<'a> Lower<'a> {
     /// Values of the program's input registers.
     pub(super) fn inputs(&mut self) -> Result<(), Stop> {
@@ -324,7 +344,7 @@ impl<'a> Lower<'a> {
                 _ => Err("an input"),
             }
         };
-        // (pack2, the second row).
+        // (pack2, the second row, whether the metadata names it).
         let packing = match &self.x.native.io {
             StageIo::Ps { inputs, .. } => inputs
                 .iter()
@@ -339,7 +359,7 @@ impl<'a> Lower<'a> {
                     } else {
                         None
                     };
-                    (i.pack2, b)
+                    (i.pack2, b, i.pack2 && i.row2 != i.row)
                 }),
             _ => None,
         };
@@ -347,16 +367,26 @@ impl<'a> Lower<'a> {
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
             None => channel(self, attribute.row, attribute.channel)?,
-            Some((pack2, b)) => {
+            Some((pack2, b, explicit_second_row)) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
-                    let src = if pack2 {
+                    let src = if pack2 && f16 {
+                        packed_input_half(&l.s.inputs, attribute.row, b, h, explicit_second_row)?
+                    } else if pack2 {
                         packed_half(&l.s.inputs, attribute.row, b, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
                     let Some((row, ch)) = src else {
+                        // shortcut: a 16-bit read of the padding after a
+                        // second row the metadata names reads zero. The
+                        // host declares no element there; the console's
+                        // half holds whatever the producing stage exported
+                        // in it.
+                        if f16 && explicit_second_row {
+                            return Ok(Some(l.s.m.i32(0)));
+                        }
                         return Ok(None);
                     };
                     let x = channel(l, row, ch)?;
@@ -412,7 +442,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::half_input_partners;
+    use super::{half_input_partners, packed_input_half};
     use crate::emit::container::SigElement;
     use crate::native::{PsInput, StageIo, Usage};
 
@@ -457,6 +487,22 @@ mod tests {
         assert_eq!(p.get(&0), Some(&1));
         assert_eq!(p.get(&3), Some(&4));
         assert_eq!(p.get(&5), None);
+    }
+
+    #[test]
+    fn explicit_packed_input_tail_is_padding() {
+        // Four halves in row 6 followed by only two in its explicit partner
+        // row 7. The next two reads address the packing's zero padding.
+        let sig = vec![element(6, 4), element(7, 2)];
+        assert_eq!(
+            packed_input_half(&sig, 6, Some(7), 5, true),
+            Ok(Some((7, 1)))
+        );
+        assert_eq!(packed_input_half(&sig, 6, Some(7), 6, true), Ok(None));
+        assert_eq!(packed_input_half(&sig, 6, Some(7), 7, true), Ok(None));
+        // With an inferred partner the same gap is not assumed to be zero.
+        assert!(packed_input_half(&sig, 6, Some(7), 6, false).is_err());
+        assert!(packed_input_half(&sig, 6, None, 4, false).is_err());
     }
 
     /// A pixel program interpolating the high half of channel z or w of a
@@ -534,10 +580,12 @@ mod tests {
     fn a_packed_pixel_input_reads_the_second_row_the_metadata_leaves_out() {
         // Half 5 is channel 1 of row 1, which no input entry names.
         packed_read(2, 0).unwrap();
-        // Half 7 is past row 1's two halves.
+        // Half 7 is past row 1's two halves: with a guessed second row it
+        // is no padding the metadata describes.
         let e = packed_read(3, 0).unwrap_err();
         assert!(e.contains("a packed input half no element holds"), "{e}");
-        // The second row named by the metadata reads the same.
+        // With the second row named, it is padding.
         packed_read(2, 1).unwrap();
+        packed_read(3, 1).unwrap();
     }
 }
