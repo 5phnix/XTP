@@ -490,7 +490,7 @@ of them is the zero texture, the sky's light is multiplied or replaced by
   two such targets): a pass that should fill an input is dropped. Find
   it with `grep 2da4beb386509b77` in the run's log (the refusal) and in
   the pass view's `DROPPED` lines, then see which scene colour writer
-  reads that target.
+  reads that target. **Translated since (§9).**
 
 ### 8.5 Already set aside
 

@@ -1184,7 +1184,7 @@ impl<'a> Tracer<'a> {
                     | Operand::Const(_)
                     | Operand::Literal(_) => true,
                     Operand::Scalar { code, .. } => {
-                        inst.read(Reg::S(code)).is_some_and(|v| self.from_entry(v))
+                        inst.read(Reg::S(code)).is_some_and(|v| self.entry_value(v))
                     }
                     _ => false,
                 };
@@ -1199,7 +1199,7 @@ impl<'a> Tracer<'a> {
     }
 
     /// Whether `v` is an input or a constant, through scalar moves.
-    fn from_entry(&self, mut v: Value) -> bool {
+    fn entry_value(&self, mut v: Value) -> bool {
         for _ in 0..MAX_ROUNDS {
             if self.inputs[v.0 as usize].is_some() {
                 return true;
