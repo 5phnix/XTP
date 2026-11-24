@@ -45,6 +45,20 @@ Converting them ahead of time from files is only a warm-up.
 Everything except `xtp-game` is platform-level and can be tested with
 any Xbox Series title.
 
+The pipeline cache uses a 1 GiB payload budget by default. Pass a byte
+budget to `Cache::open_with_limit`, or zero to disable disk access. When
+space is needed, the cache evicts entries in write-time order and skips
+active readers and files it cannot remove. Disk errors still let the caller
+use a successful conversion. Each disk read verifies the payload length
+and BLAKE3 checksum. Older entries without a header are rebuilt on demand.
+
+Threads sharing a cache directory in one process share a budget, reader
+pins and in-flight conversions. A converter or decoder must not look up its
+own in-flight key, because it would wait for itself. Another process can
+publish a valid entry that this process discovers on lookup. Each process
+tracks its own pins and budget. `Cache::stats` reports indexed entries,
+payload bytes and successful reuses; legacy files count at their full size.
+
 ## Import resolution
 
 For every `dll!function` the title imports, in order:
