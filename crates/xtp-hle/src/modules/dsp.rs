@@ -24,6 +24,9 @@ use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
+#[cfg(any(test, feature = "diagnostics"))]
+mod capture;
+
 const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
@@ -62,6 +65,8 @@ pub struct Stream {
     frames: u32,
     channels: u32,
     status: Box<Status>,
+    #[cfg(any(test, feature = "diagnostics"))]
+    capture: Option<capture::Capture>,
 }
 
 /// One block of work.
@@ -168,6 +173,9 @@ pub extern "system" fn XDspActivate(
         dsp,
         frames: desc.frames,
         channels: desc.channels,
+        #[cfg(any(test, feature = "diagnostics"))]
+        // SAFETY: the activation descriptor supplies the impulse response and its length.
+        capture: unsafe { capture::Capture::start(desc) },
         status: Box::new(Status {
             submitted: 0,
             completed: 0,
@@ -206,10 +214,25 @@ pub extern "system" fn XDspSubmitCommand(
     }
     // SAFETY: a stream from `XDspActivate`, the title's command.
     let (stream, command) = unsafe { (&mut *stream, &*command) };
+    let samples = (stream.frames * stream.channels) as usize;
+    #[cfg(any(test, feature = "diagnostics"))]
+    let block = stream
+        .capture
+        .as_mut()
+        .and_then(capture::Capture::next_block);
+    #[cfg(any(test, feature = "diagnostics"))]
+    if let Some(path) = &block {
+        // SAFETY: the input holds one block. It can alias the output cleared below.
+        unsafe { capture::write_block(path, "input", command.input, samples) };
+    }
     if !command.output.is_null() {
-        let samples = (stream.frames * stream.channels) as usize;
         // SAFETY: the title's output buffer holds one block of the stream.
         unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+    }
+    #[cfg(any(test, feature = "diagnostics"))]
+    if let Some(path) = &block {
+        // SAFETY: the output holds the block just completed.
+        unsafe { capture::write_block(path, "output", command.output, samples) };
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
