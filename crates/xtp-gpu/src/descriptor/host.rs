@@ -1469,12 +1469,12 @@ type Kept = Option<ID3D12Resource>;
 
 /// Makes a buffer view's elements fit its host copy `copy` (`first`,
 /// `elements` of `element` bytes, the first moved to the copy already):
-/// none if no element does, or if the host refuses such a view (a stride it
-/// has no structured buffers for, a typeless format without the raw flag),
-/// which a view past its resource's end or of no elements is too. A view
-/// the host refuses can remove the device; the console reads zeros past a
-/// view's end, as the cut view does (VIctory #193, f99b792; the
-/// `buffer_view_ok` of fxceless's VIctory fork, 578d459).
+/// none if no element does, or if the host refuses such a view (a stride
+/// past D3D12's 2048, a typeless format without the raw flag), which a
+/// view past its resource's end or of no elements is too. A view the host
+/// refuses can remove the device; the console reads zeros past a view's
+/// end, as the cut view does (VIctory #193, f99b792; the `buffer_view_ok`
+/// of fxceless's VIctory fork, 578d459).
 fn fit_view(
     copy: &ID3D12Resource,
     first: u64,
@@ -1483,7 +1483,7 @@ fn fit_view(
     (stride, format, raw): (u32, u32, bool),
 ) -> Option<()> {
     const MAX_ELEMENTS: u32 = 1 << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
-    if stride > 0 && (stride > 2048 || !stride.is_multiple_of(4)) {
+    if stride > 2048 {
         once!(
             stride,
             "a structured buffer view of a stride the host refuses: null"
