@@ -794,6 +794,7 @@ dependencies = [
  "anyhow",
  "clap",
  "walkdir",
+ "xtp-core",
 ]
 
 [[package]]

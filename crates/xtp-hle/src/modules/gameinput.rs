@@ -492,6 +492,8 @@ struct State {
     running: Vec<(u64, ThreadId)>,
     /// The keyboard and mouse's pad, unless `[input]` turned it off.
     kbm: Option<Kbm>,
+    /// Buttons the autopilot holds (`hold_buttons`).
+    autopilot: u32,
 }
 
 pub struct Hub {
@@ -537,6 +539,7 @@ impl Hub {
                 pending: Vec::new(),
                 running: Vec::new(),
                 kbm: tuning().keyboard_mouse.then(|| Kbm::new(tuning())),
+                autopilot: 0,
             }),
             returned: Condvar::new(),
         }));
@@ -623,7 +626,10 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let kbm = self.kbm.as_mut().map(|kbm| kbm.pad(&keys, &mouse, now));
+        let mut kbm = self.kbm.as_mut().map(|kbm| kbm.pad(&keys, &mouse, now));
+        if self.autopilot != 0 {
+            kbm.get_or_insert_default().buttons |= self.autopilot;
+        }
         // On the first pad, or as the stand-in while there is none.
         let stand_in = match (pads.iter_mut().flatten().next(), kbm) {
             (Some(pad), Some(kbm)) => {
@@ -711,6 +717,18 @@ fn host() -> Box<dyn Source> {
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
+
+/// Holds pad buttons (bits from [`button`]) down for the autopilot until
+/// the next call, 0 for none: on the pad that plays, as the keyboard's are.
+pub(crate) fn hold_buttons(buttons: u32) {
+    HUB.state().autopilot = buttons;
+}
+
+/// The bit of the pad button `[input.bindings]` names `name` (`a`, `menu`,
+/// `dpad_up`, ...; any case).
+pub(crate) fn button(name: &str) -> Option<u32> {
+    bindings::button(name)
+}
 
 type This = *const Object;
 type Out = *mut *const c_void;
@@ -1797,6 +1815,31 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn autopilot_buttons_play_on_the_pad_that_plays() {
+        let (hub, host) = fake();
+        hub.state().autopilot = button("a").unwrap() | button("Menu").unwrap();
+        hub.poll();
+        assert_eq!(stand_in(hub).buttons, A | MENU);
+        // On top of the first host pad once there is one.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(r).buttons, A | B | MENU);
+        release(r);
+        hub.state().autopilot = 0;
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(r).buttons, B);
+        release(r);
+        // Buttons only: triggers and sticks are no buttons.
+        assert_eq!(button("left_trigger"), None);
+        assert_eq!(button("start"), None);
     }
 
     #[test]
