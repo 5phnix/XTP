@@ -153,17 +153,23 @@ impl StrideTable {
 /// slot while a list that may still read through it has not run: each
 /// recording that reads the table holds the epoch it started at
 /// ([`StrideHold`]), and a raw view given back at epoch `e` comes back to
-/// the pool once no hold of an epoch up to `e` is left. A slot's own view
-/// and entry are rewritten in place, as the title's descriptor is.
+/// the pool once no hold of an epoch up to `e` is left. A slot whose view
+/// changes keeps its raw view, rewritten in place with its entry, as the
+/// title's own descriptor is: the title rewrites its buffer views every
+/// frame (rings), and a new raw view for each change ran the pool out in
+/// half a minute of the world (stride-2: 65,536 taken, 49,829 retiring).
+/// The host buffer the old view read waits as a pool slot would, so a list
+/// in flight never reads freed memory.
 #[derive(Default)]
 struct Aliases {
     /// The raw view of each slot that has one.
     of: HashMap<u32, Alias>,
     /// Pool slots free now.
     free: Vec<u32>,
-    /// Pool slots given back, by epoch: the epoch, the pool slot, the host
-    /// buffer it views (held while a list may read through it).
-    retiring: VecDeque<(u64, u32, ID3D12Resource)>,
+    /// Pool slots given back, by epoch: the epoch, the pool slot (none for
+    /// a raw view rewritten in place), the host buffer it viewed (held
+    /// while a list may read through it).
+    retiring: VecDeque<(u64, Option<u32>, ID3D12Resource)>,
     /// Pool slots from here on were never taken.
     next: u32,
     /// Raw views given back so far.
@@ -189,6 +195,7 @@ impl Aliases {
     fn take(&mut self) -> (Option<u32>, Vec<ID3D12Resource>) {
         let oldest = self.holds.keys().next().copied();
         let mut gone = Vec::new();
+        let mut freed = 0;
         while let Some(&(epoch, pool, _)) = self.retiring.front() {
             if oldest.is_some_and(|held| held <= epoch) {
                 break;
@@ -196,9 +203,12 @@ impl Aliases {
             if let Some((_, _, buffer)) = self.retiring.pop_front() {
                 gone.push(buffer);
             }
-            self.free.push(pool);
+            if let Some(pool) = pool {
+                self.free.push(pool);
+                freed += 1;
+            }
         }
-        self.used -= gone.len() as u32;
+        self.used -= freed;
         let pool = self.free.pop().or_else(|| {
             (self.next < ALIASES).then(|| {
                 self.next += 1;
@@ -227,7 +237,14 @@ impl Aliases {
     /// Gives `alias` back: retiring until the holds of now have gone.
     fn retire(&mut self, alias: Alias) {
         self.retiring
-            .push_back((self.epoch, alias.pool, alias.buffer));
+            .push_back((self.epoch, Some(alias.pool), alias.buffer));
+        self.epoch += 1;
+    }
+
+    /// Keeps `buffer`, which a raw view rewritten in place read, until the
+    /// holds of now have gone.
+    fn keep_retired(&mut self, buffer: ID3D12Resource) {
+        self.retiring.push_back((self.epoch, None, buffer));
         self.epoch += 1;
     }
 }
@@ -1319,9 +1336,8 @@ impl HostHeap {
     /// the bytes of its host copy a buffer view reads (none for any other
     /// view, or one the host could not make). A raw view is read in its own
     /// slot; a structured or typed one through a raw view of the same bytes
-    /// in the pool, made before the entry names it. A view that changed
-    /// gets a raw view in another pool slot: the old one may still be read
-    /// by lists in flight ([`Aliases`]).
+    /// in the pool, made before the entry names it. A slot whose view
+    /// changed keeps its pool slot, rewritten in place ([`Aliases`]).
     fn note_view(&self, index: u32, viewed: Option<Viewed>) {
         let Some(s) = &self.strides else { return };
         let Some(v) = viewed else {
@@ -1360,11 +1376,22 @@ impl HostHeap {
         );
         let count = (v.len / v.element).min(u64::from(window.elements(element))) as u32;
         let mut a = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = a.of.get(&index)
-            && old.key == key
-        {
-            // The same bytes: the raw view it has.
+        if let Some(old) = a.of.get_mut(&index) {
             let pool = old.pool;
+            if old.key != key {
+                // Another view: its raw view in the same pool slot, made
+                // before the entry says so; the buffer the old one read
+                // stays while a list in flight may read through it.
+                raw_view(
+                    &v.buffer,
+                    window,
+                    v.unordered,
+                    self.cpu(s.alias_base + pool),
+                );
+                old.key = key;
+                let read = std::mem::replace(&mut old.buffer, v.buffer.clone());
+                a.keep_retired(read);
+            }
             drop(a);
             return self.set_entry(
                 index,
@@ -1388,7 +1415,7 @@ impl HostHeap {
         };
         let slot = s.alias_base + pool;
         raw_view(&v.buffer, window, v.unordered, self.cpu(slot));
-        let old = a.of.insert(
+        a.of.insert(
             index,
             Alias {
                 pool,
@@ -1405,9 +1432,6 @@ impl HostHeap {
                 count,
             },
         );
-        if let Some(old) = old {
-            a.retire(old);
-        }
         drop(a);
         drop(gone);
     }
@@ -2667,9 +2691,9 @@ mod tests {
     }
 
     /// A slot the title rewrites while a list that read the table has not
-    /// run: its entry names a new raw view at once (one 64-bit store), and
-    /// the old raw view is not made again for another slot until that
-    /// list's hold has gone; then it is.
+    /// run keeps its raw view, rewritten in place with its entry (one 64-bit
+    /// store); a raw view the slot no longer needs is not made again for
+    /// another slot until that list's hold has gone; then it is.
     #[test]
     fn raw_views_a_list_in_flight_may_read_are_kept_until_it_has_run() {
         use crate::testgpu::TitleBuffer;
@@ -2685,19 +2709,20 @@ mod tests {
         assert_eq!(raw_slot(0), pool);
         // A list reads the table, and has not run.
         let in_flight = heap.stride_hold().expect("a table");
+        // Another view in the slot: its raw view rewritten in place, as the
+        // slot's descriptor is (the title rewrites its views every frame).
         heap.make_at(0, &buffer_view(false, &buffer, structured(16), (0, 8)));
-        assert_eq!(raw_slot(0), pool + 1, "a new raw view for the new view");
+        assert_eq!(raw_slot(0), pool, "the same pool slot");
+        assert_eq!(heap.entry(0).stride, 16);
+        // No raw view for the slot any more: its pool slot waits.
         heap.make_null(0);
         heap.make_at(1, &buffer_view(false, &buffer, structured(20), (0, 8)));
-        assert_eq!(raw_slot(1), pool + 2, "the old ones are not reused");
+        assert_eq!(raw_slot(1), pool + 1, "not reused while a list may read it");
         // A list that started after: its hold does not keep them.
         let later = heap.stride_hold().expect("a table");
         drop(in_flight);
         heap.make_at(2, &buffer_view(false, &buffer, structured(20), (1, 6)));
-        heap.make_at(3, &buffer_view(false, &buffer, structured(20), (2, 4)));
-        let mut reused = [raw_slot(2), raw_slot(3)];
-        reused.sort_unstable();
-        assert_eq!(reused, [pool, pool + 1], "given back once the list has run");
+        assert_eq!(raw_slot(2), pool, "given back once the list has run");
         drop(later);
     }
 
