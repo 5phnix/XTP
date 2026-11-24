@@ -75,7 +75,30 @@ fn sample_form(name: &str) -> Option<SampleForm> {
     Some(f)
 }
 
+/// Whether image opcode `name` takes its level from its quad's implicit
+/// derivatives: a sample with no level, level 0 or gradients given (a
+/// gather with no level is refused, see [`Lower::image`]).
+pub(super) fn implicit_derivatives(name: &str) -> bool {
+    sample_form(name).is_some_and(|f| !(f.gather || f.d || f.l || f.lz))
+}
+
+/// Why a compute program's implicit derivatives cannot be the console's:
+/// see [`Lower::compute_quads`].
+const NO_CONSOLE_QUADS: Why =
+    "an implicit-derivative sample in a compute group of a size not a multiple of 4";
+
 impl<'a> Lower<'a> {
+    /// Compute: whether the host's quads are the console's, four
+    /// consecutive thread ids. They are in a group declared as one row of a
+    /// multiple of 4 threads (SM 6.6's 1D quads), which is how `Lower::new`
+    /// declares a group with such samples when its size allows it.
+    fn compute_quads(&self) -> Result<(), Why> {
+        match self.s.threads {
+            Some([x, 1, 1]) if x.is_multiple_of(4) => Ok(()),
+            _ => Err(NO_CONSOLE_QUADS),
+        }
+    }
+
     /// A 64-bit image atomic: DXIL's i64 `atomicBinOp` or
     /// `atomicCompareExchange` on the view as a 64-bit integer texture UAV
     /// (the console's R32G32 view; the host's must be R32G32_UINT, as for
@@ -551,8 +574,12 @@ impl<'a> Lower<'a> {
                 }
                 if f.l || f.lz {
                     65
-                } else if self.s.pixel || self.s.threads.is_some() && self.s.mesh.is_none() {
-                    // Implicit derivatives: pixel and compute shaders.
+                } else if self.s.pixel {
+                    64
+                } else if self.s.threads.is_some() && self.s.mesh.is_none() {
+                    // Implicit derivatives in compute: the host's, from its
+                    // quads, which must be the console's.
+                    self.compute_quads()?;
                     64
                 } else {
                     return Err(
@@ -700,13 +727,16 @@ impl<'a> Lower<'a> {
                     // them by 2^bias, the same level for isotropic filtering.
                     // A quad's four lanes share a host wave of any size, so
                     // this needs neither the console's wave size nor its
-                    // lane order beyond the quad.
+                    // lane order beyond the quad; the host's quad is the
+                    // console's in a group declared as one row
+                    // (`compute_quads`).
                     if self.s.mesh.is_some() {
                         return Err("a cross-lane operation in a mesh shader");
                     }
                     if self.s.threads.is_none() {
                         return Err("a cross-lane operation outside compute");
                     }
+                    self.compute_quads()?;
                     let scale = if op == 61 {
                         let bias = float(self, bias_at)?;
                         Some(self.unary(21, bias))

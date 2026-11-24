@@ -19,6 +19,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 /// Lanes in the group (one wave of 32: eight quads).
 const LANES: usize = 32;
+/// The group shape of most tests: the lanes in one row.
+const ROW: [u32; 3] = [LANES as u32, 1, 1];
 /// Address dwords each lane reads (v2..v17).
 const ADDR: usize = 16;
 
@@ -47,6 +49,11 @@ fn v_mov(d: u8, src: u32) -> u32 {
 
 fn v_lshl(d: u8, by: u32, v: u8) -> u32 {
     0x1A << 25 | u32::from(d) << 17 | u32::from(v) << 9 | (0x80 + by)
+}
+
+/// `v_add_nc_u32 v<d>, v<a>, v<b>`.
+fn v_add_u32(d: u8, a: u8, b: u8) -> u32 {
+    0x25 << 25 | u32::from(d) << 17 | u32::from(b) << 9 | (256 + u32::from(a))
 }
 
 /// MUBUF `op` with offen: v[data..] at s[rsrc..]'s base + v[addr] + offset.
@@ -136,16 +143,22 @@ fn mimg(name: &str, dmask: u8) -> Mimg {
 /// buffer at 1), s1 the sampler table, s2 the UAV table (index 2). Each
 /// lane loads 16 address dwords into v2..v17, `literals` then set some to
 /// constants, and the instruction's four result dwords are stored at
-/// 16 × the lane (stores write the image instead).
-fn program(inst: Mimg, literals: &[(u8, u32)]) -> Vec<u32> {
-    let mut w = vec![
+/// 16 × the lane (stores write the image instead). In a group of shape
+/// `group` (Z 1, X a power of two), the lane is the flat thread id, x + X y.
+fn program_in(inst: Mimg, literals: &[(u8, u32)], group: [u32; 3]) -> Vec<u32> {
+    assert!(group[2] == 1 && group[0].is_power_of_two(), "{group:?}");
+    let mut w = Vec::new();
+    if group[1] > 1 {
+        w.extend([v_lshl(1, group[0].trailing_zeros(), 1), v_add_u32(0, 0, 1)]);
+    }
+    w.extend([
         s_mov(4, 0),
         s_mov(5, ZERO),
         s_mov(6, 1),
         s_mov(7, ZERO),
         s_mov(20, 2),
         s_mov(21, ZERO),
-    ];
+    ]);
     w.extend(s_load(3, 8, 4, 0));
     w.extend(s_load(2, 32, 4, 0x20));
     w.extend(s_load(2, 16, 6, 0));
@@ -173,6 +186,12 @@ fn program(inst: Mimg, literals: &[(u8, u32)]) -> Vec<u32> {
 }
 
 fn native(words: &[u32]) -> NativeProgram {
+    native_in(words, ROW)
+}
+
+/// [`native`] in a group of shape `group`: thread ids x and y (v0, v1)
+/// when Y is more than 1.
+fn native_in(words: &[u32], group: [u32; 3]) -> NativeProgram {
     let table = |user_data, slot| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -202,8 +221,9 @@ fn native(words: &[u32]) -> NativeProgram {
             used(ResourceType::Uav, 2, 3, 8),
         ],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 3 << 1,
-            threads: [LANES as u32, 1, 1],
+            // Three user SGPRs; TIDIG_COMP_CNT 1 for x and y.
+            rsrc2: 3 << 1 | u32::from(group[1] > 1) << 11,
+            threads: group,
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     }
@@ -220,7 +240,16 @@ const CS_DERIVATIVES: &str = "Function uses features incompatible with the shade
 /// (`CS_DERIVATIVES` let through for a comparison sample with implicit
 /// derivatives).
 fn translate(inst: Mimg, literals: &[(u8, u32)]) -> Result<HostShader, ShaderError> {
-    let s = lower(&program(inst, literals))?;
+    translate_in(inst, literals, ROW)
+}
+
+/// [`translate`] in a group of shape `group` ([`program_in`]).
+fn translate_in(
+    inst: Mimg,
+    literals: &[(u8, u32)],
+    group: [u32; 3],
+) -> Result<HostShader, ShaderError> {
+    let s = lower_in(&program_in(inst, literals, group), group)?;
     if let Ok(mut v) =
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
     {
@@ -232,8 +261,8 @@ fn translate(inst: Mimg, literals: &[(u8, u32)]) -> Result<HostShader, ShaderErr
     Ok(s)
 }
 
-fn lower(words: &[u32]) -> Result<HostShader, ShaderError> {
-    let n = native(words);
+fn lower_in(words: &[u32], group: [u32; 3]) -> Result<HostShader, ShaderError> {
+    let n = native_in(words, group);
     let p = ir::build(&n.code, n.wave64, n.vgprs)?;
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &n.layout, n.stage, Some(&st))?;
@@ -295,16 +324,16 @@ fn point(compare: bool) -> D3D12_SAMPLER_DESC {
 }
 
 /// Runs `inst` over the lanes' addresses with `image` at heap index 0 and
-/// `out` at 2: what `out` holds afterwards.
+/// `out` at 2, in a group of shape `group`: what `out` holds afterwards.
 fn run(
     host: &Host,
-    inst: Mimg,
+    (inst, group): (Mimg, [u32; 3]),
     literals: &[(u8, u32)],
     (image, out): (View, View),
     sampler: D3D12_SAMPLER_DESC,
     addr: &[[u32; ADDR]],
 ) -> Result<Vec<u32>, String> {
-    let s = translate(inst, literals).map_err(|e| e.to_string())?;
+    let s = translate_in(inst, literals, group).map_err(|e| e.to_string())?;
     let (root, pso) = host.compute_pipeline(&s)?;
     let mut data = vec![0; s.user_data_dwords().max(1) as usize];
     for u in &s.user_data {
@@ -454,12 +483,13 @@ fn corner(l: usize) -> (f32, f32) {
 }
 
 /// One instruction over 32 lanes: its literals, then per lane the address
-/// dwords and the four result dwords expected.
+/// dwords and the four result dwords expected; the group's shape.
 struct Case {
     what: &'static str,
     inst: Mimg,
     literals: Vec<(u8, u32)>,
     lanes: Vec<(Vec<u32>, [u32; 4])>,
+    group: [u32; 3],
 }
 
 fn case(
@@ -473,6 +503,7 @@ fn case(
         inst,
         literals: literals.to_vec(),
         lanes: (0..LANES).map(lane).collect(),
+        group: ROW,
     }
 }
 
@@ -494,7 +525,8 @@ fn check(
             })
             .collect();
         let out = View::RawUav(4 * LANES as u32);
-        let got = match run(host, c.inst, &c.literals, (image(), out), sampler, &addr) {
+        let inst = (c.inst, c.group);
+        let got = match run(host, inst, &c.literals, (image(), out), sampler, &addr) {
             Ok(g) => g,
             Err(e) => {
                 failures.push(format!("{}: {e}", c.what));
@@ -982,7 +1014,7 @@ fn stores_of_some_channels_write_zero_to_the_others() {
         let dummy: &'static [[f32; 4]] = &[[0.0; 4]];
         let got = run(
             &host,
-            inst,
+            (inst, ROW),
             &[],
             (View::Texture(1, 1, dummy), View::TextureUav(8, 4)),
             point(false),
@@ -1070,6 +1102,109 @@ fn compute_samples_take_their_quads_gradients() {
         assert!(!summary.contains("sampleBias"), "{name}: {summary}");
         assert!(summary.contains("wave size any"), "{name}: {summary}");
     }
+}
+
+/// A group of 8 × 4 threads: the console's quads are still four
+/// consecutive thread ids (its lanes follow the thread order), where the
+/// host's would be 2 × 2 blocks of the thread id (SM 6.6 compute
+/// derivatives and quad reads, for a group whose X and Y are even). Each
+/// lane reads at its flat id, so a quad of 2 × 2 threads reads the
+/// coordinates of four lanes of two console quads and picks the wrong
+/// level (review of VIctory #180).
+#[test]
+fn compute_quads_of_a_2d_group_are_four_consecutive_threads() {
+    let code: Vec<u8> = [v_add_u32(0, 0, 1), S_ENDPGM]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let d = crate::gfx10::decode(&code).unwrap();
+    assert_eq!(d[0].name(), Some("v_add_nc_u32"));
+    let Some(host) = host() else { return };
+    let ow = offset_word;
+    let in_2d = |c: Case| Case {
+        group: [8, 4, 1],
+        ..c
+    };
+    let cases = [
+        in_2d(case(
+            "o",
+            mimg("image_sample_o", 0xF),
+            &[(2, ow(1, -1))],
+            |l| {
+                let ((u, v), n) = quad_lane(l);
+                ([0, f(u), f(v)].to_vec(), texel(n, (u, v), (1, -1)))
+            },
+        )),
+        in_2d(case(
+            "b_cl_o",
+            mimg("image_sample_b_cl_o", 0xF),
+            &[(2, ow(-1, 0))],
+            |l| {
+                let ((u, v), n) = quad_lane(l);
+                let bias = (l / 8 % 2) as u32;
+                let clamp = (l / 4 % 2) as u32 * 3;
+                let a = [0, f(bias as f32), f(u), f(v), f(clamp as f32)];
+                (
+                    a.to_vec(),
+                    texel((n + bias).min(3).max(clamp), (u, v), (-1, 0)),
+                )
+            },
+        )),
+    ];
+    let t = leak(level_texels());
+    check(
+        &host,
+        &cases,
+        || View::Levels(W, W, LEVELS, t),
+        point(false),
+    );
+}
+
+/// The translations behind the test above: a group of 8 × 4 threads with
+/// samples taking their quad's derivatives (gradients, or the host's own
+/// for a comparison) is declared as one row of 32, also when the thread
+/// ids follow the host lanes (`v_mbcnt` reads the lane); a group of a size
+/// that is no multiple of 4 has no such row, and its samples are refused.
+#[test]
+fn implicit_derivatives_in_compute_declare_the_group_as_one_row() {
+    let row = |name: &str, group: [u32; 3]| {
+        let lits = literals(name, false, false);
+        // A comparison returns one channel.
+        let dmask = if name.contains("_c_") { 1 } else { 0xF };
+        translate_in(mimg(name, dmask), &lits, group).map(|_| super::last_module_summary())
+    };
+    for name in ["image_sample", "image_sample_b_cl_o", "image_sample_c_o"] {
+        let summary = row(name, [8, 4, 1]).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(summary.starts_with("threads 32x1x1,"), "{name}: {summary}");
+    }
+    // Explicit levels and gradients take nothing from the quad.
+    for name in ["image_sample_l", "image_sample_d"] {
+        let summary = row(name, [8, 4, 1]).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(summary.starts_with("threads 8x4x1,"), "{name}: {summary}");
+    }
+    // Thread ids following the host lanes (console lanes).
+    let mut w = program_in(mimg("image_sample", 0xF), &[], [8, 4, 1]);
+    // v_mbcnt_lo_u32_b32 v3, -1, 0
+    w.splice(0..0, [0xD765_0003, 0x0001_00C1]);
+    let s = lower_in(&w, [8, 4, 1]).unwrap();
+    let summary = super::last_module_summary();
+    assert!(
+        summary.starts_with("threads 32x1x1, wave size 32;"),
+        "{summary}"
+    );
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut s.dxil.clone()).unwrap();
+    }
+    // Six threads: no quads the host and the console share.
+    let w = program_in(mimg("image_sample", 0xF), &[], [2, 3, 1]);
+    let e = lower_in(&w, [2, 3, 1]).err().map(|e| e.to_string());
+    assert!(
+        e.as_ref()
+            .is_some_and(|e| e.contains("a compute group of a size not a multiple of 4")),
+        "{e:?}"
+    );
 }
 
 /// A pixel program's level query (`image_get_lod`) of a 2D array: the

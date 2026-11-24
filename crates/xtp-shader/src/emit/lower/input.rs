@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use super::{Lower, Stop, Val, Why, packed_half};
+use super::{Lower, Stop, Val, Why, packed_half, packed_partners};
 use crate::emit::UserData;
 use crate::emit::bitcode::{Attr, Bin, Cast, V};
 use crate::emit::container::SigElement;
@@ -12,14 +12,13 @@ use crate::emit::shader::flags;
 use crate::gfx10::{Fields, Operand};
 use crate::io::{Barycentric, Input, Interp};
 use crate::ir::{Inst, Reg, Value};
-use crate::native::{RootType, StageIo};
+use crate::native::{PsInput, RootType, StageIo};
 use crate::resource::Site;
 
-/// Pixel inputs packing two 16-bit rows per dword whose second row the
-/// metadata leaves out (`row2` = `row`): as for outputs
-/// ([`super::export::half_outputs`]), the next 16-bit row of the signature
-/// that no input entry names, taken in row order (rows the metadata does
-/// give are taken first).
+/// The second rows of pixel inputs packing two 16-bit rows per dword, by
+/// first row: the vertex outputs' rule ([`super::export::half_outputs`]),
+/// the next 16-bit row of the signature that no input entry names, taken
+/// in row order ([`packed_partners`]).
 fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     let StageIo::Ps {
         inputs: entries, ..
@@ -27,25 +26,27 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     else {
         return HashMap::new();
     };
-    let packed = || entries.iter().filter(|i| i.fp16 && i.pack2);
-    let mut free: Vec<u8> = inputs
-        .iter()
-        .filter(|e| e.half && e.kind == 0)
-        .filter_map(|e| u8::try_from(e.row?).ok())
-        .filter(|&r| !entries.iter().any(|i| i.row == r))
-        .filter(|&r| !packed().any(|i| i.row2 != i.row && i.row2 == r))
-        .collect();
-    free.sort_unstable();
-    free.dedup();
-    let mut missing: Vec<_> = packed().filter(|i| i.row2 == i.row).collect();
-    missing.sort_by_key(|i| i.row);
-    let mut partners = HashMap::new();
-    for i in missing {
-        if let Some(k) = free.iter().position(|&r| r > i.row) {
-            partners.insert(i.row, free.remove(k));
-        }
+    packed_partners(
+        inputs,
+        |r| entries.iter().any(|i| i.row == r),
+        entries.iter().filter(|i| i.fp16 && i.pack2).map(|i| i.row),
+    )
+}
+
+/// The second row of packed pixel input `entry` ([`half_input_partners`]).
+/// The metadata names it for some inputs (`row2` ≠ `row`), never for vertex
+/// outputs, so a row it names that the rule does not give is refused: the
+/// vertex program packs another row there.
+fn half_input_partner(
+    io: &StageIo,
+    inputs: &[SigElement],
+    entry: &PsInput,
+) -> Result<Option<u8>, Why> {
+    let partner = half_input_partners(io, inputs).get(&entry.row).copied();
+    if entry.row2 != entry.row && partner != Some(entry.row2) {
+        return Err("a packed input's second row the vertex outputs' rule does not pair");
     }
-    partners
+    Ok(partner)
 }
 
 /// Where half `h` of a pixel input packing rows `a` and `b` comes from
@@ -135,6 +136,9 @@ impl<'a> Lower<'a> {
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
+            Input::ThreadIdInGroup(c) if self.flat_group.is_some() => {
+                return Val::I32(self.flat_thread_id(c));
+            }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
@@ -299,6 +303,32 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Component `c` of the console thread id in a group the host declares
+    /// as one row ([`Lower::flat_group`]): from the flat id, x fastest, as
+    /// [`Self::thread_id`] makes it with console lanes (whose flat id is
+    /// the relabelled one). The host's id in its row is the flat id.
+    fn flat_thread_id(&mut self, c: u8) -> V {
+        let [x, y, _] = self.flat_group.expect("a group declared as one row");
+        let f = if self.console_lanes {
+            self.console_flat()
+        } else {
+            match self.compute_id("threadIdInGroup.i32", 95, 0) {
+                Val::I32(f) => f,
+                _ => unreachable!(),
+            }
+        };
+        let e = self.s.entry;
+        let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
+        match c {
+            0 => self.s.m.bin(e, Bin::URem, f, xk),
+            1 => {
+                let t = self.s.m.bin(e, Bin::UDiv, f, xk);
+                self.s.m.bin(e, Bin::URem, t, yk)
+            }
+            _ => self.s.m.bin(e, Bin::UDiv, f, xy),
+        }
+    }
+
     pub(super) fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
         self.s.inputs.iter().enumerate().find_map(|(id, e)| {
             let r = e.row?;
@@ -407,14 +437,19 @@ impl<'a> Lower<'a> {
             return Err("the first half of an interpolation");
         };
         let name = inst.name();
+        let clamp = interp_clamp(inst)?;
+        if let Interp::Interpolated { first, .. } = interp {
+            // The host evaluates the pair from this second half: what a
+            // first half's modifiers would do to its partial result is lost.
+            for &(b, i) in first {
+                if interp_clamp(&self.x.p.blocks[b].insts[i])? {
+                    return Err("a clamped first half of an interpolation the host evaluates");
+                }
+            }
+        }
         let (dst, src) = match &inst.fields {
             Fields::Vintrp { dst, src, .. } => (*dst, Some(*src)),
-            Fields::Valu(v) => {
-                if v.abs != 0 || v.neg != 0 {
-                    return Err("interpolation operand modifiers");
-                }
-                (v.dst.ok_or("an interpolation")?, v.src.get(1).copied())
-            }
+            Fields::Valu(v) => (v.dst.ok_or("an interpolation")?, v.src.get(1).copied()),
             _ => unreachable!(),
         };
         let Operand::Vector { reg, .. } = dst else {
@@ -510,18 +545,15 @@ impl<'a> Lower<'a> {
             StageIo::Ps { inputs, .. } => inputs
                 .iter()
                 .find(|i| i.row == attribute.row && i.fp16)
-                .map(|i| {
-                    let b = if i.row2 != i.row {
-                        Some(i.row2)
-                    } else if i.pack2 {
-                        half_input_partners(&self.x.native.io, &self.s.inputs)
-                            .get(&i.row)
-                            .copied()
+                .map(|i| -> Result<_, Why> {
+                    let b = if i.pack2 {
+                        half_input_partner(&self.x.native.io, &self.s.inputs, i)?
                     } else {
                         None
                     };
-                    (i.pack2, b, i.pack2 && i.row2 != i.row)
-                }),
+                    Ok((i.pack2, b, i.pack2 && i.row2 != i.row))
+                })
+                .transpose()?,
             _ => None,
         };
         let f16 = name.ends_with("_f16");
@@ -572,13 +604,18 @@ impl<'a> Lower<'a> {
                 };
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
+                // The clamp of a VOP3 form, to [0, 1] in the result's format:
+                // saturating the f32 first is the same for an f16 result.
+                let clamped = |l: &mut Self, f: V| if clamp { l.unary(7, f) } else { f };
                 if name == "v_interp_p1ll_f16" {
                     // An f32 result from 16-bit vertex values (a first half
                     // evaluated on its own).
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let f = clamped(self, f);
                     self.as_int(f)
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let f = clamped(self, f);
                     let lo = to_f16(self, f);
                     self.low_half(inst, reg, lo)
                 } else if matches!(eval, Eval::Mode(1)) {
@@ -715,6 +752,27 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Whether an interpolation clamps its result: the one modifier of the
+/// VOP3 forms (`v_interp_p1ll_f16`, `v_interp_p2_f16`) the lowering
+/// applies. Operand modifiers, an output modifier and op_sel (which
+/// selects the destination's high half among others) are refused; the
+/// VINTRP forms have none.
+fn interp_clamp(inst: &Inst) -> Result<bool, Why> {
+    let Fields::Valu(v) = &inst.fields else {
+        return Ok(false);
+    };
+    if v.abs != 0 || v.neg != 0 {
+        return Err("interpolation operand modifiers");
+    }
+    if v.omod != 0 {
+        return Err("an interpolation with an output modifier");
+    }
+    if v.opsel != 0 {
+        return Err("an interpolation with op_sel");
+    }
+    Ok(v.clamp)
+}
+
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
 fn interp_mode(kind: Barycentric) -> Option<u8> {
@@ -780,7 +838,69 @@ mod tests {
         let p = half_input_partners(&io, &sig);
         assert_eq!(p.get(&0), Some(&1));
         assert_eq!(p.get(&3), Some(&4));
-        assert_eq!(p.get(&5), None);
+        // The row 5 names is the one the rule gives.
+        assert_eq!(p.get(&5), Some(&6));
+    }
+
+    /// Pixel inputs pair their packed rows by the vertex outputs' rule
+    /// (`half_outputs`), whose metadata names no second row: where the
+    /// pixel metadata names one the rule does not give, the input is
+    /// refused rather than read from a row the vertex program did not
+    /// pack there (review of VIctory #592).
+    #[test]
+    fn packed_rows_pair_alike_in_vertex_outputs_and_pixel_inputs() {
+        use super::half_input_partner;
+        use crate::emit::lower::export::half_outputs;
+        use crate::native::VsOutput;
+        // 16-bit rows 0-4; rows 0 and 2 pack.
+        let sig: Vec<_> = (0..5).map(|r| element(r, 4)).collect();
+        let output = |row| VsOutput {
+            usage: Usage::Generic,
+            row,
+            param: row,
+            fp16: true,
+            pack2: true,
+        };
+        let vs = StageIo::Vs {
+            inputs: vec![],
+            outputs: vec![output(0), output(2)],
+        };
+        let out = half_outputs(&vs, &sig);
+        assert_eq!(out.get(&0), Some(&(true, Some(1))));
+        assert_eq!(out.get(&2), Some(&(true, Some(3))));
+        let input = |row, row2| PsInput {
+            usage: Usage::Generic,
+            row,
+            mask: 0xF,
+            attr: row,
+            flat: false,
+            fp16: true,
+            pack2: true,
+            row2,
+        };
+        let ps = |inputs| StageIo::Ps {
+            inputs,
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        };
+        // Second rows left out, or named as the rule pairs them: the
+        // outputs' pairs.
+        for row2 in [[0, 2], [1, 2], [0, 3], [1, 3]] {
+            let entries = vec![input(0, row2[0]), input(2, row2[1])];
+            let io = ps(entries.clone());
+            for (e, want) in entries.iter().zip([1, 3]) {
+                assert_eq!(half_input_partner(&io, &sig, e), Ok(Some(want)));
+            }
+        }
+        // Row 2 naming row 1, which the vertex program packs with row 0:
+        // refused. Row 0 still pairs with row 1, as the outputs do (the
+        // rule that left the named rows out paired it with row 3).
+        let entries = vec![input(0, 0), input(2, 1)];
+        let io = ps(entries.clone());
+        assert_eq!(half_input_partner(&io, &sig, &entries[0]), Ok(Some(1)));
+        let e = half_input_partner(&io, &sig, &entries[1]).unwrap_err();
+        assert!(e.contains("second row"), "{e}");
     }
 
     #[test]
@@ -804,21 +924,40 @@ mod tests {
     /// metadata names the second row (`row2`) or leaves it out: the
     /// translation, validated where `dxil.dll` is found, or the error.
     fn packed_read(high_channel: u8, row2: u8) -> Result<(), String> {
+        interp16(high_channel, row2, 0, [0, 0], false).map(|_| ())
+    }
+
+    /// [`packed_read`]'s program with `p1` OR-ed into the first half's
+    /// first word and `p2` into the second half's words, and j computed
+    /// (`v_mul_f32 v3, 0.5, v1`) when `computed`: the translation's module
+    /// summary, or the error.
+    fn interp16(
+        high_channel: u8,
+        row2: u8,
+        p1: u32,
+        p2: [u32; 2],
+        computed: bool,
+    ) -> Result<String, String> {
         use crate::dxbc::{self, Container, FourCC};
         use crate::emit::{container, emit, validator::Validator};
         use crate::native::{HwStage, NativeProgram};
         use crate::{io, ir, resource, structure};
         // src0 of the VOP3 interpolations: attr0, the channel, high half.
         let attr = u32::from(high_channel) << 6 | 1 << 8;
-        let words = [
-            0xD742_0002u32, // v_interp_p1ll_f16 v2, v0, attr0.<c>.high
+        let j = if computed { 259 } else { 257 };
+        let mut words = Vec::new();
+        if computed {
+            words.push(0x1006_02F0); // v_mul_f32 v3, 0.5, v1
+        }
+        words.extend([
+            0xD742_0002 | p1, // v_interp_p1ll_f16 v2, v0, attr0.<c>.high
             attr | 256 << 9,
-            0xD75A_0002, // v_interp_p2_f16 v2, attr0.<c>.high, v1, v2
-            attr | 257 << 9 | 258 << 18,
+            0xD75A_0002 | p2[0], // v_interp_p2_f16 v2, attr0.<c>.high, v<j>, v2
+            attr | j << 9 | 258 << 18 | p2[1],
             0xF800_180F,
             0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
             0xBF81_0000,
-        ];
+        ]);
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -864,10 +1003,44 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res).map_err(|e| e.to_string())?;
+        let summary = crate::emit::last_module_summary();
         if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
-        Ok(())
+        Ok(summary)
+    }
+
+    /// VOP3 interpolations: a clamp on the second half saturates the result,
+    /// interpolated by the host or from computed barycentrics; one on a
+    /// first half the host's interpolation replaces is refused, as are an
+    /// output modifier and op_sel (the destination's high half), which the
+    /// lowering does not apply (review of VIctory #453).
+    #[test]
+    fn vop3_interpolation_modifiers_are_applied_or_refused() {
+        const CLAMP: u32 = 1 << 15;
+        const OMOD_MUL2: u32 = 1 << 27;
+        const DST_HIGH: u32 = 8 << 11;
+        for computed in [false, true] {
+            let plain = interp16(2, 0, 0, [0, 0], computed).unwrap();
+            assert!(!plain.contains("unary"), "{plain}");
+            let clamped = interp16(2, 0, 0, [CLAMP, 0], computed).unwrap();
+            assert!(clamped.contains("unary"), "{clamped}");
+            // A first half evaluated on its own clamps its own result.
+            let first = interp16(2, 0, CLAMP, [0, 0], computed);
+            if computed {
+                assert!(first.unwrap().contains("unary"));
+            } else {
+                let e = first.unwrap_err();
+                assert!(e.contains("a clamped first half"), "{e}");
+            }
+            for (p2, why) in [
+                ([0, OMOD_MUL2], "an output modifier"),
+                ([DST_HIGH, 0], "op_sel"),
+            ] {
+                let e = interp16(2, 0, 0, p2, computed).unwrap_err();
+                assert!(e.contains(why), "{e}");
+            }
+        }
     }
 
     #[test]
@@ -989,27 +1162,39 @@ mod tests {
             psv[at + 5]
         }
 
+        /// `v_mov_b32 v<dst>, v<src>`.
+        fn v_mov_b32(dst: u32, src: u32) -> u32 {
+            0x7E00_0200 | dst << 17 | (256 + src)
+        }
+
         /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
         /// plain floats: they are channels y and z of `SV_Barycentrics`, the
-        /// weights of vertices 1 and 2.
+        /// weights of vertices 1 and 2. I alone reads y, J alone z (the sum
+        /// of both would read the same with the two swapped).
         #[test]
         fn barycentrics_read_as_values_are_sv_barycentrics() {
             let [e0, e1] = exp_mrt0(2);
-            let words = [v_add_f32(2, 0, 1), e0, e1, S_ENDPGM];
-            let shader = pixel(&words, PERSP_CENTER).unwrap();
-            let (features, inputs) = parts(&shader);
-            assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
-            let bary: Vec<_> = inputs.iter().filter(|e| e.kind == 28).collect();
-            assert_eq!(bary.len(), 1, "{inputs:?}");
-            assert_eq!((bary[0].index, bary[0].col, bary[0].cols), (0, 0, 3));
-            // Not packed: the validator wants packing location -1.
-            assert_eq!(bary[0].row, None);
-            // Only y and z (I and J) are read.
-            let isg1 = Container::parse(&shader.dxil).unwrap();
-            let isg1 = isg1.part(FourCC::ISG1).unwrap().data;
-            let rw: Vec<u8> = (0..2).map(|k| isg1[8 + 32 * k + 25]).collect();
-            assert!(rw.contains(&0b110), "{rw:?}");
-            validate(&shader);
+            for (value, read) in [
+                (v_mov_b32(2, 0), 0b010),
+                (v_mov_b32(2, 1), 0b100),
+                (v_add_f32(2, 0, 1), 0b110),
+            ] {
+                let words = [value, e0, e1, S_ENDPGM];
+                let shader = pixel(&words, PERSP_CENTER).unwrap();
+                let (features, inputs) = parts(&shader);
+                assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
+                let bary: Vec<_> = inputs.iter().filter(|e| e.kind == 28).collect();
+                assert_eq!(bary.len(), 1, "{inputs:?}");
+                assert_eq!((bary[0].index, bary[0].col, bary[0].cols), (0, 0, 3));
+                // Not packed: the validator wants packing location -1.
+                assert_eq!(bary[0].row, None);
+                // The channels read: the element's read mask.
+                let k = inputs.iter().position(|e| e.kind == 28).unwrap();
+                let isg1 = Container::parse(&shader.dxil).unwrap();
+                let isg1 = isg1.part(FourCC::ISG1).unwrap().data;
+                assert_eq!(isg1[8 + 32 * k + 25], read, "{inputs:?}");
+                validate(&shader);
+            }
         }
 
         /// Two kinds of barycentrics read directly: one element per mode.
