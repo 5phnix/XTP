@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy to %LOCALAPPDATA%\\xtp\\cloud.json (or set XTP_CLOUD_CONFIG), outside the repository, and fill in the <...> values. See docs/dev/cloud-setup.md. Keys starting with _ are ignored.",
+  "project": "<your-project-id>",
+  "region": "<region, e.g. europe-west4>",
+  "_zones": "Zones tried in order when the VM is created; the first with capacity wins. A zone of another region works, but then the VM reads the bucket across regions.",
+  "zones": ["<region>-a", "<region>-b", "<region>-c"],
+  "bucket": "<globally-unique-bucket-name>",
+  "gameDir": "<path to your own dump of the title, e.g. D:\\xtp-data\\game>",
+  "titleExe": "<the title's executable, relative to gameDir>",
+  "_goldenDir": "Optional: an XTP data folder (saves, settings) that game runs start from; copied for each run, never written. Leave empty for none.",
+  "goldenDir": "",
+  "vm": "xtp-l4",
+  "machineType": "g2-standard-16",
+  "accelerator": "nvidia-l4-vws",
+  "bootDiskGb": 100,
+  "dataDiskGb": 300,
+  "diskType": "pd-balanced",
+  "idleMinutes": 30,
+  "stopSchedule": "0 3 * * *",
+  "timeZone": "Europe/Paris"
+}
