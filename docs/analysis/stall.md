@@ -94,6 +94,7 @@ creates committed DEFAULT resources one after the other and times each call
 | 15:15 | 256 MB buffers | 8.5 GB | 0.6–2.1 s each, admitted up to 10.5 GB |
 | 15:20 | A holds 6.0 GB, B allocates 64 MB buffers | B: 2.44 GB | 717–739 ms |
 | 15:22 | BC7 1.4 MB, `CREATE_NOT_ZEROED` | 8.28 GB | 308–1 395 ms |
+| 15:27 | BC7 1.4 MB, right after Windows Memory Cleaner emptied the RAM lists (free/zero pages 0.37 → 40.3 GB, standby 41 → 2.7 GB, modified 4.9 → 0.02 GB) | 8.13 GB | 325–577 ms; VidMm plateau 9.64 GB resident, 6.03 GB of free VRAM pages |
 
 Below the threshold a call takes 0.3 ms (texture) to 2–7 ms (buffer).
 
@@ -113,8 +114,9 @@ VidMm's own counters (`D3DKMTQueryStatistics`, no admin rights;
 So it is not memory exhaustion (6 GB free per VidMm, 6 GB free per
 nvidia-smi), not the budget (14.92 GB, usage 8.2–8.5), not the number of
 allocations (64 MB and 256 MB buffers hit it too), not zeroing
-(`CREATE_NOT_ZEROED` changes nothing), and not per process (two processes
-share it). It is an admission rate VidMm (or the driver) applies once its
+(`CREATE_NOT_ZEROED` changes nothing), not per process (two processes
+share it), and not system RAM (emptying the standby and modified lists
+leaves it where it was). It is an admission rate VidMm (or the driver) applies once its
 free local pages fall under ≈ 5.9 GB. The kernel side of that decision was
 not seen: it needs an elevated ETW trace (§6.1).
 
