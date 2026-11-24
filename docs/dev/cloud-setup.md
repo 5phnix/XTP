@@ -205,6 +205,20 @@ a [reservation](https://cloud.google.com/compute/docs/instances/reservations-ove
 of a g2-standard-16 with an L4 in its zone, billed like a running VM
 whether you use it or not.
 
+When the zone stays full, move the VM: `move-vm.ps1 -Zones <zone>,<zone>,...`
+stops it, snapshots both disks (Windows, tools and game files as they are),
+renames it `<vm>-old`, and recreates it in the first listed zone with a GPU
+free (the boot disk first, which holds the zone; then the data disk). It
+needs no quota request: the GPU and CPU quotas are the same in every region,
+and the stopped old VM uses none. Where the region's `SSD_TOTAL_GB` (often
+250 GB) cannot hold both disks, the data disk becomes **Hyperdisk ML**,
+which has its own quota (`HDML_TOTAL_GB`, 500 GB by default) and bills its
+throughput (`dataDiskThroughput`, 400 MiB/s by default; see
+[Costs](#7-costs-and-keeping-them-down)). Restoring a snapshot in another
+region than where it is stored is billed as network transfer. Check the new
+VM (`run-remote.ps1 -DeviceCheck`, a game run), then `move-vm.ps1
+-DeleteOld` removes the old one and the snapshots.
+
 ## 3. Configuration file
 
 Copy [`tools/cloud/cloud.example.json`](../../tools/cloud/cloud.example.json) to
@@ -367,14 +381,16 @@ needed for scripted keys and frame capture), then `vm\run-game.ps1`:
   end runs slower than on a desktop PC, and in our first run the presses
   never took the title past it;
 - sets `XTP_CAPTURE` (presented frames as PNG) and samples the GPU's memory
-  and use every 2 s (`gpu.csv`, from `nvidia-smi`);
+  and use every 2 s: `gpu.csv` (`nvidia-smi`: memory used, GPU use) and
+  `vidmm.csv` (Windows' `GPU Adapter Memory` counters: dedicated and shared
+  usage per adapter);
 - starts the title in the desktop session, stops it after `-Seconds`, and
   prints a summary: exit code, the device line, the last frame-rate lines,
   the autopilot's lines, errors, the peak GPU memory, the end of
   `crashes.log`.
 
 Back on your PC you get `run.log`, `env.txt`, `result.json`, `xtp.toml`,
-`gpu.csv`, `crashes.log` (if any) and `capture\frame-<n>.png`. The data copy
+`gpu.csv`, `vidmm.csv`, `crashes.log` (if any) and `capture\frame-<n>.png`. The data copy
 (saves) stays on the VM.
 
 **Watching a run.** `tools\cloud\rdp-vm.ps1 -NewPassword` prints a new
@@ -467,7 +483,7 @@ no GitHub credentials and should not get any.
 
 A Hangar worker is a Claude Code session in a worktree of its own on your PC.
 To keep your PC free for game sessions, workers build and test elsewhere:
-everyday `cargo` and the delivery check on the [build farm](build-farm.md),
+everyday `cargo` and the delivery check on the build farm (`tools/buildfarm/`, `docs/dev/build-farm.md`),
 and on this VM what needs the L4 or the game:
 
 - each worker runs `tools\cloud\run-remote.ps1 -Game -Local` (or `-Check`,
@@ -478,13 +494,16 @@ and on this VM what needs the L4 or the game:
 - workers do not stop the VM (another may be using it): it stops itself after
   `idleMinutes` without activity, and the orchestrator or you can run
   `stop-vm.ps1`;
-- one game run at a time: a second worker's run waits, or fails if the first
-  one hangs (`run.lock` names the holder);
+- **one session at a time**: a build, test or game run holds the VM's
+  clone from the build to the end of the run, and its desktop session runs
+  one job. A second worker waits and is told who holds the VM (its Hangar
+  pane, worktree and PC, and since when); with `-NoWait` it fails at once
+  instead. `stop-vm.ps1 -Status` shows the holder and what runs;
 - the same rules as below apply: workers run their own branches, never a
   stranger's pull request.
 
 **Builds and tests without game files** belong on the
-[build farm](build-farm.md): Spot VMs without a GPU that run every worker's
+build farm (`tools/buildfarm/`, `docs/dev/build-farm.md`): Spot VMs without a GPU that run every worker's
 `cargo` and the delivery check, and never receive game files. The L4 VM is
 for what needs the real GPU or the game: GPU tests on hardware, game runs,
 measurements. A single build machine of your own can also come from these
@@ -510,6 +529,7 @@ Prices from Google's catalogue (on-demand, USD, November 2026; check
 | External IPv4 address while running | 0.005 /h | 0.005 /h |
 | **Running, compute total** | **≈ 2.09 /h** | **≈ 2.15 /h** |
 | Disks, 100 + 300 GB pd-balanced (running or stopped) | 0.10 /GB-month = 40 /month | 0.11 /GB-month = 44 /month |
+| Or a Hyperdisk ML data disk (after `move-vm.ps1`, 300 GB, 400 MiB/s) | – | 300 × 0.084 + 400 × 0.126 ≈ 76 /month, instead of 33 |
 | Bucket, ≈ 210 GB Standard | 0.020 /GB-month ≈ 4.2 /month | ≈ 4.2 /month |
 | **Stopped, total** | **≈ 44 /month** | **≈ 48 /month** |
 
@@ -573,7 +593,7 @@ Keeping them down:
 | Symptom | Cause and fix |
 |---------|---------------|
 | `ZONE_RESOURCE_POOL_EXHAUSTED` when creating | No GPU free in that zone right now. `new-vm.ps1 -RetryMinutes 120`, more zones in `zones`, or try again later. |
-| `ZONE_RESOURCE_POOL_EXHAUSTED` when starting | The VM's zone has no GPU free right now; its zone cannot change. `start-vm.ps1 -RetryMinutes 120`, or later. See [Capacity](#capacity-when-no-zone-has-a-gpu-free). |
+| `ZONE_RESOURCE_POOL_EXHAUSTED` when starting | The VM's zone has no GPU free right now. `start-vm.ps1 -RetryMinutes 120`, or move the VM (`move-vm.ps1 -Zones ...`). See [Capacity](#capacity-when-no-zone-has-a-gpu-free). |
 | `Quota ... exceeded` | See [Quotas](#2-quotas); the message names the metric. |
 | SSH: `Server refused our key` | Right after creation the guest agent may not have created your account yet: wait a minute. Otherwise the user name has capitals: Windows' sshd only matches the lowercase name, and the scripts use `sshUser` (lowercase) for that reason. With gcloud by hand: `gcloud compute ssh <lowercase-user>@<vm> --tunnel-through-iap`. |
 | `unrecognized arguments` from gcloud in your own PowerShell | PowerShell splits unquoted `a,b` into two arguments and eats a bare `--`: quote such arguments (`"--accelerator=type=nvidia-l4-vws,count=1"`). |

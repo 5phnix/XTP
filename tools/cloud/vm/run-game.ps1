@@ -101,10 +101,14 @@ try {
         $sampler = Start-Process -FilePath $smi -PassThru -WindowStyle Hidden -ArgumentList @(
             '--query-gpu=timestamp,memory.used,memory.total,utilization.gpu', '--format=csv', '-lms', '2000', '-f', $gpuCsv)
     }
+    # Windows' own view of the adapters' memory (dxgkrnl's counters, every 2 s).
+    $vidmmCsv = Join-Path $run 'vidmm.csv'
+    $typeperf = Start-Process -FilePath "$env:SystemRoot\System32\typeperf.exe" -PassThru -WindowStyle Hidden -ArgumentList @(
+        '"\GPU Adapter Memory(*)\Dedicated Usage"', '"\GPU Adapter Memory(*)\Shared Usage"', '-si', '2', '-f', 'CSV', '-o', "`"$vidmmCsv`"", '-y')
     try {
         $code = Invoke-XtpSessionJob -Exe $Exe -Arguments "run `"$title`" --execute $XtpArgs" -Log $raw -Seconds $Seconds -Environment $envs -User $SessionUser -Quiet
     } finally {
-        if ($sampler -and -not $sampler.HasExited) { Stop-Process -Id $sampler.Id -Force -ErrorAction SilentlyContinue }
+        foreach ($p in $sampler, $typeperf) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
     }
     $result = $script:XtpLastJob
     $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding ASCII

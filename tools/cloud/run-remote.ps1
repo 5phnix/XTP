@@ -23,7 +23,8 @@
   -Game options: -Seconds, -Autopilot <script in the repository> (instead of
   the scripted Enter presses), -Keys, -Env @{...}, -XtpArgs, -Name,
   -NoBuild, -NoGolden, -NoCapture. The VM's GPU memory and use are sampled
-  every 2 s during the run (gpu.csv).
+  every 2 s during the run (gpu.csv from nvidia-smi, vidmm.csv from
+  Windows' GPU Adapter Memory counters).
 
   The VM is started if needed and stops by itself once idle. One build and
   one game run at a time: a second caller waits. Logs go to
@@ -144,7 +145,7 @@ switch ($what) {
         if ($run) {
             # The log, the frames and the crash log; not the data folder (saves).
             $zip = "C:\xtp\jobs\$(Split-Path -Leaf $run).zip"
-            $pack = "`$r = '$run'; `$items = @('run.log', 'env.txt', 'result.json', 'xtp.toml', 'gpu.csv', 'capture') | ForEach-Object { Join-Path `$r `$_ } | Where-Object { Test-Path `$_ }; " +
+            $pack = "`$r = '$run'; `$items = @('run.log', 'env.txt', 'result.json', 'xtp.toml', 'gpu.csv', 'vidmm.csv', 'capture') | ForEach-Object { Join-Path `$r `$_ } | Where-Object { Test-Path `$_ }; " +
                 "`$crash = Get-ChildItem -LiteralPath (Join-Path `$r 'data') -Recurse -Filter 'crashes.log' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; " +
                 "if (`$crash) { Copy-Item -LiteralPath `$crash -Destination (Join-Path `$r 'crashes.log'); `$items += (Join-Path `$r 'crashes.log') }; " +
                 "Compress-Archive -Path `$items -DestinationPath '$zip' -Force"
