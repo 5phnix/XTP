@@ -23,7 +23,7 @@ reason (today they are `VICTORY_*`).
 | CI | `.github/workflows/ci.yml`: `windows-latest`, clippy without and with `--all-features`, `cargo test --workspace --locked` |
 | Runtime tooling | `crates/xtp-core/src/{config.rs,logging.rs,policy.rs}`, `crates/xtp-loader/src/{crash.rs,stacks.rs,thunks.rs}`, the diagnostics switches listed in `README.md` ("Debugging") |
 | CLI | `apps/xtp/src/{main.rs,inspect.rs,census.rs,shader.rs,translate.rs,run.rs}` |
-| Game-specific layer | `crates/xtp-game/src/lib.rs` (`KnownBuild`, `KNOWN_BUILDS` (empty), `identify`), `crates/xtp-game/src/sgd5.rs` (the engine's shader file) |
+| Game-specific layer | `crates/xtp-game/src/lib.rs` (`KnownBuild`, `KNOWN_BUILDS` (1.0.2.1), `identify`), `crates/xtp-game/src/sgd5.rs` (the engine's shader file), `crates/xtp-game/src/watchdog.rs` (the opt-in watchdog hook) |
 | Policy | `docs/asset-policy.md`, `xtp.example.toml` |
 
 ### xcl (E:/xtp-refs/xcl, read only)
