@@ -32,6 +32,20 @@
 //! the GPU at their place in the list ([`copy`], [`write`]), so they see
 //! what shaders before them wrote and later commands see their result.
 //!
+//! Big title buffers have their copy in the card's own memory ([`cards`];
+//! the idea comes from fxceless's VIctory fork, commit 578d459, its
+//! `cards`; reimplemented, none of its code is taken): shaders use it there
+//! without going through PCIe, and what they wrote is found on the card.
+//! The CPU's side, which refreshes fill and the three-way merge takes as
+//! its "before", stays in system memory. Around each submission's lists,
+//! in its own `ExecuteCommandLists` ([`cards_around`]): before them, what
+//! the CPU side took goes up and each piece of the ranges its shaders may
+//! write is hashed on the card; after them, each is hashed again, and the
+//! pieces whose hash changed are copied into system memory. Its copy-back
+//! merges only those ([`Shadow::card_back`]): no snapshot and no compare on
+//! the CPU, which cost about 42 and 80 ms a Series S world frame
+//! (docs/analysis/lazy-copyback.md).
+//!
 //! shortcut: only the ranges draws are known to read are brought up to
 //! date (vertex and index buffer views, constant buffers in tables, root
 //! descriptors, buffer views in tables); buffers read through directly
@@ -54,7 +68,10 @@ use crate::watch::PAGE;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    /// What shaders use: system memory, or the card's ([`Card`]).
     pub(crate) buffer: ID3D12Resource,
+    /// The copy's bytes as the CPU sees them: `buffer`'s, or with a
+    /// [`Card`] its CPU side's.
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -78,6 +95,58 @@ pub(crate) struct Shadow {
     /// view, other memory.
     #[cfg(any(test, feature = "diagnostics"))]
     kind: AtomicU8,
+    /// For a copy in the card's memory ([`cards`]): its CPU side and what
+    /// goes between the two.
+    card: Option<Card>,
+}
+
+/// What a copy in the card's memory ([`cards`]) has beside
+/// `Shadow::buffer`, which is in the card's memory then.
+///
+/// Its CPU side (`staging`, which `Shadow::data` maps) holds title memory
+/// as refreshes took it and copy-backs merged it. The card side equals it
+/// but where shaders of a submission not copied back yet wrote, once
+/// `dirty` has gone up: a refresh leaves those ranges alone (as it leaves
+/// a system memory copy's), and so does every other write into the CPU
+/// side. So the CPU side over a range a submission declares is the card
+/// side's bytes from before its shaders ran, the "before" of the three-way
+/// merge, without a snapshot.
+struct Card {
+    /// The CPU's side, in system memory.
+    staging: ID3D12Resource,
+    /// System memory, mapped at `after_data`, where the card copies what a
+    /// submission's GPU work wrote, at its offsets in the copy: the pieces
+    /// whose hash changed, and the destinations of its GPU copies.
+    after: ID3D12Resource,
+    after_data: *mut u8,
+    /// What the card side lacks of the CPU side, as offsets `[from, to)`:
+    /// it goes up before the next submission's lists. Ranges refreshes
+    /// copied, and the title's bytes a copy-back's merge kept.
+    dirty: Mutex<Vec<(usize, usize)>>,
+    /// The work of submissions not copied back yet on this copy.
+    parts: Mutex<Vec<Part>>,
+    /// The card side's bytes, held against [`card_limits`]' budget.
+    bytes: u64,
+}
+
+impl Drop for Card {
+    fn drop(&mut self) {
+        CARD_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// A submission's work on one copy in the card's memory ([`cards_around`]).
+struct Part {
+    submission: u64,
+    /// The slot of its plan ([`CardWork`]).
+    slot: usize,
+    /// Where the card wrote its pieces' records: the slot's memory, which
+    /// stays until the part is done with.
+    records: *const u8,
+    /// The pieces of the ranges its shaders may write, as offsets `[from,
+    /// to)` in the copy (each in one page of title memory), with their
+    /// record's index.
+    spans: Vec<(usize, usize, u32)>,
 }
 
 /// What a copy holds of a page of title memory as the title wrote it.
@@ -330,7 +399,14 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+    fn new(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        card: Option<Card>,
+    ) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
             buffer,
@@ -344,7 +420,13 @@ impl Shadow {
             before: Mutex::default(),
             #[cfg(any(test, feature = "diagnostics"))]
             kind: AtomicU8::new(0),
+            card,
         }
+    }
+
+    /// Whether the copy is in the card's memory ([`cards`]).
+    pub(crate) fn carded(&self) -> bool {
+        self.card.is_some()
     }
 
     /// Whether the title memory at `at` (in the buffer) is a view of
@@ -392,9 +474,11 @@ impl Shadow {
     /// then no refresh copies title memory over it. Call after the
     /// [`Shadow::refresh`] that gives the shaders the title's data.
     ///
-    /// shortcut: what shaders wrote is found by keeping the range's bytes
-    /// before the submission (a copy per declared range and submission);
-    /// a GPU-side dirty mask would save that if big ranges make it slow.
+    /// shortcut: in a copy in system memory, what shaders wrote is found by
+    /// keeping the range's bytes before the submission (a copy per declared
+    /// range and submission); a copy in the card's memory finds it on the
+    /// card ([`cards_around`]), with no copy. Big buffers only
+    /// ([`card_limits`]): smaller ones and loose memory keep the snapshot.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
@@ -417,6 +501,13 @@ impl Shadow {
             to: address + len,
             shaders: true,
         });
+        if self.card.is_some() {
+            // The card tells what its shaders wrote ([`cards_around`]),
+            // from its CPU side, which nothing changes there meanwhile.
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::CardDeclared, 1);
+            return;
+        }
         let (from, to) = self.inside(address, len);
         if from >= to {
             return;
@@ -487,6 +578,9 @@ impl Shadow {
     /// declared: they are done with once it is back. Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, submission: u64, address: usize, len: usize) -> usize {
+        if let Some(card) = &self.card {
+            return self.card_back(card, submission, address, len);
+        }
         let mut snapshots = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -526,7 +620,12 @@ impl Shadow {
                         end = end_of(end);
                     }
                     let old = &mut before[at - from..end - from];
-                    written += self.put_back(at, end, old, &mut synced);
+                    // SAFETY: inside the mapping; the submitting thread
+                    // leaves the range alone until this submission has
+                    // finished.
+                    let host =
+                        unsafe { std::slice::from_raw_parts_mut(self.data.add(at), end - at) };
+                    written += self.put_back(at, end, host, old, &mut synced).0;
                 }
                 at = end;
             }
@@ -601,6 +700,9 @@ impl Shadow {
         let end = address + len;
         self.busy()
             .retain(|b| b.shaders || b.submission != submission || b.from < address || b.to > end);
+        if let Some(card) = &self.card {
+            self.card_settled(card, submission);
+        }
         written
     }
 
@@ -610,6 +712,21 @@ impl Shadow {
             return 0;
         }
         let start = self.start as usize;
+        if let Some(card) = &self.card {
+            // What the GPU copies wrote is on the card, which copied it
+            // into `after` once the submission's lists had run
+            // ([`cards_around`]): the CPU side takes it, the card side
+            // holds it already.
+            // SAFETY: inside both mappings; the submission has run, and no
+            // later GPU work writes this range before it is written back.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    card.after_data.add(from),
+                    self.data.add(from),
+                    to - from,
+                );
+            }
+        }
         // The submission, for the census only.
         #[cfg(not(any(test, feature = "diagnostics")))]
         let _ = submission;
@@ -635,15 +752,16 @@ impl Shadow {
     }
 
     /// [`Shadow::copy_back`] of `[from, to)` (offsets in the copy), a run of
-    /// pieces the GPU changed (`old`: their bytes before the submission):
-    /// title memory read with one copy, where it can all be read (else the
-    /// pieces that can: [`read_pieces`]), then piece by piece the GPU's
-    /// bytes written into title memory where it lacks them, the title's
-    /// taken into the copy elsewhere. Pieces that cannot be read are left
-    /// alone; those read go into `synced` (page numbers), and `old` takes
-    /// what the copy holds of them then: another range of the submission
-    /// over them compares with that, and puts back only what this left.
-    /// Returns the bytes written.
+    /// pieces the GPU changed (`host`: the copy's bytes of them after the
+    /// submission; `old`: before it): title memory read with one copy, where
+    /// it can all be read (else the pieces that can: [`read_pieces`]), then
+    /// piece by piece the GPU's bytes written into title memory where it
+    /// lacks them, the title's taken into `host` elsewhere. Pieces that
+    /// cannot be read are left alone; those read go into `synced` (page
+    /// numbers), and `old` takes what `host` holds of them then: another
+    /// range of the submission over them compares with that, and puts back
+    /// only what this left. Returns the bytes written, and the parts read
+    /// (offsets in the run).
     ///
     /// Unlike Marvisak/VIctory#1124, which writes back whole runs of pieces
     /// with one kernel call, only the bytes the GPU changed are written
@@ -661,7 +779,14 @@ impl Shadow {
     /// untouched. A title write into bytes the GPU left alone stays; the
     /// copy then holds the title's bytes as read, and the page is not
     /// current ([`Shadow::mark_current`] compares).
-    fn put_back(&self, from: usize, to: usize, old: &mut [u8], synced: &mut Vec<usize>) -> usize {
+    fn put_back(
+        &self,
+        from: usize,
+        to: usize,
+        host: &mut [u8],
+        old: &mut [u8],
+        synced: &mut Vec<usize>,
+    ) -> (usize, Vec<(usize, usize)>) {
         thread_local! {
             /// Title memory of a run, kept (already touched) for the next.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -670,19 +795,18 @@ impl Shadow {
         TITLE.with_borrow_mut(|title| {
             title.resize(to - from, 0);
             let mut written = 0;
-            for (a, b) in read_pieces(at, title) {
+            let parts = read_pieces(at, title);
+            for &(a, b) in &parts {
                 let mut piece = a;
                 while piece < b {
                     let end = (piece + PIECE - (at + piece) % PIECE).min(b);
                     #[cfg(test)]
                     tests::after_reading(at + piece);
-                    // SAFETY: inside the mapping; the submitting thread
-                    // leaves the range alone until this submission has
-                    // finished.
-                    let host = unsafe {
-                        std::slice::from_raw_parts_mut(self.data.add(from + piece), end - piece)
-                    };
-                    let (old, title) = (&mut old[piece..end], &title[piece..end]);
+                    let (host, old, title) = (
+                        &mut host[piece..end],
+                        &mut old[piece..end],
+                        &title[piece..end],
+                    );
                     written += self.write_gpu_runs(at + piece, host, old, title);
                     // Put back: the copy's bytes are the snapshot's now.
                     old.copy_from_slice(host);
@@ -690,7 +814,7 @@ impl Shadow {
                     piece = end;
                 }
             }
-            written
+            (written, parts)
         })
     }
 
@@ -992,6 +1116,10 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         if from >= to {
             return 0;
+        }
+        if let Some(card) = &self.card {
+            // Up to the card side before the next submission's lists.
+            lock(&card.dirty).push((from - start, to - start));
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let host = unsafe { self.data.add(from - start) };
@@ -2124,6 +2252,1046 @@ pub(crate) mod census {
     }
 }
 
+/// `mutex`'s guard, poisoned or not.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the copies of big title buffers are in the card's own memory
+/// (see the module): unless `XTP_CARD_BUFFERS=0`, which keeps every copy in
+/// system memory as before. There shaders read and write it through PCIe,
+/// and finding what they wrote takes a snapshot of each declared range
+/// before the submission and a compare after it, on the CPU: 41.9 and about
+/// 80 ms of a Series S world frame, for about 620 MB a frame
+/// (docs/analysis/lazy-copyback.md, session lazyback-mirrors-ab).
+pub(crate) fn cards() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XTP_CARD_BUFFERS")
+            .ok()
+            .is_none_or(|v| v.trim() != "0");
+        if !on {
+            tracing::info!(
+                "copies of big title buffers stay in system memory (XTP_CARD_BUFFERS=0)"
+            );
+        }
+        on
+    })
+}
+
+/// The smallest title buffer whose copy goes to the card's memory, and the
+/// most bytes of such copies at once: `XTP_CARD_BUFFERS_MIN_MB` (16) and
+/// `XTP_CARD_BUFFERS_MB` (512). A buffer past the budget keeps its copy in
+/// system memory, as before. The Series S world makes seven buffers of 24
+/// MB or more, 383 MB in all (session lazyback-mirrors-ab).
+fn card_limits() -> (u64, u64) {
+    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let mb = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default)
+                << 20
+        };
+        (
+            mb("XTP_CARD_BUFFERS_MIN_MB", 16).max(1 << 16),
+            mb("XTP_CARD_BUFFERS_MB", 512),
+        )
+    })
+}
+
+/// For tests: bytes of pieces the card found changed, at copy-backs of
+/// copies in its memory ([`Shadow::card_back`]).
+#[cfg(test)]
+pub(crate) static CARD_CHANGED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Bytes of the card sides alive.
+static CARD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The copies in the card's memory, for [`cards_around`].
+static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Notes `shadow` for [`cards_around`] if it is in the card's memory.
+fn carded(shadow: &Arc<Shadow>) {
+    if shadow.card.is_some() {
+        lock(&CARDED).push(Arc::downgrade(shadow));
+    }
+}
+
+/// For the frame-rate line: the copies in the card's memory and their
+/// bytes there.
+pub(crate) fn card_summary() -> Option<String> {
+    if !cards() {
+        return None;
+    }
+    let copies = lock(&CARDED)
+        .iter()
+        .filter(|w| w.strong_count() > 0)
+        .count();
+    Some(format!(
+        "{copies} title buffer copies on the card, {} MiB",
+        CARD_BYTES.load(Ordering::Relaxed) >> 20
+    ))
+}
+
+/// The card side of a copy of `size` bytes whose CPU side is `staging`,
+/// and the rest of its [`Card`], if the copy is to be in the card's memory:
+/// [`cards`] is on, `size` is within [`card_limits`] and below 4 GiB (the
+/// card's passes count in 32 bits), and the card's passes could be made
+/// ([`work`]).
+fn card_for(
+    host: &crate::host::Host,
+    size: u64,
+    staging: &ID3D12Resource,
+) -> Option<(ID3D12Resource, Card)> {
+    let (least, most) = card_limits();
+    if !cards() || size < least || size >= 1 << 32 {
+        return None;
+    }
+    let work = work()?;
+    // `size` bytes of the budget, if they fit.
+    let reserve = || {
+        let fits = CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size <= most;
+        if !fits {
+            CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        }
+        fits
+    };
+    let mut reserved = reserve();
+    if !reserved {
+        // Copies the title let go may still be held by plans that have run.
+        lock(work).let_go();
+        reserved = reserve();
+    }
+    if !reserved {
+        tracing::info!(
+            size,
+            most,
+            "a big title buffer's copy stays in system memory: the card's budget for them is \
+             taken (XTP_CARD_BUFFERS_MB)"
+        );
+        return None;
+    }
+    let made = crate::host::buffers::card_buffer(&host.device, size)
+        .and_then(|buffer| Some((buffer, host.shared_buffer(size)?)));
+    let Some((buffer, (after, after_data))) = made else {
+        CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    };
+    let card = Card {
+        staging: staging.clone(),
+        after,
+        after_data,
+        // The card side's bytes are undefined until the CPU side's have
+        // gone up: all of them first.
+        dirty: Mutex::new(vec![(0, size as usize)]),
+        parts: Mutex::default(),
+        bytes: size,
+    };
+    Some((buffer, card))
+}
+
+impl Part {
+    /// Whether the card found the piece of record `i` changed.
+    fn changed(&self, i: u32) -> bool {
+        // SAFETY: a record of the part's slot, which stays until the part is
+        // done with; the card wrote it before the submission finished.
+        let flag = unsafe {
+            self.records
+                .add(i as usize * RECORD + 8)
+                .cast::<u32>()
+                .read_volatile()
+        };
+        flag != 0
+    }
+}
+
+impl Shadow {
+    /// [`Shadow::copy_back`] of a copy in the card's memory. The pieces of
+    /// `[address, address + len)` whose hash changed on the card while the
+    /// submission's lists ran ([`cards_around`]) are merged as a system
+    /// memory copy's ([`Shadow::put_back`]): the card's bytes, which it
+    /// copied into `after`, against the CPU side's from before (which
+    /// nothing wrote since), and title memory. The other pieces the GPU
+    /// left as they were: nothing to compare. The CPU side takes what the
+    /// merge made, and the card side the title's bytes it kept (`dirty`).
+    fn card_back(&self, card: &Card, submission: u64, address: usize, len: usize) -> usize {
+        let (from, to) = self.inside(address, len);
+        let start = self.start as usize;
+        let mut written = 0;
+        if from < to {
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            // The range's pieces the card compared, and those it found
+            // changed.
+            let (compared, changed) = {
+                let parts = lock(&card.parts);
+                match parts.iter().find(|p| p.submission == submission) {
+                    Some(part) => {
+                        let inside = || {
+                            part.spans
+                                .iter()
+                                .filter(move |&&(a, b, _)| a < to && b > from)
+                        };
+                        let compared: usize = inside().map(|&(a, b, _)| b - a).sum();
+                        let changed: Vec<(usize, usize)> = inside()
+                            .filter(|&&(_, _, i)| part.changed(i))
+                            .map(|&(a, b, _)| (a.max(from), b.min(to)))
+                            .collect();
+                        (compared, changed)
+                    }
+                    None => {
+                        tracing::warn!(
+                            address = format_args!("{:#x}", start + from),
+                            len = to - from,
+                            "a range shaders wrote in a copy on the card was not compared: \
+                             what they wrote there does not reach title memory"
+                        );
+                        (0, Vec::new())
+                    }
+                }
+            };
+            #[cfg(any(test, feature = "diagnostics"))]
+            let census = census::before_back(submission, start + from, start + to, || {
+                self.census_view(start + from)
+            });
+            let mut synced = Vec::new();
+            let mut i = 0;
+            while i < changed.len() {
+                // With the pieces after it that touch it, up to a run.
+                let (a, mut b) = changed[i];
+                i += 1;
+                while once() && i < changed.len() && changed[i].0 == b && b - a < RUN {
+                    b = changed[i].1;
+                    i += 1;
+                }
+                written += self.card_put_back(card, a, b, &mut synced);
+            }
+            #[cfg(test)]
+            CARD_CHANGED.fetch_add(
+                changed.iter().map(|&(a, b)| b - a).sum::<usize>(),
+                Ordering::Relaxed,
+            );
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::CardCompared, compared as u64);
+                add(
+                    C::CardChanged,
+                    changed.iter().map(|&(a, b)| b - a).sum::<usize>() as u64,
+                );
+                add(C::CardBackUs, started.elapsed().as_micros() as u64);
+            }
+            let _ = compared;
+            // As a system memory copy's: the range's whole pages put back
+            // are current where title memory equals the CPU side.
+            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+            let mut current: Vec<usize> = synced
+                .into_iter()
+                .filter(|p| (first..last).contains(p))
+                .collect();
+            current.sort_unstable();
+            current.dedup();
+            self.mark_current(&current);
+            #[cfg(any(test, feature = "diagnostics"))]
+            census::after_back(census, submission, start + from, start + to);
+        }
+        let end = address + len;
+        self.busy().retain(|b| {
+            !(b.shaders && b.submission == submission && address <= b.from && b.to <= end)
+        });
+        self.card_settled(card, submission);
+        written
+    }
+
+    /// [`Shadow::card_back`] of `[from, to)` (offsets), a run of pieces the
+    /// card found changed. Returns the bytes written into title memory.
+    fn card_put_back(&self, card: &Card, from: usize, to: usize, synced: &mut Vec<usize>) -> usize {
+        thread_local! {
+            /// A run's bytes as the card copied them, and as merged (kept,
+            /// already touched, for the next).
+            static RUN_BYTES: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+        }
+        RUN_BYTES.with_borrow_mut(|(gpu, merged)| {
+            let n = to - from;
+            gpu.resize(n, 0);
+            merged.resize(n, 0);
+            // SAFETY: inside `after`'s mapping, which the card wrote before
+            // the submission finished. A later submission's compare may copy
+            // its pieces over this range's edges meanwhile: the same bytes,
+            // as no GPU work writes the range before it is copied back.
+            unsafe {
+                std::ptr::copy_nonoverlapping(card.after_data.add(from), gpu.as_mut_ptr(), n)
+            };
+            merged.copy_from_slice(gpu);
+            // SAFETY: inside the CPU side's mapping, which nothing else
+            // writes in this range until the submission is copied back.
+            let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(from), n) };
+            let (written, read) = self.put_back(from, to, merged, old, synced);
+            // Where title memory could not be read: the CPU side takes the
+            // card's bytes, as a copy in system memory keeps the GPU's.
+            let mut at = 0;
+            for &(a, b) in read.iter().chain([&(n, n)]) {
+                if at < a {
+                    old[at..a].copy_from_slice(&gpu[at..a]);
+                }
+                at = b;
+            }
+            // The title's bytes the merge kept, in place of the GPU's or
+            // beside them: the card side lacks them.
+            let mut dirty = Vec::new();
+            for &(a, b) in &read {
+                let mut i = a;
+                loop {
+                    let x = first_change(&merged[..b], &gpu[..b], i);
+                    if x == b {
+                        break;
+                    }
+                    i = first_same(&merged[..b], &gpu[..b], x);
+                    dirty.push((from + x, from + i));
+                }
+            }
+            if !dirty.is_empty() {
+                lock(&card.dirty).extend(dirty);
+            }
+            written
+        })
+    }
+
+    /// After a copy-back or write-back of `submission` on a copy in the
+    /// card's memory: once none of its ranges is left, its part is done
+    /// with (its slot may serve another plan once its other parts are).
+    fn card_settled(&self, card: &Card, submission: u64) {
+        if self.busy().iter().any(|b| b.submission == submission) {
+            return;
+        }
+        let part = {
+            let mut parts = lock(&card.parts);
+            parts
+                .iter()
+                .position(|p| p.submission == submission)
+                .map(|i| parts.swap_remove(i))
+        };
+        if let (Some(part), Some(work)) = (part, work()) {
+            lock(work).done(part.slot);
+        }
+    }
+
+    /// `ranges` (offsets, sorted, apart) cut at the pages of title memory:
+    /// the copy-back's pieces.
+    fn pieces(&self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let start = self.start as usize;
+        let mut out = Vec::new();
+        for &(mut at, to) in ranges {
+            while at < to {
+                let end = (at + PIECE - (start + at) % PIECE).min(to);
+                out.push((at, end));
+                at = end;
+            }
+        }
+        out
+    }
+}
+
+/// `ranges` sorted, those that overlap or touch merged.
+fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// One copy's work in a submission's plan ([`cards_around`]).
+struct Job {
+    shadow: Arc<Shadow>,
+    /// Ranges of the CPU side that go up (offsets, sorted, apart).
+    uploads: Vec<(usize, usize)>,
+    /// The pieces of the ranges the submission's shaders may write, and of
+    /// those its GPU copies write (offsets).
+    spans: Vec<(usize, usize)>,
+    fetches: Vec<(usize, usize)>,
+    /// The first record of each.
+    first_span: u32,
+    first_fetch: u32,
+}
+
+/// For a submission about to run, the lists of ours that go first and last
+/// in its `ExecuteCommandLists` (`Host::run_as`), for the copies in the
+/// card's memory ([`cards`]); `(None, None)` when there is nothing to do.
+///
+/// - First: what their CPU side took since the last submission goes up to
+///   their card side, then each piece of the ranges its shaders may write
+///   is hashed on the card (128 bits of a mix of its bytes, [`CARD_PASS`]).
+/// - Last, once its lists have run: each piece is hashed again; a piece
+///   whose hash changed is copied into system memory (`Card::after`), and
+///   so is what its GPU copies wrote.
+///
+/// Its copy-back then has what shaders changed, and only that, when the
+/// submission's fence is reached ([`Shadow::card_back`]): no snapshot, no
+/// compare on the CPU, no wait for the card. In one `ExecuteCommandLists`,
+/// lists run one after the other with nothing between them, so the hashes
+/// tell the card's bytes at the start and at the end of the submission's
+/// lists. Hashing each submission's pieces both times, rather than keeping
+/// a hash per piece across submissions, leaves each submission's result to
+/// its own bytes: a later submission may write other bytes of a piece
+/// before this one is copied back.
+pub(crate) fn cards_around(
+    submission: u64,
+) -> (Option<ID3D12CommandList>, Option<ID3D12CommandList>) {
+    if !cards() {
+        return (None, None);
+    }
+    let shadows: Vec<Arc<Shadow>> = {
+        let mut all = lock(&CARDED);
+        all.retain(|w| w.strong_count() > 0);
+        all.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    let mut jobs = Vec::new();
+    for shadow in shadows {
+        let Some(card) = &shadow.card else {
+            continue;
+        };
+        let uploads = joined(std::mem::take(&mut *lock(&card.dirty)));
+        let (mut written, mut copied) = (Vec::new(), Vec::new());
+        for b in shadow.busy().iter().filter(|b| b.submission == submission) {
+            let (from, to) = shadow.inside(b.from, b.to - b.from);
+            if from < to {
+                (if b.shaders { &mut written } else { &mut copied }).push((from, to));
+            }
+        }
+        // Each byte once, as the host merges the ranges it copies back.
+        let spans = shadow.pieces(&joined(written));
+        let fetches = shadow.pieces(&joined(copied));
+        if uploads.is_empty() && spans.is_empty() && fetches.is_empty() {
+            continue;
+        }
+        jobs.push(Job {
+            shadow,
+            uploads,
+            spans,
+            fetches,
+            first_span: 0,
+            first_fetch: 0,
+        });
+    }
+    if jobs.is_empty() {
+        return (None, None);
+    }
+    // Copies are in the card's memory only once the passes are made.
+    let Some(work) = work() else {
+        return (None, None);
+    };
+    lock(work).plan(submission, jobs)
+}
+
+/// The record of a piece the card's passes take, in a slot's memory: its
+/// offsets `[from, to)` in the copy (32 bits each), whether the compare
+/// found it changed (32 bits), a word unused, then the hash of its bytes
+/// before the submission's lists (128 bits).
+const RECORD: usize = 32;
+
+/// Words of the card's marks: two per slot ([`CardWork`]).
+const MARKS: usize = 1 << 14;
+
+/// The card's passes over the copies in its memory: one compute program,
+/// four ways.
+///
+/// - 0: hashes each piece of its records into the record.
+/// - 1: hashes each again, notes in the record whether the hash changed,
+///   and copies a changed piece from `card` into `after`.
+/// - 2: copies each piece into `after` (a GPU copy's destination).
+/// - 3: sets word `first` of `after` (the marks) to `size` (a ticket).
+///
+/// A group of 256 threads takes a piece (at most 64 KiB), 16 bytes a step,
+/// its ends widened to 16 bytes (inside the buffer, whose size is a
+/// multiple of 64 KiB): a byte just outside a piece that changes only makes
+/// a compare that finds nothing on the CPU. Each thread mixes its words
+/// into 128 bits of its own, every step a bijection of them for a given
+/// word, so a change of one word always changes the thread's result; the
+/// group's results are joined by xor, which keeps that. Changes of several
+/// words could cancel out with odds of about 2^-128.
+const CARD_PASS: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Way : register(b0) {
+    uint mode;
+    uint first;  // the dispatch's first record (mode 3: the mark's word)
+    uint size;   // the copy's bytes on the card (mode 3: the ticket)
+};
+RWByteAddressBuffer card : register(u0);
+RWByteAddressBuffer after : register(u1);
+RWByteAddressBuffer records : register(u2);
+groupshared uint4 lanes[256];
+groupshared uint changed;
+
+uint4 mix(uint4 s) {
+    s *= uint4(0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du, 0x27D4EB2Fu);
+    s ^= s >> 15;
+    s.x += s.w;
+    s.y += s.x;
+    s.z += s.y;
+    s.w += s.z;
+    return s;
+}
+
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    if (mode == 3u) {
+        if (group.x == 0u && t == 0u) after.Store(first * 4u, size);
+        return;
+    }
+    uint at = (first + group.x) * 32u;
+    uint lo = records.Load(at) & ~15u;
+    uint hi = min((records.Load(at + 4u) + 15u) & ~15u, size);
+    if (mode != 2u) {
+        uint4 h = uint4(t, t ^ 0x6A09E667u, 0xBB67AE85u - t, 0x3C6EF372u);
+        for (uint b = lo + t * 16u; b < hi; b += 4096u) {
+            h = mix(h ^ card.Load4(b));
+        }
+        lanes[t] = mix(h);
+        GroupMemoryBarrierWithGroupSync();
+        [unroll]
+        for (uint n = 128u; n > 0u; n >>= 1u) {
+            if (t < n) {
+                lanes[t] ^= lanes[t + n];
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        uint4 sum = lanes[0];
+        if (mode == 0u) {
+            if (t == 0u) records.Store4(at + 16u, sum);
+            return;
+        }
+        if (t == 0u) {
+            changed = any(sum != records.Load4(at + 16u)) ? 1u : 0u;
+            records.Store(at + 8u, changed);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (changed == 0u) return;
+    }
+    for (uint c = lo + t * 16u; c < hi; c += 4096u) {
+        after.Store4(c, card.Load4(c));
+    }
+}
+"#;
+
+/// The ways of [`CARD_PASS`].
+const HASH: u32 = 0;
+const COMPARE: u32 = 1;
+const FETCH: u32 = 2;
+const MARK: u32 = 3;
+
+/// What the card's passes need ([`CARD_PASS`]), and the lists of ours they
+/// are recorded into, by slot: a submission's plan takes a free slot.
+struct CardWork {
+    device: ID3D12Device,
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    /// Two words per slot (system memory, mapped): the ticket of the plan
+    /// whose first list, and whose last, the card ended last.
+    marks: (ID3D12Resource, *mut u32),
+    slots: Vec<Slot>,
+    /// The last ticket given.
+    ticket: u32,
+}
+
+/// The lists and records of one plan at a time.
+struct Slot {
+    /// The first list and the last (with their allocators).
+    lists: [(ID3D12CommandAllocator, ID3D12GraphicsCommandList); 2],
+    /// Its records (buffer, mapping, how many it holds).
+    records: Option<(ID3D12Resource, *mut u8, usize)>,
+    /// Its last plan's ticket, and which of its lists that plan ran.
+    ticket: u32,
+    ran: [bool; 2],
+    /// Copies whose part of the last plan is not done with yet.
+    parts: usize,
+    /// The copies its last plan's lists name, kept until they have run.
+    keep: Vec<Arc<Shadow>>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the mappings are of buffers it
+// holds, used under its lock (and by the parts its records serve).
+unsafe impl Send for CardWork {}
+
+static WORK: std::sync::OnceLock<Option<Mutex<CardWork>>> = std::sync::OnceLock::new();
+
+/// The card's passes, made at the first copy in the card's memory; `None`
+/// if they cannot be (every copy then stays in system memory).
+fn work() -> Option<&'static Mutex<CardWork>> {
+    WORK.get_or_init(|| {
+        let made = host()
+            .ok_or_else(windows::core::Error::empty)
+            .and_then(CardWork::new);
+        match made {
+            Ok(work) => Some(Mutex::new(work)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "copies of big title buffers stay in system memory: the card's passes could \
+                     not be made"
+                );
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+impl CardWork {
+    fn new(host: &crate::host::Host) -> windows::core::Result<CardWork> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let device = host.device.clone();
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; out pointers
+        // ours.
+        let compiled = unsafe {
+            D3DCompile(
+                CARD_PASS.as_ptr().cast(),
+                CARD_PASS.len(),
+                windows::core::s!("card passes"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            let text = errors.map_or_else(String::new, |errors| {
+                // SAFETY: the blob's own bytes.
+                let text = unsafe {
+                    std::slice::from_raw_parts(
+                        errors.GetBufferPointer().cast::<u8>(),
+                        errors.GetBufferSize(),
+                    )
+                };
+                String::from_utf8_lossy(text).into_owned()
+            });
+            let what = format!("the card's passes did not compile: {text}");
+            return Err(windows::core::Error::new(e.code(), what));
+        }
+        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let (marks, marks_data) = host
+            .shared_buffer((MARKS * 4) as u64)
+            .ok_or_else(windows::core::Error::empty)?;
+        crate::host::name(&marks, || "marks of the card's passes".into());
+        // SAFETY: the blob's own bytes; the root signature is inside the
+        // shader.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })?;
+            Ok(CardWork {
+                device,
+                root,
+                pso,
+                marks: (marks, marks_data.cast()),
+                slots: Vec::new(),
+                ticket: 0,
+            })
+        }
+    }
+
+    /// A part of slot `slot`'s plan is done with.
+    fn done(&mut self, slot: usize) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.parts = s.parts.saturating_sub(1);
+        }
+    }
+
+    /// Whether slot `i` is free: the card has ended its last plan's lists,
+    /// and that plan's parts are done with.
+    fn free(&self, i: usize) -> bool {
+        let s = &self.slots[i];
+        // SAFETY: words inside the marks' mapping, which the card writes.
+        let mark = |word: usize| unsafe { self.marks.1.add(word).read_volatile() };
+        s.parts == 0 && (0..2).all(|l| !s.ran[l] || mark(2 * i + l) == s.ticket)
+    }
+
+    /// Lets go of the copies that free slots still hold.
+    fn let_go(&mut self) {
+        for i in 0..self.slots.len() {
+            if self.free(i) {
+                self.slots[i].keep.clear();
+            }
+        }
+    }
+
+    /// The lists of `submission`'s plan, `jobs` ([`cards_around`]). A
+    /// failure to record them ends the run: the copies' card sides would
+    /// hold what the GPU did not write, or miss what the title did.
+    fn plan(
+        &mut self,
+        submission: u64,
+        jobs: Vec<Job>,
+    ) -> (Option<ID3D12CommandList>, Option<ID3D12CommandList>) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let planned = self.record(submission, jobs);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::CardPlans, 1);
+            add(C::CardPlanUs, started.elapsed().as_micros() as u64);
+        }
+        planned.unwrap_or_else(|e| {
+            crate::host::fail(format_args!(
+                "the card's passes over title buffer copies could not be recorded ({e})"
+            ))
+        })
+    }
+
+    fn record(
+        &mut self,
+        submission: u64,
+        mut jobs: Vec<Job>,
+    ) -> windows::core::Result<(Option<ID3D12CommandList>, Option<ID3D12CommandList>)> {
+        let mut records = 0u32;
+        for job in &mut jobs {
+            job.first_span = records;
+            records += job.spans.len() as u32;
+            job.first_fetch = records;
+            records += job.fetches.len() as u32;
+        }
+        let i = self.slot(records as usize)?;
+        self.ticket = self.ticket.wrapping_add(1).max(1);
+        let ticket = self.ticket;
+        let (buffer, data, _) = self.slots[i]
+            .records
+            .clone()
+            .ok_or_else(windows::core::Error::empty)?;
+        for job in &jobs {
+            for (k, &(a, b)) in job.spans.iter().chain(&job.fetches).enumerate() {
+                let at = (job.first_span as usize + k) * RECORD;
+                // SAFETY: inside the slot's records, which no list of ours
+                // uses now (the slot is free).
+                unsafe {
+                    data.add(at)
+                        .cast::<[u32; 4]>()
+                        .write_unaligned([a as u32, b as u32, 0, 0]);
+                }
+            }
+        }
+        // SAFETY: a plain query of a live buffer.
+        let records_at = unsafe { buffer.GetGPUVirtualAddress() };
+        let first = jobs
+            .iter()
+            .any(|j| !j.uploads.is_empty() || !j.spans.is_empty());
+        let last = jobs
+            .iter()
+            .any(|j| !j.spans.is_empty() || !j.fetches.is_empty());
+        let slot = &self.slots[i];
+        let mut up = None;
+        let mut back = None;
+        // SAFETY: the slot's lists are not running (it is free); live
+        // buffers (kept until the lists have run), ranges inside them.
+        unsafe {
+            if first {
+                up = Some(self.record_first(&slot.lists[0], &jobs, records_at, 2 * i, ticket)?);
+            }
+            if last {
+                back =
+                    Some(self.record_last(&slot.lists[1], &jobs, records_at, 2 * i + 1, ticket)?);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let sum = |f: fn(&Job) -> &Vec<(usize, usize)>| -> (u64, u64) {
+                jobs.iter().flat_map(f).fold((0, 0), |(n, bytes), &(a, b)| {
+                    (n + 1, bytes + (b - a) as u64)
+                })
+            };
+            let (ups, up_bytes) = sum(|j| &j.uploads);
+            add(C::CardUps, ups);
+            add(C::CardUpBytes, up_bytes);
+            add(C::CardSpans, sum(|j| &j.spans).0);
+            add(C::CardFetched, sum(|j| &j.fetches).1);
+        }
+        let mut parts = 0;
+        for job in &jobs {
+            let Some(card) = &job.shadow.card else {
+                continue;
+            };
+            if job.spans.is_empty() && job.fetches.is_empty() {
+                continue;
+            }
+            parts += 1;
+            let spans = job
+                .spans
+                .iter()
+                .zip(job.first_span..)
+                .map(|(&(a, b), k)| (a, b, k))
+                .collect();
+            lock(&card.parts).push(Part {
+                submission,
+                slot: i,
+                records: data.cast_const(),
+                spans,
+            });
+        }
+        let slot = &mut self.slots[i];
+        slot.ticket = ticket;
+        slot.ran = [up.is_some(), back.is_some()];
+        slot.parts = parts;
+        slot.keep = jobs.into_iter().map(|j| j.shadow).collect();
+        Ok((
+            up.and_then(|l| l.cast().ok()),
+            back.and_then(|l| l.cast().ok()),
+        ))
+    }
+
+    /// A free slot for a plan of `records` records: one whose last plan's
+    /// lists the card has ended and whose parts are done with, else a new
+    /// one.
+    fn slot(&mut self, records: usize) -> windows::core::Result<usize> {
+        let i = match (0..self.slots.len()).find(|&i| self.free(i)) {
+            Some(i) => i,
+            None => {
+                if 2 * (self.slots.len() + 1) > MARKS {
+                    return Err(windows::core::Error::empty());
+                }
+                let lists = [self.list()?, self.list()?];
+                self.slots.push(Slot {
+                    lists,
+                    records: None,
+                    ticket: 0,
+                    ran: [false; 2],
+                    parts: 0,
+                    keep: Vec::new(),
+                });
+                self.slots.len() - 1
+            }
+        };
+        let slot = &mut self.slots[i];
+        // Its lists have run: what they named may go.
+        slot.keep.clear();
+        if slot.records.as_ref().is_none_or(|r| r.2 < records) {
+            let n = records.max(2048).next_power_of_two();
+            let (buffer, data) = host()
+                .and_then(|h| h.shared_buffer((n * RECORD) as u64))
+                .ok_or_else(windows::core::Error::empty)?;
+            crate::host::name(&buffer, || "records of the card's passes".into());
+            slot.records = Some((buffer, data, n));
+        }
+        Ok(i)
+    }
+
+    /// A closed list of ours, with its allocator.
+    fn list(&self) -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+        // SAFETY: plain object creation.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            list.Close()?;
+            crate::host::name(&list, || {
+                format!("xtp card passes {:#x}", list.as_raw() as usize)
+            });
+            Ok((allocator, list))
+        }
+    }
+
+    /// The plan's first list: what the CPU sides took goes up (a copy per
+    /// range), then the pieces are hashed. The card sides start in the
+    /// common state (buffers decay to it between `ExecuteCommandLists`) and
+    /// end in it, as the title's lists after it take them.
+    ///
+    /// # Safety
+    ///
+    /// The list is not running; the jobs' buffers stay alive until it has
+    /// run; `records` holds the jobs' records.
+    unsafe fn record_first(
+        &self,
+        (allocator, list): &(ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+        jobs: &[Job],
+        records: u64,
+        mark: usize,
+        ticket: u32,
+    ) -> windows::core::Result<ID3D12GraphicsCommandList> {
+        let (common, dest, uav) = (
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        // SAFETY: as the caller vouches.
+        unsafe {
+            allocator.Reset()?;
+            list.Reset(allocator, None)?;
+            let mut copied = Vec::new();
+            for job in jobs.iter().filter(|j| !j.uploads.is_empty()) {
+                let Some(card) = &job.shadow.card else {
+                    continue;
+                };
+                for &(a, b) in &job.uploads {
+                    let (at, n) = (a as u64, (b - a) as u64);
+                    list.CopyBufferRegion(&job.shadow.buffer, at, &card.staging, at, n);
+                }
+                let then = if job.spans.is_empty() { common } else { uav };
+                copied.push(transition(&job.shadow.buffer, dest, then));
+            }
+            if !copied.is_empty() {
+                list.ResourceBarrier(&copied);
+            }
+            self.bind(list, records);
+            let hashed: Vec<&Job> = jobs.iter().filter(|j| !j.spans.is_empty()).collect();
+            for job in &hashed {
+                self.pass(list, HASH, job, job.first_span, job.spans.len());
+            }
+            if !hashed.is_empty() {
+                let back: Vec<D3D12_RESOURCE_BARRIER> = hashed
+                    .iter()
+                    .map(|j| transition(&j.shadow.buffer, uav, common))
+                    .collect();
+                list.ResourceBarrier(&back);
+            }
+            self.mark(list, mark, ticket);
+            list.Close()?;
+        }
+        Ok(list.clone())
+    }
+
+    /// The plan's last list, after the submission's: its shaders' writes
+    /// done first, the pieces compared, those that changed copied out, and
+    /// so are the destinations of its GPU copies.
+    ///
+    /// # Safety
+    ///
+    /// As [`CardWork::record_first`].
+    unsafe fn record_last(
+        &self,
+        (allocator, list): &(ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+        jobs: &[Job],
+        records: u64,
+        mark: usize,
+        ticket: u32,
+    ) -> windows::core::Result<ID3D12GraphicsCommandList> {
+        // SAFETY: as the caller vouches.
+        unsafe {
+            allocator.Reset()?;
+            list.Reset(allocator, None)?;
+            list.ResourceBarrier(&[uav_barrier()]);
+            self.bind(list, records);
+            for job in jobs {
+                if !job.spans.is_empty() {
+                    self.pass(list, COMPARE, job, job.first_span, job.spans.len());
+                }
+                if !job.fetches.is_empty() {
+                    self.pass(list, FETCH, job, job.first_fetch, job.fetches.len());
+                }
+            }
+            self.mark(list, mark, ticket);
+            list.Close()?;
+        }
+        Ok(list.clone())
+    }
+
+    /// Binds the passes and their records.
+    ///
+    /// # Safety
+    ///
+    /// An open list; `records` a live buffer's address.
+    unsafe fn bind(&self, list: &ID3D12GraphicsCommandList, records: u64) {
+        // SAFETY: as the caller vouches; our own root signature.
+        unsafe {
+            list.SetComputeRootSignature(&self.root);
+            list.SetPipelineState(&self.pso);
+            list.SetComputeRootUnorderedAccessView(3, records);
+        }
+    }
+
+    /// A pass of way `way` over `count` records from `first`, one group per
+    /// record, on `job`'s copy: its card side bound whole, and its `after`
+    /// (the card side again for a hash, which writes none).
+    ///
+    /// # Safety
+    ///
+    /// The passes bound ([`CardWork::bind`]); the records lie inside the
+    /// copy.
+    unsafe fn pass(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        way: u32,
+        job: &Job,
+        first: u32,
+        count: usize,
+    ) {
+        let Some(card) = &job.shadow.card else {
+            return;
+        };
+        let size = card.bytes as u32;
+        let after = if way == HASH {
+            &job.shadow.buffer
+        } else {
+            &card.after
+        };
+        // SAFETY: as the caller vouches.
+        unsafe {
+            list.SetComputeRootUnorderedAccessView(1, job.shadow.buffer.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, after.GetGPUVirtualAddress());
+            let (mut first, mut left) = (first, count);
+            while left > 0 {
+                let n = left.min(65535);
+                let constants = [way, first, size];
+                list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+                list.Dispatch(n as u32, 1, 1);
+                first += n as u32;
+                left -= n;
+            }
+        }
+    }
+
+    /// Ends a list with its mark: the card sets word `word` of the marks to
+    /// `ticket` once the list's work before it is done.
+    ///
+    /// # Safety
+    ///
+    /// The passes bound ([`CardWork::bind`]).
+    unsafe fn mark(&self, list: &ID3D12GraphicsCommandList, word: usize, ticket: u32) {
+        // SAFETY: as the caller vouches; the marks are ours, the word inside
+        // them.
+        unsafe {
+            list.ResourceBarrier(&[uav_barrier()]);
+            let marks = self.marks.0.GetGPUVirtualAddress();
+            list.SetComputeRootUnorderedAccessView(1, marks);
+            list.SetComputeRootUnorderedAccessView(2, marks);
+            let constants = [MARK, word as u32, ticket];
+            list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+            list.Dispatch(1, 1, 1);
+        }
+    }
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -2182,11 +3350,22 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let len = entry_end - key.0;
     // Rounded up so that views ending in the buffer's last 256 bytes fit.
     // Shaders write some buffers (unordered access), so not upload memory.
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
-    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+    let size = len.next_multiple_of(1 << 16);
+    let host = host()?;
+    let (staging, data) = host.shared_buffer(size)?;
+    crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
+    let (buffer, card) = match card_for(host, size, &staging) {
+        Some((buffer, card)) => {
+            crate::host::name(&buffer, || {
+                format!("title buffer {:#x}+{len:#x} on the card", key.0)
+            });
+            (buffer, Some(card))
+        }
+        None => (staging, None),
+    };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let made = Arc::new(Shadow::new(buffer, data, gpu, key.0, len));
+    let made = Arc::new(Shadow::new(buffer, data, gpu, key.0, len, card));
     let mut map = buffers();
     match map.get_mut(&key) {
         // Another thread made one meanwhile: that one (ours goes).
@@ -2195,13 +3374,19 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }) => return Some(s.clone()),
         Some(entry) if entry.end == entry_end => entry.shadow = Some(made.clone()),
         // Released (or made again) meanwhile: ours serves this use only.
-        _ => return Some(made),
+        _ => {
+            drop(map);
+            carded(&made);
+            return Some(made);
+        }
     }
     drop(map);
+    carded(&made);
     if len >= 16 << 20 {
         tracing::info!(
             start = format_args!("{:#x}", key.0),
             len,
+            card = made.carded(),
             "large buffer copied to the host"
         );
     } else {
@@ -2418,7 +3603,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let made = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    let made = Arc::new(Shadow::new(buffer, data, gpu, start, len, None));
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     // The first one made stays.
     let shadow = map.entry((start, len)).or_insert(made).clone();
@@ -2636,6 +3821,13 @@ mod tests {
             unsafe { std::slice::from_raw_parts(self.data.add(from), len) }.to_vec()
         }
 
+        /// The snapshot mirrors the copy holds, for submissions in flight
+        /// or kept for the next.
+        pub(crate) fn snapshots(&self) -> usize {
+            let snapshots = self.before.lock().unwrap();
+            snapshots.live.len() + snapshots.spare.len()
+        }
+
         /// Writes the copy at title addresses `[at, at + len)`, as the GPU
         /// does.
         pub(super) fn set_host(&self, at: usize, len: usize, byte: u8) {
@@ -2644,6 +3836,28 @@ mod tests {
             // SAFETY: inside the mapping; tests stand in for the GPU.
             unsafe { self.data.add(from).write_bytes(byte, len) };
         }
+    }
+
+    /// The card's passes compile, and their pipeline is made.
+    #[test]
+    fn the_cards_passes_are_made() {
+        let test = "shadow::tests::the_cards_passes_are_made";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if let Err(e) = CardWork::new(host) {
+            panic!("{e}");
+        }
+    }
+
+    /// The ranges a plan of the card's passes takes are each byte once:
+    /// those that overlap or touch are joined, as the host joins the ranges
+    /// it copies back.
+    #[test]
+    fn a_cards_plan_takes_each_byte_once() {
+        let ranges = vec![(10, 20), (0, 5), (5, 8), (15, 30), (40, 41), (30, 30)];
+        assert_eq!(joined(ranges), [(0, 8), (10, 30), (40, 41)]);
+        assert!(joined(Vec::new()).is_empty());
     }
 
     /// A submission's snapshot takes the bytes of each range it declares

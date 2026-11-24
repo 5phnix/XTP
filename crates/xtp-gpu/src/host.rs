@@ -1247,6 +1247,16 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Copies of big title buffers in the card's memory
+        // (`shadow::cards_around`): what their CPU side took goes up first,
+        // and what the shaders wrote is found on the card after the lists,
+        // in the same submission.
+        let (cards_first, cards_last) = crate::shadow::cards_around(batch.submission);
+        if let Some(first) = cards_first {
+            lists.insert(0, Some(first));
+            firsts.iter_mut().skip(1).for_each(|at| *at += 1);
+        }
+        lists.extend(cards_last.map(Some));
         let (mut pending, touches) = Pending::of(runs, batch.submission);
         // Preparing, without the waits for earlier submissions (counted as
         // waiting).
