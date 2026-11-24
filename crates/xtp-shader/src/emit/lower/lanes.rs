@@ -261,6 +261,10 @@ impl<'a> Lower<'a> {
     /// Console flow: `x` of console lane `lane` (uniform), from whichever
     /// half holds it.
     pub(super) fn console_read_lane(&mut self, x: V, lane: V) -> V {
+        if !self.split {
+            // One host wave is the console wave, all of its lanes here.
+            return self.read_lane(x, lane);
+        }
         let c = self.cur;
         let (k31, k5, one, z) = (
             self.s.m.i32(31),
@@ -426,11 +430,27 @@ impl<'a> Lower<'a> {
     pub(super) fn any_lane(&mut self, m: Bool) -> Result<V, Why> {
         let c = self.cur;
         let bit = self.boolean(m, c)?;
-        let lo = self.ballot_word(c, bit);
-        let (lo, hi) = self.exchange(c, lo);
+        let (lo, hi) = self.console_ballot(c, bit);
         let or = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, pred::NE, or, z))
+    }
+
+    /// Console flow: the console wave's ballot of `bit`, low and high word.
+    pub(super) fn console_ballot(&mut self, at: usize, bit: V) -> (V, V) {
+        if self.split {
+            let word = self.ballot_word(at, bit);
+            return self.exchange(at, word);
+        }
+        // One host wave is the console wave (the high word is 0 in waves
+        // of 32).
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
     }
 
     /// The host wave's ballot of `bit` (32 lanes: the first word).
@@ -484,14 +504,14 @@ impl<'a> Lower<'a> {
         f
     }
 
-    /// Split: this lane's console lane (0..63) and half (0, 1).
+    /// This lane's console lane (0..63, 0..31 in waves of 32) and its
+    /// half of a wave64 (0, 1).
     pub(super) fn console_lane(&mut self) -> (V, V) {
         let f = self.console_flat();
         let e = self.s.entry;
-        let (k63, k5, one) = (self.s.m.i32(63), self.s.m.i32(5), self.s.m.i32(1));
-        let lane = self.s.m.bin(e, Bin::And, f, k63);
-        let h = self.s.m.bin(e, Bin::LShr, f, k5);
-        let half = self.s.m.bin(e, Bin::And, h, one);
+        let (mask, k5) = (self.s.m.i32(self.wave() - 1), self.s.m.i32(5));
+        let lane = self.s.m.bin(e, Bin::And, f, mask);
+        let half = self.s.m.bin(e, Bin::LShr, lane, k5);
         (lane, half)
     }
 

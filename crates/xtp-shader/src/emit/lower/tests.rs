@@ -38,6 +38,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         mesh_stride: 0,
         target: super::super::Target::ANY,
         console_cf: false,
+        per_lane_only: false,
     })
     .map(|_| ())
 }
@@ -90,6 +91,7 @@ fn lower_wave(
         mesh_stride: 0,
         target: super::super::Target::ANY,
         console_cf: false,
+        per_lane_only: false,
     })
 }
 
@@ -196,6 +198,7 @@ fn perm_features(selector: u32) -> u64 {
         mesh_stride: 0,
         target: super::super::Target::ANY,
         console_cf: false,
+        per_lane_only: false,
     })
     .unwrap();
 

@@ -83,6 +83,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lane_read_loop_tests;
 // IR to DXIL, one file per encoding or concern: which backlog item of
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
 mod lower;
@@ -405,13 +407,36 @@ pub fn emit_for(
         mesh_stride,
         target,
         console_cf: false,
+        per_lane_only: false,
     };
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
-            let console = structure::structure_console(p)?;
-            parts.st = &console;
-            parts.console_cf = true;
-            lower::lower(&parts)?
+            let console = structure::structure_console(p);
+            let lowered = match &console {
+                Ok(console) => {
+                    parts.st = console;
+                    parts.console_cf = true;
+                    lower::lower(&parts)
+                }
+                Err(e) => Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: match e {
+                        ShaderError::Unsupported { what, .. } => what,
+                        _ => "a program the console structure cannot hold",
+                    },
+                }),
+            };
+            match lowered {
+                Ok(l) => l,
+                // What the console flow cannot lower keeps the per-lane form
+                // where that translates; else the console flow's reason.
+                Err(e) => {
+                    parts.st = st;
+                    parts.console_cf = false;
+                    parts.per_lane_only = true;
+                    lower::lower(&parts).map_err(|_| e)?
+                }
+            }
         }
         l => l?,
     };

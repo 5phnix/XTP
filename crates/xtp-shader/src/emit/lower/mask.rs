@@ -82,8 +82,7 @@ impl<'a> Lower<'a> {
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
             let bit = self.boolean(m, at)?;
-            let word = self.ballot_word(at, bit);
-            let xy = self.exchange(at, word);
+            let xy = self.console_ballot(at, bit);
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
         }

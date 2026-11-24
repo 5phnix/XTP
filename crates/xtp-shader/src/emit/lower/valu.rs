@@ -581,7 +581,12 @@ impl<'a> Lower<'a> {
                         _ => Err(LANE_MASK),
                     }
                 };
-                let (lo, hi) = (word(self, EXEC)?, word(self, EXEC + 1)?);
+                let lo = word(self, EXEC)?;
+                let hi = if self.x.native.wave64 {
+                    word(self, EXEC + 1)?
+                } else {
+                    self.s.m.i32(0)
+                };
                 let i32t = self.s.t.i32;
                 let flo = self
                     .s

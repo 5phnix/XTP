@@ -134,16 +134,30 @@ pub(crate) struct Parts<'a> {
     /// Run the program as the console does (see [`CONSOLE_FLOW`]); `st`
     /// is then [`crate::structure::structure_console`]'s.
     pub console_cf: bool,
+    /// Never ask for the console flow: the per-lane form or nothing (what
+    /// a program falls back to when the console flow cannot lower it).
+    pub per_lane_only: bool,
 }
 
-/// What [`lower`] stops with when a wave64 program needs its two 32-lane
-/// halves to exchange values on a host without 64-lane waves: lower it
-/// again from [`crate::structure::structure_console`] with
-/// [`Parts::console_cf`]. Every lane of the group (one console wave) then
-/// runs every block, branches are the console's (taken wave-wide, from
-/// masks both halves exchange through group-shared memory), and EXEC
-/// guards the vector instructions; both halves reach every exchange, so
-/// a group barrier orders it.
+/// What [`lower`] stops with when a program should run as the console runs
+/// it: lower it again from [`crate::structure::structure_console`] with
+/// [`Parts::console_cf`]. Every lane of a console wave then runs every
+/// block, branches are the console's (taken wave-wide) and EXEC guards the
+/// vector instructions. Two kinds of program ask for it:
+///
+/// * a wave64 program whose two 32-lane halves must exchange values on a
+///   host without 64-lane waves (a group of one console wave): the wave-wide
+///   tests come from masks both halves exchange through group-shared
+///   memory, and both halves reach every exchange, so a group barrier
+///   orders it;
+/// * on any host, a program that reads or writes a named lane
+///   (`v_readlane`, `v_writelane`) and has branches its lanes take
+///   differently. Those instructions ignore EXEC on the console, and a wave
+///   runs a loop while any lane does; in the per-lane form a lane that left
+///   a loop (or skipped a branch) is not there to be read, and never sees
+///   the scalars set inside. One host wave is the console wave here, so
+///   nothing is exchanged. If the console flow cannot lower such a program
+///   it keeps the per-lane form ([`Parts::per_lane_only`]).
 pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange lanes (console flow)";
 
 enum Stop {
@@ -394,9 +408,27 @@ impl<'a> Lower<'a> {
                 && cs.threads.iter().product::<u32>() <= 64
                 && !insts().any(|i| i.name().contains("permute"))
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            // On a host that runs the console's wave size: lane reads and
+            // writes in a program whose lanes branch differently (see
+            // [`CONSOLE_FLOW`]).
+            let uniform = |when: Bool| {
+                x.st.bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_)))
+            };
+            wants_console_flow |= x.target.runs(wave)
+                && insts().any(|i| matches!(i.name(), "v_readlane_b32" | "v_writelane_b32"))
+                && x.st
+                    .exits
+                    .iter()
+                    .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
+                && !insts().any(|i| i.name().contains("permute"))
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             if x.console_cf {
                 console_lanes = true;
-                split = true;
+                // In halves only where the host cannot run the console wave.
+                split = x.native.wave64 && !x.target.runs(64);
             }
             if split {
                 s.wave_size = Some(32);
@@ -524,7 +556,7 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
-        if self.wants_console_flow && !self.x.console_cf {
+        if self.wants_console_flow && !self.x.console_cf && !self.x.per_lane_only {
             return Err(unsupported(0, CONSOLE_FLOW));
         }
         if let Some(n) = self.s.wave_size
