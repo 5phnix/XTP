@@ -11,10 +11,10 @@
 //! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 //!
-//! A container this build cannot translate for a target is cached too, as
-//! its error (marker, length, checksum, text: the length and checksum are
-//! what tell a damaged entry from a real one), under the key a translation
-//! would have: the build and the target. The translator's refusals
+//! A container this build cannot translate for a target is cached under the
+//! same key as a translation. The disk cache verifies the payload's length
+//! and digest first. The shader decoder then checks the refusal's marker,
+//! text length, checksum and UTF-8. The translator's refusals
 //! ([`xtp_shader::ShaderError`]: a malformed container, GFX10 code it
 //! cannot decode or does not handle yet) depend only on the container and
 //! on what `key()` hashes (our executable, its loop limit, the target's
@@ -512,14 +512,24 @@ mod tests {
         assert_eq!(cached(&cache, &build, container, fail), error);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
 
-        // A damaged failure entry is a miss, tried again.
+        // The disk header is valid, but the refusal's own checksum is stale.
         let input = [&build[..], container].concat();
-        let entry = xtp_pipeline::CacheKey::new(&Translate::new(fail), &input);
-        std::fs::write(
-            cache.path_for(&entry),
-            [FAILED.as_slice(), &[0xff, 0xfe]].concat(),
-        )
-        .unwrap();
+        let converter = Translate::new(fail);
+        let entry = xtp_pipeline::CacheKey::new(&converter, &input);
+        let mut damaged = encode_failure("unsupported operand");
+        *damaged.last_mut().unwrap() ^= 1;
+        let frame = [
+            b"XTP\x01".as_slice(),
+            &(damaged.len() as u64).to_le_bytes(),
+            blake3::hash(&damaged).as_bytes(),
+            &damaged,
+        ]
+        .concat();
+        std::fs::write(cache.path_for(&entry), frame).unwrap();
+        assert_eq!(
+            cache.get_or_convert(&converter, &input).unwrap().as_ref(),
+            damaged
+        );
         assert_eq!(cached(&cache, &build, container, fail), error);
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         assert_eq!(cached(&cache, &build, container, fail), error);

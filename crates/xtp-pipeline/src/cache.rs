@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -66,6 +67,7 @@ struct Store {
     root: PathBuf,
     limit: u64,
     index: Mutex<Index>,
+    warned_write_failure: AtomicBool,
 }
 
 // Opening the same directory twice in this process must also share its pins.
@@ -115,6 +117,7 @@ impl Cache {
             root: root.clone(),
             limit,
             index: Mutex::new(index),
+            warned_write_failure: AtomicBool::new(false),
         });
         stores.retain(|_, store| store.strong_count() > 0);
         stores.insert(root, Arc::downgrade(&store));
@@ -211,7 +214,18 @@ impl Cache {
             && size <= self.store.limit
             && let Err(e) = self.publish(key, &path, &bytes)
         {
-            tracing::warn!(path = %path.display(), error = %e, "could not store converted output");
+            let already_warned = self
+                .store
+                .warned_write_failure
+                .swap(true, Ordering::Relaxed);
+            if already_warned {
+                tracing::debug!(path = %path.display(), error = %e, "could not store converted output");
+            } else {
+                tracing::warn!(
+                    path = %path.display(), error = %e,
+                    "could not store converted output (further write failures logged at debug level)"
+                );
+            }
         }
         Ok((bytes, value))
     }
