@@ -38,6 +38,9 @@ enum Command {
         /// List every exported function.
         #[arg(long)]
         exports: bool,
+        /// Emit stable JSON instead of the text summary.
+        #[arg(long)]
+        json: bool,
     },
     /// Aggregate the imports of every PE image under the given paths and
     /// show which ones our runtime covers. Defaults to the configured
@@ -50,6 +53,9 @@ enum Command {
         /// List every missing `dll!function`, most used first.
         #[arg(long)]
         missing: bool,
+        /// Emit stable JSON instead of the text table.
+        #[arg(long)]
+        json: bool,
     },
     /// List the `dll!export` pairs an import library describes.
     LibExports {
@@ -189,12 +195,14 @@ fn main() -> Result<()> {
             file,
             imports,
             exports,
-        } => inspect::run(&file, imports, exports),
+            json,
+        } => inspect::run(&file, imports, exports, json),
         Command::Census {
             paths,
             strict,
             missing,
-        } => census::run(paths, strict, missing),
+            json,
+        } => census::run(paths, strict, missing, json),
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
         Command::ShaderInfo {
             paths,
