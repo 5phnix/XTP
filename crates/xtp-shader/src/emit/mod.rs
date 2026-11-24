@@ -204,14 +204,56 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    translate_program(&c, &native).map_err(|(_, e)| e)
+}
+
+/// The step of [`translate_program`] that stopped a program, in the order
+/// they report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Step {
+    /// [`ir::build`]: decoding and the SSA form.
+    Decode,
+    /// [`resource::track`].
+    Resources,
+    /// [`io::raise`].
+    Io,
+    /// [`structure::structure`] (it runs before the resources, which need
+    /// it, but its failure is reported after theirs and the I/O's).
+    Structure,
+    /// [`emit`].
+    Emit,
+}
+
+impl Step {
+    pub fn name(self) -> &'static str {
+        match self {
+            Step::Decode => "decode",
+            Step::Resources => "resources",
+            Step::Io => "I/O",
+            Step::Structure => "structure",
+            Step::Emit => "emit",
+        }
+    }
+}
+
+/// Translates one vertex, pixel, compute or mesh program of a parsed
+/// container: what [`translate`] does with the first of them. On failure,
+/// the step that stopped it and its error (the first blocker: fixing it
+/// can reveal another one in a later step).
+pub fn translate_program(
+    c: &Container,
+    native: &NativeProgram,
+) -> Result<HostShader, (Step, ShaderError)> {
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)
+        .map_err(|e| (Step::Decode, e))?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
-    let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())
+        .map_err(|e| (Step::Resources, e))?;
+    let io = io::raise(&p, native).map_err(|e| (Step::Io, e))?;
+    let st = st.map_err(|e| (Step::Structure, e))?;
+    emit(c, native, &p, &st, &io, &res).map_err(|e| (Step::Emit, e))
 }
 
 /// Emits a program whose earlier stages already ran.
