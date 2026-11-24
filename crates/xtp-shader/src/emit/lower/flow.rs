@@ -47,11 +47,8 @@ pub(super) struct Drain {
     /// Whether the program's lanes drain (none: not decided yet; decided at
     /// the entry block's exit).
     on: Option<bool>,
-    /// Per IR block: the barriers a lane has passed when it enters it (a
-    /// phi, filled by [`Lower::fill_phis`]).
-    entry: Vec<(usize, V)>,
-    /// Per IR block: the barriers a lane has passed when it leaves it.
-    exit: HashMap<usize, V>,
+    /// The barriers a lane has passed.
+    passed: Carried,
     /// The two group-shared counts of the threads that ended, by the parity
     /// of the barriers they had passed.
     ended: Option<V>,
@@ -59,6 +56,79 @@ pub(super) struct Drain {
     block: Option<(usize, V)>,
     /// That phi's incoming.
     incoming: Vec<(V, usize)>,
+}
+
+/// The back edges a lane has taken in all loops together, against
+/// [`crate::emit::loop_budget`]: the loop limits count per loop and per
+/// entry into it, so loops inside loops multiply theirs. A lane that takes
+/// the budget's back edge leaves as a lane at a loop's limit does. Only in
+/// programs where the loops together can pass the budget
+/// ([`loops_can_pass`]).
+#[derive(Default)]
+pub(super) struct Budget {
+    /// Whether the program's lanes count their back edges (none: not
+    /// decided yet; decided at the entry block's exit).
+    on: Option<bool>,
+    /// The back edges a lane has taken.
+    taken: Carried,
+}
+
+/// A count each lane carries from block to block ([`Drain`]'s barriers,
+/// [`Budget`]'s back edges): a phi where each IR block starts (0 in the
+/// entry block), its value where the block ends, and the value a back edge
+/// carries instead.
+#[derive(Default)]
+struct Carried {
+    /// Per IR block: the phi (filled by [`Lower::fill_phis`]).
+    entry: Vec<(usize, V)>,
+    /// Per IR block: the count where it ends.
+    exit: HashMap<usize, V>,
+    /// Per back edge (IR block, header), where it carries another count.
+    back: HashMap<(usize, usize), V>,
+}
+
+/// Which [`Carried`] count.
+#[derive(Clone, Copy)]
+enum Count {
+    Barriers,
+    BackEdges,
+}
+
+/// Whether a lane can take more back edges than `budget` in the loops of
+/// `p` together (`headers`, each with its own limit, `limit`): where one
+/// loop is inside another (its passes multiply), or where the limits of
+/// loops one after the other add up to it. Unreachable blocks are
+/// `usize::MAX` in `rpo`.
+pub(super) fn loops_can_pass(
+    p: &Program,
+    rpo: &[usize],
+    headers: &[usize],
+    limit: impl Fn(usize) -> u32,
+    budget: u32,
+) -> bool {
+    let reachable = |q: usize| rpo[q] != usize::MAX;
+    let nested = headers.iter().any(|&h| {
+        // The loop's body: what reaches a latch without passing the header.
+        let mut body = HashSet::from([h]);
+        let mut work: Vec<usize> = p.blocks[h]
+            .preds
+            .iter()
+            .copied()
+            .filter(|&q| reachable(q) && rpo[h] <= rpo[q])
+            .collect();
+        while let Some(b) = work.pop() {
+            if body.insert(b) {
+                work.extend(p.blocks[b].preds.iter().filter(|&&q| reachable(q)));
+            }
+        }
+        headers.iter().any(|&g| g != h && body.contains(&g))
+    });
+    // Each loop runs once otherwise: its limit's back edges at most.
+    let total: u64 = headers
+        .iter()
+        .map(|&h| u64::from(limit(h).saturating_sub(1)))
+        .sum();
+    nested || total >= u64::from(budget)
 }
 
 #[cfg(test)]
@@ -497,6 +567,12 @@ impl<'a> Lower<'a> {
         } else {
             None
         };
+        // Where loops have a budget: the back edges a lane has taken (none
+        // within a block); a back edge adds its own ([`Self::count_iteration`]).
+        if self.budgeted() {
+            let taken = self.entering(Count::BackEdges, b);
+            self.budget.taken.exit.insert(b, taken);
+        }
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, self.cur);
@@ -671,24 +747,31 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A back edge to header `to`, entering it from DXIL block `from`: the
-    /// count goes up (computed here); the result is whether it is below
-    /// [`LOOP_LIMIT`](super::LOOP_LIMIT) (go on; at it: stop), the
-    /// spin-wait limit for a loop that only waits for memory to change
-    /// (`spin.rs`), or the higher limit of a counted loop
-    /// ([`counted_loops`]).
+    /// The iteration limit of the loop at header `h`:
+    /// [`LOOP_LIMIT`](super::LOOP_LIMIT), the spin-wait limit for a loop
+    /// that only waits for memory to change (`spin.rs`), or the higher
+    /// limit of a counted loop ([`counted_loops`]).
+    fn limit_of(&self, h: usize) -> u32 {
+        if self.spin.contains(&h) {
+            crate::emit::spin_limit()
+        } else if self.counted.contains(&h) {
+            crate::emit::counted_loop_limit()
+        } else {
+            crate::emit::loop_limit()
+        }
+    }
+
+    /// A back edge from the current IR block to header `to`, entering it
+    /// from DXIL block `from`: the count goes up (computed here); the
+    /// result is whether it is below the loop's limit ([`Self::limit_of`];
+    /// go on; at it: stop) and, where loops have a budget ([`Budget`]),
+    /// the lane's back edges below it.
     pub(super) fn count_iteration(&mut self, to: usize, from: usize) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = if self.spin.contains(&to) {
-            crate::emit::spin_limit()
-        } else if self.counted.contains(&to) {
-            crate::emit::counted_loop_limit()
-        } else {
-            crate::emit::loop_limit()
-        };
+        let limit = self.limit_of(to);
         #[cfg(test)]
         self.limits.push(limit);
         let limit = self.s.m.i32(limit);
@@ -697,7 +780,16 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, from));
-        self.s.m.cmp(c, pred::IULT, next, limit)
+        let ok = self.s.m.cmp(c, pred::IULT, next, limit);
+        let b = self.cur_ir;
+        let Some(&taken) = self.budget.taken.exit.get(&b) else {
+            return ok;
+        };
+        let taken = self.s.m.bin(c, Bin::Add, taken, one);
+        self.budget.taken.back.insert((b, to), taken);
+        let budget = self.s.m.i32(crate::emit::loop_budget());
+        let left = self.s.m.cmp(c, pred::IULT, taken, budget);
+        self.s.m.bin(c, Bin::And, ok, left)
     }
 
     /// The latch of a conditional back edge from IR block `from` to header
@@ -782,14 +874,7 @@ impl<'a> Lower<'a> {
     /// ([`Drain`]; `extra`: those its exit adds): what it entered with (a
     /// phi; 0 in the entry block), plus the block's.
     fn passed(&mut self, b: usize, extra: u32) -> V {
-        let start = if self.rpo[b] == 0 {
-            self.s.m.i32(0)
-        } else {
-            let at = self.block[b].expect("reachable");
-            let phi = self.s.m.phi(at, self.s.t.i32);
-            self.drain.entry.push((b, phi));
-            phi
-        };
+        let start = self.entering(Count::Barriers, b);
         let n = self.barriers_in(b) + extra;
         let v = if n == 0 {
             start
@@ -797,8 +882,60 @@ impl<'a> Lower<'a> {
             let k = self.s.m.i32(n);
             self.s.m.bin(self.cur, Bin::Add, start, k)
         };
-        self.drain.exit.insert(b, v);
+        self.drain.passed.exit.insert(b, v);
         v
+    }
+
+    /// Whether the program's lanes count their back edges against the
+    /// budget ([`Budget`]).
+    fn budgeted(&mut self) -> bool {
+        if let Some(on) = self.budget.on {
+            return on;
+        }
+        let budget = crate::emit::loop_budget();
+        let mut headers: Vec<usize> = self.counters.keys().copied().collect();
+        headers.sort_unstable();
+        let on = budget > 0
+            && loops_can_pass(self.x.p, &self.rpo, &headers, |h| self.limit_of(h), budget);
+        self.budget.on = Some(on);
+        on
+    }
+
+    fn carried(&mut self, count: Count) -> &mut Carried {
+        match count {
+            Count::Barriers => &mut self.drain.passed,
+            Count::BackEdges => &mut self.budget.taken,
+        }
+    }
+
+    /// `count` where IR block `b` starts: a phi (0 in the entry block).
+    fn entering(&mut self, count: Count, b: usize) -> V {
+        if self.rpo[b] == 0 {
+            return self.s.m.i32(0);
+        }
+        let at = self.block[b].expect("reachable");
+        let phi = self.s.m.phi(at, self.s.t.i32);
+        self.carried(count).entry.push((b, phi));
+        phi
+    }
+
+    /// The phis of `count`: from each predecessor, its count where it ends,
+    /// or the one its back edge carries.
+    fn fill_carried(&mut self, count: Count) {
+        let p = self.x.p;
+        let carried = std::mem::take(self.carried(count));
+        for (b, phi) in carried.entry {
+            let mut incoming = Vec::new();
+            for &q in &p.blocks[b].preds {
+                let (Some(qb), Some(&n)) = (self.tail[q], carried.exit.get(&q)) else {
+                    continue;
+                };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let n = carried.back.get(&(q, b)).copied().unwrap_or(n);
+                incoming.push((n, qb));
+            }
+            self.s.m.set_phi(phi, incoming);
+        }
     }
 
     /// [`Drain`]'s two group-shared counts of ended threads.
@@ -905,18 +1042,10 @@ impl<'a> Lower<'a> {
     pub(super) fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // Where lanes drain: the barriers passed when entering each block,
-        // and by each lane that ends.
-        for (b, phi) in std::mem::take(&mut self.drain.entry) {
-            let mut incoming = Vec::new();
-            for &q in &p.blocks[b].preds {
-                let (Some(qb), Some(&n)) = (self.tail[q], self.drain.exit.get(&q)) else {
-                    continue;
-                };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                incoming.push((n, qb));
-            }
-            self.s.m.set_phi(phi, incoming);
-        }
+        // and by each lane that ends; where loops have a budget, the back
+        // edges taken.
+        self.fill_carried(Count::Barriers);
+        self.fill_carried(Count::BackEdges);
         if let Some((_, phi)) = self.drain.block {
             let incoming = std::mem::take(&mut self.drain.incoming);
             self.s.m.set_phi(phi, incoming);
@@ -1122,10 +1251,10 @@ mod tests {
         assert_eq!(limits(&lanes), [counted_loop_limit()]);
     }
 
-    /// Whether [`super::barrier_after_loop`] finds an `s_barrier` reachable
-    /// from a loop header of `words` (a block a later block branches back
-    /// to).
-    fn barrier_after(words: &[u32]) -> bool {
+    /// The IR of `words`, the reverse-postorder index of each block
+    /// (`usize::MAX`: unreachable) and the loop headers (blocks a later
+    /// block branches back to).
+    fn loops_of(words: &[u32]) -> (ir::Program, Vec<usize>, Vec<usize>) {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = ir::build(&code, false, 8).unwrap();
         let order = ir::reverse_postorder(&p.blocks);
@@ -1133,15 +1262,60 @@ mod tests {
         for (n, &b) in order.iter().enumerate() {
             rpo[b] = n;
         }
-        let headers = order.iter().copied().filter(|&h| {
-            p.blocks[h]
-                .preds
-                .iter()
-                .any(|&q| rpo[q] != usize::MAX && rpo[h] <= rpo[q])
-        });
+        let headers = order
+            .iter()
+            .copied()
+            .filter(|&h| {
+                p.blocks[h]
+                    .preds
+                    .iter()
+                    .any(|&q| rpo[q] != usize::MAX && rpo[h] <= rpo[q])
+            })
+            .collect();
+        (p, rpo, headers)
+    }
+
+    /// Whether [`super::barrier_after_loop`] finds an `s_barrier` reachable
+    /// from a loop header of `words`.
+    fn barrier_after(words: &[u32]) -> bool {
+        let (p, _, headers) = loops_of(words);
         super::barrier_after_loop(&p, headers, |b| {
             p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier")
         })
+    }
+
+    /// The budget counts where loops can pass it together: a loop inside a
+    /// loop, or loops one after the other whose limits add up to it. One
+    /// loop alone has its own limit.
+    #[test]
+    fn budgets_count_where_loops_can_pass_them() {
+        let can_pass = |words: &[u32], limit: u32, budget: u32| {
+            let (p, rpo, headers) = loops_of(words);
+            super::loops_can_pass(&p, &rpo, &headers, |_| limit, budget)
+        };
+        let lt = 0xBF0A_0102; // s_cmp_lt_u32 s2, s1
+        let one = uniform_loop(0x81, lt);
+        assert!(!can_pass(&one, 1 << 14, 1 << 20));
+        assert!(!can_pass(&one, 1 << 20, 1 << 20));
+        // The same loop twice, one after the other.
+        let twice = [&one[..7], &one[..7], &[S_ENDPGM]].concat();
+        assert!(!can_pass(&twice, 1 << 14, 1 << 20));
+        assert!(can_pass(&twice, 1 << 20, 1 << 20));
+        // An inner loop whose latch also goes back to the outer header.
+        let nested = [
+            0xBE80_0380, // s_mov_b32 s0, 0
+            0xBF82_0003, // s_branch -> outer
+            0x8001_8101, // inner: s_add_u32 s1, s1, 1
+            0xBF06_8201, // s_cmp_eq_u32 s1, 2
+            0xBF84_FFFD, // s_cbranch_scc0 -> inner; else on to outer
+            0x8000_8100, // outer: s_add_u32 s0, s0, 1
+            0xBF06_8200, // s_cmp_eq_u32 s0, 2
+            0xBF85_0002, // s_cbranch_scc1 -> exit
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xBF82_FFF8, // s_branch -> inner
+            S_ENDPGM,
+        ];
+        assert!(can_pass(&nested, 1 << 14, 1 << 20));
     }
 
     /// A group barrier after a loop or inside it is one a lane the limit

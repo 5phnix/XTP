@@ -170,6 +170,40 @@ pub(crate) fn spin_limit() -> u32 {
     DEFAULT_SPIN_LIMIT.min(loop_limit())
 }
 
+/// The per-lane budget without an override: 2^20 (1,048,576) back edges.
+pub const DEFAULT_LOOP_BUDGET: u32 = 1 << 20;
+
+/// The back edges a lane may take in all of a program's loops together
+/// before it leaves the program as the loop limit leaves it (0: no budget):
+/// [`DEFAULT_LOOP_BUDGET`]. The limits count per loop and per entry into
+/// it, so loops inside loops multiply theirs (2^14 inside 2^14 is 2^28
+/// iterations, seconds of one wave: past the host's GPU watchdog); the
+/// budget bounds their product. It is the counted loops' limit, so no
+/// single loop is cut shorter than by its own limit.
+///
+/// `XTP_SHADER_LOOP_BUDGET` (decimal or `0x` hex; 0 turns it off) sets it
+/// instead, in every build. The value is part of the translation, so the
+/// shader cache must key on it (`xtp-gpu`'s does).
+// shortcut: an outer loop of n passes over an inner loop of m is cut once
+// n·m passes the budget, even where the console runs it to its end.
+pub fn loop_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET
+        .get_or_init(|| parse_loop_budget(std::env::var("XTP_SHADER_LOOP_BUDGET").ok().as_deref()))
+}
+
+/// The budget `XTP_SHADER_LOOP_BUDGET`'s value gives: the default when it
+/// is unset or unreadable. Pure, for testing.
+fn parse_loop_budget(value: Option<&str>) -> u32 {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .unwrap_or(DEFAULT_LOOP_BUDGET)
+}
+
 /// `XTP_SHADER_LOOP_LIMIT`'s value; none when it is unset, unreadable or
 /// 0. Pure, for testing.
 fn parse_limit_override(value: Option<&str>) -> Option<u32> {
@@ -663,6 +697,20 @@ mod tests {
         // Without the switch the counted loops keep their own limit.
         assert_eq!(super::parse_limit_override(None), None);
         assert_eq!(super::parse_limit_override(Some("0x10")), Some(16));
+    }
+
+    /// The budget switch: a value, 0 to turn it off, the default otherwise.
+    #[test]
+    fn the_loop_budget_switch_parses_or_falls_back() {
+        use super::{DEFAULT_LOOP_BUDGET, parse_loop_budget};
+        assert_eq!(DEFAULT_LOOP_BUDGET, 1 << 20);
+        assert_eq!(parse_loop_budget(None), DEFAULT_LOOP_BUDGET);
+        assert_eq!(parse_loop_budget(Some("0")), 0);
+        assert_eq!(parse_loop_budget(Some(" 0x400 ")), 1024);
+        assert_eq!(parse_loop_budget(Some("5000")), 5000);
+        for bad in ["", "-5", "lots", "0x", "4294967296"] {
+            assert_eq!(parse_loop_budget(Some(bad)), DEFAULT_LOOP_BUDGET, "{bad:?}");
+        }
     }
     use super::container::SigElement;
     use super::shader::Shader;
