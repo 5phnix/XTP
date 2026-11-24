@@ -467,7 +467,9 @@ const OP_GET_RESULT: u32 = 2;
 const OP_CANCEL: u32 = 3;
 const OP_CLEANUP: u32 = 4;
 
-/// One call in flight, until its result is taken or it fails.
+/// One call in flight, until its result is taken or it fails. Until `done`,
+/// it is the one `CALLS` holds for its block (only completing it, with
+/// `done` locked, or taking its result, once done, removes it from there).
 struct Call {
     provider: Provider,
     context: usize,
@@ -477,6 +479,48 @@ struct Call {
 }
 
 impl Call {
+    /// Records the result (the first one wins), wakes waiters and queues
+    /// the completion routine on the block's completion port. A call that
+    /// is over already is left alone, and so is `block`: the title may have
+    /// freed it, or begun another call on it, since.
+    fn complete(&self, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+        extern "system" fn routine(block: *mut c_void, _canceled: bool) {
+            let block = block.cast::<AsyncBlock>();
+            // SAFETY: the title keeps the block until its completion
+            // routine has run.
+            if let Some(routine) = unsafe { (*block).callback } {
+                routine(block);
+            }
+        }
+        if result == E_PENDING {
+            return;
+        }
+        let mut done = lock(&self.done);
+        if *done {
+            return;
+        }
+        // Read before publishing: once the status is set, the title may free
+        // the block.
+        // SAFETY: the call is in flight, so the title's block is valid.
+        let (handle, callback) = unsafe { ((*block).queue, (*block).callback) };
+        let (status, size) = words(block);
+        if result < 0 || required_size == 0 {
+            release(block);
+        }
+        size.store(required_size, Ordering::Release);
+        status.store(result as u32 as usize, Ordering::Release);
+        *done = true;
+        self.finished.notify_all();
+        drop(done);
+        if callback.is_some() {
+            let task = Task::new(block.cast(), routine);
+            match queue(handle) {
+                Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
+                _ => task.run(true),
+            }
+        }
+    }
+
     fn provider(
         &self,
         op: u32,
@@ -529,11 +573,24 @@ pub fn XAsyncBegin(
     _identity_name: *const u8,
     provider: Option<Provider>,
 ) -> HRESULT {
-    let Some(provider) = provider else {
-        return E_INVALIDARG;
-    };
+    match provider.map(|provider| begin(block, context, identity, provider)) {
+        Some(Ok(_)) => S_OK,
+        Some(Err(hr)) => hr,
+        None => E_INVALIDARG,
+    }
+}
+
+/// Begins a call on `block` and returns it, for a caller that completes it
+/// later: through the call, so that once it is over (cancelled, say) the
+/// block and whatever call it holds by then are left alone.
+fn begin(
+    block: *mut AsyncBlock,
+    context: *mut c_void,
+    identity: *const c_void,
+    provider: Provider,
+) -> Result<Arc<Call>, HRESULT> {
     if block.is_null() || call(block).is_some() {
-        return E_INVALIDARG;
+        return Err(E_INVALIDARG);
     }
     let (status, size) = words(block);
     status.store(E_PENDING as u32 as usize, Ordering::Release);
@@ -549,9 +606,9 @@ pub fn XAsyncBegin(
     // A failed begin fails the call, so the completion routine still runs.
     let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
     if hr < 0 {
-        XAsyncComplete(block, hr, 0);
+        call.complete(block, hr, 0);
     }
-    S_OK
+    Ok(call)
 }
 
 /// Queues the provider's `DoWork` on the block's work port.
@@ -579,43 +636,10 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     }
 }
 
-/// Records the result (the first one wins), wakes waiters and queues the
-/// completion routine on the block's completion port.
+/// Completes the call on the block; see [`Call::complete`].
 pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
-    extern "system" fn complete(block: *mut c_void, _canceled: bool) {
-        let block = block.cast::<AsyncBlock>();
-        // SAFETY: read before the status was published; see below.
-        if let Some(routine) = unsafe { (*block).callback } {
-            routine(block);
-        }
-    }
-    let Some(call) = call(block) else { return };
-    if result == E_PENDING {
-        return;
-    }
-    let mut done = lock(&call.done);
-    if *done {
-        return;
-    }
-    // Read before publishing: once the status is set, the title may free
-    // the block.
-    // SAFETY: a block in flight is valid.
-    let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
-    let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
-    }
-    size.store(required_size, Ordering::Release);
-    status.store(result as u32 as usize, Ordering::Release);
-    *done = true;
-    call.finished.notify_all();
-    drop(done);
-    if routine.is_some() {
-        let task = Task::new(block.cast(), complete);
-        match queue(handle) {
-            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
-            _ => task.run(true),
-        }
+    if let Some(call) = call(block) {
+        call.complete(block, result, required_size);
     }
 }
 
@@ -649,7 +673,9 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
-        XAsyncComplete(block, E_ABORT, 0);
+        // This call: if the provider completed it, the title may have begun
+        // another on the block since.
+        call.complete(block, E_ABORT, 0);
     }
 }
 
@@ -755,70 +781,82 @@ pub fn finished_with(
 
 /// Like [`finished_with`], but the result comes from `work`, run on a
 /// thread of ours; the call stays pending until it returns (a dialog, say).
+/// If the title cancels the call first, it is over at once: `work` still
+/// runs to its end, but what it returns is dropped, and neither the block
+/// nor a call the title has begun on it since is touched.
 pub fn pending_with(
     block: *mut AsyncBlock,
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(
-        Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>,
-        Vec<u8>,
-    )>;
+    match pending(block, identity, work) {
+        Ok(_) => S_OK,
+        Err(hr) => hr,
+    }
+}
+
+/// Where the result of a [`pending_with`] call waits for `XAsyncGetResult`.
+/// The call (its provider context) and its worker thread each hold a
+/// reference, since either may end first: the call when it is cancelled,
+/// the worker when its work is done.
+type Slot = Mutex<Vec<u8>>;
+
+/// [`pending_with`], returning the call's slot.
+fn pending(
+    block: *mut AsyncBlock,
+    identity: *const c_void,
+    work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
+) -> Result<Arc<Slot>, HRESULT> {
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
-        // boxed state until cleanup frees it.
+        // call's reference to its slot (`Arc::into_raw` in `pending`), which
+        // only cleanup, the call's last operation, gives up.
         let data = unsafe { &*data };
-        let state = data.context.cast::<Data>();
+        let slot = data.context.cast_const().cast::<Slot>();
         match op {
-            // SAFETY: boxed in `pending_with`; nothing runs after cleanup.
-            OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
-            OP_BEGIN => {
-                // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0
-                    .take();
-                let (block, state) = (data.block as usize, state as usize);
-                std::thread::spawn(move || {
-                    let result = work.map_or(Err(E_ABORT), |work| work());
-                    let (hr, len) = match &result {
-                        Ok(bytes) => (S_OK, bytes.len()),
-                        Err(hr) => (*hr, 0),
-                    };
-                    if let Ok(bytes) = result {
-                        // SAFETY: the call is pending, so its state lives.
-                        let state = unsafe { &*(state as *const Data) };
-                        state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
-                    }
-                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
-                });
-            }
-            // SAFETY: as above; the runtime checked the buffer's size.
+            // SAFETY: as above, once; the worker holds a reference of its own.
+            OP_CLEANUP => drop(unsafe { Arc::from_raw(slot) }),
+            // SAFETY: as above; the runtime checked the buffer's size against
+            // the length the worker completed the call with, after it had
+            // put the bytes in the slot.
             OP_GET_RESULT => unsafe {
-                let state = (*state).lock().unwrap_or_else(|e| e.into_inner());
+                let bytes = lock(&*slot);
                 data.buffer
                     .cast::<u8>()
-                    .copy_from(state.1.as_ptr(), state.1.len());
+                    .copy_from(bytes.as_ptr(), bytes.len());
             },
             _ => {}
         }
         S_OK
     }
-    let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
-    let context = Box::into_raw(state);
-    let hr = XAsyncBegin(
-        block,
-        context.cast(),
-        identity,
-        std::ptr::null(),
-        Some(provider),
-    );
-    if hr < 0 {
-        // SAFETY: refused before the call existed; still ours.
-        drop(unsafe { Box::from_raw(context) });
-    }
-    hr
+    let slot = Arc::new(Slot::default());
+    let context = Arc::into_raw(slot.clone());
+    let call = match begin(block, context.cast_mut().cast(), identity, provider) {
+        Ok(call) => call,
+        Err(hr) => {
+            // SAFETY: refused before the call existed; the reference is still
+            // ours.
+            drop(unsafe { Arc::from_raw(context) });
+            return Err(hr);
+        }
+    };
+    let (block, result) = (block as usize, slot.clone());
+    std::thread::spawn(move || {
+        let (hr, len) = match work() {
+            Ok(bytes) => {
+                let len = bytes.len();
+                // Our reference: the slot lives even if the call is over.
+                *lock(&result) = bytes;
+                (S_OK, len)
+            }
+            Err(hr) => (hr, 0),
+        };
+        // Through the call, not the block: a cancelled call is over, so this
+        // late result is dropped without touching the block, which the title
+        // may have freed or begun another call on.
+        call.complete(block as *mut AsyncBlock, hr, len);
+    });
+    Ok(slot)
 }
 
 /// The result of a call begun with [`finished_with`] for `identity`, as a
@@ -1331,6 +1369,112 @@ mod tests {
         assert!(!XTaskQueueDispatch(a, WORK, INFINITE));
         XTaskQueueCloseHandle(a);
         XTaskQueueCloseHandle(b);
+    }
+
+    /// Sends on its channel when dropped: kept in a thread-local of a
+    /// worker thread, it says the thread has ended, its last act included.
+    struct Exit(std::sync::mpsc::Sender<()>);
+    impl Drop for Exit {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    thread_local! {
+        static EXIT: std::cell::RefCell<Option<Exit>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The title cancels a `pending_with` call whose work is still running
+    /// (a dialog on screen), and its cleanup runs; the title then begins a
+    /// second call on the same block. When the first work ends at last, its
+    /// result must reach neither the block nor the second call, and go only
+    /// to memory still alive. (Before the fix, cleanup freed the state the
+    /// worker then wrote to, and the late result completed the second call.)
+    #[test]
+    fn a_cancelled_pending_call_leaves_the_reused_block_alone() {
+        use std::sync::mpsc::channel;
+        static COMPLETED: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn completed(_: *mut AsyncBlock) {
+            COMPLETED.fetch_add(1, Ordering::SeqCst);
+        }
+        // Unlike values: the linker could fold like ones into one address.
+        static FIRST: u8 = 1;
+        static SECOND: u8 = 2;
+        let (first, second) = ((&raw const FIRST).cast(), (&raw const SECOND).cast());
+        let long = Duration::from_secs(10);
+        let mut q = std::ptr::null();
+        // Completion dispatched by hand, to see each one.
+        assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
+        // Leaked: a worker left blocked by a failed assertion keeps a valid
+        // block.
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(completed),
+            internal: [0; 4],
+        }));
+
+        let (go_first, wait_first) = channel::<()>();
+        let (exited, first_ended) = channel();
+        // The counter: who holds the first call's slot (we keep a reference
+        // to look at it).
+        let slot = pending(block, first, move || {
+            EXIT.with(|e| *e.borrow_mut() = Some(Exit(exited)));
+            let _ = wait_first.recv();
+            Ok(b"first!".to_vec())
+        })
+        .expect("begun");
+        assert_eq!(Arc::strong_count(&slot), 3, "us, the call, the worker");
+        assert_eq!(XAsyncGetStatus(block, false), E_PENDING);
+
+        XAsyncCancel(block);
+        assert_eq!(XAsyncGetStatus(block, false), E_ABORT);
+        assert!(call(block).is_none(), "cleanup ran: the call is over");
+        assert_eq!(Arc::strong_count(&slot), 2, "the worker still holds it");
+        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert_eq!(COMPLETED.load(Ordering::SeqCst), 1);
+
+        let (go_second, wait_second) = channel::<()>();
+        let hr = pending_with(block, second, move || {
+            let _ = wait_second.recv();
+            Ok(b"second".to_vec())
+        });
+        assert_eq!(hr, S_OK);
+
+        // The first work ends; its thread is gone once `first_ended` hears.
+        go_first.send(()).unwrap();
+        first_ended
+            .recv_timeout(long)
+            .expect("the first worker ended");
+        // It wrote its result into its own slot, alive until it let go.
+        assert_eq!(Arc::strong_count(&slot), 1, "the worker let go");
+        assert_eq!(*lock(&slot), b"first!");
+        assert_eq!(
+            XAsyncGetStatus(block, false),
+            E_PENDING,
+            "the first call's late result completed the second"
+        );
+        assert!(
+            !XTaskQueueDispatch(q, COMPLETION, 0),
+            "a completion was queued for the second call"
+        );
+        assert_eq!(COMPLETED.load(Ordering::SeqCst), 1);
+
+        // The canary: the second call's result is its own. (Its state was
+        // made just after the first one's cleanup, where a state freed then
+        // would have been, and the first worker wrote after that.)
+        go_second.send(()).unwrap();
+        assert_eq!(XAsyncGetStatus(block, true), S_OK);
+        let mut size = 0;
+        assert_eq!(XAsyncGetResultSize(block, &mut size), S_OK);
+        assert_eq!(size, 6);
+        let (mut out, mut used) = ([0u8; 6], 0);
+        let buffer = out.as_mut_ptr().cast();
+        assert_eq!(XAsyncGetResult(block, second, 6, buffer, &mut used), S_OK);
+        assert_eq!((&out, used), (b"second", 6));
+        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert_eq!(COMPLETED.load(Ordering::SeqCst), 2);
+        assert!(call(block).is_none(), "the call ends with its result");
+        XTaskQueueCloseHandle(q);
     }
 
     #[test]
