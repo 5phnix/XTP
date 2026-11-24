@@ -174,13 +174,20 @@ impl<'a> Lower<'a> {
 
     /// A back edge to header `to` (a back edge keeps its block, no
     /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`](super::LOOP_LIMIT) by `p` (below: go on; at or above: stop).
+    /// [`LOOP_LIMIT`](super::LOOP_LIMIT) by `p` (below: go on; at or above:
+    /// stop), or with the spin-wait limit for a loop that only waits for
+    /// memory to change (`spin.rs`).
     pub(super) fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(crate::emit::loop_limit());
+        let limit = if self.spin.contains(&to) {
+            crate::emit::spin_limit()
+        } else {
+            crate::emit::loop_limit()
+        };
+        let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
             .expect("header")
