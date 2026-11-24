@@ -430,7 +430,7 @@ from a worktree on the PC:
 | `xtp-check.ps1` again, after small changes | 28 s |
 | `cargo test -p xtp-gpu` after a one-line change in `crates/xtp-gpu` | 8.2 s (cargo 1.9 s) |
 | A stopped VM started on demand, until the job runs | 29 s |
-| A Spot reclaim during a job, until it runs again on another VM | about 1 minute |
+| A Spot reclaim during a job, until it runs again on another VM | 1 minute (measured once; bounded by the time limits) |
 | A failed job's extra check (is the VM going away?) | about 2 s |
 | An idle VM stopping itself (guest shutdown, then TERMINATED) | at its idle threshold, then 37 s |
 

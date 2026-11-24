@@ -84,13 +84,14 @@ $code = 98
 try {
     # 3. The slot, one job at a time.
     $lockPath = Join-Path $Root "locks\$($req.slot).lock"
-    $deadline = (Get-Date).AddMinutes([int] $req.waitMinutes)
+    # Its own limit: $deadline stays the whole job's.
+    $lockDeadline = (Get-Date).AddMinutes([int] $req.waitMinutes)
     $said = $false
     while (-not $lock) {
         try {
             $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         } catch {
-            if ((Get-Date) -gt $deadline) { Write-FarmErr "slot $($req.slot) stayed busy for $($req.waitMinutes) minutes"; exit 99 }
+            if ((Get-Date) -gt $lockDeadline) { Write-FarmErr "slot $($req.slot) stayed busy for $($req.waitMinutes) minutes"; exit 99 }
             if (-not $said) { Write-FarmErr "slot $($req.slot) is busy: waiting"; $said = $true }
             Start-Sleep -Seconds 2
         }

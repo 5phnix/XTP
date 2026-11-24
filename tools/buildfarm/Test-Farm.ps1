@@ -117,6 +117,15 @@ if ($Live) {
     Assert-Farm ($r.ExitCode -eq 124 -and $secs -lt 150) ("a job over its time stops with 124 (got $($r.ExitCode) after {0:N0} s)" -f $secs)
     Assert-Farm ($r.Err -match 'ran over its time') 'the VM says the job ran over its time'
 
+    # ...but a job within its time runs to its end: with XTP_FARM_JOB_MINUTES=2
+    # the slot wait is limited to 1 minute, and five steps (about 95 s) must
+    # not be cut at that minute.
+    $t = Get-Date
+    $r = Invoke-FarmProcess -FilePath $ps -WorkingDirectory $wt.Top -NoStdin -Capture -Environment @{ XTP_FARM_JOB_MINUTES = '2' } `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $cargo, '--farm-steps', $s, $s, $s, $s, $s)
+    $secs = ((Get-Date) - $t).TotalSeconds
+    Assert-Farm ($r.ExitCode -eq 0 -and $secs -gt 60) ("a job within its time runs past the slot wait to its end (exit $($r.ExitCode) after {0:N0} s)" -f $secs)
+
     # A command that does not answer in time: ssh and its IAP proxy are stopped.
     $vm = (@(Get-FarmInstances -Config $c -Refresh) | Where-Object { Test-FarmRunning $_ } | Select-Object -First 1).name
     $t = Get-Date
