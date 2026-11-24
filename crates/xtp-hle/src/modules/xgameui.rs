@@ -2,10 +2,14 @@
 //! show and closes at once. Text entry, message dialogs and error dialogs
 //! open a small host dialog on a thread of their own and complete the async
 //! call with the user's answer, or as cancelled (`E_ABORT`) when the dialog
-//! is dismissed or cannot open.
+//! cannot open. When `XTP_DIALOGS=auto` (or [`set_auto_dismiss`] in
+//! unattended/autopilot runs) is enabled, message dialogs complete immediately
+//! with `cancel_button` (`S_OK`) and error dialogs complete immediately with
+//! `S_OK` without opening a window.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::xasync::{self, AsyncBlock, E_ABORT};
 use super::xgameruntime::{
@@ -30,6 +34,30 @@ pub const IID_2026: Guid = Guid::new(
 pub static OBJECT: Object = Object::new("game ui", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, IID_2026, &OBJECT)];
 
+/// Environment variable that auto-dismisses modal dialogs when set to `auto`.
+pub const DIALOGS_ENV: &str = "XTP_DIALOGS";
+
+/// `E_INVALIDARG` (`0x80070057`).
+const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
+
+/// `XGameUiMessageDialogButton` values in `XGameUI.h`.
+pub const BUTTON_FIRST: u32 = 0;
+pub const BUTTON_SECOND: u32 = 1;
+pub const BUTTON_THIRD: u32 = 2;
+
+static AUTO_DISMISS: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable unattended auto-dismissal of message and error dialogs
+/// (used by `--autopilot` runs so modal dialogs never stall the session).
+pub fn set_auto_dismiss(enabled: bool) {
+    AUTO_DISMISS.store(enabled, Ordering::Relaxed);
+}
+
+fn auto_dismiss_enabled() -> bool {
+    AUTO_DISMISS.load(Ordering::Relaxed)
+        || std::env::var(DIALOGS_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("auto"))
+}
+
 type This = *const Object;
 
 static MESSAGE: u8 = 0;
@@ -37,18 +65,22 @@ static PROFILE: u8 = 0;
 static ERROR_DIALOG: u8 = 0;
 static TEXT: u8 = 0;
 
-/// `XGameUiMessageDialogButton` values in `XGameUI.h`.
-pub const BUTTON_FIRST: u32 = 0;
-pub const BUTTON_SECOND: u32 = 1;
-pub const BUTTON_THIRD: u32 = 2;
-
 /// Request passed to the host message-dialog backend.
-#[derive(Debug, Clone)]
+///
+/// Each entry in `buttons` carries its original `XGameUiMessageDialogButton`
+/// enum value (`0`, `1`, or `2`) paired with its label so gaps (e.g. a null
+/// second button) never shift the reported button index.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MessageDialogRequest {
     title: String,
     content: String,
-    buttons: Vec<String>,
+    buttons: Vec<(u32, String)>,
     default_button: u32,
+    cancel_button: u32,
+}
+
+fn escape_mnemonic(label: &str) -> String {
+    label.replace('&', "&&")
 }
 
 extern "system" fn message_dialog_async(
@@ -65,13 +97,28 @@ extern "system" fn message_dialog_async(
     let title = text(title).unwrap_or_default();
     let content = text(content).unwrap_or_default();
     let mut buttons = Vec::new();
-    for label in [first_button, second_button, third_button] {
+    for (idx, label) in [
+        (BUTTON_FIRST, first_button),
+        (BUTTON_SECOND, second_button),
+        (BUTTON_THIRD, third_button),
+    ] {
         if let Some(s) = text(label).filter(|s| !s.is_empty()) {
-            buttons.push(s);
+            buttons.push((idx, s));
         }
     }
     if buttons.is_empty() {
-        buttons.push("OK".to_owned());
+        buttons.push((BUTTON_FIRST, "OK".to_owned()));
+    }
+    if auto_dismiss_enabled() {
+        tracing::warn!(
+            title,
+            content,
+            cancel_button,
+            "message dialog: auto-dismissing with cancel_button"
+        );
+        return xasync::pending_with(block, (&raw const MESSAGE).cast(), move || {
+            Ok(cancel_button.to_le_bytes().to_vec())
+        });
     }
     tracing::info!(
         title,
@@ -86,6 +133,7 @@ extern "system" fn message_dialog_async(
         content,
         buttons,
         default_button,
+        cancel_button,
     };
     xasync::pending_with(
         block,
@@ -96,7 +144,7 @@ extern "system" fn message_dialog_async(
                 Ok(button.to_le_bytes().to_vec())
             }
             None => {
-                tracing::info!("message dialog: cancelled");
+                tracing::info!("message dialog: could not open");
                 Err(E_ABORT)
             }
         },
@@ -109,7 +157,7 @@ extern "system" fn message_dialog_result(
     result_button: *mut u32,
 ) -> HRESULT {
     if result_button.is_null() {
-        return put(result_button, 0);
+        return E_INVALIDARG;
     }
     let mut raw = [0u8; 4];
     let mut written = 0usize;
@@ -133,6 +181,14 @@ extern "system" fn error_dialog_async(
     context: *const c_char,
 ) -> HRESULT {
     let context = text(context).unwrap_or_default();
+    if auto_dismiss_enabled() {
+        tracing::warn!(
+            error_code = format_args!("{error_code:#010x}"),
+            context,
+            "error dialog: auto-dismissing"
+        );
+        return xasync::finished(block, (&raw const ERROR_DIALOG).cast(), S_OK);
+    }
     tracing::warn!(
         error_code = format_args!("{error_code:#010x}"),
         context,
@@ -143,7 +199,7 @@ extern "system" fn error_dialog_async(
             tracing::info!("error dialog: dismissed");
             Ok(Vec::new())
         } else {
-            tracing::info!("error dialog: cancelled");
+            tracing::info!("error dialog: could not open");
             Err(E_ABORT)
         }
     })
@@ -249,8 +305,8 @@ fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
-/// Shows a modal host message dialog; returns the chosen button index or `None`
-/// if dismissed / no window can be shown.
+/// Shows a modal host message dialog; returns the chosen button enum value or
+/// `None` if no window can be shown.
 #[cfg(not(test))]
 fn show_message_dialog(req: &MessageDialogRequest) -> Option<u32> {
     dialog::message(req)
@@ -295,18 +351,22 @@ mod dialog {
 
     const EDIT: i32 = 100;
     const BTN_BASE: i32 = 200;
+    // Static control style: do not interpret '&' as a mnemonic prefix.
+    const SS_NOPREFIX: u32 = 0x0080;
     // Edit control messages (the controls headers).
     const EM_SETSEL: u32 = 0xb1;
     const EM_LIMITTEXT: u32 = 0xc5;
 
     struct MessageState {
         chosen: Option<u32>,
-        button_count: u32,
+        button_ids: Vec<u32>,
+        default_button: u32,
+        cancel_button: u32,
     }
 
     /// Shows a modal message dialog with up to three buttons from an in-memory
-    /// template. Returns the 0-based button index, or `None` if cancelled or
-    /// the dialog could not be created.
+    /// template. Esc and the close box report `req.cancel_button`. Returns
+    /// `None` only if the host dialog could not be created.
     #[allow(dead_code)] // unused in test builds
     pub(super) fn message(req: &super::MessageDialogRequest) -> Option<u32> {
         let mut t: Vec<u16> = Vec::new();
@@ -318,8 +378,8 @@ mod dialog {
             t.push(0);
         }
         let btn_count = req.buttons.len().min(3) as u16;
-        let width: u16 = 260;
-        let height: u16 = 78;
+        let width: u16 = 280;
+        let height: u16 = 104;
         let style = wm::WS_POPUP | wm::WS_CAPTION | wm::WS_SYSMENU;
         let flags = (wm::DS_MODALFRAME | wm::DS_CENTER | wm::DS_SETFOREGROUND) as u32;
         dword(&mut t, style | flags);
@@ -338,26 +398,33 @@ mod dialog {
             t.push(0);
         };
         let (button_cls, label_cls) = (0x80, 0x82);
-        item(0, [8, 8, width - 16, 40], 0xffff, label_cls, &req.content);
-        let btn_w: u16 = 66;
+        item(
+            SS_NOPREFIX,
+            [8, 8, width - 16, 66],
+            0xffff,
+            label_cls,
+            &req.content,
+        );
+        let btn_w: u16 = 72;
         let gap: u16 = 6;
         let total_w = btn_count * btn_w + btn_count.saturating_sub(1) * gap;
         let start_x = width.saturating_sub(8 + total_w);
-        for (i, label) in req.buttons.iter().take(3).enumerate() {
-            let is_default = i as u32 == req.default_button;
+        for (pos, &(btn_value, ref label)) in req.buttons.iter().take(3).enumerate() {
+            let is_default = btn_value == req.default_button;
             let btn_style = wm::WS_TABSTOP
                 | if is_default {
                     wm::BS_DEFPUSHBUTTON as u32
                 } else {
                     wm::BS_PUSHBUTTON as u32
                 };
-            let x = start_x + (i as u16) * (btn_w + gap);
+            let x = start_x + (pos as u16) * (btn_w + gap);
+            let caption = super::escape_mnemonic(label);
             item(
                 btn_style,
                 [x, height - 22, btn_w, 14],
-                (BTN_BASE + i as i32) as u16,
+                (BTN_BASE + btn_value as i32) as u16,
                 button_cls,
-                label,
+                &caption,
             );
         }
         let template: Vec<u32> = t
@@ -366,7 +433,9 @@ mod dialog {
             .collect();
         let mut state = MessageState {
             chosen: None,
-            button_count: u32::from(btn_count),
+            button_ids: req.buttons.iter().take(3).map(|&(id, _)| id).collect(),
+            default_button: req.default_button,
+            cancel_button: req.cancel_button,
         };
         // SAFETY: `template` is a valid in-memory dialog template and `state`
         // outlives the synchronous `DialogBoxIndirectParamW` call.
@@ -397,26 +466,44 @@ mod dialog {
             match message {
                 wm::WM_INITDIALOG => {
                     wm::SetWindowLongPtrW(dialog, wm::GWLP_USERDATA, lparam);
-                    1
+                    let state = &*(lparam as *const MessageState);
+                    let target = if state.button_ids.contains(&state.default_button) {
+                        state.default_button
+                    } else {
+                        state.button_ids.first().copied().unwrap_or(0)
+                    };
+                    let btn = wm::GetDlgItem(dialog, BTN_BASE + target as i32);
+                    if !btn.is_null() {
+                        SetFocus(btn);
+                        0 // focus explicitly set on the default button
+                    } else {
+                        1
+                    }
                 }
                 wm::WM_COMMAND => {
                     let state = &mut *(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA)
                         as *mut MessageState);
                     let id = (wparam & 0xffff) as i32;
                     if id == wm::IDCANCEL {
-                        state.chosen = None;
-                        wm::EndDialog(dialog, 0);
-                        return 1;
-                    }
-                    if id >= BTN_BASE && (id - BTN_BASE) < state.button_count as i32 {
-                        state.chosen = Some((id - BTN_BASE) as u32);
+                        state.chosen = Some(state.cancel_button);
                         wm::EndDialog(dialog, 1);
                         return 1;
+                    }
+                    if id >= BTN_BASE {
+                        let value = (id - BTN_BASE) as u32;
+                        if state.button_ids.contains(&value) {
+                            state.chosen = Some(value);
+                            wm::EndDialog(dialog, 1);
+                            return 1;
+                        }
                     }
                     0
                 }
                 wm::WM_CLOSE => {
-                    wm::EndDialog(dialog, 0);
+                    let state = &mut *(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA)
+                        as *mut MessageState);
+                    state.chosen = Some(state.cancel_button);
+                    wm::EndDialog(dialog, 1);
                     1
                 }
                 _ => 0,
@@ -588,8 +675,13 @@ static VTABLE: Methods<20> = Methods([
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    /// Serialize tests that mutate process-wide dialog hooks / auto-dismiss.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn block() -> AsyncBlock {
         AsyncBlock {
@@ -658,7 +750,10 @@ mod tests {
     }
 
     #[test]
-    fn message_dialog_returns_chosen_button_and_cancels_without_window() {
+    fn message_dialog_buttons_gaps_default_cancel_and_auto_dismiss() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_auto_dismiss(false);
+
         let this: This = &OBJECT;
         type ShowMsg = extern "system" fn(
             This,
@@ -675,10 +770,12 @@ mod tests {
         let show = method::<ShowMsg>(&OBJECT, 0x18);
         let result = method::<MsgResult>(&OBJECT, 0x20);
 
-        // Fake dialog answers button 2 (BUTTON_SECOND).
-        *MESSAGE_HOOK.lock().unwrap() = Some(Box::new(|req| {
-            assert_eq!(req.title, "Confirm");
-            assert_eq!(req.buttons, ["Yes", "No"]);
+        // 1. Fake dialog answers button 2 (BUTTON_SECOND) and records the request
+        //    without asserting on the worker thread.
+        let recorded = Arc::new(Mutex::new(None::<MessageDialogRequest>));
+        let rec = recorded.clone();
+        *MESSAGE_HOOK.lock().unwrap() = Some(Box::new(move |req| {
+            *rec.lock().unwrap() = Some(req.clone());
             Some(BUTTON_SECOND)
         }));
         let mut b = block();
@@ -691,26 +788,115 @@ mod tests {
                 c"Yes".as_ptr(),
                 c"No".as_ptr(),
                 std::ptr::null(),
+                BUTTON_SECOND,
+                BUTTON_SECOND,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        assert_eq!(result(this, &mut b, std::ptr::null_mut()), E_INVALIDARG);
+        let mut chosen = u32::MAX;
+        assert_eq!(result(this, &mut b, &mut chosen), S_OK);
+        assert_eq!(chosen, BUTTON_SECOND);
+        let req = recorded.lock().unwrap().take().expect("hook ran");
+        assert_eq!(req.title, "Confirm");
+        assert_eq!(req.default_button, BUTTON_SECOND);
+        assert_eq!(req.cancel_button, BUTTON_SECOND);
+        assert_eq!(
+            req.buttons,
+            vec![
+                (BUTTON_FIRST, "Yes".to_owned()),
+                (BUTTON_SECOND, "No".to_owned()),
+            ]
+        );
+
+        // 2. Labels with a gap (null second button): third button keeps BUTTON_THIRD.
+        let rec = recorded.clone();
+        *MESSAGE_HOOK.lock().unwrap() = Some(Box::new(move |req| {
+            *rec.lock().unwrap() = Some(req.clone());
+            Some(BUTTON_THIRD)
+        }));
+        let mut b = block();
+        assert_eq!(
+            show(
+                this,
+                &mut b,
+                c"Gap".as_ptr(),
+                c"Save & Quit".as_ptr(),
+                c"Save".as_ptr(),
+                std::ptr::null(),
+                c"Quit".as_ptr(),
+                BUTTON_THIRD,
+                BUTTON_FIRST,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        assert_eq!(result(this, &mut b, &mut chosen), S_OK);
+        assert_eq!(chosen, BUTTON_THIRD);
+        let req = recorded.lock().unwrap().take().expect("hook ran");
+        assert_eq!(
+            req.buttons,
+            vec![
+                (BUTTON_FIRST, "Save".to_owned()),
+                (BUTTON_THIRD, "Quit".to_owned()),
+            ]
+        );
+        assert_eq!(req.default_button, BUTTON_THIRD);
+        assert_eq!(req.cancel_button, BUTTON_FIRST);
+
+        // 3. Esc / cancel returns req.cancel_button with S_OK.
+        *MESSAGE_HOOK.lock().unwrap() = Some(Box::new(|req| Some(req.cancel_button)));
+        let mut b = block();
+        assert_eq!(
+            show(
+                this,
+                &mut b,
+                c"Esc".as_ptr(),
+                c"Close?".as_ptr(),
+                c"Stay".as_ptr(),
+                c"Leave".as_ptr(),
+                c"Cancel".as_ptr(),
+                BUTTON_FIRST,
+                BUTTON_THIRD,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        assert_eq!(result(this, &mut b, &mut chosen), S_OK);
+        assert_eq!(chosen, BUTTON_THIRD);
+
+        // 4. Unattended auto-dismiss answers with cancel_button without calling the hook.
+        *MESSAGE_HOOK.lock().unwrap() = None;
+        set_auto_dismiss(true);
+        let mut b = block();
+        assert_eq!(
+            show(
+                this,
+                &mut b,
+                c"Auto".as_ptr(),
+                c"Unattended".as_ptr(),
+                c"OK".as_ptr(),
+                c"Cancel".as_ptr(),
+                std::ptr::null(),
                 BUTTON_FIRST,
                 BUTTON_SECOND,
             ),
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
-        assert!(result(this, &mut b, std::ptr::null_mut()) < 0);
-        let mut chosen = u32::MAX;
         assert_eq!(result(this, &mut b, &mut chosen), S_OK);
         assert_eq!(chosen, BUTTON_SECOND);
+        set_auto_dismiss(false);
 
-        // No window / cancelled: completes with E_ABORT.
-        *MESSAGE_HOOK.lock().unwrap() = None;
+        // 5. No window / cannot open: completes with E_ABORT.
         let mut b = block();
         assert_eq!(
             show(
                 this,
                 &mut b,
-                c"Confirm".as_ptr(),
-                c"Proceed?".as_ptr(),
+                c"Headless".as_ptr(),
+                c"No window".as_ptr(),
                 c"OK".as_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
@@ -721,19 +907,24 @@ mod tests {
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), E_ABORT);
         assert_eq!(result(this, &mut b, &mut chosen), E_ABORT);
+        assert_eq!(escape_mnemonic("Save & Exit"), "Save && Exit");
     }
 
     #[test]
-    fn error_dialog_completes_or_cancels_without_window() {
+    fn error_dialog_completes_auto_dismisses_or_cancels_without_window() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_auto_dismiss(false);
+
         let this: This = &OBJECT;
         type ShowErr = extern "system" fn(This, *mut AsyncBlock, HRESULT, *const c_char) -> HRESULT;
         type ErrResult = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
         let show = method::<ShowErr>(&OBJECT, 0x70);
         let result = method::<ErrResult>(&OBJECT, 0x78);
 
-        *ERROR_HOOK.lock().unwrap() = Some(Box::new(|code, ctx| {
-            assert_eq!(code, E_ABORT);
-            assert_eq!(ctx, "network offline");
+        let recorded = Arc::new(Mutex::new(None::<(HRESULT, String)>));
+        let rec = recorded.clone();
+        *ERROR_HOOK.lock().unwrap() = Some(Box::new(move |code, ctx| {
+            *rec.lock().unwrap() = Some((code, ctx.to_owned()));
             true
         }));
         let mut b = block();
@@ -743,9 +934,21 @@ mod tests {
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         assert_eq!(result(this, &mut b), S_OK);
+        assert_eq!(
+            recorded.lock().unwrap().take(),
+            Some((E_ABORT, "network offline".to_owned()))
+        );
+
+        // Unattended auto-dismiss completes immediately with S_OK.
+        *ERROR_HOOK.lock().unwrap() = None;
+        set_auto_dismiss(true);
+        let mut b = block();
+        assert_eq!(show(this, &mut b, E_ABORT, std::ptr::null()), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        assert_eq!(result(this, &mut b), S_OK);
+        set_auto_dismiss(false);
 
         // No window / cannot open: completes as cancelled (E_ABORT).
-        *ERROR_HOOK.lock().unwrap() = None;
         let mut b = block();
         assert_eq!(show(this, &mut b, E_ABORT, std::ptr::null()), S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), E_ABORT);

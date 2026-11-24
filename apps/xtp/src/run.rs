@@ -256,6 +256,7 @@ pub fn run(
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
     if let Some(script) = autopilot {
+        xtp_hle::modules::xgameui::set_auto_dismiss(true);
         let size = image.info().size_of_image as usize;
         xtp_hle::modules::autopilot::start(&script, &hash, image.base(), size)
             .map_err(anyhow::Error::msg)?;

@@ -173,7 +173,7 @@ Legend: ✔ implemented and tested, ◐ partial, ✘ missing, — not needed.
 | XStore: own licence active, add-ons none, store calls fail as offline | ✔ | ✘ refused class | 1 / — | **Keep XTP** (better) |
 | XNetworking: stack up, reaches nothing | ✔ | ✔ real hints, CryptoAPI certificate checks | 1 / 7 | Keep XTP (offline by design) |
 | XGameUi: profile card, text entry (host dialog) | ✔ | → PC runtime | 1 / — | Keep XTP |
-| XGameUi message and error dialogs | ✘ | → PC runtime | — / — | **New work** (R5) |
+| XGameUi message and error dialogs | ✔ host dialogs (`XTP_DIALOGS=auto`) | → PC runtime | 3 / — | Done (R5) |
 | Speech synthesis | ✔ Windows voices, text and SSML to 48 kHz PCM | → PC runtime | 4 / — | Done (R6) |
 | Closed captions, high contrast | ✔ Windows settings and title override | ✔ `accessibility.rs` | 5 / 3 | Done (R7) |
 | XError callback and options | ✘ class absent | ✔ | — / — | After xcl, if the title asks (R9) |
