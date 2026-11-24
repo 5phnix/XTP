@@ -252,6 +252,16 @@ impl<'a> Lower<'a> {
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
+                    // A descriptor's dwords reaching a join that also takes
+                    // data: the registers are reused after the descriptor's
+                    // last access, so the program reads the joined value
+                    // only after the data edge (the console compiler's phi
+                    // of a value defined on one edge only).
+                    // shortcut: undefined on the descriptor edge; wrong if
+                    // the program read the descriptor's dwords as data there.
+                    (Some(Val::Missing(_)), false) if self.descriptor_dword(arg) => {
+                        self.s.m.undef(self.s.t.i32)
+                    }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
@@ -289,5 +299,67 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::emit::tests::{compute, emit_for};
+    use crate::native::{ComputeIo, ResourceType, RootParam, RootType, StageIo, UsedResource};
+
+    /// s8 holds a buffer descriptor's first dword on one edge (a root
+    /// constant chose the load) and 5 on the other, and the program reads
+    /// the joined s8 only where the constant chose the data edge: the
+    /// descriptor edge brings an undefined dword instead of stopping the
+    /// program ("a descriptor's address or format read as data").
+    #[test]
+    fn descriptor_dwords_join_data_as_undefined_on_their_edge() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0009, // s_cbranch_scc1 -> 52
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_2000,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            0xBF82_0001, // s_branch -> 56
+            0xBE88_0385, // 52: s_mov_b32 s8, 5
+            0xBF06_8001, // 56: s_cmp_eq_u32 s1, 0
+            0xBF84_0003, // s_cbranch_scc0 -> 76
+            0x7E06_0208, // v_mov_b32 v3, s8
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            0xBF81_0000, // 76: s_endpgm
+        ];
+        let mut p = compute(&words, false);
+        let param = |root, user_data| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: user_data,
+        };
+        p.layout = vec![param(RootType::Table, 0), param(RootType::Constants, 1)];
+        p.used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        p.io = StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15 | 2 << 1,
+            threads: [64, 1, 1],
+        });
+        emit_for(&p, crate::emit::Target::ANY).unwrap();
     }
 }
