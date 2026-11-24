@@ -165,6 +165,10 @@ pub extern "system" fn XMemVirtualAlloc(
         } else if kind & MEM_COMMIT != 0 {
             uma::committed(at as usize, size);
         }
+        // The GPU side's copies are told of it all: among it, commits into
+        // a reservation the title placed itself, which they take for a
+        // placeholder until then.
+        remapped(at as usize, size);
     }
     if base.is_null() {
         tracing::debug!(
@@ -350,10 +354,26 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 // The memory API set's `VirtualAlloc` and `VirtualFree`, which the title's
 // exe imports: the host's, with the GPU side's heaps over title memory
-// (`xtp_gpu::uma`) kept in step. Nothing else changes; with `XTP_UMA` off,
-// nothing at all. The set's other functions still go to the host.
+// (`xtp_gpu::uma`) kept in step, and its copies told (`remapped`). Nothing
+// else changes; with `XTP_UMA` off, no heaps. The set's other functions
+// still go to the host.
 
-/// The title's `VirtualAlloc`: what it commits of title memory gets heaps.
+/// Tells the GPU side's copies that title memory `[at, at + len)` changed
+/// (`xtp_gpu::title_memory_remapped`): what they noted of it (views,
+/// placeholders, guarded blocks) is out of date. The thread's last error is
+/// kept for the title: the report gives guarded blocks write access back,
+/// which fails harmlessly where they are gone. Our own views of physical
+/// pages (`Section`) are not reported: no copy takes them.
+fn remapped(at: usize, len: usize) {
+    // SAFETY: plain reads and writes of this thread's last error.
+    let error = unsafe { GetLastError() };
+    xtp_gpu::title_memory_remapped(at, len);
+    // SAFETY: as above.
+    unsafe { SetLastError(error) };
+}
+
+/// The title's `VirtualAlloc`: what it commits of title memory gets heaps,
+/// and what it reserves or commits is reported to the GPU side's copies.
 pub extern "system" fn title_virtual_alloc(
     address: *const c_void,
     size: usize,
@@ -362,13 +382,16 @@ pub extern "system" fn title_virtual_alloc(
 ) -> *mut c_void {
     // SAFETY: the title's own arguments, forwarded.
     let at = unsafe { VirtualAlloc(address, size, kind, protect) };
-    if !at.is_null() && kind & MEM_COMMIT != 0 {
+    if !at.is_null() {
         let from = if address.is_null() {
             at.cast_const()
         } else {
             address
         };
-        uma::committed(from as usize, size);
+        if kind & MEM_COMMIT != 0 {
+            uma::committed(from as usize, size);
+        }
+        remapped(from as usize, size);
     }
     at
 }
@@ -383,27 +406,33 @@ const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
 
 /// `VirtualFree`, the heaps over the memory released first: the host
 /// refuses to decommit or release memory under an open heap (error 87).
-/// What is still committed there gets heaps again after.
+/// What is still committed there gets heaps again after. The GPU side's
+/// copies are told once it is done.
 fn free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
-    // Splitting and merging placeholders changes no committed memory.
-    let placeholders = kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) != 0;
-    if !uma::enabled() || placeholders {
-        // SAFETY: the caller's own arguments, forwarded.
-        return unsafe { VirtualFree(address, size, kind) };
-    }
     let (at, len) = match size {
         // The whole allocation, as the host reads a size of 0.
         0 => allocation(address as usize),
         size => (address as usize, size),
     };
-    let change = uma::changing(at, len);
-    // SAFETY: as above.
-    let done = change.call(|| unsafe { VirtualFree(address, size, kind) } != 0);
-    // SAFETY: plain calls; the caller reads the host's error after.
-    let error = unsafe { GetLastError() };
-    change.done(done && kind & MEM_RELEASE != 0);
-    // SAFETY: as above.
-    unsafe { SetLastError(error) };
+    // Splitting and merging placeholders changes no committed memory.
+    let placeholders = kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) != 0;
+    let done = if !uma::enabled() || placeholders {
+        // SAFETY: the caller's own arguments, forwarded.
+        unsafe { VirtualFree(address, size, kind) != 0 }
+    } else {
+        let change = uma::changing(at, len);
+        // SAFETY: as above.
+        let done = change.call(|| unsafe { VirtualFree(address, size, kind) } != 0);
+        // SAFETY: plain calls; the caller reads the host's error after.
+        let error = unsafe { GetLastError() };
+        change.done(done && kind & MEM_RELEASE != 0);
+        // SAFETY: as above.
+        unsafe { SetLastError(error) };
+        done
+    };
+    if done {
+        remapped(at, len);
+    }
     done.into()
 }
 
@@ -990,7 +1019,7 @@ fn map(views: &mut Views, base: usize, len: usize, slice: Slice) -> bool {
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
-    xtp_gpu::title_memory_remapped(base, len);
+    remapped(base, len);
     views.insert(base, (len, slice));
     true
 }
@@ -1048,7 +1077,8 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it. No GPU heap is ever open over these views
 /// (`xtp_gpu::uma` opens physical pages on our own view of them), so none
-/// holds them mapped.
+/// holds them mapped. The GPU side's copies are told before each view goes
+/// and after.
 fn unmap(views: &mut Views, base: usize, len: usize) {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
@@ -1072,7 +1102,9 @@ fn unmap(views: &mut Views, base: usize, len: usize) {
         let Some((size, slice)) = views.remove(&at) else {
             continue;
         };
-        xtp_gpu::title_memory_remapped(at, size);
+        // Before: guarded blocks get write access back, for the title's
+        // writes until the view goes.
+        remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1083,6 +1115,9 @@ fn unmap(views: &mut Views, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        // After: a copy may have guarded the view, and noted it one, since
+        // the report before.
+        remapped(at, size);
         UNMAPS.fetch_add(1, Ordering::Relaxed);
         if at < base {
             map(views, at, base - at, slice.clone());
@@ -1622,10 +1657,17 @@ mod tests {
     }
 
     /// Freeing an allocation's pages unmaps our view of it, once no title
-    /// view shows them any more.
+    /// view shows them any more. Run alone in a child process: our views go
+    /// at the lowest free address from 2^40 on, so a test running alongside
+    /// maps its own allocation where ours was as soon as it is gone (one
+    /// run in five read `MEM_RESERVE` there). The address cannot tell the
+    /// two apart: same base, same kind of view.
     #[test]
     fn freeing_an_allocation_unmaps_our_view() {
         use windows_sys::Win32::System::Memory::MEM_FREE;
+        if !alone("freeing_an_allocation_unmaps_our_view", false) {
+            return;
+        }
         let a = allocate(2);
         let ours = slice(a[0]).section.base;
         assert!(write_physical(&a, 0, &pattern(2 * PAGE)));
@@ -1749,7 +1791,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, MEM_FREE};
         use xtp_gpu::uma::{lookup, settle};
         const TEST: &str = "title_calls_succeed_under_open_heaps";
-        if !alone_with_uma(TEST) {
+        if !alone(TEST, true) {
             return;
         }
         if let Err(reason) = xtp_gpu::uma::ready() {
@@ -1847,25 +1889,29 @@ mod tests {
         assert!(lookup(ours, 1).is_none());
     }
 
-    /// Runs test `name` of this module alone, in a child process with
-    /// `XTP_UMA=1`, and checks that it passed there. True in that child,
-    /// where the test then goes on.
-    fn alone_with_uma(name: &str) -> bool {
-        const CHILD: &str = "XTP_UMA_TEST_CHILD";
+    /// Runs test `name` of this module alone, in a child process, with
+    /// `XTP_UMA=1` if `uma` (else without it), and checks that it passed
+    /// there. True in that child, where the test then goes on.
+    fn alone(name: &str, uma: bool) -> bool {
+        const CHILD: &str = "XTP_ALONE_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            assert!(xtp_gpu::uma::enabled(), "XTP_UMA=1 in the child");
+            assert_eq!(xtp_gpu::uma::enabled(), uma, "XTP_UMA as asked");
             return true;
         }
         let module = module_path!();
         let path = module.split_once("::").map_or(module, |(_, rest)| rest);
         let test = format!("{path}::{name}");
         let exe = std::env::current_exe().expect("the test binary");
-        let out = std::process::Command::new(exe)
+        let mut child = std::process::Command::new(exe);
+        child
             .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .env("XTP_UMA", "1")
-            .output()
-            .expect("the child runs");
+            .env(CHILD, "1");
+        if uma {
+            child.env("XTP_UMA", "1");
+        } else {
+            child.env_remove("XTP_UMA");
+        }
+        let out = child.output().expect("the child runs");
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
