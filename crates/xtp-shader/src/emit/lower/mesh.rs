@@ -22,18 +22,7 @@
 //!   never gets there hangs the GPU; each barrier the lowering keeps must
 //!   be in a block every lane of the group runs as often as the others;
 //! * LDS a group of one console wave shares: the console compiler leaves
-//!   out the barriers between its lanes, which two host waves need;
-//! * LDS order within a console wave of a larger group: one wave's `ds_*`
-//!   instructions run in order on the console, so a lane may read another
-//!   lane's write (or write after its read) with no `s_barrier` between,
-//!   where two host waves race. A program with an LDS read after a write,
-//!   or a write after a read, on a path of the console's flow with no
-//!   group barrier the lowering keeps between them, is refused
-//!   (`mesh_lds_unordered`). None of BTP 6's mesh programs has one: each
-//!   of the five with LDS writes it all, crosses one barrier, then reads
-//!   (`docs/analysis/mesh-wave64.md`). Two writes are not ordered against
-//!   each other: two lanes writing one dword with no barrier between race
-//!   in the HLSL program already.
+//!   out the barriers between its lanes, which two host waves need.
 //!
 //! The output counts need nothing: they are the declared maxima, set once
 //! in the entry block for the whole group (`mesh_prologue`).
@@ -60,41 +49,10 @@ const MESH_LDS_DWORDS: u32 = 28 * 1024 / 4;
 /// 64-lane waves.
 pub(super) const MESH_BARRIER: Why = "a group barrier lanes of a wave64 mesh group reach differently, on a host without 64-lane waves";
 
-/// A wave64 mesh program whose group is one console wave of more lanes than
-/// the host's smallest wave, with LDS, on a host without 64-lane waves.
+/// A wave64 mesh program whose group is one console wave of more than 32
+/// lanes, with LDS, on a host without 64-lane waves.
 pub(super) const MESH_LDS_IN_ONE_WAVE: Why =
     "LDS shared within one wave64 mesh wave, on a host without 64-lane waves";
-
-/// A wave64 mesh program of several console waves whose LDS accesses only
-/// its console waves order (see the module notes), on a host without
-/// 64-lane waves.
-pub(super) const MESH_LDS_ORDER: Why = "LDS read after a write, or written after a read, with no group barrier between, in a wave64 mesh program on a host without 64-lane waves";
-
-/// An LDS access's kinds ([`lds_kinds`]).
-const READS: u8 = 1;
-const WRITES: u8 = 2;
-
-/// What `inst` does to the program's LDS: reads it, writes it, or both
-/// (atomics, exchanges, GWS and counters); 0 for no access (swizzles and
-/// permutes move data between lanes, not through LDS).
-fn lds_kinds(inst: &crate::ir::Inst) -> u8 {
-    let n = inst.name();
-    match inst.fields {
-        crate::gfx10::Fields::Buffer { lds: true, .. } => WRITES,
-        crate::gfx10::Fields::Ds { .. } => {
-            if n.starts_with("ds_swizzle") || n.contains("permute") || n == "ds_nop" {
-                0
-            } else if n.starts_with("ds_read") {
-                READS
-            } else if n.starts_with("ds_write") {
-                WRITES
-            } else {
-                READS | WRITES
-            }
-        }
-        _ => 0,
-    }
-}
 
 impl<'a> Lower<'a> {
     /// Mesh: the counts and the primitives no lane exports. The console's
@@ -153,14 +111,8 @@ impl<'a> Lower<'a> {
         let StageIo::Ms(ms) = &self.x.native.io else {
             return Ok(());
         };
-        // A group no larger than the host's smallest wave is one host wave,
-        // whose LDS accesses run in order as the console's do.
-        let split = ms.threads > self.x.target.lanes_min;
-        if ms.lds_bytes > 0 && split && ms.threads <= 64 {
+        if ms.lds_bytes > 0 && ms.threads > 32 && ms.threads <= 64 {
             return Err(MESH_LDS_IN_ONE_WAVE);
-        }
-        if split && self.mesh_lds_unordered() {
-            return Err(MESH_LDS_ORDER);
         }
         let uniform = self.uniform.as_ref().expect("analysed");
         let p = self.x.p;
@@ -172,48 +124,6 @@ impl<'a> Lower<'a> {
         match divergent {
             Some(_) => Err(MESH_BARRIER),
             None => Ok(()),
-        }
-    }
-
-    /// Mesh: whether an LDS access may follow one of the other kind (a
-    /// read after a write, a write after a read) with no group barrier the
-    /// lowering keeps between them. Over the program's own edges: the
-    /// console's flow, which runs both sides of a branch its lanes take
-    /// apart, one after the other, and follows back edges into the next
-    /// iteration. Per block on entry: the kinds of access since the last
-    /// kept barrier, on any path there.
-    fn mesh_lds_unordered(&self) -> bool {
-        let p = self.x.p;
-        let kept = |b: usize, i: &crate::ir::Inst| {
-            i.name() == "s_barrier" && !self.no_barrier.contains(&b)
-        };
-        let order = crate::ir::reverse_postorder(&p.blocks);
-        let mut entry = vec![0u8; p.blocks.len()];
-        let mut unordered = false;
-        loop {
-            let mut changed = false;
-            for &b in &order {
-                let mut since = entry[b];
-                for inst in &p.blocks[b].insts {
-                    if kept(b, inst) {
-                        since = 0;
-                        continue;
-                    }
-                    let k = lds_kinds(inst);
-                    unordered |= k & READS != 0 && since & WRITES != 0
-                        || k & WRITES != 0 && since & READS != 0;
-                    since |= k;
-                }
-                for t in p.blocks[b].exit.successors() {
-                    if entry[t] | since != entry[t] {
-                        entry[t] |= since;
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                return unordered;
-            }
         }
     }
 

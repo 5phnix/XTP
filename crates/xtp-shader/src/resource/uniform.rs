@@ -35,11 +35,8 @@
 //!   analysis's `source_regs`): an EXEC named there counts (and is not
 //!   uniform, below), the EXEC that
 //!   guards the instruction and the old value of the VGPRs it writes (which
-//!   no lane keeps) do not. `vccz`, `execz` and `lds_direct` (a bit of a
-//!   whole wave's mask, a dword of LDS) are never uniform, scalar
-//!   instructions' operands too, whatever VCC, EXEC or M0 hold. A carry-in
-//!   is read lane by lane: its lane bits must be uniform
-//!   ([`Tracer::mask_uniform`]);
+//!   no lane keeps) do not. A carry-in is read lane by lane: its lane bits
+//!   must be uniform ([`Tracer::mask_uniform`]);
 //! - a phi whose arguments are all uniform, when no branch whose lanes may
 //!   part ways sends lanes to it along different edges: not a join of the
 //!   two arms of such a branch, nor a block of a loop it can leave or stay
@@ -91,9 +88,9 @@
 use std::cell::{OnceCell, RefCell};
 
 use super::{MAX_ROUNDS, Site, Sum, Term, Tracer};
-use crate::emit::lower::uniform::{Sources, is_exec, keeps_old, lane_bit_operand, source_regs};
+use crate::emit::lower::uniform::{keeps_old, source_regs};
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{Exit, Inst, Reg, Value, reverse_postorder};
+use crate::ir::{EXEC, Exit, Inst, Reg, Value, reverse_postorder};
 use crate::structure::{Atom, Bool, Bools, LaneExit, Structured};
 
 /// VALU operations whose result is uniform when their operands are: the
@@ -145,12 +142,21 @@ impl AddressUniformity {
     }
 }
 
-/// The lane mask `inst` reads lane by lane as a carry-in or a select (the
-/// third operand of `v_add_co_ci_u32` and `v_cndmask_b32`, the mesh
-/// analysis's `lane_bit_operand`): its first SGPR and dwords.
+fn is_exec(reg: Reg) -> bool {
+    matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+}
+
+/// The lane mask `inst` reads lane by lane as a carry-in (the third operand
+/// of `v_add_co_ci_u32`): its first SGPR and dwords.
 fn carry_in(inst: &Inst) -> Option<(u8, u8)> {
-    match lane_bit_operand(inst)? {
-        Operand::Scalar { code, dwords } => Some((code, dwords)),
+    let Fields::Valu(f) = &inst.fields else {
+        return None;
+    };
+    if !inst.name().ends_with("_co_ci_u32") {
+        return None;
+    }
+    match f.src.get(2) {
+        Some(&Operand::Scalar { code, dwords }) => Some((code, dwords)),
         _ => None,
     }
 }
@@ -335,10 +341,7 @@ impl Tracer<'_> {
             return true;
         }
         match &inst.fields {
-            Fields::Sop { .. } => {
-                source_regs(inst) != Sources::Lane
-                    && inst.reads.iter().all(|&(_, x)| self.uniform(x))
-            }
+            Fields::Sop { .. } => inst.reads.iter().all(|&(_, x)| self.uniform(x)),
             Fields::Valu(_) if !keeps_old(inst) && UNIFORM_VALU.contains(&inst.name()) => {
                 self.valu_uniform(site, inst)
             }
@@ -370,10 +373,7 @@ impl Tracer<'_> {
         if !matches!(inst.fields, Fields::Valu(_)) {
             return false;
         }
-        let sources = source_regs(inst);
-        if sources == Sources::Lane {
-            return false;
-        }
+        let sources = source_regs(inst, if self.p.wave64 { 2 } else { 1 });
         let carry = carry_in(inst);
         if let Some((code, dwords)) = carry {
             let lo = inst.read(Reg::S(code));
@@ -386,9 +386,11 @@ impl Tracer<'_> {
             (Reg::S(c), Some((code, n))) => (code..code + n).contains(&c),
             _ => false,
         };
+        // Without a list of operands (`v_movrel*`), every read counts.
+        let operand = |r: Reg| sources.as_ref().is_none_or(|s| s.contains(&r));
         inst.reads
             .iter()
-            .all(|&(reg, x)| !sources.has(reg) || carried(reg) || self.uniform(x))
+            .all(|&(reg, x)| !operand(reg) || carried(reg) || self.uniform(x))
     }
 
     /// Whether the lane mask `lo` (with `hi` in wave64) has the same bit in
@@ -691,43 +693,6 @@ mod tests {
             assert!(st.guards[0][4].is_some(), "{what}: the move is guarded");
             assert!(t.uniform(v7(0)), "{what}: the old value is uniform");
             assert!(!t.uniform(v7(4)), "{what}");
-        }
-    }
-
-    /// `vccz`, `execz` and `lds_direct` are never uniform, as operands of
-    /// a VALU or a scalar instruction, though VCC and M0 hold constants
-    /// here and every lane runs the moves (the shared `source_regs`).
-    #[test]
-    fn special_operands_are_never_uniform() {
-        for (op, what, dst) in [
-            (0x7E02_02FB, "v_mov_b32 v1, src_vccz", Reg::V(1)),
-            (0x7E02_02FC, "v_mov_b32 v1, src_execz", Reg::V(1)),
-            (0x7E02_02FE, "v_mov_b32 v1, src_lds_direct", Reg::V(1)),
-            (0xBE81_03FB, "s_mov_b32 s1, src_vccz", Reg::S(1)),
-        ] {
-            let words: [u32; 5] = [
-                0xBEEA_0380, // s_mov_b32 vcc_lo, 0
-                0xBEFC_0380, // s_mov_b32 m0, 0
-                0x7E04_0280, // v_mov_b32 v2, 0
-                op,
-                0xBF81_0000, // s_endpgm
-            ];
-            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            let text: Vec<String> = crate::gfx10::decode(&code)
-                .unwrap()
-                .iter()
-                .map(|i| i.text(false))
-                .collect();
-            assert_eq!(text[3], what, "{text:#?}");
-            let p = crate::ir::build(&code, false, 256).unwrap();
-            let st = crate::structure::structure(&p).unwrap();
-            let t = Tracer::new(&p, &[], HwStage::Cs, Some(&st)).unwrap();
-            let insts = &p.blocks[0].insts;
-            assert!(
-                t.uniform(insts[2].write(Reg::V(2)).unwrap()),
-                "v_mov_b32 v2, 0"
-            );
-            assert!(!t.uniform(insts[3].write(dst).unwrap()), "{what}");
         }
     }
 }
