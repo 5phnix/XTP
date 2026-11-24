@@ -174,8 +174,12 @@ impl Shader {
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
         self.m.ptr(fty);
-        self.ops
-            .insert(name.split('.').next().unwrap_or(name).to_owned());
+        // One allocation per distinct operation, not per call: every
+        // translation (the runtime's too) records them.
+        let op = name.split('.').next().unwrap_or(name);
+        if !self.ops.contains(op) {
+            self.ops.insert(op.to_owned());
+        }
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
