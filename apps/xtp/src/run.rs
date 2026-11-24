@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -11,6 +11,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    autopilot: Option<PathBuf>,
 ) -> Result<()> {
     use std::sync::Arc;
     use xtp_hle::{HleResolver, HostPolicy};
@@ -19,6 +20,16 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     xtp_hle::modules::lifecycle::wait_for_previous();
     let cfg = xtp_core::Config::load()?;
+    let input = &cfg.input;
+    xtp_hle::modules::gameinput::configure(&xtp_hle::modules::gameinput::Settings {
+        keyboard_mouse: input.keyboard_mouse,
+        mouse_sensitivity: input.mouse_sensitivity,
+        mouse_curve: input.mouse_curve,
+        mouse_dead_zone: input.mouse_dead_zone,
+        invert_y: input.invert_y,
+        bindings: input.bindings.clone(),
+    })
+    .map_err(|e| anyhow::anyhow!("[input] in the config: {e}"))?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = xtp_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -30,6 +41,8 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     xtp_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = xtp_loader::load(&prepared, &images)?;
+    // SAFETY: just mapped from the executable `hash` names; no title code has run.
+    unsafe { xtp_game::watchdog::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
     xtp_hle::runtime::set_main_image(image.base());
     xtp_hle::runtime::set_image_path(image.base(), exe);
     println!(
@@ -116,6 +129,11 @@ pub fn run(
     xtp_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    if let Some(script) = autopilot {
+        let size = image.info().size_of_image as usize;
+        xtp_hle::modules::autopilot::start(&script, &hash, image.base(), size)
+            .map_err(anyhow::Error::msg)?;
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
@@ -329,6 +347,13 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: Option<PathBuf>,
+) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

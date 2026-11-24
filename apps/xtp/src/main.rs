@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+mod survey;
 mod translate;
 
 use std::path::PathBuf;
@@ -85,6 +86,28 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Survey a shader pack (your own `shaders.rpf`): every program through
+    /// the translator, counted once under its first blocker and grouped by
+    /// the backlog item that removes it (docs/analysis/shader.md, S0).
+    /// Defaults to `XTP_SAMPLE_SHADERS`, else `shaders.rpf` in the
+    /// configured game folder.
+    ShaderSurvey {
+        pack: Option<PathBuf>,
+        /// Also write the survey as stable JSON (one program per line, with
+        /// the hash of its translation), to compare two runs as text.
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+        /// Check every translation with dxil.dll's validator (`XTP_DXIL`,
+        /// else the newest Windows SDK's).
+        #[arg(long)]
+        validate: bool,
+        /// Validate the translations of every Nth record only.
+        #[arg(long, value_name = "N")]
+        validate_every: Option<usize>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -100,6 +123,9 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Drive the title by this script (autopilot/, docs/dev/autopilot.md).
+        #[arg(long, value_name = "SCRIPT")]
+        autopilot: Option<PathBuf>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -153,14 +179,22 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => translate::run(paths, validate, pipelines, list, jobs),
+        Command::ShaderSurvey {
+            pack,
+            json,
+            validate,
+            validate_every,
+            jobs,
+        } => survey::run(pack, json, validate_every.or(validate.then_some(1)), jobs),
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
             console,
+            autopilot,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => run::run(&exe, unimplemented, strict, execute, console, autopilot),
         Command::Config => show_config(),
     }
 }

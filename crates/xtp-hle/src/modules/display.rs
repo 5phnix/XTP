@@ -100,6 +100,14 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     // SAFETY: the request we just created.
     if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
         let hr = last_error();
+        // A session without a desktop (a service, an SSH session on a build
+        // machine) refuses display requests with ERROR_NOT_SUPPORTED: there is
+        // no display to keep on, so there is nothing to defer. The title still
+        // gets a handle, which `close_deferral` releases as usual.
+        const NOT_SUPPORTED: HRESULT = 0x8007_0032_u32 as i32;
+        if hr == NOT_SUPPORTED {
+            return put(out, request);
+        }
         // SAFETY: as above; not handed out.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
         return hr;

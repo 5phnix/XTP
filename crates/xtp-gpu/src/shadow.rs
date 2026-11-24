@@ -10,18 +10,28 @@
 //! in its copy. Ranges shaders write go back to title memory after the
 //! submission ([`Shadow::gpu_writes`]).
 //!
+//! The list's buffer copies and memory writes that touch a copy run on
+//! the GPU at their place in the list ([`copy`], [`write`]), so they see
+//! what shaders before them wrote and later commands see their result.
+//!
 //! shortcut: only the ranges draws are known to read are brought up to
 //! date (vertex and index buffer views, constant buffers in tables, root
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
+//!
+//! shortcut: copies have no tracked resource state. Like every other use,
+//! the GPU copies and writes take them as common (draws rely on implicit
+//! promotion), with an unordered access barrier first so that earlier
+//! shader writes are done; the debug layer may report the state.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::core::Interface;
 
-use crate::host::{HostList, host};
+use crate::host::{HostList, host, transition, uav_barrier};
 use crate::watch::PAGE;
 
 /// A title buffer's host copy.
@@ -260,6 +270,46 @@ impl Shadow {
         written
     }
 
+    /// A buffer copy `list` records on the GPU writes `[address, address +
+    /// len)` of the copy: once the list has run, the range goes back into
+    /// title memory, all of it ([`Shadow::write_back`]).
+    pub(crate) fn gpu_copies(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        let len = len.min(self.left(address));
+        list.defer_gpu_copy(self, address as usize, len as usize);
+    }
+
+    /// After the submission ran: writes `[address, address + len)` of the
+    /// copy into title memory (unmapped pages left alone), as the GPU
+    /// copies that wrote it would have. Unlike [`Shadow::copy_back`], no
+    /// snapshot tells the GPU's bytes apart: the range is exactly what a
+    /// copy wrote. Returns the bytes written.
+    pub(crate) fn write_back(&self, address: usize, len: usize) -> usize {
+        let (from, to) = self.inside(address, len);
+        if from >= to {
+            return 0;
+        }
+        let start = self.start as usize;
+        crate::watch::writing(start + from, to - from);
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host = unsafe { self.data.add(from) };
+        crate::host::write_mapped((start + from) as *mut u8, host, to - from);
+        // Whole pages written are now as the copy has them: our own write
+        // is not taken for the title's (a title write after it shows at
+        // the next refresh).
+        let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+        if first < last
+            && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+            && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+        {
+            let base = start / PAGE;
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for page in first..last {
+                copied[page - base] = now;
+            }
+        }
+        to - from
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -434,6 +484,172 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
     }
     entry.shadow.clone()
+}
+
+/// The copy [`find`] gives `[address, address + len)`, if it is made
+/// already.
+pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers();
+    match map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+    {
+        Some((_, entry)) => entry.shadow.clone(),
+        None => {
+            drop(map);
+            let start = address & !(WINDOW - 1);
+            let len = end.next_multiple_of(WINDOW) - start;
+            let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&(start, len)).cloned()
+        }
+    }
+}
+
+/// A buffer copy of `len` bytes from title address `src` to `dst` in
+/// `list`. When either side has a host copy, shaders may have written the
+/// source earlier in the submission or read the destination later, so the
+/// copy runs on the GPU between host copies (made for the other side if
+/// need be) at its place in the list, and the destination goes back to
+/// title memory once the list has run. Returns false, recording nothing,
+/// when neither side has a copy: title memory is then all there is, and
+/// the caller copies it on the CPU at submission.
+pub(crate) fn copy(list: &HostList, dst: u64, src: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let (from, to) = (existing(src, len), existing(dst, len));
+    if from.is_none() && to.is_none() {
+        return false;
+    }
+    let (Some(from), Some(to), Some(host)) = (
+        from.or_else(|| find(src, len)),
+        to.or_else(|| find(dst, len)),
+        host(),
+    ) else {
+        return false;
+    };
+    let (at, from_at) = (to.offset(dst), from.offset(src));
+    let same = from.buffer.as_raw() == to.buffer.as_raw();
+    // Overlapping ranges of one buffer go through a buffer of the list's
+    // own, as if the source were read whole first.
+    let through = if same && from_at < at + len && at < from_at + len {
+        let Some((through, _)) = host.shared_buffer(len) else {
+            return false;
+        };
+        list.keep(&through);
+        Some(through)
+    } else {
+        None
+    };
+    // The source as the title or earlier work of the submission left it.
+    from.refresh(list, src, len);
+    to.gpu_copies(list, dst, len);
+    #[cfg(feature = "diagnostics")]
+    list.note_read(
+        || format!("copy {len:#x} bytes from {src:#x} to {dst:#x} on the GPU"),
+        (from.gpu(src), len),
+    );
+    let (common, source, dest) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    // SAFETY: an open list and live buffers (the steps above keep both
+    // copies until the list is reset); ranges inside both.
+    unsafe {
+        if let Some(through) = &through {
+            let b = &from.buffer;
+            list.list.ResourceBarrier(&[
+                uav_barrier(),
+                transition(b, common, source),
+                transition(through, common, dest),
+            ]);
+            list.list.CopyBufferRegion(through, 0, b, from_at, len);
+            list.list.ResourceBarrier(&[
+                transition(b, source, dest),
+                transition(through, dest, source),
+            ]);
+            list.list.CopyBufferRegion(b, at, through, 0, len);
+            list.list.ResourceBarrier(&[transition(b, dest, common)]);
+        } else if same {
+            // One buffer is the source and the destination: copied within
+            // it as a destination.
+            let b = &to.buffer;
+            list.list
+                .ResourceBarrier(&[uav_barrier(), transition(b, common, dest)]);
+            list.list.CopyBufferRegion(b, at, b, from_at, len);
+            list.list.ResourceBarrier(&[transition(b, dest, common)]);
+        } else {
+            let (a, b) = (&from.buffer, &to.buffer);
+            list.list.ResourceBarrier(&[
+                uav_barrier(),
+                transition(a, common, source),
+                transition(b, common, dest),
+            ]);
+            list.list.CopyBufferRegion(b, at, a, from_at, len);
+            list.list
+                .ResourceBarrier(&[transition(a, source, common), transition(b, dest, common)]);
+        }
+    }
+    true
+}
+
+/// A memory write in `list` of the low `bytes` (4 or 8) of `value` at
+/// title address `address`: if the address has a host copy, also written
+/// there on the GPU at this place in the list, so that later commands of
+/// the list read it (title memory gets it once the list has run, as
+/// before). Returns whether it was.
+///
+/// shortcut: only where a copy exists already (a word nothing on the GPU
+/// read yet does not get one), and only values: timestamps are known when
+/// the list has run.
+pub(crate) fn write(list: &HostList, address: u64, value: u64, bytes: usize) -> bool {
+    if !matches!(bytes, 4 | 8) || !address.is_multiple_of(4) {
+        return false;
+    }
+    let Some(shadow) = existing(address, bytes as u64) else {
+        return false;
+    };
+    let Ok(list2) = list.list.cast::<ID3D12GraphicsCommandList2>() else {
+        return false;
+    };
+    let gpu = shadow.gpu(address);
+    let words = [value as u32, (value >> 32) as u32];
+    let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words[..bytes / 4]
+        .iter()
+        .zip(0..)
+        .map(|(&word, i)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+            Dest: gpu + 4 * i,
+            Value: word,
+        })
+        .collect();
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("write {value:#x} ({bytes} bytes) at {address:#x} on the GPU"));
+    list.keep(&shadow.buffer);
+    list.count_gpu_write(bytes);
+    let b = &shadow.buffer;
+    // SAFETY: an open list, a live buffer (kept until the list is reset)
+    // and destinations inside it.
+    unsafe {
+        list2.ResourceBarrier(&[
+            uav_barrier(),
+            transition(
+                b,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+        ]);
+        list2.WriteBufferImmediate(params.len() as u32, params.as_ptr(), None);
+        list2.ResourceBarrier(&[transition(
+            b,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
+    }
+    true
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand

@@ -4,6 +4,7 @@
 //! file (`XTP_CONFIG`, else `./xtp.toml`), then the default.
 //! See `xtp.example.toml` at the repository root.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -22,8 +23,27 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// A data folder kept as it is (a save in the world, say), copied for
+    /// each `cargo xtask play` run.
+    pub golden_data: Option<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+    /// `[input]`: keyboard and mouse settings, from the file only.
+    pub input: Input,
+}
+
+/// `[input]`; unset values keep the input module's defaults.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Input {
+    pub keyboard_mouse: Option<bool>,
+    pub mouse_sensitivity: Option<f32>,
+    pub mouse_curve: Option<f32>,
+    pub mouse_dead_zone: Option<f32>,
+    pub invert_y: Option<bool>,
+    /// `[input.bindings]`: pad control to key and mouse input names.
+    #[serde(default)]
+    pub bindings: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +51,8 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    input: Input,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,6 +63,7 @@ struct FilePaths {
     data_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
+    golden_data: Option<PathBuf>,
 }
 
 impl Config {
@@ -67,7 +90,9 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        let mut config = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
+        config.input = parsed.input;
+        Ok(config)
     }
 
     fn resolve(
@@ -93,7 +118,9 @@ impl Config {
             cache_dir,
             data_dir,
             test_titles,
+            golden_data: env_path("XTP_GOLDEN_DATA").or(file.golden_data),
             source,
+            input: Input::default(),
         })
     }
 
@@ -152,6 +179,20 @@ mod tests {
     }
 
     #[test]
+    fn golden_data_comes_from_the_environment_or_the_file() {
+        let file = || FilePaths {
+            golden_data: Some("golden-from-file".into()),
+            ..Default::default()
+        };
+        let none = |_: &str| None;
+        let cfg = Config::resolve(file(), None, none).unwrap();
+        assert_eq!(cfg.golden_data, Some(PathBuf::from("golden-from-file")));
+        let env = |k: &str| (k == "XTP_GOLDEN_DATA").then(|| OsString::from("golden-from-env"));
+        let cfg = Config::resolve(file(), None, env).unwrap();
+        assert_eq!(cfg.golden_data, Some(PathBuf::from("golden-from-env")));
+    }
+
+    #[test]
     fn empty_env_values_are_ignored() {
         let file = FilePaths {
             game_dir: Some("from-file".into()),
@@ -190,6 +231,28 @@ mod tests {
         let text = include_str!("../../../xtp.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+        // Its `[input]` only shows the defaults, commented out.
+        assert!(parsed.input.keyboard_mouse.is_none() && parsed.input.bindings.is_empty());
+    }
+
+    #[test]
+    fn input_section_parses() {
+        let text = r#"
+            [input]
+            mouse_sensitivity = 1.5
+            invert_y = true
+            [input.bindings]
+            a = ["Space", "MouseBack"]
+            menu = []
+        "#;
+        let parsed: FileConfig = toml::from_str(text).unwrap();
+        assert_eq!(parsed.input.mouse_sensitivity, Some(1.5));
+        assert_eq!(parsed.input.invert_y, Some(true));
+        assert_eq!(parsed.input.bindings["a"], ["Space", "MouseBack"]);
+        assert!(parsed.input.bindings["menu"].is_empty());
+        // A misspelt setting is refused, not ignored.
+        let misspelt = toml::from_str::<FileConfig>("[input]\nsensitivity = 2.0\n");
+        assert!(misspelt.is_err());
     }
 
     #[test]

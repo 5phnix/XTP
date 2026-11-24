@@ -110,7 +110,8 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
+/// Runs the lists' host lists and waits for them (decision 0007), counted
+/// as one title submission for the frame-rate line.
 extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
@@ -123,7 +124,7 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&host_lists);
+        host.submit(&host_lists);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -227,8 +228,8 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
-pub(crate) fn presented() -> u64 {
+/// Frames the title presented so far.
+pub fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
