@@ -446,12 +446,17 @@ pub fn emit_for(
             match lowered {
                 Ok(l) => l,
                 // What the console flow cannot lower keeps the per-lane form
-                // where that translates; else the console flow's reason.
+                // where that translates. Else the reason is the console
+                // flow's where the program needs it to run at all (a wave64
+                // on a host without 64-lane waves: the per-lane form's
+                // reason is only that), and the per-lane form's elsewhere:
+                // what removes that one translates the program there.
                 Err(e) => {
                     parts.st = st;
                     parts.console_cf = false;
                     parts.per_lane_only = true;
-                    lower::lower(&parts).map_err(|_| e)?
+                    let halves = native.wave64 && !target.runs(64);
+                    lower::lower(&parts).map_err(|per_lane| if halves { e } else { per_lane })?
                 }
             }
         }
