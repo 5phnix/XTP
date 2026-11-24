@@ -20,9 +20,11 @@
 //!
 //! A stand-in with an alpha channel the title's format lacks (R9G9B9E5 as
 //! RGBA16F, B5G6R5 as RGBA8, [`alpha_one`]) reads alpha as one, as the
-//! console does: shader views force it to one, and pipelines rendering to
-//! such a target neither write alpha nor blend with it (`pipeline/host.rs`,
-//! `blend_without_alpha`).
+//! console does: shader views force it to one.
+//!
+//! shortcut: pipelines rendering to such a target still write its alpha and
+//! blend with it (the console's destination alpha reads one); the fix,
+//! moved out of the dark-world delivery, belongs to `pipeline/host.rs`.
 //!
 //! shortcut: a stand-in has more precision than the console's format, so
 //! what a pass renders keeps bits the console would round away (B5G5R5A1's
