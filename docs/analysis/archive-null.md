@@ -220,5 +220,59 @@ a thread keeps guarding a 2 MiB view while the test reads a file into it.
 - Now: none of 1,000, and the data lands. The next copy then sees every page
   written.
 
+**When the write is done.** When the token drops, the pages of write-watched
+memory it covered are noted written (a fresh asking in the journal), after
+any asking made while it was under way. A device writing into pages locked
+when the read began (unbuffered reads, which BTP 6 makes; overlapped reads)
+does so without a fault and leaves no trace for a copy that asked in
+between. Copies are taken only of pages known written, so without this one
+would stay stale. View memory needs nothing more: its blocks stayed open
+and are reported written until a copy guards them again. The test is
+`watch::tests::a_kernel_write_is_noted_written_when_it_is_done`. For
+overlapped reads, a thread of ours looks every millisecond while some are
+pending. BTP 6 calls none of the completion functions
+(`GetOverlappedResult`, completion ports) we could hook instead.
+
 **The workaround, kept:** `XTP_TITLE_ASSERTS=continue` still lets a session
 pass the check if an Archive header fails for another reason.
+
+## The session after the fix
+
+Session watchdog3-b, PC, Series S, 2026-11-24 21:48–21:51:
+- run `E:\xtp-data\cache\play\20261124-204819`, branch at 70f4688 (the fix
+  plus main with the wave64 mesh programs and the FidelityFX HLE);
+- **without `XTP_TITLE_ASSERTS`**, with `XTP_WATCHDOG_HOOK=1`,
+  `XTP_XMEM_LEDGER=1` and captures.
+
+What it showed:
+- Gameplay at 26 s, then the 150 s the autopilot asks for. Exit code 0, no
+  `crashes.log`, no `int3`.
+- No failed DirectStorage request, and no "read was cut" warning (the
+  fallback re-read never ran).
+- 79 files opened through DirectStorage.
+- World captures in `E:\xtp-data\runs\frames-watchdog`, frames 796 to 941:
+  the intro's title card and credits, over a world still drawn black. That
+  is the black world of task c19d640b, not this one.
+
+One session cannot prove a race gone: run A was the only one of 40 with
+it. The proof is the test, which failed every read before the fix and none
+of 1,000 after.
+
+## The GPU side's own kernel copies (proposed, outside this task's files)
+
+`crates/xtp-gpu/src/host.rs` has the same race for its kernel copy mode,
+which the review of this fix pointed out:
+- `copy` (about line 2457) calls `crate::watch::writing` and then
+  `ReadProcessMemory` into title memory. A copy guarding the blocks in
+  between cuts the read.
+- `write_mapped` (about line 2509) uses `WriteProcessMemory`, which lifts a
+  read-only protection itself, without a fault. A block a copy guarded is
+  then written but still counted clean. `shadow.rs`'s `write_title` goes
+  through it too.
+
+Holding a `KernelWrite` across each covers both, `shadow.rs` included:
+- in `copy`:
+  `let _writing = title_dst.then(|| crate::watch::kernel_writing(dst as usize, len));`
+  in place of the `writing` call;
+- at the top of `write_mapped`:
+  `let _writing = crate::watch::kernel_writing(dst as usize, len);`.

@@ -1693,8 +1693,47 @@ const INVALID_USER_BUFFER: u32 = 1784;
 const IO_PENDING: u32 = 997;
 
 /// Overlapped reads into title memory still under way: the `OVERLAPPED`
-/// each was given, and the announcement that holds its destination open.
+/// each was given, and the announcement that holds its destination open
+/// (and, once it drops, notes it written).
 static PENDING_READS: Mutex<Vec<(usize, xtp_gpu::KernelWrite)>> = Mutex::new(Vec::new());
+static READS_PENDING: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Holds the destination of overlapped read `overlapped` open until it
+/// completes. A thread of ours looks every millisecond while some are
+/// pending, so that copies take their pages soon after the device wrote
+/// them, not only at the title's next read (BTP 6 calls none of the
+/// completion functions we could hook).
+fn hold_until_done(overlapped: usize, writing: xtp_gpu::KernelWrite) {
+    static WATCHER: std::sync::Once = std::sync::Once::new();
+    WATCHER.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("xtp-overlapped-reads".into())
+            .spawn(|| {
+                loop {
+                    {
+                        let mut pending = PENDING_READS.lock().unwrap_or_else(|e| e.into_inner());
+                        while pending.is_empty() {
+                            pending = READS_PENDING
+                                .wait(pending)
+                                .unwrap_or_else(|e| e.into_inner());
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    finish_overlapped_reads();
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "overlapped reads are let go only at the next read: no thread to watch them ({e})"
+            );
+        }
+    });
+    PENDING_READS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((overlapped, writing));
+    READS_PENDING.notify_one();
+}
 
 /// Lets go of the destinations of the overlapped reads that completed: the
 /// kernel replaces the `OVERLAPPED`'s status (its first field,
@@ -1753,10 +1792,7 @@ pub extern "system" fn ReadFile(
         error = unsafe { GetLastError() };
     }
     if done == 0 && error == IO_PENDING && !overlapped.is_null() {
-        PENDING_READS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((overlapped as usize, writing));
+        hold_until_done(overlapped as usize, writing);
     } else {
         drop(writing);
     }
@@ -2096,21 +2132,26 @@ mod tests {
     }
 
     /// An overlapped read still under way keeps its destination open until
-    /// the kernel sets the `OVERLAPPED`'s status, then lets it go.
+    /// the kernel sets the `OVERLAPPED`'s status; then the watching thread
+    /// lets it go, without another read.
     #[test]
     fn overlapped_reads_hold_their_destination_until_they_complete() {
         let mut status: usize = 0x103; // STATUS_PENDING
         let at = (&raw mut status) as usize;
         let destination = [0u8; 64];
         let writing = xtp_gpu::kernel_will_write(destination.as_ptr() as usize, 64);
-        PENDING_READS.lock().unwrap().push((at, writing));
+        hold_until_done(at, writing);
         let held = || PENDING_READS.lock().unwrap().iter().any(|&(o, _)| o == at);
+        std::thread::sleep(std::time::Duration::from_millis(20));
         finish_overlapped_reads();
         assert!(held(), "still pending");
         // SAFETY: our local, as the kernel writes the status on completion.
         unsafe { (&raw mut status).write_volatile(0) };
-        finish_overlapped_reads();
-        assert!(!held(), "completed: let go");
+        let waited = std::time::Instant::now();
+        while held() && waited.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!held(), "completed: let go by the watching thread");
     }
 
     fn text(v: &[u16]) -> String {

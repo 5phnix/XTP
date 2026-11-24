@@ -621,18 +621,66 @@ fn is_flying(flying: &[Range<usize>], block: usize) -> bool {
 }
 
 /// A kernel write into title memory under way, from [`kernel_writing`] until
-/// this drops: its blocks stay open.
+/// this drops: its blocks stay open. When it drops, the write is done, and
+/// its pages are noted written for copies of write-watched memory too
+/// ([`kernel_write_done`]).
 #[must_use = "dropping it at once leaves the blocks to the next copy before the kernel writes them"]
 #[derive(Debug)]
-pub struct KernelWrite(u64);
+pub struct KernelWrite {
+    id: u64,
+    pages: Range<usize>,
+}
 
 impl Drop for KernelWrite {
     fn drop(&mut self) {
-        if self.0 != 0 {
+        if self.id != 0 {
+            // Noted before the write stops counting as under way: a copy
+            // in between finds the pages both ways.
+            kernel_write_done(self.pages.clone());
             let mut f = in_flight();
-            f.writes.remove(&self.0);
+            f.writes.remove(&self.id);
             FLYING.store(f.writes.len(), SeqCst);
         }
+    }
+}
+
+/// The largest kernel write whose pages [`kernel_write_done`] notes one by
+/// one (16 GiB): a title buffer is far smaller.
+const NOTED_PAGES: usize = (16 << 30) / PAGE;
+
+/// A kernel write into pages `pages` is done: where they are write-watched,
+/// they are noted written now, after any asking made while it was under
+/// way, so that the next copy takes them again. A device that writes into
+/// pages locked when the read began (unbuffered or overlapped reads) does
+/// so without a fault and need not leave a trace a copy has not already
+/// cleared. View memory needs nothing: its blocks were left open meanwhile
+/// and are reported written until a copy guards them again.
+fn kernel_write_done(pages: Range<usize>) {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    if pages.is_empty() || pages.len() > NOTED_PAGES {
+        return;
+    }
+    let (mut found, mut count, mut granularity) = (0usize, 1, 0);
+    // SAFETY: room for the one address asked for; no reset. It fails
+    // outside write-watched memory.
+    let watched = unsafe {
+        GetWriteWatch(
+            0,
+            (pages.start * PAGE) as *const _,
+            pages.len() * PAGE,
+            (&raw mut found).cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } == 0;
+    if !watched {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    for page in pages {
+        j.written.insert(page, now);
     }
 }
 
@@ -647,13 +695,14 @@ impl Drop for KernelWrite {
 /// once the write is done: for an overlapped read, once it completed.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     if len == 0 {
-        return KernelWrite(0);
+        return KernelWrite { id: 0, pages: 0..0 };
     }
+    let pages = blocks(at, len);
     let id = {
         let mut f = in_flight();
         let id = f.next;
         f.next += 1;
-        f.writes.insert(id, blocks(at, len));
+        f.writes.insert(id, pages.clone());
         FLYING.store(f.writes.len(), SeqCst);
         id
     };
@@ -663,8 +712,8 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     // waits for it, and the opening undoes what it guarded; a copy after it
     // sees this write. (`writing`'s shortcut never fires in the world, where
     // some view is always guarded.)
-    open(&mut guards(), blocks(at, len));
-    KernelWrite(id)
+    open(&mut guards(), pages.clone());
+    KernelWrite { id, pages }
 }
 
 /// Whether some block of view memory is guarded now, without the guards'
@@ -2515,6 +2564,55 @@ pub(crate) mod tests {
         let written = guard(view, view + len).unwrap();
         assert_eq!(written.len(), len / PAGE);
         unmapped(view, BLOCKS);
+    }
+
+    /// A kernel write into write-watched memory is noted written once it is
+    /// done, after an asking made while it was under way: a device writing
+    /// into pages locked when the read began (unbuffered or overlapped
+    /// reads) leaves no trace for a copy that asked in between, and copies
+    /// are taken only of pages known written.
+    #[test]
+    fn a_kernel_write_is_noted_written_when_it_is_done() {
+        let _serial = serial();
+        // SAFETY: a fresh write-watched allocation, released below.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 4 * PAGE);
+        writes(start, end, false).expect("watched");
+        let writing = kernel_writing(p + PAGE, 2 * PAGE);
+        // A copy asks while the device writes: nothing to see yet.
+        let (during, _) = writes(start, end, false).unwrap();
+        drop(writing);
+        let (after, written) = writes(start, end, false).unwrap();
+        assert!(after > during);
+        let noted: Vec<usize> = written
+            .iter()
+            .filter(|&&(_, asking)| asking > during)
+            .map(|&(page, _)| page)
+            .collect();
+        assert_eq!(noted, [p / PAGE + 1, p / PAGE + 2]);
+        // An announcement outside write-watched memory notes nothing.
+        let view = mapped(1);
+        let before = JOURNAL.lock().unwrap().asked;
+        drop(kernel_writing(view, PAGE));
+        assert_eq!(JOURNAL.lock().unwrap().asked, before);
+        unmapped(view, 1);
+        // SAFETY: our allocation.
+        assert_ne!(unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) }, 0);
+        // Its pages leave the journal, as other tests may get the address.
+        let mine = p / PAGE..p / PAGE + 4;
+        JOURNAL
+            .lock()
+            .unwrap()
+            .written
+            .retain(|page, _| !mine.contains(page));
     }
 
     /// Whether one protection change over a run of blocks costs less than
