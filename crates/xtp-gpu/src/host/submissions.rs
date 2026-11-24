@@ -331,10 +331,18 @@ unsafe impl Sync for Shared {}
 // SAFETY: as above.
 unsafe impl Send for Shared {}
 
-/// A list reset while its submission runs records into fresh memory: its
-/// scratch memory is not reused and its allocator is another, so the
-/// running submission reads what it was given. The old memory goes back
-/// once that submission has finished.
+impl Shared {
+    /// The list, through the whole wrapper (a closure naming its field
+    /// would take the list alone, which is not `Sync`).
+    fn get(&self) -> &HostList {
+        &self.0
+    }
+}
+
+/// A title's list reset while its submission runs records into fresh
+/// memory: its scratch memory is not reused and its allocator is another,
+/// so the running submission reads what it was given. The old memory goes
+/// back once that submission has finished.
 #[test]
 fn a_list_reset_while_it_runs_records_into_fresh_memory() {
     let test = "host::submissions::a_list_reset_while_it_runs_records_into_fresh_memory";
@@ -370,7 +378,7 @@ fn a_list_reset_while_it_runs_records_into_fresh_memory() {
     list.defer_write(ptr(&first), Written::Value(7), 8);
     list.close();
     let mut gate = Gate::close(host);
-    host.execute(&[&list]);
+    host.submit(&[&list]);
     assert!(list.running());
     let allocator = list.allocator.lock().unwrap().as_raw();
     list.reset();
@@ -381,7 +389,7 @@ fn a_list_reset_while_it_runs_records_into_fresh_memory() {
     assert_ne!(scratch_a, scratch_b, "fresh scratch memory");
     list.defer_write(ptr(&second), Written::Value(9), 8);
     list.close();
-    host.execute(&[&list]);
+    host.submit(&[&list]);
     gate.open();
     host.drain();
     // SAFETY: the buffers' mappings, 256 bytes each; the GPU is done.
@@ -400,9 +408,9 @@ fn a_list_reset_while_it_runs_records_into_fresh_memory() {
     assert!(!list.running());
 }
 
-/// The dynamic descriptor slots of a list reset while it runs stay leased
-/// until its submission has finished (the GPU reads its tables until
-/// then). After VIctory#595's test by aycow.
+/// The dynamic descriptor slots of a title's list reset while it runs stay
+/// leased until its submission has finished (the GPU reads its tables
+/// until then). After VIctory#595's test by aycow.
 #[test]
 fn dynamic_descriptors_stay_leased_until_the_submission_finishes() {
     use crate::descriptor::{HeapDesc, create_heap, heap};
@@ -447,7 +455,7 @@ fn dynamic_descriptors_stay_leased_until_the_submission_finishes() {
     assert_eq!(host_heap.dynamic(1), None);
     list.close();
     let mut gate = Gate::close(host);
-    host.execute(&[&list]);
+    host.submit(&[&list]);
     list.reset();
     assert_eq!(host_heap.dynamic(1), None, "still leased while it runs");
     gate.open();
@@ -634,10 +642,10 @@ fn a_panic_on_the_completion_thread_ends_the_run() {
     );
 }
 
-/// A list reset while its submission runs leaves that submission the
-/// pipelines (and notes) of the recording it runs, for its reports of a
-/// slow submission or a removed device; the list's next recording starts
-/// afresh.
+/// A title's list reset while its submission runs leaves that submission
+/// the pipelines (and notes) of the recording it runs, for its reports of
+/// a slow submission or a removed device; the list's next recording
+/// starts afresh.
 #[test]
 fn a_reset_leaves_a_running_submission_its_recording() {
     let test = "host::submissions::a_reset_leaves_a_running_submission_its_recording";
@@ -647,7 +655,7 @@ fn a_reset_leaves_a_running_submission_its_recording() {
     list.used_pipeline("first");
     list.close();
     let mut gate = Gate::close(host);
-    host.execute(&[&list]);
+    host.submit(&[&list]);
     list.reset();
     list.used_pipeline("second");
     let ours = std::ptr::from_ref(&list);
@@ -663,5 +671,233 @@ fn a_reset_leaves_a_running_submission_its_recording() {
     let next: Vec<String> = list.recorded().pipelines.iter().cloned().collect();
     assert_eq!(next, ["second"]);
     gate.open();
+    host.drain();
+}
+
+/// A frame of the title's, with frames in flight: a submission whose
+/// bottom-of-pipe write tells it apart, then its present's copy (a list of
+/// ours), let run on past the present. The lists stay in flight while the
+/// test's gate holds the GPU.
+fn frame_in_flight(host: &'static Host, label: &'static u64) -> (HostList, HostList) {
+    let (work, present) = (host.new_list().unwrap(), host.new_list().unwrap());
+    work.defer_write(ptr(label), Written::Value(1), 8);
+    work.close();
+    present.close();
+    host.submit(&[&work]);
+    host.execute(&[&present]);
+    host.presented(&present, true);
+    (work, present)
+}
+
+/// Whether `f`, on a thread of its own, is still running after 300 ms;
+/// then the gate is opened and `f` waited for.
+fn waits_for_the_gate(gate: &mut Gate, f: impl FnOnce() + Send) -> bool {
+    let (done, ended) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            f();
+            let _ = done.send(());
+        });
+        let waited = ended
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err();
+        gate.open();
+        ended.recv().unwrap();
+        waited
+    })
+}
+
+/// One frame in flight: a present lets its frame run on (nothing of it is
+/// done when it returns), and the next flip, or the next present before it
+/// records its copy, waits for that frame, written back and all.
+#[test]
+fn a_frame_runs_on_past_its_present_until_the_next_flip() {
+    let test = "host::submissions::a_frame_runs_on_past_its_present_until_the_next_flip";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let label: &'static u64 = Box::leak(Box::new(0u64));
+    let mut gate = Gate::close(host);
+    let (work, present) = frame_in_flight(host, label);
+    assert!(work.running() && present.running(), "returned in flight");
+    assert_eq!(word(label), 0, "nothing of the frame done");
+    assert!(
+        waits_for_the_gate(&mut gate, || host.flip()),
+        "the next flip waits for the frame before"
+    );
+    assert_eq!(word(label), 1, "the frame finished, its writes done");
+    assert!(!work.running() && !present.running());
+}
+
+/// Frames in flight off: a present finishes every submission before it
+/// returns, as before.
+#[test]
+fn without_frames_in_flight_a_present_finishes_every_submission() {
+    let test = "host::submissions::without_frames_in_flight_a_present_finishes_every_submission";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let label: &'static u64 = Box::leak(Box::new(0u64));
+    let (work, present) = (host.new_list().unwrap(), host.new_list().unwrap());
+    work.defer_write(ptr(label), Written::Value(1), 8);
+    work.close();
+    present.close();
+    let mut gate = Gate::close(host);
+    host.submit(&[&work]);
+    host.execute(&[&present]);
+    let present = Shared(present);
+    let waited = waits_for_the_gate(&mut gate, || host.presented(present.get(), false));
+    assert!(waited, "the present waits for its frame");
+    assert_eq!(word(label), 1);
+    assert!(!work.running() && !present.get().running());
+}
+
+/// A title's blocking flip wait (`frame::wait`) ends once the frame
+/// presented last has finished, as a console flips a frame once its GPU is
+/// done with it: what the title reads after the flip is written.
+#[test]
+fn a_flip_wait_ends_once_the_frame_presented_last_has_finished() {
+    let test = "host::submissions::a_flip_wait_ends_once_the_frame_presented_last_has_finished";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let label: &'static u64 = Box::leak(Box::new(0u64));
+    let mut gate = Gate::close(host);
+    let (_work, _present) = frame_in_flight(host, label);
+    let flip = || {
+        const FLIP: u32 = 2;
+        let (null, mut token) = (std::ptr::null(), 0);
+        assert_eq!(
+            crate::frame::wait(null, FLIP, u32::MAX, null.cast(), 0, &mut token),
+            crate::object::S_OK
+        );
+    };
+    assert!(
+        waits_for_the_gate(&mut gate, flip),
+        "the flip waits for the frame"
+    );
+    assert_eq!(word(label), 1, "the title reads the frame's writes");
+}
+
+/// With the frame in flight, the title waits for its own fence, signalled
+/// behind the frame's submission: the wait ends only once what the frame's
+/// shaders wrote is back in title memory. The copy-back comes before the
+/// signal, at the frame's end on the GPU, not at its present.
+#[test]
+fn the_title_waits_for_its_fence_and_finds_what_the_frame_in_flight_wrote() {
+    use crate::object::{HRESULT, S_OK, This, slot};
+    let test =
+        "host::submissions::the_title_waits_for_its_fence_and_finds_what_the_frame_in_flight_wrote";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let kernel = Kernel::new(host);
+    let window = watched(4 << 20);
+    let (scratch, out) = (window, window + (1 << 16));
+    let null = std::ptr::null();
+    let mut fence: This = null;
+    let fence_iid = &crate::fence::FENCE_IIDS[0];
+    assert_eq!(
+        crate::fence::create(null, 0, 0, fence_iid, &mut fence),
+        S_OK
+    );
+    let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+    let on_completion =
+        slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> HRESULT>(fence, 0x48);
+    let (work, present) = (host.new_list().unwrap(), host.new_list().unwrap());
+    kernel.dispatch(&work, Pass::Fill, scratch as u64, out as u64);
+    work.close();
+    present.close();
+    let mut gate = Gate::close(host);
+    host.submit(&[&work]);
+    assert_eq!(crate::queue::signal(null, fence, 1), S_OK);
+    host.execute(&[&present]);
+    host.presented(&present, true);
+    // The present returned with the frame on the GPU: nothing of it has
+    // reached the title.
+    assert_eq!(completed(fence), 0);
+    assert_eq!(words_at(out), [0; 64], "not written back at the present");
+    let event = EventForTest::new();
+    assert_eq!(on_completion(fence, 1, event.0.0), S_OK);
+    assert!(!event.set_within(0), "the title's wait goes on");
+    gate.open();
+    assert!(event.set_within(10_000), "ends once the frame has run");
+    let want: Vec<u32> = (0..64).map(pattern).collect();
+    assert_eq!(words_at(out), want, "written back before the signal");
+    assert_eq!(completed(fence), 1);
+    host.drain();
+    assert_eq!(
+        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence),
+        0
+    );
+}
+
+/// The next frame's refresh of memory the frame in flight's shaders write
+/// waits for that frame when the title wrote the page meanwhile (as it
+/// may, beside the GPU's range): the in-flight checks hold across a
+/// present. The next frame reads the first one's output, and the title's
+/// write is kept.
+#[test]
+fn the_next_frame_leaves_what_the_frame_in_flight_writes() {
+    let test = "host::submissions::the_next_frame_leaves_what_the_frame_in_flight_writes";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let kernel = Kernel::new(host);
+    let window = watched(4 << 20);
+    let (scratch, out, copy) = (window, window + (1 << 16), window + (2 << 16));
+    let (first, present) = (host.new_list().unwrap(), host.new_list().unwrap());
+    kernel.dispatch(&first, Pass::Fill, scratch as u64, out as u64);
+    first.close();
+    present.close();
+    let mut gate = Gate::close(host);
+    host.submit(&[&first]);
+    host.execute(&[&present]);
+    host.presented(&present, true);
+    // The title prepares the next frame: it writes beside what the GPU
+    // writes, then records a pass reading the GPU's output.
+    // SAFETY: the test's memory, past the 64 words the shaders write.
+    unsafe { (out as *mut u32).add(100).write_volatile(0x5555_5555) };
+    let second = host.new_list().unwrap();
+    kernel.dispatch(&second, Pass::Copy, out as u64, copy as u64);
+    second.close();
+    let second = Shared(second);
+    let waited = waits_for_the_gate(&mut gate, || host.submit(&[second.get()]));
+    assert!(
+        waited,
+        "the next frame's refresh waits for the frame in flight"
+    );
+    host.flip();
+    host.drain();
+    let want: Vec<u32> = (0..64).map(pattern).collect();
+    assert_eq!(words_at(copy), want, "the first frame's output");
+    assert_eq!(words_at(out), want, "not overwritten by the refresh");
+    // SAFETY: the test's memory.
+    let kept = unsafe { (out as *const u32).add(100).read_volatile() };
+    assert_eq!(kept, 0x5555_5555, "the title's write is kept");
+}
+
+/// A list of ours reset while it runs waits for its submission: our code
+/// rewrites what its running lists read when it records again (the plane
+/// compositor's views), with no fence of the title's in between. A title's
+/// list does not (`a_list_reset_while_it_runs_records_into_fresh_memory`).
+#[test]
+fn a_list_of_ours_waits_for_its_submission_when_reset() {
+    let test = "host::submissions::a_list_of_ours_waits_for_its_submission_when_reset";
+    let _serial = serial();
+    let Some(host) = device(test) else { return };
+    let label: &'static u64 = Box::leak(Box::new(0u64));
+    let list = host.new_list().unwrap();
+    list.defer_write(ptr(label), Written::Value(1), 8);
+    list.close();
+    let mut gate = Gate::close(host);
+    host.execute(&[&list]);
+    assert!(list.running());
+    let allocator = list.allocator.lock().unwrap().as_raw();
+    let list = Shared(list);
+    let waited = waits_for_the_gate(&mut gate, || list.get().reset());
+    assert!(waited, "the reset waits");
+    assert_eq!(word(label), 1, "finished before it returned");
+    assert_eq!(
+        list.0.allocator.lock().unwrap().as_raw(),
+        allocator,
+        "its own allocator, reset in place"
+    );
+    list.0.close();
     host.drain();
 }
