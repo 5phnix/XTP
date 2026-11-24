@@ -359,16 +359,23 @@ needed for scripted keys and frame capture), then `vm\run-game.ps1`:
   (when the bucket has a golden folder; the golden folder itself is never
   written) and an `xtp.toml` pointing at `D:\game`, `D:\xtp-data\cache` and
   that copy;
-- sets `XTP_KEYS` (by default Enter, the pad's A, every 2.5 s from 5 s to
-  50 s, which takes the title past its start screens; `-Keys` changes it,
-  `-Keys '-'` presses nothing) and `XTP_CAPTURE` (presented frames as PNG);
+- drives the title either with the [autopilot](autopilot.md)
+  (`-Autopilot autopilot\gameplay.txt`: it waits on the title's own state,
+  the better choice) or with `XTP_KEYS` (the default without `-Autopilot`:
+  Enter, the pad's A, every 2.5 s from 5 s to 50 s; `-Keys` changes it,
+  `-Keys '-'` presses nothing). Fixed times are fragile on this VM: its front
+  end runs slower than on a desktop PC, and in our first run the presses
+  never took the title past it;
+- sets `XTP_CAPTURE` (presented frames as PNG) and samples the GPU's memory
+  and use every 2 s (`gpu.csv`, from `nvidia-smi`);
 - starts the title in the desktop session, stops it after `-Seconds`, and
   prints a summary: exit code, the device line, the last frame-rate lines,
-  errors, the end of `crashes.log`.
+  the autopilot's lines, errors, the peak GPU memory, the end of
+  `crashes.log`.
 
 Back on your PC you get `run.log`, `env.txt`, `result.json`, `xtp.toml`,
-`crashes.log` (if any) and `capture\frame-<n>.png`. The data copy (saves)
-stays on the VM.
+`gpu.csv`, `crashes.log` (if any) and `capture\frame-<n>.png`. The data copy
+(saves) stays on the VM.
 
 **Watching a run.** `tools\cloud\rdp-vm.ps1 -NewPassword` prints a new
 Windows password for *your* account (once, in your console: keep it in your
@@ -423,7 +430,10 @@ rules, `Tool(<command> *)`, and match case-insensitively); a `gcloud` call
 *inside* a script is not checked against them, so allow the scripts you trust
 and keep destructive or account-changing commands for yourself. Leave
 `new-bucket.ps1`, `new-vm.ps1`, `setup-vm.ps1` and `rdp-vm.ps1` to ask each
-time. Check your rules with a harmless prompt before you rely on them.
+time. `invoke-vm.ps1` runs anything on the VM as you (an administrator of a
+machine that holds your game files): move it to `ask` if you want to see
+each command first. Check your rules with a harmless prompt before you rely
+on them.
 
 What to ask for, typically: "run the workspace check on the cloud VM for my
 current commit" (`run-remote.ps1 -Check -Local`), "run the game for 4 minutes
