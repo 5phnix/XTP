@@ -1111,6 +1111,9 @@ mod tests {
         if !guards() || !predication() {
             return;
         }
+        // Guards are the process's: one test that guards views at a time
+        // (the watch's own tests count what is guarded).
+        let _serial = crate::watch::tests::serial();
         const LEN: usize = 64 << 10;
         // SAFETY: a fresh pagefile section mapped twice, read-write: the
         // title's view and a writer's own (as xmem's is).
@@ -1184,9 +1187,11 @@ mod tests {
 
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
-        // The views stay mapped until the tests end: the watch's journal
-        // keeps the pages these checks found written, which a test that
-        // allocates fresh memory at the same address would read as its own.
+        // Its guards go back (other tests count what is guarded); the views
+        // stay mapped until the tests end: the watch's journal keeps the
+        // pages these checks found written, which a test that allocates
+        // fresh memory at the same address would read as its own.
+        crate::watch::title_memory_remapped(view, LEN);
         let _ = other;
     }
 
