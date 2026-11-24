@@ -47,6 +47,14 @@ named by RVA (relative to `game_scarlett_master.exe`, build blake3
   The title is not the bottleneck: at most 20-40 ms of a frame are not
   XTP's.
 
+- **Since 13:37 no session reaches the world** on this machine (section
+  7.4): at the start of the world load xtp.exe's video memory jumps from
+  4.4 to 8.4 GB, every texture the title then creates waits 1.5 to 14 s in
+  the kernel, frames stop and the title stops itself. Same binary, save and
+  cache as the runs that passed; launcher, keys, sound, pipeline library,
+  Discord, the NVIDIA overlay, other GPU tests and a driver reset are ruled
+  out. The numbers above come from the runs before it.
+
 The ranked list with shares and backlog items is section 9.
 
 ## 2. Runs
@@ -62,6 +70,12 @@ The ranked list with shares and backlog items is section 9.
 | `play-E` | 13:33:03 | golden | `XTP_SHADER_LOOP_LIMIT=1024` (cold shader cache), 4 `rustc` running | +186 s | 24 s | stopped at +210 s |
 | `play-E2` | 13:37:53 | golden | same, warm cache; first version of the no-focus launcher | – | – | the process vanished at +24 s, on the profile screen, with no log line and no crash record |
 | `play-F` | 13:39:38 | golden | render-target dumps every 10-25 frames, 2 `rustc` | not reached: loading from +116 s, no frame presented after +122 s | – | the title crashes itself at +155 s (section 7.3) |
+| `play-G` | 13:52:21 | golden | no keys, launcher v2 (no focus, muted), quiet machine | not reached: loading from +36.6 s, no frame after +46 s | – | the title crashes itself at +78 s |
+| `play-H` | 14:03:46 | golden | no keys, started through `cmd.exe` as the first runs, muted, quiet machine | not reached: loading from +34 s, no frame after +42 s | – | the title crashes itself at +73 s |
+| `play-I` to `play-N` | 14:15-14:39 | golden | one change each (section 7.4) | not reached: each stops presenting on the loading screen | – | the title crashes itself |
+| `play-O` | 14:43:30 | golden | `main` `e1a4d29`, `cargo xtask play` (autopilot), resource debug log | not reached: loading from about +28 s, no frame after +38 s | – | the title crashes itself at +74 s |
+| `play-P` | 14:54:20 | golden | `main` `c7a4220` after a graphics driver reset, autopilot, VRAM sampling; Discord still running | not reached | – | the title crashes itself |
+| `play-Q` | 14:59:18 | golden | same binary as P, Discord closed (0 processes), 1.4 GB of VRAM in use before the start | not reached | – | the title crashes itself at about +2 min |
 
 "Clean" timing runs are `run1`, `A-fresh` and `play-test1` (captures
 cost a few ms per captured frame). `B-save` carries DRED's per-command
@@ -378,6 +392,74 @@ that stops the title when no frame completes for a while. With 9 s frames
 35 s without a frame. Once frames are normal it does not matter; for
 diagnostic runs it caps how slow a frame may be.
 
+### 7.4 The loading screen that stops presenting
+
+From 13:37 on, every session failed before the world: E2's process
+vanished at +24 s; F, G, H, I, J, K, L, M, N and O stopped presenting
+frames 6 to 10 s into the loading screen, and the title then stopped
+itself (7.3). It happened with the same XTP binary (`2d0257e`, built
+13:07Z, never rebuilt) that reached the world in runs C, test1 and E, the
+same golden save and the same title images in the cache; and with
+today's `main` (`e1a4d29`, run O). Ruled out one session at a time:
+
+| Session | Change | Result |
+|---|---|---|
+| H | started through `cmd.exe` as the first runs, window activated the usual way | stalls |
+| I | shared pipeline library moved aside (empty library) | stalls |
+| J | silent by volume 0 instead of the mute flag | stalls |
+| K | the title gets the original `TMP`/`TEMP` back | stalls |
+| L | screen sharing (Discord, ~39 % GPU in video encode) and the NVIDIA overlay switched off by the person | stalls |
+| N | Enter every 5 s (see `run-keys.md` 4) until 120 s, as runs C and test1 | stalls |
+| O | today's `main`, the autopilot pressing A every 2.5 s, no GPU test of other workers running | stalls |
+| P | graphics driver reset by the person (Win+Ctrl+Shift+B), `main` `c7a4220` | stalls |
+| Q | as P, Discord closed (it held 3.9 GB of video memory) | stalls |
+
+What the stall is (stacks of M every 5 s; resource log of O):
+
+- The title thread that creates its streamed textures calls XTP's
+  `xtp_gpu::resource::create_at_address` → `hand_out_resource` →
+  `host_texture`, a D3D12 `CreateCommittedResource` for the host copy of
+  each texture. That call waits in the kernel
+  (`NtGdiDdDDIWaitForSynchronizationObjectFromCpu`, a video-memory-manager
+  fence for clearing or residency).
+- It is slow, not stuck: during the front end the title creates thousands
+  of textures at their addresses (4 600 in 10 s in O); once the world
+  load starts, each one takes 1.7 to 2.0 s (O, from 14:44:20). With a few
+  textures per 10 s the load crawls, no frame is presented, and after
+  about 30 s the title's watchdog fires.
+- Meanwhile the GPU has nothing of ours to run: the title's submission
+  thread waits for work, the 32 DirectStorage threads and the 8 pipeline
+  threads are idle, and the title's window stops pumping messages.
+- Memory is not exhausted at the stall: 25-29 GB physical free, 78-82 of
+  97 GB committed, xtp.exe 8.3-8.4 GB of dedicated video memory (of 16)
+  and 0.6-0.7 GB shared.
+- After a stalled run the dead process stays in the kernel for over a
+  minute holding its 8 GB of video memory (N: one thread, no handle,
+  14:40:25 → after 14:41:23), then goes.
+
+What triggers it (VRAM sampled every 2-7 s in P and Q):
+
+| | P (Discord running) | Q (Discord closed) |
+|---|---|---|
+| xtp.exe dedicated video memory, front end | 4.4 GB | 4.4 GB |
+| same, from the start of the world load | 8.33-8.40 GB (jump within 10 s) | 8.37-8.40 GB (jump within 8 s) |
+| whole adapter during the stall | 9.9 GB of 16 | 9.7 GB of 16 |
+| DXGI local budget (before the start) | 16.02 GB | 16.02 GB |
+| texture creations at an address, before the jump | instantaneous (1 900-4 600 per 10 s) | instantaneous (2 000-4 600 per 10 s) |
+| same, after the jump (median per 10 s) | 0.4, 0.9, then 1.5-2.1 s | 1.4, 13.7, 3.1, 1.6, 2.3, 8.6 s |
+| world frames during the load | 7-14 s | 11-19 s |
+
+So the slowdown starts at the moment xtp.exe takes about 4 GB of video
+memory at once at the beginning of the world load, with the card far from
+full; from then on the `MakeResident` behind each new host texture (the
+other workers' reading of the kernel wait, task 6bb65399) costs 1.5 to
+14 s. The same binary passed the same load before 13:36, when nothing
+measured video memory. Not established: what allocates those 4 GB, in
+which heap, and why residency became that slow. Closing Discord, resetting
+the driver and stopping other GPU tests did not change it. Until it is
+fixed no session reaches the world on this machine, which blocks the
+watchdog, dark-world, integration and asynchronous-submission checks.
+
 ## 8. What the title waits on
 
 Every thread's stack was taken twice in the world (`XTP_STACKS`, run
@@ -444,7 +526,9 @@ both the memory rewrite and the GPU time explained (section 10).
 | # | Cause | Effect | Backlog |
 |---|---|---|---|
 | 1 | One list running longer than 2 s (up to 3.2 s timed alone), in mesh passes fed null views | TDR in 3 of 5 world sessions, 38-64 s in | `gpu.md` G11 (bounded submissions) plus whatever section 10 finds (loops, stale data: G3–G6); W2 for the null views |
-| 2 | No frame for about 17-35 s (very slow diagnostic frames, or a stalled presentation as in `play-F`) | the title stops itself (section 7.3) | none once frames are normal; keep diagnostic frames under ~9 s; the `play-F` stall itself is unexplained |
+| 2 | No frame for about 17-35 s (very slow diagnostic frames, or the loading stall of section 7.4) | the title stops itself (section 7.3) | none once frames are normal; keep diagnostic frames under ~9 s; the `play-F` stall itself is unexplained |
+
+| 3 | Each host texture created after xtp.exe's video memory jumps to 8.4 GB at the world load waits 1.5-14 s in the kernel (section 7.4) | no session reaches the world since 13:37 | **W6** (new) |
 
 ### 9.4 New items
 
@@ -472,6 +556,14 @@ both the memory rewrite and the GPU time explained (section 10).
   RVA `0x9e58138`) falls to 0, instead of absolute frame numbers that vary
   by a thousand between runs. Needed for section 6 under the machine's
   "few chosen frames" rule.
+
+- **W6. The world-load stall** (M, first). Log what allocates the ~4 GB
+  at the start of the world load (heap type, size, residency); time each
+  `CreateCommittedResource` / `MakeResident` of host textures; then create
+  host textures without a synchronous residency wait (placed in pooled
+  heaps, or `D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT` with an asynchronous
+  `EnqueueMakeResident`). Test: on this machine the world is reached again
+  and no texture creation exceeds 50 ms.
 
 ## 10. Still open
 
