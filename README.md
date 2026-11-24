@@ -149,7 +149,8 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder. The loader also prints the first 16 title C++ throws
-(type, readable MSVC `std::exception` message and title `module+rva`) to stderr,
+(decorated type name, readable MSVC `std::exception` message and title
+`module+rva`) to stderr,
 and maps legacy debugger thread names to Windows thread descriptions.
 
 ## Contributing

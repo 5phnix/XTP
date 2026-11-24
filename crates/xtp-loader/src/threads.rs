@@ -30,16 +30,33 @@ fn images() -> std::sync::MutexGuard<'static, Vec<Mapped>> {
     IMAGES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The registered title image containing `address`, as `(base, size)`.
-/// A busy registry means unknown rather than blocking an exception handler.
+fn try_images() -> Option<std::sync::MutexGuard<'static, Vec<Mapped>>> {
+    match IMAGES.try_lock() {
+        Ok(images) => Some(images),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+fn contains(image: &LoadedImage, address: usize) -> bool {
+    let base = image.base();
+    base.checked_add(image.info().size_of_image as usize)
+        .is_some_and(|end| base <= address && address < end)
+}
+
+/// Snapshot membership for the candidate PCs under one nonblocking acquisition.
+/// No allocation or Windows API runs under the lock, and the image count is unbounded.
+pub(crate) fn title_membership<const N: usize>(addresses: &[usize; N]) -> Option<[bool; N]> {
+    let images = try_images()?;
+    Some(addresses.map(|address| images.iter().any(|m| contains(&m.image, address))))
+}
+
+#[cfg(test)]
 pub(crate) fn image_at(address: usize) -> Option<(usize, usize)> {
-    let images = IMAGES.try_lock().ok()?;
-    images.iter().find_map(|m| {
-        let base = m.image.base();
-        let size = m.image.info().size_of_image as usize;
-        let end = base.checked_add(size)?;
-        (base <= address && address < end).then_some((base, size))
-    })
+    try_images()?
+        .iter()
+        .find(|m| contains(&m.image, address))
+        .map(|m| (m.image.base(), m.image.info().size_of_image as usize))
 }
 
 pub(crate) fn mapped(image: &LoadedImage) {
@@ -101,7 +118,7 @@ const DETACH_DEADLINE: Duration = Duration::from_secs(5);
 /// (title threads and ours); every attached image gets
 /// `DLL_PROCESS_DETACH`, DLLs in reverse initialisation order, then the
 /// exe's TLS callbacks; then the CRT ends the process.
-extern "C" fn detach_all() {
+pub(crate) extern "C" fn detach_all() {
     let attached: Vec<_> = images()
         .iter_mut()
         .filter(|m| m.attached)
@@ -455,6 +472,70 @@ mod tests {
         assert!(
             out.status.success() && text.contains("ENDED KEPT"),
             "{text}"
+        );
+    }
+    #[test]
+    fn review_registry_child() {
+        if std::env::var_os("XTP_REGISTRY_CHILD").is_none() {
+            return;
+        }
+        let (lookup_ready, wait_lookup) = std::sync::mpsc::channel();
+        let (go, wait_go) = std::sync::mpsc::channel();
+        let (result, wait_result) = std::sync::mpsc::channel();
+        let lookup = std::thread::spawn(move || {
+            lookup_ready.send(()).unwrap();
+            wait_go.recv().unwrap();
+            result
+                .send(super::title_membership(&[0]).is_none())
+                .unwrap();
+        });
+        wait_lookup.recv().unwrap(); // TLS start notifications completed before taking IMAGES
+        let (ready, wait_ready) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = super::images();
+            ready.send(()).unwrap();
+            wait_release.recv().unwrap();
+        });
+        wait_ready.recv().unwrap();
+        go.send(()).unwrap();
+        let skipped = wait_result.recv_timeout(std::time::Duration::from_secs(2));
+        release.send(()).unwrap(); // release even if an accidental blocking lookup times out
+        holder.join().unwrap();
+        lookup.join().unwrap();
+        assert!(skipped.unwrap());
+        assert!(super::title_membership(&[0]).is_some());
+        let _ = std::panic::catch_unwind(|| {
+            let _lock = super::images();
+            panic!("synthetic poisoned registry");
+        });
+        assert!(super::IMAGES.is_poisoned());
+        assert!(
+            super::title_membership(&[0]).is_some(),
+            "recover poisoned registry"
+        );
+        println!("XTP REGISTRY CONTENTION AND POISON CHECKED");
+    }
+
+    #[test]
+    fn review_registry_lookup_skips_contention_and_recovers_poison() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "threads::tests::review_registry_child",
+                "--nocapture",
+            ])
+            .env("XTP_REGISTRY_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout)
+                    .contains("XTP REGISTRY CONTENTION AND POISON CHECKED"),
+            "status {:?}\n{}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

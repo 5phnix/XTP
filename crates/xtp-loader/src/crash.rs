@@ -29,8 +29,9 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleExW,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, GetCurrentThreadStackLimits, OpenThread,
-    SetThreadDescription, THREAD_SET_LIMITED_INFORMATION,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, GetCurrentThreadStackLimits,
+    GetProcessIdOfThread, OpenThread, SetThreadDescription, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SET_LIMITED_INFORMATION,
 };
 
 use crate::insn;
@@ -131,7 +132,7 @@ fn title_output() -> String {
 
 /// Installs the handlers, and the reports of failures no handler sees
 /// (`fastfail`: CRT invalid parameters, the process ending with a
-/// failure status); call once before running title code.
+/// failure status). Idempotent through `Once`; call before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
@@ -626,14 +627,9 @@ fn bounded_cstr(address: usize, limit: usize) -> Result<String, (String, &'stati
     Err((String::from_utf8_lossy(&bytes).into_owned(), "unterminated"))
 }
 
-/// SizeOfImage from a loaded PE32+ header, all read fallibly. Registered
-/// title images use the size already validated by the PE parser.
+/// SizeOfImage from a loaded PE32+ header, all read fallibly. This also
+/// handles host runtime metadata without acquiring the title registry again.
 fn image_size(base: usize) -> Option<usize> {
-    if let Some((at, size)) = crate::threads::image_at(base)
-        && at == base
-    {
-        return Some(size);
-    }
     if read_array::<2>(base)? != *b"MZ" {
         return None;
     }
@@ -656,17 +652,55 @@ fn image_address(base: usize, size: usize, rva: usize, len: usize) -> Option<usi
     base.checked_add(rva)
 }
 
-/// Find an actual title PC, including a caller of a host throwing routine.
-/// Metadata ownership alone does not establish where a throw originated.
+/// Only these CRT families may intervene before a title frame. Match a DLL
+/// basename and suffix boundary, never an arbitrary path substring.
+fn runtime_family(module: &str) -> bool {
+    let module = module.to_ascii_lowercase();
+    let Some(stem) = module.strip_suffix(".dll") else {
+        return false;
+    };
+    ["vcruntime140", "msvcp140"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|tail| {
+            tail.is_empty()
+                || tail == "d"
+                || tail.strip_prefix('_').is_some_and(|version| {
+                    !version.is_empty()
+                        && version
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                })
+        })
+    })
+}
+
+fn throw_machinery(address: usize) -> bool {
+    crate::fastfail::in_module(address, &["ntdll.dll", "kernelbase.dll", "ucrtbase.dll"])
+        || module_of(address).and_then(|module| {
+            module
+                .rsplit_once('+')
+                .map(|(name, _)| runtime_family(name))
+        }) == Some(true)
+}
+
+fn title_frame<const N: usize>(frames: &[usize; N]) -> Option<usize> {
+    let title = crate::threads::title_membership(frames)?
+        .iter()
+        .position(|&is_title| is_title)?;
+    frames[..title]
+        .iter()
+        .all(|&pc| throw_machinery(pc))
+        .then_some(frames[title])
+}
+
+/// Walk in dispatch order. A host/HLE/unknown caller stops classification;
+/// finding a title farther down cannot attribute that host exception to it.
 fn throw_site(record: &EXCEPTION_RECORD, context: &CONTEXT) -> Option<usize> {
-    let at = record.ExceptionAddress as usize;
-    if crate::threads::image_at(at).is_some() {
-        return Some(at);
+    let mut frames = [0; MAX_FRAMES + 1];
+    frames[0] = record.ExceptionAddress as usize;
+    for (slot, pc) in frames[1..].iter_mut().zip(unwind(*context)) {
+        *slot = pc as usize;
     }
-    unwind(*context)
-        .into_iter()
-        .map(|pc| pc as usize)
-        .find(|&pc| crate::threads::image_at(pc).is_some())
+    title_frame(&frames)
 }
 
 fn claim_first_chance() -> bool {
@@ -681,6 +715,9 @@ fn claim_first_chance() -> bool {
 static FIRST_CHANCE_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 fn observe_cpp(record: &EXCEPTION_RECORD, context: &CONTEXT) {
+    if crate::threads::exiting() {
+        return;
+    }
     thread_local! { static OBSERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     struct ObserveGuard;
     impl Drop for ObserveGuard {
@@ -702,6 +739,7 @@ fn observe_cpp(record: &EXCEPTION_RECORD, context: &CONTEXT) {
     let Some(site) = throw_site(record, context) else {
         return;
     };
+    // Each verified title event, including a rethrow, claims one slot.
     if !claim_first_chance() {
         return;
     }
@@ -721,13 +759,18 @@ fn observe_cpp(record: &EXCEPTION_RECORD, context: &CONTEXT) {
 }
 
 /// Applies a legacy Visual Studio THREADNAME_INFO notification. On x64 its
-/// three argument words contain { type, padding }, { name }, { id, flags }.
+/// first three words contain { type, padding }, { name }, { id, flags }.
+/// Legacy DWORD-count samples provide extra words; reserved flags are ignored.
 fn name_thread(p: &[usize]) -> bool {
-    if p.len() != 3 || p[0] as u32 != 0x1000 || p[2] >> 32 != 0 {
+    if crate::threads::exiting() {
         return false;
     }
-    let Ok(name) = bounded_cstr(p[1], MAX_STRING) else {
+    if p.len() < 3 || p[0] as u32 != 0x1000 {
         return false;
+    }
+    let name = match bounded_cstr(p[1], MAX_STRING) {
+        Ok(name) | Err((name, "unterminated")) => name,
+        Err(_) => return false,
     };
     let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     let id = p[2] as u32;
@@ -738,14 +781,21 @@ fn name_thread(p: &[usize]) -> bool {
         } else if id == 0 {
             return false;
         } else {
-            OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, id)
+            OpenThread(
+                THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                id,
+            )
         }
     };
     if thread.is_null() {
         return false;
     }
-    // SAFETY: `thread` is current or open, and `wide` is NUL-terminated.
-    let result = unsafe { SetThreadDescription(thread, wide.as_ptr()) } >= 0;
+    // SAFETY: `thread` is current or open. Check ownership before naming,
+    // then close every owned handle below, including rejected foreign ones.
+    let ours = unsafe { GetProcessIdOfThread(thread) == GetCurrentProcessId() };
+    // SAFETY: `wide` is NUL-terminated; only this process's threads are named.
+    let result = ours && unsafe { SetThreadDescription(thread, wide.as_ptr()) } >= 0;
     if id != u32::MAX {
         // SAFETY: this branch opened `thread`; the current-thread pseudo
         // handle is never closed.
@@ -759,6 +809,9 @@ fn name_thread(p: &[usize]) -> bool {
 fn thrown(p: &[usize]) -> String {
     if p.len() != 4 || !CPP_MAGICS.contains(&p[0]) {
         return "<invalid MSVC exception parameters>".into();
+    }
+    if p[1] == 0 && p[2] == 0 {
+        return "<rethrow>".into();
     }
     let Some(size) = image_size(p[3]) else {
         return "<unreadable C++ image metadata>".into();
@@ -1654,6 +1707,17 @@ mod tests {
     static SWALLOW_THREAD: AtomicU32 = AtomicU32::new(0);
     static SWALLOW_CODE: TestAtomicUsize = TestAtomicUsize::new(0);
     static SWALLOW_SEEN: AtomicUsize = AtomicUsize::new(0);
+    static SWALLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static SWALLOW_PARAMS: [AtomicUsize; 15] = [const { AtomicUsize::new(0) }; 15];
+
+    fn child_ran(out: &std::process::Output, name: &str) -> bool {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        out.status.success()
+            && stdout
+                .lines()
+                .any(|line| line == format!("test crash::tests::{name} ... ok"))
+            && stdout.contains("test result: ok. 1 passed; 0 failed;")
+    }
 
     fn isolated(name: &str) -> bool {
         if std::env::var("XTP_EXCEPTION_CHILD").as_deref() == Ok(name) {
@@ -1665,8 +1729,9 @@ mod tests {
             .output()
             .unwrap();
         assert!(
-            out.status.success(),
-            "{name}: {}\n{}",
+            child_ran(&out, name),
+            "{name}: status {:?}\n{}\n{}",
+            out.status,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -1688,7 +1753,15 @@ mod tests {
         // has no preconditions.
         let (record, current) = unsafe { (&*(*info).ExceptionRecord, GetCurrentThreadId()) };
         let mine = current == SWALLOW_THREAD.load(Ordering::Relaxed);
-        if mine && record.ExceptionCode as usize == SWALLOW_CODE.load(Ordering::Relaxed) {
+        let count = SWALLOW_COUNT.load(Ordering::Relaxed);
+        let expected = record.NumberParameters as usize == count
+            && count <= SWALLOW_PARAMS.len()
+            && record.ExceptionInformation[..count]
+                .iter()
+                .zip(&SWALLOW_PARAMS)
+                .all(|(&p, expected)| p == expected.load(Ordering::Relaxed));
+        if mine && expected && record.ExceptionCode as usize == SWALLOW_CODE.load(Ordering::Relaxed)
+        {
             SWALLOW_SEEN.fetch_add(1, Ordering::Relaxed);
             -1
         } else {
@@ -1707,6 +1780,11 @@ mod tests {
         // SAFETY: a plain query of the calling thread.
         SWALLOW_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
         SWALLOW_CODE.store(code as usize, Ordering::Relaxed);
+        assert!(p.len() <= SWALLOW_PARAMS.len());
+        SWALLOW_COUNT.store(p.len(), Ordering::Relaxed);
+        for (expected, &value) in SWALLOW_PARAMS.iter().zip(p) {
+            expected.store(value, Ordering::Relaxed);
+        }
         // SAFETY: installs a handler for the continuable exception below.
         let swallow = unsafe { AddVectoredExceptionHandler(0, Some(swallow_test_exception)) };
         assert!(!swallow.is_null());
@@ -1732,6 +1810,57 @@ mod tests {
         );
     }
 
+    fn forwarding_code(target: usize) -> Vec<u8> {
+        let mut code = vec![0x48, 0x83, 0xec, 0x28, 0x48, 0xb8]; // sub rsp,40; mov rax,imm64
+        code.extend_from_slice(&target.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x28, 0xc3]);
+        code
+    }
+
+    /// Our PE mapped by Windows directly, deliberately absent from the title registry.
+    struct HostCaller {
+        module: HMODULE,
+        _dir: tempfile::TempDir,
+    }
+    impl HostCaller {
+        fn new(name: &str) -> Self {
+            use std::os::windows::ffi::OsStrExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            let prepared = crate::prepare(&SyntheticThrow::fixture()).unwrap();
+            std::fs::write(&path, prepared.bytes).unwrap();
+            let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: the synthetic DLL has no entry point, callbacks or imports.
+            let module = unsafe {
+                windows_sys::Win32::System::LibraryLoader::LoadLibraryExW(
+                    wide.as_ptr(),
+                    null_mut(),
+                    0,
+                )
+            };
+            assert!(!module.is_null(), "{}", std::io::Error::last_os_error());
+            let code = forwarding_code(RaiseException as *const () as usize);
+            // SAFETY: this fixture's .test section is writable, and owns the code range.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    code.as_ptr(),
+                    (module as usize + SyntheticThrow::CODE) as *mut u8,
+                    code.len(),
+                )
+            };
+            Self { module, _dir: dir }
+        }
+        fn code(&self) -> usize {
+            self.module as usize + SyntheticThrow::CODE
+        }
+    }
+    impl Drop for HostCaller {
+        fn drop(&mut self) {
+            // SAFETY: owns the load reference; no calls remain in flight.
+            unsafe { windows_sys::Win32::Foundation::FreeLibrary(self.module) };
+        }
+    }
+
     struct SyntheticThrow {
         image: crate::LoadedImage,
         _dir: tempfile::TempDir,
@@ -1747,7 +1876,7 @@ mod tests {
         const CODE: usize = 0x2200;
         const BACK: usize = Self::CODE + 16;
 
-        fn new(names: &[&[u8]]) -> Self {
+        fn fixture() -> Vec<u8> {
             // Original minimal PE32+ DLL: one writable/executable section,
             // no imports, and unwind data for a tiny RaiseException caller.
             let mut pe = vec![0u8; 0x2200];
@@ -1798,7 +1927,11 @@ mod tests {
             {
                 put(&mut pe, 0x1620 + i * 4, &v.to_le_bytes());
             }
-            let prepared = crate::prepare(&pe).unwrap();
+            pe
+        }
+
+        fn new(names: &[&[u8]]) -> Self {
+            let prepared = crate::prepare(&Self::fixture()).unwrap();
             let dir = tempfile::tempdir().unwrap();
             let image = crate::load(&prepared, dir.path()).unwrap();
             let this = Self {
@@ -1818,10 +1951,10 @@ mod tests {
                 this.bytes(descriptor + 16, name);
                 this.bytes(descriptor + 16 + name.len(), &[0]);
             }
-            let mut code = vec![0x48, 0x83, 0xec, 0x28, 0x48, 0xb8]; // sub rsp,40; mov rax,imm64
-            code.extend_from_slice(&(RaiseException as *const () as u64).to_le_bytes());
-            code.extend_from_slice(&[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x28, 0xc3]);
-            this.bytes(Self::CODE, &code);
+            this.bytes(
+                Self::CODE,
+                &forwarding_code(RaiseException as *const () as usize),
+            );
             assert_eq!(
                 crate::threads::image_at(this.base + Self::BACK),
                 Some((this.base, this.size))
@@ -1830,11 +1963,21 @@ mod tests {
         }
 
         fn put<T: Copy>(&self, offset: usize, value: T) {
+            assert!(
+                offset
+                    .checked_add(size_of::<T>())
+                    .is_some_and(|end| end <= self.size)
+            );
             // SAFETY: all callers use offsets and sizes inside our image.
             unsafe { ((self.base + offset) as *mut T).write_unaligned(value) };
         }
 
         fn bytes(&self, offset: usize, bytes: &[u8]) {
+            assert!(
+                offset
+                    .checked_add(bytes.len())
+                    .is_some_and(|end| end <= self.size)
+            );
             // SAFETY: all callers keep the copy inside our allocated image.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -1984,8 +2127,8 @@ mod tests {
     }
 
     #[test]
-    fn null_invalid_and_malformed_exceptions_do_not_fault_or_consume_budget() {
-        if isolated("null_invalid_and_malformed_exceptions_do_not_fault_or_consume_budget") {
+    fn invalid_payloads_are_logged_but_bad_parameter_headers_do_not_consume_budget() {
+        if isolated("invalid_payloads_are_logged_but_bad_parameter_headers_do_not_consume_budget") {
             return;
         }
         let image = SyntheticThrow::new(&[b".?AVexception@std@@"]);
@@ -1993,6 +2136,7 @@ mod tests {
         image.raise(null_what.as_ptr() as usize);
         image.raise(0);
         let mut bad_info = image.params(0);
+        bad_info[1] = 1; // object non-null: not a rethrow
         bad_info[2] = 0;
         raise_from(Some(&image), CPP_EXCEPTION, &bad_info);
         let logged = lines();
@@ -2035,7 +2179,7 @@ mod tests {
         image.put(SyntheticThrow::CATCHABLE + 4, 0x2fefu32);
         image.bytes(0x2fff, b"x");
         assert!(thrown(&image.params(0)).contains("unterminated C++ type name"));
-        // Range lookup is half-open and must never wait on a busy registry.
+        // Range lookup is half-open; contention is tested separately.
         assert!(crate::threads::image_at(image.base - 1).is_none());
         assert!(crate::threads::image_at(image.base + image.size).is_none());
     }
@@ -2209,6 +2353,331 @@ mod tests {
             std::fs::read_to_string(log)
                 .unwrap()
                 .contains("still reported")
+        );
+    }
+    #[test]
+    fn review_rethrows_use_throw_site_and_event_budget() {
+        if isolated("review_rethrows_use_throw_site_and_event_budget") {
+            return;
+        }
+        let image = SyntheticThrow::new(&[]);
+        let rethrow = [CPP_MAGICS[0], 0, 0, 0];
+        raise(CPP_EXCEPTION, &rethrow); // host caller
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), 0);
+        raise_from(Some(&image), CPP_EXCEPTION, &rethrow);
+        let expected = format!(
+            "XTP: first-chance C++ <rethrow> at {}",
+            locate(image.base + SyntheticThrow::BACK)
+        );
+        assert_eq!(lines().as_slice(), std::slice::from_ref(&expected));
+        raise_from(Some(&image), CPP_EXCEPTION, &rethrow);
+        assert_eq!(
+            FIRST_CHANCE.load(Ordering::Relaxed),
+            2,
+            "rethrows are separate events"
+        );
+        for bad in [[0, 0, 0, 0], [CPP_MAGICS[0], 0, 0, 0]] {
+            let params = if bad[0] == 0 { &bad[..] } else { &bad[..3] };
+            raise_from(Some(&image), CPP_EXCEPTION, params);
+            assert!(thrown(params).contains("invalid MSVC exception parameters"));
+        }
+        assert_eq!(lines(), [expected.clone(), expected]);
+        assert!(!thrown(&[CPP_MAGICS[0], 1, 0, 0]).contains("rethrow"));
+        assert!(!thrown(&[CPP_MAGICS[0], 0, 1, 0]).contains("rethrow"));
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), 2);
+    }
+
+    unsafe extern "system" fn hle_raise(code: u32, flags: u32, count: u32, params: *const usize) {
+        // SAFETY: forwards the live parameters supplied by the fixture caller.
+        unsafe { RaiseException(code, flags, count, params) };
+    }
+    unsafe extern "system" fn hle_panics(_: u32, _: u32, _: u32, _: *const usize) {
+        assert!(std::panic::catch_unwind(|| panic!("synthetic HLE panic")).is_err());
+    }
+
+    #[test]
+    fn review_only_throw_machinery_may_precede_a_title_frame() {
+        if isolated("review_only_throw_machinery_may_precede_a_title_frame") {
+            return;
+        }
+        let title = SyntheticThrow::new(&[b".H"]);
+        let value = 7u32;
+        title.raise((&raw const value) as usize); // real KernelBase -> title
+        let expected = format!(" at {}", locate(title.base + SyntheticThrow::BACK));
+        assert!(lines()[0].ends_with(&expected));
+        for name in ["msvcp140_xtp_review.dll", "VCRUNTIME140_123_XTP.dll"] {
+            let runtime = HostCaller::new(name);
+            assert!(throw_machinery(runtime.code()));
+            title.bytes(SyntheticThrow::CODE, &forwarding_code(runtime.code()));
+            title.raise((&raw const value) as usize);
+            assert!(lines().last().unwrap().ends_with(&expected));
+        }
+        assert_eq!(
+            lines().len(),
+            3,
+            "both runtime DLL callers must emit a new diagnostic"
+        );
+        let used = FIRST_CHANCE.load(Ordering::Relaxed);
+        assert_eq!(used, 3);
+        let host = HostCaller::new("xtp-unrelated-host.dll");
+        assert!(!throw_machinery(host.code()));
+        title.bytes(SyntheticThrow::CODE, &forwarding_code(host.code()));
+        title.raise((&raw const value) as usize);
+        title.bytes(
+            SyntheticThrow::CODE,
+            &forwarding_code(hle_raise as *const () as usize),
+        );
+        title.raise((&raw const value) as usize);
+        title.bytes(
+            SyntheticThrow::CODE,
+            &forwarding_code(hle_panics as *const () as usize),
+        );
+        // SAFETY: our forwarding stub calls hle_panics, which catches its own panic.
+        // No swallowing VEH: Rust's real catch_unwind must receive this exception.
+        unsafe {
+            let call: unsafe extern "system" fn(u32, u32, u32, *const usize) =
+                std::mem::transmute(title.base + SyntheticThrow::CODE);
+            call(0, 0, 0, std::ptr::null());
+        }
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), used);
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            IMAGE_RUNTIME_FUNCTION_ENTRY, IMAGE_RUNTIME_FUNCTION_ENTRY_0, RtlAddFunctionTable,
+            RtlDeleteFunctionTable,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: fresh executable fixture and matching unwind table, removed before freeing it.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let code = forwarding_code(RaiseException as *const () as usize);
+            page.copy_from_nonoverlapping(code.as_ptr(), code.len());
+            page.add(0x100)
+                .copy_from_nonoverlapping([1, 4, 1, 0, 4, 0x42, 0, 0].as_ptr(), 8);
+            let entry = IMAGE_RUNTIME_FUNCTION_ENTRY {
+                BeginAddress: 0,
+                EndAddress: 21,
+                Anonymous: IMAGE_RUNTIME_FUNCTION_ENTRY_0 { UnwindData: 0x100 },
+            };
+            assert!(RtlAddFunctionTable(&entry, 1, page as u64));
+            assert!(module_of(page as usize).is_none());
+            title.bytes(SyntheticThrow::CODE, &forwarding_code(page as usize));
+            title.raise((&raw const value) as usize);
+            assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), used);
+            assert!(RtlDeleteFunctionTable(&entry));
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+        // An unknown frame must stop before a later title PC, even if readable.
+        assert_eq!(title_frame(&[1, title.base + SyntheticThrow::BACK]), None);
+        assert_eq!(
+            title_frame(&[host.code(), title.base + SyntheticThrow::BACK]),
+            None
+        );
+        assert_eq!(
+            title_frame(&[title.base + SyntheticThrow::BACK]),
+            Some(title.base + SyntheticThrow::BACK)
+        );
+        for name in [
+            "vcruntime140.dll",
+            "VCRUNTIME140_1D.DLL",
+            "msvcp140_atomic_wait.dll",
+        ] {
+            assert!(runtime_family(name));
+        }
+        for name in [
+            "other-msvcp140.dll",
+            "vcruntime140fake.dll",
+            "msvcp140.exe",
+            "ucrtbase-extra.dll",
+            "msvcp140_.dll",
+        ] {
+            assert!(!runtime_family(name));
+        }
+    }
+
+    #[test]
+    fn review_invalid_child_selector_is_rejected() {
+        let name = "this_child_test_does_not_exist";
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("crash::tests::{name}"), "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "libtest returns success for zero matches"
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("0 passed"));
+        assert!(!child_ran(&out, name));
+    }
+
+    #[test]
+    fn review_legacy_names_accept_flags_extra_words_and_truncation() {
+        if isolated("review_legacy_names_accept_flags_extra_words_and_truncation") {
+            return;
+        }
+        // SAFETY: current-thread pseudo handle requires no ownership.
+        let current = unsafe { GetCurrentThread() };
+        let name = c"legacy name";
+        let p = [
+            0x1000,
+            name.as_ptr() as usize,
+            u32::MAX as usize | (42usize << 32),
+            0,
+            0,
+            0,
+        ];
+        raise(THREAD_NAME_EXCEPTION, &p); // sizeof(THREADNAME_INFO)/sizeof(DWORD) = 6
+        assert_eq!(description(current), "legacy name");
+        let long = vec![b'x'; MAX_STRING + 64];
+        raise(
+            THREAD_NAME_EXCEPTION,
+            &[0x1000, long.as_ptr() as usize, u32::MAX as usize],
+        );
+        assert_eq!(description(current), "x".repeat(MAX_STRING));
+        assert!(!name_thread(&[0x1000, 1, u32::MAX as usize]));
+    }
+
+    #[test]
+    fn review_foreign_thread_child() {
+        if std::env::var_os("XTP_FOREIGN_THREAD_CHILD").is_none() {
+            return;
+        }
+        use std::io::{BufRead, Write};
+        // SAFETY: queries this child's calling thread.
+        println!("XTP FOREIGN THREAD {}", unsafe { GetCurrentThreadId() });
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().lock().read_line(&mut input).unwrap();
+        assert_eq!(input.trim(), "finish");
+        // SAFETY: a live current-thread pseudo handle.
+        let current = unsafe { GetCurrentThread() };
+        assert_ne!(description(current), "foreign rename forbidden");
+        println!("XTP FOREIGN NAME UNCHANGED");
+    }
+
+    #[test]
+    fn review_explicit_thread_id_must_belong_to_this_process() {
+        if isolated("review_explicit_thread_id_must_belong_to_this_process") {
+            return;
+        }
+        use std::io::{BufRead, Write};
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash::tests::review_foreign_thread_child",
+                "--nocapture",
+            ])
+            .env("XTP_FOREIGN_THREAD_CHILD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let id = loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "foreign child ended before readiness"
+            );
+            if let Some((_, id)) = line.trim().split_once("XTP FOREIGN THREAD ") {
+                break id.parse::<u32>().unwrap();
+            }
+        };
+        // Prove Windows granted this foreign handle, rather than testing only OpenThread failure.
+        // SAFETY: requesting limited access to the controlled child's live thread.
+        let handle = unsafe {
+            OpenThread(
+                THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                id,
+            )
+        };
+        assert!(!handle.is_null());
+        // SAFETY: live opened handle; this query precedes its close.
+        assert_eq!(unsafe { GetProcessIdOfThread(handle) }, child.id());
+        // SAFETY: owns this real handle.
+        unsafe { CloseHandle(handle) };
+        assert!(!name_thread(&[
+            0x1000,
+            c"foreign rename forbidden".as_ptr() as usize,
+            id as usize
+        ]));
+        writeln!(child.stdin.take().unwrap(), "finish").unwrap();
+        use std::io::Read;
+        let mut rest = String::new();
+        output.read_to_string(&mut rest).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{rest}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(rest.contains("XTP FOREIGN NAME UNCHANGED"), "{rest}");
+    }
+
+    #[test]
+    fn review_exit_observers_child() {
+        if std::env::var_os("XTP_OBSERVER_EXIT_CHILD").is_none() {
+            return;
+        }
+        // Prepare everything before actual shutdown ends the harness's other threads.
+        let image = SyntheticThrow::new(&[]);
+        report_crashes();
+        let mut record = EXCEPTION_RECORD {
+            ExceptionCode: CPP_EXCEPTION,
+            NumberParameters: 4,
+            ExceptionAddress: (image.base + SyntheticThrow::BACK) as *mut _,
+            ..Default::default()
+        };
+        record.ExceptionInformation[..4].copy_from_slice(&[CPP_MAGICS[0], 0, 0, 0]);
+        let mut context = context();
+        let mut info = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut context,
+        };
+        let name = [
+            0x1000,
+            c"must not name during exit".as_ptr() as usize,
+            u32::MAX as usize,
+        ];
+        crate::threads::detach_all();
+        assert!(crate::threads::exiting());
+        observe_cpp(&record, &context);
+        assert!(!name_thread(&name));
+        assert_eq!(FIRST_CHANCE.load(Ordering::Relaxed), 0);
+        // SAFETY: pointers are live; shutdown observers must continue dispatch.
+        assert_eq!(unsafe { handler(&mut info) }, EXCEPTION_CONTINUE_SEARCH);
+        println!("XTP EXIT OBSERVERS SKIPPED");
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn review_exit_skips_both_observers() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash::tests::review_exit_observers_child",
+                "--nocapture",
+            ])
+            .env("XTP_OBSERVER_EXIT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("XTP EXIT OBSERVERS SKIPPED"),
+            "status {:?}\n{}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }
