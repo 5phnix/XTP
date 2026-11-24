@@ -19,8 +19,9 @@
 //! lanes ([`emit::Target`]): `32-32` is NVIDIA's, where console wave64
 //! programs run as two 32-lane halves or stop with their reason
 //! (`docs/wave64-on-wave32.md`). Without it the translation is the one for
-//! any host, and the JSON is what it was. The report counts the wave size
-//! each translation requires, by the console's.
+//! any host, and the JSON is what it was; with it the JSON also says
+//! `host_lanes`, and each translation's `wave` where it requires one. The
+//! report counts the wave size each translation requires, by the console's.
 //!
 //! The pack: the path given, else `XTP_SAMPLE_SHADERS`, else `shaders.rpf`
 //! in the configured game folder. Records are found as `xtp translate`
@@ -977,13 +978,22 @@ pub(crate) fn to_json(s: &Survey) -> String {
         }
         for (k, p) in r.programs.iter().enumerate() {
             let outcome = match &p.outcome {
-                Outcome::Translated { output, check, .. } => {
+                Outcome::Translated {
+                    output,
+                    check,
+                    wave,
+                } => {
                     let check = match check {
                         None => String::new(),
                         Some(Ok(())) => ", \"validator\": \"ok\"".into(),
                         Some(Err(e)) => format!(", \"validator\": {}", quote(e)),
                     };
-                    format!("\"outcome\": \"translated\", \"output\": \"{output}\"{check}")
+                    // With --host-lanes only, as the header's `host_lanes`.
+                    let wave = match wave {
+                        Some(w) if s.target != emit::Target::ANY => format!(", \"wave\": {w}"),
+                        _ => String::new(),
+                    };
+                    format!("\"outcome\": \"translated\", \"output\": \"{output}\"{wave}{check}")
                 }
                 Outcome::Failed { step, what } => format!(
                     "\"outcome\": {}, \"item\": {}",
