@@ -192,8 +192,18 @@ zone of europe-west1, -west2, -west3, -west4, -west6 and us-central1 was
 stocked out for about twenty minutes; `us-central1-a` had one at the third
 round of retries. `new-vm.ps1` tries the configured zones in order, and with
 `-RetryMinutes <n>` tries them again every four minutes. List several regions'
-zones in `zones`, your preferred ones first. Starting a stopped VM can hit the
-same wall (its zone is fixed): wait and retry.
+zones in `zones`, your preferred ones first.
+
+Starting a stopped VM hits the same wall, and its zone is fixed: that day
+our VM stopped itself while idle and could not start again for a while
+(`ZONE_RESOURCE_POOL_EXHAUSTED` in us-central1-a). Every script retries a
+start every 2 minutes for `startRetryMinutes`; `start-vm.ps1 -RetryMinutes
+120` waits longer. When you need the GPU at a given time (a measurement
+session), start the VM ahead and keep it from stopping (raise
+`xtp-idle-minutes`, see [Troubleshooting](#9-troubleshooting)), or pay for
+a [reservation](https://cloud.google.com/compute/docs/instances/reservations-overview)
+of a g2-standard-16 with an L4 in its zone, billed like a running VM
+whether you use it or not.
 
 ## 3. Configuration file
 
@@ -214,6 +224,7 @@ names your project, bucket and paths.
 | `goldenDir` | optional: an XTP data folder (saves, settings) that game runs start from, e.g. one with the first boot done and a save in the world |
 | `vm`, `machineType`, `accelerator`, `bootDiskGb`, `dataDiskGb`, `diskType` | the VM (defaults: `xtp-l4`, `g2-standard-16`, `nvidia-l4-vws`, 100, 300, `pd-balanced`) |
 | `idleMinutes` | the VM shuts itself down after this long without activity (default 30; 0: never) |
+| `startRetryMinutes` | how long the scripts keep trying to start a stopped VM whose zone has no GPU free (default 20) |
 | `stopSchedule`, `timeZone` | a daily stop, as a backstop (default `0 3 * * *`, `Europe/Paris`) |
 | `sshUser` | your account on the VM (default: your Windows user name in lowercase) |
 | `sessionUser` | the local account whose desktop runs the game (default `xtp`) |
@@ -306,6 +317,7 @@ tools\cloud\run-remote.ps1 -Check -Ref origin/some-branch   # a branch of the VM
 tools\cloud\run-remote.ps1 -Cargo 'test -p xtp-gpu --locked' -Local
 tools\cloud\run-remote.ps1 -Game -Local -Seconds 240
 tools\cloud\run-remote.ps1 -Game -NoBuild -Env @{ XTP_LOG = 'xtp_gpu=debug,info'; XTP_GPU_TIMING = '1' }
+tools\cloud\run-remote.ps1 -Game -Local -Repo E:\XTP -LocalRev main -Autopilot autopilot\gameplay.txt -Seconds 420
 tools\cloud\invoke-vm.ps1 'nvidia-smi'                       # any short PowerShell on the VM
 tools\cloud\invoke-vm.ps1 -Shell                             # a shell on the VM
 ```
@@ -444,12 +456,15 @@ no GitHub credentials and should not get any.
 ### Hangar workers
 
 A Hangar worker is a Claude Code session in a worktree of its own on your PC.
-To keep your PC free for game sessions, workers build and test on the VM:
+To keep your PC free for game sessions, workers build and test elsewhere:
+everyday `cargo` and the delivery check on the [build farm](build-farm.md),
+and on this VM what needs the L4 or the game:
 
-- each worker runs `tools\cloud\run-remote.ps1 -Check -Local` (or `-Cargo`,
-  `-Game`) from its worktree: its own commit is bundled and checked out on the
-  VM, builds are serialized by a lock on the VM, and each worker gets its logs
-  in its own folder;
+- each worker runs `tools\cloud\run-remote.ps1 -Game -Local` (or `-Check`,
+  `-Cargo`) from its worktree: its own commit is bundled and checked out on
+  the VM (`-Repo <path> -LocalRev <branch>` sends another one, such as an
+  unpushed `main`), builds are serialized by a lock on the VM, and each
+  worker gets its logs in its own folder;
 - workers do not stop the VM (another may be using it): it stops itself after
   `idleMinutes` without activity, and the orchestrator or you can run
   `stop-vm.ps1`;
@@ -458,16 +473,17 @@ To keep your PC free for game sessions, workers build and test on the VM:
 - the same rules as below apply: workers run their own branches, never a
   stranger's pull request.
 
-**Build machines without a GPU** use the same scripts with another
-configuration file: `accelerator` empty, another `vm` name and `machineType`
-(for example `c3-standard-22`), and `-Config <that file>`. `setup-vm.ps1`
-then skips the NVIDIA driver; the desktop session is still set up, because
-builds and tests run there. Game files are not needed on them: give them a
-`serviceAccount` of their own (`new-vm.ps1` creates it without any access to
-the bucket; do not run `new-bucket.ps1` with that configuration), skip
-`sync-game.ps1` and use a smaller `dataDiskGb`. Without game files and
-without access to them, such a machine is the place for code you have not
-reviewed yet.
+**Builds and tests without game files** belong on the
+[build farm](build-farm.md): Spot VMs without a GPU that run every worker's
+`cargo` and the delivery check, and never receive game files. The L4 VM is
+for what needs the real GPU or the game: GPU tests on hardware, game runs,
+measurements. A single build machine of your own can also come from these
+scripts, with another configuration file: `accelerator` empty, another `vm`
+name and `machineType` (for example `c3-standard-22`), a `serviceAccount` of
+its own (`new-vm.ps1` creates it without any access to the bucket; do not
+run `new-bucket.ps1` with that configuration), a smaller `dataDiskGb`, and no
+`sync-game.ps1`. `setup-vm.ps1` then skips the NVIDIA driver and still sets
+up the desktop session, where builds and tests run.
 
 ## 7. Costs, and keeping them down
 
@@ -546,14 +562,15 @@ Keeping them down:
 
 | Symptom | Cause and fix |
 |---------|---------------|
-| `ZONE_RESOURCE_POOL_EXHAUSTED` when creating or starting | No GPU free in that zone right now. `new-vm.ps1 -RetryMinutes 120`, more zones in `zones`, or try again later. |
+| `ZONE_RESOURCE_POOL_EXHAUSTED` when creating | No GPU free in that zone right now. `new-vm.ps1 -RetryMinutes 120`, more zones in `zones`, or try again later. |
+| `ZONE_RESOURCE_POOL_EXHAUSTED` when starting | The VM's zone has no GPU free right now; its zone cannot change. `start-vm.ps1 -RetryMinutes 120`, or later. See [Capacity](#capacity-when-no-zone-has-a-gpu-free). |
 | `Quota ... exceeded` | See [Quotas](#2-quotas); the message names the metric. |
 | SSH: `Server refused our key` | Right after creation the guest agent may not have created your account yet: wait a minute. Otherwise the user name has capitals: Windows' sshd only matches the lowercase name, and the scripts use `sshUser` (lowercase) for that reason. With gcloud by hand: `gcloud compute ssh <lowercase-user>@<vm> --tunnel-through-iap`. |
 | `unrecognized arguments` from gcloud in your own PowerShell | PowerShell splits unquoted `a,b` into two arguments and eats a bare `--`: quote such arguments (`"--accelerator=type=nvidia-l4-vws,count=1"`). |
 | Game run: `... is not logged on to the console` | The automatic logon failed (or someone took over the session with Remote Desktop). Restart the VM (`invoke-vm.ps1 'Restart-Computer -Force'`), or `setup-vm.ps1 -ResetSessionPassword`. |
 | The D3D12 check fails | `invoke-vm.ps1 'nvidia-smi'`: no GPU means a driver problem (run `setup-vm.ps1` again); a licence status other than *Licensed* means the vWS licence is missing (the VM must use `nvidia-l4-vws`). |
 | Serial console warnings `logging.logEntries.create denied` | Harmless: the VM's service account may not write to Cloud Logging. Grant it `roles/logging.logWriter` on the project if you want the guest agent's logs there. |
-| The VM stopped during your work | The idle shutdown saw no activity for `idleMinutes`: start it again; for long pauses with nothing running, write a time into `C:\xtp\keep-awake-until` (see `vm\idle-shutdown.ps1`) or raise `xtp-idle-minutes` in the VM's metadata. |
+| The VM stopped during your work | The idle shutdown saw no activity for `idleMinutes`: start it again; for long pauses with nothing running, write a time into `C:\xtp\keep-awake-until` (`invoke-vm.ps1 "(Get-Date).AddHours(3).ToString('o') \| Set-Content C:\xtp\keep-awake-until"`) or raise the limit: `gcloud compute instances add-metadata <vm> --zone=<zone> --metadata=xtp-idle-minutes=120`. |
 
 ## 10. Removing everything
 

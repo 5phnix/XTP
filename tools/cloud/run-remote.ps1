@@ -16,7 +16,14 @@
     default         origin/main of the VM's clone (or -Ref <commit|branch>)
     -Local          your current commit (HEAD of the repository this script is
                     in), sent to the VM as a git bundle: commit first, local
-                    changes are not sent
+                    changes are not sent; -Repo <path> and -LocalRev <branch>
+                    send another repository's or another branch's commit
+                    (e.g. -Repo E:\XTP -LocalRev main, not yet pushed)
+
+  -Game options: -Seconds, -Autopilot <script in the repository> (instead of
+  the scripted Enter presses), -Keys, -Env @{...}, -XtpArgs, -Name,
+  -NoBuild, -NoGolden, -NoCapture. The VM's GPU memory and use are sampled
+  every 2 s during the run (gpu.csv).
 
   The VM is started if needed and stops by itself once idle. One build and
   one game run at a time: a second caller waits. Logs go to
@@ -27,6 +34,7 @@
   tools\cloud\run-remote.ps1 -Cargo 'test -p xtp-gpu --locked' -Local
   tools\cloud\run-remote.ps1 -Game -Seconds 240 -Local
   tools\cloud\run-remote.ps1 -Game -NoBuild -Env @{ XTP_LOG = 'xtp_gpu=debug,info' }
+  tools\cloud\run-remote.ps1 -Game -Local -Repo E:\XTP -LocalRev main -Autopilot autopilot\gameplay.txt -Seconds 300
 #>
 [CmdletBinding(DefaultParameterSetName = 'Check')]
 param(
@@ -35,7 +43,10 @@ param(
     [Parameter(ParameterSetName = 'Game', Mandatory)] [switch]$Game,
     [Parameter(ParameterSetName = 'Device', Mandatory)] [switch]$DeviceCheck,
     [switch]$Local,
+    [string]$Repo = '',
+    [string]$LocalRev = 'HEAD',
     [string]$Ref = '',
+    [Parameter(ParameterSetName = 'Game')] [string]$Autopilot = '',
     [Parameter(ParameterSetName = 'Game')] [int]$Seconds = 180,
     [Parameter(ParameterSetName = 'Game')] [string]$Keys = '',
     [Parameter(ParameterSetName = 'Game')] [hashtable]$Env = @{},
@@ -59,12 +70,15 @@ Send-XtpVmToolFolder $cfg $zone
 $source = @{}
 if ($what -ne 'device') {
     if ($Local) {
-        $repo = $script:XtpRepoRoot
-        $head = (& git -C $repo rev-parse --short HEAD)
-        if (& git -C $repo status --porcelain --untracked-files=no) { Write-Warning "Local changes in $repo are not sent: only commit $head is." }
+        $repoDir = if ($Repo) { (Resolve-Path -LiteralPath $Repo).Path } else { $script:XtpRepoRoot }
+        $head = (& git -C $repoDir rev-parse --short $LocalRev)
+        if (-not $head) { throw "No commit $LocalRev in $repoDir" }
+        if ($LocalRev -eq 'HEAD' -and (& git -C $repoDir status --porcelain --untracked-files=no)) {
+            Write-Warning "Local changes in $repoDir are not sent: only commit $head is."
+        }
         $bundle = Join-Path $out 'src.bundle'
         $ErrorActionPreference = 'Continue'
-        & git -C $repo bundle create $bundle HEAD 2>&1 | Out-Null
+        & git -C $repoDir bundle create $bundle $LocalRev 2>&1 | Out-Null
         $ErrorActionPreference = 'Stop'
         if (-not (Test-Path -LiteralPath $bundle)) { throw 'git bundle create failed' }
         Write-Step "Sending commit $head ($([Math]::Round((Get-Item $bundle).Length / 1MB, 1)) MB bundle)"
@@ -104,6 +118,11 @@ switch ($what) {
         if (-not $cfg.titleExe) { throw "Set 'titleExe' in $($cfg.path)" }
         Write-Step "$(if ($NoBuild) { '' } else { 'Diagnostics build, then ' })game run on the VM ($Seconds s)"
         $envText = ($Env.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';'
+        if ($Autopilot) {
+            # The script drives the title; no scripted Enter presses beside it.
+            $XtpArgs = "$XtpArgs --autopilot $Autopilot".Trim()
+            if (-not $Keys) { $Keys = '-' }
+        }
         # One call: the VM keeps the clone locked from the build to the end of the run.
         $lines = Invoke-XtpVmTool -Cfg $cfg -Zone $zone -Name 'run-game.ps1' -AllowFail -Arguments ($source + @{
                 TitleExe = $cfg.titleExe; Seconds = $Seconds; Keys = $Keys; Env = $envText; Name = $Name; XtpArgs = $XtpArgs
@@ -116,7 +135,7 @@ switch ($what) {
         if ($run) {
             # The log, the frames and the crash log; not the data folder (saves).
             $zip = "C:\xtp\jobs\$(Split-Path -Leaf $run).zip"
-            $pack = "`$r = '$run'; `$items = @('run.log', 'env.txt', 'result.json', 'xtp.toml', 'capture') | ForEach-Object { Join-Path `$r `$_ } | Where-Object { Test-Path `$_ }; " +
+            $pack = "`$r = '$run'; `$items = @('run.log', 'env.txt', 'result.json', 'xtp.toml', 'gpu.csv', 'capture') | ForEach-Object { Join-Path `$r `$_ } | Where-Object { Test-Path `$_ }; " +
                 "`$crash = Get-ChildItem -LiteralPath (Join-Path `$r 'data') -Recurse -Filter 'crashes.log' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; " +
                 "if (`$crash) { Copy-Item -LiteralPath `$crash -Destination (Join-Path `$r 'crashes.log'); `$items += (Join-Path `$r 'crashes.log') }; " +
                 "Compress-Archive -Path `$items -DestinationPath '$zip' -Force"

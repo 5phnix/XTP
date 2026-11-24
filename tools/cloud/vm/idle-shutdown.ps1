@@ -6,8 +6,10 @@
   xtp-idle-minutes (default 30; 0 turns this off). A VM shut down from inside
   is STOPPED: its CPU, GPU and Windows licence are no longer billed.
 
-  Busy means any of:
-  - an SSH connection (gcloud compute ssh, scp, the tools/cloud scripts);
+  Busy means any of, now or since the previous check:
+  - an SSH connection (gcloud compute ssh, scp, the tools/cloud scripts; the
+    OpenSSH event log catches the short ones);
+  - a file written in C:\xtp\jobs, C:\xtp\logs or C:\xtp\tools\vm;
   - a Remote Desktop session that is connected;
   - a build, test, game run, sync or Claude Code process (see $busyNames);
   - C:\xtp\keep-awake-until holding a time that has not passed yet
@@ -43,6 +45,16 @@ $ErrorActionPreference = 'Stop'
 if ($rdp -gt 0) { $reasons += "remote desktop ($rdp)" }
 $procs = @(Get-Process -Name $busyNames -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique)
 if ($procs.Count) { $reasons += ($procs -join ',') }
+# What happened since the last check (every 5 minutes): a short SSH command,
+# a copy or a job between two checks counts too.
+$recent = (Get-Date).AddMinutes(-6)
+try {
+    $ssh = Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 1 -ErrorAction Stop
+    if ($ssh.TimeCreated -gt $recent) { $reasons += 'ssh in the last minutes' }
+} catch { Write-Verbose "no OpenSSH log: $_" }
+$touched = Get-ChildItem -LiteralPath 'C:\xtp\jobs', 'C:\xtp\logs', 'C:\xtp\tools\vm' -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -gt $recent -and $_.FullName -ne $state -and $_.FullName -ne $log } | Select-Object -First 1
+if ($touched) { $reasons += "recent file $($touched.Name)" }
 if (Test-Path 'C:\xtp\keep-awake-until') {
     try { if ([datetime](Get-Content 'C:\xtp\keep-awake-until' -Raw).Trim() -gt (Get-Date)) { $reasons += 'keep-awake' } } catch { Write-Verbose "unreadable keep-awake-until: $_" }
 }

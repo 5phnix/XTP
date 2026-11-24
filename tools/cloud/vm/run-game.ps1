@@ -87,7 +87,19 @@ try {
 
     $raw = Join-Path $run 'run.raw.log'
     Write-Output "run folder: $run (from $from, $Seconds s)"
-    $code = Invoke-XtpSessionJob -Exe $Exe -Arguments "run `"$title`" --execute $XtpArgs" -Log $raw -Seconds $Seconds -Environment $envs -User $SessionUser -Quiet
+    # The GPU's memory and use every 2 s, beside the run.
+    $smi = @('C:\Windows\System32\nvidia-smi.exe', 'C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $gpuCsv = Join-Path $run 'gpu.csv'
+    $sampler = $null
+    if ($smi) {
+        $sampler = Start-Process -FilePath $smi -PassThru -WindowStyle Hidden -ArgumentList @(
+            '--query-gpu=timestamp,memory.used,memory.total,utilization.gpu', '--format=csv', '-lms', '2000', '-f', $gpuCsv)
+    }
+    try {
+        $code = Invoke-XtpSessionJob -Exe $Exe -Arguments "run `"$title`" --execute $XtpArgs" -Log $raw -Seconds $Seconds -Environment $envs -User $SessionUser -Quiet
+    } finally {
+        if ($sampler -and -not $sampler.HasExited) { Stop-Process -Id $sampler.Id -Force -ErrorAction SilentlyContinue }
+    }
     $result = $script:XtpLastJob
     $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding ASCII
 
@@ -107,6 +119,18 @@ try {
     if ($fail.Count) { Write-Output 'errors:'; $fail | ForEach-Object { "  $($_.Substring(0, [Math]::Min(300, $_.Length)))" } }
     $crash = Get-ChildItem -LiteralPath $data -Recurse -Filter 'crashes.log' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($crash) { Write-Output "crashes.log ($($crash.FullName)):"; Get-Content -LiteralPath $crash.FullName -Tail 15 | ForEach-Object { "  $_" } }
+    $auto = @($lines | Where-Object { $_ -match 'autopilot' } | Select-Object -Last 8)
+    if ($auto.Count) { Write-Output 'autopilot:'; $auto | ForEach-Object { "  $($_.Substring(0, [Math]::Min(300, $_.Length)))" } }
+    if (Test-Path -LiteralPath $gpuCsv) {
+        $rows = @(Import-Csv -LiteralPath $gpuCsv)
+        if ($rows.Count) {
+            # Columns: timestamp, memory.used, memory.total, utilization.gpu.
+            $used = @($rows | ForEach-Object { [int]((@($_.PSObject.Properties.Value)[1]) -replace '[^\d]', '') })
+            $total = @($rows[0].PSObject.Properties.Value)[2]
+            $peak = ($used | Measure-Object -Maximum).Maximum
+            Write-Output ("GPU memory used (every 2 s, {0} samples): peak {1:N0} MiB of {2}, last {3:N0} MiB" -f $rows.Count, $peak, "$total".Trim(), $used[-1])
+        }
+    }
     $frames = @(Get-ChildItem -LiteralPath (Join-Path $run 'capture') -Filter '*.png' -ErrorAction SilentlyContinue)
     if ($frames.Count) { Write-Output "captured frames: $($frames.Count) (last: $($frames | Sort-Object LastWriteTime | Select-Object -Last 1 -ExpandProperty Name))" }
     Write-Output "RUN DIR $run"

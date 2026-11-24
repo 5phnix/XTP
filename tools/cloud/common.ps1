@@ -35,6 +35,7 @@ $script:XtpCloudDefaults = [ordered]@{
     titleExe          = $null          # the title's executable, relative to the game folder
     repoUrl           = 'https://github.com/MiamiGame/XTP.git'
     idleMinutes       = 30             # the VM shuts itself down after this long idle
+    startRetryMinutes = 20             # how long a start retries while the zone has no GPU free
     stopSchedule      = '0 3 * * *'    # backstop: an instance schedule stops the VM daily
     timeZone          = 'Europe/Paris'
     sessionUser       = 'xtp'          # local account logged on to the desktop for game runs
@@ -199,17 +200,30 @@ function Send-XtpVmToolFolder($Cfg, [string]$Zone) {
     Send-XtpVmFile -Cfg $Cfg -Zone $Zone -Path $files -Destination 'C:\xtp\tools\vm'
 }
 
-# The VM, started if it is stopped; returns its zone.
-function Start-XtpVm($Cfg) {
+# The VM, started if it is stopped; returns its zone. A stopped VM keeps its
+# zone, and the zone may have no GPU free at that moment
+# (ZONE_RESOURCE_POOL_EXHAUSTED): the start is tried again every 2 minutes
+# for RetryMinutes (default: the configuration's startRetryMinutes).
+function Start-XtpVm($Cfg, [int]$RetryMinutes = -1) {
+    if ($RetryMinutes -lt 0) { $RetryMinutes = [int]$Cfg.startRetryMinutes }
     $zone = Get-XtpVmZone $Cfg
     if (-not $zone) { throw "No VM named $($Cfg.vm) in $($Cfg.project); create it with new-vm.ps1." }
     $status = Get-XtpVmStatus $Cfg $zone
     if ($status -ne 'RUNNING') {
         Write-Step "Starting $($Cfg.vm) in $zone (was $status)"
-        if ($status -eq 'STOPPING') {
-            while ((Get-XtpVmStatus $Cfg $zone) -eq 'STOPPING') { Start-Sleep -Seconds 10 }
+        while ((Get-XtpVmStatus $Cfg $zone) -in 'STOPPING', 'SUSPENDING') { Start-Sleep -Seconds 10 }
+        $deadline = (Get-Date).AddMinutes($RetryMinutes)
+        while ($true) {
+            $null = Invoke-Gcloud -Arguments (@('compute', 'instances', 'start', $Cfg.vm, "--zone=$zone") + (Get-XtpBaseArgList $Cfg)) -AllowFail -Quiet
+            if ($LASTEXITCODE -eq 0) { break }
+            $err = $global:XtpGcloudError
+            if ($err -notmatch 'RESOURCE_POOL_EXHAUSTED|STOCKOUT|does not have enough resources') { throw "Starting $($Cfg.vm) failed:`n$err" }
+            if ((Get-Date) -ge $deadline) {
+                throw "No GPU free in $zone to start $($Cfg.vm) (ZONE_RESOURCE_POOL_EXHAUSTED); tried for $RetryMinutes min. Try again later (start-vm.ps1 -RetryMinutes 120)."
+            }
+            Write-Host ("    {0:HH:mm:ss} no capacity in {1}, trying again in 2 minutes" -f (Get-Date), $zone)
+            Start-Sleep -Seconds 120
         }
-        $null = Invoke-Gcloud -Arguments (@('compute', 'instances', 'start', $Cfg.vm, "--zone=$zone") + (Get-XtpBaseArgList $Cfg))
     }
     Wait-XtpVmSsh $Cfg $zone
     return $zone

@@ -53,7 +53,13 @@ function Invoke-XtpGit([string[]]$ArgList) {
 # Puts C:\xtp\src on -Ref (default: the bundle's head, or origin/main).
 function Set-XtpSource([string]$Bundle, [string]$Ref) {
     if ($Bundle) {
-        Invoke-XtpGit @('fetch', '--quiet', '--force', $Bundle, '+HEAD:refs/xtp/local')
+        # The bundle's first ref (HEAD, or the branch run-remote.ps1 -LocalRev named).
+        $ErrorActionPreference = 'Continue'
+        $heads = @(& $script:XtpGit -C 'C:\xtp\src' bundle list-heads $Bundle 2>$null)
+        $ErrorActionPreference = 'Stop'
+        if (-not $heads.Count) { throw "No ref in the bundle $Bundle." }
+        $name = ("$($heads[0])" -split '\s+')[1]
+        Invoke-XtpGit @('fetch', '--quiet', '--force', $Bundle, "+$($name):refs/xtp/local")
         if (-not $Ref) { $Ref = 'refs/xtp/local' }
     } else {
         Invoke-XtpGit @('fetch', '--quiet', '--prune', 'origin')

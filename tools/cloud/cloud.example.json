@@ -16,6 +16,7 @@
   "dataDiskGb": 300,
   "diskType": "pd-balanced",
   "idleMinutes": 30,
+  "startRetryMinutes": 20,
   "stopSchedule": "0 3 * * *",
   "timeZone": "Europe/Paris"
 }
