@@ -11,16 +11,23 @@
 //! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 //!
-//! A container this build cannot translate is cached too, as its error
-//! (marker, length, checksum, text: the length and checksum are what tell a
-//! damaged entry from a real one): translation depends only on the container
-//! and on what [`build`] hashes, so it would fail the same way again. Without
-//! that, every run translated the same few hundred refused programs again
-//! (seconds each for the large ones) while the title waited for them.
+//! A container this build cannot translate for a target is cached too, as
+//! its error (marker, length, checksum, text: the length and checksum are
+//! what tell a damaged entry from a real one), under the key a translation
+//! would have: the build and the target. The translator's refusals
+//! ([`xtp_shader::ShaderError`]: a malformed container, GFX10 code it
+//! cannot decode or does not handle yet) depend only on the container and
+//! on what `key()` hashes (our executable, its loop limit, the target's
+//! wave sizes), so it would fail the same way again. Without that, every
+//! run translated the same few hundred refused programs again (seconds each
+//! for the large ones) while the title waited for them. Nothing transient
+//! is kept: the host driver's compile, where out of memory and a removed
+//! device happen, comes after this cache, and an entry that cannot be
+//! written is answered from the translation without being kept.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use xtp_pipeline::{Cache, Converter};
 use xtp_shader::emit::{HostShader, StaticSampler, Target, UserData};
@@ -87,7 +94,9 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
 /// `translate`'s translation of `container` for `target` from `cache`,
 /// under this build's key for that target; made and stored on a miss.
 /// The target that keys the entry is the one `translate` is for: the
-/// caller passes both.
+/// caller passes both. An error of `translate` is kept too, as the
+/// container's answer for this build and target: it must be one that would
+/// come again (a refusal of the translator), never a passing condition.
 pub(crate) fn kept(
     cache: &Cache,
     container: &[u8],
@@ -107,10 +116,23 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
 }
 
 /// The cache entry's converter: the key ([`key`]) and the container in,
-/// the encoded translation out. `ran` tells a miss from a hit.
+/// the encoded translation (or refusal) out. `ran` tells a miss from a
+/// hit; `made` keeps what was translated, the answer when the entry cannot
+/// be written.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    made: Mutex<Option<Result<HostShader, String>>>,
+}
+
+impl<F> Translate<F> {
+    fn new(translate: F) -> Translate<F> {
+        Translate {
+            translate,
+            ran: AtomicBool::new(false),
+            made: Mutex::new(None),
+        }
+    }
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -123,10 +145,13 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        Ok(match (self.translate)(&input[32..]) {
-            Ok(shader) => encode(&shader),
-            Err(error) => encode_failure(&error),
-        })
+        let made = (self.translate)(&input[32..]);
+        let entry = match &made {
+            Ok(shader) => encode(shader),
+            Err(error) => encode_failure(error),
+        };
+        *self.made.lock().unwrap_or_else(PoisonError::into_inner) = Some(made);
+        Ok(entry)
     }
 }
 
@@ -137,22 +162,33 @@ fn cached(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
     let input = [&key[..], container].concat();
-    let converter = Translate {
-        translate,
-        ran: AtomicBool::new(false),
-    };
+    let converter = Translate::new(translate);
     for _ in 0..2 {
         let path = match cache.get_or_convert(&converter, &input) {
             Ok(path) => path,
             Err(e) => {
                 // The cache is a convenience: a folder that cannot be
                 // written must not cost the reason a container is refused
-                // for. Answer from the translation itself.
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "shader cache entry not written; translating without it"
-                );
-                break;
+                // for, nor a second translation. Answer from the one just
+                // made. Told once: a full disk would say it per shader.
+                static TOLD: AtomicBool = AtomicBool::new(false);
+                let error = format!("{e:#}");
+                if TOLD.swap(true, Ordering::Relaxed) {
+                    tracing::debug!(error = %error, "shader cache entry not written");
+                } else {
+                    tracing::warn!(
+                        error = %error,
+                        "shader cache entry not written; answering from the translation \
+                         (further ones at debug level)"
+                    );
+                }
+                let made = converter
+                    .made
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                MISSES.fetch_add(1, Ordering::Relaxed);
+                return made.unwrap_or_else(|| (converter.translate)(container));
             }
         };
         let entry = std::fs::read(&path)
@@ -571,34 +607,108 @@ mod tests {
     /// A cache whose entry cannot be written (here: the entry's path is a
     /// directory, so the rename onto it fails) must not turn a refusal into
     /// an OS error: the reason is the answer, the cache is only a shortcut.
+    /// Nor a translation (before the port it did too), and the answer is
+    /// the translation already made, not a second one.
     #[test]
     fn a_cache_that_cannot_be_written_still_says_why() {
         use xtp_pipeline::CacheKey;
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
-        let container = b"a container that does not translate".as_slice();
         let runs = AtomicU64::new(0);
         let fail = |_: &[u8]| {
             runs.fetch_add(1, Ordering::Relaxed);
             Err::<HostShader, _>("a scalar memory read as data".to_owned())
         };
-        // Block the entry's own path with a directory before the first call.
-        let input = [&build[..], container].concat();
-        let key = CacheKey::new(
-            &Translate {
-                translate: fail,
-                ran: AtomicBool::new(false),
-            },
-            &input,
-        );
-        std::fs::create_dir_all(cache.path_for(&key)).unwrap();
+        let ok = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        // Block each entry's own path with a directory before the first call.
+        let block = |container: &[u8]| {
+            let input = [&build[..], container].concat();
+            let key = CacheKey::new(&Translate::new(fail), &input);
+            std::fs::create_dir_all(cache.path_for(&key)).unwrap();
+        };
+        let refused = b"a container that does not translate".as_slice();
+        block(refused);
         assert_eq!(
-            cached(&cache, &build, container, fail),
+            cached(&cache, &build, refused, fail),
             Err("a scalar memory read as data".to_owned()),
             "the reason, not the OS error"
         );
-        assert!(runs.load(Ordering::Relaxed) >= 1);
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "translated once");
+        let translated = b"a container that translates".as_slice();
+        block(translated);
+        assert_eq!(cached(&cache, &build, translated, ok), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "translated once");
+    }
+
+    /// The acceptance test of the port: a refusal is kept under the key a
+    /// translation would have, the build and the target. A container is
+    /// translated once per pair, then its refusal comes from the cache; a
+    /// rebuilt translator or another target translates it again (and may
+    /// take it: a 64-lane host runs what a 32-lane one refuses).
+    #[test]
+    fn refusals_are_kept_by_build_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"a wave64 program that reads across its halves".as_slice();
+        let (build, rebuilt) = ([7u8; 32], [8u8; 32]);
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let runs = AtomicU64::new(0);
+        // Taken for 64-lane hosts, and by the rebuilt translator for any.
+        let get = |build: &[u8; 32], target: Target| {
+            let translate = |_: &[u8]| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                if target.runs(64) || *build == rebuilt {
+                    Ok(shader())
+                } else {
+                    Err("it needs 64-lane waves".to_owned())
+                }
+            };
+            cached(&cache, &key(build, target), container, translate)
+        };
+        let refused = Err("it needs 64-lane waves".to_owned());
+        let runs = || runs.load(Ordering::Relaxed);
+        assert_eq!(get(&build, nvidia), refused);
+        assert_eq!(get(&build, nvidia), refused);
+        assert_eq!(runs(), 1, "the second refusal came from the cache");
+
+        assert_eq!(get(&build, Target::ANY), Ok(shader()), "another target");
+        assert_eq!(runs(), 2);
+        assert_eq!(get(&rebuilt, nvidia), Ok(shader()), "another build");
+        assert_eq!(runs(), 3);
+
+        // Each is its own entry, found again.
+        assert_eq!(get(&build, nvidia), refused);
+        assert_eq!(get(&build, Target::ANY), Ok(shader()));
+        assert_eq!(get(&rebuilt, nvidia), Ok(shader()));
+        assert_eq!(runs(), 3);
+        assert_eq!(walk(dir.path()).len(), 3);
+    }
+
+    /// What `host_shader` keeps: the translator's own refusal, with its
+    /// text, translated once.
+    #[test]
+    fn the_translators_refusal_is_kept_with_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |c: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            xtp_shader::emit::translate_for(c, Target::ANY).map_err(|e| e.to_string())
+        };
+        let container = b"not a shader container".as_slice();
+        let refused = Err("not a DXBC container".to_owned());
+        for _ in 0..2 {
+            let got = cached(&cache, &key(&[7; 32], Target::ANY), container, translate);
+            assert_eq!(got, refused);
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the second from the cache");
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
