@@ -304,7 +304,7 @@ fn frames() -> Vec<u64> {
 }
 
 /// Whether `address` is in one of the DLLs `names` names.
-fn in_module(address: usize, names: &[&str]) -> bool {
+pub(crate) fn in_module(address: usize, names: &[&str]) -> bool {
     locate(address)
         .split_once('+')
         .is_some_and(|(module, _)| names.iter().any(|n| module.eq_ignore_ascii_case(n)))

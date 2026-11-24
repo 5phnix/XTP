@@ -11,10 +11,10 @@
 //! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 //!
-//! A container this build cannot translate for a target is cached too, as
-//! its error (marker, length, checksum, text: the length and checksum are
-//! what tell a damaged entry from a real one), under the key a translation
-//! would have: the build and the target. The translator's refusals
+//! A container this build cannot translate for a target is cached under the
+//! same key as a translation. The disk cache verifies the payload's length
+//! and digest first. The shader decoder then checks the refusal's marker,
+//! text length, checksum and UTF-8. The translator's refusals
 //! ([`xtp_shader::ShaderError`]: a malformed container, GFX10 code it
 //! cannot decode or does not handle yet) depend only on the container and
 //! on what `key()` hashes (our executable, its loop limit, the target's
@@ -26,8 +26,8 @@
 //! written is answered from the translation without being kept.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
 
 use xtp_pipeline::{Cache, Converter};
 use xtp_shader::emit::{HostShader, StaticSampler, Target, UserData};
@@ -125,13 +125,10 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
 }
 
 /// The cache entry's converter: the key ([`key`]) and the container in,
-/// the encoded translation (or refusal) out. `ran` tells a miss from a
-/// hit; `made` keeps what was translated, the answer when the entry cannot
-/// be written.
+/// the encoded translation (or refusal) out. `ran` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
-    made: Mutex<Option<Result<HostShader, String>>>,
 }
 
 impl<F> Translate<F> {
@@ -139,7 +136,6 @@ impl<F> Translate<F> {
         Translate {
             translate,
             ran: AtomicBool::new(false),
-            made: Mutex::new(None),
         }
     }
 }
@@ -154,13 +150,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let made = (self.translate)(&input[32..]);
-        let entry = match &made {
-            Ok(shader) => encode(shader),
-            Err(error) => encode_failure(error),
-        };
-        *self.made.lock().unwrap_or_else(PoisonError::into_inner) = Some(made);
-        Ok(entry)
+        Ok(match (self.translate)(&input[32..]) {
+            Ok(shader) => encode(&shader),
+            Err(error) => encode_failure(&error),
+        })
     }
 }
 
@@ -172,62 +165,20 @@ fn cached(
 ) -> Result<HostShader, String> {
     let input = [&key[..], container].concat();
     let converter = Translate::new(translate);
-    for _ in 0..2 {
-        let path = match cache.get_or_convert(&converter, &input) {
-            Ok(path) => path,
-            Err(e) => {
-                // The cache is a convenience: a folder that cannot be
-                // written must not cost the reason a container is refused
-                // for, nor a second translation. Answer from the one just
-                // made. Told once: a full disk would say it per shader.
-                static TOLD: AtomicBool = AtomicBool::new(false);
-                let error = format!("{e:#}");
-                if TOLD.swap(true, Ordering::Relaxed) {
-                    tracing::debug!(error = %error, "shader cache entry not written");
-                } else {
-                    tracing::warn!(
-                        error = %error,
-                        "shader cache entry not written; answering from the translation \
-                         (further ones at debug level)"
-                    );
-                }
-                let made = converter
-                    .made
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
-                return count(
-                    &MISSES,
-                    made.unwrap_or_else(|| (converter.translate)(container)),
-                );
-            }
-        };
-        let entry = std::fs::read(&path)
-            .ok()
-            .and_then(|b| decode(&b).map(Ok).or_else(|| decode_failure(&b).map(Err)));
-        if let Some(result) = entry {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            tracing::debug!(path = %path.display(), ok = result.is_ok(), "shader {what}");
-            return count(counter, result);
-        }
-        tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
-        let _ = std::fs::remove_file(&path);
-    }
-    // Entries that do not read back as written: the translation made for
-    // the last one is the answer, not a third.
-    let made = converter
-        .made
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
-    count(
-        &MISSES,
-        made.unwrap_or_else(|| (converter.translate)(container)),
-    )
+    let result = cache
+        .get_or_convert_with(&converter, &input, |bytes| {
+            decode(&bytes)
+                .map(Ok)
+                .or_else(|| decode_failure(&bytes).map(Err))
+        })
+        .map_err(|e| format!("{e:#}"))?;
+    let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+        (&MISSES, "translated")
+    } else {
+        (&HITS, "from the cache")
+    };
+    tracing::debug!(ok = result.is_ok(), "shader {what}");
+    count(counter, result)
 }
 
 /// For tests: [`wave64_program`] with its lane reads.
@@ -497,8 +448,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 /// counters sees only its own.
 #[cfg(test)]
 pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
-    static CACHE_TESTS: Mutex<()> = Mutex::new(());
-    CACHE_TESTS.lock().unwrap_or_else(PoisonError::into_inner)
+    static CACHE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CACHE_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -615,14 +568,32 @@ mod tests {
         assert_eq!(cached(&cache, &build, container, fail), error);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
 
-        // A damaged failure entry is a miss, tried again.
-        for e in walk(dir.path()) {
-            if std::fs::read(&e).unwrap().starts_with(FAILED) {
-                std::fs::write(e, [FAILED.as_slice(), &[0xff, 0xfe]].concat()).unwrap();
-            }
-        }
+        // The disk header is valid, but the refusal's own checksum is stale.
+        let input = [&build[..], container].concat();
+        let converter = Translate::new(fail);
+        let entry = xtp_pipeline::CacheKey::new(&converter, &input);
+        let mut damaged = encode_failure("unsupported operand");
+        *damaged.last_mut().unwrap() ^= 1;
+        let frame = [
+            b"XTP\x01".as_slice(),
+            &(damaged.len() as u64).to_le_bytes(),
+            blake3::hash(&damaged).as_bytes(),
+            &damaged,
+        ]
+        .concat();
+        std::fs::write(cache.path_for(&entry), frame).unwrap();
+        assert_eq!(
+            cache.get_or_convert(&converter, &input).unwrap().as_ref(),
+            damaged
+        );
         assert_eq!(cached(&cache, &build, container, fail), error);
         assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert_eq!(cached(&cache, &build, container, fail), error);
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "the rebuilt refusal was cached"
+        );
     }
 
     #[test]

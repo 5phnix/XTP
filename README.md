@@ -42,7 +42,7 @@ What each part does today and what it still needs:
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
 | Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
+| Series S mode (the default) | The world loads in seconds and runs (150 s in a row measured, about 1.7 fps) | The world, as above |
 
 ## Getting started
 
@@ -110,9 +110,16 @@ xtp lib-exports <import.lib> [--list]
 xtp shader-info [paths...] [--verbose] [--disasm]
 xtp translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 xtp run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
+            [--console series-s|series-x] [-- <title arguments>]
 xtp config
 ```
+
+The title sees an Xbox Series S unless `--console series-x` or
+`XTP_CONSOLE=series-x` says otherwise: with Series S budgets the world
+loads in seconds, where Series X's push the host GPU's resident memory
+past the point at which Windows slows every new allocation, and loading
+takes minutes (docs/analysis/series-s.md, stall.md). `cargo xtask play`
+passes `XTP_CONSOLE` on as `--console`.
 
 Logging: `XTP_LOG=xtp_loader=trace,info` (a release build logs
 info and above).
@@ -149,7 +156,10 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_SKIP_INTRO=1` | every build: cuts the intro movie of the start-up front end (sent to its last frame when it starts), so the world starts loading about 13 s sooner (docs/analysis/intro-skip.md); known builds only (1.0.2.1), otherwise a warning and nothing changed |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+title's data folder. The loader also prints the first 16 title C++ throws
+(decorated type name, readable MSVC `std::exception` message and title
+`module+rva`) to stderr,
+and maps legacy debugger thread names to Windows thread descriptions.
 
 ## Contributing
 

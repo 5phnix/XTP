@@ -72,6 +72,7 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
         xtp.display()
     );
 
+    let console = console(std::env::var("XTP_CONSOLE").ok().as_deref())?;
     let _session = Session::take()?;
     refuse_a_second_title()?;
     let run = cfg.cache_subdir("play")?.join(stamp(SystemTime::now()));
@@ -82,6 +83,7 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
         .with_context(|| format!("writing {}", autopilot.display()))?;
     let log = run.join("run.log");
     println!("play: run folder {}", run.display());
+    println!("play: console {console} (XTP_CONSOLE=series-x for Series X)");
     println!(
         "play: {} drives the title to gameplay{}",
         script.display(),
@@ -96,6 +98,7 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
         .arg("--execute")
         .arg("--autopilot")
         .arg(&autopilot)
+        .args(["--console", console])
         // Over the config file's: the title writes only the copy.
         .env("XTP_DATA_DIR", &data)
         .stdin(Stdio::null())
@@ -141,6 +144,16 @@ fn build(root: &Path) -> Result<()> {
         .context("running cargo build")?;
     ensure!(status.success(), "cargo build failed ({status})");
     Ok(())
+}
+
+/// The console `xtp run` gets: `XTP_CONSOLE` (`series-x` or `series-s`),
+/// else Series S, as `xtp run` picks it.
+fn console(env: Option<&str>) -> Result<&'static str> {
+    match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("series-s") => Ok("series-s"),
+        Some("series-x") => Ok("series-x"),
+        Some(other) => bail!("XTP_CONSOLE={other}: expected series-x or series-s"),
+    }
 }
 
 /// The script, with `exit after` the measured seconds at its end: they
@@ -459,6 +472,14 @@ mod tests {
         (365.2 preparing: copies 280.0 ms 212.3 MB, textures 0.0 ms 0.0 MB; 250.5 on the GPU; \
         98.0 copying back 40.0 MB), 2400 draws/frame, dropped 1250 without a host pipeline \
         (12 being made) and 230 indirect";
+
+    #[test]
+    fn play_runs_series_s_unless_told() {
+        assert_eq!(console(None).unwrap(), "series-s");
+        assert_eq!(console(Some("")).unwrap(), "series-s");
+        assert_eq!(console(Some(" Series-X ")).unwrap(), "series-x");
+        assert!(console(Some("one")).is_err());
+    }
 
     #[test]
     fn play_reads_the_frame_rate_lines_figures() {
