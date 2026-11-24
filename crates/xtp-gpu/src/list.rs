@@ -1431,14 +1431,20 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags (the
-/// ray-tracing builder dispatches this way). Each pair of flags and program
-/// is logged the first time, with its counts and the program's thread
-/// group ([`note_dispatch_x`]).
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags. With one of
+/// the [`thread_count_flags`] the counts are threads, run as the groups
+/// [`dispatch_x_groups`] makes of them; otherwise they are groups, as in
+/// `Dispatch`. Each pair of flags and program is logged the first time
+/// ([`note_dispatch_x`]).
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
     {
-        note_dispatch_x(kept_pipeline(this), [x, y, z], flags);
+        let pipeline = kept_pipeline(this);
+        let host = crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
+        let group = host.and_then(console_group);
+        let groups = dispatch_x_groups([x, y, z], flags, thread_count_flags(), group);
+        note_dispatch_x(pipeline, host, ([x, y, z], flags), group, groups);
+        let [x, y, z] = groups;
         state::dispatch(this, x, y, z);
     }
     #[cfg(not(windows))]
@@ -1448,18 +1454,91 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     }
 }
 
+/// The `DispatchX` flag bits that make its counts threads rather than
+/// thread groups: `XTP_DISPATCH_X_THREADS` (hexadecimal, `0x` optional),
+/// read once; none without it.
+#[cfg(windows)]
+fn thread_count_flags() -> u32 {
+    static FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FLAGS.get_or_init(|| {
+        let value = std::env::var("XTP_DISPATCH_X_THREADS").ok();
+        let flags = parse_thread_count_flags(value.as_deref());
+        if value.is_some() {
+            tracing::info!(
+                flags = format_args!("{flags:#x}"),
+                "DispatchX: these flags make the counts threads (XTP_DISPATCH_X_THREADS)"
+            );
+        }
+        flags
+    })
+}
+
+/// [`thread_count_flags`] from the variable's value: no bits when it is
+/// unset or not a hexadecimal number.
+#[cfg(windows)]
+fn parse_thread_count_flags(value: Option<&str>) -> u32 {
+    let Some(value) = value.map(str::trim) else {
+        return 0;
+    };
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    u32::from_str_radix(digits, 16).unwrap_or_else(|_| {
+        tracing::warn!(
+            value,
+            "XTP_DISPATCH_X_THREADS is not a hexadecimal number: ignored"
+        );
+        0
+    })
+}
+
+/// The thread group of a host compute pipeline's console program, as the
+/// console runs it (the host's may be laid out as one row, see
+/// `xtp_shader`'s `flat_group`).
+#[cfg(windows)]
+fn console_group(p: &crate::pipeline::host::HostPipeline) -> Option<[u32; 3]> {
+    p.stages.first()?.shader.native().ok()?.threads
+}
+
+/// The thread groups a `DispatchX` of `counts` runs: the counts, or, when
+/// `flags` holds one of the `threads` bits, the counts taken as threads in
+/// groups of `group`, each dimension rounded up to whole groups. Without
+/// a group (no host pipeline, which drops the dispatch anyway) the counts
+/// stay as they are.
+#[cfg(windows)]
+fn dispatch_x_groups(
+    counts: [u32; 3],
+    flags: u32,
+    threads: u32,
+    group: Option<[u32; 3]>,
+) -> [u32; 3] {
+    match group {
+        Some(g) if flags & threads != 0 && !g.contains(&0) => {
+            [0, 1, 2].map(|k| counts[k].div_ceil(g[k]))
+        }
+        _ => counts,
+    }
+}
+
 /// Logs a `DispatchX` the first time its flags come with its program (the
 /// bound pipeline's compute shader, or no host pipeline yet): the flags,
-/// the counts and the program's console thread group, which tell whether
-/// the counts are groups or threads.
+/// the counts, the program's console thread group and the groups run,
+/// which tell whether the counts are groups or threads.
 #[cfg(windows)]
-fn note_dispatch_x(pipeline: This, counts: [u32; 3], flags: u32) {
+fn note_dispatch_x(
+    pipeline: This,
+    host: Option<&crate::pipeline::host::HostPipeline>,
+    (counts, flags): ([u32; 3], u32),
+    group: Option<[u32; 3]>,
+    groups: [u32; 3],
+) {
     use std::collections::HashSet;
     static SEEN: std::sync::Mutex<Option<HashSet<(u32, usize)>>> = std::sync::Mutex::new(None);
-    let host = crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
-    let stage = host.and_then(|p| p.stages.first());
     // Shaders stay interned for the run: the address names the program.
-    let program = stage.map_or(0, |s| std::sync::Arc::as_ptr(&s.shader) as usize);
+    let program = host
+        .and_then(|p| p.stages.first())
+        .map_or(0, |s| std::sync::Arc::as_ptr(&s.shader) as usize);
     let new = SEEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1468,13 +1547,13 @@ fn note_dispatch_x(pipeline: This, counts: [u32; 3], flags: u32) {
     if !new {
         return;
     }
-    let group = stage.and_then(|s| s.shader.native().ok()?.threads);
     tracing::info!(
         flags = format_args!("{flags:#x}"),
         pipeline = ?pipeline,
         program = host.map_or("no host pipeline", |p| p.name.as_str()),
         ?counts,
         ?group,
+        ?groups,
         "DispatchX: first dispatch of these flags with this program"
     );
 }
@@ -2603,6 +2682,210 @@ mod tests {
                 })
                 .collect();
             assert!(wrong.is_empty(), "{}", wrong.join("; "));
+        }
+    }
+
+    /// A thread-count flag bit for the tests below (the switch's value).
+    #[cfg(windows)]
+    const THREADS: u32 = 0x10;
+
+    /// `DispatchX`'s counts are groups unless one of the switch's bits is
+    /// in its flags; then they are threads, run as whole groups of the
+    /// program, each dimension rounded up.
+    #[cfg(windows)]
+    #[test]
+    fn dispatch_x_counts_are_groups_unless_a_flag_makes_them_threads() {
+        let row = Some([64, 1, 1]);
+        assert_eq!(dispatch_x_groups([5, 2, 1], 0, THREADS, row), [5, 2, 1]);
+        assert_eq!(
+            dispatch_x_groups([5, 2, 1], 0x4, THREADS, row),
+            [5, 2, 1],
+            "another flag"
+        );
+        assert_eq!(
+            dispatch_x_groups([5, 2, 1], THREADS, 0, row),
+            [5, 2, 1],
+            "no bits switched on"
+        );
+        assert_eq!(
+            dispatch_x_groups([1000, 1, 1], THREADS, THREADS, row),
+            [16, 1, 1]
+        );
+        assert_eq!(
+            dispatch_x_groups([1024, 1, 1], THREADS, THREADS, row),
+            [16, 1, 1]
+        );
+        assert_eq!(
+            dispatch_x_groups([1025, 1, 1], THREADS | 0x4, THREADS, row),
+            [17, 1, 1],
+            "with another flag"
+        );
+        assert_eq!(
+            dispatch_x_groups([20, 5, 3], THREADS, THREADS, Some([8, 4, 2])),
+            [3, 2, 2],
+            "each dimension by its own size"
+        );
+        assert_eq!(
+            dispatch_x_groups([0, 7, 1], THREADS, THREADS, Some([8, 8, 1])),
+            [0, 1, 1],
+            "no threads, no groups"
+        );
+        assert_eq!(
+            dispatch_x_groups([1024, 1, 1], THREADS, THREADS, Some([1024, 1, 1])),
+            [1, 1, 1],
+            "one group where 1,024 ran before"
+        );
+        assert_eq!(
+            dispatch_x_groups([1000, 1, 1], THREADS, THREADS, None),
+            [1000, 1, 1],
+            "no program: as given (the dispatch is dropped)"
+        );
+        assert_eq!(
+            dispatch_x_groups([1000, 1, 1], THREADS, THREADS, Some([0, 1, 1])),
+            [1000, 1, 1],
+            "an empty group: as given"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn thread_count_flags_are_read_in_hexadecimal() {
+        assert_eq!(parse_thread_count_flags(None), 0);
+        assert_eq!(parse_thread_count_flags(Some("0x20")), 0x20);
+        assert_eq!(parse_thread_count_flags(Some("0X1")), 1);
+        assert_eq!(parse_thread_count_flags(Some(" 30 ")), 0x30);
+        assert_eq!(parse_thread_count_flags(Some("threads")), 0, "not a number");
+        assert_eq!(parse_thread_count_flags(Some("")), 0);
+    }
+
+    /// `DispatchX`'s two forms on the host GPU.
+    #[cfg(windows)]
+    mod dispatch_x_gpu {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::s;
+
+        use super::THREADS;
+        use crate::list::dispatch_x_groups;
+        use crate::testgpu::{TitleBuffer, TitleList, device};
+
+        /// A program of 8 × 4 threads that counts the threads it runs (word
+        /// 0) and the extent they cover (words 1 to 3: the largest thread
+        /// id + 1 in x, y and z).
+        const COUNTING: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 4, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    seen.InterlockedAdd(0, 1);
+    seen.InterlockedMax(4, id.x + 1);
+    seen.InterlockedMax(8, id.y + 1);
+    seen.InterlockedMax(12, id.z + 1);
+}
+"#;
+
+        fn counting(host: &crate::host::Host) -> (ID3D12RootSignature, ID3D12PipelineState) {
+            let mut code: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call; out
+            // pointers ours.
+            let compiled = unsafe {
+                D3DCompile(
+                    COUNTING.as_ptr().cast(),
+                    COUNTING.len(),
+                    s!("counting"),
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
+            };
+            if let Err(e) = compiled {
+                let text = errors.map_or_else(String::new, |errors| {
+                    // SAFETY: the blob's own bytes.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            errors.GetBufferPointer().cast::<u8>(),
+                            errors.GetBufferSize(),
+                        )
+                    };
+                    String::from_utf8_lossy(bytes).into_owned()
+                });
+                panic!("the counting program did not compile ({e}): {text}");
+            }
+            let code = code.expect("compiled code");
+            // SAFETY: the blob's own bytes; the root signature is inside it.
+            unsafe {
+                let bytes = std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                );
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+                let pso = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        }
+
+        /// The counting program dispatched with the groups `DispatchX`
+        /// makes of each case's counts and flags. Counts in groups run
+        /// those groups. Counts in threads run the whole groups that cover
+        /// them: the host has no partial groups, so the last group of each
+        /// dimension runs whole, and never 32 times the threads asked for.
+        #[test]
+        fn dispatch_x_runs_thread_counts_as_whole_groups() {
+            let test = "list::tests::dispatch_x_gpu::dispatch_x_runs_thread_counts_as_whole_groups";
+            let Some(host) = device(test) else { return };
+            let (root, pso) = counting(host);
+            let group = Some([8, 4, 1]);
+            // Counts, flags, then the threads run and the extent they cover.
+            let cases: [([u32; 3], u32, u32, [u32; 3]); 5] = [
+                ([3, 2, 1], 0, 192, [24, 8, 1]),
+                ([2, 1, 1], 0x4, 64, [16, 4, 1]),
+                ([20, 5, 1], THREADS, 192, [24, 8, 1]),
+                ([16, 8, 1], THREADS, 128, [16, 8, 1]),
+                ([1, 1, 1], THREADS, 32, [8, 4, 1]),
+            ];
+            let buffers: Vec<TitleBuffer> = cases.iter().map(|_| TitleBuffer::new(256)).collect();
+            let list = TitleList::new();
+            let l = list.host();
+            l.keep(&root);
+            l.keep(&pso);
+            for (&(counts, flags, ..), buffer) in cases.iter().zip(&buffers) {
+                let [x, y, z] = dispatch_x_groups(counts, flags, THREADS, group);
+                let to = buffer.shadow();
+                to.refresh(l, buffer.address(), 256);
+                to.gpu_writes(l, buffer.address(), 256);
+                // SAFETY: an open list, live objects (kept until the list is
+                // reset) and a root view inside the host copy.
+                unsafe {
+                    l.list.SetComputeRootSignature(&root);
+                    l.list.SetPipelineState(&pso);
+                    l.list
+                        .SetComputeRootUnorderedAccessView(0, to.gpu(buffer.address()));
+                    l.list.Dispatch(x, y, z);
+                }
+            }
+            list.run();
+            for (case, buffer) in cases.iter().zip(&buffers) {
+                let w = buffer.words();
+                assert_eq!((w[0], [w[1], w[2], w[3]]), (case.2, case.3), "{case:?}");
+            }
         }
     }
 }
