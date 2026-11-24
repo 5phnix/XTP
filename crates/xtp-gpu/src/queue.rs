@@ -4,6 +4,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -35,8 +36,46 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    /// Waits for fences not reached when they were made, kept (with a
+    /// reference to the fence) until the queue's next submission.
+    unmet: Mutex<Vec<(usize, u64)>>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A fence's value, read as the title reads it: through its method at 0x40.
+#[cfg(windows)]
+fn completed(fence: This) -> u64 {
+    // SAFETY: one of our fences, whose first field is its table; slot 8 is
+    // `GetCompletedValue`.
+    unsafe {
+        let table = *fence.cast::<*const *const ()>();
+        let method: extern "system" fn(This) -> u64 = std::mem::transmute(*table.add(8));
+        method(fence)
+    }
+}
+
+/// Queue signals made and not done yet: the fence (its address) and the
+/// value it is set to once the submissions before the signal have finished.
+static ISSUED: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
+/// Whether a queue signal made so far, not done yet, gets `fence` to
+/// `value`.
+#[cfg(windows)]
+fn issued(fence: usize, value: u64) -> bool {
+    lock(&ISSUED)
+        .iter()
+        .any(|&(f, v)| f == fence && v >= value)
+}
+
+/// Diagnostics for the frame line: the queue waits for fences, those whose
+/// fence was not there yet at the queue's next submission, and among those
+/// the ones no queue signal made so far gets there (their lists ran before
+/// what they wait for).
+static WAITS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 fn queue<'a>(this: This) -> &'a Queue {
     // SAFETY: called from queue methods only.
@@ -62,6 +101,7 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        unmet: Mutex::new(Vec::new()),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -113,7 +153,7 @@ extern "system" fn release(this: This) -> u32 {
 
 /// Runs the lists' host lists (decision 0007), counted as one title
 /// submission for the frame-rate line.
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -121,6 +161,9 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if !this.is_null() {
+            count_late_waits(this, lists.len());
+        }
         let host_lists: Vec<_> = lists
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
@@ -128,9 +171,36 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
         host.submit(&host_lists);
         return;
     }
+    let _ = this;
     static ONCE: AtomicBool = AtomicBool::new(false);
     if !ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
+    }
+}
+
+/// Diagnostics: the queue's waits not reached when they were made, as they
+/// stand at its submission of `lists` lists ([`WAITS`]).
+#[cfg(windows)]
+fn count_late_waits(this: This, lists: usize) {
+    let unmet = std::mem::take(&mut *lock(&queue(this).unmet));
+    for (fence, value) in unmet {
+        let now = completed(fence as This);
+        if now < value {
+            WAITS[1].fetch_add(1, Ordering::Relaxed);
+            if !issued(fence, value) {
+                let n = WAITS[2].fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    tracing::info!(
+                        kind = queue(this).kind,
+                        now,
+                        value,
+                        lists,
+                        "a queue's lists run before the fence they wait for gets there (no queue signal made so far gets it there)"
+                    );
+                }
+            }
+        }
+        crate::fence::release_kept(fence as This);
     }
 }
 
@@ -170,9 +240,17 @@ pub(crate) extern "system" fn signal(_: This, fence: This, value: u64) -> HRESUL
         // Kept until it is set.
         object::add_ref(fence);
         let at = fence as usize;
+        // Not under the lock: `after` runs it at once when nothing is in
+        // flight.
+        lock(&ISSUED).push((at, value));
         host.after(move || {
             let fence = at as This;
             crate::fence::signal(fence, value);
+            let mut issued = lock(&ISSUED);
+            if let Some(i) = issued.iter().position(|&s| s == (at, value)) {
+                issued.swap_remove(i);
+            }
+            drop(issued);
             crate::fence::release_kept(fence);
         });
         return S_OK;
@@ -180,8 +258,20 @@ pub(crate) extern "system" fn signal(_: This, fence: This, value: u64) -> HRESUL
     crate::fence::signal(fence, value)
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+/// Diagnostics: a wait for a value not reached yet is looked at again at
+/// the queue's next submission ([`WAITS`]).
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    WAITS[0].fetch_add(1, Ordering::Relaxed);
+    #[cfg(windows)]
+    if !this.is_null() && completed(fence) < value {
+        object::add_ref(fence);
+        lock(&queue(this).unmet).push((fence as usize, value));
+    }
+    let _ = (this, value);
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -280,6 +370,13 @@ extern "system" fn present(
             dispatches,
             dispatched,
             "frame presented (since the last line: draws and dispatches, and those run on the host)"
+        );
+        let [waits, late, unsignalled] = WAITS.each_ref().map(|n| n.load(Ordering::Relaxed));
+        tracing::info!(
+            waits,
+            late,
+            unsignalled,
+            "queue waits for fences so far (late: not reached at the queue's next submission; unsignalled: of those, no queue signal made yet got there)"
         );
         #[cfg(windows)]
         if frame >= 256 {
