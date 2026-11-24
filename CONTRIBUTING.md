@@ -1,6 +1,6 @@
 # Contributing to XTP
 
-Thank you for helping. XTP runs the Xbox Series build of Grand Theft Auto VI
+Thank you for helping. XTP runs the Xbox Series build of BTP 6
 natively on Windows, from files each user supplies. Many people work on it at
 once, so the process below is strict and mostly automatic: a pull request that
 follows it is labelled, checked and routed to a reviewer without anyone
@@ -266,7 +266,7 @@ the title), tests, and docs.
   (the `undocumented_unsafe_blocks` lint); `unsafe fn` bodies use explicit
   `unsafe` blocks.
 - Platform code (every crate but `xtp-game`) must work for any Xbox Series
-  title. What only Grand Theft Auto VI needs (formats, build identities,
+  title. What only BTP 6 needs (formats, build identities,
   hooks) goes in `xtp-game`.
 - Log with `tracing`; return errors (with `anyhow` or `thiserror`, as the
   crate already does) rather than panicking on bad input.

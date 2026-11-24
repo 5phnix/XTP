@@ -1,6 +1,6 @@
 # The dark world: from the 1440p targets to the presented image
 
-Why Grand Theft Auto VI's world reaches the screen black under XTP, what was
+Why BTP 6's world reaches the screen black under XTP, what was
 fixed, and what still blocks it. Written on 2026-11-24 from XTP's own runs on
 the person's RTX 4080 SUPER (`E:\xtp-data\runs`, never in the repository),
 the VIctory community's reports, and a reading of the title's code (build
@@ -91,7 +91,7 @@ AMD. Why the input reads black is section 4's question.
   writes black with whatever it adds (dither, film grain), which fits #841's
   0-to-1 output; whether the upscaler reads it that way is what section 6's
   capture must show.
-- Testers with VIctory #643 on an RX 9070 XT saw the "Rockstar Games
+- Testers with VIctory #643 on an RX 9070 XT saw the "the publisher
   presents" card for the first time, and cutscene subtitles stopped piling
   up on each other: aliases had been resolving to the wrong copy.
 

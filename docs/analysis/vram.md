@@ -7,7 +7,7 @@ what it costs, and what is still to measure. Code:
 
 ## 1. The problem
 
-While the world loads, Grand Theft Auto VI creates thousands of resources in
+While the world loads, BTP 6 creates thousands of resources in
 its memory (device method 0x428, `create_at_address`); each texture gets a
 host copy (`host_texture`). Until this change every host copy was a
 committed resource: its own implicit heap, its own residency operation.

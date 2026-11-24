@@ -1,6 +1,6 @@
 # The running game in the world: frame time, missing image, hangs
 
-What keeps Grand Theft Auto VI's first mission from 30 fps on the person's
+What keeps BTP 6's first mission from 30 fps on the person's
 machine (RTX 4080 SUPER 16 GB, Ryzen 9 7950X3D, 64 GB, Windows 11
 26300), measured on XTP `main` at `2d0257e` with the diagnostics build
 (`cargo build --profile diag -p xtp --features diagnostics`), on

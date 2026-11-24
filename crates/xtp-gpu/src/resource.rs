@@ -210,8 +210,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         && let Some(t) = texture_layout(desc)
     {
         // As the console: the layout's own alignment unless more is asked
-        // (4 KiB for 4 KiB modes, where PC says 64 KiB). Grand Theft Auto
-        // VI keeps these sizes in its texture tables, and its streaming
+        // (4 KiB for 4 KiB modes, where PC says 64 KiB). BTP 6
+        // keeps these sizes in its texture tables, and its streaming
         // asserts when they disagree with the streamed layout.
         let alignment = desc.alignment.max(t.alignment);
         if !alignment.is_power_of_two() {
@@ -634,7 +634,7 @@ static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::
 
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
-/// memory themselves (Grand Theft Auto VI places its back buffers in a
+/// memory themselves (BTP 6 places its back buffers in a
 /// block of its own and checks they fill it). The runtime names it before
 /// the device exists.
 pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
@@ -980,8 +980,8 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 
 /// The host's resource flags for the title's: render target, depth,
 /// unordered access and no shader access; a depth target loses unordered
-/// access, which PC refuses with it (the console allows both; Grand Theft
-/// Auto VI's shadow maps ask for it).
+/// access, which PC refuses with it (the console allows both; BTP 6
+///'s shadow maps ask for it).
 /// shortcut: the host copy loses UAV use; give it a second view-only copy
 /// if draws write it as a UAV (VIctory #469).
 #[cfg(windows)]
@@ -1594,7 +1594,7 @@ pub(crate) extern "system" fn create_committed(
     )
 }
 
-/// Device method 0x3f8, inferred from Grand Theft Auto VI's calls
+/// Device method 0x3f8, inferred from BTP 6's calls
 /// (title+0x193e1b4: its back buffers, heap flag "allow display"): the
 /// committed resource creation of the enhanced-barrier interfaces,
 /// `(heap, heap flags, desc1, initial layout, clear value, protected
@@ -1657,7 +1657,7 @@ pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HR
 }
 
 /// Device method 0x428, one of the `ID3D12Device9` to `ID3D12Device11`
-/// additions. From Grand Theft Auto VI's call: a resource at a virtual
+/// additions. From BTP 6's call: a resource at a virtual
 /// address the title mapped itself, `(address, desc1, initial barrier
 /// layout, clear value, iid, out)`, as `CreatePlacedResourceX` with
 /// enhanced barriers. GPU addresses are CPU addresses, so the resource is
@@ -1721,7 +1721,7 @@ fn at_address(
 }
 
 /// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, Grand Theft Auto VI's streamed and
+/// resource object (device 0x230, BTP 6's streamed and
 /// interface textures), by address and description (padding zeroed): a
 /// resource at that address, made the first time a draw reads one, the
 /// alias count (`alias::changes`) it was last matched at and the bytes it
@@ -2374,7 +2374,7 @@ mod tests {
         slot::<Custom>(device, 0xd0)(&mut p, device, 1, 1);
         assert_eq!(p.cpu_pages, 1, "default: not CPU-visible");
 
-        // 0x428: a buffer over memory the title owns, as GTA VI asks.
+        // 0x428: a buffer over memory the title owns, as BTP 6 asks.
         type At = extern "system" fn(
             This,
             u64,
@@ -3053,8 +3053,8 @@ mod tests {
     }
 
     /// The dark world's first cause (VIctory #643): a render target drawn by
-    /// the GPU, then read through a view of its memory (as Grand Theft Auto
-    /// VI's placed views are) or through another resource at its address.
+    /// the GPU, then read through a view of its memory (as BTP 6
+    ///'s placed views are) or through another resource at its address.
     /// Both see what the GPU drew, not the zeros of title memory.
     #[cfg(windows)]
     #[test]

@@ -1,7 +1,7 @@
 //! The host formats of title formats: what the host GPU creates a title's
 //! textures, views, targets and clear values in. The console's GPU has
 //! formats PC D3D12 lacks (its own numbers 116, 117, 189, 190, 191) and
-//! uses a PC driver refuses: Grand Theft Auto VI's 2560x1440 B5G5R5A1 target
+//! uses a PC driver refuses: BTP 6's 2560x1440 B5G5R5A1 target
 //! that is also unordered access, and its B4G4R4A4 target (E_INVALIDARG on
 //! an NVIDIA driver, first run), and R9G9B9E5 targets (GPUs have none).
 //!

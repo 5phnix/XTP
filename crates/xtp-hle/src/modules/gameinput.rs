@@ -835,7 +835,7 @@ fn relative(
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
     // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; Grand Theft Auto VI walks
+    // not every device's readings in time order; BTP 6 walks
     // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
@@ -910,7 +910,7 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
+// shortcut: reading callbacks never run; BTP 6 registers none
 // (it polls).
 extern "system" fn register_reading(
     _: This,
@@ -1110,7 +1110,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
     }
 }
 /// Four motor levels: low and high frequency, left and right trigger
-/// (Grand Theft Auto VI sends trigger levels too); null stops them all.
+/// (BTP 6 sends trigger levels too); null stops them all.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -1367,8 +1367,8 @@ mod host {
             let key = |virtual_key: u8, layout: HKL| KeyState {
                 scan_code: scan_code(virtual_key, layout),
                 virtual_key,
-                // shortcut: no characters (code point 0); Grand Theft
-                // Auto VI reads scan codes and virtual keys only.
+                // shortcut: no characters (code point 0); BTP 6
+                // reads scan codes and virtual keys only.
                 ..Default::default()
             };
             #[cfg(feature = "diagnostics")]
