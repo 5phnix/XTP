@@ -350,6 +350,10 @@ impl Queues {
 
 static QUEUES: (Mutex<Queues>, Condvar) = (Mutex::new(Queues::new()), Condvar::new());
 
+/// Stack of each pipeline worker: room for the driver's shader compiler,
+/// which runs on it (reserved address space; committed only as used).
+const PIPELINE_STACK: usize = 64 << 20;
+
 /// The workers (half the logical processors, 2 to 8), started on first
 /// use: how many there are.
 fn workers() -> usize {
@@ -360,6 +364,10 @@ fn workers() -> usize {
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
                     .name(format!("xtp-pipelines-{i}"))
+                    // The driver compiles pipelines on this thread, recursively:
+                    // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
+                    // on a world compute program and refused it as out of memory.
+                    .stack_size(PIPELINE_STACK)
                     .spawn(work);
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
