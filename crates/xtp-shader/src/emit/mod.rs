@@ -81,6 +81,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+// IR to DXIL, one file per encoding or concern: which backlog item of
+// docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
 mod lower;
 mod sampler;
 mod shader;
