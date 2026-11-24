@@ -70,7 +70,7 @@ function Get-FarmConfig {
         dailyCapUsd      = 50
         maxBuildsPerVm   = 2
         slotsPerVm       = 6
-        maxRunMinutes    = 120
+        maxRunMinutes    = 30
         maxSendFileMB    = 20
         stateDir         = $null
         tempDir          = $null
@@ -220,8 +220,28 @@ function ConvertTo-FarmArg([string] $Arg) {
     $sb.ToString()
 }
 
+# Stops a process and every process it started (ssh and its IAP proxy).
+function Stop-FarmProcessTree([int] $ProcessId) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    $psi.Arguments = "/PID $ProcessId /T /F"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $k = [System.Diagnostics.Process]::Start($psi)
+    [void] $k.StandardOutput.ReadToEnd()
+    [void] $k.StandardError.ReadToEnd()
+    $k.WaitForExit()
+    $k.Dispose()
+}
+
 # Runs a program. Without -Capture or -StdoutFile its stdout and stderr are
 # this process's own (output streams straight through).
+# -TimeoutSeconds: stop its whole tree when it runs longer. -StallSeconds:
+# stop it when it takes no stdin for that long (a stuck connection: ssh's own
+# keepalives cannot fire while it is blocked on its proxy). Either way the
+# result says TimedOut, with exit code 255 (a lost connection).
 function Invoke-FarmProcess {
     param(
         [Parameter(Mandatory)] [string] $FilePath,
@@ -231,7 +251,9 @@ function Invoke-FarmProcess {
         [string] $StdinFile = '',
         [string] $StdoutFile = '',
         [switch] $NoStdin,
-        [switch] $Capture
+        [switch] $Capture,
+        [int] $TimeoutSeconds = 0,
+        [int] $StallSeconds = 0
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
@@ -252,8 +274,10 @@ function Invoke-FarmProcess {
         $psi.StandardOutputEncoding = New-Object Text.UTF8Encoding $false
         $psi.StandardErrorEncoding = New-Object Text.UTF8Encoding $false
     }
+    $deadline = $(if ($TimeoutSeconds -gt 0) { (Get-Date).AddSeconds($TimeoutSeconds) } else { [datetime]::MaxValue })
     $p = [System.Diagnostics.Process]::Start($psi)
     $fs = $null
+    $timedOut = $false
     try {
         $outTask = $null
         $errTask = $null
@@ -266,24 +290,48 @@ function Invoke-FarmProcess {
             $copyTask = $p.StandardOutput.BaseStream.CopyToAsync($fs)
         }
         if ($psi.RedirectStandardInput) {
-            try {
-                if ($StdinFile) {
-                    $src = [IO.File]::OpenRead($StdinFile)
-                    try { $src.CopyTo($p.StandardInput.BaseStream) } finally { $src.Dispose() }
-                    $p.StandardInput.BaseStream.Flush()
+            if ($StdinFile) {
+                $src = [IO.File]::OpenRead($StdinFile)
+                try {
+                    $in = $p.StandardInput.BaseStream
+                    $buf = New-Object byte[] 65536
+                    while (($n = $src.Read($buf, 0, $buf.Length)) -gt 0) {
+                        # Each chunk must go within StallSeconds (and the deadline).
+                        [double] $wait = [Math]::Min([double] [int]::MaxValue, [double] ($deadline - (Get-Date)).TotalMilliseconds)
+                        if ($StallSeconds -gt 0) { $wait = [Math]::Min($wait, [double] $StallSeconds * 1000) }
+                        $t = $in.WriteAsync($buf, 0, $n)
+                        $ok = $false
+                        try { $ok = $t.Wait([int] [Math]::Max(0.0, $wait)) } catch { $ok = $true }  # the program exited early
+                        if (-not $ok) { $timedOut = $true; break }
+                        if ($t.IsFaulted) { break }
+                    }
+                    if (-not $timedOut) { try { $in.Flush() } catch { } }
+                } finally {
+                    $src.Dispose()
                 }
-            } catch {
-                # The program exited before reading it all: its exit code says why.
-            } finally {
+            }
+            if ($timedOut) {
+                Stop-FarmProcessTree $p.Id
+            } else {
                 try { $p.StandardInput.Close() } catch { }
             }
         }
+        if (-not $timedOut) {
+            $left = ($deadline - (Get-Date)).TotalMilliseconds
+            if ($left -lt [int]::MaxValue) {
+                if (-not $p.WaitForExit([int] [Math]::Max(0.0, [double] $left))) {
+                    $timedOut = $true
+                    Stop-FarmProcessTree $p.Id
+                }
+            }
+        }
         $p.WaitForExit()
-        if ($copyTask) { $copyTask.Wait(); $fs.Dispose(); $fs = $null }
-        $r = [pscustomobject]@{ ExitCode = $p.ExitCode; Out = ''; Err = '' }
+        if ($copyTask) { try { $copyTask.Wait() } catch { }; $fs.Dispose(); $fs = $null }
+        $code = $(if ($timedOut) { 255 } else { $p.ExitCode })
+        $r = [pscustomobject]@{ ExitCode = $code; Out = ''; Err = ''; TimedOut = $timedOut }
         if ($Capture) {
-            $r.Out = $outTask.Result
-            $r.Err = $errTask.Result
+            try { $r.Out = $outTask.Result } catch { }
+            try { $r.Err = $errTask.Result } catch { }
         }
         $r
     } finally {
@@ -671,7 +719,7 @@ function Initialize-FarmSsh([Parameter(Mandatory)] $Config) {
         $lines += '  HostKeyAlgorithms ssh-ed25519'
         $lines += '  BatchMode yes'
         $lines += '  ServerAliveInterval 15'
-        $lines += '  ServerAliveCountMax 8'
+        $lines += '  ServerAliveCountMax 4'
         $lines += '  LogLevel ERROR'
         $lines += "  ProxyCommand `"$($g.Python)`" -S `"$($g.Main)`" compute start-iap-tunnel $($vm.name) 22 --listen-on-stdin --project=$($Config.project) --zone=$($vm.zone) --verbosity=error"
     }
@@ -727,16 +775,52 @@ function Invoke-FarmSsh {
         [string] $StdinFile = '',
         [string] $StdoutFile = '',
         [switch] $Capture,
-        [int] $ConnectTimeout = 60
+        [int] $ConnectTimeout = 60,
+        # Whole command; short commands get 3 minutes. 0: no limit.
+        [int] $TimeoutSeconds = 180,
+        # Longest wait for the VM to take more of stdin.
+        [int] $StallSeconds = 60
     )
     $p = Get-FarmSshPaths $Config
     if (-not (Test-Path -LiteralPath $p.Config)) { $p = Initialize-FarmSsh $Config }
     if (-not (Test-FarmKnownHost $Config $Vm)) { Update-FarmKnownHost -Config $Config -Vm $Vm -WaitSeconds 300 }
-    $a = @('-F', $p.Config, '-T', '-o', "ConnectTimeout=$ConnectTimeout")
+    $a = @('-F', $p.Config, '-T', '-o', "ConnectTimeout=$ConnectTimeout", '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4')
     if (-not $StdinFile) { $a += '-n' }
     $a += @($Vm, $Command)
-    Invoke-FarmProcess -FilePath (Get-FarmSshExe) -ArgumentList $a -StdinFile $StdinFile -StdoutFile $StdoutFile -Capture:$Capture `
-        -NoStdin:(-not $StdinFile) -Environment (Get-FarmGcloudEnv)
+    $r = Invoke-FarmProcess -FilePath (Get-FarmSshExe) -ArgumentList $a -StdinFile $StdinFile -StdoutFile $StdoutFile -Capture:$Capture `
+        -NoStdin:(-not $StdinFile) -Environment (Get-FarmGcloudEnv) -TimeoutSeconds $TimeoutSeconds -StallSeconds $StallSeconds
+    if ($r.TimedOut) {
+        $what = $(if ($Command.Length -gt 60) { $Command.Substring(0, 60) + '...' } else { $Command })
+        Write-FarmLog $Config "ssh to $Vm stopped: no answer in time ($what)"
+    }
+    $r
+}
+
+# The farm's ssh processes (and their IAP proxies) whose caller is gone: a
+# cargo-remote stopped in the middle of a job leaves them behind, holding a
+# connection. Those whose caller still runs are never touched. At most once a
+# minute (all callers share the stamp).
+function Remove-FarmOrphans([Parameter(Mandatory)] $Config, [switch] $Force) {
+    $stamp = Join-Path $Config.stateDir 'orphans.stamp'
+    if (-not $Force -and (Test-Path -LiteralPath $stamp) -and ((Get-Date) - (Get-Item -LiteralPath $stamp).LastWriteTime).TotalSeconds -lt 60) { return @() }
+    [IO.File]::WriteAllText($stamp, '')
+    $cfg = (Get-FarmSshPaths $Config).Config
+    $byId = @{}
+    foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) { $byId[[int] $p.ProcessId] = $p }
+    $killed = @()
+    foreach ($p in @($byId.Values)) {
+        $cl = "$($p.CommandLine)"
+        $ours = ($p.Name -eq 'ssh.exe' -and $cl.IndexOf($cfg, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+        ($p.Name -eq 'python.exe' -and $cl -match 'start-iap-tunnel' -and $cl.Contains("--project=$($Config.project)") -and $cl.Contains(" $($Config.prefix)-"))
+        if (-not $ours) { continue }
+        $parent = $byId[[int] $p.ParentProcessId]
+        # A parent created after its child is another process with a reused id.
+        if ($parent -and $parent.CreationDate -le $p.CreationDate) { continue }
+        Write-FarmLog $Config ('stopping orphaned {0} {1} (started {2:u})' -f $p.Name, $p.ProcessId, $p.CreationDate)
+        Stop-FarmProcessTree ([int] $p.ProcessId)
+        $killed += [int] $p.ProcessId
+    }
+    $killed
 }
 
 # After a failed job: is the VM still up and staying? When it shuts down
@@ -1264,7 +1348,7 @@ function Receive-FarmFiles {
     $tgz = Join-Path $Config.tempDir "fetch-$PID.tgz"
     try {
         $cmd = 'powershell -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -File C:\farm\bin\farm-fetch.ps1 ' + (ConvertTo-FarmBase64 $q)
-        $r = Invoke-FarmSsh -Config $Config -Vm $Vm -Command $cmd -StdoutFile $tgz
+        $r = Invoke-FarmSsh -Config $Config -Vm $Vm -Command $cmd -StdoutFile $tgz -TimeoutSeconds 900
         if ($r.ExitCode -ne 0) { Write-FarmMessage "fetching from $Vm failed ($($r.ExitCode))"; return $r.ExitCode }
         $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
         $x = Invoke-FarmProcess -FilePath $tar -ArgumentList @('-xzf', $tgz, '-C', $Worktree.Top) -Capture -NoStdin
@@ -1297,6 +1381,7 @@ function Invoke-FarmJob {
     if (-not (Test-Path -LiteralPath (Get-FarmSshPaths $Config).Config) -or -not (Test-Path -LiteralPath (Get-FarmSshPaths $Config).Key)) {
         Initialize-FarmSsh $Config | Out-Null
     }
+    try { Remove-FarmOrphans $Config | Out-Null } catch { Write-FarmLog $Config "orphan cleanup failed: $($_.Exception.Message)" }
     if ($FetchOnly) {
         $slots = @(Read-FarmJson (Join-Path $Config.stateDir 'slots.json') @())
         $s = $slots | Where-Object { $_.worktree -eq $wt.Top.ToLowerInvariant() } | Sort-Object used -Descending | Select-Object -First 1
@@ -1314,8 +1399,19 @@ function Invoke-FarmJob {
         $stepList += [ordered]@{ args = @(ConvertTo-FarmCargoArgs @($Steps[$n]) $wt.Top); label = $label }
     }
     $what = $(if ($snap.Dirty) { "$($snap.Head.Substring(0, 8)) + uncommitted changes" } else { $snap.Head.Substring(0, 8) })
+    # The job's time, all attempts included: the VM stops cargo at its own
+    # deadline, a little before this client gives up on a VM that stopped
+    # answering (then another VM, or the PC).
+    $jobMinutes = [int] $Config.maxRunMinutes
+    if ("$env:XTP_FARM_JOB_MINUTES" -match '^\d+$' -and [int] $env:XTP_FARM_JOB_MINUTES -gt 0) { $jobMinutes = [int] $env:XTP_FARM_JOB_MINUTES }
+    $giveUp = $t0.AddMinutes($jobMinutes + 3)
     $exclude = @()
     for ($attempt = 1; $attempt -le 3; $attempt++) {
+        if ($attempt -gt 1 -and ($giveUp - (Get-Date)).TotalMinutes -lt 2) {
+            Write-FarmMessage "unavailable: no farm VM could finish the job within $jobMinutes minutes"
+            Write-FarmLog $Config "gave up on a job of $($wt.Name) after $jobMinutes minutes"
+            return $script:ExitUnavailable
+        }
         $sel = Select-FarmTarget -Config $Config -Worktree $wt.Top -Exclude $exclude
         if (-not $sel.ok) {
             Write-FarmMessage "unavailable: $($sel.reason)"
@@ -1333,6 +1429,7 @@ function Invoke-FarmJob {
             }
             $known = @(Get-FarmKnown $Config $sel.vm $sel.id)
             $lost = $false
+            $stuck = $false
             for ($try = 0; $try -lt 4; $try++) {
                 $bundle = New-FarmBundle $Config $wt $snap.Target $known
                 $req = [ordered]@{
@@ -1346,15 +1443,22 @@ function Invoke-FarmJob {
                     steps       = @($stepList)
                     env         = $envs
                     collect     = [bool] $CollectBinaries
-                    maxMinutes  = [int] $Config.maxRunMinutes
-                    waitMinutes = 30
+                    maxMinutes  = [int] [Math]::Max(1, [Math]::Floor(($giveUp - (Get-Date)).TotalMinutes - 2))
+                    waitMinutes = [int] [Math]::Max(1, [Math]::Min(10, [Math]::Floor(($giveUp - (Get-Date)).TotalMinutes - 3)))
                     worktree    = $wt.Name
                 }
                 Write-FarmMessage ('{0} slot {1}: {2}, sent {3:0} KB' -f $sel.vm, $sel.slot, $what, ([double] $bundle.Size / 1KB))
                 $cmd = 'powershell -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -File C:\farm\bin\farm-run.ps1 ' + (ConvertTo-FarmBase64 $req)
                 $tRun = Get-Date
-                $code = (Invoke-FarmSsh -Config $Config -Vm $sel.vm -Command $cmd -StdinFile $bundle.Path).ExitCode
+                $run = Invoke-FarmSsh -Config $Config -Vm $sel.vm -Command $cmd -StdinFile $bundle.Path `
+                    -TimeoutSeconds ([int] [Math]::Max(60, ($giveUp - (Get-Date)).TotalSeconds)) -StallSeconds 60
+                $code = $run.ExitCode
                 if ($bundle.Path) { Remove-Item -Force -LiteralPath $bundle.Path -ErrorAction SilentlyContinue }
+                if ($run.TimedOut) {
+                    $lost = $true
+                    $stuck = $true
+                    break
+                }
                 if ($code -eq 96) {
                     Write-FarmMessage "updating the farm agent on $($sel.vm)"
                     Publish-FarmAgent $Config $sel.vm | Out-Null
@@ -1406,6 +1510,14 @@ function Invoke-FarmJob {
                 return $code
             }
             if (-not $lost) { throw "build farm: $($sel.vm) kept refusing the job" }
+            if ($stuck) {
+                # No answer for too long: ssh and its IAP proxy were stopped.
+                Write-FarmMessage "$($sel.vm) stopped answering (stuck connection): running the job elsewhere"
+                Write-FarmLog $Config "job of $($wt.Name) on $($sel.vm) stopped: no answer in time"
+                Set-FarmHealth $Config $sel.vm 5 'stuck connection'
+                $exclude += $sel.vm
+                continue
+            }
             if ($code -eq 95) {
                 Write-FarmMessage "$($sel.vm) is being reclaimed or stopped: running the job elsewhere"
                 Write-FarmLog $Config "$($sel.vm) went away during a job of $($wt.Name)"

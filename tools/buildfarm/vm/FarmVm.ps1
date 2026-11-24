@@ -95,21 +95,24 @@ function Get-FarmSessionPids {
 }
 
 # Runs a program with this process's stdout and stderr (output streams to
-# the client), stops its whole tree when it runs over MaxMinutes or when the
-# ssh session goes away. 124: over time; 125: client gone.
+# the client), stops its whole tree at the job's deadline or when the ssh
+# session goes away. 124: over time; 125: client gone.
 function Invoke-FarmWatched {
     param([string] $FilePath, [string[]] $ArgumentList, [hashtable] $Environment, [string] $WorkingDirectory,
-        [int] $MaxMinutes = 120, [int[]] $Watch = @())
+        [datetime] $Deadline = (Get-Date).AddHours(2), [int[]] $Watch = @())
+    if ((Get-Date) -ge $Deadline) {
+        Write-FarmErr 'the job is out of time: this command did not start'
+        return 124
+    }
     $psi = New-FarmStartInfo $FilePath $ArgumentList $Environment $WorkingDirectory
     $psi.RedirectStandardInput = $true
     $p = [System.Diagnostics.Process]::Start($psi)
     try {
         $p.StandardInput.Close()
-        $deadline = (Get-Date).AddMinutes($MaxMinutes)
         $tick = 0
         while (-not $p.WaitForExit(2000)) {
-            if ((Get-Date) -gt $deadline) {
-                Write-FarmErr "cargo ran over $MaxMinutes minutes: stopped"
+            if ((Get-Date) -gt $Deadline) {
+                Write-FarmErr ('the job ran over its time (until {0:HH:mm:ss} UTC): cargo stopped' -f $Deadline.ToUniversalTime())
                 Stop-FarmTree $p.Id
                 $p.WaitForExit()
                 return 124
@@ -193,6 +196,15 @@ function ConvertFrom-FarmJsonArray([string] $Json) {
     foreach ($e in @($value)) {
         if ($null -ne $e) { $e }
     }
+}
+
+# Reads up to Count bytes from a stream into Buffer, waiting at most
+# TimeoutSeconds: the number read, 0 at the end of the stream, -1 when
+# nothing came in time (the client's connection is stuck).
+function Read-FarmStream($Stream, [byte[]] $Buffer, [int] $Count, [int] $TimeoutSeconds = 60) {
+    $t = $Stream.ReadAsync($Buffer, 0, $Count)
+    if (-not $t.Wait($TimeoutSeconds * 1000)) { return -1 }
+    $t.Result
 }
 
 function ConvertFrom-FarmBase64([string] $Text) {

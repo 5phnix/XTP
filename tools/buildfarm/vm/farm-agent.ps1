@@ -101,6 +101,14 @@ while ($true) {
         foreach ($f in @(Get-ChildItem (Join-Path $Root 'run') -Filter '*.json' -ErrorAction SilentlyContinue)) {
             $runPid = 0
             if ([int]::TryParse($f.BaseName, [ref] $runPid) -and (Get-Process -Id $runPid -ErrorAction SilentlyContinue)) {
+                # A run's own deadline ends it long before this: a run that old
+                # is stuck, and would keep the VM up for ever.
+                if (((Get-Date) - $f.CreationTime).TotalHours -ge 6) {
+                    Write-Agent "stopping run $runPid, started $($f.CreationTime.ToUniversalTime().ToString('u')): stuck"
+                    & taskkill.exe /PID $runPid /T /F 2>&1 | Out-Null
+                    Remove-Item -Force $f.FullName -ErrorAction SilentlyContinue
+                    continue
+                }
                 $runs += $runPid
             } else {
                 Remove-Item -Force $f.FullName -ErrorAction SilentlyContinue
