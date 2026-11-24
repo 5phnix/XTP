@@ -1423,10 +1423,13 @@ fn write_title(dst: usize, src: *const u8, len: usize) {
 /// the guard, which BTP 6's synchronous reads retry, but a DirectStorage or
 /// `fread` read into it would fail.
 ///
-/// shortcut: what the census does not see. A kernel read of a guarded page
-/// (`ReadProcessMemory`: the textures' and the title copies' reads, which
-/// read again after a failure) takes its guard off without a fault; the
-/// page then counts as not touched. A kernel or runtime write the journal
+/// shortcut: what the census does not see, and what it costs. A kernel read
+/// of a guarded page (`ReadProcessMemory`: the title copies' and some
+/// texture reads, `host::copy_mapped`) fails on the guard and takes it off
+/// without a fault; the page then counts as not touched. `copy_mapped` reads
+/// again piece by piece after a failure, and meets each other guard once
+/// more: with a census, such copies give the GPU zeros there (1–5 MB a frame
+/// in the Series S world; docs/analysis/lazy-copyback.md). A kernel or runtime write the journal
 /// sees counts as written unseen. A write to a read-only view block opens
 /// the whole block ([`crate::watch`]), its other guards with it: the rest of
 /// its pages count as uncounted after a write. A guard the guard of view
