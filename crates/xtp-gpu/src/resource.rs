@@ -823,9 +823,14 @@ struct Resource {
     #[cfg(windows)]
     beside: std::sync::atomic::AtomicU64,
     /// For a depth texture the title also writes through unordered
-    /// access, the colour texture shaders write instead ([`Twin`]).
+    /// access, the colour texture shaders write instead ([`Twin`]): made
+    /// with the first unordered access view of it ([`twin_view`]). Many
+    /// depth textures ask for unordered access and never get a view (the
+    /// shadow maps the title places anew every frame); a committed twin
+    /// for each, at its creation, cost a video memory admission apiece
+    /// (0.3 to 0.5 s once VidMm throttles): the world took 90 s to load.
     #[cfg(windows)]
-    twin: Option<Arc<Twin>>,
+    twin: std::sync::OnceLock<Option<Arc<Twin>>>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1484,12 +1489,6 @@ fn hand_out_resource(
             (host_texture(&desc, state, clear).map(Arc::new), false)
         }
     };
-    // A depth texture shaders also write: its colour twin.
-    #[cfg(windows)]
-    let twin = host
-        .as_ref()
-        .filter(|_| !shared)
-        .and_then(|h| twin_texture(&desc, &h.texture));
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1503,7 +1502,7 @@ fn hand_out_resource(
         #[cfg(windows)]
         beside: std::sync::atomic::AtomicU64::new(0),
         #[cfg(windows)]
-        twin,
+        twin: std::sync::OnceLock::new(),
     });
     #[cfg(windows)]
     {
@@ -2901,7 +2900,26 @@ pub(crate) fn twin(this: This) -> Option<Arc<Twin>> {
     if r.desc.dimension == BUFFER {
         return None;
     }
-    r.twin.clone()
+    r.twin.get().cloned().flatten()
+}
+
+/// The colour twin of title texture `this`, made now if it has none yet
+/// and is a depth texture the title also asks unordered access for.
+#[cfg(windows)]
+fn twin_made(this: This) -> Option<Arc<Twin>> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || r.shared {
+        return None;
+    }
+    r.twin
+        .get_or_init(|| {
+            let host = r.host.as_ref()?;
+            twin_texture(&r.desc, &host.texture)
+        })
+        .clone()
 }
 
 /// The texture and view for the title's unordered access view `desc` of
@@ -2922,7 +2940,7 @@ pub(crate) fn twin_view(
     windows::Win32::Graphics::Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC,
 )> {
     use windows::Win32::Graphics::Direct3D12::*;
-    let twin = twin(this)?;
+    let twin = twin_made(this)?;
     let view = |texture: &ID3D12Resource| {
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };

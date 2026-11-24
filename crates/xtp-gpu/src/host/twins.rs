@@ -864,6 +864,9 @@ mod tests {
         };
         const D16_UNORM: u32 = 55;
         let depth = depth(4, 4, D16_UNORM);
+        // Made with the first unordered access view of the texture.
+        assert!(crate::resource::twin(depth).is_none());
+        assert!(crate::resource::twin_view(depth, None).is_some());
         let twin = crate::resource::twin(depth).expect("a twin");
         // SAFETY: live resources.
         let (d, t) = unsafe {
@@ -917,6 +920,7 @@ mod tests {
         };
         const D32_FLOAT_S8X24_UINT: u32 = 20;
         let depth = depth(4, 4, D32_FLOAT_S8X24_UINT);
+        assert!(crate::resource::twin_view(depth, None).is_some());
         let twin = crate::resource::twin(depth).expect("a twin");
         let plane = twin.plane.clone().expect("a depth plane twin");
         let step = f32::from_bits(0x3780_0080);
