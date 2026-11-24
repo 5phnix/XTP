@@ -10,7 +10,20 @@ processors; Windows 11 26300) on 2026-11-24, in Series S mode
 translated shaders' hashes. Times are UTC. Logs are under
 `E:\xtp-data\` (§9), none in the repository.
 
+§1 to §9 were measured before the 3D ran (about 125 draws a frame). §10
+measures the 3D world with the lit scene (task N6, the 30 fps plan's step
+7): the GPU frame by kind and by program in two sessions, the A/B of
+`XTP_DXIL_OPT`, and the top costs with their causes and owners.
+
 ## 1. Summary
+
+- **With the 3D and the lit scene (§10)** the GPU works 220–225 ms of a
+  370–390 ms frame (two thirds of it), against a budget of 25 ms. XTP's
+  indirect argument clamp is the largest single cost (54–59 ms a frame,
+  3,000 clamps of 18 µs), then one mesh program whose pixel stage runs a
+  light loop bounded by data (1 ms per execution for a few thousand
+  pixels), then a family of vertex-transform compute programs (about
+  24 ms). `XTP_DXIL_OPT=1` gives no measurable GPU gain on this GPU.
 
 - **The GPU works about a third of the frame.** GPU timestamps
   (`XTP_GPU_TIMESTAMPS=1`, new, §3.1) put the world frame's GPU work at 91 ms
@@ -478,4 +491,501 @@ fix of §7.
   touches `host.rs`, `fence.rs` and `queue.rs` and is not delivered.
 - VIctory #1500's diff: `E:\xtp-data\runs\gpu-prof\upstream\victory-1500.diff`
   (head 2340003).
+
+## 10. The 3D world's GPU frame, by pass and program (N6)
+
+Task N6 of `30fps.md` (§8 step 7, §9): the GPU timestamps again, now that
+the world draws in 3D (wave64 mesh programs, mesh64) and its scene is lit
+(worldlight), with each command's pipeline statistics, in two Series S
+world sessions on `main`. The second turns on `XTP_DXIL_OPT=1` (dxilopt's
+DXIL clean-up passes), so the pair is also dxilopt's A/B (§10.6).
+
+### 10.1 Summary
+
+- **The GPU works 220–225 ms of a 374–388 ms frame** (timestamps, means of
+  the world windows), two thirds of it, against a budget of 25 ms. Before
+  the 3D it was 76–91 ms of a 213–252 ms frame (§4). The frame is now
+  closer to GPU-bound: the GPU is idle or running untimed work 97–110 ms a
+  frame.
+- **XTP's own argument clamp is the largest single cost**: 54–59 ms a
+  frame, 2,900–3,300 clamps of 18–20 µs. Before the 3D each took 2.5 µs.
+  Each runs one group of 64 threads between two global UAV barriers, with a
+  switch to compute and back. About a quarter of them precede executions
+  that are then dropped (§10.7, N6a).
+- **One mesh program is the costliest program**: `[mesh ba8d52f4ea1a1bac,
+  pixel b37565055f2f7d3b]`, 13–29 ms a frame, 1.0–1.1 ms per execution.
+  The pipeline statistics show the work is tiny: 270 to 750 mesh
+  invocations and 460 to 2,000 pixel invocations per execution. Its pixel
+  stage is a
+  light loop that leaves only when an index reaches a bound read from data
+  (§10.7, N6b).
+- **A family of vertex-transform compute programs** (32-thread, wave32,
+  heavy on legacy multiplies and 16-byte loads) takes about 24 ms:
+  `24f989b98dcb03f0`, `3a79195f06d3ed85`, `ebe4e53f031f5249`,
+  `12eae112b559091c`, `512416d975ace48b` (N6c).
+- **Many small mesh executions**: 1,400–1,700 indirect mesh dispatches a
+  frame of 16–21 µs each, plus a clamp before each (N6a).
+- **The pipeline statistics show no runaway draw** like VIctory #1723's
+  (51 million pixels for 184 primitives). The frame shades 27 million
+  pixels; the draws with the most pixels are full-screen passes of 0.9 to
+  3.8 million pixels a primitive.
+- **`XTP_DXIL_OPT=1` gives no measurable GPU gain here.** Per execution the
+  translated programs got 3–10 % slower in B. XTP's own passes, which the
+  switch does not touch, got 10 % slower too. Measured against those, the
+  translated programs are about 2.5 % faster, well within what two
+  sessions differ by (§10.6).
+- **Owners**: N6a (`indirect.rs`, `draw.rs`), N6b (the translator's loop
+  lowering, `emit/lower/flow.rs`, then the pass that writes the bound), N6c
+  (the translator's VALU and buffer lowering). Each is a ready task in
+  §10.8.
+
+### 10.2 Sessions
+
+| Session | Play (UTC) | World | Binary | Switches | End |
+|---|---|---|---|---|---|
+| **A** | 22:43:46–22:45:24 | from +32 s, 60 s | diag of `main` 99b6376 (worldlight and dxilopt in) with this task's pipeline statistics, the tree of 54a1b76; sha256 `369987b8…` | `XTP_DXIL_OPT=0` | exit 0, no device removal |
+| **B** | 22:46:00–22:47:46 | from +39 s, 60 s | the same | `XTP_DXIL_OPT=1` (all passes, `passes=31` on the log) | exit 0, no device removal |
+
+- Both: Series S, `XTP_SKIP_INTRO=1`, `XTP_WATCHDOG_HOOK=1`, autopilot
+  from the golden save, `--measure 60` with a 150 s hard stop (the
+  person's rule for short sessions), `XTP_GPU_TIMESTAMPS=1`,
+  `XTP_GPU_PIPESTATS=1` (§10.3), `XTP_FRAME_LINE=5`,
+  `XTP_LOG=info,xtp_gpu::timestamps=debug`. Run through
+  `E:\tools\stall-probe\session.ps1` under `measure.lock`, one after the
+  other in one slot of the PC, sound muted.
+- World windows: the frame lines with at least 1,000 draws a frame, 9 per
+  session, and the 10 timestamp windows logged after them (10 to 25 frames
+  each).
+- Pipelines being made: 208–261 (A) and 215–573 (B) throughout. Most are
+  heavy compute pipelines whose indirect dispatches are dropped as "being
+  made (heavy)": 392 a frame in A, 412 in B. Each binary translates every
+  shader again (the shader cache keys on our executable and on
+  `XTP_DXIL_OPT`), and no world window of either session has no pipeline
+  being made: the A/B compares time per execution (§10.6).
+- Not measured: the cloud L4 (its world load landed after these sessions),
+  and a session without the statistics queries. The queries add one
+  query per marked command: the frame line's "on the GPU" (294–318 ms
+  here) cannot separate their cost from the lit scene's.
+
+### 10.3 What was added to measure: pipeline statistics per command
+
+`crates/xtp-gpu/src/pipestats.rs` (new, off by default):
+`XTP_GPU_PIPESTATS=1` with `XTP_GPU_TIMESTAMPS=1`. Every command the
+timestamps mark (§3.1) also gets a pipeline statistics query,
+`PIPELINE_STATISTICS1` where the device counts mesh work (the RTX 4080
+SUPER does), else `PIPELINE_STATISTICS`. Each query counts:
+
+- vertex, mesh, amplification, pixel and compute invocations;
+- mesh primitives;
+- primitives into and out of the clipper.
+
+A list's queries are resolved into a read-back buffer when it closes and
+read once its submission has finished. Every 5 s the sums are logged per
+frame: the totals, per kind of command, and per program for the union of
+the 15 programs that run the most of each counter, with pixel invocations
+per primitive.
+
+- Milliseconds say how long a command took; these counts say what it did.
+  The idea comes from VIctory #1723 (a per-command statistics patch); the
+  code is XTP's own, written for `timestamps.rs`.
+- `timestamps.rs` calls it at the five places where marks are made (five
+  lines added), and `lib.rs` gets the module line.
+- Queries of one type cannot nest: a command marked inside another one's
+  query is counted with the outer one, until the outer one ends. The line
+  counts these as "nested"; there were none in these sessions.
+- WARP tests (`pipestats::tests`):
+  - a marked dispatch of the test kernel counts its 64 threads;
+  - an outer query around an inner mark counts all three dispatches (192);
+  - nothing is asked when off;
+  - a result reads by counter with and without mesh counters;
+  - the line ranks a draw of 184 primitives and 51 million pixels first.
+
+### 10.4 The frame and the GPU by kind
+
+Frame lines, medians of the 9 world lines (lowest to highest):
+
+| Per frame | A (`=0`) | B (`=1`) |
+|---|---:|---:|
+| frame | 374 ms (226–572) | 388 ms (275–505) |
+| preparing | 74 | 80 |
+| frame line "on the GPU" | 318 | 294 |
+| copy-back | 50 | 57 |
+| waiting | 389 | 361 |
+| draws | 2,539 | 2,346 |
+| dropped without a host pipeline (of them being made); indirect dropped | 474 (210); 812 | 477 (216); 841 |
+
+GPU timestamps, 10 windows each: the lists' work 233 ms (A, median;
+mean 225) and 219 ms (B; mean 220) a frame, in 29–30 title submissions.
+The GPU is idle, or runs untimed work, 97 ms (A) and 110 ms (B) a frame
+between submissions. Of the 4,230 title submissions of A's whole session,
+23 % ran 10 ms or more and took 86 % of the GPU time (at most 155 ms).
+
+By kind, mean ms a frame over the windows (A's executions a frame and µs
+each):
+
+| Kind | A | B | A per frame | A µs each | share of A |
+|---|---:|---:|---:|---:|---:|
+| dispatch | 63.4 | 62.3 | 1,226 | 51 | 26 % |
+| **indirect argument clamp (XTP's)** | **57.7** | **59.3** | 3,302 | 18 | **23 %** |
+| mesh dispatch | 55.5 | 33.9 | 452 | 125 | 22 % |
+| indirect mesh dispatch | 31.5 | 31.6 | 1,701 | 19 | 13 % |
+| indirect dispatch | 17.5 | 18.1 | 682 | 27 | 7 % |
+| texture upload (XTP's predicated staging copies, §7) | 5.9 | 6.6 | 320 | 19 | 2 % |
+| rectangle expansion (XTP's) | 4.1 | 4.7 | 254 | 16 | 2 % |
+| indirect rectangles | 3.8 | 4.3 | 254 | 15 | 2 % |
+| draw | 3.1 | 3.2 | 146 | 23 | 1 % |
+| between commands (copies, barriers, clears) | 2.6 | 2.6 | 8,598 spans | 0.3 | 1 % |
+| indexed, indirect indexed and indirect draws | 1.6 | 1.6 | 59 | | 1 % |
+| *of the programs, those with a wave64 stage* | *135.1* | *116.6* | *3,956* | | |
+
+By class:
+
+- mesh: 87.0 ms (A), 65.4 (B);
+- compute: 81 (A), 80 (B);
+- XTP's own passes (clamp, rectangle expansion, texture copies): 68 (A),
+  71 (B);
+- draws, rectangles included: 8.5 (A), 9.1 (B);
+- between commands: 2.6.
+
+Mesh dispatch differs between A and B by where the autopilot walked, not by
+the switch (§10.6): the costliest mesh program ran 27 times a frame in A,
+12 in B.
+
+Pipeline statistics, A, per frame:
+
+- 8,205 commands queried;
+- vertex invocations 1.3 M, mesh 0.95 M;
+- 2.1 M primitives into the clipper and 0.6 M out of it;
+- pixel invocations 27.4 M: draws 20.4 M, indirect mesh 3.8 M, mesh 1.5 M;
+- compute invocations 48.9 M: dispatches 46.1 M, indirect dispatches
+  2.6 M, the clamps 0.20 M (62 threads per clamp, one group each).
+
+The draws with the most pixels shade 0.9 to 3.8 M pixels a primitive:
+full-screen passes, one or a few large triangles each. The largest of
+them, `[vertex 1d65098be346d062, pixel 5510a9fd27ceb4b1]`, shades 2.5 M a
+frame. The program with the most pixels is a mesh one, `[mesh
+f5257487f2945fdb, pixel 2edbd011d7110758]`, 3.4 M a frame at 70 a
+primitive. The other mesh programs listed shade 2 to 115 pixels a
+primitive. Nothing approaches the 51 M pixels for 184 primitives of
+VIctory #1723.
+
+### 10.5 By program: the top 20
+
+Programs by A's ms a frame, summed over the 10 windows (each window's top
+25 lines: a lower bound for a program that left a window's top). Their
+pipeline names are their translated shaders' hashes.
+
+| # | Program | Kind | Wave64 stage | A ms/frame | A per frame | A µs each | B ms/frame | B µs each | B/A per execution |
+|---:|---|---|:-:|---:|---:|---:|---:|---:|---:|
+| 1 | `mesh ba8d52f4ea1a1bac, pixel b37565055f2f7d3b` | mesh dispatch | yes | 28.60 | 27.4 | 1,042 | 13.24 | 1,099 | 1.05 |
+| 2 | `compute 24f989b98dcb03f0` | dispatch | | 8.49 | 10.5 | 809 | 9.04 | 832 | 1.03 |
+| 3 | `compute 3a79195f06d3ed85` | dispatch | | 8.18 | 45.8 | 179 | 6.23 | 186 | 1.04 |
+| 4 | `compute ebe4e53f031f5249` | dispatch | | 4.09 | 5.7 | 720 | 4.83 | 784 | 1.09 |
+| 5 | `mesh 7972997d15fd9e69, pixel 9f14b72117e2abec` | indirect mesh dispatch | yes | 3.79 | 230.5 | 16 | 3.54 | 18 | 1.07 |
+| 6 | `mesh 32c5e0e62380b489, pixel 4c7bfa5c7bc65187` | mesh dispatch | yes | 2.14 | 61.4 | 35 | 2.66 | 38 | 1.10 |
+| 7 | `compute 660814153af43185` | indirect dispatch | yes | 2.05 | 65.7 | 31 | 2.13 | 33 | 1.04 |
+| 8 | `compute 12eae112b559091c` | dispatch | | 2.02 | 21.3 | 95 | 1.86 | 125 | 1.31 |
+| 9 | `compute 6a04b371a8e26853` | dispatch | yes | 2.01 | 108.7 | 18 | 2.31 | 20 | 1.06 |
+| 10 | `compute f8f50ab85e7b10bb` | indirect dispatch | yes | 1.96 | 68.8 | 29 | 1.92 | 30 | 1.06 |
+| 11 | `mesh f0c7efd2aceb2aaa, pixel 7d85c9cab3c80721` | mesh dispatch | yes | 1.81 | 49.2 | 37 | 1.82 | 41 | 1.11 |
+| 12 | `compute 7c90a988167650a1` | dispatch | yes | 1.79 | 1.0 | 1,795 | 1.96 | 1,945 | 1.08 |
+| 13 | `compute 7de0f9db96ddd295` | dispatch | yes | 1.51 | 63.6 | 24 | 1.76 | 25 | 1.06 |
+| 14 | `compute 42683eebec081520` | dispatch | yes | 1.49 | 0.8 | 1,754 | 1.26 | 1,680 | 0.96 |
+| 15 | `compute 512416d975ace48b` | dispatch | | 1.41 | 24.4 | 58 | 1.54 | 71 | 1.23 |
+| 16 | `compute c9da71da40af2e28` | indirect dispatch | yes | 1.29 | 55.5 | 23 | 1.48 | 25 | 1.06 |
+| 17 | `mesh 37f363f0a5dcd806, pixel 4a45195a99ac14f7` | mesh dispatch | yes | 1.02 | 25.3 | 40 | 0.88 | 44 | 1.09 |
+| 18 | `mesh c962201cddbdd7dd, pixel e5e9af2bbd2c006a` | mesh dispatch | yes | 0.91 | 19.8 | 46 | 0.68 | 49 | 1.08 |
+| 19 | `mesh a26422c01dcf5612, pixel 6a3a8d3fe52b4eab` | mesh dispatch | yes | 0.80 | 1.4 | 590 | 0.95 | 729 | 1.23 |
+| 20 | `mesh 8f690b0f5dbbce02, pixel 271a87c54ac648a5` | indirect mesh dispatch | yes | 0.75 | 40.4 | 18 | 0.96 | 19 | 1.03 |
+
+- The top 20 programs take 76 ms of A's 225. Programs with a wave64 stage
+  alone number 876 a window (median). Below the top 5, no program reaches
+  2.2 ms. Most of the rest is many executions of 16 to 50 µs each.
+- Of the previous top programs (§4.2), `3a79195f06d3ed85` (16.2 ms then)
+  and `ebe4e53f031f5249` are still in the top 5. Per execution,
+  `24f989b98dcb03f0` grew from 45 µs to 809 µs.
+
+### 10.6 `XTP_DXIL_OPT`: the A/B for dxilopt
+
+Per execution, B against A, over the 58 programs in both sessions' lines
+(`n6ab.py`):
+
+- **Translated programs**: weighted by A's time, 7.3 % slower in B (A's
+  88.6 ms of these programs would take 95.0 ms at B's times). Of the top
+  20, only `42683eebec081520` got faster (0.96).
+- **XTP's own passes**, HLSL compiled by the system's compiler and not
+  touched by the switch (the clamp, the rectangle expansion, the texture
+  copies): 18.0 µs per execution in A, 19.8 µs in B, **10 % slower**.
+- So B's GPU ran about 10 % slower for everything. Against that control,
+  the translated programs are **about 2.5 % faster** with the passes.
+- Two sessions of identical shaders differ by more than that: gpu-prof's
+  A2 and B3 (same translations) differed by 0.89 to 1.24 per program among
+  their 8 largest, and by 12 % over all.
+- **dxilopt's gain is not measurable on this GPU.** The NVIDIA driver
+  compiles DXIL with its own optimizer, and that optimizer already removes
+  what the passes remove (dead code, folded constants, repeated values and
+  loads). The fork's figure of about 20 ms a frame was not reproduced
+  here. Another GPU or driver (AMD's, the L4) is untested.
+- **No harm seen**: both sessions ran their 60 s without a device removal.
+  The draw and drop counts are the same within the scene's spread. Keeping
+  the switch off by default costs nothing measurable on NVIDIA.
+
+### 10.7 The top costs: why, and who owns them
+
+**0. XTP's indirect argument clamp: 54–59 ms a frame** (`indirect.rs`,
+`State::execute_indirect` in `draw.rs`).
+
+- **What each clamp records.** Every indirect execution is preceded by
+  `indirect::bound`:
+  1. a global UAV barrier;
+  2. the clamp's root signature and pipeline (a compute pipeline, so a
+     switch from the title's graphics or mesh state);
+  3. one dispatch of one group (62 threads on average by the statistics);
+  4. a second global UAV barrier;
+  5. a transition of the arguments to the indirect-argument state.
+
+  `execute_indirect` then sets `host_pipeline = 0` and `host_roots[1] = 0`:
+  the title's pipeline and roots are bound again for every execution.
+- **What changed with the 3D.** Before it each clamp took 2.5 µs between
+  compute dispatches; now 18–20 µs, between mesh executions. The clamp's
+  own work is one 64-thread group. What grew is the switch between
+  graphics and compute, the barriers' drain of the mesh work before each
+  clamp, and the rebind after it.
+- **Redundant barriers.** The leading barrier waits for all earlier work,
+  even when nothing since the last barrier wrote the arguments.
+- **Before dropped executions.** A ran 2,413 indirect executions a frame
+  that clamp: 1,701 mesh, 682 dispatches and about 30 draws (the 254
+  rectangle draws bound their records in their own expansion). It ran
+  3,302 clamps, so about 890 a frame (27 %) clamp the arguments of an
+  execution that `prepare` then drops (no host pipeline, still being
+  made). B: 2,998 clamps for 2,096 executions (30 %). §4.2 found the same
+  before the 3D (73 % then).
+- **Attribution caveat.** A timestamp is written once the GPU has finished
+  the commands before it (§3.1), so the clamp's span starts after the
+  previous execution. Its barriers still remove the overlap the next
+  execution would have had. How much of the 57 ms comes back once the
+  clamp is batched can only be measured (N6a's acceptance).
+
+**1. `[mesh ba8d52f4ea1a1bac, pixel b37565055f2f7d3b]`: 13–29 ms a frame,
+1.0–1.1 ms per execution** (translator; the pass that writes the loop's
+bound).
+
+- **Tiny work.** Per execution the statistics count 270 to 750 mesh
+  invocations and primitives, and 460 to 2,000 pixel invocations (1.8 to
+  8.6 a primitive). A millisecond for that is the cost of a loop, not of
+  geometry or fill.
+- **The mesh stage is not it.** It is wave64 with 556 instructions, no
+  loop, 2 group barriers and 7 first-lane reads (the exchange through
+  group-shared memory of `mesh-wave64.md` §3.2). That costs a few
+  barriers per group, not a millisecond.
+- **The pixel stage** is wave32, 5,405 instructions with 9 loops, and does
+  tiled lighting:
+  - an outer loop walks the words of a light mask. Its index (`s81`, one
+    more each pass) leaves only when it **equals** a per-lane bound (`v56`:
+    `v_cmp_eq_u32 vcc, s81, v56` then `s_cbranch_vccz` back);
+  - each pass ORs the lanes' mask words across the wave (`dpp8`,
+    `row_mirror`, `v_permlanex16`, `v_readlane`);
+  - an inner loop of 1,916 instructions, 90 of them memory instructions
+    (light data by `s_load_dwordx4`), runs over the wave's mask and leaves
+    on `s83 == s84`.
+- **The suspicion.** A loop bounded by equality with data runs until XTP's
+  loop limit when the bound is not what the console's data says (commit
+  fca2059: such loops are no counted loops). Many passes that
+  could write the light grid do not run yet: 529 dispatches a frame "do
+  not translate", 392 indirect dispatches are "being made (heavy)".
+- **Not proven.** At this GPU's issue rate, one wave would run a few
+  hundred to a thousand passes of the 1,916-instruction body in a
+  millisecond: far more than a tile's lights. The trip count has to be
+  counted (N6b).
+
+**2–4. The vertex-transform compute family: about 24 ms a frame** (the
+translator's VALU and buffer lowering).
+
+| Program | ms a frame (A) | runs a frame × µs | Before the 3D (§4.2) |
+|---|---:|---:|---|
+| `24f989b98dcb03f0` | 8.5 | 10.5 × 809 | 18.5 × 45 µs |
+| `3a79195f06d3ed85` | 8.2 | 45.8 × 179 | 39.6 × 290 µs |
+| `ebe4e53f031f5249` | 4.1 | 5.7 × 720 | 10.8 × 310 µs |
+| `12eae112b559091c` | 2.0 | 21.3 × 95 | 31.3 × 44 µs |
+| `512416d975ace48b` | 1.4 | 24.4 × 58 | 17.0 × 189 µs |
+
+- **What they are.** All are 32-thread, wave32 programs of 2,400 to 12,000
+  instructions, with no group-shared memory, no barrier and no wave64.
+  - Most of their loops are scalar (`s_cbranch_scc0` over constants read
+    by `s_buffer_load_dwordx4`). `24f989b98dcb03f0` also has a vector
+    loop that leaves on a float comparison.
+  - In the three checked (`3a79195f06d3ed85`, `24f989b98dcb03f0`,
+    `12eae112b559091c`):
+    - legacy multiplies are about 15 % of their instructions
+      (`v_mul_legacy_f32`: 0 times anything is 0);
+    - each thread makes 102 to 138 16-byte buffer loads;
+    - `3a79195f06d3ed85` writes vertex-sized results
+      (`buffer_store_dwordx3`), and its translation has no back edge.
+- **The translation of `3a79195f06d3ed85`**: 9,075 DXIL instructions for
+  2,432 console ones (3.7 times):
+  - 854 `fcmp` and 533 `select`, mostly the 358 legacy multiplies (both
+    operands compared with 0, then a select);
+  - 130 `createHandleFromHeap` and `annotateHandle` pairs, one per buffer
+    load;
+  - 2,800 bitcasts.
+
+  dxilopt's passes did not change their time (1.03–1.09 per execution, §10.6).
+- **Not known.** Their threads per execution: they are below the
+  statistics line's top 15 for compute invocations, so under about 0.9 M
+  a frame each. So it is not known whether the growth since the 3D
+  (`24f989b98dcb03f0` 18 times per execution) is more work per dispatch or
+  slower work.
+
+**5. `[mesh 7972997d15fd9e69, pixel 9f14b72117e2abec]`, and every small
+mesh execution: 3.8 ms for this one, 31.5 ms for all indirect mesh
+dispatches** (`draw.rs`, `indirect.rs`: N6a).
+
+- **Fixed cost per execution.** 230 indirect mesh dispatches a frame of
+  16 µs each, for 100 to 200 mesh invocations and a few hundred pixels per
+  execution. Over the 1,701 indirect mesh dispatches a frame (19 µs each),
+  the per-execution cost dominates, not the work.
+- **The clamp doubles it.** Each execution also carries a clamp of 18 µs
+  and the rebind of its pipeline and roots after it (item 0). Removing the
+  per-execution clamp and rebind is the lever; the title's execution
+  count is its own.
+- The rectangles path is not a top cost: its expansion and draws take
+  7.9 ms for 254 draws a frame (31 µs per rectangle draw), part of it the
+  same pattern of passes between barriers.
+
+### 10.8 Ready tasks
+
+**N6a. The indirect argument clamp: once per run of executions, no
+barrier it does not need, nothing for a dropped execution.**
+
+- *Goal.* 54–59 ms a frame of 3,000–3,300 clamps of 18–20 µs (§10.7 item
+  0) to at most 5 ms, without unbounded arguments reaching the GPU.
+- *What to change.*
+  1. In `State::execute_indirect`, find the host pipeline (and drop the
+     execution) before clamping: about 890 clamps a frame.
+  2. Clamp the arguments of a run of executions in one dispatch, where
+     nothing between them writes those arguments (one group per execution
+     or per arguments range, records in order, the budget in order).
+  3. A UAV barrier before a clamp only when a UAV write was recorded since
+     the last one. Barriers on the arguments buffer rather than global
+     ones.
+  4. Keep the title's pipeline and roots bound across the clamp where the
+     clamp's state did not replace them (compute roots only for a
+     graphics or mesh execution).
+- *Files.* `crates/xtp-gpu/src/indirect.rs`,
+  `crates/xtp-gpu/src/draw.rs` (`State::execute_indirect`, the rectangle
+  path that clamps inside its expansion).
+- *Acceptance.*
+  - In a Series S world session with `XTP_GPU_TIMESTAMPS=1`: the clamp at
+    most 5 ms a frame, the indirect executions run a frame unchanged, and
+    the frame's GPU work lower by at least 40 ms against this section's A.
+  - The WARP tests of `indirect.rs` (budget in order, no wrap) green, plus
+    one for two executions clamped in one dispatch and one for a dropped
+    execution that clamps nothing.
+
+**N6b. The light loop of `pixel b37565055f2f7d3b`: count its passes, then
+find who writes its bound.**
+
+- *Goal.* `[mesh ba8d52f4ea1a1bac, pixel b37565055f2f7d3b]` takes about a
+  millisecond per execution for a few thousand pixels (13–29 ms a frame).
+  Find whether its outer light loop (leaves on `s81 == v56`) or its inner
+  loop runs far more passes than the console's data allow. If so, find
+  the pass whose output is the bound, and why it differs: a dropped pass,
+  a pipeline still being made, or a wrong translation.
+- *What to change.*
+  1. A diagnostics counter of the lanes that leave a loop by XTP's limit
+     or budget, per program: a UAV the translated program increments
+     where the limit's exit is taken, read with the timestamps, named by
+     program.
+  2. One short session with it, or with `XTP_SHADER_LOOP_LIMIT=256`
+     against the default, comparing this program's µs per execution.
+  3. Then the light grid's writer, from the dropped-execution lines.
+- *Files.* `crates/xtp-shader/src/emit/lower/flow.rs` (the limit's exit),
+  a diagnostics file in `xtp-gpu` for the counter (or `pipestats.rs`'s
+  line).
+- *Acceptance.*
+  - The number of lanes and programs that leave by the limit, per frame,
+    in a Series S world session.
+  - For this program: its passes per pixel, and its time per execution
+    under 100 µs once the bound is right, or the reason it cannot be.
+
+**N6c. The vertex-transform compute family: what a thread costs, and the
+legacy multiply and per-load handles.**
+
+- *Goal.* `24f989b98dcb03f0`, `3a79195f06d3ed85`, `ebe4e53f031f5249`,
+  `12eae112b559091c` and `512416d975ace48b` take about 24 ms a frame
+  (§10.7 items 2–4). Find their threads per execution and their cost per
+  thread, and lower what the translation adds.
+- *What to change.*
+  1. Their compute invocations from `XTP_GPU_PIPESTATS` (widen the
+     line's per-program list, or list these programs by name).
+  2. Lower `v_mul_legacy_f32` in fewer host instructions where an operand
+     is known finite, or as one compare of the product's NaN and a
+     select.
+  3. Create a buffer's descriptor handle once per program and range, not
+     once per load (130 in `3a79195f06d3ed85`).
+  4. Compare with the driver's own code (the SASS) for one of them.
+- *Files.* `crates/xtp-shader/src/emit/lower/valu.rs` (legacy multiply),
+  `crates/xtp-shader/src/emit/lower/buffer.rs` and `descriptor.rs`
+  (handles); measurement only in `xtp-gpu`.
+- *Acceptance.*
+  - Threads per execution and µs per thousand threads for each of the
+    five, in a Series S world session.
+  - The translated instruction count of `3a79195f06d3ed85` lower by at
+    least 25 %, the survey's translations otherwise byte-identical where
+    nothing changed, and the shader tests green (WARP and the L4).
+
+### 10.9 Toward 25 ms
+
+| Step | Today (A, ms a frame) | After (estimate) | Task |
+|---|---:|---:|---|
+| the clamp | 57.7 | ≤ 5 | N6a |
+| the light loop of the top mesh program | 13–29 | ≤ 3 | N6b |
+| the vertex-transform family | 24 | 10–15 | N6c |
+| indirect mesh executions' fixed cost (beyond the clamp) | 31.5 | 15–20 | N6a (rebind), then per program |
+| everything else (hundreds of programs, XTP's other passes) | about 83 | 60–83 | per program, from this section's lines |
+| GPU work | 225 | **about 100–130** | |
+
+- **These steps do not reach 25 ms.** The budget needs a factor of about
+  9, not 2.
+- **Rough scale.** The title is made to run this frame within 33 ms on
+  the Series S's GPU, at a fraction of an RTX 4080 SUPER's peak rates. So on this GPU the frame's
+  own work should take a few milliseconds. Most of the 225 ms is
+  translation or emulation overhead per execution and per instruction,
+  repeated over 8,000 commands a frame. This is an estimate from peak
+  rates, not a measurement.
+- **The dropped work will add to it.** 1,300 executions a frame are still
+  dropped (474 without a host pipeline, 812 indirect). As they translate,
+  the GPU work grows.
+- **After N6a–N6c**, measure again with this section's sessions and rank
+  the next programs. The per-execution fixed cost (16–50 µs for the
+  smallest executions) is then the next item to measure.
+
+### 10.10 Method
+
+- Logs:
+  - `E:\xtp-data\cache\play\20261124-224345\run.log` (A) and
+    `-224559` (B), copied to `E:\xtp-data\runs\n6gpu\A-run.log` and
+    `B-run.log`;
+  - samplers in `E:\xtp-data\runs\stall-n6-A` and `stall-n6-B`;
+  - the binary in `E:\xtp-data\runs\n6gpu\bin\xtp-dc4bb11.exe`;
+  - the session plan in `E:\xtp-data\runs\n6gpu\sessions.md`.
+- `E:\xtp-data\runs\n6gpu\tools\n6frame.py <run.log> --min-draws 1000
+  --top 25` gives §10.4 and the statistics, joined to the program ranking
+  (`A-report.txt`, `B-report.txt`). `n6ab.py A-run.log B-run.log` gives
+  §10.5's and §10.6's per-execution comparison (`AB-report.txt`,
+  `top20-AB.md`).
+- Programs' code:
+  1. `n6probe.exe` writes a program's container from the title's shader
+     pack by its hash (a local probe, not in the repository);
+  2. `xtp shader-info --disasm` lists the console code, and
+     `tools\loops.py` finds its loops and its instruction mix;
+  3. `xtp translate --list --host-lanes 32-32` with `XTP_EMIT_DUMP` writes
+     the translation, which `dxc -dumpbin` disassembles;
+  4. `pack-info.tsv` holds the native properties of all 26,084 programs of
+     the pack: wave64, group size, barriers, LDS, lane reads, instructions.
+
+  Nothing of the title is in the repository; programs are named by hash
+  and code by address.
+- Pipeline statistics: §10.3. Both sessions ran with them; their own
+  cost is not separated (§10.2).
 
