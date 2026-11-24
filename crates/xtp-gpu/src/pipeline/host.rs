@@ -410,9 +410,25 @@ pub(crate) struct HostPipeline {
 static REFUSED: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The reason of the last refusal on this thread (diagnostics: what
+    /// draws dropped for want of the pipeline are counted under).
+    static LAST_REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The reason of the last refusal on this thread since the last call
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_refusal() -> Option<String> {
+    LAST_REFUSAL.with(|r| r.borrow_mut().take())
+}
+
 /// Counts a pipeline that gets no host pipeline for `reason`; true for the
 /// first of that reason.
 fn note_refusal(reason: String) -> bool {
+    #[cfg(feature = "diagnostics")]
+    LAST_REFUSAL.with(|r| *r.borrow_mut() = Some(reason.clone()));
     let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
     let n = refused.entry(reason).or_default();
     *n += 1;
@@ -524,7 +540,12 @@ impl Needs {
     /// not say and it is no wave64 mesh program that needs its waves whole
     /// (that check does not depend on the container).
     pub(crate) fn of_translated(stage: &str, shader: &Translated) -> Option<Needs> {
-        let wave64_mesh = Self::mesh_reason(stage, shader, wave64_mesh_allowed());
+        let waves = (
+            shader.wave64,
+            shader.mesh_lds_in_one_wave,
+            shader.mesh_first_lane_reads,
+        );
+        let wave64_mesh = Self::mesh_reason(stage, waves, wave64_mesh_allowed());
         match Needs::of(&shader.host.dxil) {
             Some(needs) => Some(Needs {
                 wave64_mesh,
@@ -538,17 +559,40 @@ impl Needs {
         }
     }
 
-    /// [`Needs::wave64_mesh`] for a translated `stage` shader; `allow`:
-    /// `XTP_WAVE64_MESH=allow`. A program whose first-lane reads were not
-    /// looked at counts as reading.
-    fn mesh_reason(stage: &str, shader: &Translated, allow: bool) -> Option<&'static str> {
-        if stage != "mesh" || !shader.wave64 {
+    /// What a `stage` shader whose console program says it of itself
+    /// (`native`) needs, as far as that decides: whether it is a wave64 mesh
+    /// program that needs its waves whole, with any lanes and shader model
+    /// (mesh translations declare no wave size, so the translation would
+    /// not say more on that); `None` if it is none.
+    pub(crate) fn of_native(stage: &str, native: &super::Native) -> Option<Needs> {
+        let waves = (
+            native.wave64,
+            native.mesh_lds_in_one_wave,
+            native.mesh_first_lane_reads,
+        );
+        Self::mesh_reason(stage, waves, wave64_mesh_allowed()).map(|what| Needs {
+            lanes: (0, u32::MAX),
+            model: (0, 0),
+            wave64_mesh: Some(what),
+        })
+    }
+
+    /// [`Needs::wave64_mesh`] for a `stage` shader whose console program
+    /// is `(wave64, LDS shared within one wave, first-lane reads)`;
+    /// `allow`: `XTP_WAVE64_MESH=allow`. A program whose first-lane reads
+    /// were not looked at counts as reading.
+    fn mesh_reason(
+        stage: &str,
+        (wave64, lds_in_one_wave, first_lane_reads): (bool, bool, Option<bool>),
+        allow: bool,
+    ) -> Option<&'static str> {
+        if stage != "mesh" || !wave64 {
             None
         } else if !allow {
             Some(MESH_WAVE64)
-        } else if shader.mesh_lds_in_one_wave {
+        } else if lds_in_one_wave {
             Some(MESH_LDS_IN_ONE_WAVE)
-        } else if shader.mesh_first_lane_reads != Some(false) {
+        } else if first_lane_reads != Some(false) {
             Some(MESH_FIRST_LANE)
         } else {
             None
@@ -628,6 +672,17 @@ fn shader_refusal(stage: &str, shader: &Translated) -> Option<String> {
     needs.refusal(lanes, model)
 }
 
+/// Why the host cannot run a `stage` shader, known from its console
+/// program alone ([`Needs::of_native`]): the reason [`shader_refusal`]
+/// would give once it is translated. `None` if only the translation can
+/// say (or the host's lanes are unknown).
+fn native_refusal(stage: &str, shader: &Shader) -> Option<String> {
+    let needs = Needs::of_native(stage, shader.native().ok()?)?;
+    let lanes = crate::device::host_wave_lanes()?;
+    let model = crate::device::host_shader_model()?;
+    needs.refusal(lanes, model)
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -665,6 +720,16 @@ impl HostPipeline {
                 "the host GPU has no mesh shaders (or no shader model 6.6)",
                 shaders,
             );
+        }
+        // What the console programs refuse by themselves, before any
+        // translation: one takes a worker up to seconds, and in the world
+        // the workers spent them on wave64 mesh programs refused right
+        // after (a quarter of the world's shaders, docs/analysis/drops.md),
+        // while the pipelines that would run waited behind them.
+        for (s, _) in &stages {
+            if let Some(why) = native_refusal(s.stage, s) {
+                return refuse(format!("{} shader {why}", s.stage), shaders);
+            }
         }
         for (s, _) in &stages {
             if let Some(why) = shader_refusal(s.stage, s.translated()?) {
@@ -1106,6 +1171,111 @@ mod tests {
     /// Compute shader (kind 5), shader model 6.6.
     const CS_6_6: u32 = 5 << 16 | 6 << 4 | 6;
 
+    /// A refusal known from the console program alone is the one its
+    /// translation gets: for every wave64 mesh program, on hosts with and
+    /// without 64-lane waves; and there is none for other stages and
+    /// wave32 programs, which only their translation can refuse.
+    #[test]
+    fn mesh_refusals_before_and_after_translation_agree() {
+        let flags = [
+            (true, false, Some(false)),
+            (true, true, Some(false)),
+            (true, false, Some(true)),
+            (true, false, None),
+            (false, false, None),
+        ];
+        for (stage, (wave64, lds, first_lane)) in ["mesh", "pixel", "compute"]
+            .into_iter()
+            .flat_map(|s| flags.map(|f| (s, f)))
+        {
+            let native = super::super::Native {
+                used: Vec::new(),
+                wave64,
+                mesh_lds_in_one_wave: lds,
+                mesh_first_lane_reads: first_lane,
+            };
+            let translated = Translated {
+                host: xtp_shader::emit::HostShader {
+                    stage: xtp_shader::HwStage::Ms,
+                    // Mesh translations declare no wave size.
+                    dxil: container(48, (0, u32::MAX), CS_6_6),
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                },
+                used: Vec::new(),
+                wave64,
+                mesh_lds_in_one_wave: lds,
+                mesh_first_lane_reads: first_lane,
+            };
+            for lanes in [(32, 32), (4, 4), (32, 64), (64, 64)] {
+                let before =
+                    Needs::of_native(stage, &native).and_then(|n| n.refusal(lanes, (6, 8)));
+                let after =
+                    Needs::of_translated(stage, &translated).and_then(|n| n.refusal(lanes, (6, 8)));
+                if before.is_some() {
+                    assert_eq!(
+                        before, after,
+                        "{stage} {wave64} {lds} {first_lane:?} {lanes:?}"
+                    );
+                }
+                if stage != "mesh" || !wave64 || lanes.1 >= 64 {
+                    assert_eq!(before, None, "{stage} {wave64} {lanes:?}");
+                }
+            }
+        }
+    }
+
+    /// A wave64 mesh pipeline the host refuses is refused before any of
+    /// its shaders is translated: on a host without 64-lane waves (WARP,
+    /// NVIDIA) its mesh and pixel shaders stay untranslated.
+    #[test]
+    fn wave64_mesh_pipelines_are_refused_before_translation() {
+        let test = "pipeline::host::tests::wave64_mesh_pipelines_are_refused_before_translation";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let lanes = crate::device::host_wave_lanes().expect("the device's lanes");
+        if !host.mesh_shaders() || lanes.1 >= 64 || wave64_mesh_allowed() {
+            // Nothing is refused for its waves on this host: not a missing
+            // device, so no failure in strict mode either.
+            eprintln!("SKIPPED {test}: no mesh shaders, 64-lane waves, or XTP_WAVE64_MESH set");
+            return;
+        }
+        let shader = |stage, hash: &str| {
+            Arc::new(Shader {
+                stage,
+                hash: hash.into(),
+                container: b"not translated".to_vec(),
+                native: std::sync::OnceLock::from(Ok(super::super::Native {
+                    used: Vec::new(),
+                    wave64: true,
+                    mesh_lds_in_one_wave: false,
+                    mesh_first_lane_reads: None,
+                })),
+                translated: std::sync::OnceLock::new(),
+            })
+        };
+        let (ms, ps) = (
+            shader("mesh", "6d65736836340000"),
+            shader("pixel", "7069786c36340000"),
+        );
+        let made = HostPipeline::new(&[ms.clone(), ps.clone()], Some(&GraphicsState::default()));
+        assert!(made.is_none(), "refused");
+        assert!(
+            ms.translated.get().is_none(),
+            "the mesh shader was not translated"
+        );
+        assert!(ps.translated.get().is_none(), "nor the pixel shader");
+        let refused = refusals().unwrap_or_default();
+        assert!(
+            refused.contains("mesh shader is a mesh program written for 64-lane waves"),
+            "{refused}"
+        );
+    }
+
     #[test]
     fn wave64_programs_are_refused_on_32_lane_hosts() {
         let wave64 = Needs::of(&container(48, (64, 64), CS_6_6)).unwrap();
@@ -1233,7 +1403,10 @@ mod tests {
         let unread = translated(psv(), true, false, None);
         let plain = translated(psv(), true, false, Some(false));
         let wave32 = translated(psv(), false, false, Some(true));
-        let reason = Needs::mesh_reason;
+        let reason = |stage, t: &Translated, allow| {
+            let waves = (t.wave64, t.mesh_lds_in_one_wave, t.mesh_first_lane_reads);
+            Needs::mesh_reason(stage, waves, allow)
+        };
         for t in [&lds, &first, &unread, &plain] {
             assert_eq!(reason("mesh", t, false), Some(MESH_WAVE64), "by default");
         }
@@ -1515,6 +1688,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = xtp_pipeline::Cache::open(dir.path()).unwrap();
         let runs = AtomicU64::new(0);
+        let _serial = crate::shader_cache::serial();
         let translate = |in_half: bool, target: Target| {
             let (c, native) = crate::shader_cache::wave64_program(in_half);
             let container: &[u8] = if in_half {
@@ -1544,6 +1718,7 @@ mod tests {
                 stage: "compute",
                 hash: hash.into(),
                 container: Vec::new(),
+                native: std::sync::OnceLock::new(),
                 translated: std::sync::OnceLock::from(Some(Translated {
                     host,
                     used: Vec::new(),
