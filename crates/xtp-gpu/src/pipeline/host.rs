@@ -1432,6 +1432,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: false,
+                run_time_buffers: 0,
             },
             used: Vec::new(),
             wave64: true,

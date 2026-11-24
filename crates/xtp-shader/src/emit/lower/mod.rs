@@ -118,6 +118,9 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     /// The program reads the host's runtime stride table.
     pub stride_table: bool,
+    /// Buffers read (and written) through view-heap slots the program
+    /// picks at run time ([`super::RUN_TIME_READS`], [`super::RUN_TIME_WRITES`]).
+    pub run_time_buffers: u8,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -250,6 +253,8 @@ struct Lower<'a> {
     /// Runtime stride table entries read in a DXIL block, by the
     /// descriptor's load (`descriptor::Entry`).
     entries: HashMap<(usize, Site, u8), descriptor::Entry>,
+    /// [`Lowered::run_time_buffers`] so far.
+    run_time_buffers: u8,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -693,6 +698,7 @@ impl<'a> Lower<'a> {
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             entries: HashMap::new(),
+            run_time_buffers: 0,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -884,6 +890,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             stride_table,
+            run_time_buffers: self.run_time_buffers,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]

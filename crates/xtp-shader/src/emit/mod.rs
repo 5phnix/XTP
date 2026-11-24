@@ -252,7 +252,20 @@ pub struct HostShader {
     /// [`STRIDE_SPACE`], a [`StrideEntry`] per view-heap slot): only when
     /// translated for a [`Target`] that has one.
     pub stride_table: bool,
+    /// Whether the shader reads ([`RUN_TIME_READS`]) or may write
+    /// ([`RUN_TIME_WRITES`]) buffers through view-heap slots it picks when it
+    /// runs: a descriptor loaded at an address with a run-time part, or per
+    /// lane. No used-resource entry names such a slot, so the host makes and
+    /// refreshes its views another way (`xtp-gpu`'s `XTP_RUN_TIME_VIEWS`).
+    pub run_time_buffers: u8,
 }
+
+/// [`HostShader::run_time_buffers`]: buffers read through slots picked at
+/// run time.
+pub const RUN_TIME_READS: u8 = 1;
+/// [`HostShader::run_time_buffers`]: unordered access views through slots
+/// picked at run time (they may be written).
+pub const RUN_TIME_WRITES: u8 = 2;
 
 impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a
@@ -599,6 +612,7 @@ pub fn emit_for(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         stride_table: l.stride_table,
+        run_time_buffers: l.run_time_buffers,
     })
 }
 
@@ -882,6 +896,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             stride_table: false,
+            run_time_buffers: 0,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -893,6 +908,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: false,
+                run_time_buffers: 0,
             })
         };
         let ps = file("XTP_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

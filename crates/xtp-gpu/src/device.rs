@@ -427,6 +427,29 @@ pub fn stride_table_on() -> bool {
     })
 }
 
+/// Whether a draw or dispatch whose shaders pick buffer slots of the view
+/// heap when they run (`HostShader::run_time_buffers`) first gets every
+/// buffer view the title wrote in that heap made, and their title memory
+/// brought up to date (`descriptor::host::HostHeap::picked_spans`; watch.md
+/// item 170: without it the instance culling reads zeros and culls every
+/// instance): `XTP_RUN_TIME_VIEWS=1`. Off by default: making the views the
+/// world's loading wrote removed the device in a VIctory run (an invalid
+/// view or memory exhaustion, not told apart there). Read once.
+#[cfg(windows)]
+pub fn run_time_views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XTP_RUN_TIME_VIEWS").is_ok_and(|v| v == "1");
+        if on {
+            tracing::warn!(
+                "XTP_RUN_TIME_VIEWS=1: buffer views of slots shaders pick at run time are \
+                 made and refreshed once a frame (experimental)"
+            );
+        }
+        on
+    })
+}
+
 /// The target for a host with waves of `lanes` (min, max; none: unknown),
 /// or for `forced` (`<min>-<max>`, or one number) in their place; the
 /// forced text back if it is not a range of powers of two from 4 to 128.

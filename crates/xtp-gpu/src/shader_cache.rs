@@ -271,7 +271,8 @@ pub(crate) fn wave64_program(
 }
 
 /// A translation's entry: this, then [`encode`]'s words. 2: with whether it
-/// reads the runtime stride table (VIctory #193).
+/// reads the runtime stride table (VIctory #193) and the buffers it reads
+/// through slots picked at run time.
 const MAGIC: &[u8; 4] = b"VSH2";
 /// A refusal's entry: this, then the text's length (little endian, 4 bytes),
 /// then a checksum of the text (4 bytes), then the error's text (UTF-8). The
@@ -387,6 +388,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         out.extend(slots);
     }
     word(&mut out, u32::from(s.stride_table));
+    word(&mut out, u32::from(s.run_time_buffers));
     out
 }
 
@@ -448,6 +450,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         1 => true,
         _ => return None,
     };
+    let run_time_buffers = u8::try_from(r.word()?).ok()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -457,6 +460,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         stride_table,
+        run_time_buffers,
     })
 }
 
@@ -530,6 +534,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             stride_table: true,
+            run_time_buffers: 3,
         }
     }
 

@@ -105,6 +105,7 @@ fn shader(words: &[u32], uav: u32, io: ComputeIo) -> HostShader {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         stride_table: l.stride_table,
+        run_time_buffers: l.run_time_buffers,
     }
 }
 
@@ -539,14 +540,18 @@ fn views_chosen_by_a_loaded_heap_index() {
     ];
     // Four threads (v0: the thread's id), the group's id in s5 after the
     // user SGPRs s0..s4.
-    let cs = shader(
-        words,
-        8,
-        ComputeIo {
-            rsrc2: 5 << 1 | 1 << 7,
-            threads: [4, 1, 1],
-        },
-    );
+    let io = ComputeIo {
+        rsrc2: 5 << 1 | 1 << 7,
+        threads: [4, 1, 1],
+    };
+    let cs = shader(words, 8, io);
+    // The load's slot is picked when the program runs (the store's is at a
+    // constant place of the table): the host must make its view itself.
+    assert_eq!(cs.run_time_buffers, super::RUN_TIME_READS);
+    let named = lowered(LOAD_STORE_ATOMICS, 8, ONE_THREAD, TABLE).unwrap();
+    assert_eq!(named.run_time_buffers, 0, "slots the table names");
+    let without = lowered(words, 8, io, Target::ANY).err();
+    assert!(without.is_some(), "an unknown stride without the table");
     let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
     // Slot 2: three elements of 12 bytes; slot 3: four of 16 bytes from
     // element 1; their raw views in slots 4 and 5. Slot 1, written: four

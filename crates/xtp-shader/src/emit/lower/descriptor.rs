@@ -102,6 +102,41 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether `src` is a descriptor of a view-heap slot the program picks
+    /// when it runs: loaded at an address with a part known only then (an
+    /// index read from a buffer, say), from the resource heap itself, or
+    /// per lane. No used-resource entry names such a slot.
+    pub(super) fn picked_at_run_time(&self, src: &Source) -> bool {
+        match src {
+            Source::Loaded { load, .. } => self.scalar.get(load).is_some_and(|a| {
+                a.dynamic.is_some()
+                    || self
+                        .x
+                        .native
+                        .layout
+                        .get(a.param)
+                        .is_some_and(|p| p.root == RootType::ResourceHeap)
+            }),
+            Source::Phi { args, .. } | Source::Select { args, .. } => {
+                args.iter().any(|a| self.picked_at_run_time(a))
+            }
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => true,
+            Source::Constant(_) | Source::Built { .. } => false,
+        }
+    }
+
+    /// Notes a buffer handle (`props`: its kind, with the unordered access
+    /// bit) made of `src`'s slot, for [`super::Lowered::run_time_buffers`].
+    pub(super) fn note_run_time(&mut self, src: &Source, props: u32) {
+        let buffer = matches!(props & 0xFF, 10..=12);
+        if buffer && self.picked_at_run_time(src) {
+            self.run_time_buffers |= crate::emit::RUN_TIME_READS;
+            if props & 0x1000 != 0 {
+                self.run_time_buffers |= crate::emit::RUN_TIME_WRITES;
+            }
+        }
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     pub(super) fn handle(
         &mut self,
@@ -110,6 +145,9 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if !sampler {
+            self.note_run_time(src, props.0);
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props.0);

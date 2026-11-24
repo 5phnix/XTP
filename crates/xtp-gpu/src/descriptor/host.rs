@@ -51,6 +51,8 @@ pub(crate) struct HostHeap {
     /// of title slots with `XTP_STRIDE_TABLE=1`
     /// ([`crate::device::stride_table_on`]).
     strides: Option<Strides>,
+    /// The last [`HostHeap::picked_spans`]: its frame, and what it found.
+    picked: Mutex<Option<(u64, Arc<Picked>)>>,
 }
 
 /// Slots past the dynamic ones in a view heap with a runtime stride table,
@@ -276,7 +278,31 @@ struct Made {
     /// For a texture the title placed itself, the host texture the slot
     /// views (see [`HostHeap::mirror`]).
     placed: HashMap<u32, usize>,
+    /// Title slots whose buffer view waits for a draw (made null when the
+    /// title wrote it), each once: [`HostHeap::picked_spans`] makes them.
+    waiting: Vec<u32>,
+    queued: Vec<bool>,
+    /// The buffer views made in title slots: the title memory each reads
+    /// (address, bytes) and whether it is for unordered access.
+    buffers: HashMap<u32, (u64, u64, bool)>,
 }
+
+/// What the buffer views of a heap's title slots read, for shaders that
+/// pick slots when they run ([`HostHeap::picked_spans`]).
+#[derive(Default)]
+pub(crate) struct Picked {
+    /// Per host copy, the span of title memory its views read.
+    pub(crate) reads: Vec<(Arc<Shadow>, u64, u64)>,
+    /// The ranges of unordered access views, each up to [`PICKED_WRITES`].
+    pub(crate) writes: Vec<(Arc<Shadow>, u64, u64)>,
+}
+
+/// The largest unordered access view whose range a shader that picks
+/// slots at run time is taken to write (copied back after its submission).
+/// shortcut: larger ones reached only that way are not copied back (as
+/// r4tedx's gpu/run-time-indexed-views); what shaders write stays in the
+/// host copy, where later submissions read it.
+const PICKED_WRITES: u64 = 16 << 20;
 
 /// Dynamic slot bookkeeping.
 struct Slots {
@@ -528,6 +554,9 @@ impl HostHeap {
             made: Mutex::new(Made {
                 keys: vec![0; count as usize],
                 placed: HashMap::new(),
+                waiting: Vec::new(),
+                queued: vec![false; if sampler { 0 } else { count as usize }],
+                buffers: HashMap::new(),
             }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             slots: Mutex::new(Slots {
@@ -539,6 +568,7 @@ impl HostHeap {
             shared: Mutex::default(),
             null_raw: OnceLock::new(),
             strides,
+            picked: Mutex::new(None),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1071,6 +1101,7 @@ impl HostHeap {
                     null_view(self.cpu(index));
                 }
                 self.forget_view(index);
+                made.buffers.remove(&index);
                 old = self.swap_kept(index, None);
             }
             // A host resource the slot held goes after the lock.
@@ -1083,6 +1114,14 @@ impl HostHeap {
             let view = placed.as_ref().and_then(Option::as_ref).unwrap_or(&view);
             let later = !for_draw && view.is_buffer();
             made.keys[index as usize] = if later { 0 } else { key };
+            if later && let Some(queued) = made.queued.get_mut(index as usize) {
+                // Made null until a draw names it, or a shader that picks
+                // slots at run time is bound (`picked_spans`).
+                if !*queued {
+                    *queued = true;
+                    made.waiting.push(index);
+                }
+            }
             match texture {
                 Some(t) if !later => made.placed.insert(index, t),
                 _ => made.placed.remove(&index),
@@ -1099,6 +1138,15 @@ impl HostHeap {
             }
             // The entry with the descriptor, under the same lock.
             self.note_view(index, viewed.filter(|_| kept.is_some()));
+            match buffer_range(view).filter(|&(_, len)| kept.is_some() && len > 0) {
+                Some((address, len)) => {
+                    let unordered = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+                    made.buffers.insert(index, (address, len, unordered));
+                }
+                None => {
+                    made.buffers.remove(&index);
+                }
+            }
             old = self.swap_kept(index, kept.flatten());
         }
         drop(made);
@@ -1398,6 +1446,96 @@ impl HostHeap {
                 }
             }
         }
+    }
+
+    /// What the buffer views of the title's slots read, with every buffer
+    /// view the title wrote made first, for a shader that picks the slots
+    /// it reads when it runs (no used-resource entry names them, so no
+    /// draw's table made their views: they were null views, read as zeros;
+    /// VIctory #71, watch.md item 170). `start` is the title heap's first
+    /// descriptor. Made at most once a frame per heap: views the title
+    /// writes later in the frame wait for the next one.
+    ///
+    /// The approach of Marvisak/VIctory#1544 (n-romanovich): views written
+    /// by the title made before a draw that reads the heap directly, their
+    /// title memory brought up to date. Here the slots that waited are
+    /// made once (not every slot that ever held a view, at each change of
+    /// the heap), the spans are merged per host copy, and the views go
+    /// through the checks a host view must pass (`fit_view`), so that a bad
+    /// record makes a null view rather than remove the device.
+    pub(crate) fn picked_spans(&self, start: u64) -> Arc<Picked> {
+        let frame = crate::frame::current();
+        let mut picked = self.picked.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, p)) = &*picked
+            && *at == frame
+        {
+            return p.clone();
+        }
+        let started = std::time::Instant::now();
+        let waiting = {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let waiting = std::mem::take(&mut made.waiting);
+            for &index in &waiting {
+                if let Some(queued) = made.queued.get_mut(index as usize) {
+                    *queued = false;
+                }
+            }
+            waiting
+        };
+        let mut made_now = 0u32;
+        for &index in &waiting {
+            if self
+                .mirror(index, start + u64::from(index) * 32, true)
+                .is_some()
+            {
+                made_now += 1;
+            }
+        }
+        let ranges: Vec<(u64, u64, bool)> = self
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .buffers
+            .values()
+            .copied()
+            .collect();
+        let mut spans: HashMap<usize, (Arc<Shadow>, u64, u64)> = HashMap::new();
+        let mut writes = Vec::new();
+        for (address, len, unordered) in ranges.iter().copied() {
+            let Some(copy) = crate::shadow::existing(address, len) else {
+                continue;
+            };
+            let span = spans
+                .entry(Arc::as_ptr(&copy) as usize)
+                .or_insert_with(|| (copy.clone(), address, address + len));
+            span.1 = span.1.min(address);
+            span.2 = span.2.max(address + len);
+            if unordered && len <= PICKED_WRITES {
+                writes.push((copy, address, len));
+            }
+        }
+        let p = Arc::new(Picked {
+            reads: spans.into_values().collect(),
+            writes,
+        });
+        static PASSES: AtomicU64 = AtomicU64::new(0);
+        let passes = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if passes.is_power_of_two() {
+            let bytes: u64 = p.reads.iter().map(|(_, from, to)| to - from).sum();
+            tracing::info!(
+                passes,
+                waited = waiting.len(),
+                made = made_now,
+                views = ranges.len(),
+                copies = p.reads.len(),
+                mib = bytes >> 20,
+                writes = p.writes.len(),
+                us = started.elapsed().as_micros() as u64,
+                "buffer views of slots picked at run time: made and listed"
+            );
+        }
+        *picked = Some((frame, p.clone()));
+        p
     }
 
     /// Slot `index`'s table entry (tests).

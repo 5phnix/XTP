@@ -666,6 +666,7 @@ impl<'a> Lower<'a> {
         access: impl FnOnce(&mut Self, V, V) -> Result<Vec<V>, Why>,
     ) -> Result<Vec<V>, Why> {
         let (e, byte, valid) = self.runtime_view(src, index, off, width)?;
+        self.note_run_time(src, props);
         let at = self.begin_guarded(Some(valid));
         let h = self
             .s
