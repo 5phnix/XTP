@@ -6,11 +6,15 @@
 //! the host format of each title format.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+mod alias;
 pub(crate) mod format;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::c_void;
 use std::ptr::NonNull;
+#[cfg(windows)]
+use std::sync::Arc;
 
 use xtp_formats::texture;
 
@@ -118,6 +122,18 @@ impl ResourceDesc {
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
+
+/// A resource description as words with its two padding words (bytes 4-7,
+/// after the dimension, and 52-55, after the flags) zeroed: titles pass
+/// descriptions from the stack, and equal ones must compare equal (after
+/// VIctory #643, by nathanbzrr).
+pub(crate) fn canonical_resource_desc(mut words: [u32; 14]) -> [u32; 14] {
+    words[1] = 0;
+    words[13] = 0;
+    words
+}
 
 const BUFFER: u32 = 1;
 const TEXTURE_3D: u32 = 4;
@@ -838,6 +854,25 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+/// The host's resource flags for the title's: render target, depth,
+/// unordered access and no shader access; a depth target loses unordered
+/// access, which PC refuses with it (the console allows both; Grand Theft
+/// Auto VI's shadow maps ask for it).
+/// shortcut: the host copy loses UAV use; give it a second view-only copy
+/// if draws write it as a UAV (VIctory #469).
+#[cfg(windows)]
+fn host_flags(flags: u32) -> u32 {
+    const PC_FLAGS: u32 = 0xf;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    let flags = flags & PC_FLAGS;
+    if flags & DEPTH != 0 {
+        flags & !UNORDERED
+    } else {
+        flags
+    }
+}
+
 /// The host description of a title texture for a device that can do
 /// `caps`: the same description without the console's layout and flags, in
 /// the host's format. Its error says why the device cannot create it (no
@@ -847,20 +882,11 @@ pub(crate) fn host_desc(
     desc: &ResourceDesc,
     caps: &impl format::Caps,
 ) -> Result<ResourceDesc, String> {
-    const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
+    const UNORDERED: u32 = 4;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
-    d.flags &= PC_FLAGS;
-    // PC refuses depth targets that are also unordered-access (the console
-    // allows both; Grand Theft Auto VI's shadow maps ask for it).
-    // shortcut: the host copy loses UAV use; give it a second view-only
-    // copy if draws write it as a UAV.
-    const DEPTH: u32 = 2;
-    const UNORDERED: u32 = 4;
-    if d.flags & DEPTH != 0 {
-        d.flags &= !UNORDERED;
-    }
+    d.flags = host_flags(d.flags);
     if caps.choice(desc.format) == Some(format::Choice::Refused) {
         return Err("no host format".into());
     }
@@ -994,9 +1020,10 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
-impl Resource {
+impl Backing {
+    /// The memory's first byte.
     fn data(&self) -> *mut u8 {
-        match self.backing {
+        match *self {
             Backing::Committed(ref memory) => memory.ptr.as_ptr(),
             // SAFETY: placement checked the range lies inside the heap.
             Backing::Placed { heap, offset } => unsafe {
@@ -1009,6 +1036,18 @@ impl Resource {
             Backing::Address(at) => at,
         }
     }
+
+    /// Its address (GPU addresses are CPU addresses).
+    #[cfg(windows)]
+    fn address(&self) -> u64 {
+        self.data() as u64
+    }
+}
+
+impl Resource {
+    fn data(&self) -> *mut u8 {
+        self.backing.data()
+    }
 }
 
 fn resource<'a>(this: This) -> &'a Resource {
@@ -1016,7 +1055,8 @@ fn resource<'a>(this: This) -> &'a Resource {
     unsafe { &*this.cast::<Resource>() }
 }
 
-// The creation methods' own arguments, passed on.
+// The creation methods' own arguments, passed on, and how the resource is
+// made (for the alias log).
 #[allow(clippy::too_many_arguments)]
 fn hand_out_resource(
     desc: ResourceDesc,
@@ -1027,11 +1067,28 @@ fn hand_out_resource(
     clear: *const c_void,
     iid: *const Iid,
     out: *mut This,
+    how: &'static str,
 ) -> HRESULT {
     #[cfg(not(windows))]
-    let _ = (state, clear);
+    let _ = (state, clear, how);
+    // A texture at the address of a live one the GPU writes shares its host
+    // copy (`alias`), with the state it is in; else it gets its own.
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    let address = backing.address();
+    #[cfg(windows)]
+    let host = if desc.dimension == BUFFER {
+        None
+    } else {
+        alias::shared(address, &desc, how).or_else(|| {
+            host_texture(&desc, state, clear).map(|texture| {
+                let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+                std::sync::Arc::new(HostTexture {
+                    texture,
+                    state: state.into(),
+                })
+            })
+        })
+    };
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1039,20 +1096,28 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-            })
-        }),
+        host,
     });
     #[cfg(windows)]
-    if desc.dimension == BUFFER {
+    {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        if desc.dimension == BUFFER {
+            crate::shadow::register(at, resource.data() as u64, desc.width);
+        } else if let Some(host) = &resource.host {
+            alias::register(address, at, &desc, host);
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+}
+
+/// Whether `this` is one of our resources: false for any other pointer,
+/// readable or not (the planes of a present, read at a guessed stride).
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let mut table = [0u8; 8];
+    !this.is_null()
+        && crate::host::read_into(this.cast(), &mut table)
+        && usize::from_le_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 
 #[cfg(windows)]
@@ -1082,6 +1147,11 @@ impl Drop for Resource {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
+            );
+        } else {
+            alias::unregister(
+                self.data() as u64,
+                std::ptr::from_ref::<Resource>(self) as usize,
             );
         }
     }
@@ -1124,6 +1194,7 @@ pub(crate) extern "system" fn create_committed(
         clear,
         iid,
         out,
+        "committed",
     )
 }
 
@@ -1209,9 +1280,6 @@ pub(crate) extern "system" fn create_at_address(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    if address == 0 {
-        return E_INVALIDARG;
-    }
     tracing::debug!(
         address = format_args!("{address:#x}"),
         dimension = desc.dimension,
@@ -1219,6 +1287,22 @@ pub(crate) extern "system" fn create_at_address(
         layout,
         "resource at an address"
     );
+    at_address(address, desc, clear, iid, out, "at an address")
+}
+
+/// A resource over memory at `address` (see [`create_at_address`]); `how`
+/// says who asks, for the alias log.
+fn at_address(
+    address: u64,
+    desc: ResourceDesc,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+    how: &'static str,
+) -> HRESULT {
+    if address == 0 {
+        return E_INVALIDARG;
+    }
     const COMMON: u32 = 0;
     const DEFAULT: HeapProperties = HeapProperties {
         kind: 1,
@@ -1236,47 +1320,64 @@ pub(crate) extern "system" fn create_at_address(
         clear,
         iid,
         out,
+        how,
     )
 }
 
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
-/// interface textures), by address and description: a resource at that
-/// address, made the first time a draw reads one.
+/// interface textures), by address and description (padding zeroed): a
+/// resource at that address, made the first time a draw reads one, and the
+/// alias count (`alias::changes`) it was last matched at.
 /// shortcut: never released (one host texture per distinct address and
 /// description viewed); release them when the title unmaps or reuses the
 /// memory once streaming grows VRAM use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::Mutex<
+    std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use. When a texture the
+/// GPU writes comes to that address after it (or another one replaces it),
+/// the next use makes a new resource, which shares that texture's host
+/// copy (`alias`).
+/// shortcut: the resource replaced is kept (lists and views made before
+/// may still name it).
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
-    }
+    let desc = canonical_resource_desc(*desc);
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
     }
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let changes = alias::changes();
+    if let Some(entry) = map.get_mut(&(address, desc)) {
+        let made = entry.0 as This;
+        let current = resource(made).host.clone();
+        let stale = entry.1 != changes
+            && alias::current(address, &d)
+                .is_some_and(|now| !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &now)));
+        entry.1 = changes;
+        if !stale {
+            return current.is_some().then_some(made);
+        }
+        let mut out = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        if at_address(address, d, std::ptr::null(), iid, &mut out, "placed view") != S_OK {
+            return current.is_some().then_some(made);
+        }
+        entry.0 = out as usize;
+        return resource(out).host.is_some().then_some(out);
+    }
     let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
-        0,
-        std::ptr::null(),
-        &RESOURCE_IIDS[0],
-        &mut out,
-    );
-    if made != S_OK {
+    let iid = &RESOURCE_IIDS[0];
+    if at_address(address, d, std::ptr::null(), iid, &mut out, "placed view") != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
+    map.insert((address, desc), (out as usize, changes));
     resource(out).host.is_some().then_some(out)
 }
 
@@ -1325,6 +1426,7 @@ pub(crate) extern "system" fn create_placed(
         clear,
         iid,
         out,
+        "placed in a heap",
     )
 }
 
@@ -1451,6 +1553,141 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
+
+/// What tests of other modules need from title textures.
+#[cfg(all(test, windows))]
+pub(crate) mod tests_support {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// A `width` x `height` render target in `format`.
+    pub(crate) fn target(width: u64, height: u32, format: u32) -> ResourceDesc {
+        ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1,
+        }
+    }
+
+    /// A committed title resource described by `desc`.
+    pub(crate) fn committed(desc: &ResourceDesc) -> This {
+        let null = std::ptr::null();
+        let heap = HeapProperties {
+            kind: 1,
+            cpu_pages: 0,
+            pool: 0,
+            creation_nodes: 0,
+            visible_nodes: 0,
+        };
+        let mut out = null;
+        let iid = &RESOURCE_IIDS[0];
+        assert_eq!(
+            create_committed(null, &heap, 0, desc, 0, null.cast(), iid, &mut out),
+            S_OK
+        );
+        out
+    }
+
+    /// The 8-bit RGBA texels of subresource 0 of `texture` (at most 64
+    /// texels wide), which is in `state` and stays in it: rows 256 bytes
+    /// apart.
+    pub(crate) fn read_back(host: &crate::host::Host, texture: &ID3D12Resource, state: u32) -> Vec<u8> {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        assert!(d.Width <= 64);
+        let size = 256 * u64::from(d.Height);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let list = host.new_list().unwrap();
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: d.Width as u32,
+                        Height: d.Height,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let state = D3D12_RESOURCE_STATES(state as i32);
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: an open list; both locations name live resources.
+        unsafe {
+            if state != copy {
+                list.list
+                    .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
+            }
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            if state != copy {
+                list.list
+                    .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy ran (execute waits); the buffer is `size` bytes.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), size as usize).to_vec();
+            readback.Unmap(0, None);
+            bytes
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2124,5 +2361,218 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// Descriptions as words, with these padding words.
+    fn words(desc: &ResourceDesc, pad: [u32; 2]) -> [u32; 14] {
+        // SAFETY: a description is 56 bytes.
+        let mut words: [u32; 14] = unsafe { std::mem::transmute_copy(desc) };
+        (words[1], words[13]) = (pad[0], pad[1]);
+        words
+    }
+
+    #[test]
+    fn descriptions_compare_without_their_padding() {
+        let desc = texture(16, 16, 28, 1);
+        let (a, b) = (words(&desc, [1, 2]), words(&desc, [0xdead, 0xbeef]));
+        assert_ne!(a, b);
+        assert_eq!(canonical_resource_desc(a), canonical_resource_desc(b));
+        let c = canonical_resource_desc(a);
+        assert_eq!((c[1], c[13]), (0, 0));
+        assert_eq!(c[0], 3, "the dimension stays");
+        assert_eq!(c[2..13], a[2..13], "every field stays");
+    }
+
+    /// 64 KiB of memory at an address no live texture, alias source or
+    /// placed view of an earlier test names (addresses come back after a
+    /// release).
+    #[cfg(windows)]
+    fn fresh_memory(held: &mut Vec<Memory>) -> Memory {
+        loop {
+            let memory = Memory::zeroed(KIB_64, KIB_64).unwrap();
+            let at = memory.address();
+            let placed = PLACED_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .any(|&(a, _)| a == at);
+            if !placed && !alias::has_sources(at) {
+                return memory;
+            }
+            held.push(memory);
+        }
+    }
+
+    #[cfg(windows)]
+    fn at(address: u64, desc: &ResourceDesc) -> This {
+        let mut out = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        let made = create_at_address(std::ptr::null(), address, desc, 0, std::ptr::null(), iid, &mut out);
+        assert_eq!(made, S_OK);
+        out
+    }
+
+    #[cfg(windows)]
+    fn same_copy(a: This, b: This) -> bool {
+        Arc::ptr_eq(&host_copy(a).unwrap(), &host_copy(b).unwrap())
+    }
+
+    /// The 16x16 RGBA8 texels of a title texture's host copy, rows 256
+    /// bytes apart.
+    #[cfg(windows)]
+    fn read_16x16(host: &crate::host::Host, resource: This) -> Vec<u8> {
+        let copy = host_copy(resource).unwrap();
+        let state = copy.state.load(std::sync::atomic::Ordering::Relaxed);
+        tests_support::read_back(host, &copy.texture, state)
+    }
+
+    /// The dark world's first cause (VIctory #643): a render target drawn by
+    /// the GPU, then read through a view of its memory (as Grand Theft Auto
+    /// VI's placed views are) or through another resource at its address.
+    /// Both see what the GPU drew, not the zeros of title memory.
+    #[cfg(windows)]
+    #[test]
+    fn views_of_a_drawn_target_read_what_the_gpu_drew() {
+        let test = "resource::tests::views_of_a_drawn_target_read_what_the_gpu_drew";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        const RENDER_TARGET: u32 = 1;
+        let target = at(
+            address,
+            &ResourceDesc {
+                flags: RENDER_TARGET,
+                ..texture(16, 16, 28, 1)
+            },
+        );
+        // The title clears it through a render target view.
+        let rtv = [0u64; 16];
+        let null = std::ptr::null();
+        crate::descriptor::create_rtv(null, target, null.cast(), rtv.as_ptr() as u64);
+        let list = crate::testgpu::TitleList::new();
+        type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
+        let color = [64.0f32 / 255.0, 128.0 / 255.0, 191.0 / 255.0, 1.0];
+        slot::<Clear>(list.this(), 0x1a0)(list.this(), rtv.as_ptr() as u64, &color, 0, null.cast());
+        list.run();
+
+        // A placed view, its description padded with whatever the stack
+        // held, twice: one resource, the target's host copy.
+        let view = texture(16, 16, 28, 1);
+        let placed = texture_at(address, &words(&view, [0xdead_beef, 7])).unwrap();
+        let again = texture_at(address, &words(&view, [0xcafe_babe, 9])).unwrap();
+        assert_eq!(placed, again, "padding makes no second texture");
+        assert!(same_copy(placed, target));
+        assert!(!crate::texture::title_written(host_resource(placed).unwrap()));
+        // A resource the title makes at that address shares it too.
+        let other = at(address, &view);
+        assert!(same_copy(other, target));
+
+        let texels = read_16x16(host, placed);
+        for y in 0..16 {
+            for x in 0..16 {
+                let at = y * 256 + x * 4;
+                assert_eq!(texels[at..at + 4], [64, 128, 191, 255], "texel {x},{y}");
+            }
+        }
+        assert_eq!(host.log_messages(), None);
+        for r in [other, target] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        assert!(!alias::has_sources(address));
+    }
+
+    /// What the host cannot view as asked keeps a copy of its own: another
+    /// shape or family, writes the copy does not allow, a typed copy written
+    /// in another format, shader reads of a depth target that denies them.
+    /// A texture that only reads is no source: once the target is released,
+    /// a later one at its address gets its own copy.
+    #[cfg(windows)]
+    #[test]
+    fn aliases_share_only_what_the_host_can_view() {
+        let test = "resource::tests::aliases_share_only_what_the_host_can_view";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        let view = texture(16, 16, 28, 1);
+        let target = ResourceDesc { flags: 1, ..view };
+        // A view first: no source, then the target cannot write its copy.
+        let read = at(address, &view);
+        let drawn = at(address, &target);
+        assert!(!same_copy(read, drawn));
+        let srgb = at(address, &ResourceDesc { format: 29, ..target });
+        assert!(!same_copy(drawn, srgb), "a typed copy drawn in another format");
+        let wide = at(address, &texture(32, 16, 28, 1));
+        let half = at(address, &texture(16, 16, 10, 1));
+        for other in [wide, half] {
+            assert!(!same_copy(drawn, other), "another shape or family");
+        }
+        let unordered = at(address, &ResourceDesc { flags: 4, ..view });
+        assert!(!same_copy(drawn, unordered), "writes the copy does not allow");
+        // An sRGB view reads the target's copy (in its format).
+        let srgb_view = at(address, &texture(16, 16, 29, 1));
+        assert!(same_copy(drawn, srgb_view));
+        for r in [read, drawn, srgb, wide, half, unordered] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        // Only the view is left there: it is no source.
+        assert!(!alias::has_sources(address));
+        let later = at(address, &view);
+        assert!(!same_copy(srgb_view, later));
+        for r in [srgb_view, later] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+
+        // Depth that shaders may not read.
+        let depth = at(
+            address,
+            &ResourceDesc {
+                flags: 2 | 8,
+                ..texture(16, 16, 40, 1)
+            },
+        );
+        let float = at(address, &texture(16, 16, 41, 1));
+        assert!(!same_copy(depth, float));
+        for r in [depth, float] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        assert!(!alias::has_sources(address));
+    }
+
+    /// A placed view made before the target it aliases is made again, on
+    /// its next use, over the target's copy.
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_view_made_before_its_target_follows_it() {
+        let test = "resource::tests::a_placed_view_made_before_its_target_follows_it";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        let view = words(&texture(16, 16, 28, 1), [3, 4]);
+        let before = texture_at(address, &view).unwrap();
+        assert!(crate::texture::title_written(host_resource(before).unwrap()));
+        let target = at(
+            address,
+            &ResourceDesc {
+                flags: 1,
+                ..texture(16, 16, 28, 1)
+            },
+        );
+        let after = texture_at(address, &view).unwrap();
+        assert_ne!(after, before);
+        assert!(same_copy(after, target));
+        assert_eq!(texture_at(address, &words(&texture(16, 16, 28, 1), [5, 6])), Some(after));
+        assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+        // The view keeps the copy (title memory still holds what was
+        // drawn, on the console); nothing makes it again.
+        assert_eq!(texture_at(address, &view), Some(after));
     }
 }
