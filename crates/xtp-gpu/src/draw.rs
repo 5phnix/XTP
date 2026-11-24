@@ -516,13 +516,46 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
-#[cfg(feature = "diagnostics")]
-fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
-    if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
-        last.push_str(" DROPPED");
+/// Why a draw or dispatch cannot run on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unready {
+    /// Its pipeline has no host pipeline (yet, or for good):
+    /// `pipeline::note_drop` tells which.
+    NoPipeline,
+    /// Anything else.
+    Because(&'static str),
+}
+
+impl From<&'static str> for Unready {
+    fn from(why: &'static str) -> Unready {
+        Unready::Because(why)
     }
+}
+
+/// Counts a draw or dispatch of `pipeline`, recorded at `path`, that did
+/// not run on the host for `why` (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn note_unready(path: &str, pipeline: usize, why: Unready) {
+    match why {
+        Unready::NoPipeline => crate::pipeline::note_drop(path, pipeline as This),
+        Unready::Because(why) => crate::pipeline::note_why(format!("{path}: {why}")),
+    }
+}
+
+/// Counts a draw, mesh dispatch or dispatch recorded at `path` that did
+/// not run on the host for `why`, and (diagnostics) marks the last traced
+/// draw as not run.
+fn dropped(path: &str, pipeline: usize, why: Unready) {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        note_unready(path, pipeline, why);
+        if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
+            last.push_str(" DROPPED");
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (path, pipeline, why);
 }
 
 /// Dispatches run on the host so far.
@@ -726,31 +759,34 @@ impl State {
             .find(|h| h.index(handle).is_some())
     }
 
-    /// Brings the host list up to date for a draw; false if the draw cannot
-    /// run on the host.
-    fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
+    /// Brings the host list up to date for a draw; why the draw cannot run
+    /// on the host if it cannot.
+    fn prepare(&mut self, list: &HostList, indexed: bool) -> Result<(), Unready> {
         self.prepare_for(list, indexed, false)
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> Result<(), Unready> {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return Err(Unready::NoPipeline);
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return Err(Unready::NoPipeline);
         };
         if p.compute || p.mesh != mesh {
             once!(
                 mesh,
                 "a draw or mesh dispatch with another kind of pipeline"
             );
-            return false;
+            return Err(match (p.compute, p.mesh) {
+                (true, _) => "a compute pipeline bound",
+                (false, true) => "a mesh pipeline bound",
+                (false, false) => "a vertex pipeline bound",
+            }
+            .into());
         }
-        if !self.bind(list, p, false) {
-            return false;
-        }
+        self.bind(list, p, false)?;
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -782,7 +818,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                return false;
+                return Err("index buffer outside title buffers".into());
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -801,7 +837,7 @@ impl State {
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
         }
-        true
+        Ok(())
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -846,7 +882,14 @@ impl State {
         self.host_roots = [0; 2];
     }
 
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    /// Binds `p` and what its stages read; why not if the draw or dispatch
+    /// must not run.
+    fn bind(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+    ) -> Result<(), &'static str> {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -889,7 +932,7 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
-                return false;
+                return Err("no dynamic slots for its tables");
             }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
@@ -918,15 +961,13 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // An unset table is undefined: a null view instead.
-                        if tabled && !self.root_srv_table(list, None, param, compute) {
-                            return false;
+                        if tabled {
+                            self.root_srv_table(list, None, param, compute)?;
                         }
                         continue;
                     };
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute) {
-                            return false;
-                        }
+                        self.root_srv_table(list, Some(address), param, compute)?;
                         continue;
                     }
                     let gpu = if srv {
@@ -960,12 +1001,12 @@ impl State {
         {
             self.writes += 1;
         }
-        true
+        Ok(())
     }
 
     /// Binds a root SRV as a one-view table (see
     /// [`crate::pipeline::host::bounded_root_srvs`] and
-    /// [`State::root_srv_slot`]). False if it cannot be (the draw is
+    /// [`State::root_srv_slot`]). Why not if it cannot be (the draw is
     /// dropped).
     fn root_srv_table(
         &mut self,
@@ -973,10 +1014,8 @@ impl State {
         address: Option<u64>,
         param: u32,
         compute: bool,
-    ) -> bool {
-        let Some((host, slot)) = self.root_srv_slot(list, address) else {
-            return false;
-        };
+    ) -> Result<(), &'static str> {
+        let (host, slot) = self.root_srv_slot(list, address)?;
         let handle = host.gpu_handle(slot);
         // SAFETY: an open list; the slot is in the view heap set on it.
         unsafe {
@@ -986,7 +1025,7 @@ impl State {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
-        true
+        Ok(())
     }
 
     /// The slot, in the view heap set on the host list (the title's, or
@@ -1001,28 +1040,22 @@ impl State {
     /// vertices): such an SRV gets a copy of its range of the list's own,
     /// made on the GPU at this place in the list (so it holds what earlier
     /// work wrote), and a view of that, in a slot the list holds.
-    /// `None` if no slot could be had.
+    /// Why not if no slot could be had.
     fn root_srv_slot(
         &mut self,
         list: &HostList,
         address: Option<u64>,
-    ) -> Option<(&'static crate::descriptor::host::HostHeap, u32)> {
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(what.into());
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+    ) -> Result<(&'static crate::descriptor::host::HostHeap, u32), &'static str> {
         let heap = self.host_heaps[0];
         let Some(host) = host_heap(heap) else {
             once!("a root SRV without a view heap (none of XTP's own either): the draw is dropped");
-            why("a root SRV without a view heap");
-            return None;
+            return Err("a root SRV without a view heap");
         };
         let Some((a, s)) = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s))) else {
-            let slot = host.null_raw();
-            if slot.is_none() {
-                why("no dynamic slot for a null root SRV");
-            }
-            return slot.map(|slot| (host, slot));
+            let slot = host
+                .null_raw()
+                .ok_or("no dynamic slot for a null root SRV")?;
+            return Ok((host, slot));
         };
         // By host copy too: a buffer the title makes at the address of one
         // it released while recording the list has a copy of its own.
@@ -1034,7 +1067,7 @@ impl State {
         let in_place = offset.is_multiple_of(16);
         let key = (heap, a, copy, if in_place { 0 } else { self.writes + 1 });
         if let Some(&slot) = self.root_srv_slots.get(&key) {
-            return Some((host, slot));
+            return Ok((host, slot));
         }
         note_root_srv(a, &s);
         let slot = if in_place {
@@ -1051,11 +1084,10 @@ impl State {
                 warn,
                 "a draw or dispatch dropped: no dynamic slot for a root SRV"
             );
-            why("no dynamic slot for a root SRV");
-            return None;
+            return Err("no dynamic slot for a root SRV");
         };
         self.root_srv_slots.insert(key, slot);
-        Some((host, slot))
+        Ok((host, slot))
     }
 
     /// A slot the list holds with a raw view of a copy of the list's own of
@@ -1162,10 +1194,10 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        const PATH: &str = "dispatch";
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::pipeline::note_drop(self.pipeline as This);
+            dropped(PATH, self.pipeline, Unready::NoPipeline);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1173,17 +1205,16 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            dropped(PATH, self.pipeline, Unready::NoPipeline);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            dropped(PATH, self.pipeline, "a graphics pipeline bound".into());
             return;
         }
-        if !self.bind(list, p, true) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+        if let Err(why) = self.bind(list, p, true) {
+            dropped(PATH, self.pipeline, why.into());
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1235,22 +1266,20 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
-                    #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
-                    true
-                }
-                Err(_) => false,
-            };
-        if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+        let ran = self.prepare_for(list, false, true).and_then(|()| {
+            let l6 = list
+                .list
+                .cast::<ID3D12GraphicsCommandList6>()
+                .map_err(|_| "no mesh dispatch on the host list")?;
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            list.note_op(|| self.op_text(format!("mesh {x}"), false));
+            // SAFETY: an open list with everything set.
+            unsafe { l6.DispatchMesh(x, 1, 1) };
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        if let Err(why) = ran {
+            dropped("mesh dispatch", self.pipeline, why);
         }
     }
 
@@ -1491,8 +1520,13 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
-        if ran {
+        let ran = self.prepare(list, false).and_then(|()| {
+            if rects {
+                self.rectangles(list, vertices, first)?;
+            }
+            Ok(())
+        });
+        if ran.is_ok() {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
                 (vertices / 3 * 6, 0)
@@ -1508,18 +1542,16 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
-        if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+        if let Err(why) = ran {
+            dropped("draw", self.pipeline, why);
         }
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> Result<(), Unready> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return Err(Unready::NoPipeline);
         };
         let rects = u64::from(count / 3);
         for slot in 0..32 {
@@ -1541,10 +1573,10 @@ impl State {
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
-                return false;
+                return Err("rectangle vertices outside their buffer".into());
             }
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
-                return false;
+                return Err("no scratch memory for rectangles".into());
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
@@ -1567,7 +1599,7 @@ impl State {
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
         }
-        true
+        Ok(())
     }
 
     pub(crate) fn draw_indexed(
@@ -1581,27 +1613,31 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        if self.topology == RECTANGLES {
+        let ran = if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
-        }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
-        if ran {
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
-        }
-        if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            Err(INDEXED_RECTANGLES.into())
+        } else {
+            self.prepare(list, true)
+        };
+        match ran {
+            Ok(()) => {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+                };
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(why) => dropped("indexed draw", self.pipeline, why),
         }
     }
 }
+
+/// Why indexed rectangle lists are dropped.
+/// shortcut: they are not expanded, neither direct nor indirect ones.
+const INDEXED_RECTANGLES: &str = "indexed rectangles";
 
 impl State {
     /// Indirect execution of a one-argument signature of `kind` (PC
@@ -1617,32 +1653,55 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        let path = match kind {
+            DRAW => "indirect kind 0 (draw)",
+            INDEXED => "indirect kind 1 (indexed draw)",
+            DISPATCH => "indirect kind 2 (dispatch)",
+            MESH => "indirect kind 10 (mesh dispatch)",
+            _ => "indirect, another kind",
+        };
+        let pipeline = self.pipeline;
+        // Counted in `list` (its indirect drops); here only why.
+        let fail = |why: Unready| {
+            #[cfg(feature = "diagnostics")]
+            note_unready(path, pipeline, why);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (path, pipeline, why);
+            false
+        };
+        // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            return fail(Unready::NoPipeline);
+        }
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
+            // Whether the corners come from vertex buffers or from the
+            // vertex id tells which expansion they need.
+            let inputs = crate::pipeline::host_pipeline(self.pipeline as This)
+                .map(|p| p.inputs.iter().any(|e| !e.per_instance));
+            return fail(match (kind, inputs) {
+                (INDEXED, _) => INDEXED_RECTANGLES.into(),
+                (_, None) => Unready::NoPipeline,
+                (_, Some(true)) => {
+                    "rectangles (not expanded for indirect draws), vertex inputs".into()
+                }
+                (_, Some(false)) => {
+                    "rectangles (not expanded for indirect draws), no vertex inputs".into()
+                }
+            });
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
-            why("arguments outside title buffers");
-            return false;
+            return fail("arguments outside title buffers".into());
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
-                None => {
-                    why("count outside title buffers");
-                    return false;
-                }
+                None => return fail("count outside title buffers".into()),
             },
             None => None,
         };
@@ -1650,8 +1709,7 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
-            why("no host signature");
-            return false;
+            return fail("no host signature".into());
         };
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
@@ -1659,31 +1717,23 @@ impl State {
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+            return fail("not bounded (no clamp, or arguments not 4-byte aligned)".into());
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
+                Some(p) if p.compute => self.bind(list, p, true).map_err(Unready::from),
+                Some(_) => Err("a graphics pipeline bound".into()),
+                None => Err(Unready::NoPipeline),
             },
-            _ => false,
+            _ => Err("another kind".into()),
         };
-        if !ran {
+        if let Err(why) = ran {
             crate::indirect::done(list, &args.buffer);
-            #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {})",
-                    p.compute, p.mesh
-                )),
-            }
-            return false;
+            return fail(why);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {

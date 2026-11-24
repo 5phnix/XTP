@@ -42,6 +42,9 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// Why the host refused it, once it has (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    refusal: OnceLock<String>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -80,13 +83,25 @@ impl Pending {
             finished: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
+            refusal: OnceLock::new(),
         }
     }
 
     /// Makes the host pipeline (once); true for the call that finished it.
     fn make(&self) -> bool {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            #[cfg(feature = "diagnostics")]
+            let _ = super::host::take_refusal();
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            #[cfg(feature = "diagnostics")]
+            if made.is_none()
+                && let Some(why) = super::host::take_refusal()
+            {
+                let _ = self.refusal.set(why);
+            }
+            made
+        });
         let first = !self.finished.swap(true, Ordering::Relaxed);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -99,13 +114,15 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Why a pipeline has no host pipeline, and which shaders that concerns
+/// (diagnostics): "being made"; "does not translate", with its shaders
+/// that do not; "refused" and the host's reason, with all its shaders.
+/// `None` if it has one.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn missing(p: &Pending) -> Option<String> {
+pub(crate) fn missing(p: &Pending) -> Option<(String, Option<String>)> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(("being made".into(), None)),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -114,9 +131,13 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
+                let why = p
+                    .refusal
+                    .get()
+                    .map_or("refused".into(), |r| format!("refused, {r}"));
+                (why, Some(format!("{:?}", p.shaders)))
             } else {
-                failed.join(" + ")
+                ("does not translate".into(), Some(failed.join(" + ")))
             })
         }
     }
