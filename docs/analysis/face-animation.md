@@ -7,7 +7,12 @@ through 32-bit floats, as VIctory did before fxceless/victory-fork#927.
 The views the title gives them are 16-bit unsigned, so each access read a
 float through an integer view. D3D12 leaves that undefined. XTP now moves
 each channel's 16 bits as an unsigned integer
-(`crates/xtp-shader/src/emit/lower/buffer.rs`).
+(`crates/xtp-shader/src/emit/lower/buffer.rs`). The head's blend-shape
+extraction reads the network's output with plain typed loads and takes
+the low half of each as a half. Reading those loads as floats put rainbow
+squares on faces in the fork. XTP names that one program by the
+fingerprint of its code and gives its plain typed loads the same integer
+path: a shortcut for this title (§3, §4).
 
 ## 1. What the fork found
 
@@ -54,6 +59,30 @@ a float view to swap. `befaf3b5aa` takes the load's own place (traced
 offset plus first dword). A descriptor picked at run time names nothing and
 keeps the float path.
 
+Later follow-ups on the PR, read on 2026-11-25:
+
+- `6d65a930c2` (avt0m4t48) is a WARP test of the fork's `State::tables`. A
+  table made afresh for a half twin at dword 8 reserves one slot, because
+  its length counts only range starts; the next allocation takes the
+  second slot. The suggested fix adds the half places to the slots the
+  length counts.
+- `efd753e` (iGoldenNinja) checks that a half view's handle is the start of
+  a slot before reading its record.
+- iGoldenNinja reproduced the output result on another RTX 5080: at the
+  extraction's `R16_UINT` input, 0 of 76 reads were nonzero before and 69
+  of 69 after. Their audit found all 425 sixteen-bit access sites of the
+  24 network programs they saw at the start of their ranges.
+- The author put the PR back to draft. With it, some faces show small
+  rainbow-coloured squares on the skin (the opening cutscene's waitress,
+  every time; one A/B each way). The cause given: the head's blend-shape
+  extraction (`970c4fbb3b017c0e`) reads the network's output with a plain
+  `buffer_load_format_x`, not d16, through the same 16-bit unsigned view.
+  It uses only the low half of each result, as a half (`v_fma_mix_f32`
+  with that half selected). The translator kept that load as a float load.
+  Before the fix the output was all zeros, so what it read was zero too.
+  The author is extending the change to "a format load whose every use
+  reads one half as a half float"; no code for it is published yet.
+
 ## 2. XTP had the same defect
 
 `Lower::buffer` in `crates/xtp-shader/src/emit/lower/buffer.rs` (before
@@ -89,9 +118,37 @@ declared as four unsigned integers (`0x405`). Each channel keeps the low 16
 bits of what it reads, packed two to a register as before (the low half
 first; an odd last channel leaves the high half 0). A
 `buffer_store_format_d16_xyzw` stores each half, masked to 16 bits, with
-`bufferStore.i32` through the same kind of handle. Other typed buffer
-accesses keep their float handles. The code carries the credit line
-"Ported from fxceless/victory-fork#927 (5dc9e63f04) by tippythetaidum".
+`bufferStore.i32` through the same kind of handle. The code carries the
+credit line "Ported from fxceless/victory-fork#927 (5dc9e63f04) by
+tippythetaidum".
+
+**Shortcut for this title: the head's blend-shape extraction.** The
+plain typed loads (`buffer_load_format_*`, not d16) of the programs listed
+in `INTEGER_LOAD_PROGRAMS` (`lower/buffer.rs`) take the same integer path.
+Each register then holds the element's 16 bits zero-extended, as on the
+console through a 16-bit unsigned view. Programs are named by FNV-1a on
+64 bits of their native code (`code_fingerprint`). The list holds one
+program: the extraction, container `970c4fbb3b017c0e`, whose 2,112 bytes
+of code hash to `0x4a229537a8657146`. That value was printed on the build
+farm from the program the translator reads.
+
+What the program does, from its disassembly on the farm (outside the
+repository):
+- it loads a descriptor from dword 16 of its table (`s_load_dwordx4
+  s[36:39], s[4:5], 0x40`);
+- it reads three elements with `buffer_load_format_x`;
+- it widens the low half of each with `v_fma_mix_f32 vN, sel_lo(v11),
+  1.0, vN`.
+
+The fork measured that view as `R16_UINT`, 1,064,960 bytes: tippythetaidum
+read it from the program's code, and iGoldenNinja probed it on another
+RTX 5080 at root 0, dword 16. Through a float handle, which D3D12 leaves
+undefined over an integer view, the extraction gave the faces rainbow
+squares once the network computed (§1). The fork has published no code for
+this case. XTP's shortcut follows tippythetaidum's analysis; §4 says why
+it is not a general rule.
+
+Every other typed buffer access keeps its float handle.
 
 Tests (`buffer16_tests.rs`; WARP, and the hardware adapter where there is
 one). Each test lowers a synthetic GFX10 program and validates it with
@@ -102,16 +159,64 @@ one). Each test lowers a synthetic GFX10 program and validates it with
 | `halves_cross_r16g16b16a16_uint_views_as_they_are` | `buffer_load_format_d16_xyzw` from an `R16G16B16A16_UINT` SRV, `buffer_store_format_d16_xyzw` to an `R16G16B16A16_UINT` UAV | 128 halves come back unchanged: both zeros, subnormals, infinities, not-a-numbers with payloads, and integers above `0x7bff` |
 | `indices_load_from_r16_uint_views_as_they_are` | `buffer_load_format_d16_x` from an `R16_UINT` SRV, the register stored as a dword | 32 indices: the low half of each register is the element's 16 bits |
 | `a_descriptor_loaded_inside_a_range_is_the_one_moved` | the same move as the first, with the SRV loaded at byte 0x20 into a range one entry describes from dword 0, a decoy view in slot 0, and the UAV at byte 0x40 | the halves come from slot 1, not from the range's start |
+| `a_listed_program_reads_its_format_loads_as_16_bit_integers` | the extraction's read: `buffer_load_format_x` (not d16) from an `R16_UINT` SRV, `v_fma_mix_f32` of its low half with 1.0 and 0, the result stored as a dword; the program named in the list for the test (its fingerprint added by a test-only override) | 32 halves come out as their float values: zeros, normal numbers, infinities, and not-a-numbers as not-a-numbers |
+| `other_programs_keep_the_float_path_of_format_loads` | the same program not listed; then a variant that also stores the register whole, from an `R32_FLOAT` SRV | no load lowered as integers; the 32 floats come back as they were |
+| `programs_are_named_by_the_fnv_1a_hash_of_their_code` | `code_fingerprint` | FNV-1a 64's published values for `""`, `"a"` and `"foobar"` |
 
-With the change all three pass (build farm, commit `4f937e4`):
-`cargo-slot.ps1 test -p xtp-shader --locked --lib buffer16_tests` gives
-3 passed, 0 failed.
+Each translating test also checks how many of its loads the translator
+lowered as 16-bit integers (`Lowered::integer_loads`, kept for tests
+only): one in the first four, none in the fifth.
+
+Results on the build farm:
+
+- The first three pass from commit `4f937e4` on, and all six from
+  `1a86ee8` on.
+- With the shortcut cut (`d16` alone, the rest as at `1a86ee8`),
+  `a_listed_program_reads_its_format_loads_as_16_bit_integers` fails on
+  its count of integer loads (0 instead of 1). The other five pass.
+- Run on WARP, the old float path happens to keep the bits of the
+  extraction's plain load. The 16 bits come back as the float's bits,
+  untouched until the program reads their low half. So WARP alone does
+  not show the squares; the fork saw them on an RTX 5080.
 
 ## 4. Critical review: what was ported and what was not
 
 - **Ported:** the translator's integer path, with the fork's masking and
   packing. The handle's component type (`0x405`) and the `ResRet.i32`
   return type are the fork's.
+- **Added: a shortcut for the extraction, not a general rule.** XTP
+  lowers the extraction's plain load exactly as the fork did: the d16
+  part alone leaves the extraction unchanged (§5). So the d16 part alone
+  would very likely show the fork's squares here too. A general rule
+  ("a plain typed load whose every use reads one half as a half moves
+  16-bit integers", the fork's announced direction) was written, tested
+  and dropped, for two reasons:
+  - **It missed the extraction.** Its three loads run inside a partial
+    EXEC mask (`v_cmpx`). The registers are later written again under
+    other partial masks (`v_mov_b32 v11, v13`), then read as floats in the
+    lanes that wrote them. XTP's SSA form merges the loaded value through
+    a phi and counts those partial writes as reads, so the code alone
+    cannot show that the loaded values are read only as halves. That
+    would take reasoning lane by lane.
+  - **It changed 658 other programs**, most of them pixel shaders:
+    textured and ped materials, particles, breakable glass, cables,
+    decals, fog composite, the deferred resolve, light proxies, and the
+    compute light probes, water and scattering programs. All validated.
+    Their code reads a plain typed load only as a half, for example
+    `buffer_load_format_x v40` then `v_cvt_f32_f16 v40, v40` in
+    `PS_ResolveDeferred_1`. That is right on the console only if the view
+    holds integer bits. With an `R16_UINT` or `R32_UINT` view, the
+    unsigned handle is right and today's float handle is outside D3D12.
+    With an `R32_FLOAT` view filled with `asuint`, it is the other way
+    round. Which one the title binds is known only on the host, so a
+    separate task probes those formats in a session (some of these
+    programs feed the lighting).
+  The shortcut names the one program whose view the fork measured. It
+  changes that program alone (§5), and the test checks that the same
+  loads elsewhere keep their float path.
+- **Not ported: `6d65a930c2` and `efd753e`.** Both concern the fork's host
+  twin (the length of a table made afresh for it, and the handles of its
+  half views). XTP has no twin and makes no table for halves.
 - **Not ported: the host twin.** This covers `half_view`, `half_inexact`,
   `HostShader::half_views`, the shader cache field and the fresh tables in
   `State::tables`. The fork's own counts say the title's views at these
@@ -151,47 +256,81 @@ With the change all three pass (build farm, commit `4f937e4`):
 
 ## 5. Shader survey
 
-Two surveys of the whole pack (`xtp shader-survey --validate --host-lanes
-32-32 --json`) ran on the build farm (`Invoke-FarmSurvey.ps1`): the same
-pack (26,503 records, 26,698 programs), the base `997af76`, then this
-change `4f937e4`. Each program's translation hash (DXIL and binding tables)
-was compared:
+Surveys of the whole pack (`xtp shader-survey --validate --host-lanes 32-32
+--json`) ran on the build farm (`Invoke-FarmSurvey.ps1`), all over the same
+pack (26,503 records, 26,698 programs):
+- the base `997af76`;
+- the d16 part `4f937e4`;
+- with the extraction's shortcut, `1a86ee8`.
 
-| | Base `997af76` | With the change `4f937e4` |
-| --- | ---: | ---: |
-| Programs translated | 25,812 | 25,812 |
-| Programs refused | 886 | 886 |
-| Programs whose outcome changed | | 0 |
-| Programs whose translation changed | | **65** |
-| Of those, validated by `dxil.dll` | 65 | 65 |
+Each program's translation hash (DXIL and binding tables) was compared
+with the base's:
 
-The 65 changed programs are all compute programs, and they are exactly the
-65 programs of the face network (the fork's `compute_graph_ops` group). No
-other program's translation changed, including the head's blend-shape and
-normal programs downstream, and the report's totals and categories are
-identical. All 65 network programs were already translated on the base:
-nothing refused the network at translation, but its reads went through the
-float path that reads 0 (§2). Results:
-`E:\xtp-data\farm-surveys\faceanim-before-997af76` and
-`faceanim-after-4f937e4` (outside the repository).
+| | Base `997af76` | d16 part `4f937e4` | With the shortcut `1a86ee8` |
+| --- | ---: | ---: | ---: |
+| Programs translated | 25,812 | 25,812 | 25,812 |
+| Programs refused | 886 | 886 | 886 |
+| Programs whose outcome changed | | 0 | 0 |
+| Programs whose translation changed | | **65** | **66** |
+| Of those, validated by `dxil.dll` | | 65 | 66 |
+
+- The 65 are exactly the 65 compute programs of the face network (the
+  fork's `compute_graph_ops` group).
+- The 66th is the head's blend-shape extraction. From `4f937e4` to
+  `1a86ee8` it is the only program that changed.
+- No other program's translation changed, and the report's totals and
+  categories are identical.
+- All 65 network programs were already translated on the base. Nothing
+  refused the network at translation, but its reads went through the
+  float path that reads 0 (§2).
+
+The general rule, dropped (§4), changed 723 programs over the base at its
+commit (`eb42e38`, no longer on the branch): the 65, plus 658 others, and
+not the extraction. Results, outside the repository:
+`E:\xtp-data\farm-surveys\faceanim-before-997af76`,
+`faceanim-after-4f937e4`, `faceanim-shortcut-1a86ee8` and
+`faceanim-ext-eb42e38`.
 
 ## 6. Open points
+
+- **Plain typed loads read as halves in 658 programs** (§4). A separate
+  task probes, in a session, the formats of the views those loads read:
+  the deferred resolve, fog composite, light proxies and light probes
+  among them. An unsigned view would want the same integer path as the
+  extraction, and the float handle they use today is outside D3D12 over
+  it. A 32-bit float one keeps today's path.
+- **The shortcut names a program by its code.** A title update that
+  changes the extraction's code changes its fingerprint, and its loads
+  fall back to the float path silently. The survey shows whether the
+  extraction still changes (§5).
 
 - **No session probe.** The fork's evidence in the game is a diagnostics
   patch that hashes the arena every fourth frame, and that patch is not in
   its PR. XTP has no such probe. The faces can be checked by eye in the
   prologue's cutscenes on a session with this change.
 - **Neighbouring cases, not changed here:**
-  - A typed load without d16 (`buffer_load_format_x` to `_xyzw`) still
-    reads through a float handle. Through a 16- or 32-bit unsigned or
-    signed view the console returns integers, so that is the same mismatch
-    in 32-bit form. It is not counted for this title.
+  - A plain typed load (`buffer_load_format_x` to `_xyzw`) read other
+    than as low halves still goes through a float handle. Through a 16- or
+    32-bit unsigned or signed view the console returns integers, so that
+    is the same mismatch for a program that uses them as integers. It is
+    not counted for this title.
   - `Lower::buffer` does not take `tbuffer_load_format_d16_*` as d16
     (`d16` requires the `buffer_` prefix), so it would write one channel to
     a register, not two. Whether the title uses it was not counted.
   - Image d16 results are still taken as floats (`lower/image.rs`).
+- **The length of a table made afresh** (XTP's counterpart of
+  `6d65a930c2`, outside the d16 path). `State::tables` in
+  `crates/xtp-gpu/src/draw.rs` makes some tables afresh in dynamic slots:
+  those holding a constant buffer, and those reaching past the host heap.
+  It copies `n` slots, where `n` is one past the last range start the
+  used-resource entries give. A shader that loads a descriptor inside a
+  range, past its last start, would read a slot not copied: whatever the
+  next allocation puts there. This does not touch the face network, whose
+  sixteen-bit access sites all sit at the start of their ranges (the
+  fork's count and iGoldenNinja's). Whether any other program loads past
+  its last range start through such a table was not counted.
 - **One handle per descriptor and block.** Handles are cached by
   descriptor, block and kind (`Lower::handle`), not by component type. A
-  program that reads one descriptor both with and without d16 in the same
-  block would get the first access's handle for both. The key is in
+  program that reads one descriptor in the same block both as 16-bit
+  integers and as floats would get the first access's handle for both. The key is in
   `lower/descriptor.rs`, outside this change; no such program is known.
