@@ -775,9 +775,13 @@ fn tables() -> MutexGuard<'static, Tables> {
 pub(crate) fn newer_layout(kind: u8, table: &[*const ()]) -> Option<bool> {
     match kind {
         LIST => {
-            if table[71] == table[72] {
+            let waits = [
+                crate::queue::wait32 as *const (),
+                crate::queue::wait64 as *const (),
+            ];
+            if table[71..73] == waits {
                 Some(false)
-            } else if table[73] == table[74] {
+            } else if table[73..75] == waits {
                 Some(true)
             } else {
                 None
