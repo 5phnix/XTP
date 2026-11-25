@@ -748,6 +748,41 @@ pub(crate) struct Scratch {
     vertices: Option<Buffer>,
     /// Made larger when a draw has more records.
     args: Option<Buffer>,
+    direct: Option<DirectPage>,
+}
+
+// Une page mappée de commandes directes. Les anciennes pages restent dans
+// la liste si celle-ci remplit sa page avant la fin de l’enregistrement.
+struct DirectPage {
+    buffer: ID3D12Resource,
+    data: usize,
+    used: usize,
+}
+
+impl DirectPage {
+    fn append(page: &mut Option<Self>, list: &HostList, words: [u32; 5]) -> Option<u64> {
+        const BYTES: usize = 64 << 10;
+        const STEP: usize = 32;
+        if page.as_ref().is_none_or(|p| p.used == BYTES) {
+            let (buffer, data) = host()?.shared_buffer(BYTES as u64)?;
+            *page = Some(Self {
+                buffer,
+                data: data as usize,
+                used: 0,
+            });
+        }
+        let p = page.as_mut()?;
+        if p.used == 0 {
+            list.keep(&p.buffer);
+        }
+        let at = p.used;
+        p.used += STEP;
+        // SAFETY: cette tranche de 32 octets reste réservée jusqu’à la retraite de la liste.
+        unsafe {
+            ((p.data + at) as *mut [u32; 5]).write_unaligned(words);
+            Some(p.buffer.GetGPUVirtualAddress() + at as u64)
+        }
+    }
 }
 
 /// One buffer of a [`Scratch`].
@@ -823,6 +858,9 @@ impl Scratch {
 /// run, so its buffers are back in the common state. A large arguments
 /// buffer goes.
 pub(crate) fn give_back(mut scratch: Scratch) {
+    if let Some(page) = &mut scratch.direct {
+        page.used = 0;
+    }
     for b in [&mut scratch.vertices, &mut scratch.args]
         .into_iter()
         .flatten()
@@ -833,7 +871,7 @@ pub(crate) fn give_back(mut scratch: Scratch) {
     if scratch.args.as_ref().is_some_and(|a| a.len > ARGS_POOLED) {
         scratch.args = None;
     }
-    if scratch.vertices.is_none() && scratch.args.is_none() {
+    if scratch.vertices.is_none() && scratch.args.is_none() && scratch.direct.is_none() {
         return;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -932,6 +970,7 @@ fn take_scratch<'a>(
             held.insert(pooled.unwrap_or(Scratch {
                 vertices: None,
                 args: None,
+                direct: None,
             }))
         }
     };
@@ -1235,16 +1274,9 @@ pub(crate) fn expand(
             (gpu + 4, gpu, 24)
         }
         Records::Direct(words) => {
-            let (buffer, data) = host()
-                .and_then(|h| h.shared_buffer(20))
+            let gpu = DirectPage::append(&mut scratch.direct, list, words)
                 .ok_or("no memory for direct rectangle arguments")?;
-            list.keep(&buffer);
-            // SAFETY: a fresh mapped buffer retained until the recording retires.
-            unsafe {
-                data.cast::<[u32; 5]>().write_unaligned(words);
-                let gpu = buffer.GetGPUVirtualAddress();
-                (gpu, gpu, stride)
-            }
+            (gpu, gpu, stride)
         }
     };
     if first == 0 {
@@ -1936,6 +1968,29 @@ mod tests {
     }
 
     #[test]
+    fn direct_records_keep_the_first_page_alive_after_rollover() {
+        let Some(_gpu) = crate::testgpu::device(
+            "rectangles::tests::direct_records_keep_the_first_page_alive_after_rollover",
+        ) else {
+            return;
+        };
+        let list = TitleList::new();
+        let mut page = None;
+        let first = DirectPage::append(&mut page, list.host(), [17; 5]).unwrap();
+        let data = page.as_ref().unwrap().data as *const [u32; 5];
+        let second = DirectPage::append(&mut page, list.host(), [23; 5]).unwrap();
+        assert_eq!(second - first, 32);
+        for _ in 2..2048 {
+            DirectPage::append(&mut page, list.host(), [0; 5]).unwrap();
+        }
+        let next = DirectPage::append(&mut page, list.host(), [42; 5]).unwrap();
+        assert_ne!(next, first);
+        // SAFETY: la liste conserve la première page mappée.
+        assert_eq!(unsafe { data.read_unaligned() }, [17; 5]);
+        list.run();
+    }
+
+    #[test]
     fn indexed_rectangles_gather_gpu_indices_and_keep_the_instance_start() {
         let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let test =
@@ -2075,6 +2130,7 @@ mod tests {
         let mut held = Some(Scratch {
             vertices: None,
             args: None,
+            direct: None,
         });
         let prepared = expand(
             list.host(),
