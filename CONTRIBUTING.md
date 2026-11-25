@@ -180,8 +180,7 @@ failure. CI also runs `actionlint` on the workflows.
   raises on its thread. Locally, with Graphics Tools installed:
   `$env:XTP_TEST_ADAPTER='warp'; $env:XTP_D3D12_DEBUG='1'; $env:RUST_TEST_THREADS='1'; cargo test -p xtp-gpu --features diagnostics --locked`.
   Wrap a call that hands the device invalid input on purpose in
-  `testgpu::expect_layer_errors`. A test with errors tracked by an issue
-  names their message ids with `testgpu::known_layer_errors`.
+  `testgpu::expect_layer_errors`.
 - Such tests assert on properties (it decodes, sizes match, the hash of our
   output is stable for your input), never on snapshots of game content, and
   they write nothing below the repository (`xtp_core::ensure_outside_repo`).
