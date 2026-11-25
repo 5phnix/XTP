@@ -110,6 +110,7 @@ fn shader(words: &[u32], uav: u32, io: ComputeIo) -> HostShader {
     HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
+        group_base: l.group_base,
         user_data: l.user_data,
         samplers: l.samplers,
         static_samplers: Vec::new(),
@@ -730,6 +731,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
     let cs = HostShader {
         stage: HwStage::Cs,
         dxil: plain.dxil,
+        group_base: plain.group_base,
         user_data: plain.user_data,
         samplers: plain.samplers,
         static_samplers: Vec::new(),
@@ -750,6 +752,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
         HostShader {
             stage: HwStage::Cs,
             dxil: l.dxil,
+            group_base: l.group_base,
             user_data: l.user_data,
             samplers: l.samplers,
             static_samplers: Vec::new(),

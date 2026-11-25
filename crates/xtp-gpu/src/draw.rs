@@ -185,6 +185,8 @@ struct Own {
     copied: u64,
     /// What the list's indirect rectangle draws are expanded into.
     rects: Option<crate::rectangles::Scratch>,
+    dispatch_args: Option<crate::indirect::Expanded>,
+    indirect_samples: crate::indirect::Samples,
     /// The holds on the raw views of the runtime stride tables the list's
     /// shaders read, by view heap ([`State::stride_table`]).
     strides: Vec<(usize, crate::descriptor::host::StrideHold)>,
@@ -1305,6 +1307,8 @@ impl State {
     /// starts with a barrier ([`State::dispatch_dropped`]).
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
+        crate::indirect::note_direct(list, self.pipeline, [x, y, z]);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             self.dispatch_dropped(Unready::NoPipeline);
             return;
@@ -1335,7 +1339,9 @@ impl State {
             if std::mem::take(&mut self.dropped_dispatch) {
                 list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
             }
-            list.list.Dispatch(x, y, z)
+            crate::indirect::direct(list, [x, y, z], p.group_base(), false, |[x, y, z]| {
+                list.list.Dispatch(x, y, z)
+            });
         };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
@@ -1397,23 +1403,30 @@ impl State {
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
-    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, groups: [u32; 3]) {
         #[cfg(feature = "diagnostics")]
-        self.trace("mesh", x, 0);
+        {
+            self.trace("mesh", groups[0], 0);
+            crate::indirect::note_direct(list, self.pipeline, groups);
+        }
         let ran = self.prepare_for(list, false, true).and_then(|()| {
             let l6 = list
                 .list
                 .cast::<ID3D12GraphicsCommandList6>()
                 .map_err(|_| "no mesh dispatch on the host list")?;
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("mesh {x}"), false));
+            list.note_op(|| self.op_text(format!("mesh {groups:?}"), false));
             let _timed = crate::timestamps::command(
                 list,
                 crate::timestamps::What::Mesh,
                 crate::pipeline::host_pipeline(self.pipeline as This),
             );
-            // SAFETY: an open list with everything set.
-            unsafe { l6.DispatchMesh(x, 1, 1) };
+            let p =
+                crate::pipeline::host_pipeline(self.pipeline as This).ok_or(Unready::NoPipeline)?;
+            // SAFETY: la liste est ouverte et le pipeline mesh est lié.
+            crate::indirect::direct(list, groups, p.group_base(), true, |[x, y, z]| unsafe {
+                l6.DispatchMesh(x, y, z)
+            });
             DRAWN.fetch_add(1, Ordering::Relaxed);
             Ok(())
         });
@@ -1875,29 +1888,37 @@ impl State {
                 Err(why) => fail(why),
             };
         }
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        if !matches!(kind, DRAW | INDEXED | DISPATCH | MESH) {
             return fail("no host signature".into());
-        };
+        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        #[cfg(feature = "diagnostics")]
-        if matches!(kind, DISPATCH | MESH) && crate::indirect::measuring() {
-            crate::indirect::sample(
-                list, crate::pipeline::dispatch_hash(self.pipeline as This).unwrap_or_default(),
-                stride, max, (&args.buffer, args.offset(arguments)),
-                counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
-            );
-        }
-        // Bounded first: the clamp binds a compute pipeline of its own.
         let clamping = crate::timestamps::command(list, crate::timestamps::What::Clamp, None);
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            return fail("not bounded (no clamp, or arguments not 4-byte aligned)".into());
+        let expanded = if matches!(kind, DISPATCH | MESH) {
+            let Some(out) =
+                crate::indirect::Expanded::reserve(&mut self.own.dispatch_args, list, max)
+            else {
+                return fail("no memory for expanded dispatches".into());
+            };
+            Some(out)
+        } else {
+            None
+        };
+        let count_gpu = counter.as_ref().map(|(s, at)| s.gpu(*at));
+        let stats = self.own.indirect_samples.next(list, pipeline);
+        if !crate::indirect::rewrite(
+            list,
+            args.gpu(arguments),
+            (kind, stride, max),
+            count_gpu,
+            expanded,
+            stats,
+        ) {
+            return fail("not bounded (no clamp or invalid arguments)".into());
         }
+        let expanded = expanded.map(|s| (s.buffer.clone(), s.capacity));
         drop(clamping);
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1912,7 +1933,6 @@ impl State {
             _ => Err("another kind".into()),
         };
         if let Err(why) = ran {
-            crate::indirect::done(list, &args.buffer);
             return fail(why);
         }
         #[cfg(feature = "diagnostics")]
@@ -1927,23 +1947,59 @@ impl State {
             crate::timestamps::What::Indirect(kind),
             crate::pipeline::host_pipeline(self.pipeline as This),
         );
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached;
-        // the barrier names no resource.
+        let (buffer, offset, maximum, counter, signature) = if let Some((out, capacity)) = expanded
+        {
+            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+                return fail(Unready::NoPipeline);
+            };
+            let base = p.group_base();
+            let Some(sig) = p
+                .dispatch_signature
+                .get_or_init(|| crate::indirect::signature(kind, &p.root, base))
+                .as_ref()
+            else {
+                return fail("no split dispatch signature".into());
+            };
+            list.keep(sig);
+            let offset = if base.is_some() { 4 } else { 16 };
+            (out.clone(), offset, capacity, Some((out, 0)), sig.clone())
+        } else {
+            let Some(sig) = host_signature(kind, stride) else {
+                return fail("no host signature".into());
+            };
+            (
+                args.buffer.clone(),
+                args.offset(arguments),
+                max,
+                counter
+                    .as_ref()
+                    .map(|(s, at)| (s.buffer.clone(), s.offset(*at))),
+                sig,
+            )
+        };
+        let separate_count = counter.as_ref().map(|(s, _)| s).filter(|s| *s != &buffer);
+        crate::indirect::ready(list, &buffer);
+        if let Some(c) = separate_count {
+            crate::indirect::ready(list, c);
+        }
+        // SAFETY: les deux plages sont en état INDIRECT_ARGUMENT et gardées par la liste.
         unsafe {
             if kind == DISPATCH && std::mem::take(&mut self.dropped_dispatch) {
                 list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
             }
             list.list.ExecuteIndirect(
                 &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                maximum,
+                &buffer,
+                offset,
+                counter.as_ref().map(|(s, _)| s),
+                counter.as_ref().map_or(0, |(_, at)| *at),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &buffer);
+        if let Some(c) = separate_count {
+            crate::indirect::done(list, c);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2066,6 +2122,7 @@ impl State {
             &vertices,
             (args, arguments, stride, max),
             counter,
+            self.own.indirect_samples.next(list, self.pipeline),
         )?)
     }
 }

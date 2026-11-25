@@ -2937,6 +2937,8 @@ impl Meter {
                 longest_lists = title.longest_lists,
                 making = crate::pipeline::making()
             );
+            #[cfg(feature = "diagnostics")]
+            crate::indirect::log_counts();
             crate::device::log_frame();
             if let Some(pools) = buffers::summary() {
                 tracing::info!("buffer heaps: {pools}");

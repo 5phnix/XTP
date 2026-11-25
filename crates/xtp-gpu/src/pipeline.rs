@@ -240,7 +240,16 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn dispatch_hash(this: This) -> Option<String> {
-    (!this.is_null()).then(|| pipeline(this).shaders.first().map(|s| s.hash.clone())).flatten()
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let shader = p
+        .shaders
+        .iter()
+        .find(|s| matches!(s.stage, "mesh" | "compute" | "vertex"))
+        .or_else(|| p.shaders.first())?;
+    Some(shader.hash.clone())
 }
 
 /// List method: logs each pipeline's shaders the first time a list binds
