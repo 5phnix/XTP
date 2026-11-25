@@ -497,9 +497,13 @@ fn derive_with(
     };
     // The kept descriptions by vertex program, and the mesh ones by their
     // passes' technique and state bytes, tier by tier.
+    // Each by the first kept description of its stream: thousands share a
+    // few states, and a state is tried once.
     let mut by_vertex: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
     let mut by_pass: [ByPass; TIERS.len()] = Default::default();
+    let mut first: HashMap<&[u8], usize> = HashMap::new();
     for (d, desc) in recorded.pipelines.iter().enumerate() {
+        let d = *first.entry(desc.stream.bytes()).or_insert(d);
         match desc.shaders.first().map(|s| s.stage) {
             Some("vertex") => by_vertex.entry(desc.hashes[0]).or_default().push(d),
             Some("mesh") => {
@@ -516,6 +520,13 @@ fn derive_with(
             }
             _ => {}
         }
+    }
+    for list in by_vertex
+        .values_mut()
+        .chain(by_pass.iter_mut().flat_map(HashMap::values_mut))
+    {
+        list.sort_unstable();
+        list.dedup();
     }
     let mut derived = Vec::new();
     for (set, passes) in &set_passes {

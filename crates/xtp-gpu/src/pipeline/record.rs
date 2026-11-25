@@ -344,6 +344,11 @@ impl Capture {
 }
 
 impl Stream {
+    /// The stream as kept.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+
     /// The graphics state the stream describes: each subobject given to
     /// `GraphicsState::read` again, in the stream's order, as the title's
     /// creation call gave it; `None` if one does not decode.
