@@ -397,12 +397,81 @@ const EXTRA: u32 = MAX_GROUPS / LIMIT;
 const RUN_LENGTH: usize = 128;
 const PAGE_BYTES: u32 = 64 << 10;
 
+/// L’ordre des barrières porte sur les ressources D3D12 entières. La série,
+/// elle, peut traverser une écriture sur d’autres octets de la même ressource.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Writes {
+    series: u64,
+    revisions: [u64; 2],
+}
+
+#[derive(Default)]
+pub(crate) struct Writers {
+    revisions: std::collections::HashMap<usize, u64>,
+    unknown: u64,
+    series: u64,
+    watched: [usize; 2],
+    dirty: [Option<(u64, u64)>; 2],
+}
+
+impl Writers {
+    pub(crate) fn record(&mut self, buffer: &ID3D12Resource, offset: u64, bytes: usize, uav: bool) {
+        let id = buffer.as_raw() as usize;
+        if uav {
+            *self.revisions.entry(id).or_default() += 1;
+        }
+        let end = offset + bytes as u64;
+        for (watched, dirty) in self.watched.iter().zip(&mut self.dirty) {
+            if *watched == id {
+                let (lo, hi) = dirty.get_or_insert((offset, end));
+                *lo = (*lo).min(offset);
+                *hi = (*hi).max(end);
+            }
+        }
+    }
+
+    pub(crate) fn unknown(&mut self) {
+        self.unknown += 1;
+        self.series += 1;
+        self.dirty = [None; 2];
+    }
+
+    pub(crate) fn before(
+        &mut self,
+        (args, at, bytes): (&ID3D12Resource, u64, u64),
+        count: Option<(&ID3D12Resource, u64)>,
+    ) -> Writes {
+        let watched = [
+            args.as_raw() as usize,
+            count.map_or(0, |(b, _)| b.as_raw() as usize),
+        ];
+        let count_at = count.map_or(0, |(_, at)| at);
+        let reads = [(at, at + bytes), (count_at, count_at + 4)];
+        if self.watched != watched
+            || self
+                .dirty
+                .iter()
+                .zip(reads)
+                .any(|(dirty, (lo, hi))| dirty.is_some_and(|(start, end)| start < hi && lo < end))
+        {
+            self.watched = watched;
+            self.dirty = [None; 2];
+            self.series += 1;
+        }
+        Writes {
+            series: self.series,
+            revisions: watched
+                .map(|id| self.unknown + self.revisions.get(&id).copied().unwrap_or(0)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Inputs {
     args: u64,
     count: u64,
     stats: u64,
-    writes: [u64; 2],
+    series: u64,
 }
 
 struct Run {
@@ -528,7 +597,7 @@ pub(crate) fn bound(
     (kind, stride, records): (u32, u32, u32),
     count: Option<(&ID3D12Resource, u64)>,
     stats: Option<(u64, u32)>,
-    writes: [u64; 2],
+    writes: Writes,
     output: Output,
 ) -> Option<Bounded> {
     let min_stride = match kind {
@@ -550,7 +619,7 @@ pub(crate) fn bound(
         args: args_base,
         count: count_base,
         stats: stats_base,
-        writes,
+        series: writes.series,
     };
     let capacity = if kind <= 1 {
         records
@@ -623,8 +692,8 @@ pub(crate) fn bound(
             let mut barriers = Vec::new();
             // La première lecture ordonne aussi les écritures des listes précédentes.
             for (b, revision) in [
-                (Some(buffer), writes[0]),
-                (count.map(|(b, _)| b), writes[1]),
+                (Some(buffer), writes.revisions[0]),
+                (count.map(|(b, _)| b), writes.revisions[1]),
             ] {
                 if let Some(b) = b
                     && runs.ordered.insert(b.as_raw() as usize, revision) != Some(revision)
@@ -849,7 +918,15 @@ mod tests {
         }
         let mut commands = None;
         for _ in 0..calls {
-            commands = super::bound(&list, (&buffer, 0), spec, None, None, [0; 2], Output::Draw);
+            commands = super::bound(
+                &list,
+                (&buffer, 0),
+                spec,
+                None,
+                None,
+                Writes::default(),
+                Output::Draw,
+            );
             assert!(commands.is_some());
         }
         let (_out, result) = read_commands(&list, &commands.unwrap(), 4 + u64::from(records) * 24);
@@ -909,7 +986,7 @@ mod tests {
                 (10, 16, 18),
                 Some((&args, 12)),
                 Some((stats.GetGPUVirtualAddress(), 0)),
-                [0; 2],
+                Writes::default(),
                 Output::Expanded,
             )
             .unwrap();
@@ -990,7 +1067,7 @@ mod tests {
             (0, 16, 2),
             None,
             None,
-            [0; 2],
+            Writes::default(),
             Output::Draw,
         )
         .unwrap();
@@ -1000,7 +1077,7 @@ mod tests {
             (0, 16, 1),
             None,
             None,
-            [0; 2],
+            Writes::default(),
             Output::Draw,
         )
         .unwrap();
@@ -1034,7 +1111,10 @@ mod tests {
         a.refresh(list, args.address(), 16);
         c.refresh(list, count.address(), 4);
         let run = || {
-            let writes = list.indirect_writes(&a.buffer, Some(&c.buffer));
+            let writes = list.indirect_writes(
+                (&a.buffer, a.offset(args.address()), 16),
+                Some((&c.buffer, c.offset(count.address()))),
+            );
             bound(
                 list,
                 (&a.buffer, a.offset(args.address())),
@@ -1048,6 +1128,8 @@ mod tests {
         };
         let first = run();
         let (_before, one) = read_commands(list, &first, 4);
+        assert!(crate::shadow::write(list, count.address() + 4, 7, 4));
+        assert!(!run().dispatched, "autre mot du même tampon");
         assert!(crate::shadow::write(list, count.address(), 0, 4));
         let next = run();
         assert!(first.dispatched && next.dispatched);
@@ -1096,7 +1178,7 @@ mod tests {
             (2, 12, 3),
             None,
             None,
-            [0; 2],
+            Writes::default(),
             Output::NativePrefix,
         )
         .unwrap();
@@ -1108,7 +1190,7 @@ mod tests {
             (2, 12, 3),
             None,
             None,
-            [0; 2],
+            Writes::default(),
             Output::Native,
         )
         .unwrap();

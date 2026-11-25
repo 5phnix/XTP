@@ -2283,7 +2283,7 @@ impl State {
             (&s.buffer, s.offset(*at))
         });
         args.refresh(list, arguments, len);
-        let writes = list.indirect_writes(&args.buffer, counter.map(|(s, _)| s));
+        let writes = list.indirect_writes((&args.buffer, args.offset(arguments), len), counter);
         let compute = kind == DISPATCH;
         self.pending_compute = Some(Vec::new());
         let ready = if compute {
@@ -2422,7 +2422,14 @@ impl State {
     ) -> Result<(), Unready> {
         // The rewritten records: draw arguments, 16 bytes apart.
         let signature = host_signature(0, 16).ok_or("no host signature")?;
-        let writes = list.indirect_writes(&args.buffer, counter.map(|(s, _)| &s.buffer));
+        let writes = list.indirect_writes(
+            (
+                &args.buffer,
+                args.offset(arguments),
+                u64::from(stride) * u64::from(max),
+            ),
+            counter.map(|(s, at)| (&s.buffer, s.offset(at))),
+        );
         let pso = bind(self, list)?;
         let prepared = self.expand_rectangles(
             list,
@@ -2475,7 +2482,7 @@ impl State {
         (stride, max): (u32, u32),
         (args, arguments): (&Arc<crate::shadow::Shadow>, u64),
         counter: Option<(&Arc<crate::shadow::Shadow>, u64)>,
-        writes: [u64; 2],
+        writes: crate::indirect::Writes,
     ) -> Result<crate::rectangles::Prepared, Unready> {
         let vertices = self.vertex.map(|v| (v.address, v.size, v.stride));
         self.recording.lease(list);
@@ -4648,7 +4655,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                 (16, 1),
                 (&args_copy, args.address()),
                 None,
-                [0; 2],
+                Default::default(),
             )
             .expect("expanded");
         let scratch = prepared.args.clone();

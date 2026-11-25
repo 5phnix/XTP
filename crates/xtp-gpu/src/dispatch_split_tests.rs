@@ -116,7 +116,7 @@ fn every_group_runs_once_with_its_guest_id() {
                             (2, 12, 1),
                             None,
                             None,
-                            [0; 2],
+                            Default::default(),
                             indirect::Output::NativePrefix,
                         )
                         .unwrap(),

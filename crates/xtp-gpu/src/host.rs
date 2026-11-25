@@ -945,9 +945,7 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
-    // Dernière écriture connue de chaque tampon, et des UAV à indice dynamique.
-    buffer_writes: std::collections::HashMap<usize, u64>,
-    unknown_writes: u64,
+    indirect_writers: crate::indirect::Writers,
 }
 
 /// A list a submission in flight names.
@@ -2270,10 +2268,9 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        *deferred
-            .buffer_writes
-            .entry(shadow.buffer.as_raw() as usize)
-            .or_default() += 1;
+        deferred
+            .indirect_writers
+            .record(&shadow.buffer, shadow.offset(address as u64), len, true);
         deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
@@ -2289,10 +2286,9 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        *deferred
-            .buffer_writes
-            .entry(shadow.buffer.as_raw() as usize)
-            .or_default() += 1;
+        deferred
+            .indirect_writers
+            .record(&shadow.buffer, shadow.offset(address as u64), len, false);
         deferred
             .copies
             .push(Step::GpuCopy(shadow.clone(), address, len));
@@ -2300,33 +2296,22 @@ impl HostList {
 
     /// Counts a memory write of `bytes` the list records on the GPU, once
     /// per submission (see [`crate::shadow::write`]).
-    pub(crate) fn count_gpu_write(&self, buffer: &ID3D12Resource, bytes: usize) {
+    pub(crate) fn count_gpu_write(&self, buffer: &ID3D12Resource, at: u64, bytes: usize) {
         let mut deferred = self.deferred();
-        *deferred
-            .buffer_writes
-            .entry(buffer.as_raw() as usize)
-            .or_default() += 1;
+        deferred.indirect_writers.record(buffer, at, bytes, false);
         deferred.copies.push(Step::GpuWord(bytes));
     }
 
     pub(crate) fn unknown_buffer_write(&self) {
-        self.deferred().unknown_writes += 1;
+        self.deferred().indirect_writers.unknown();
     }
 
     pub(crate) fn indirect_writes(
         &self,
-        args: &ID3D12Resource,
-        count: Option<&ID3D12Resource>,
-    ) -> [u64; 2] {
-        let d = self.deferred();
-        let revision = |b: &ID3D12Resource| {
-            d.unknown_writes
-                + d.buffer_writes
-                    .get(&(b.as_raw() as usize))
-                    .copied()
-                    .unwrap_or(0)
-        };
-        [revision(args), count.map_or(0, revision)]
+        args: (&ID3D12Resource, u64, u64),
+        count: Option<(&ID3D12Resource, u64)>,
+    ) -> crate::indirect::Writes {
+        self.deferred().indirect_writers.before(args, count)
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

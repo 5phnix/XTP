@@ -3757,7 +3757,7 @@ pub(crate) fn write(list: &HostList, address: u64, value: u64, bytes: usize) -> 
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("write {value:#x} ({bytes} bytes) at {address:#x} on the GPU"));
     list.keep(&shadow.buffer);
-    list.count_gpu_write(&shadow.buffer, bytes);
+    list.count_gpu_write(&shadow.buffer, shadow.offset(address), bytes);
     let b = &shadow.buffer;
     // SAFETY: an open list, a live buffer (kept until the list is reset)
     // and destinations inside it.

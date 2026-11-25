@@ -1271,7 +1271,7 @@ mod tests {
             (&args_copy, args.address(), 16, 1),
             None,
             None,
-            [0; 2],
+            Default::default(),
         )
         .expect("expanded");
         target.bind(list.host(), &root, &pso);

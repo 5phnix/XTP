@@ -967,7 +967,7 @@ pub(crate) fn expand(
     (args, arguments, stride, max): (&Arc<Shadow>, u64, u32, u32),
     count: Option<(&Arc<Shadow>, u64)>,
     stats: Option<(u64, u32)>,
-    writes: [u64; 2],
+    writes: crate::indirect::Writes,
 ) -> Result<Prepared, &'static str> {
     if stride < 16 || !stride.is_multiple_of(4) || !args.gpu(arguments).is_multiple_of(4) {
         return Err("rectangle records short or not 4-byte aligned");
@@ -1582,7 +1582,7 @@ mod tests {
                 (&args_copy, args.address(), 16, 5),
                 Some((&count_copy, count.address())),
                 None,
-                [0; 2],
+                Default::default(),
             )
             .expect("expanded")
         };
@@ -1659,7 +1659,7 @@ mod tests {
             (&args_copy, args.address(), 16, 1),
             None,
             None,
-            [0; 2],
+            Default::default(),
         )
         .expect("expanded");
         let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
@@ -1712,7 +1712,7 @@ mod tests {
             (&args_copy, args.address(), 16, 4),
             Some((&count_copy, count.address())),
             None,
-            [0; 2],
+            Default::default(),
         )
         .expect("expanded");
         assert!(prepared.views.is_empty());
@@ -1799,7 +1799,7 @@ mod tests {
             (&args_copy, args.address(), 16, 2),
             None,
             None,
-            [0; 2],
+            Default::default(),
         )
         .expect("expanded");
         let (_, layouts) = scratch_layout(&[(0, 10), (2, 6)], SCRATCH_BYTES).expect("a layout");
