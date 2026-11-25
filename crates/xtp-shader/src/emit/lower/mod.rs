@@ -496,15 +496,6 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.ordered_uavs = x.native.io.pops();
-        // 0xkn0wh3r3 identified the missing mapping in VIctory #2085 (1f6fa41).
-        // DEPTH_BEFORE_SHADER tests rasterized depth before any pixel UAV writes.
-        if let StageIo::Ps {
-            db_shader_control, ..
-        } = x.native.io
-            && db_shader_control & (1 << 12) != 0
-        {
-            s.flags |= super::shader::flags::FORCE_EARLY_DEPTH_STENCIL;
-        }
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
