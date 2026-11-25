@@ -93,6 +93,20 @@ extern "system" fn launch_new_game(
     }
 }
 
+/// Records `args` so the crash reporter relaunches the title once if an
+/// unhandled crash occurs (`XLaunchRestartOnCrash` in `XGame.h`).
+extern "system" fn launch_restart_on_crash(_: This, args: *const c_char, reserved: u32) -> HRESULT {
+    if reserved != 0 {
+        return super::xasync::E_INVALIDARG;
+    }
+    let args = text(args).unwrap_or_default();
+    tracing::info!(args, "XLaunchRestartOnCrash");
+    let ours: Vec<_> = std::env::args_os().skip(1).collect();
+    let command = relaunch_args(ours, std::ffi::OsStr::new(""), "", &args);
+    super::lifecycle::set_restart_on_crash(command);
+    S_OK
+}
+
 /// Our own arguments for the relaunch: the title's executable replaced by
 /// `exe`, earlier title arguments dropped, `args` after `--`.
 fn relaunch_args(
@@ -161,12 +175,17 @@ extern "system" fn write_event(
     S_OK
 }
 
-static TITLE_VTABLE: Methods<5> = Methods([
+/// `TITLE_IID` vtable: `XGameGetXboxTitleId` (0x18) and `XLaunchNewGame` (0x20)
+/// are confirmed; `XLaunchRestartOnCrash` at slot 0x28 is inferred from
+/// `XGame.h` declaration order after `IUnknown`, not confirmed against a live
+/// call site.
+static TITLE_VTABLE: Methods<6> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    title_id as *const (),        // 0x18
-    launch_new_game as *const (), // 0x20
+    title_id as *const (),                // 0x18
+    launch_new_game as *const (),         // 0x20
+    launch_restart_on_crash as *const (), // 0x28
 ]);
 
 static FEATURES_VTABLE: Methods<4> = Methods([
@@ -227,6 +246,27 @@ mod tests {
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");
+    }
+
+    #[test]
+    fn a_restart_without_title_args_keeps_the_executable_and_drops_old_args() {
+        let ours = ["run", "G:/game.exe", "--", "-old"].map(std::ffi::OsString::from);
+        let current = std::ffi::OsStr::new("G:/game.exe");
+        for args in [std::ptr::null(), c"".as_ptr(), c" \t".as_ptr()] {
+            let args = text(args).unwrap_or_default();
+            assert_eq!(relaunch_args(ours.to_vec(), current, "", &args), ours[..2]);
+        }
+    }
+
+    #[test]
+    fn a_restart_uses_the_shared_whitespace_split_for_quoted_args() {
+        let ours = ["run", "G:/game.exe", "--", "-old"].map(std::ffi::OsString::from);
+        let current = std::ffi::OsStr::new("G:/game.exe");
+        let command = relaunch_args(ours.to_vec(), current, "", "-save \"slot 1\"");
+        assert_eq!(
+            command,
+            ["run", "G:/game.exe", "--", "-save", "\"slot", "1\""].map(std::ffi::OsString::from)
+        );
     }
 
     #[test]

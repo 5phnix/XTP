@@ -266,7 +266,7 @@ pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
 
 extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     host::report_unhandled(info);
-    match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
+    let disposition = match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         filter => {
             type Filter = extern "system" fn(*const c_void) -> i32;
@@ -274,7 +274,12 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
             let filter: Filter = unsafe { std::mem::transmute(filter) };
             filter(info)
         }
+    };
+    #[cfg(windows)]
+    if disposition != windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION {
+        xtp_loader::run_on_crash();
     }
+    disposition
 }
 
 /// See [`exit`]; only the current process is logged.

@@ -31,6 +31,12 @@ fn routines() -> MutexGuard<'static, Vec<(usize, Routine, usize)>> {
 /// How long the console lets suspend routines run before it ends the title.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
+static ENDING: AtomicBool = AtomicBool::new(false);
+
+fn claim_ending() -> bool {
+    !ENDING.swap(true, Ordering::SeqCst)
+}
+
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
 pub extern "system" fn RegisterAppStateChangeNotification(
@@ -203,10 +209,13 @@ extern "system" fn window_proc(
 /// Suspends the title as the console does when it ends it, runs `then`
 /// (once), then ends the process. Returns at once; later calls do nothing.
 pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
-    static ENDING: AtomicBool = AtomicBool::new(false);
-    if ENDING.swap(true, Ordering::SeqCst) {
+    if !claim_ending() {
         return;
     }
+    RESTART_ON_CRASH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     let suspend = routines().clone();
     tracing::info!(routines = suspend.len(), "{why}: suspending the title");
     // Whoever comes first (the routines or the deadline) runs `then`; the
@@ -239,9 +248,83 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
 /// of the process it replaces.
 const RELAUNCHED_FROM: &str = "XTP_RELAUNCHED_FROM";
 
+/// Set in the environment of a process restarted after a crash so a second
+/// crash does not loop indefinitely. Cleared from the environment at startup
+/// (into [`ALREADY_CRASH_RESTARTED`]) so a later `XLaunchNewGame` relaunch
+/// does not inherit it.
+const CRASH_RESTARTED: &str = "XTP_CRASH_RESTARTED";
+
+/// Remembered in-process after [`wait_for_previous`] removes [`CRASH_RESTARTED`]
+/// from the environment.
+static ALREADY_CRASH_RESTARTED: AtomicBool = AtomicBool::new(false);
+
+/// Command-line arguments recorded by `XLaunchRestartOnCrash`.
+static RESTART_ON_CRASH: Mutex<Option<Vec<std::ffi::OsString>>> = Mutex::new(None);
+
+/// Records the arguments to relaunch with if the process hits an unhandled
+/// crash (`XLaunchRestartOnCrash`).
+pub(crate) fn set_restart_on_crash(args: Vec<std::ffi::OsString>) {
+    let mut restart = RESTART_ON_CRASH.lock().unwrap_or_else(|e| e.into_inner());
+    if !ENDING.load(Ordering::SeqCst) {
+        *restart = Some(args);
+    }
+}
+
+/// Installs the hook for fatal unhandled exceptions. Autopilot logs a skip
+/// if the title armed a restart, so its harness can observe the original exit.
+pub fn install_crash_restart(autopilot: bool) {
+    xtp_loader::on_crash(if autopilot {
+        || relaunch_on_crash(true)
+    } else {
+        || relaunch_on_crash(false)
+    });
+}
+
+fn relaunch_on_crash(autopilot: bool) {
+    let Some(args) = RESTART_ON_CRASH
+        .try_lock()
+        .ok()
+        .and_then(|mut args| args.take())
+    else {
+        return;
+    };
+    if !claim_crash_restart(autopilot) {
+        return;
+    }
+    if relaunch_with_env(args, Some((CRASH_RESTARTED, "1"))) {
+        // Terminate directly from the crash filter without running normal
+        // shutdown hooks (saving the pipeline cache or releasing input could
+        // deadlock if the faulting thread holds an internal lock).
+        // SAFETY: terminating our own crashing process after spawning the
+        // replacement; exit code 1 distinguishes a crash-restart exit.
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 1);
+        }
+    }
+}
+
+fn claim_crash_restart(autopilot: bool) -> bool {
+    if autopilot {
+        tracing::info!("skipping crash restart: autopilot is enabled");
+        return false;
+    }
+    if ALREADY_CRASH_RESTARTED.load(Ordering::Relaxed)
+        || std::env::var_os(CRASH_RESTARTED).is_some()
+    {
+        tracing::info!("skipping crash restart: already restarted once");
+        return false;
+    }
+    // Both paths must claim the shutdown before either can spawn a replacement.
+    claim_ending()
+}
+
 /// Starts `xtp` again with `args` (after the title has suspended); the
 /// new process waits until this one has ended.
 pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
+    let _ = relaunch_with_env(args, None);
+}
+
+fn relaunch_with_env(args: Vec<std::ffi::OsString>, extra_env: Option<(&str, &str)>) -> bool {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
     let mut me: HANDLE = std::ptr::null_mut();
     // SAFETY: an inheritable duplicate of our own process handle.
@@ -262,19 +345,34 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
         if duplicated {
             command.env(RELAUNCHED_FROM, (me as usize).to_string());
         }
+        if let Some((k, v)) = extra_env {
+            command.env(k, v);
+        }
         command.spawn()
     });
     match spawned {
-        Ok(child) => tracing::info!(pid = child.id(), ?args, "relaunched"),
-        Err(e) => tracing::warn!(%e, "relaunch failed; the title just ends"),
+        Ok(child) => {
+            tracing::info!(pid = child.id(), ?args, "relaunched");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(%e, "relaunch failed; the title just ends");
+            false
+        }
     }
 }
 
-/// In a relaunched `xtp`: waits (30 s at most) for the process it
-/// replaces to be gone, so the two never share the title's files.
+/// In a relaunched `xtp`: consumes `XTP_CRASH_RESTARTED` (so a later
+/// `XLaunchNewGame` does not inherit it) and waits (30 s at most) for the
+/// process it replaces to be gone, so the two never share the title's files.
 pub fn wait_for_previous() {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    if std::env::var_os(CRASH_RESTARTED).is_some() {
+        ALREADY_CRASH_RESTARTED.store(true, Ordering::Relaxed);
+        // SAFETY: removing our own variable at startup before title threads run.
+        unsafe { std::env::remove_var(CRASH_RESTARTED) };
+    }
     let Some(handle) = std::env::var(RELAUNCHED_FROM)
         .ok()
         .and_then(|h| h.parse::<usize>().ok())
@@ -320,6 +418,46 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_restart_and_intentional_end_have_only_one_winner() {
+        const CHILD: &str = "XTP_TEST_CRASH_RESTART_CLAIM";
+        // These flags are process-global, so no other library tests may run here.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "modules::lifecycle::tests::crash_restart_and_intentional_end_have_only_one_winner",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove(CRASH_RESTARTED)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"));
+            return;
+        }
+
+        assert!(!claim_crash_restart(true));
+        assert!(!ENDING.load(Ordering::SeqCst));
+        ALREADY_CRASH_RESTARTED.store(true, Ordering::Relaxed);
+        assert!(!claim_crash_restart(false));
+        assert!(!ENDING.load(Ordering::SeqCst));
+        ALREADY_CRASH_RESTARTED.store(false, Ordering::Relaxed);
+
+        for crash_first in [true, false] {
+            let (crash_won, intentional_won) = if crash_first {
+                let crash_won = claim_crash_restart(false);
+                (crash_won, claim_ending())
+            } else {
+                let intentional_won = claim_ending();
+                (claim_crash_restart(false), intentional_won)
+            };
+            assert_eq!((crash_won, intentional_won), (crash_first, !crash_first));
+            ENDING.store(false, Ordering::SeqCst);
+        }
+    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 
