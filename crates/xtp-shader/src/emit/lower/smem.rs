@@ -17,6 +17,8 @@ use crate::resource::{Address, CODE, Role, Site, Source};
 /// tiling) holds as data: [`Lower::descriptor_data`] rebuilds only sizes.
 pub(super) const DESCRIPTOR_WORD: Why = "a descriptor's address or format read as data";
 
+pub(super) const ONLY_DATA: Why = "a descriptor read only as data";
+
 /// What [`Lower::unused_descriptor`] finds a descriptor load to be.
 enum Unused<'a> {
     /// No dword has a host value ([`DESCRIPTOR_WORD`]): a join takes it as
@@ -617,7 +619,6 @@ impl<'a> Lower<'a> {
         count: u32,
         dwords: &[Option<Value>],
     ) -> Result<Unused<'a>, Why> {
-        const ONLY_DATA: Why = "a descriptor read only as data";
         let sampler = self.x.res.descriptors.iter().any(|d| {
             d.role == Role::Sampler
                 && d.source.leaves().into_iter().any(|l| {
