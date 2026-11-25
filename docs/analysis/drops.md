@@ -196,6 +196,26 @@ same way); without the stage the same draw lights each first triangle only.
 A pipeline the driver refuses with the stage is made without it (a
 warning), and a pixel shader that reads `SV_PrimitiveID` gets none.
 
+In the world (session rects-1, 2026-11-25 01:39, PC, Series S, build
+`6125363`, `XTP_RAW_STRUCTURED=1`, `XTP_SKIP_PIPELINES=577248728544d74b`,
+`XTP_TEXTURE_POOL=1`, `XTP_GPU_PIPESTATS=1`): no pipeline was refused with
+the stage nor went without it. The tiled lighting's draw
+(`[vertex 167501e87c356551, pixel 9727fc3c51b2f11c]`, one a frame) runs
+2,759 vertex invocations (920 tiles of 32 × 32, 40 × 23 over 1280 × 720),
+1,839 primitives into the clipper (two a tile; one before) and 921,127 pixel
+invocations, the 921,600 pixels of 1280 × 720: its tiles cover the target.
+Over four 5 s reports its primitives are 2/3 of its vertex invocations
+(0.666 to 0.667). The other indirect rectangle draws, 238 to 275 a frame,
+send 183 to 320 primitives a frame for 528 to 831 vertex invocations, most
+of them clipped away (14 to 114 out of the clipper, 3,500 to 74,000 pixel
+invocations): the counts do not tell their corner-less triangles from
+their rectangles. All indirect rectangle draws take 3.2 to 3.7 ms of GPU a
+frame. Rectangles dropped: only the indexed ones (0.5 to 1.5 a frame),
+which nothing here changes. The pass view's sampled "lit" share of the
+tiled lighting's outputs says nothing about this: without the stage
+(present-1, frames 677 to 703) the same pass's depth output is 8.3 % to
+29.8 % lit from frame to frame, with it (frame 641) 15.8 %.
+
 #### 5.1.1 Where the start vertex and start instance arrive
 
 Under D3D12, `SV_VertexID` leaves out the draw's start vertex and
