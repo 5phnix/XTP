@@ -7517,11 +7517,13 @@ float4 ps(V v) : SV_Target { return v.color; }
     /// from z = -2, at x = 0 and x = 4, the one at `x` hits it two units on.
     /// Its inputs, which must outlive the build.
     fn tlas_scene(producer: &TitleList, x: f32, at: u64) -> Vec<TitleBuffer> {
+        // Plain DXR formats: the console builder reads R16_TYPELESS indices
+        // as meshlet-compressed and R32G32_FLOAT vertices as quantized.
         use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R32G32_FLOAT,
+            DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32G32B32_FLOAT,
         };
-        let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
-        let positions = [x - 1., -1., x, 1., x + 1., -1.];
+        let (vertices, indices) = (TitleBuffer::new(36), TitleBuffer::new(8));
+        let positions = [x - 1., -1., 0., x, 1., 0., x + 1., -1., 0.];
         vertices.set_words(|i| positions[i].to_bits());
         indices.set_words(|i| [1 << 16, 2][i]);
         let (blas, instances) = (TitleBuffer::new(1024), TitleBuffer::new(64));
@@ -7537,14 +7539,14 @@ float4 ps(V v) : SV_Target { return v.color; }
             Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
             Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
                 Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
-                    IndexFormat: DXGI_FORMAT_R16_TYPELESS,
-                    VertexFormat: DXGI_FORMAT_R32G32_FLOAT,
+                    IndexFormat: DXGI_FORMAT_R16_UINT,
+                    VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
                     IndexCount: 3,
                     VertexCount: 3,
                     IndexBuffer: indices.address(),
                     VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
                         StartAddress: vertices.address(),
-                        StrideInBytes: 8,
+                        StrideInBytes: 12,
                     },
                     ..Default::default()
                 },
