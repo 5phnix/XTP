@@ -1380,9 +1380,15 @@ mod tests {
         #[cfg(windows)]
         if way.is_empty() || way == "cold" {
             timed("own index read cold", &|| {
+                let started = std::time::Instant::now();
                 let bytes = read_unbuffered(&root.join(disk::INDEX_FILE)).unwrap();
+                println!(
+                    "  its {} bytes from the disk in {:.3} s",
+                    bytes.len(),
+                    started.elapsed().as_secs_f64()
+                );
                 let mut read = Index::default();
-                for change in disk::parse_index(&bytes).expect("a sound index") {
+                for change in disk::records_of_any_version(&bytes).expect("a sound index") {
                     read.apply(change);
                 }
                 (read.files.len(), read.bytes)

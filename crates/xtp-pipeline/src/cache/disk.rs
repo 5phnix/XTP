@@ -233,6 +233,23 @@ pub(super) fn read_index(root: &Path) -> Option<Vec<Change>> {
     parse_index(&fs::read(root.join(INDEX_FILE)).ok()?)
 }
 
+/// The records of an index file of this version or the one before (the
+/// same records, without the snapshot's), none checked against the others:
+/// for the probe that times reading a real cache's index, which may have
+/// been written by a build of either.
+#[cfg(test)]
+pub(super) fn records_of_any_version(bytes: &[u8]) -> Option<Vec<Change>> {
+    let (magic, rest) = bytes.split_at_checked(INDEX_MAGIC.len())?;
+    (magic[..15] == INDEX_MAGIC[..15]).then_some(())?;
+    let (records, torn) = rest.as_chunks::<RECORD>();
+    torn.is_empty().then_some(())?;
+    records
+        .iter()
+        .map(Change::decode)
+        .filter(|c| !matches!(c, Some(Change::Snapshot { .. })))
+        .collect()
+}
+
 /// [`read_index`] of the file's bytes.
 pub(super) fn parse_index(bytes: &[u8]) -> Option<Vec<Change>> {
     let (records, torn) = bytes
