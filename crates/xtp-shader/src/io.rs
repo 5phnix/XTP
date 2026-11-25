@@ -70,7 +70,21 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Merged ES + GS: VGPR n (0 to 4) on entry, the GS half's system
+    /// values, which the ES keeps: the ESGS ring offsets of the input
+    /// vertices in 16-bit halves of v0, v1 (and v4), then the primitive and
+    /// invocation ids in the GFX9 layout. Only ring addresses read the
+    /// offsets, and `emit/lower/geometry.rs` resolves those before the
+    /// lowering; no other read has a host value.
+    GsSystem(u8),
 }
+
+/// The VGPR an export shader's vertex id arrives in, after the GS half's
+/// system VGPRs ([`Input::GsSystem`]): what the title's ES programs index
+/// their vertex streams with.
+pub(crate) const ES_VERTEX_ID: u8 = 5;
+/// The GS half's system VGPRs: v0 up to this.
+const GS_SYSTEM_VGPRS: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Barycentric {
@@ -280,6 +294,34 @@ pub(crate) fn raise_inputs(
             ];
             (loaded, &[][..], &ms.outputs[..])
         }
+        // Merged ES + GS (`docs/analysis/es-gs.md`): the GS half's system
+        // VGPRs, then for the ES its vertex id and the attributes the fetch
+        // shader loads (v9 up in the title, where its VS has v4 up). s3, the
+        // merged wave info, is left out: the lane counts' EXEC set-up is
+        // removed before (`drop_lane_prologue`) and only ring addresses read
+        // the wave index. Neither half exports.
+        (StageIo::Es(es), HwStage::Es) => {
+            let mut loaded: Vec<(Reg, Input)> = (0..GS_SYSTEM_VGPRS)
+                .map(|r| (Reg::V(r), Input::GsSystem(r)))
+                .collect();
+            loaded.push((Reg::V(ES_VERTEX_ID), Input::VertexId));
+            for i in &es.inputs {
+                for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
+                    let input = Input::Attribute {
+                        row: i.row,
+                        channel,
+                    };
+                    loaded.push((Reg::V(i.vgpr + channel), input));
+                }
+            }
+            (loaded, &[][..], &[][..])
+        }
+        (StageIo::Gs(_), HwStage::Gs) => {
+            let loaded = (0..GS_SYSTEM_VGPRS)
+                .map(|r| (Reg::V(r), Input::GsSystem(r)))
+                .collect();
+            (loaded, &[][..], &[][..])
+        }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
     let inputs: Vec<(Value, Input)> = p
@@ -408,6 +450,10 @@ pub(crate) fn raise_inputs(
                     done,
                     ..
                 } => {
+                    // A merged half's outputs are its ring writes.
+                    if matches!(native.stage, HwStage::Es | HwStage::Gs) {
+                        return Err(unsupported(at, "an export in a merged ES + GS program"));
+                    }
                     let target = match *target {
                         t @ 0..=7 => Target::Color(t),
                         8 => Target::Depth,
@@ -752,6 +798,70 @@ mod tests {
         assert_eq!(io.exports[0].target, Target::Primitive);
         // The group input is uniform only as the first lane reads it.
         assert!(mesh(&[0x7E02_0305, S_ENDPGM]).is_err()); // v_mov_b32 v1, v5
+    }
+
+    /// A merged ES + GS pair's halves: the GS half's system VGPRs in both,
+    /// the ES's vertex id in v5 and its attributes at the stage data's
+    /// VGPRs; neither half exports.
+    #[test]
+    fn merged_es_and_gs_inputs() {
+        let merged = |stage: HwStage, words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 256).unwrap();
+            let io = match stage {
+                HwStage::Es => StageIo::Es(crate::native::ExportIo {
+                    inputs: vec![crate::native::VsInput {
+                        usage: Usage::Generic,
+                        row: 1,
+                        mask: 3,
+                        vgpr: 9,
+                    }],
+                    outputs: vec![],
+                    item_dwords: 8,
+                }),
+                _ => StageIo::Gs(crate::native::GeometryIo {
+                    outputs: vec![],
+                    item_dwords: 60,
+                    count: 1,
+                    max_vertices: 3,
+                    vertex_dwords: 20,
+                }),
+            };
+            let native = NativeProgram {
+                stage,
+                wave64: true,
+                float_mode: 0,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io,
+                code,
+            };
+            (raise(&p, &native), p)
+        };
+        let (io, p) = merged(
+            HwStage::Es,
+            &[
+                0x7E28_0305, // v_mov_b32 v20, v5
+                0x7E2A_030A, // v_mov_b32 v21, v10
+                0x7E2C_0300, // v_mov_b32 v22, v0
+                S_ENDPGM,
+            ],
+        );
+        let input = |reg| p.inputs.iter().find(|i| i.0 == Reg::V(reg)).unwrap().1;
+        let io = io.unwrap();
+        assert!(io.inputs.contains(&(input(5), Input::VertexId)));
+        let y = Input::Attribute { row: 1, channel: 1 };
+        assert!(io.inputs.contains(&(input(10), y)));
+        assert!(io.inputs.contains(&(input(0), Input::GsSystem(0))));
+        let (io, p) = merged(HwStage::Gs, &[0x7E28_0301, S_ENDPGM]); // v_mov_b32 v20, v1
+        let v1 = p.inputs.iter().find(|i| i.0 == Reg::V(1)).unwrap().1;
+        assert_eq!(io.unwrap().inputs, [(v1, Input::GsSystem(1))]);
+        for stage in [HwStage::Es, HwStage::Gs] {
+            // exp prim, v9, off, off, off done
+            let (io, _) = merged(stage, &[0xF800_0941, 0x0000_0009, S_ENDPGM]);
+            assert!(io.is_err(), "{stage:?} exports");
+        }
     }
 
     #[test]

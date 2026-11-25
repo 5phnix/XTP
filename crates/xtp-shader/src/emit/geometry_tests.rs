@@ -17,8 +17,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Interface, PCSTR};
 
-use super::bitcode::{Attr, Md, Module, Term, V};
-use super::container::{self, Psv, SigElement};
+use super::bitcode::{Attr, Term, V};
+use super::container::SigElement;
 use super::host::Host;
 use super::lower::geometry::{
     self, EsPlan, GsPlan, GsShape, Message, Primitive, RingAccess, Slot, Topology, Vertices,
@@ -26,6 +26,7 @@ use super::lower::geometry::{
 use super::shader::Shader;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{self, Exit, Inst, Program, Reg};
+use crate::native::{GeometryIo, HwStage};
 use crate::resource::Site;
 
 // GFX10 encodings (AMD's RDNA ISA reference).
@@ -40,6 +41,10 @@ const S_LSHL_B32: u32 = 0x1E;
 const S_MUL_I32: u32 = 0x26;
 const S_BFE_U32: u32 = 0x27;
 const S_CMP_EQ_U32: u32 = 0x06;
+const S_BFE_I32: u32 = 0x28;
+const S_BFM_B64: u32 = 0x25;
+const S_CSELECT_B32: u32 = 0x0A;
+const S_CSELECT_B64: u32 = 0x0B;
 const S_ENDPGM: u32 = 0xBF81_0000;
 const S_BRANCH: u32 = 0x02;
 const S_CBRANCH_SCC1: u32 = 0x05;
@@ -846,6 +851,162 @@ fn geometry_shapes_within_d3d12_limits() {
     assert_eq!(geometry::element_at(&outs, 10), Some((2, 2)));
 }
 
+/// A `PSV0` part's data as a geometry shader's: GSInfo (input primitive,
+/// output topology, stream mask, a position output), then runtime
+/// information 1 with the stage (`stage`, 2 for geometry) and the most
+/// vertices; no resources.
+fn gs_psv(input: u32, topology: u32, streams: u32, stage: u8, max_vertices: u16) -> Vec<u8> {
+    let mut info = [0u8; 48];
+    info[0..4].copy_from_slice(&input.to_le_bytes());
+    info[4..8].copy_from_slice(&topology.to_le_bytes());
+    info[8..12].copy_from_slice(&streams.to_le_bytes());
+    info[12] = 1;
+    info[24] = stage;
+    info[26..28].copy_from_slice(&max_vertices.to_le_bytes());
+    let mut psv = 48u32.to_le_bytes().to_vec();
+    psv.extend(info);
+    psv.extend(0u32.to_le_bytes());
+    psv
+}
+
+/// The stage data of the GS of [`shape`]`(max_vertices)`.
+fn gs_io(max_vertices: u32, count: u32) -> GeometryIo {
+    GeometryIo {
+        outputs: Vec::new(),
+        item_dwords: max_vertices * VERTEX_DWORDS,
+        count,
+        max_vertices,
+        vertex_dwords: VERTEX_DWORDS,
+    }
+}
+
+/// A console geometry shader's shape: the primitive, topology and most
+/// vertices of its `PSV0`, the ring layout of its stage data, which must
+/// agree; the shapes the translation does not know are refused. A
+/// geometry shader the translation makes (`Shader::finish` with its
+/// shape) reads back as the same shape.
+#[test]
+fn geometry_shape_from_psv0_and_stage_data() {
+    let io = gs_io(3, 1);
+    assert_eq!(GsShape::of(&gs_psv(3, 5, 1, 2, 3), &io), Ok(shape(3)));
+    let points = GsShape::of(&gs_psv(1, 1, 1, 2, 1), &gs_io(1, 1)).expect("points");
+    assert_eq!(
+        (points.input, points.topology),
+        (Primitive::Point, Topology::Points)
+    );
+    let lines = GsShape::of(&gs_psv(2, 3, 1, 2, 2), &gs_io(2, 1)).expect("lines");
+    assert_eq!(
+        (lines.input, lines.topology),
+        (Primitive::Line, Topology::LineStrip)
+    );
+    // Triangles with adjacency; a triangle list; streams 0 and 1.
+    assert_eq!(
+        GsShape::of(&gs_psv(7, 5, 1, 2, 3), &io),
+        Err(geometry::PRIMITIVE)
+    );
+    assert_eq!(
+        GsShape::of(&gs_psv(3, 4, 1, 2, 3), &io),
+        Err(geometry::TOPOLOGY)
+    );
+    assert_eq!(
+        GsShape::of(&gs_psv(3, 5, 3, 2, 3), &io),
+        Err(geometry::STREAMS)
+    );
+    assert_eq!(
+        GsShape::of(&gs_psv(3, 5, 1, 2, 4), &io),
+        Err(geometry::MOST_VERTICES)
+    );
+    assert_eq!(
+        GsShape::of(&gs_psv(3, 5, 1, 2, 3), &gs_io(3, 2)),
+        Err(geometry::COUNT)
+    );
+    // Another stage's runtime information; one too short; none.
+    assert_eq!(
+        GsShape::of(&gs_psv(3, 5, 1, 1, 3), &io),
+        Err(geometry::PSV)
+    );
+    let mut short = gs_psv(3, 5, 1, 2, 3);
+    short[..4].copy_from_slice(&24u32.to_le_bytes());
+    assert_eq!(GsShape::of(&short, &io), Err(geometry::PSV));
+    assert_eq!(GsShape::of(&short[..30], &io), Err(geometry::PSV));
+    assert_eq!(GsShape::of(&[], &io), Err(geometry::PSV));
+
+    let steps = [Step::Emit(0), Step::Emit(1), Step::Emit(2), Step::Done];
+    let p = gs_program(&steps, 3);
+    let plan = geometry::gs_plan(&p, &shape(3)).expect("a plan");
+    let made = lower_gs(&p, &plan, &shape(3));
+    let c = crate::Container::parse(&made).expect("a container");
+    let psv = c.part(crate::FourCC::PSV0).expect("a PSV0 part").data;
+    assert_eq!(GsShape::of(psv, &io), Ok(shape(3)));
+    // Program kind 2 (geometry), shader model 6.6.
+    let dxil = c.part(crate::FourCC::DXIL).expect("a DXIL part").data;
+    assert_eq!(&dxil[..4], &(2u32 << 16 | 0x66).to_le_bytes());
+}
+
+/// The lane set-up a merged half starts with, as the title's do it: EXEC
+/// from its lane count in s3 (`first` its first bit: 0 for the ES, 8 for
+/// the GS), every lane when the count is 64.
+fn lane_prologue(code: &mut Code, first: u32) {
+    code.add([sop2(S_BFE_I32, 4, 3, LITERAL), 8 << 16 | first]);
+    code.add([
+        sop2(S_BFM_B64, EXEC, 4, int(0)),
+        sopc(S_CMP_EQ_U32, 4, int(64)),
+        sop2(S_CSELECT_B64, EXEC, MINUS_ONE, u32::from(EXEC)),
+    ]);
+}
+
+/// Each half's EXEC set-up from s3 goes, and what read the EXEC it made
+/// reads the entry's instead (every vertex shader or geometry shader
+/// invocation on the host is one of the half's lanes). Another stage is
+/// left as it is; another set-up, or one whose count or compare something
+/// else reads, is refused.
+#[test]
+fn geometry_lane_prologue_leaves_every_lane_on() {
+    let program = |first: u32, tail: &[u32]| {
+        let mut code = Code::default();
+        lane_prologue(&mut code, first);
+        code.add([vop1(V_MOV_B32, 1, vgpr(0))]);
+        code.add(tail.iter().copied());
+        code.add([S_ENDPGM]);
+        code.program()
+    };
+    let exec = |p: &Program, k: u8| {
+        let entry = p.inputs.iter().find(|i| i.0 == Reg::S(ir::EXEC + k));
+        entry.map(|i| i.1).expect("EXEC on entry")
+    };
+    for (stage, first) in [(HwStage::Es, 0), (HwStage::Gs, 8)] {
+        let mut p = program(first, &[]);
+        let before = p.blocks[0].insts.len();
+        geometry::drop_lane_prologue(&mut p, stage).expect("the title's set-up");
+        assert_eq!(p.blocks[0].insts.len(), before - 4, "{stage:?}");
+        let mov = &p.blocks[0].insts[0];
+        assert_eq!(mov.name(), "v_mov_b32");
+        assert_eq!(mov.read(Reg::S(ir::EXEC)), Some(exec(&p, 0)));
+        assert_eq!(mov.read(Reg::S(ir::EXEC + 1)), Some(exec(&p, 1)));
+    }
+    let same = program(0, &[]);
+    let mut p = same.clone();
+    geometry::drop_lane_prologue(&mut p, HwStage::Vs).expect("nothing to do");
+    assert_eq!(p, same);
+    let refused = |first: u32, tail: &[u32], stage: HwStage| {
+        geometry::drop_lane_prologue(&mut program(first, tail), stage)
+    };
+    // The other half's count.
+    assert_eq!(refused(8, &[], HwStage::Es), Err(geometry::PROLOGUE));
+    assert_eq!(refused(0, &[], HwStage::Gs), Err(geometry::PROLOGUE));
+    // The count read again; the compare's SCC read again.
+    let count = sop1(S_MOV_B32, 20, 4);
+    assert_eq!(refused(0, &[count], HwStage::Es), Err(geometry::PROLOGUE));
+    let scc = sop2(S_CSELECT_B32, 20, int(1), int(0));
+    assert_eq!(refused(0, &[scc], HwStage::Es), Err(geometry::PROLOGUE));
+    // No set-up at all.
+    let mut bare = gs_program(&[Step::Done], 3);
+    assert_eq!(
+        geometry::drop_lane_prologue(&mut bare, HwStage::Gs),
+        Err(geometry::PROLOGUE)
+    );
+}
+
 /// `v_mov_b32` of a constant or a VGPR: the only data instructions the
 /// walkers below lower.
 fn moved(s: &mut Shader, inst: &Inst, regs: &mut HashMap<Reg, V>) -> bool {
@@ -942,7 +1103,10 @@ fn lower_gs(p: &Program, plan: &GsPlan, shape: &GsShape) -> Vec<u8> {
         }
     }
     s.m.terminate(block, Term::Ret);
-    finish_gs(s, shape, &inputs, &outs)
+    s.inputs = inputs;
+    s.outputs = outs;
+    s.geometry = Some(*shape);
+    s.finish()
 }
 
 /// The vertex shader of the console ES `p` and its plan: the address
@@ -992,141 +1156,6 @@ fn lower_es(p: &Program, plan: &EsPlan) -> Vec<u8> {
     s.outputs = outputs;
     s.m.terminate(block, Term::Ret);
     s.finish()
-}
-
-/// A signature's metadata: one node per element, as the other stages
-/// declare theirs.
-fn signature_md(m: &mut Module, elements: &[SigElement]) -> Md {
-    fn c32(m: &mut Module, v: u32) -> Option<Md> {
-        let c = m.i32(v);
-        Some(m.md_value(c))
-    }
-    fn c8(m: &mut Module, v: u8) -> Option<Md> {
-        let c = m.i8(v);
-        Some(m.md_value(c))
-    }
-    let mut list = Vec::with_capacity(elements.len());
-    for (id, e) in elements.iter().enumerate() {
-        let index = c32(m, e.index);
-        let indices = Some(m.md_node(vec![index]));
-        let (tag, mask) = (c32(m, 3), c32(m, u32::from(e.usage)));
-        let usage = Some(m.md_node(vec![tag, mask]));
-        let ops = vec![
-            c32(m, id as u32),
-            Some(m.md_str(&e.name)),
-            c8(m, e.comp),
-            c8(m, e.kind),
-            indices,
-            c8(m, e.interp),
-            c32(m, 1),
-            c8(m, e.cols),
-            c32(m, e.row.unwrap_or(u32::MAX)),
-            c8(m, e.col),
-            usage,
-        ];
-        list.push(Some(m.md_node(ops)));
-    }
-    m.md_node(list)
-}
-
-/// The geometry shader's container around the module `s` holds: what
-/// `emit/shader.rs` will declare for this stage (W10's second phase), with
-/// the geometry state and runtime information of `lower/geometry.rs`.
-fn finish_gs(
-    mut s: Shader,
-    shape: &GsShape,
-    inputs: &[SigElement],
-    outs: &[SigElement],
-) -> Vec<u8> {
-    const GEOMETRY: u32 = 2;
-    let (void, i32t) = (s.t.void, s.t.i32);
-    let mut m = std::mem::take(&mut s.m);
-    let main_ty = m.func_ty(void, vec![]);
-    let main = m.function("main", main_ty, None, true);
-    let c = |m: &mut Module, v: u32| {
-        let k = m.i32(v);
-        m.md_value(k)
-    };
-    let scalars = |els: &[SigElement]| {
-        els.iter()
-            .filter_map(|e| e.row.map(|r| r * 4 + u32::from(e.col + e.cols)))
-            .max()
-            .unwrap_or(0)
-    };
-    // View-id state: the input scalars, then for stream 0 its output
-    // scalars and what each input feeds (everything), then streams 1-3.
-    let (ni, no) = (scalars(inputs), scalars(outs));
-    let mut view = vec![ni, no];
-    for _ in 0..ni {
-        for k in 0..no.div_ceil(32) {
-            let bits = (no - 32 * k).min(32);
-            view.push(if bits == 32 {
-                u32::MAX
-            } else {
-                (1 << bits) - 1
-            });
-        }
-    }
-    view.extend([0, 0, 0]);
-    let arr = m.array(view.len() as u32, i32t);
-    let words: Vec<V> = view.iter().map(|&w| m.i32(w)).collect();
-    let arr = m.aggregate(arr, &words);
-    let arr = m.md_value(arr);
-    let node = m.md_node(vec![Some(arr)]);
-    m.named_md("dx.viewIdState", vec![node]);
-    let ins = signature_md(&mut m, inputs);
-    let outs_md = signature_md(&mut m, outs);
-    let sigs = m.md_node(vec![Some(ins), Some(outs_md), None]);
-    let state: Vec<Option<Md>> = shape.state().iter().map(|&n| Some(c(&mut m, n))).collect();
-    let state = m.md_node(state);
-    let tag = c(&mut m, 1);
-    let props = m.md_node(vec![Some(tag), Some(state)]);
-    let main = m.md_value(main);
-    let name = m.md_str("main");
-    let entry = m.md_node(vec![Some(main), Some(name), Some(sigs), None, Some(props)]);
-    let ident = m.md_str("xtp");
-    let ident = m.md_node(vec![Some(ident)]);
-    m.named_md("llvm.ident", vec![ident]);
-    let (one, six) = (c(&mut m, 1), c(&mut m, 6));
-    let version = m.md_node(vec![Some(one), Some(six)]);
-    m.named_md("dx.version", vec![version]);
-    m.named_md("dx.valver", vec![version]);
-    let gs = m.md_str("gs");
-    let model = m.md_node(vec![Some(gs), Some(six), Some(six)]);
-    m.named_md("dx.shaderModel", vec![model]);
-    m.named_md("dx.entryPoints", vec![entry]);
-    let bitcode = m.write();
-    let mut dxil = Vec::with_capacity(24 + bitcode.len());
-    dxil.extend((GEOMETRY << 16 | 0x66).to_le_bytes());
-    dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
-    dxil.extend(b"DXIL");
-    dxil.extend(0x106u32.to_le_bytes());
-    dxil.extend(16u32.to_le_bytes());
-    dxil.extend((bitcode.len() as u32).to_le_bytes());
-    dxil.extend(&bitcode);
-    let isg1 = container::signature(inputs, true);
-    let osg1 = container::signature(outs, false);
-    let mut psv0 = container::psv(&Psv {
-        stage: GEOMETRY as u8,
-        flag: false,
-        inputs,
-        outputs: outs,
-        prims: &[],
-        mesh: None,
-        bindings: &[],
-        threads: [0; 3],
-        wave_size: None,
-    });
-    shape.runtime_info(&mut psv0, outs.iter().any(|e| e.kind == 3));
-    let (sfi0, hash) = ([0u8; 8], [0u8; 20]);
-    container::build(&[
-        (b"SFI0", &sfi0),
-        (b"ISG1", &isg1),
-        (b"OSG1", &osg1),
-        (b"PSV0", &psv0),
-        (b"HASH", &hash),
-        (b"DXIL", &dxil),
-    ])
 }
 
 fn err(e: windows::core::Error) -> String {

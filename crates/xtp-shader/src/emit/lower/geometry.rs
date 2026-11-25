@@ -75,6 +75,7 @@ use crate::emit::container::SigElement;
 use crate::emit::shader::Shader;
 use crate::gfx10::{Fields, NULL, Operand, Valu};
 use crate::ir::{EXEC, Inst, M0, Program, Reg, Value, idoms, reverse_postorder};
+use crate::native::{GeometryIo, HwStage};
 use crate::resource::{Site, inline};
 
 /// A ring access the rings do not explain: an address the plans cannot
@@ -108,6 +109,19 @@ pub(crate) const SCALARS: Why =
 pub(crate) const ROWS: Why = "a geometry shader signature past D3D12's 32 rows";
 pub(crate) const INSTANCES: Why = "a geometry shader beyond D3D12's 32 instances";
 pub(crate) const BOOLEAN: Why = "a boolean geometry shader input or output";
+/// A merged half that does not start by setting EXEC to its lanes from s3
+/// as the title's do ([`drop_lane_prologue`]).
+pub(crate) const PROLOGUE: Why =
+    "a merged ES + GS program whose EXEC set-up from s3 the translation does not know";
+pub(crate) const PSV: Why = "a geometry shader whose PSV0 the translation does not read";
+pub(crate) const PRIMITIVE: Why =
+    "a geometry shader input primitive other than points, lines or triangles";
+pub(crate) const TOPOLOGY: Why =
+    "a geometry shader output topology other than points, line strips or triangle strips";
+pub(crate) const MOST_VERTICES: Why =
+    "a geometry shader whose stage data and PSV0 disagree on its most vertices";
+pub(crate) const COUNT: Why =
+    "a geometry shader whose stage data instance or stream count is not 1";
 
 /// D3D12's geometry-shader limits: registers per input vertex and per output
 /// vertex (`D3D12_GS_INPUT_REGISTER_COUNT`, `D3D12_GS_OUTPUT_REGISTER_COUNT`),
@@ -129,8 +143,8 @@ pub(crate) const VERTEX_OFFSETS: [(u8, u8); 6] =
 
 /// The VGPR holding an ES lane's vertex id (v0 to v4 hold the GS half's
 /// inputs, which the ES keeps): what the title's ES programs index their
-/// vertex streams with.
-pub(crate) const ES_VERTEX_ID: u8 = 5;
+/// vertex streams with ([`crate::io::ES_VERTEX_ID`]).
+pub(crate) const ES_VERTEX_ID: u8 = crate::io::ES_VERTEX_ID;
 
 /// `s_sendmsg` message ids (bits 0-3) of the GS messages.
 const MSG_GS: u16 = 2;
@@ -810,6 +824,51 @@ pub(crate) struct GsShape {
 }
 
 impl GsShape {
+    /// The shape of a console geometry shader: input primitive, output
+    /// topology and most vertices from its container's `PSV0` (`psv`, the
+    /// part's data), the GSVS ring layout from its stage data (`io`), which
+    /// must agree on the most vertices. Stream 0 only, one instance: the
+    /// stage data's count is 1 in every program of the title, which does not
+    /// say whether it counts instances or streams.
+    pub(crate) fn of(psv: &[u8], io: &GeometryIo) -> Result<GsShape, Why> {
+        let at = |o: usize| psv.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        let size = at(0).ok_or(PSV)? as usize;
+        // GSInfo, then runtime info 1: the stage (2) and the most vertices.
+        if size < 28 || psv.len() < 4 + size || psv[4 + 24] != 2 {
+            return Err(PSV);
+        }
+        let input = match at(4).ok_or(PSV)? {
+            1 => Primitive::Point,
+            2 => Primitive::Line,
+            3 => Primitive::Triangle,
+            _ => return Err(PRIMITIVE),
+        };
+        let topology = match at(8).ok_or(PSV)? {
+            1 => Topology::Points,
+            3 => Topology::LineStrip,
+            5 => Topology::TriangleStrip,
+            _ => return Err(TOPOLOGY),
+        };
+        if at(12).ok_or(PSV)? != 1 {
+            return Err(STREAMS);
+        }
+        let max_vertices = u32::from(u16::from_le_bytes([psv[4 + 26], psv[4 + 27]]));
+        if max_vertices != io.max_vertices {
+            return Err(MOST_VERTICES);
+        }
+        if io.count != 1 {
+            return Err(COUNT);
+        }
+        Ok(GsShape {
+            input,
+            topology,
+            max_vertices,
+            vertex_dwords: io.vertex_dwords,
+            item_dwords: io.item_dwords,
+            instances: 1,
+        })
+    }
+
     /// D3D12's limits for this shape with these signatures (`inputs` one
     /// input vertex's, `outputs` stream 0's).
     pub(crate) fn check(&self, inputs: &[SigElement], outputs: &[SigElement]) -> Result<(), Why> {
@@ -961,6 +1020,146 @@ fn exec_at(p: &Program, site: Site) -> (Option<Value>, Option<Value>) {
         .then(|| live_at(p, Reg::S(EXEC + 1), site))
         .flatten();
     (live_at(p, Reg::S(EXEC), site), hi)
+}
+
+/// Each half of a merged stage first sets EXEC to its own lanes from the
+/// counts in s3 (the ES's in bits 0-7, the GS's in 8-15), as the title's
+/// programs do it:
+///
+/// ```text
+/// s_bfe_i32 sN, s3, 0x80000 | first bit
+/// s_bfm_b64 exec, sN, 0
+/// s_cmp_eq_u32 sN, 64
+/// s_cselect_b64 exec, -1, exec
+/// ```
+///
+/// On the host every vertex shader and geometry shader invocation is one
+/// of those lanes, so EXEC stays as it enters (every lane): this removes
+/// the four instructions and gives their EXEC's readers the entry's. Other
+/// stages are left as they are; a merged half without this set-up, or
+/// whose count or compare something else reads, is refused. Runs before
+/// anything else looks at the program (its instructions' sites change).
+pub(crate) fn drop_lane_prologue(p: &mut Program, stage: HwStage) -> Result<(), Why> {
+    let first = match stage {
+        HwStage::Es => 0,
+        HwStage::Gs => 8,
+        _ => return Ok(()),
+    };
+    if !p.wave64 || p.blocks.is_empty() {
+        return Err(PROLOGUE);
+    }
+    let s3 = p.inputs.iter().find(|i| i.0 == Reg::S(3)).map(|i| i.1);
+    let insts = &p.blocks[0].insts;
+    let scalar = |op: Option<Operand>| match op {
+        Some(Operand::Scalar { code, .. }) => Some(code),
+        _ => None,
+    };
+    let constant = |op: Option<Operand>| match op {
+        Some(Operand::Const(c)) => inline(c),
+        Some(Operand::Literal(x)) => Some(x),
+        _ => None,
+    };
+    let src = |i: &Inst, k: usize| match &i.fields {
+        Fields::Sop { src, .. } => src.get(k).copied(),
+        _ => None,
+    };
+    let dst = |i: &Inst| match &i.fields {
+        Fields::Sop { dst, .. } => scalar(*dst),
+        _ => None,
+    };
+    let at = (0..insts.len().saturating_sub(3)).find(|&k| {
+        let [bfe, bfm, cmp, sel] = [&insts[k], &insts[k + 1], &insts[k + 2], &insts[k + 3]];
+        let Some(n) = dst(bfe) else {
+            return false;
+        };
+        let count = bfe.write(Reg::S(n));
+        matches!(bfe.name(), "s_bfe_i32" | "s_bfe_u32")
+            && scalar(src(bfe, 0)) == Some(3)
+            && s3.is_some()
+            && bfe.read(Reg::S(3)) == s3
+            && constant(src(bfe, 1)) == Some(8 << 16 | first)
+            && bfm.name() == "s_bfm_b64"
+            && dst(bfm) == Some(EXEC)
+            && bfm.read(Reg::S(n)) == count
+            && constant(src(bfm, 1)) == Some(0)
+            && cmp.name() == "s_cmp_eq_u32"
+            && scalar(src(cmp, 0)) == Some(n)
+            && cmp.read(Reg::S(n)) == count
+            && constant(src(cmp, 1)) == Some(64)
+            && sel.name() == "s_cselect_b64"
+            && dst(sel) == Some(EXEC)
+            && constant(src(sel, 0)) == Some(u32::MAX)
+            && scalar(src(sel, 1)) == Some(EXEC)
+            && sel.read(Reg::Scc) == cmp.write(Reg::Scc)
+            && sel.read(Reg::S(EXEC)) == bfm.write(Reg::S(EXEC))
+            && sel.read(Reg::S(EXEC + 1)) == bfm.write(Reg::S(EXEC + 1))
+    });
+    let at = at.ok_or(PROLOGUE)?;
+    let removed: Vec<Inst> = p.blocks[0].insts[at..at + 4].to_vec();
+    let sel = &removed[3];
+    // What the first three write, which only the four may read: the count,
+    // SCC (the extract's, which the compare overwrites, and the compare's),
+    // the narrowed EXEC. The selected EXEC's readers get the entry's.
+    let internal: HashSet<Value> = removed[..3]
+        .iter()
+        .flat_map(|i| i.writes.iter().map(|w| w.1))
+        .collect();
+    let (Some(lo), Some(hi)) = (sel.write(Reg::S(EXEC)), sel.write(Reg::S(EXEC + 1))) else {
+        return Err(PROLOGUE);
+    };
+    let read_elsewhere = p.blocks.iter().enumerate().any(|(b, block)| {
+        block.phis.iter().any(|phi| phi.args.iter().any(|a| internal.contains(a)))
+            || block.insts.iter().enumerate().any(|(i, x)| {
+                (b != 0 || !(at..at + 4).contains(&i))
+                    && x.reads.iter().any(|r| internal.contains(&r.1))
+            })
+    });
+    if read_elsewhere {
+        return Err(PROLOGUE);
+    }
+    let mut next = fresh_value(p);
+    let mut entry = |p: &mut Program, reg: Reg| match p.inputs.iter().find(|i| i.0 == reg) {
+        Some(i) => i.1,
+        None => {
+            let v = Value(next);
+            next += 1;
+            p.inputs.push((reg, v));
+            v
+        }
+    };
+    let map = [
+        (lo, entry(p, Reg::S(EXEC))),
+        (hi, entry(p, Reg::S(EXEC + 1))),
+    ];
+    let to = |v: Value| map.iter().find(|m| m.0 == v).map_or(v, |m| m.1);
+    p.blocks[0].insts.drain(at..at + 4);
+    for block in &mut p.blocks {
+        for phi in &mut block.phis {
+            for a in &mut phi.args {
+                *a = to(*a);
+            }
+        }
+        for x in &mut block.insts {
+            for r in &mut x.reads {
+                r.1 = to(r.1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A value number no value of `p` has.
+fn fresh_value(p: &Program) -> u32 {
+    let mut top = p.inputs.iter().map(|i| i.1.0).max().unwrap_or(0);
+    for block in &p.blocks {
+        for phi in &block.phis {
+            top = phi.args.iter().map(|a| a.0).fold(top.max(phi.value.0), u32::max);
+        }
+        for x in &block.insts {
+            top = x.reads.iter().chain(&x.writes).map(|r| r.1.0).fold(top, u32::max);
+        }
+    }
+    top + 1
 }
 
 /// A geometry shader's ring accesses and messages.
