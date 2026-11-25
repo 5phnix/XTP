@@ -348,6 +348,8 @@ struct Own {
     /// The holds on the raw views of the runtime stride tables the list's
     /// shaders read, by view heap ([`State::stride_table`]).
     strides: Vec<(usize, crate::descriptor::host::StrideHold)>,
+    /// Where [`Own::zeros`] put its zeros: upload chunk and offset.
+    zeros: Option<(usize, u64)>,
 }
 
 struct Chunk {
@@ -432,16 +434,24 @@ impl Own {
     /// Copies `len` bytes of host copy `from` from byte `offset` into GPU
     /// memory of the list's own, at this place in the list (after what
     /// earlier commands wrote there, before later ones read it): the buffer
-    /// and the offset in it. `None` past [`LIST_COPIES`] or
-    /// [`ALL_COPIES`] (logged).
+    /// and the offset in it. The `pad` bytes after them are zeroed (at
+    /// most 255: a constant view's [`padding`]). `None` past
+    /// [`LIST_COPIES`] or [`ALL_COPIES`] (logged).
     fn gpu_copy(
         &mut self,
         list: &HostList,
         from: &ID3D12Resource,
         offset: u64,
         len: u64,
+        pad: u64,
     ) -> Option<(ID3D12Resource, u64)> {
         use crate::host::{transition, uav_barrier};
+        debug_assert!(pad < 256);
+        let zeros = if pad > 0 {
+            Some(self.zeros(list)?)
+        } else {
+            None
+        };
         if self.copied + len > LIST_COPIES {
             counted!(
                 warn,
@@ -484,6 +494,11 @@ impl Own {
                 transition(&c.buffer, c.state, dest),
             ]);
             list.list.CopyBufferRegion(&c.buffer, at, from, offset, len);
+            if let Some((zeros, zeros_at)) = &zeros {
+                // Within the 256-byte steps `place` gives.
+                list.list
+                    .CopyBufferRegion(&c.buffer, at + len, zeros, *zeros_at, pad);
+            }
             list.list.ResourceBarrier(&[
                 transition(from, source, common),
                 transition(&c.buffer, dest, read),
@@ -495,12 +510,61 @@ impl Own {
 
     /// Upload memory of the list's own holding `len` bytes of title memory
     /// at `address` once the list is submitted: its host address.
+    /// The [`padding`] after them reads zeros.
     fn upload_fill(&mut self, list: &HostList, address: u64, len: u64) -> Option<u64> {
         let (i, at) = self.place(false, list, len)?;
         let c = &self.upload[i];
+        // SAFETY: the padding lies in the place just taken in this mapped
+        // chunk, which no GPU work reads before the list's submission; the
+        // fill writes only the first `len` bytes.
+        unsafe {
+            ((c.data + (at + len) as usize) as *mut u8).write_bytes(0, padding(len) as usize)
+        };
         list.defer_fill_at(c.data, at as usize, address as usize, len as usize);
         Some(c.gpu + at)
     }
+
+    /// 256 bytes of zeros in the list's upload memory, to copy from on the
+    /// GPU: the buffer and the offset in it. Made once per recording.
+    fn zeros(&mut self, list: &HostList) -> Option<(ID3D12Resource, u64)> {
+        let (i, at) = match self.zeros {
+            Some(place) => place,
+            None => {
+                let (i, at) = self.place(false, list, 256)?;
+                let c = &self.upload[i];
+                // SAFETY: the place just taken in this mapped chunk; the
+                // GPU reads it only after the list's submission.
+                unsafe { ((c.data + at as usize) as *mut u8).write_bytes(0, 256) };
+                self.zeros = Some((i, at));
+                (i, at)
+            }
+        };
+        Some((self.upload[i].buffer.clone(), at))
+    }
+}
+
+/// The bytes past `len` up to the next 256 of a constant view of the list's
+/// own memory: the host view takes whole 256s, and there the console reads
+/// zeros (past the view's size), not what earlier lists left.
+fn padding(len: u64) -> u64 {
+    len.next_multiple_of(256) - len
+}
+
+/// Scratch memory of the list's holding `len` bytes of title memory at
+/// `address` once it is submitted, for a table's constant view: its host
+/// address. The [`padding`] after them reads zeros.
+fn scratch_constant(list: &HostList, address: u64, len: u64) -> Option<u64> {
+    let pad = padding(len);
+    if pad == 0 {
+        return list.scratch_fill(address, len);
+    }
+    let (gpu, to) = list.scratch(len + pad)?;
+    // SAFETY: `len + pad` bytes of the list's mapped scratch memory, which
+    // no GPU work reads before the list's submission (a list reset while it
+    // runs records into fresh chunks); the fill writes only the first `len`.
+    unsafe { to.add(len as usize).write_bytes(0, pad as usize) };
+    list.defer_fill(to, address as *const u8, len as usize);
+    Some(gpu)
 }
 
 /// A chunk of `size` bytes and [`CBV_SPAN`] more: in GPU memory (`gpu`,
@@ -2285,7 +2349,7 @@ impl State {
         let width = unsafe { s.buffer.GetDesc() }.Width;
         let offset = s.offset(a);
         let bytes = len.next_multiple_of(4).min(width - offset);
-        let Some((buffer, at)) = self.own.gpu_copy(list, &s.buffer, offset, bytes) else {
+        let Some((buffer, at)) = self.own.gpu_copy(list, &s.buffer, offset, bytes, 0) else {
             counted!(
                 warn,
                 address = a,
@@ -2330,7 +2394,9 @@ impl State {
         let key = (shadow.buffer.as_raw() as usize, address);
         if let Some(copy) = self.cbv_copies.get(&key)
             && copy.input.gpu_source == input.gpu_source
-            && len <= copy.bytes
+            // A view of whole 256s reads no padding; one with padding must
+            // find zeros there, not the longer copy's next bytes.
+            && (len == copy.bytes || padding(len) == 0 && len <= copy.bytes)
             // A larger snapshot may also cover a newer write outside the
             // requested prefix. Every write after that snapshot is newer.
             && input.writes <= copy.input.writes
@@ -2341,10 +2407,13 @@ impl State {
             return Ok(copy.gpu);
         }
         let gpu = if input.gpu_source.is_some() {
-            let Some((buffer, at)) =
-                self.own
-                    .gpu_copy(list, &shadow.buffer, shadow.offset(address), len)
-            else {
+            let Some((buffer, at)) = self.own.gpu_copy(
+                list,
+                &shadow.buffer,
+                shadow.offset(address),
+                len,
+                padding(len),
+            ) else {
                 counted!(
                     warn,
                     address,
@@ -2724,14 +2793,21 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    // No address or no bytes: a null constant view (zeros),
+                    // not a view of 0 bytes or of title address 0.
+                    Some(View::Constant(address, size)) if address == 0 || size == 0 => {
+                        host.null_constant(index);
+                    }
                     Some(View::Constant(address, size)) => {
+                        // At most what a shader can index: the rest is not
+                        // copied, and the host takes no larger view.
+                        let size = crate::descriptor::host::capped_constant(address, size);
                         let len = u64::from(size);
                         let shadow = crate::shadow::existing(address, len);
                         let input = CbvInput::at(list, address, len, shadow.as_ref());
                         let gpu = match shadow.filter(|_| input.gpu_source.is_some()) {
                             Some(s) => self.fill_cbv(list, &s, address, len, input)?,
-                            None => list
-                                .scratch_fill(address, len)
+                            None => scratch_constant(list, address, len)
                                 .ok_or("could not upload a table CBV")?,
                         };
                         constants.push((address, len, input));
@@ -5761,6 +5837,118 @@ void main(uint3 id : SV_DispatchThreadID) {
         want[0] = 0x1234;
         want[100] = 0x5678;
         assert_eq!(got, want);
+    }
+
+    /// A table's constant view reads its title bytes, then zeros to its
+    /// 256-byte end (the console reads zeros past a view's size), not what
+    /// earlier work left in the list's memory: in scratch memory filled at
+    /// submission, or in a copy on the GPU (a source shaders write). Views
+    /// of no address or no bytes are null ones and take no memory; views
+    /// over 64 KiB take 64 KiB.
+    #[test]
+    fn table_cbvs_read_zeros_past_their_size() {
+        let test = "draw::tests::table_cbvs_read_zeros_past_their_size";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let reader = Reader::new(host, ReaderView::TableCbv);
+        let heap = TestHeap::views(16);
+        let title = crate::descriptor::heap(heap.0);
+        let views = title.host().unwrap();
+        let src = TitleBuffer::new(1 << 20);
+        src.set_words(pattern);
+        let written = TitleBuffer::new(1 << 17);
+        written.set_words(pattern);
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            slot: 0,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+        }];
+        let list = host.new_list().unwrap();
+        // What an earlier recording left in the list's scratch memory (a
+        // list not running keeps its chunks through a reset).
+        const STALE: u64 = 1 << 20;
+        let (_, stale) = list.scratch(STALE).unwrap();
+        // SAFETY: `STALE` bytes of the list's mapped scratch memory.
+        unsafe { stale.write_bytes(0xff, STALE as usize) };
+        list.close();
+        list.reset();
+        let mut state = state(heap.0);
+        heaps(&mut state, &list);
+        let bind = |state: &mut State, index: u64, address: u64, bytes: u32| {
+            let handle = title.start + index * 32;
+            let desc = [address as u32, (address >> 32) as u32, bytes, 0];
+            crate::descriptor::create_cbv(std::ptr::null(), &desc, handle);
+            state.set_table(true, 0, handle);
+            let made = state.tables(&list, &used, true).unwrap();
+            assert_eq!(made.len(), 1);
+            (made[0].1 / 32) & !xtp_shader::emit::REMAPPED_SLOT
+        };
+        let scratch_at = |list: &HostList| list.scratch(256).unwrap().0;
+
+        // 32 bytes through scratch memory.
+        let scratch = bind(&mut state, 0, src.address(), 32);
+
+        // 32 bytes copied on the GPU, into memory of the list's own that a
+        // longer copy (a root CBV's) filled first.
+        let at = written.address() + 4096 + 16;
+        written.shadow().gpu_writes(&list, at, 4);
+        state.root_cbv(&list, at).unwrap();
+        assert_eq!(state.own.gpu.len(), 1);
+        assert_eq!(state.own.copied, CBV_SPAN);
+        (state.own.gpu[0].used, state.own.copied) = (0, 0);
+        state.cbv_copies.clear();
+        let copied = bind(&mut state, 1, at, 32);
+        assert_eq!(state.own.copied, 32, "copied on the GPU");
+
+        // Null views, which take no scratch memory.
+        let before = scratch_at(&list);
+        let nulls = [(2, 0, 0), (3, src.address(), 0), (4, 0, 256)]
+            .map(|(index, address, bytes)| bind(&mut state, index, address, bytes));
+        assert_eq!(scratch_at(&list), before + 256, "null views take no memory");
+
+        // A view of 969,472 bytes (a size seen in a title's stale slot).
+        let before = scratch_at(&list);
+        let big = bind(&mut state, 5, src.address(), 969_472);
+        assert_eq!(
+            scratch_at(&list),
+            before + 256 + CBV_SPAN,
+            "64 KiB of scratch memory"
+        );
+
+        let slots = [scratch, copied, nulls[0], nulls[1], nulls[2], big];
+        let bytes = WORDS as u64 * 4;
+        let (out, data) = host.shared_buffer(slots.len() as u64 * bytes).unwrap();
+        // SAFETY: a live buffer.
+        let out_at = unsafe { out.GetGPUVirtualAddress() };
+        for (k, &slot) in slots.iter().enumerate() {
+            let to = out_at + k as u64 * bytes;
+            reader.dispatch(&list, Bind::Table(views.gpu_handle(slot)), to);
+        }
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: the GPU finished writing the mapped output.
+        let got = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), slots.len() * WORDS) };
+        let got = |k: usize| &got[k * WORDS..(k + 1) * WORDS];
+        assert_eq!(got(0), bounded(0, 8), "scratch: zeros past 32 bytes");
+        // Its first word is the shader's (`gpu_writes`), which wrote none:
+        // the host copy keeps its zeros there.
+        let mut want = bounded((4096 + 16) / 4, 8);
+        want[0] = 0;
+        assert_eq!(got(1), want, "GPU copy: zeros past 32 bytes");
+        for k in 2..5 {
+            assert_eq!(got(k), [0; WORDS], "null view {k}");
+        }
+        assert_eq!(got(5), bounded(0, WORDS), "the first 64 KiB");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     #[test]

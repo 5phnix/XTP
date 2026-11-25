@@ -1250,11 +1250,13 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+/// Without a description it makes a null constant view, as D3D12's does:
+/// `View::Constant(0, 0)`, which the host makes a null CBV (reads zeros),
+/// not the view the slot held before.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let [lo, hi, size, _] = words(desc).unwrap_or_default();
+    let address = u64::from(lo) | u64::from(hi) << 32;
+    record(handle, View::Constant(address, size));
 }
 
 /// Device method.
@@ -1579,6 +1581,20 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    /// A constant view made without a description is a null one, as on
+    /// D3D12: it replaces the view the slot held, which the host would
+    /// otherwise go on reading.
+    #[test]
+    fn a_constant_view_without_a_description_is_a_null_one() {
+        let null = std::ptr::null();
+        let heap = [0u64; 4]; // one 32-byte slot
+        let s0 = heap.as_ptr() as u64;
+        create_cbv(null, &[0x2000, 1, 512, 0], s0);
+        assert_eq!(view(s0), Some(View::Constant(0x1_0000_2000, 512)));
+        create_cbv(null, std::ptr::null(), s0);
+        assert_eq!(view(s0), Some(View::Constant(0, 0)));
     }
 
     #[test]
