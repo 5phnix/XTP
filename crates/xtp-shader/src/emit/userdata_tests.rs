@@ -506,6 +506,12 @@ fn root_halfword_crosses_a_dword_and_typed_access_preserves_its_value() {
             0x8002_0400,
             0xE070_0010,
             0x8002_0400,
+            0x7E08_0208,
+            0x7E0A_0209,
+            0xDC30_800C,
+            0x067D_0004, // Même adresse via la paire de VGPR.
+            0xE070_0014,
+            0x8002_0600,
             END,
         ],
     ]
@@ -515,13 +521,20 @@ fn root_halfword_crosses_a_dword_and_typed_access_preserves_its_value() {
     let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
     let Ok(host) = Host::new(false) else { return };
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
+    let mut ud = vec![0; cs.user_data_dwords() as usize];
+    let bias = cs
+        .user_data
+        .iter()
+        .find(|u| u.root == super::ROOT_UAV_BIAS)
+        .unwrap();
+    ud[bias.index as usize] = 4;
     let out = host
         .dispatch(
             &root,
             &pso,
             &Dispatch {
                 roots: vec![
-                    (0, Root::Constants(vec![0; cs.user_data_dwords() as usize])),
+                    (0, Root::Constants(ud)),
                     (
                         1,
                         Root::Table {
@@ -530,11 +543,11 @@ fn root_halfword_crosses_a_dword_and_typed_access_preserves_its_value() {
                         },
                     ),
                 ],
-                views: &[View::RawUav(6)],
+                views: &[View::RawUav(8)],
                 samplers: &[],
                 groups: [1; 3],
             },
         )
         .unwrap();
-    assert_eq!(out[0], [0xAB00_0000, 0x12, 0, 0x12AB, 0x12AB, 0]);
+    assert_eq!(out[0], [0, 0xAB00_0000, 0x12, 0, 0x12AB, 0x12AB, 0x12AB, 0]);
 }
