@@ -206,7 +206,7 @@ This covers the FP16 reduction with an opposite-row gather in
 The 23 distinct container hashes in the 20261125-000534 log all use
 `v_mbcnt_lo/hi`, previously excluded from the large-group form. The table
 gives the other relevant instructions and control flow in their disassemblies.
-A number counts static occurrences. “Mask” counts `s_bcnt1_i32_b64` and
+A number counts static occurrences. "Mask" counts `s_bcnt1_i32_b64` and
 `s_ff1_i32_b64`. The branch column counts branches to an earlier instruction.
 
 | Container | Back branches | Read first lane | Mask | LDS barriers | Read lane | Write lane |
@@ -242,6 +242,21 @@ read without an intervening `s_barrier`: `02384a60fda6f2d0` at 0x608,
 `a1bf269d5b19f025` at 0x1d4, `b8f3f7979d6bbc50` at 0x101c and
 `eae3498e6553afa8` at 0xff8. The old mixed-access check rejects each
 path regardless of whether the addresses alias.
+
+On the L4, `xtp shader-survey --host-lanes 32-32` examined the same
+26,698 programs at `1c61fa1` and `f992374`. Translations rose from
+24,433 to 24,476, including a rise from 2,266 to 2,309 compute programs.
+Matching by pack record offset and program index found all 43 former
+large-group refusals among the gains. All 24,433 previous translations
+retained their DXIL hashes. The 23 containers above each passed DXIL
+validation and D3D12 pipeline creation in isolation. The other 20 newly
+translated compute programs also passed DXIL validation.
+
+The L4 ran all 43 `emit::split_tests` cases successfully with
+`tools/cloud/run-remote.ps1 -GpuTests -Local -Packages xtp-shader -Filter split_tests`.
+GPU readbacks covered different loop counts in neighboring console waves,
+masked LDS atomics across those waves, numeric masks, and the FP16
+whole-wave section. The crate test suite passed 309 tests with 36 ignored.
 
 ### The console flow on every host
 
@@ -318,9 +333,11 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
 6. ~~One-wave LDS sharing (a group barrier before each LDS access in the
    console flow).~~
-7. Multi-wave groups without LDS: one console wave per host group (the
-   translator's ids, then direct and indirect dispatch counts).
-8. Multi-wave groups with LDS.
+7. ~~Complete multi-wave groups without LDS, including wave-local branches
+   and loops.~~ One host wave carries one console wave. Dispatch counts stay
+   the same.
+8. ~~Complete multi-wave groups with LDS.~~ All console waves in the group
+   share the allocation and rendezvous at its group barriers.
 
 ## In XTP
 
