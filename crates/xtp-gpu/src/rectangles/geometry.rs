@@ -711,6 +711,7 @@ mod tests {
             static_samplers: vec![],
             root_cbvs: vec![],
             root_srvs: vec![],
+            root_uavs: vec![],
             stride_table: false,
             run_time_buffers: 0,
         };
