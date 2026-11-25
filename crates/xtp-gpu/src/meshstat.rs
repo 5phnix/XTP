@@ -151,7 +151,7 @@ struct Range {
 pub(crate) struct Probe {
     op: Op,
     ran: bool,
-    hash: u64,
+    program: Program,
     reads: Vec<Range>,
     writes: Vec<Range>,
 }
@@ -207,10 +207,10 @@ impl Drop for Started<'_> {
             return;
         };
         let open = OPEN.with(|o| o.borrow_mut().take()).unwrap_or_default();
-        let hash = hash_of(self.pipeline);
+        let program = program_of(self.pipeline);
         if !self.ran && self.op.draws() {
             let no_pipeline = crate::pipeline::host_pipeline(self.pipeline as This).is_none();
-            stats().dropped(self.op, hash, no_pipeline);
+            stats().dropped(self.op, program, no_pipeline);
             return;
         }
         let (reads, writes) = if self.ran {
@@ -221,19 +221,36 @@ impl Drop for Started<'_> {
         list.mesh_probe(Probe {
             op: self.op,
             ran: self.ran,
-            hash,
+            program,
             reads,
             writes,
         });
     }
 }
 
-/// The program a pipeline's draws are known by: its mesh, compute or vertex
-/// shader's hash; 0 if none.
-fn hash_of(pipeline: usize) -> u64 {
-    crate::pipeline::dispatch_hash(pipeline as This)
-        .and_then(|h| u64::from_str_radix(&h, 16).ok())
-        .unwrap_or(0)
+/// What work is known by: its host pipeline's first shader (vertex, mesh
+/// or compute), or without a host pipeline the title pipeline's address,
+/// which the log's `first bind` lines give the shaders of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Program {
+    Shader(u64),
+    Pipeline(usize),
+}
+
+impl std::fmt::Display for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Program::Shader(hash) => write!(f, "{hash:016x}"),
+            Program::Pipeline(at) => write!(f, "pipeline {at:#x}"),
+        }
+    }
+}
+
+fn program_of(pipeline: usize) -> Program {
+    crate::pipeline::host_pipeline(pipeline as This)
+        .and_then(|p| p.stages.first())
+        .and_then(|s| u64::from_str_radix(&s.shader.hash, 16).ok())
+        .map_or(Program::Pipeline(pipeline), Program::Shader)
 }
 
 /// The work being recorded reads `[address, address + len)` of `shadow`.
@@ -325,7 +342,7 @@ impl Class {
 struct Writer {
     /// The host copy written (its address).
     shadow: usize,
-    hash: u64,
+    program: Program,
     submission: u64,
     /// The bytes of the view it wrote through (the world declares views of
     /// its 174 MB heap, over everything).
@@ -341,8 +358,8 @@ const FOLLOWED: u64 = 64 << 20;
 /// submission that wrote it (else a later one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Fed {
-    writer: u64,
-    reader: u64,
+    writer: Program,
+    reader: Program,
     label: &'static str,
     buffers: bool,
     same_copy: bool,
@@ -405,7 +422,7 @@ struct Verdict {
     args_here: bool,
     args_before: bool,
     /// The dispatches dropped earlier in its frame (programs).
-    dropped_before: Vec<u64>,
+    dropped_before: Vec<Program>,
     /// A first stale range: its address, bytes that differ, other views.
     first_stale: Option<(u64, usize, usize)>,
     /// The GPU output it reads (reader and label left to [`finished`]).
@@ -430,10 +447,10 @@ struct Counts {
 struct Stats {
     counts: Counts,
     /// Per class, program and kind of work: how often, since the last line.
-    top: HashMap<(Class, u64, &'static str), u64>,
+    top: HashMap<(Class, Program, &'static str), u64>,
     /// Dropped dispatches before executions without arguments that nothing
     /// ran wrote: how often, by program, since the last line.
-    culprits: HashMap<u64, u64>,
+    culprits: HashMap<Program, u64>,
     /// Draws reading GPU output (skinned vertices, culled arguments): how
     /// often, since the last line.
     fed: HashMap<Fed, u64>,
@@ -443,7 +460,7 @@ struct Stats {
     pending: HashMap<u64, Vec<Option<Verdict>>>,
     in_flight: BTreeSet<u64>,
     /// The dispatches dropped in the current frame: its number, programs.
-    dropped: (u64, Vec<u64>),
+    dropped: (u64, Vec<Program>),
     examples: [u32; CLASSES],
 }
 
@@ -459,28 +476,28 @@ fn stats() -> std::sync::MutexGuard<'static, Stats> {
 const WRITTEN_MAX: usize = 1 << 20;
 
 impl Stats {
-    fn dropped(&mut self, op: Op, hash: u64, no_pipeline: bool) {
+    fn dropped(&mut self, op: Op, program: Program, no_pipeline: bool) {
         let class = if no_pipeline {
             Class::NoPipeline
         } else {
             Class::Dropped
         };
-        self.count(class, hash, op.label());
+        self.count(class, program, op.label());
     }
 
-    fn count(&mut self, class: Class, hash: u64, label: &'static str) {
+    fn count(&mut self, class: Class, program: Program, label: &'static str) {
         self.counts.classes[class as usize] += 1;
-        *self.top.entry((class, hash, label)).or_default() += 1;
+        *self.top.entry((class, program, label)).or_default() += 1;
     }
 
-    fn note_written(&mut self, ranges: &[Range], hash: u64, submission: u64) {
+    fn note_written(&mut self, ranges: &[Range], program: Program, submission: u64) {
         if self.written.len() > WRITTEN_MAX {
             self.written.clear();
         }
         for r in ranges {
             let writer = Writer {
                 shadow: Arc::as_ptr(&r.shadow) as usize,
-                hash,
+                program,
                 submission,
                 declared: r.len,
             };
@@ -624,19 +641,19 @@ pub(crate) fn submitting(runs: &[&HostList], submission: u64) {
     for list in runs {
         for probe in list.mesh_probes().iter() {
             if !probe.ran {
-                if !s.dropped.1.contains(&probe.hash) {
-                    s.dropped.1.push(probe.hash);
+                if !s.dropped.1.contains(&probe.program) {
+                    s.dropped.1.push(probe.program);
                 }
                 verdicts.push(None);
                 continue;
             }
             if !probe.op.draws() {
-                s.note_written(&probe.writes, probe.hash, submission);
+                s.note_written(&probe.writes, probe.program, submission);
                 verdicts.push(None);
                 continue;
             }
             let v = judge(s, probe, submission, &mut cache);
-            s.note_written(&probe.writes, probe.hash, submission);
+            s.note_written(&probe.writes, probe.program, submission);
             verdicts.push(Some(v));
         }
     }
@@ -668,8 +685,8 @@ fn judge(s: &mut Stats, probe: &Probe, submission: u64, cache: &mut Compared) ->
             }
             let followed = buffers || (r.what == What::View && w.declared <= FOLLOWED);
             let fed = Fed {
-                writer: w.hash,
-                reader: 0,
+                writer: w.program,
+                reader: Program::Shader(0),
                 label: "",
                 buffers,
                 same_copy: w.shadow == shadow,
@@ -725,18 +742,18 @@ pub(crate) fn finished<'a>(submission: u64, probes: impl Iterator<Item = &'a Arc
         };
         *s.counts.ran.entry(probe.op.label()).or_default() += 1;
         let (class, detail) = classify(probe, &v);
-        s.count(class, probe.hash, probe.op.label());
+        s.count(class, probe.program, probe.op.label());
         if v.stale_aliased {
             s.counts.stale_aliased += 1;
         }
         if class == Class::NoArgsUnwritten {
-            for &hash in &v.dropped_before {
-                *s.culprits.entry(hash).or_default() += 1;
+            for &program in &v.dropped_before {
+                *s.culprits.entry(program).or_default() += 1;
             }
         }
         for fed in &v.fed {
             let fed = Fed {
-                reader: probe.hash,
+                reader: probe.program,
                 label: probe.op.label(),
                 ..*fed
             };
@@ -749,11 +766,11 @@ pub(crate) fn finished<'a>(submission: u64, probes: impl Iterator<Item = &'a Arc
             tracing::info!(
                 class = class.text(),
                 op = probe.op.label(),
-                program = format_args!("{:016x}", probe.hash),
+                program = %probe.program,
                 at = format_args!("{first:#x}"),
                 reads = probe.reads.len(),
                 stale = ?v.first_stale.map(|(a, d, w)| format!("{a:#x}: {d} bytes, {w} other views")),
-                dropped_before = ?v.dropped_before.iter().take(8).map(|h| format!("{h:016x}")).collect::<Vec<_>>(),
+                dropped_before = ?v.dropped_before.iter().take(8).map(ToString::to_string).collect::<Vec<_>>(),
                 "{detail}meshes: a case"
             );
         }
@@ -835,8 +852,8 @@ fn classify(probe: &Probe, v: &Verdict) -> (Class, String) {
 #[derive(Default)]
 pub(crate) struct Taken {
     counts: Counts,
-    top: HashMap<(Class, u64, &'static str), u64>,
-    culprits: HashMap<u64, u64>,
+    top: HashMap<(Class, Program, &'static str), u64>,
+    culprits: HashMap<Program, u64>,
     fed: HashMap<Fed, u64>,
 }
 
@@ -901,28 +918,28 @@ pub(crate) fn log(taken: Taken, frames: f64) {
         per(counts.aliased_reads),
         per(counts.unchecked),
     );
-    let mut top: Vec<((Class, u64, &'static str), u64)> = top.into_iter().collect();
+    let mut top: Vec<((Class, Program, &'static str), u64)> = top.into_iter().collect();
     top.sort_unstable_by(|a, b| a.0.0.cmp(&b.0.0).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
     let mut shown = [0; CLASSES];
-    for ((class, hash, label), n) in top {
+    for ((class, program, label), n) in top {
         let seen = &mut shown[class as usize];
         if class == Class::HasData || *seen == 6 {
             continue;
         }
         *seen += 1;
         tracing::info!(
-            "meshes per frame: {}: {label} {hash:016x}: {:.1}",
+            "meshes per frame: {}: {label} {program}: {:.1}",
             class.text(),
             per(n)
         );
     }
-    let mut culprits: Vec<(u64, u64)> = culprits.into_iter().collect();
+    let mut culprits: Vec<(Program, u64)> = culprits.into_iter().collect();
     culprits.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     if !culprits.is_empty() {
         let named: Vec<String> = culprits
             .iter()
             .take(8)
-            .map(|(hash, n)| format!("{hash:016x} {:.1}", per(*n)))
+            .map(|(program, n)| format!("{program} {:.1}", per(*n)))
             .collect();
         tracing::info!(
             "meshes per frame: dispatches dropped earlier in the frame of executions without \
@@ -947,7 +964,7 @@ pub(crate) fn log(taken: Taken, frames: f64) {
         }
         *seen += 1;
         tracing::info!(
-            "meshes per frame: GPU output of {:016x} read through {} by {} {:016x}, through {} \
+            "meshes per frame: GPU output of {} read through {} by {} {}, through {} \
              host copy, {} submission: {:.1}",
             f.writer,
             if f.buffers {
@@ -987,7 +1004,7 @@ mod tests {
     fn writer(shadow: usize, submission: u64) -> Writer {
         Writer {
             shadow,
-            hash: 0,
+            program: Program::Shader(0),
             submission,
             declared: 0,
         }
