@@ -29,6 +29,18 @@ runtime logs them). Times are UTC unless marked local. Logs are under
 - **DRED is slow on the L4**, about five times: the loss comes 24 to 41
   frames into the world, which takes a DRED session about 15 minutes of
   world there (§4).
+- **The likely cause: BLAS builds given indices past their vertices.**
+  With task ec5a7ada's check of the build inputs (4a0cdb3), the L4 ran
+  20 minutes of world, about 70 frames, without losing the device, while
+  4,096 to 8,191 BLAS builds were refused for an index past their vertices
+  (index 65401 for 529 vertices, 63487 for 105, …). Before 4a0cdb3 nothing
+  refused them, and the driver read past their vertex buffers (§5).
+- **The check now reads what the build reads** (Codex review 11f27db1,
+  §6): on the GPU, after every write of the submission before the build,
+  instead of title memory when the build is recorded. Two more defects of
+  the review are fixed: a batch entry that recorded no build no longer
+  skips the next build's UAV barrier, and a TLAS whose empty-TLAS stand-in
+  cannot be made is refused instead of naming a null BLAS.
 
 ## 2. Device-removed data in XTP
 
@@ -117,6 +129,8 @@ ec5a7ada's builder verdict; world 32 s after the start, removal 14:01:38):
 | dred-12-b | this branch (1b24311) | on, with contexts | 13:54:09, frame 2421 | about 15 (16–24 s a frame) | no, stopped at 420 s |
 | dred-12-long | this branch (1b24311) | on, with contexts | 14:01:26, frame 2567 | about 50 (about 20 s a frame) | **yes**, removed 14:18:14 |
 | nodred-main | main 81aeecd (with the CBV cap) | off | 14:23:10, frame 2933 | about 115 (0.3 to 0.9 fps) | **yes**, removed 14:25:08, 2 lists in flight |
+| debug-gbv-main | main 81aeecd | off; D3D12 debug layer and GPU-based validation | 14:31:25, frame 2028 | about 40 s | no: ended by a CPU fault in title code (+0x23cf683, a write at 0), as cxstrideon2-both did |
+| dred-markers-l4 | this branch at 3706ba2 (4a0cdb3's build markers and input checks) | on | 14:38:25, frame 2400 | about 70 in 20 minutes | **no**; ended by a breakpoint exception in title code (+0x63966f) |
 
 Without DRED the L4 runs the world at 0.3 fps (3.5 s a frame); with it,
 0.1 fps, and about 0.05 fps with breadcrumb contexts. Both the time spent
@@ -149,7 +163,98 @@ The PC and the L4 lose the device the same way: list 0, a host build
 without a marker, then dispatches of 969c1cef8b783b39. On the L4 the build
 had the constant buffer view cap (760ec60); on the PC it did not.
 
-## 5. Checked
+## 5. Indices past their vertices
+
+`dred-markers-l4` ran this branch at 3706ba2, which holds task ec5a7ada's
+work (4a0cdb3): a DRED marker on every host DXR build, copy and instance
+rewrite, and a check of each BLAS's inputs before its build is recorded
+(`E:\xtp-data\cloud-runs\20261125-153431-game`).
+
+- The device was not lost in 20 minutes of world, about 70 frames; every
+  earlier L4 session lost it 24 to 115 frames in (§4).
+- The input check refused 4,096 to 8,191 BLAS builds (its log is at powers
+  of two) for an index past the geometry's vertices, from the world's
+  first seconds on: index 65401 at 0x64052dc90 for 529 vertices, 63487 for
+  105, 65405 for 5195, 56504 for 210, 51200 for 240, 63488 for 349. Values
+  like 0xFF79, 0xF7FF or 0xF800 are not indices of such small meshes: the
+  title memory read when the build was recorded either did not hold the
+  indices yet, or held another kind of data.
+- The run ended on a breakpoint exception in title code, not on the GPU.
+
+So the hangs came, most likely, from BLAS builds whose index buffers held
+such values when the GPU ran them: DXR leaves an index past `VertexCount`
+undefined, and the driver then reads far past the vertex buffer, in the
+host copy's heap, without faulting. The debug layer and GPU-based
+validation said nothing about these builds (`debug-gbv-main`): neither
+checks index values.
+
+The check of 4a0cdb3 read title memory when the build was recorded, while
+the build reads the host copy, refreshed at submission and possibly
+written by a copy or a shader of the same submission before the build
+(Codex review 11f27db1, P1-2). §6 moves it to the GPU.
+
+## 6. Fixes (Codex review 11f27db1)
+
+- **P1-2, the indices a build reads** (`rt/indices.rs`, `indices.hlsl`):
+  before each BLAS build with indices, a pass of ours copies each indexed
+  geometry's indices, as 32-bit ones, into a buffer of the build's own,
+  after a UAV barrier that orders every earlier write of the submission.
+  An index past its geometry's vertices raises the build's flag, and then
+  every index of the build becomes 0: degenerate triangles, which DXR
+  leaves inactive, so the build takes none of them. The build reads that
+  buffer. The flag is copied to a read-back word and logged once the
+  submission has run ("host DXR BLAS input refused on the GPU"). The CPU
+  read of title memory at recording is gone (it also allocated and read a
+  whole index buffer per build, Codex P2-5). Shortcut: a refused build
+  still takes the triangles of its geometries without indices.
+- **P1-1, a missing barrier in a batch**: `build_one` tells apart a
+  structure published and a build recorded (`Mirrored`); a batch orders
+  its next entry by the second. A TLAS of no instance is the shared empty
+  TLAS, records no build, and leaves the next entry its own barrier.
+- **P1-3, a TLAS without its stand-in**: when the empty TLAS and its
+  stand-in BLAS cannot be made, the title's TLAS is refused and logged,
+  instead of being built with no instance or with a null BLAS for an
+  instance of a BLAS the host does not have.
+- **P1-2, buffers left in the unordered-access state**: no change. The
+  title's shaders write host copies through GPU addresses (root views) or
+  heap views, which D3D12 does not tie to a resource: no state change is
+  recorded, the copy stays in the common state for D3D12, and the build
+  reads it by implicit promotion. What orders those writes before the
+  build is the UAV barrier, which P1-1 restores where it was skipped and
+  which the index pass records itself.
+- **`XTP_D3D12_DRED=0`** (or empty) now leaves device-removed data off;
+  the variable's presence alone turned it on.
+- **`XTP_RT_BUILDS=0`** refuses the title's builds, copies and
+  rehydrations but keeps the empty TLAS and the trace commands: a trace
+  binds the empty TLAS and every ray misses, as on the console with an
+  empty structure (task ac895e39's traces were dropped under 4a0cdb3).
+
+## 7. Tests
+
+In `rt/tests.rs` (GPU tests, through `testgpu`):
+
+- `rt_indices_are_checked_as_the_build_reads_them`: a GPU copy in the
+  build's list writes the indices' host copy before the build. Valid in
+  title memory but made invalid by the copy, the build takes no triangle
+  and every ray misses; invalid in title memory but made valid by the
+  copy, the BLAS is built and hit (4a0cdb3 refused it).
+- `rt_a_tlas_of_no_instance_leaves_the_next_build_its_barrier` and
+  `rt_a_tlas_without_its_stand_in_is_refused` (P1-1, P1-3; the stand-in's
+  failure is simulated per thread).
+- `rt_builds_off_keeps_the_empty_tlas_and_traces_miss`.
+- `rt_blas_of_known_bounds_from_title_memory` (watch item 497, Leonida
+  #1816's fixture, reimplemented): a triangle with bounds (−5, 0, 1) to
+  (4, 8, 9), its vertices and indices in title buffers, then in title
+  memory outside any buffer object across a 4 MiB window boundary (XTP's
+  loose window copies), built twice with the title's CPU moving it by 1
+  along z in between; eight rays near its edges read the distances and
+  misses each build must give. It passes: address translation and the
+  refreshed copy are right on both paths, before any title geometry.
+
+In `dred.rs`: the marker pairing by order, the report's texts, the
+switches.
+
+## 8. Checked
 
 - **The loop budget** (`XTP_SHADER_LOOP_BUDGET`): on by default, 2^20 back
   edges per lane across all of a lane's loops (`DEFAULT_LOOP_BUDGET`,
