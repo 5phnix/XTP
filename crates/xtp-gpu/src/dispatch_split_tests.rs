@@ -77,15 +77,20 @@ fn every_group_runs_once_with_its_guest_id() {
             // SAFETY: tampons mappés, descriptions bornées, objets vivants jusqu’à drain().
             unsafe {
                 std::ptr::copy_nonoverlapping(dims.as_ptr(), mapped.cast(), 3);
-                let heap: ID3D12DescriptorHeap = host
-                    .device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: 1,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-                    .unwrap();
+                let [views, samplers]: [ID3D12DescriptorHeap; 2] = [
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                ]
+                .map(|kind| {
+                    host.device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: kind,
+                            NumDescriptors: 1,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
+                        .unwrap()
+                });
                 let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                     Format: DXGI_FORMAT_R32_TYPELESS,
                     ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -101,7 +106,7 @@ fn every_group_runs_once_with_its_guest_id() {
                     &output,
                     None,
                     Some(&desc),
-                    heap.GetCPUDescriptorHandleForHeapStart(),
+                    views.GetCPUDescriptorHandleForHeapStart(),
                 );
                 if indirect {
                     let scratch = Expanded::reserve(&mut held, &list, 1).unwrap();
@@ -116,7 +121,7 @@ fn every_group_runs_once_with_its_guest_id() {
                     indirect::ready(&list, &scratch.buffer);
                 }
                 let l = &list.list;
-                l.SetDescriptorHeaps(&[Some(heap.clone())]);
+                l.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
                 l.SetComputeRootSignature(&p.root);
                 l.SetPipelineState(&p.pso);
                 l.SetComputeRoot32BitConstants(param, dwords, user.as_ptr().cast(), 0);
