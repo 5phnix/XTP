@@ -164,6 +164,14 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// Where a dispatch of its program, spliced with an inline ray query,
+    /// finds the title's descriptor of the structure the walk read
+    /// (`xtp_shader::emit::tlas_descriptor`): only the few trace programs
+    /// whose translation reads the host TLAS ask, once per dispatch.
+    pub(crate) fn tlas_descriptor(&self) -> Option<xtp_shader::emit::TlasDescriptor> {
+        xtp_shader::emit::container_tlas_descriptor(&self.container)
+    }
 }
 
 /// The translation of `container` for the host's wave sizes

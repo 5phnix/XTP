@@ -897,18 +897,18 @@ fn root_srv_direct(list: &HostList, address: u64) -> Option<u64> {
 }
 
 /// Why a dispatch of a program spliced with an inline ray query (RT phase
-/// 2b) does not run: it reads the host TLAS at the reserved root SRV, and
-/// nothing binds one there before RT phase 2c (`docs/analysis/rt-dxr.md`
-/// section 8, `xtp_gpu::rt::host_tlas`).
-const NO_HOST_TLAS: &str = "rt: no host TLAS";
+/// 2b, its root SRV at [`xtp_shader::emit::TLAS_REGISTER`]) does not run:
+/// the title's view of the structure its walk read is not where the walk
+/// read it (`Shader::tlas_descriptor`): no descriptor table bound at that
+/// root parameter, or no view at that offset of it.
+const NO_TLAS_VIEW: &str = "rt: no title view of the structure";
 
-/// Whether `p` reads the host TLAS ([`xtp_shader::emit::TLAS_REGISTER`]).
-fn reads_tlas(p: &HostPipeline) -> bool {
-    use xtp_shader::emit::TLAS_REGISTER;
-    p.stages
-        .iter()
-        .any(|s| s.root_srvs.iter().any(|r| r.0 == TLAS_REGISTER))
-}
+/// Why it does not run either: the host has no TLAS for the structure the
+/// view names that this recording may read (`rt::descriptor_tlas`): none
+/// built, or built in a list not submitted yet. A direct dispatch dropped
+/// for either is one of a trace program without a host pipeline, as before
+/// the splice ([`State::rt_dropped`]).
+const NO_HOST_TLAS: &str = "rt: no host TLAS";
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
@@ -1501,9 +1501,6 @@ impl State {
         compute: bool,
         limits: [u32; 3],
     ) -> Result<(), &'static str> {
-        if reads_tlas(p) {
-            return Err(NO_HOST_TLAS);
-        }
         #[cfg(feature = "diagnostics")]
         list.twin_reader(&p.name);
         // Depth planes whose twins shaders of the list wrote are drawn
@@ -1698,6 +1695,11 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    // Not a title root view: the host TLAS of a spliced walk.
+                    if srv && slot == xtp_shader::emit::TLAS_REGISTER {
+                        self.bind_tlas(list, stage, param, compute)?;
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::root_srv_in_table(slot);
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -2197,6 +2199,50 @@ impl State {
         Some(counts)
     }
 
+    /// Binds at root parameter `param`, a root SRV, the host TLAS a program
+    /// spliced with an inline ray query reads
+    /// ([`xtp_shader::emit::TLAS_REGISTER`]): the one the host built for the
+    /// structure the title's view names, the view where the program's walk
+    /// read it ([`State::tlas_view`]). `rt::descriptor_tlas` pins it for the
+    /// recording and gives it only once its build is recorded earlier in
+    /// this list or submitted. Why not if it cannot be (the dispatch is
+    /// dropped).
+    fn bind_tlas(
+        &mut self,
+        list: &HostList,
+        stage: &crate::pipeline::host::Stage,
+        param: u32,
+        compute: bool,
+    ) -> Result<(), &'static str> {
+        let handle = self.tlas_view(stage, compute).ok_or(NO_TLAS_VIEW)?;
+        let gpu = crate::rt::descriptor_tlas_in(list, handle).ok_or(NO_HOST_TLAS)?;
+        if compute {
+            self.compute_root(list, param, ComputeRoot::Srv(gpu));
+        } else {
+            // SAFETY: an open list, which keeps the structure.
+            unsafe { list.list.SetGraphicsRootShaderResourceView(param, gpu) };
+        }
+        Ok(())
+    }
+
+    /// The title's view of the structure a spliced program's walk reads:
+    /// the descriptor at its site's offset in the table bound at the root
+    /// parameter whose address the site's user SGPR holds
+    /// (`Shader::tlas_descriptor`), in a heap the list has bound.
+    fn tlas_view(&self, stage: &crate::pipeline::host::Stage, compute: bool) -> Option<u64> {
+        self.tlas_view_at(stage.shader.tlas_descriptor()?, compute)
+    }
+
+    /// [`State::tlas_view`] where `d` says.
+    fn tlas_view_at(&self, d: xtp_shader::emit::TlasDescriptor, compute: bool) -> Option<u64> {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(d.slot)) else {
+            return None;
+        };
+        let handle = table.checked_add(u64::from(d.offset))?;
+        self.heap_of(handle)?;
+        Some(handle)
+    }
+
     /// Binds a root SRV as a one-view table (see
     /// [`crate::pipeline::host::bounded_root_srvs`] and
     /// [`State::root_srv_slot`]). Why not if it cannot be (the draw is
@@ -2522,14 +2568,6 @@ impl State {
             self.dispatch_dropped(Unready::NoPipeline);
             return;
         }
-        // A program spliced with an inline ray query: dropped as one
-        // without a host pipeline is, the RT stand-in included, until the
-        // host TLAS is bound ([`NO_HOST_TLAS`]).
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| reads_tlas(&p)) {
-            self.rt_dropped(list, crate::rt_standin::Work::Groups([x, y, z]));
-            self.dispatch_dropped(NO_HOST_TLAS.into());
-            return;
-        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -2548,6 +2586,9 @@ impl State {
             return;
         }
         if let Err(why) = self.bind(list, p, true, limits) {
+            if why == NO_TLAS_VIEW || why == NO_HOST_TLAS {
+                self.rt_dropped(list, crate::rt_standin::Work::Groups([x, y, z]));
+            }
             self.dispatch_dropped(why.into());
             return;
         }
@@ -7308,6 +7349,29 @@ float4 ps(V v) : SV_Target { return v.color; }
 
         state.set_root_signature(true, std::ptr::null());
         assert!(state.compute.is_empty());
+    }
+
+    /// A spliced program's dispatch finds the title's view of its structure
+    /// at the descriptor's offset in the table bound at its root parameter,
+    /// in a bound heap: none without a table there (another stage's, root
+    /// constants), and none past the heap's end.
+    #[test]
+    fn the_tlas_view_is_in_the_table_the_walk_read() {
+        let heap = TestHeap::views(16);
+        let title = crate::descriptor::heap(heap.0);
+        let mut state = state(heap.0);
+        let d = xtp_shader::emit::TlasDescriptor {
+            slot: 2,
+            offset: 0x20,
+        };
+        assert_eq!(state.tlas_view_at(d, true), None);
+        state.set_table(true, 2, title.start + 3 * 32);
+        assert_eq!(state.tlas_view_at(d, true), Some(title.start + 4 * 32));
+        assert_eq!(state.tlas_view_at(d, false), None);
+        state.set_table(true, 2, title.start + 15 * 32);
+        assert_eq!(state.tlas_view_at(d, true), None);
+        state.set_constants(true, 2, &[1], 0);
+        assert_eq!(state.tlas_view_at(d, true), None);
     }
 
     /// A title heap released while a list records and another made at its
