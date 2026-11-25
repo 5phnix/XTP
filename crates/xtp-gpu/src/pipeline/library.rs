@@ -51,6 +51,13 @@
 //!   description (StorePipeline refuses a name it holds, so before this the
 //!   pipeline was compiled again in every session) gets the pipeline under
 //!   an alternate name ([`SLOTS`]), which the next session loads.
+//! - Such a name is remembered as broken in the names file: the precook
+//!   answers a pipeline by its names only when one of them is held and not
+//!   known to fail, and otherwise makes it (under the next name), so that
+//!   a pipeline a load refused is not counted ready again. What no process
+//!   has loaded yet cannot be known to fail without a load: the session
+//!   that first finds such an entry makes the pipeline beside it and says
+//!   so in the names file, and the precooks after it count it no more.
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -151,6 +158,23 @@ impl Library {
         }
     }
 
+    /// A load of `name` for the description of that name loaded (`ok`), or
+    /// failed: the name is held and mended, or marked broken if it is known
+    /// to be held (a load also fails for a name the library does not hold,
+    /// which a library read without its names may not know of).
+    fn loaded(&self, name: &str, ok: bool) {
+        let mut names = self.names.write().unwrap_or_else(|e| e.into_inner());
+        let changed = if ok {
+            let held = names.held.insert(name.to_owned());
+            names.broken.remove(name) | held
+        } else {
+            names.held.contains(name) && names.broken.insert(name.to_owned())
+        };
+        if changed {
+            self.names_changed.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Stores `pso` under the first of `slots` (its names, [`slot`]) that
     /// does not hold an entry this pipeline's description fails to load
     /// from: `failed` says the slots whose load failed here. A slot the
@@ -185,6 +209,8 @@ impl Library {
                     if !failed {
                         return;
                     }
+                    // Held, and its load failed here: another entry.
+                    self.loaded(name, false);
                 }
                 Err(e) => {
                     tracing::debug!(name, error = %e, "host pipeline not stored");
@@ -220,21 +246,29 @@ impl FileId {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Names {
     held: HashSet<String>,
+    /// Of `held`, the names whose entry did not load for the description
+    /// of that name when a process last loaded it (another description's
+    /// entry, or one the driver refuses).
+    broken: HashSet<String>,
     /// `held` is every name the library holds: it started empty, or its
     /// names file said so. Otherwise a name not in it may still be there.
     complete: bool,
 }
 
-/// The names file beside the library, and its first line.
+/// The names file beside the library, and its first line. Version 2 marks
+/// broken names ([`Names::broken`]); version 1, which did not, is read too.
 const NAMES_FILE: &str = "host-pipelines.names";
-const NAMES_FORMAT: &str = "xtp pipeline names 1";
+const NAMES_FORMAT: &str = "xtp pipeline names 2";
+const NAMES_FORMAT_1: &str = "xtp pipeline names 1";
+/// After a broken name in the names file.
+const BROKEN: &str = " broken";
 
 impl Names {
     /// The names of a library that holds none.
     fn empty() -> Names {
         Names {
-            held: HashSet::new(),
             complete: true,
+            ..Names::default()
         }
     }
 
@@ -243,9 +277,13 @@ impl Names {
         Names::default()
     }
 
-    /// Whether the library holds some name of the pipeline named `name`.
-    fn hold_any(&self, name: &str) -> bool {
-        (0..SLOTS).any(|k| self.held.contains(&slot(name, k)))
+    /// Whether the library holds some name of the pipeline named `name`
+    /// that is not known to fail to load ([`Names::broken`]): what the
+    /// precook answers without loading ([`without_loading`]).
+    fn ready_any(&self, name: &str) -> bool {
+        (0..SLOTS)
+            .map(|k| slot(name, k))
+            .any(|n| self.held.contains(&n) && !self.broken.contains(&n))
     }
 
     /// The names file of a library file `file` holding these names.
@@ -260,6 +298,9 @@ impl Names {
         );
         for name in held {
             text.push_str(name);
+            if self.broken.contains(name) {
+                text.push_str(BROKEN);
+            }
             text.push('\n');
         }
         text
@@ -269,7 +310,11 @@ impl Names {
     /// `blob`; `None` if it is another file's (or not a names file).
     fn read(text: &str, blob: &[u8]) -> Option<(Names, FileId)> {
         let mut lines = text.lines();
-        (lines.next()? == NAMES_FORMAT).then_some(())?;
+        let marks = match lines.next()? {
+            NAMES_FORMAT => true,
+            NAMES_FORMAT_1 => false,
+            _ => return None,
+        };
         let mut head = lines.next()?.strip_prefix("library ")?.split(' ');
         let bytes: u64 = head.next()?.parse().ok()?;
         let hash = head.next()?;
@@ -284,10 +329,22 @@ impl Names {
         // Hashed only once the size agrees: some 0.5 s per GiB.
         let file = FileId::of(blob);
         (blake3::Hash::from(file.blake3).to_hex().as_str() == hash).then_some(())?;
-        let held = lines
-            .map(|line| is_name(line).then(|| line.to_owned()))
-            .collect::<Option<HashSet<String>>>()?;
-        Some((Names { held, complete }, file))
+        let mut names = Names {
+            complete,
+            ..Names::default()
+        };
+        for line in lines {
+            let (name, broken) = match line.strip_suffix(BROKEN) {
+                Some(name) if marks => (name, true),
+                _ => (line, false),
+            };
+            is_name(name).then_some(())?;
+            if broken {
+                names.broken.insert(name.to_owned());
+            }
+            names.held.insert(name.to_owned());
+        }
+        Some((names, file))
     }
 }
 
@@ -557,7 +614,7 @@ fn found_in(
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .names()
-            .hold_any(name)
+            .ready_any(name)
     {
         KNOWN.fetch_add(1, Ordering::Relaxed);
         return Ok((stand_in.0.clone(), Source::Known));
@@ -597,12 +654,16 @@ fn found_in(
         for k in ours {
             match load(&l.library, PCWSTR(slots[k].1.as_ptr())) {
                 Ok(pso) => {
-                    // Learned, when the names were not all known.
-                    l.hold(&slots[k].0);
+                    // Learned, when the names were not all known, and
+                    // mended if a load failed before.
+                    l.loaded(&slots[k].0, true);
                     loaded = Some((pso, Source::Library));
                     break;
                 }
-                Err(_) => failed[k] = true,
+                Err(_) => {
+                    failed[k] = true;
+                    l.loaded(&slots[k].0, false);
+                }
             }
         }
         if loaded.is_none()
@@ -631,6 +692,20 @@ fn found_in(
     l.store(&slots, &failed, &pso);
     keep_stand_in(&pso);
     Ok((pso, Source::Made))
+}
+
+/// For tests: whether `pso` is the stand-in [`without_loading`] answers
+/// for a pipeline the library's names hold.
+#[cfg(test)]
+pub(crate) fn is_stand_in(pso: &ID3D12PipelineState) -> bool {
+    STAND_IN.get().is_some_and(|s| s.0 == *pso)
+}
+
+/// For tests: whether this process has a pipeline library (none: every
+/// pipeline is made, and [`without_loading`] answers none by its name).
+#[cfg(test)]
+pub(crate) fn has_library() -> bool {
+    library().is_some()
 }
 
 /// Keeps `pso` as the stand-in [`without_loading`] answers, if none is.
@@ -1260,11 +1335,22 @@ mod tests {
         let a = "0123456789abcdef0123456789abcdef";
         let names = Names {
             held: [a.to_owned(), format!("{a}~1")].into(),
+            broken: [a.to_owned()].into(),
             complete: true,
         };
         let file = FileId::of(&blob);
         let text = names.text(&file);
         assert_eq!(Names::read(&text, &blob), Some((names.clone(), file)));
+        // A file of the first version marks none broken, and its marks are
+        // no names.
+        let first = text.replace(NAMES_FORMAT, NAMES_FORMAT_1);
+        assert_eq!(Names::read(&first, &blob), None, "a mark in version 1");
+        let first = first.replace(BROKEN, "");
+        let unmarked = Names {
+            broken: HashSet::new(),
+            ..names.clone()
+        };
+        assert_eq!(Names::read(&first, &blob), Some((unmarked, file)));
         let partial = Names {
             complete: false,
             ..names.clone()
@@ -1286,7 +1372,17 @@ mod tests {
         assert_eq!(Names::read("", &blob), None);
         assert!(is_name(a) && is_name(&format!("{a}~3")));
         assert!(!is_name(&format!("{a}~0")) && !is_name(&a.to_uppercase()) && !is_name("a"));
-        assert!(names.hold_any(a) && !names.hold_any(&a.replace('0', "f")));
+        assert!(names.ready_any(a) && !names.ready_any(&a.replace('0', "f")));
+        // Ready by a name held and not broken only.
+        let only_broken = Names {
+            held: [a.to_owned()].into(),
+            ..names.clone()
+        };
+        assert!(!only_broken.ready_any(a), "its one name is broken");
+        assert_eq!(
+            Names::read(&format!("{text}{a}~2{BROKEN}{BROKEN}\n"), &blob),
+            None
+        );
     }
 
     /// An entry of a pipeline's name that does not load for its
@@ -1362,14 +1458,16 @@ mod tests {
         let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
         let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
 
-        // Read with its names: held, so not loaded; another is made.
+        // Read with its names: held, so not loaded; another is made. (The
+        // count is the process's: other tests' precooks, the replay's,
+        // may add to it meanwhile. `Source::Known` says this ask's.)
         let known = KNOWN.load(Ordering::Relaxed);
         let named = RwLock::new(open(&device, blob.clone(), Some(&text)).unwrap());
         assert_eq!(
             without_loading(|| ask(&named, &host.device, &a, name_a)),
             Source::Known
         );
-        assert_eq!(KNOWN.load(Ordering::Relaxed) - known, 1);
+        assert!(KNOWN.load(Ordering::Relaxed) > known, "counted");
         assert_eq!(
             without_loading(|| ask(&named, &host.device, &b, name_b)),
             Source::Made
@@ -1404,5 +1502,93 @@ mod tests {
             (learned.held, learned.complete),
             ([name_a.to_owned()].into(), false)
         );
+    }
+
+    /// The Codex review of 12556d6: the precook answered a pipeline by any
+    /// name the library held, before the driver, even one whose entry does
+    /// not load for its description. A load that fails now marks the name
+    /// broken, in the names file too, and the precook does not answer by a
+    /// broken name: it makes the pipeline under the next one, by which it
+    /// answers from then on.
+    #[test]
+    fn the_precook_does_not_answer_by_a_broken_name() {
+        let test = "pipeline::library::tests::the_precook_does_not_answer_by_a_broken_name";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let (a, b) = (kernel(&host.device, 3), kernel(&host.device, 7));
+        let name = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+        let dir = tempfile::tempdir().unwrap();
+        let saved = |library: &RwLock<Library>| {
+            let wrote = write_library(library, dir.path(), true, |_| Ok(true));
+            assert!(!matches!(wrote, Saved::Failed(_)), "{wrote:?}");
+            let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
+            let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
+            (blob, text)
+        };
+        // The library's entry of the name is another description's.
+        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        assert_eq!(ask(&library, &host.device, &a, name), Source::Made);
+        let (blob, text) = saved(&library);
+
+        // A session's load of `b` by that name fails, and its compile too
+        // (nothing goes under the next name): the names file says broken.
+        let session = RwLock::new(open(&device, blob.clone(), Some(&text)).unwrap());
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a copy of a live root signature, not released by the
+            // description.
+            pRootSignature: unsafe { std::mem::transmute_copy(&b.root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.code.as_ptr().cast(),
+                BytecodeLength: b.code.len(),
+            },
+            ..Default::default()
+        };
+        let refused = crate::testgpu::expect_layer_errors(|| {
+            found_in(
+                &session,
+                name,
+                // SAFETY: the description points at live data.
+                |l, name| unsafe { l.LoadComputePipeline(name, &desc) },
+                || Err(windows::Win32::Foundation::E_FAIL.into()),
+            )
+        });
+        assert!(refused.is_err());
+        let (blob, text) = saved(&session);
+        let (names, _) = Names::read(&text, &blob).expect("its names");
+        assert_eq!(names.broken, [name.to_owned()].into(), "{text}");
+        assert!(!names.ready_any(name));
+
+        // The precook does not answer by it: it loads, then makes `b`,
+        // under the next name.
+        let precook = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let made = crate::testgpu::expect_layer_errors(|| {
+            without_loading(|| ask(&precook, &host.device, &b, name))
+        });
+        assert_eq!(made, Source::Made, "not answered by a broken name");
+        assert_eq!(
+            without_loading(|| ask(&precook, &host.device, &b, name)),
+            Source::Known,
+            "by the next name"
+        );
+        let (blob, text) = saved(&precook);
+        let (names, _) = Names::read(&text, &blob).expect("its names");
+        assert_eq!(
+            (names.held, names.broken),
+            (
+                [name.to_owned(), slot(name, 1)].into(),
+                [name.to_owned()].into()
+            )
+        );
+
+        // A session after it loads `b` by the next name; `a` still loads
+        // by its own, which mends it.
+        let next = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let found = crate::testgpu::expect_layer_errors(|| ask(&next, &host.device, &b, name));
+        assert_eq!(found, Source::Library);
+        assert_eq!(ask(&next, &host.device, &a, name), Source::Library);
+        assert!(next.read().unwrap().names().broken.is_empty(), "mended");
     }
 }
