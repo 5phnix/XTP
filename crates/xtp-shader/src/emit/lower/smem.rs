@@ -17,6 +17,19 @@ use crate::resource::{Address, CODE, Role, Site, Source};
 /// tiling) holds as data: [`Lower::descriptor_data`] rebuilds only sizes.
 pub(super) const DESCRIPTOR_WORD: Why = "a descriptor's address or format read as data";
 
+/// What [`Lower::unused_descriptor`] finds a descriptor load to be.
+enum Unused<'a> {
+    /// No dword has a host value ([`DESCRIPTOR_WORD`]): a join takes it as
+    /// undefined on the load's edge (`flow.rs`), a direct read stops.
+    Dead,
+    /// An image the program measures: a 2D texture, an unordered one where
+    /// the entry says so.
+    Image { uav: bool },
+    /// A buffer the program tests by its record count, viewed as its entry
+    /// says.
+    Buffer { used: &'a UsedResource },
+}
+
 /// How many scalar ALU operations back [`Lower::same_scalar`] compares two
 /// computed numbers.
 const SAME_SCALAR_DEPTH: u32 = 8;
@@ -109,10 +122,13 @@ impl<'a> Lower<'a> {
         // shortcut: with no entry, a slot that holds a constant buffer view
         // is read raw too (VIctory #1409's rule), and WARP removes its
         // device on that, as on a constant-buffer handle over a raw or
-        // structured view (`emit::smem_tests`). The run-time choice by the
-        // slot's kind needs the stride table of task 84451453, as
-        // fxceless's fork does it, or host slots of the title's constant
-        // buffers made as raw views.
+        // structured view (`emit::smem_tests`). On a target with the
+        // runtime stride table the raw read goes through the table's raw
+        // view: such a slot holds no buffer view there and reads 0, which
+        // the device survives, but not the constants. Reading them needs
+        // the slot's kind at run time (a constant-buffer entry in the
+        // table), or host slots of the title's constant buffers made as
+        // raw views.
         let raw = match kind {
             Some(u) if u.kind == ResourceType::Srv => Some(11),
             Some(u) if u.kind == ResourceType::Uav => Some(11 | 0x1000),
@@ -132,12 +148,7 @@ impl<'a> Lower<'a> {
             let c = l.cur;
             let mut xs = Vec::new();
             if let Some(kind) = raw {
-                let h = l.handle(site, src, false, (kind, 0))?;
-                // The console ignores the two low bits of the address. Past
-                // the view's end each dword reads 0 (D3D12's bounds check of
-                // a buffer view, one dword per load), as on the console past
-                // the record count: a host view made from the title's covers
-                // the same bytes (`descriptor/host.rs`).
+                // The console ignores the two low bits of the address.
                 let addr = match constant {
                     Some(byte) if byte & 3 == 0 => addr,
                     Some(byte) => l.s.m.i32(byte & !3),
@@ -146,6 +157,41 @@ impl<'a> Lower<'a> {
                         l.s.m.bin(c, Bin::And, addr, dword)
                     }
                 };
+                if l.raw_through_table(src) {
+                    // Through the runtime stride table's raw view, as the
+                    // slot's vector accesses by offset read it (`buffer.rs`):
+                    // the slot's own view for a raw one, a raw view of the
+                    // same bytes for a structured or typed one, whose slot
+                    // may hold no view the host could make (the Codex review
+                    // of rawfix, P1). Each dword past the view's bytes, or
+                    // where the table names no buffer view, reads 0.
+                    for k in 0..count {
+                        let off = l.s.m.i32(4 * k);
+                        let a = l.s.m.bin(l.cur, Bin::Add, addr, off);
+                        let x = l.runtime_access(src, None, a, 4, kind, |l, h, byte| {
+                            let c = l.cur;
+                            let mask = l.s.m.i8(1);
+                            let (u, al) = (l.s.m.undef(l.s.t.i32), l.s.m.i32(4));
+                            let r = l.s.op(
+                                c,
+                                "rawBufferLoad.f32",
+                                Attr::ReadOnly,
+                                l.s.t.res_ret,
+                                139,
+                                &[h, byte, u, mask, al],
+                            );
+                            let x = l.s.m.extract(c, r, 0);
+                            Ok(vec![l.as_int(x)])
+                        })?;
+                        xs.push(x[0]);
+                    }
+                    return Ok(xs);
+                }
+                let h = l.handle(site, src, false, (kind, 0))?;
+                // Past the view's end each dword reads 0 (D3D12's bounds
+                // check of a buffer view, one dword per load), as on the
+                // console past the record count: a host view made from the
+                // title's covers the same bytes (`descriptor/host.rs`).
                 for k in 0..count {
                     let off = l.s.m.i32(4 * k);
                     let a = l.s.m.bin(c, Bin::Add, addr, off);
@@ -213,7 +259,12 @@ impl<'a> Lower<'a> {
     /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
     /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count:
     /// elements of a structured or typed view, bytes of a raw one, as
-    /// [`Self::record_count_view`] asks for them).
+    /// [`Self::record_count_view`] asks for them, or as the runtime stride
+    /// table holds them where the buffer's accesses go through it).
+    ///
+    /// The view's kind comes from how the program uses the descriptor
+    /// (its own access, or a twin load's), else from what the load is:
+    /// [`Self::unused_descriptor`].
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
@@ -265,8 +316,9 @@ impl<'a> Lower<'a> {
         };
         let use_at =
             uses(&|load| load == site).or_else(|| uses(&|load| self.twin_loads(site, load)));
-        // `per`: the stride the size is divided by (see `record_count_view`).
-        let (first, src, props, image, uav, per) = match use_at {
+        // `per`: the stride the size is divided by (see `record_count_view`);
+        // `table`: the record count is the runtime stride table's.
+        let (first, src, props, image, uav, per, table) = match use_at {
             Some((at, first)) => {
                 let src = Source::Loaded { load: site, first };
                 let used = self.used_kind(&src);
@@ -276,7 +328,7 @@ impl<'a> Lower<'a> {
                     || un.contains("atomic")
                     || used.is_some_and(|u| u.kind == ResourceType::Uav);
                 let u = if uav { 0x1000 } else { 0 };
-                let ((props, per), image) = match &ui.fields {
+                let ((props, per), image, table) = match &ui.fields {
                     Fields::Image { dim, .. } => {
                         let kind = match dim {
                             0 => 1,
@@ -286,22 +338,29 @@ impl<'a> Lower<'a> {
                             5 => 7,
                             _ => return Err("an image dimension (cube or MSAA)"),
                         };
-                        (((kind | u, 0x409), None), Some(kind))
+                        (((kind | u, 0x409), None), Some(kind), false)
                     }
-                    Fields::Buffer { format, .. } => {
+                    Fields::Buffer { format, idxen, .. } => {
                         if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                             return Err("a constant buffer's descriptor read as data");
                         }
-                        let view = if un.starts_with("buffer_load_format")
+                        if un.starts_with("buffer_load_format")
                             || un.starts_with("buffer_store_format")
                         {
-                            ((10 | u, 0x409), None)
-                        } else if format.is_none() {
-                            Self::record_count_view(used, 11 | u)
+                            // Typed: through the slot's own typed view.
+                            (((10 | u, 0x409), None), None, false)
                         } else {
-                            ((11 | u, 0), None)
-                        };
-                        (view, None)
+                            // Untyped, and typed by the instruction's format
+                            // (`tbuffer_load_format_*`, which `buffer.rs`
+                            // reads raw by offset): the count is the
+                            // descriptor's, in elements where the entry says
+                            // the view is structured, whatever instruction
+                            // reads it (the Codex review of rawfix, P2: in
+                            // bytes for MTBUF before).
+                            let by_index = *idxen && format.is_none();
+                            let table = self.counted_through_table(&src, by_index, used);
+                            (Self::record_count_view(used, 11 | u), None, table)
+                        }
                     }
                     Fields::Smem { .. } => {
                         // An `s_buffer_load`: the slot's kind as `smem` reads
@@ -312,36 +371,43 @@ impl<'a> Lower<'a> {
                             Some(_) => return Err("a constant buffer's descriptor read as data"),
                             None => self.slot_raw_kind(&src),
                         };
-                        (Self::record_count_view(used, raw), None)
+                        let table = self.raw_through_table(&src);
+                        (Self::record_count_view(used, raw), None, table)
                     }
                     _ => return Err("a scalar memory read as data"),
                 };
                 let uav = uav || props.0 & 0x1000 != 0;
-                (first, src, props, image, uav, per)
+                (first, src, props, image, uav, per, table)
             }
-            None => {
-                // An image the program only measures (it reads the size
-                // bits; other programs sample it): an eight-dword SRV entry
-                // of the table is an image descriptor, taken here as a 2D
-                // texture. Not where no entry says what the descriptor is
-                // (the handle would declare a texture over a view of any
-                // kind), nor where it says another kind or a four-dword
-                // descriptor (two buffers loaded at once).
-                // shortcut: a 3D or array image reads depth or layers 1, and
-                // the heap holds a view of another dimension than the 2D one
-                // the handle declares.
-                let src = Source::Loaded {
-                    load: site,
-                    first: 0,
-                };
-                let image = self
-                    .used_kind(&src)
-                    .is_some_and(|u| u.kind == ResourceType::Srv && u.dwords == 8);
-                if count != 8 || !image {
-                    return Err("a descriptor read only as data");
+            None => match self.unused_descriptor(site, count, &dwords)? {
+                Unused::Dead => {
+                    for v in dwords.into_iter().flatten() {
+                        self.vals.insert(v, Val::Missing(OTHER));
+                    }
+                    return Ok(());
                 }
-                (0, src, (2, 0x409), Some(2), false, None)
-            }
+                Unused::Image { uav } => {
+                    let src = Source::Loaded {
+                        load: site,
+                        first: 0,
+                    };
+                    let u = if uav { 0x1000 } else { 0 };
+                    (0, src, (2 | u, 0x409), Some(2), uav, None, false)
+                }
+                Unused::Buffer { used } => {
+                    let src = Source::Loaded {
+                        load: site,
+                        first: 0,
+                    };
+                    let uav = used.kind == ResourceType::Uav;
+                    let u = if uav { 0x1000 } else { 0 };
+                    let ((props, per), table) = (
+                        Self::record_count_view(Some(used), 11 | u),
+                        self.raw_through_table(&src),
+                    );
+                    (0, src, props, None, uav, per, table)
+                }
+            },
         };
         // A heap index per lane where the load's offset is a waterfall
         // loop's first-lane read (each lane's own value) or the load is
@@ -354,7 +420,25 @@ impl<'a> Lower<'a> {
             None
         };
         let rels: &[u32] = if image.is_some() { &[1, 2, 3, 4] } else { &[2] };
+        debug_assert!(!table || image.is_none(), "a table count is a buffer's");
         let xs = self.guarded_load(guard, |l| {
+            if table {
+                // The count the table's range checks use (`runtime_view`),
+                // for the view its raw view holds, whatever the slot's own
+                // view is or whether the host could make one there (the
+                // Codex review of rawfix, P1: a slot holding no view read 0
+                // records, a stride known only at run time gave bytes):
+                // elements of a structured or typed view, dwords of a raw
+                // one, which the console counts in bytes.
+                // shortcut: a raw view of a size off a multiple of 4 counts
+                // its whole dwords only (the table's count).
+                let e = l.stride_entry(&src)?;
+                let c = l.cur;
+                let (zero, two) = (l.s.m.i32(0), l.s.m.i32(2));
+                let raw = l.s.m.cmp(c, pred::EQ, e.stride, zero);
+                let bytes = l.s.m.bin(c, Bin::Shl, e.count, two);
+                return Ok(vec![l.s.m.select(c, raw, bytes, e.count)]);
+            }
             let h = if own {
                 let index = l.heap_index(site, first, false)?;
                 l.s.heap_handle(l.cur, index, false, true, props)
@@ -423,12 +507,13 @@ impl<'a> Lower<'a> {
     }
 
     /// The handle a buffer's record count (descriptor dword 2) is asked
-    /// through, for an untyped access (`raw`: the raw kind, 11, with the
-    /// unordered-access bit where the access has it), and the stride the
-    /// size it gives is divided by. The console's count is in elements for
-    /// a structured view (what a used-resource entry of a stride of 4 bytes
-    /// or more says the slot holds), whatever the access: by index, by
-    /// byte offset (`offen`) or by a scalar load; in bytes for a raw one.
+    /// through, for an untyped access, an MTBUF one or none (`raw`: the raw
+    /// kind, 11, with the unordered-access bit where the access has it),
+    /// and the stride the size it gives is divided by. The console's count
+    /// is in elements for a structured view (what a used-resource entry of
+    /// a stride of 4 bytes or more says the slot holds), whatever the
+    /// access: by index, by byte offset (`offen`), in a format the
+    /// instruction names or by a scalar load; in bytes for a raw one.
     ///
     /// The host's view of a structured slot is structured, where a
     /// structured handle gives the elements; with `XTP_RAW_STRUCTURED=1`
@@ -455,6 +540,104 @@ impl<'a> Lower<'a> {
                 }
             }
             _ => ((raw, 0), None),
+        }
+    }
+
+    /// Whether the accesses of `src`'s buffer that a record count sizes go
+    /// through the runtime stride table, as `buffer.rs` routes them: by
+    /// offset alone (`by_index` false: an untyped or MTBUF access by
+    /// offset, a scalar load) for a view-heap descriptor on a target with
+    /// the table; by element where the stride is not known here, or, with
+    /// `XTP_RAW_STRUCTURED=1`, a known one (`buffer.rs`'s
+    /// `runtime_stride`; a stride it refuses gives no access to size).
+    fn counted_through_table(
+        &self,
+        src: &Source,
+        by_index: bool,
+        used: Option<&UsedResource>,
+    ) -> bool {
+        if !by_index {
+            return self.raw_through_table(src);
+        }
+        self.x.target.stride_table
+            && match used.map_or(0, |u| u.stride) {
+                s if s >= 4 && s.is_multiple_of(4) => crate::emit::raw_structured(),
+                0 => true,
+                _ => false,
+            }
+    }
+
+    /// What a descriptor load is that no access uses as a descriptor (nor
+    /// a twin load's), whose dwords `dwords` the code reads all the same,
+    /// told by the load itself and the used-resource entry it falls in:
+    /// - a sampler's descriptor (its load, or a twin's, gives an access its
+    ///   sampler): no program reads its dwords as numbers, so where one
+    ///   meets data at a join the register is dead on that edge, as a
+    ///   resource descriptor's address or format is ([`Unused::Dead`]).
+    ///   The material programs `f23ac5187c49056a`, `f6e7139e15a906d8` and
+    ///   `578e2ba641dbe64e` join a sampler's dword 1 with a constant at a
+    ///   branch whose outcome does not depend on it on that edge;
+    /// - eight dwords whose width, height or levels (dwords 1 to 3) the
+    ///   code reads, and not depth or layers (dword 4), with no entry or an
+    ///   eight-dword SRV or UAV one: an image the program measures, taken
+    ///   as a 2D texture. The puddle detection (`6b6db9f1a526daeb`, 35
+    ///   programs of the pack) turns the width, height and base level of a
+    ///   mask it picks from the heap by an index in a constant buffer into
+    ///   a texel size, and samples the masks it picks beside it as 2D ones;
+    /// - four dwords of a four-dword SRV or UAV entry: a buffer, its record
+    ///   count from the entry's view (`ceb5eb68cd99cb07` skips its pass
+    ///   when the buffer is empty), its other dwords dead as above. With
+    ///   no entry it stops: nothing says the slot holds a buffer view.
+    ///
+    /// Anything else stops the program ("a descriptor read only as data"):
+    /// a handle would declare a view of a kind nothing says the slot holds.
+    // shortcut: a 2D texture's handle over a heap slot holding an image of
+    // another dimension (an array, 3D, a cube) is undefined in D3D12.
+    // Ported from fxceless's VIctory fork #203 (0e49a91) by triippywhale
+    // (the image and buffer of a descriptor nothing uses); the sampler's
+    // dwords dead at a join reimplemented from fxceless's VIctory fork
+    // (578d459, `descriptor_data`) by fxceless.
+    fn unused_descriptor(
+        &self,
+        site: Site,
+        count: u32,
+        dwords: &[Option<Value>],
+    ) -> Result<Unused<'a>, Why> {
+        const ONLY_DATA: Why = "a descriptor read only as data";
+        let sampler = self.x.res.descriptors.iter().any(|d| {
+            d.role == Role::Sampler
+                && d.source.leaves().into_iter().any(|l| {
+                    matches!(*l, Source::Loaded { load, .. }
+                        if load == site || self.twin_loads(site, load))
+                })
+        });
+        if sampler {
+            return Ok(Unused::Dead);
+        }
+        let read = |k: usize| {
+            dwords
+                .get(k)
+                .copied()
+                .flatten()
+                .is_some_and(|v| self.data_reads.contains(&v))
+        };
+        let used = self.used_kind(&Source::Loaded {
+            load: site,
+            first: 0,
+        });
+        let view = |u: &UsedResource, dwords: u8| {
+            matches!(u.kind, ResourceType::Srv | ResourceType::Uav) && u.dwords == dwords
+        };
+        match (count, used) {
+            (8, _) if !used.is_none_or(|u| view(u, 8)) => Err(ONLY_DATA),
+            (8, _) if (1..4).any(read) && !read(4) => Ok(Unused::Image {
+                uav: used.is_some_and(|u| u.kind == ResourceType::Uav),
+            }),
+            // An image's address and tiling (dwords 0, 5 to 7) alone.
+            (8, Some(_)) if !(1..5).any(read) => Ok(Unused::Dead),
+            (4, Some(u)) if view(u, 4) && read(2) => Ok(Unused::Buffer { used: u }),
+            (4, Some(u)) if view(u, 4) => Ok(Unused::Dead),
+            _ => Err(ONLY_DATA),
         }
     }
 
@@ -884,8 +1067,11 @@ mod tests {
     }
 
     /// An image the program only measures: its height bits from an eight-
-    /// dword table entry, no access. Taken as a 2D texture; not where the
-    /// table says the entry is a UAV or a four-dword descriptor.
+    /// dword load, no access. Taken as a 2D texture where the entry is an
+    /// eight-dword SRV or UAV, or where no entry says what it is (fork
+    /// #203's rule, `unused_descriptor`); not where the entry says it is a
+    /// four-dword descriptor (two buffers loaded at once). The values on
+    /// the host are `emit::desc_data_tests`'.
     #[test]
     fn an_image_only_measured_is_taken_as_a_2d_texture() {
         let words = [
@@ -900,19 +1086,12 @@ mod tests {
             0x0000_0100, // ds_write_b32 v0, v1
             S_ENDPGM,
         ];
-        assert_eq!(translate(&words, ResourceType::Srv, 8, 0), Ok(()));
-        for (kind, dwords) in [(ResourceType::Uav, 8), (ResourceType::Srv, 4)] {
-            assert!(
-                only_data(translate(&words, kind, dwords, 0)),
-                "{kind:?}, {dwords}"
-            );
+        for kind in [ResourceType::Srv, ResourceType::Uav] {
+            assert_eq!(translate(&words, kind, 8, 0), Ok(()), "{kind:?}");
         }
-        // Nor where no entry says what the descriptor is: the texture the
-        // handle declared could be a view of any kind.
+        assert!(only_data(translate(&words, ResourceType::Srv, 4, 0)));
         let p = program(&words, vec![]);
-        assert!(only_data(
-            emit_for(&p, crate::emit::Target::ANY).map(|_| ())
-        ));
+        assert_eq!(emit_for(&p, crate::emit::Target::ANY).map(|_| ()), Ok(()));
     }
 
     /// The console compiler's waterfall over a buffer descriptor (as
@@ -1004,8 +1183,10 @@ mod tests {
 
     /// A buffer descriptor loaded twice, the first load used by a
     /// structured load, the second read for its record count (dword 2):
-    /// the second takes the first's view. Not when the loads read other
-    /// entries.
+    /// the second takes the first's view. A load of another descriptor of
+    /// the range is no twin: its count comes from the view its entry says
+    /// the range holds (`unused_descriptor`), and with no entry it stops
+    /// (`emit::desc_data_tests`).
     #[test]
     fn a_descriptor_read_as_data_takes_the_view_of_its_twin_load() {
         let twin = |offset: u32| {
@@ -1028,7 +1209,9 @@ mod tests {
             ]
         };
         assert_eq!(translate(&twin(0), ResourceType::Srv, 4, 4), Ok(()));
-        assert!(only_data(translate(&twin(0x10), ResourceType::Srv, 4, 4)));
+        assert_eq!(translate(&twin(0x10), ResourceType::Srv, 4, 4), Ok(()));
+        // An entry of another kind than a buffer's (eight dwords: images).
+        assert!(only_data(translate(&twin(0x10), ResourceType::Srv, 8, 4)));
     }
 
     /// d3e44e754b3eb6aa's shape (docs/analysis/hang.md), in groups of 32:
@@ -1100,6 +1283,11 @@ mod tests {
         #[cfg(windows)]
         {
             use crate::emit::host::{Dispatch, Host, Root, Stride, View};
+            // One GPU test at a time (see `valu_tests::ONE_AT_A_TIME`):
+            // several WARP devices at once end the test process.
+            let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let Ok(host) = Host::new(true) else {
                 eprintln!("no WARP device; skipped");
                 return;
@@ -1170,6 +1358,11 @@ mod tests {
         #[cfg(windows)]
         {
             use crate::emit::host::{Dispatch, Host, Root, View};
+            // One GPU test at a time (see `valu_tests::ONE_AT_A_TIME`):
+            // several WARP devices at once end the test process.
+            let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let Ok(host) = Host::new(true) else {
                 eprintln!("no WARP device; skipped");
                 return;

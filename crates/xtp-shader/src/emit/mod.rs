@@ -80,11 +80,17 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod desc_data_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod geometry_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
 mod image_tests;
+#[cfg(all(test, windows))]
+mod input_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 #[cfg(all(test, windows))]
@@ -100,6 +106,8 @@ pub(crate) mod lower;
 mod raw_tests;
 pub mod rect_gs;
 mod sampler;
+#[cfg(test)]
+mod sampler_tests;
 #[cfg(all(test, windows))]
 mod scalar_gap_tests;
 mod shader;
@@ -278,7 +286,9 @@ pub struct HostShader {
 
 /// Whether buffers read by element with a stride known at translation are
 /// read through raw handles (`index * stride + offset`) instead of
-/// structured ones: `XTP_RAW_STRUCTURED=1`, read once. `xtp-gpu` then makes
+/// structured ones: on by default since 2026-11-25 (every image session ran
+/// with it; without it the world draws black), `XTP_RAW_STRUCTURED=0` turns
+/// it off, read once. `xtp-gpu` then makes
 /// the title's structured views raw views of the same bytes where it can
 /// (Marvisak/VIctory#1762, after fxceless's VIctory fork's `raw_window`):
 /// on NVIDIA a raw read through a structured view returns other dwords or
@@ -293,7 +303,7 @@ pub fn raw_structured() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "0"))
 }
 
 #[cfg(test)]
@@ -646,7 +656,8 @@ pub fn emit_for(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    // D3D12 encode comparaison, minimum et maximum dans le même champ.
+                    s.filter = (s.filter & !(3 << 7)) | 0x80;
                 }
                 s
             })
@@ -820,6 +831,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: 0,
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -1027,6 +1039,7 @@ mod tests {
                         row2: 0,
                     }],
                     input_addr,
+                    rsrc2: 0,
                     db_shader_control: 0,
                     patches: vec![],
                 },
@@ -1099,6 +1112,7 @@ mod tests {
                     row2: 0,
                 }],
                 input_addr: 0,
+                rsrc2: 0,
                 db_shader_control: 0,
                 patches: vec![],
             },

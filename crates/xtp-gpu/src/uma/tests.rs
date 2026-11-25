@@ -131,7 +131,8 @@ fn uma_is_off_unless_asked() {
 fn heaps_show_title_memory_in_place() {
     const TEST: &str = "heaps_show_title_memory_in_place";
     const LEN: usize = 4 * MIB;
-    for (name, device) in devices(TEST) {
+    let (_gpu, listed) = devices(TEST);
+    for (name, device) in listed {
         let Some(registry) = registry(TEST, name, &device, all()) else {
             continue;
         };
@@ -185,7 +186,8 @@ fn heaps_show_title_memory_in_place() {
 fn decommit_and_release_succeed_under_open_heaps() {
     const TEST: &str = "decommit_and_release_succeed_under_open_heaps";
     const LEN: usize = 16 * PAGE;
-    for (name, device) in devices(TEST) {
+    let (_gpu, listed) = devices(TEST);
+    for (name, device) in listed {
         let Some(registry) = registry(TEST, name, &device, all()) else {
             continue;
         };
@@ -267,7 +269,8 @@ fn decommit_and_release_succeed_under_open_heaps() {
 fn physical_pages_open_on_the_permanent_view() {
     const TEST: &str = "physical_pages_open_on_the_permanent_view";
     const LEN: usize = 2 * MIB;
-    for (name, device) in devices(TEST) {
+    let (_gpu, listed) = devices(TEST);
+    for (name, device) in listed {
         let Some(registry) = registry(TEST, name, &device, all()) else {
             continue;
         };
@@ -325,7 +328,8 @@ fn physical_pages_open_on_the_permanent_view() {
 fn partial_commits_open_what_is_committed() {
     const TEST: &str = "partial_commits_open_what_is_committed";
     const LEN: usize = 8 * MIB;
-    for (name, device) in devices(TEST) {
+    let (_gpu, listed) = devices(TEST);
+    for (name, device) in listed {
         let Some(registry) = registry(TEST, name, &device, all()) else {
             continue;
         };
@@ -370,7 +374,8 @@ fn partial_commits_open_what_is_committed() {
 fn the_cap_keeps_the_rest_on_shadows() {
     const TEST: &str = "the_cap_keeps_the_rest_on_shadows";
     const LEN: usize = 2 * MIB;
-    for (name, device) in devices(TEST) {
+    let (_gpu, listed) = devices(TEST);
+    for (name, device) in listed {
         let options = Options {
             cap: 3 * MIB,
             ..all()
@@ -405,7 +410,8 @@ fn the_cap_keeps_the_rest_on_shadows() {
 fn without_device13_whole_allocations_only() {
     const TEST: &str = "without_device13_whole_allocations_only";
     const LEN: usize = 4 * MIB;
-    for (name, device) in devices(TEST) {
+    let (_gpu, listed) = devices(TEST);
+    for (name, device) in listed {
         let options = Options {
             whole_allocations: true,
             ..all()
@@ -454,7 +460,8 @@ fn without_device13_whole_allocations_only() {
 #[test]
 fn release_waits_for_the_gpu() {
     const TEST: &str = "release_waits_for_the_gpu";
-    for (name, device) in devices(TEST) {
+    let (_gpu, listed) = devices(TEST);
+    for (name, device) in listed {
         let Some(registry) = registry(TEST, name, &device, all()) else {
             continue;
         };
@@ -486,19 +493,24 @@ fn release_waits_for_the_gpu() {
 
 /// The devices to test on: the host's (`crate::testgpu`), and WARP
 /// besides unless the host's is WARP. None (the skip reported) without a
-/// host device.
-fn devices(test: &str) -> Vec<(&'static str, ID3D12Device)> {
-    let Some(host) = crate::testgpu::device(test) else {
-        return Vec::new();
+/// host device. The test keeps the guard until it ends (`testgpu::Gpu`).
+fn devices(
+    test: &str,
+) -> (
+    Option<crate::testgpu::Gpu>,
+    Vec<(&'static str, ID3D12Device)>,
+) {
+    let Some(gpu) = crate::testgpu::device(test) else {
+        return (None, Vec::new());
     };
-    let mut all = vec![("host device", host.device.clone())];
+    let mut all = vec![("host device", gpu.device.clone())];
     if crate::testgpu::software() != Some(Ok(true)) {
         match warp() {
             Some(device) => all.push(("WARP", device.clone())),
             None => eprintln!("{test}: no WARP device"),
         }
     }
-    all
+    (Some(gpu), all)
 }
 
 fn warp() -> Option<&'static ID3D12Device> {

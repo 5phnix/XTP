@@ -1152,10 +1152,11 @@ mod tests {
         if std::env::var_os("XTP_GPU_TIMESTAMPS").is_some() {
             return;
         }
-        let Some(host) = device("timestamps::tests::submissions_are_counted_with_timestamps_off")
+        let Some(gpu) = device("timestamps::tests::submissions_are_counted_with_timestamps_off")
         else {
             return;
         };
+        let host = gpu.host();
         assert!(!on());
         let list = host.new_list().unwrap();
         list.close();
@@ -1174,9 +1175,10 @@ mod tests {
     /// every span labelled and the spans adding up to the list.
     #[test]
     fn a_title_list_is_timed_per_command() {
-        let Some(host) = device("timestamps::tests::a_title_list_is_timed_per_command") else {
+        let Some(gpu) = device("timestamps::tests::a_title_list_is_timed_per_command") else {
             return;
         };
+        let host = gpu.host();
         FORCED.with(|f| f.set(true));
         let kernel = Kernel::new(host);
         let (a, b) = (TitleBuffer::new(256), TitleBuffer::new(256));
@@ -1220,11 +1222,12 @@ mod tests {
     /// commands.
     #[test]
     fn a_list_reset_after_its_submission_is_timed_again() {
-        let Some(host) =
+        let Some(gpu) =
             device("timestamps::tests::a_list_reset_after_its_submission_is_timed_again")
         else {
             return;
         };
+        let host = gpu.host();
         FORCED.with(|f| f.set(true));
         let kernel = Kernel::new(host);
         let (a, b) = (TitleBuffer::new(256), TitleBuffer::new(256));
@@ -1273,9 +1276,10 @@ mod tests {
         if std::env::var_os("XTP_GPU_TIMESTAMPS").is_some() {
             return;
         }
-        let Some(host) = device("timestamps::tests::nothing_is_recorded_when_off") else {
+        let Some(gpu) = device("timestamps::tests::nothing_is_recorded_when_off") else {
             return;
         };
+        let host = gpu.host();
         let list = host.new_list().unwrap();
         // What is noted of the list's address (a list of another test that
         // was there may have left its last recording).

@@ -3,9 +3,11 @@
 //! pipeline made into the pipeline library, before a session, so that the
 //! first session after a translator change does not wait for them in the
 //! world. Each container is made ready as the title's first use of it
-//! makes it, through the same calls (`xtp_gpu::pipeline::precook`); the
-//! graphics and mesh pipelines also need the title's graphics state, which
-//! no run records, so they are still made in the session.
+//! makes it, through the same calls (`xtp_gpu::pipeline::precook`). Then
+//! the graphics and mesh pipelines earlier sessions made, which also need
+//! the title's graphics state: sessions keep their descriptions beside the
+//! pipeline library (`recorded-pipelines.bin`), and the precook makes each
+//! one again into the library, as the session did.
 //!
 //! - The pack: as `xtp shader-survey` takes it (the path given, else
 //!   `XTP_SAMPLE_SHADERS`, else `shaders.rpf` in the game folder). A
@@ -25,6 +27,11 @@
 //!   seconds (the pack is read and hashed, the host device made); `--force`
 //!   passes again. The host rejects the pipeline library after a driver
 //!   update, which the note does not see: `--force` then.
+//! - The kept pipelines take at most `XTP_PRECOOK_SECONDS` (default
+//!   [`REPLAY_SECONDS`]): those not started by then are left to the
+//!   session, and the note is not written, so the next precook goes on
+//!   (what this one made, it finds in the library). A pipeline whose
+//!   shaders no longer translate is refused at once, as in a session.
 //! - `--no-wait` starts at once, without the lock (tests, or when you know
 //!   the machine is free).
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -62,8 +69,13 @@ pub struct Options {
 
 /// The note's name, in the shader cache's folder.
 const NOTE: &str = "precook.txt";
-/// The note's first line; another version of the note is no note.
-const NOTE_FORMAT: &str = "xtp precook 1";
+/// The note's first line; another version of the note is no note. Since
+/// version 2 a pass with pipelines makes the kept graphics and mesh ones
+/// too.
+const NOTE_FORMAT: &str = "xtp precook 2";
+/// The time the kept graphics and mesh pipelines may take by default, in
+/// seconds (`XTP_PRECOOK_SECONDS`).
+const REPLAY_SECONDS: u64 = 900;
 /// How often a waiting precook looks again, and a running one looks for a
 /// title that started anyway.
 const LOOK_EVERY: Duration = Duration::from_secs(5);
@@ -163,18 +175,25 @@ fn precook(o: Options) -> Result<()> {
         o.wait.then_some(&machine),
         |c, s, p| gpu::container(c, s, p).into(),
     );
-    gpu::finish();
     let counts = gpu::counts();
+    let replay = o
+        .pipelines
+        .then(|| replay(threads, o.wait.then_some(&machine), replay_bound()));
+    gpu::finish();
     let seconds = started.elapsed().as_secs_f64();
     // The note only after a whole pass: refusals are answers kept in the
-    // cache too, so a pass with some is whole.
-    write_atomically(&note_path, note.text().as_bytes())
-        .with_context(|| format!("writing {}", note_path.display()))?;
+    // cache too, so a pass with some is whole; one whose kept pipelines
+    // ran out of time is not.
+    if replay.as_ref().is_none_or(|r| r.left == 0) {
+        write_atomically(&note_path, note.text().as_bytes())
+            .with_context(|| format!("writing {}", note_path.display()))?;
+    }
     print!(
         "{}",
         report(
             &pass,
             &counts,
+            replay.as_ref(),
             o.pipelines,
             threads,
             seconds,
@@ -304,14 +323,40 @@ where
     C: Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Outcome + Sync,
 {
     let sources = sources(data);
-    let total = sources.len();
+    let seen = Mutex::new(std::collections::HashSet::new());
+    let mut items = parallel(sources.len(), threads, machine, "records", None, |i| {
+        item(&sources[i], &seen, pipelines, &cook)
+    });
+    // In the pack's order (`sources`'s), whichever thread took each.
+    items.sort_by_key(|&(i, _)| i);
+    let mut items: Vec<Item> = items.into_iter().map(|(_, item)| item).collect();
+    first_takes_the_outcome(&mut items);
+    Pass { items }
+}
+
+/// Runs `work` on each of `0..total` on `threads` threads, and gives what
+/// each gave, by index, in no order. Says how far it is ("precook: <n> of
+/// <total> <what>") every [`PROGRESS_EVERY`], pauses while `machine` says
+/// a title runs, and starts nothing after `until`: the indices not run are
+/// not in what it gives.
+fn parallel<T, W>(
+    total: usize,
+    threads: usize,
+    machine: Option<&Machine>,
+    what: &str,
+    until: Option<Instant>,
+    work: W,
+) -> Vec<(usize, T)>
+where
+    T: Send,
+    W: Fn(usize) -> T + Sync,
+{
     let next = AtomicUsize::new(0);
     let finished = AtomicUsize::new(0);
-    let seen = Mutex::new(std::collections::HashSet::new());
     let paused = AtomicBool::new(false);
     let done = AtomicBool::new(false);
     let started = Instant::now();
-    let mut items: Vec<(usize, Item)> = std::thread::scope(|s| {
+    std::thread::scope(|s| {
         // Says how far it is, and pauses the workers while a title runs.
         s.spawn(|| {
             let mut said = Instant::now();
@@ -335,7 +380,7 @@ where
                     said = Instant::now();
                     let n = finished.load(Ordering::Relaxed);
                     println!(
-                        "precook: {n} of {total} records ({:.0} %), {:.0} s",
+                        "precook: {n} of {total} {what} ({:.0} %), {:.0} s",
                         n as f64 * 100.0 / total.max(1) as f64,
                         started.elapsed().as_secs_f64()
                     );
@@ -350,11 +395,14 @@ where
                         while paused.load(Ordering::Relaxed) {
                             std::thread::sleep(Duration::from_millis(500));
                         }
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(source) = sources.get(i) else {
+                        if until.is_some_and(|t| Instant::now() >= t) {
                             break;
-                        };
-                        out.push((i, item(source, &seen, pipelines, &cook)));
+                        }
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= total {
+                            break;
+                        }
+                        out.push((i, work(i)));
                         finished.fetch_add(1, Ordering::Relaxed);
                     }
                     out
@@ -367,12 +415,139 @@ where
             .collect();
         done.store(true, Ordering::Relaxed);
         items
-    });
-    // In the pack's order (`sources`'s), whichever thread took each.
-    items.sort_by_key(|&(i, _)| i);
-    let mut items: Vec<Item> = items.into_iter().map(|(_, item)| item).collect();
-    first_takes_the_outcome(&mut items);
-    Pass { items }
+    })
+}
+
+/// The time the kept pipelines may take: `XTP_PRECOOK_SECONDS`, else
+/// [`REPLAY_SECONDS`].
+fn replay_bound() -> Duration {
+    let seconds = match std::env::var("XTP_PRECOOK_SECONDS") {
+        Err(_) => REPLAY_SECONDS,
+        Ok(text) => text.trim().parse().unwrap_or_else(|_| {
+            eprintln!("precook: XTP_PRECOOK_SECONDS expects seconds, not {text:?}");
+            REPLAY_SECONDS
+        }),
+    };
+    Duration::from_secs(seconds)
+}
+
+/// What became of the graphics and mesh pipelines sessions kept.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Replay {
+    /// The kept pipelines to make (each once).
+    kept: usize,
+    ready: usize,
+    untranslated: usize,
+    refused: usize,
+    /// Translator bugs (counted, not fatal).
+    panicked: usize,
+    /// Not started: the time bound ran out first.
+    left: usize,
+    /// Kept but not made again: entries that do not read back, pipelines
+    /// whose containers are not kept, repeats.
+    damaged: usize,
+    missing: usize,
+    repeated: usize,
+    /// Host pipelines made, and found in the library, meanwhile.
+    made: u64,
+    loaded: u64,
+    seconds: f64,
+    bound: Duration,
+    /// Where they are kept, and why they could not be read.
+    path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+impl Replay {
+    /// Counts the `outcomes` of the kept pipelines made (each at most
+    /// once); the others were left.
+    fn count(&mut self, outcomes: &[Replayed]) {
+        for o in outcomes {
+            match o {
+                Replayed::Ready => self.ready += 1,
+                Replayed::Untranslated => self.untranslated += 1,
+                Replayed::Refused => self.refused += 1,
+                Replayed::Panicked => self.panicked += 1,
+            }
+        }
+        self.left = self.kept.saturating_sub(outcomes.len());
+    }
+}
+
+/// A kept pipeline's outcome, as `xtp_gpu::pipeline::precook` says it, or
+/// the translator's panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Replayed {
+    Ready,
+    Untranslated,
+    Refused,
+    Panicked,
+}
+
+#[cfg(windows)]
+impl From<xtp_gpu::pipeline::precook::Replayed> for Replayed {
+    fn from(o: xtp_gpu::pipeline::precook::Replayed) -> Replayed {
+        use xtp_gpu::pipeline::precook::Replayed as Gpu;
+        match o {
+            Gpu::Ready => Replayed::Ready,
+            Gpu::Untranslated => Replayed::Untranslated,
+            Gpu::Refused => Replayed::Refused,
+        }
+    }
+}
+
+/// Makes the graphics and mesh pipelines sessions kept into the library,
+/// on `threads` threads, for `bound` at most, pausing while `machine` says
+/// a title runs.
+#[cfg(windows)]
+fn replay(threads: usize, machine: Option<&Machine>, bound: Duration) -> Replay {
+    use xtp_gpu::pipeline::precook as gpu;
+
+    let started = Instant::now();
+    let before = gpu::counts();
+    let mut out = Replay {
+        bound,
+        ..Replay::default()
+    };
+    let recorded = match gpu::recorded() {
+        Ok(recorded) => recorded,
+        Err(e) => {
+            out.error = Some(e);
+            return out;
+        }
+    };
+    out.kept = recorded.len();
+    out.damaged = recorded.damaged;
+    out.missing = recorded.missing;
+    out.repeated = recorded.repeated;
+    out.path = recorded.path.clone();
+    if !recorded.is_empty() {
+        println!(
+            "precook: {} graphics and mesh pipelines kept by sessions ({} s at most)",
+            recorded.len(),
+            bound.as_secs()
+        );
+    }
+    let outcomes: Vec<Replayed> = parallel(
+        recorded.len(),
+        threads,
+        machine,
+        "kept pipelines",
+        Some(started + bound),
+        |i| match catch_unwind(AssertUnwindSafe(|| gpu::replay(&recorded, i))) {
+            Ok(o) => o.into(),
+            Err(_) => Replayed::Panicked,
+        },
+    )
+    .into_iter()
+    .map(|(_, o)| o)
+    .collect();
+    out.count(&outcomes);
+    let after = gpu::counts();
+    out.made = after.made - before.made;
+    out.loaded = after.loaded - before.loaded;
+    out.seconds = started.elapsed().as_secs_f64();
+    out
 }
 
 /// Gives a repeated container's outcome to its first record in pack order:
@@ -518,6 +693,7 @@ impl Totals {
 fn report(
     pass: &Pass,
     counts: &xtp_gpu::pipeline::precook::Counts,
+    replay: Option<&Replay>,
     pipelines: bool,
     threads: usize,
     seconds: f64,
@@ -561,6 +737,9 @@ fn report(
             "compute      {} programs: {} host pipelines made, {} from the library, {} without one",
             t.compute, counts.made, counts.loaded, t.no_pipeline
         );
+        if let Some(r) = replay {
+            o.push_str(&replay_lines(r));
+        }
         if let Some(r) = refusals {
             let _ = writeln!(o, "  {r}");
         }
@@ -571,6 +750,49 @@ fn report(
         o,
         "time         {seconds:.1} s on {threads} threads at below-normal priority"
     );
+    o
+}
+
+/// The report's lines on the kept graphics and mesh pipelines: how many,
+/// what became of them, what was not made and why.
+fn replay_lines(r: &Replay) -> String {
+    let mut o = String::new();
+    if let Some(e) = &r.error {
+        let _ = writeln!(o, "graphics     0 kept pipelines (not read: {e})");
+        return o;
+    }
+    let _ = writeln!(
+        o,
+        "graphics     {} kept pipelines: {} ready ({} host pipelines made, {} from the library), \
+         {} with shaders that do not translate, {} refused, in {:.1} s",
+        r.kept, r.ready, r.made, r.loaded, r.untranslated, r.refused, r.seconds
+    );
+    if r.panicked > 0 {
+        let _ = writeln!(o, "  {:>7}  panicked (translator bugs)", r.panicked);
+    }
+    if r.left > 0 {
+        let _ = writeln!(
+            o,
+            "  {:>7}  not made: {} s passed (XTP_PRECOOK_SECONDS); the next precook goes on",
+            r.left,
+            r.bound.as_secs()
+        );
+    }
+    for (n, what) in [
+        (r.missing, "without their containers"),
+        (r.damaged, "that do not read back"),
+        (
+            r.repeated,
+            "repeated (the same pipeline under another build's key)",
+        ),
+    ] {
+        if n > 0 {
+            let _ = writeln!(o, "  {n:>7}  {what}");
+        }
+    }
+    if let Some(path) = &r.path {
+        let _ = writeln!(o, "  kept in {}", path.display());
+    }
     o
 }
 
@@ -732,7 +954,7 @@ mod tests {
             pipelines: true,
         };
         let text = note.text();
-        assert!(text.starts_with("xtp precook 1\n"));
+        assert!(text.starts_with("xtp precook 2\n"));
         assert!(note.covered_by(&text));
         let other_key = Note {
             key: "ef".repeat(32),
@@ -754,7 +976,7 @@ mod tests {
         assert!(!note.covered_by(&without.text()));
         assert!(without.covered_by(&without.text()));
         assert!(!note.covered_by(""));
-        assert!(!note.covered_by(&text.replace("precook 1", "precook 0")));
+        assert!(!note.covered_by(&text.replace("precook 2", "precook 1")));
     }
 
     #[test]
