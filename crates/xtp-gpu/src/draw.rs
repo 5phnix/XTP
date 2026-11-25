@@ -168,6 +168,11 @@ pub(crate) struct State {
     // Racines validées avant le bridage, posées après sa passe de calcul.
     pending_compute: Option<Vec<(u32, ComputeRoot)>>,
     host_heaps: [usize; 2],
+    /// The host heap behind each key of [`State::host_heaps`] this
+    /// recording has used, by object: (key, heap). A title heap released
+    /// while the list records and another made at its address keep the
+    /// key, not the host heap ([`State::bind_host_heaps`]).
+    heap_objects: Vec<(usize, usize)>,
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
@@ -1101,19 +1106,72 @@ impl State {
     /// Sets `wanted` (see [`State::wanted_heaps`]) on the host list if it
     /// has other heaps.
     fn set_host_heaps(&mut self, list: &HostList, wanted: [usize; 2]) {
-        if self.host_heaps == wanted {
+        let heaps = wanted.map(|h| host_heap(h).map(|h| &h.heap));
+        self.bind_host_heaps(list, wanted, heaps);
+    }
+
+    /// Sets `heaps`, the host heaps behind keys `wanted`, on the host list
+    /// unless it has them, compared by host object as pipelines are
+    /// ([`State::bind_pipeline`]). A title heap released while the list
+    /// records and another made at its address keep the key: the list
+    /// keeps the old host heap alive, so the new one is another object.
+    /// Before, the key alone was compared: the host list kept the old heap
+    /// while tables were made in the new one. What the recording keeps by
+    /// that key goes with the old heap ([`State::forget_heap`]).
+    fn bind_host_heaps(
+        &mut self,
+        list: &HostList,
+        wanted: [usize; 2],
+        heaps: [Option<&ID3D12DescriptorHeap>; 2],
+    ) {
+        let mut replaced = false;
+        for (key, heap) in wanted.into_iter().zip(heaps) {
+            if key == 0 {
+                continue;
+            }
+            let object = heap.map_or(0, |h| h.as_raw() as usize);
+            match self.heap_objects.iter().position(|&(k, _)| k == key) {
+                None => self.heap_objects.push((key, object)),
+                Some(i) if self.heap_objects[i].1 == object => {}
+                Some(i) => {
+                    self.heap_objects[i].1 = object;
+                    self.forget_heap(key);
+                    replaced = true;
+                }
+            }
+        }
+        if self.host_heaps == wanted && !replaced {
             return;
         }
-        let heaps: Vec<Option<ID3D12DescriptorHeap>> = wanted
-            .iter()
-            .filter_map(|&h| host_heap(h))
-            .map(|h| Some(h.heap.clone()))
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = heaps
+            .into_iter()
+            .flatten()
+            .map(|h| Some(h.clone()))
             .collect();
         heaps.iter().flatten().for_each(|h| list.keep(h));
         // SAFETY: an open list and shader-visible heaps.
         unsafe { list.list.SetDescriptorHeaps(&heaps) };
         self.host_heaps = wanted;
         self.host_roots = [0; 2];
+    }
+
+    /// Title heap `key` has another host heap than this recording used
+    /// (see [`State::bind_host_heaps`]): what the recording keeps by the
+    /// key goes, slots of the old heap and its passes. Fresh tables all go
+    /// (they are kept by table, not heap): made again in the new heap.
+    /// Stride holds stay under no key until the recording goes (the old
+    /// heap's views may still be read), and the new heap gets its own.
+    fn forget_heap(&mut self, key: usize) {
+        self.fresh_tables.clear();
+        self.root_srv_slots.retain(|k, _| k.0 != key);
+        self.root_uav_slots.retain(|k, _| k.0 != key);
+        self.picked.retain(|&h| h != key);
+        self.heap_textured.retain(|&h| h != key);
+        for (heap, _) in &mut self.own.strides {
+            if *heap == key {
+                *heap = 0;
+            }
+        }
     }
 
     fn compute_root(&mut self, list: &HostList, param: u32, value: ComputeRoot) {
@@ -5407,5 +5465,87 @@ float4 ps(V v) : SV_Target { return v.color; }
 
         state.set_root_signature(true, std::ptr::null());
         assert!(state.compute.is_empty());
+    }
+
+    /// A title heap released while a list records and another made at its
+    /// address keep the key the state compares, not the host heap: the
+    /// host list gets the new heap (and root signatures again after it),
+    /// and what the recording kept by that key goes with the old heap, also
+    /// when XTP's own work set other heaps in between. The same heap again
+    /// sets nothing, and another heap's entries stay. Before, the key alone
+    /// was compared: the host list kept the old heap.
+    #[test]
+    fn a_heap_made_again_at_its_address_is_bound_afresh() {
+        let test = "draw::tests::a_heap_made_again_at_its_address_is_bound_afresh";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let list = TitleList::new();
+        let l = list.host();
+        let new_heap = || -> ID3D12DescriptorHeap {
+            // SAFETY: a live device and a valid shader-visible view heap
+            // description.
+            unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 4,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+            }
+            .expect("a host heap")
+        };
+        // The title heap's address, and another heap's.
+        let (key, other) = (0x1000, 0x2000);
+        // What a recording keeps by heap.
+        let keep = |state: &mut State| {
+            for heap in [key, other] {
+                state.root_srv_slots.insert((heap, 0, 0, 0), 1);
+                state.root_uav_slots.insert((heap, 0, 0, 0), 2);
+                state.picked.push(heap);
+                state.heap_textured.push(heap);
+            }
+            state.fresh_tables.insert((0x40, 0), 3);
+        };
+        let only_other = |state: &State| {
+            assert!(state.root_srv_slots.keys().all(|k| k.0 == other));
+            assert!(state.root_uav_slots.keys().all(|k| k.0 == other));
+            assert_eq!(state.root_srv_slots.len(), 1);
+            assert_eq!(state.root_uav_slots.len(), 1);
+            assert_eq!(
+                (&state.picked[..], &state.heap_textured[..]),
+                (&[other][..], &[other][..])
+            );
+            assert!(state.fresh_tables.is_empty());
+        };
+        let mut state = State::default();
+        let original = new_heap();
+        state.bind_host_heaps(l, [key, 0], [Some(&original), None]);
+        keep(&mut state);
+        state.host_roots = [1, 2];
+        state.bind_host_heaps(l, [key, 0], [Some(&original), None]);
+        assert_eq!(state.host_roots, [1, 2], "the same heap: nothing set");
+        assert_eq!(state.picked, [key, other]);
+
+        // The title releases its heap (the list holds the host heap) and
+        // makes one at its address.
+        drop(original);
+        let replacement = new_heap();
+        state.bind_host_heaps(l, [key, 0], [Some(&replacement), None]);
+        assert_eq!(state.host_roots, [0; 2], "set again after the new heap");
+        assert_eq!(state.host_heaps, [key, 0]);
+        only_other(&state);
+
+        // Again, with XTP's own heaps set in between.
+        state.picked.clear();
+        state.heap_textured.clear();
+        keep(&mut state);
+        state.forget_host();
+        drop(replacement);
+        let third = new_heap();
+        state.bind_host_heaps(l, [key, 0], [Some(&third), None]);
+        only_other(&state);
     }
 }
