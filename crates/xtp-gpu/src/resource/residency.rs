@@ -303,9 +303,10 @@ mod tests {
     #[test]
     fn a_texture_made_not_resident_becomes_usable() {
         let test = "resource::residency::tests::a_texture_made_not_resident_becomes_usable";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let texture = not_resident(&host.device);
         let residency = Residency::ask(&host.device, pageable(&texture));
         assert!(residency.wait(Duration::from_secs(5)), "within budget");
@@ -322,7 +323,6 @@ mod tests {
         host.execute(&[&list]);
         let texels = super::super::tests_support::read_back(host, &texture, 0x4);
         assert_eq!(texels[..4], [255, 0, 255, 255]);
-        assert_eq!(host.log_messages(), None);
     }
 
     /// Requests finish in any order, each on its own fence: one whose
@@ -331,9 +331,10 @@ mod tests {
     #[test]
     fn each_request_waits_on_its_own_fence() {
         let test = "resource::residency::tests::each_request_waits_on_its_own_fence";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let fences: Vec<ID3D12Fence> = (0..8)
             // SAFETY: plain creation.
             .map(|_| unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap())
@@ -368,9 +369,10 @@ mod tests {
     #[test]
     fn a_wait_that_expires_leaves_the_request_pending() {
         let test = "resource::residency::tests::a_wait_that_expires_leaves_the_request_pending";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         // SAFETY: plain creation.
         let fence: ID3D12Fence =
             unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
@@ -390,9 +392,10 @@ mod tests {
     #[test]
     fn a_refused_request_is_asked_again() {
         let test = "resource::residency::tests::a_refused_request_is_asked_again";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let texture = not_resident(&host.device);
         let r = Residency {
             ready: AtomicBool::new(false),

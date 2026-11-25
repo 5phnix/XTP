@@ -1210,9 +1210,9 @@ mod tests {
     #[test]
     fn a_cheap_pipeline_does_not_wait_behind_a_heavy_one() {
         let test = "pipeline::make::tests::a_cheap_pipeline_does_not_wait_behind_a_heavy_one";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let pipeline = |extra, salt, held| {
             let (shader, release) = compute(extra, salt, held);
             (Arc::new(Pending::new(vec![shader], None, None)), release)

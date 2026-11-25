@@ -1234,6 +1234,7 @@ fn a_level_query_of_an_array_leaves_the_slice_out() {
     n.io = StageIo::Ps {
         inputs: vec![],
         input_addr: 1 << 1,
+        rsrc2: 0,
         db_shader_control: 0,
         patches: vec![],
     };
