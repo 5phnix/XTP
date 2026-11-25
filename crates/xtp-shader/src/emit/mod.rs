@@ -85,6 +85,8 @@ mod desc_data_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod geometry_tests;
+#[cfg(all(test, windows))]
+mod group_id_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
