@@ -145,6 +145,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
     output.set_words(|_| u32::MAX);
     let geometry = geometry(&vertices, &indices);
     let blas = TitleBuffer::new(1024);
+    let cloning = TitleList::new();
     let compacted = TitleBuffer::new(1024);
     let cloned = TitleBuffer::new(1024);
     let first = TitleBuffer::new(1024);
@@ -204,7 +205,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             .load(Ordering::Acquire);
         assert!(bytes > 0);
         assert!(copy(
-            list.this(),
+            cloning.this(),
             compacted.address(),
             blas.address(),
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT.0
@@ -214,7 +215,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             bytes
         );
         assert!(copy(
-            list.this(),
+            cloning.this(),
             cloned.address(),
             compacted.address(),
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0
@@ -260,6 +261,8 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         trace(host, list.host(), a, &output);
         trace(host, list.host(), b, &after_refit);
     }
+    // The TLAS was recorded before this producer was submitted.
+    cloning.run();
     list.run();
     assert_eq!(output.words(), [1, 2.0f32.to_bits(), 0, 0]);
     assert_eq!(after_refit.words(), [0, 0, 0, 0]);

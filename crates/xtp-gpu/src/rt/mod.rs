@@ -471,6 +471,15 @@ pub unsafe fn copy(list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
 }
 
 fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u64> {
+    Some(input_range(list, address, bytes, alignment)?.gpu(address))
+}
+
+fn input_range(
+    list: &HostList,
+    address: u64,
+    bytes: u64,
+    alignment: u64,
+) -> Option<Arc<crate::shadow::Shadow>> {
     let end = address.checked_add(bytes)?;
     if address == 0 || !address.is_multiple_of(alignment) || bytes == 0 {
         return None;
@@ -491,7 +500,7 @@ fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u6
         return None;
     }
     shadow.refresh(list, address, bytes);
-    Some(gpu)
+    Some(shadow)
 }
 
 fn readable(mut address: u64, end: u64) -> bool {
@@ -554,7 +563,7 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
         let (width, alignment) = match t.VertexFormat {
             DXGI_FORMAT_R32G32B32_FLOAT => (12, 4),
             DXGI_FORMAT_R32G32_FLOAT => (8, 4),
-            DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (6, 2),
+            DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (8, 2),
             DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_SNORM => (4, 2),
             _ => return None,
         };
