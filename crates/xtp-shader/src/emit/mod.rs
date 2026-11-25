@@ -1179,7 +1179,8 @@ mod tests {
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
         assert_eq!(emit_for(&two, NVIDIA).unwrap().wave_size(), Some(32));
-        // At a lane the code computes (s1), still not.
+        // A computed lane needs both register sets. Keep a partial last
+        // wave as a negative control.
         let computed = [
             0xD760_0000,
             0x0000_0300, // v_readlane_b32 s0, v0, s1
@@ -1187,12 +1188,13 @@ mod tests {
             0xBF81_0000, // s_endpgm
         ];
         assert_eq!(
-            emit_for(&compute_of(&computed, true, 128), NVIDIA),
+            emit_for(&compute_of(&computed, true, 96), NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
                 what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
             })
         );
+        assert!(emit_for(&compute_of(&computed, true, 128), NVIDIA).is_ok());
         // The same code in waves of 32 runs on either.
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());

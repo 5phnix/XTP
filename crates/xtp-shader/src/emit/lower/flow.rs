@@ -847,7 +847,7 @@ impl<'a> Lower<'a> {
         }
         let on = self.s.threads.is_some()
             && !self.s.pixel
-            && !(self.console_cf && self.split)
+            && (!(self.console_cf && self.split) || self.s.m.paired_lanes())
             && !self.mesh_halves()
             && self.s.lds_dwords + 2
                 <= if self.s.mesh.is_some() {
@@ -1023,7 +1023,12 @@ impl<'a> Lower<'a> {
         let at = self.s.m.element(wait, ended, own);
         let after = self.s.m.load(wait, at);
         let sum = self.s.m.bin(wait, Bin::Add, before, after);
-        let all = self.s.m.i32(threads);
+        // Each physical lane counts both of its logical lanes when paired.
+        let all = self.s.m.i32(if self.s.m.paired_lanes() {
+            2 * threads
+        } else {
+            threads
+        });
         let all_ended = self.s.m.cmp(wait, pred::EQ, sum, all);
         self.s
             .m

@@ -594,7 +594,7 @@ impl<'a> Lower<'a> {
             let needs_wave64 =
                 (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
             if needs_wave64 && !x.target.runs(64) {
-                no_console_flow = if cs.threads.iter().product::<u32>() > 64 {
+                no_console_flow = if threads > 64 && !threads.is_multiple_of(64) {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
@@ -602,7 +602,7 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
-                } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
+                } else if threads < 64
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 {
                     Some("a whole-wave section of a wave64 on a host without 64-lane waves")
@@ -643,6 +643,13 @@ impl<'a> Lower<'a> {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
                 split = x.native.wave64 && !x.target.runs(64);
+            }
+            if x.console_cf && split && threads > 64 {
+                // Each physical lane carries console lanes i and i+32. One
+                // physical wave therefore follows one console program counter.
+                s.m.pair_lanes();
+                flat_group = Some(cs.threads);
+                s.threads = Some([threads / 2, 1, 1]);
             }
             if split {
                 s.wave_size = Some(32);
@@ -853,7 +860,9 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
-        self.find_sections();
+        if !self.s.m.paired_lanes() {
+            self.find_sections();
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -917,6 +926,7 @@ impl<'a> Lower<'a> {
                 }
                 (false, true) => "per lane in halves",
                 (true, false) => "console flow",
+                (true, true) if self.s.m.paired_lanes() => "console flow with paired lanes",
                 (true, true) => "console flow in halves",
             },
             cmp_samplers,

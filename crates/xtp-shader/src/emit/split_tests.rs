@@ -478,10 +478,10 @@ fn a_select_on_a_mask_held_as_a_number_runs_as_the_console() {
     );
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Constant lane reads retain the existing small exchange. A computed
+/// read in multiple complete waves uses paired lanes.
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
+fn several_console_waves_choose_the_exchange_their_lane_reads_need() {
     let body = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
@@ -497,13 +497,15 @@ fn console_flow_is_for_one_console_wave_per_group() {
     // path with the lane read through group-shared memory
     // (`lane_reads_cross_halves_in_groups_of_several_console_waves`).
     assert!(emit_for(&program(&body, 128), nvidia).is_ok());
-    // At a lane the code computes (s1, the group id), neither.
+    // A computed lane (s1, the group id).
     let computed = [
         0xD760_0009,
         0x0000_0300, // v_readlane_b32 s9, v0, s1
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
-    assert!(emit_for(&program(&computed, 128), nvidia).is_err());
+    emit_for(&program(&computed, 128), nvidia).unwrap();
+    assert!(super::last_module_summary().ends_with("; console flow with paired lanes"));
+    assert!(emit_for(&program(&computed, 96), nvidia).is_err());
 }
 
 /// Lane reads of the other half in groups of several console waves, as
@@ -632,6 +634,7 @@ fn first_lane_reads_are_the_console_waves() {
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
     console_flow_case("DPP and v_readfirstlane", &body, 64, |_| 0);
+    console_flow_case("first active lane of four waves", &body, 256, |t| t & !63);
 }
 
 /// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
@@ -681,6 +684,10 @@ fn loops_with_an_exit_mask_grown_from_zero() {
         0x4A04_040C, // v_add_nc_u32 v2, s12, v2
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
+    // The second wave takes 64 more iterations than the first.
+    console_flow_case("independent wave loops", &body, 128, |t| {
+        (t & !63) + 40 + 64
+    });
 }
 
 /// [`program`] with 512 bytes of LDS.
@@ -1480,6 +1487,7 @@ fn every_hardware_case_translates_and_validates_without_a_device() {
     numeric_selects_beside_in_half_reads();
     lane_reads_in_branches_beside_a_whole_wave_section();
     a_lane_read_past_the_wave_reads_its_low_bits();
+    paired_lanes_share_lds_and_count_their_own_mask_bits();
     lds_in_a_group_of_48_threads_reads_both_halves();
     a_loop_exit_mask_read_inside_the_loop_counts_the_lanes_that_left();
     DRY.with(|d| d.set(false));
@@ -1616,4 +1624,43 @@ fn a_loop_exit_mask_read_inside_the_loop_counts_the_lanes_that_left() {
     let p = program_wave32(LOOP_EXIT_COUNT_32, 32);
     assert_flows("wave32", &p, whole);
     program_case("wave32 loop exit mask counted inside", &p, |_| 32, true);
+}
+
+/// Lanes from different console waves exchange LDS across s_barrier.
+/// The read after the predicated atomic uses the original lane mask and
+/// its return value. Each active lane updates a distinct dword.
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn paired_lanes_share_lds_and_count_their_own_mask_bits() {
+    let body = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xD834_0000,
+        0x0000_0104, // ds_write_b32 v4, v1
+        0xBF8A_0000, // s_barrier
+        0x3A0A_00C0, // v_xor_b32 v5, 64, v0
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D88_02A8, // v_cmp_gt_u32 vcc, 40, v1
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xD880_0000,
+        0x0200_0005, // ds_add_rtn_u32 v2, v5, v0
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0000,
+        0x0600_0004, // ds_read_b32 v6, v4
+        0x4A04_0D02, // v_add_nc_u32 v2, v2, v6
+    ];
+    program_case(
+        "masked LDS add and mbcnt",
+        &program_lds(&body, 128),
+        |t| {
+            let lane = t & 63;
+            if lane < 40 { 2 * lane + (t ^ 64) } else { lane }
+        },
+        true,
+    );
 }
