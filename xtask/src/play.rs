@@ -343,7 +343,19 @@ fn alive(pid: u32) -> bool {
 
 /// One title at a time on a machine.
 fn refuse_a_second_title() -> Result<()> {
-    let running = tasks("IMAGENAME eq xtp.exe");
+    // Only an xtp.exe with a window is a title: offline `xtp translate` or
+    // `shader-info` runs by other workers have none and must not block a
+    // session (2026-11-25: they did).
+    let running = if cfg!(windows) {
+        Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq xtp.exe", "/FI", "WINDOWTITLE ne N/A"])
+            .args(["/NH", "/FO", "CSV"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     ensure!(
         !running.to_ascii_lowercase().contains("\"xtp.exe\""),
         "an xtp.exe is already running; close it first (one title at a time)"
