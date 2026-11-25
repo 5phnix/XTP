@@ -7,8 +7,10 @@
 //! the title wrote since they were last copied ([`crate::watch`]: write
 //! watching, or read-only guards on physical-page views), all of it where
 //! neither works. A title GPU address inside the buffer is the same offset
-//! in its copy. Ranges shaders write go back to title memory after the
-//! submission ([`Shadow::gpu_writes`]).
+//! in its copy. After a submission, [`crate::readmap`] keeps a completed
+//! physical page behind inaccessible title views until its first CPU access.
+//! Learned pages, and memory whose aliases cannot all be guarded, receive
+//! the result during submission completion ([`Shadow::gpu_writes`]).
 //!
 //! A range is copied at most once until the title writes it (W1): a
 //! refresh asks the write watch once for its whole range, not once per gap
@@ -4375,8 +4377,13 @@ mod tests {
                 return;
             };
             let host = gpu.host();
+            const REOPEN: &str = "XTP_TEST_REOPEN_READMAP";
             let local = tempfile::tempdir().unwrap();
-            let path = local.path().join("one-build.v1");
+            let previous = std::env::var_os(REOPEN);
+            let path = previous
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| local.path().join("one-build.v1"));
             crate::configure_copy_back(Some(path.clone()));
             crate::watch::tests::with_physical_views(|at, alias, private| {
                 register(1, at as u64, (4 * PAGE) as u64);
@@ -4388,6 +4395,17 @@ mod tests {
                     s.set_host(address + 7, 1, byte);
                     s.copy_back(id, address, PAGE)
                 };
+                if previous.is_some() {
+                    // A new process, with fresh virtual addresses and no live
+                    // owners. The same writer/offset is eager on its first use.
+                    assert_eq!(publish(at, 0x51), PAGE);
+                    assert_eq!(title(private + 7, 1), [0x51]);
+                    assert_eq!(publish(at + 3 * PAGE, 4), 0);
+                    assert_eq!(title(private + 3 * PAGE + 7, 1), [0]);
+                    host.drain();
+                    unregister(1, at as u64);
+                    return;
+                }
                 assert_eq!(publish(at, 0x51), 0);
                 // Reuse the D3D buffer for B before the CPU consumes A.
                 let b = submission();
@@ -4410,7 +4428,7 @@ mod tests {
                 assert_eq!(s.copy_back(b, at, PAGE), PAGE);
                 assert_eq!(title(private + 7, 1), [0x72]);
                 crate::save_copy_back_map();
-                assert!(!std::fs::read(path).unwrap().is_empty());
+
                 // Identical allocation with a different page offset stays
                 // cold. A kernel read must resolve it just like a CPU load.
                 assert_eq!(publish(at + PAGE, 0xa1), 0);
@@ -4437,6 +4455,18 @@ mod tests {
                 host.drain();
                 unregister(1, at as u64);
             });
+            if previous.is_none() {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([test, "--exact", "--nocapture", "--test-threads=1"])
+                    .env(REOPEN, path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "fresh process: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
         });
     }
 
