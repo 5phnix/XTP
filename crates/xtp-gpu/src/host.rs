@@ -21,7 +21,7 @@
 pub(crate) mod buffers;
 mod frames;
 #[cfg(test)]
-mod submissions;
+pub(crate) mod submissions;
 mod timeline;
 mod twins;
 
@@ -734,6 +734,7 @@ pub(crate) struct HostList {
     /// The pipelines the list binds, for reports of slow submissions:
     /// shared with its submissions ([`Recorded`]), a reset starts a new set.
     pipelines: Mutex<std::sync::Arc<std::collections::BTreeSet<String>>>,
+    writer: AtomicU64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
@@ -906,14 +907,14 @@ enum Step {
     /// Work that writes host memory only, and the title memory it reads.
     Host(Box<dyn Fn() + Send>, (usize, usize)),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64),
     /// A buffer copy the list records on the GPU writes a range (address,
     /// bytes) of a buffer's host copy: all of it goes back to title memory
     /// once the list has run.
     GpuCopy(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// A memory write the list records on the GPU (bytes), for the
     /// frame-rate line.
-    GpuWord(usize),
+    GpuWord(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1034,7 +1035,7 @@ impl Pending {
             let deferred = list.deferred();
             for step in &deferred.copies {
                 match step {
-                    Step::GpuWrite(shadow, address, len) => {
+                    Step::GpuWrite(shadow, address, len, _) => {
                         back.push((shadow.clone(), *address, *len));
                     }
                     Step::GpuCopy(shadow, address, len) => {
@@ -1198,6 +1199,7 @@ impl Host {
                 prelude: Mutex::new((prelude_allocator, prelude)),
                 twins: Mutex::default(),
                 pipelines: Mutex::default(),
+                writer: AtomicU64::new(0),
                 budget: Mutex::default(),
                 clamps: Mutex::default(),
                 last: AtomicU64::new(0),
@@ -1308,6 +1310,16 @@ impl Host {
             submission: crate::shadow::submission(),
             ..Batch::default()
         };
+        // A full sweep also rewrites inputs and WriteBufferImmediate words.
+        // Their readers and deferred title writes must finish before the
+        // sweep, and this submission must take its snapshots afterwards.
+        if crate::shadow::refresh_due(batch.submission) {
+            self.drain();
+            crate::shadow::refresh_everything(batch.submission);
+        }
+        if batch.submission.is_multiple_of(32) {
+            crate::readmap::save_copy_back_map();
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -1323,8 +1335,7 @@ impl Host {
         // Copies of big title buffers in the card's memory
         // (`shadow::cards_around`): what their CPU side took goes up first,
         // and what the shaders wrote is found on the card after the lists,
-        // in the same submission. (With `XTP_FULL_REFRESH=<n>`, a
-        // diagnostic, every host copy is taken whole there first.)
+        // in the same submission.
         let (cards_first, cards_last) = crate::shadow::cards_around(batch.submission);
         if let Some(first) = cards_first {
             lists.insert(0, Some(first));
@@ -2105,6 +2116,7 @@ impl HostList {
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // New ones: a submission in flight keeps its own (`Recorded`).
         *self.pipelines.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        self.writer.store(0, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         {
             *self.notes.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
@@ -2236,6 +2248,13 @@ impl HostList {
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::readmap::enabled() {
+            let digest = blake3::hash(name.as_bytes());
+            self.writer.store(
+                u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap()),
+                Ordering::Relaxed,
+            );
+        }
         if !pipelines.contains(name) {
             std::sync::Arc::make_mut(&mut pipelines).insert(name.to_owned());
         }
@@ -2330,9 +2349,12 @@ impl HostList {
     ) {
         let mut deferred = self.deferred();
         deferred.indirect_writers.record(&shadow.buffer, true);
-        deferred
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        deferred.copies.push(Step::GpuWrite(
+            shadow.clone(),
+            address,
+            len,
+            self.writer.load(Ordering::Relaxed),
+        ));
     }
 
     /// A buffer copy the list records on the GPU writes `[address, address
@@ -2353,10 +2375,17 @@ impl HostList {
 
     /// Counts a memory write of `bytes` the list records on the GPU, once
     /// per submission (see [`crate::shadow::write`]).
-    pub(crate) fn count_gpu_write(&self, buffer: &ID3D12Resource, bytes: usize) {
+    pub(crate) fn count_gpu_write(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        bytes: usize,
+    ) {
         let mut deferred = self.deferred();
-        deferred.indirect_writers.record(buffer, false);
-        deferred.copies.push(Step::GpuWord(bytes));
+        deferred.indirect_writers.record(&shadow.buffer, false);
+        deferred
+            .copies
+            .push(Step::GpuWord(shadow.clone(), address, bytes));
     }
 
     pub(crate) fn unknown_buffer_write(&self) {
@@ -2573,13 +2602,13 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, writer) => {
                     // The range's snapshot is taken from the host copy, which
                     // an earlier submission's GPU work may still be writing;
                     // the shaders start from the title's data.
                     batch.settle(*address, *len, false);
                     batch.flush();
-                    shadow.writing(batch.submission, *address, *len);
+                    shadow.writing_by(batch.submission, *address, *len, *writer);
                     continue;
                 }
                 // The copy reads host copies on the GPU, written back after.
@@ -2587,7 +2616,11 @@ impl HostList {
                 // the same copy, it waits for that one: what the shaders
                 // wrote is told from the copy's bytes, which it would change.
                 Step::GpuCopy(shadow, address, len) => {
-                    batch.settle_shaders(shadow, *address, *len);
+                    if shadow.carded() || crate::readmap::enabled() {
+                        batch.settle(*address, *len, false);
+                    } else {
+                        batch.settle_shaders(shadow, *address, *len);
+                    }
                     // Le bridage ou le titre peut avoir lu la destination avant la
                     // copie. Installer ses données initiales avant de la marquer occupée.
                     batch.flush_before_copy(shadow, *address, *len);
@@ -2595,8 +2628,12 @@ impl HostList {
                     moved(Moved::GpuCopy, *len);
                     continue;
                 }
-                &Step::GpuWord(bytes) => {
-                    moved(Moved::ListWrite, bytes);
+                Step::GpuWord(shadow, address, bytes) => {
+                    if crate::readmap::enabled() || shadow.carded() {
+                        batch.settle(*address, *bytes, false);
+                        shadow.invalidate_mirror(*address, *bytes);
+                    }
+                    moved(Moved::ListWrite, *bytes);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -2785,7 +2822,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
-    if title_dst {
+    let _destination = (title_dst && crate::readmap::enabled())
+        .then(|| crate::watch::kernel_writing(dst as usize, len));
+    if title_dst && _destination.is_none() {
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
@@ -2834,7 +2873,19 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let copy = |done: &mut usize| unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, done) != 0
+    };
+    if copy(&mut done) {
+        return true;
+    }
+    if !crate::readmap::enabled() {
+        return false;
+    }
+    let Some(_pin) = crate::watch::pin_read(src as usize, len) else {
+        return false;
+    };
+    copy(&mut done)
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -2842,6 +2893,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let _pin = crate::readmap::enabled().then(|| crate::watch::kernel_writing(dst as usize, len));
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
