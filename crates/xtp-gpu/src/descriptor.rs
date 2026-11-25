@@ -59,6 +59,49 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// The heap's life, for work that runs after the recordings that use
+    /// it ([`HeapHold`]).
+    #[cfg(windows)]
+    life: std::sync::Arc<Life>,
+}
+
+/// Whether a title heap is still there, for work that outlives the
+/// recordings that use it: the sweeps a list runs as it closes and at its
+/// submissions (`draw.rs` `picked_buffers`).
+#[cfg(windows)]
+struct Life {
+    /// The heap's address while the title holds it; 0 once its release has
+    /// begun. Work on the heap reads it locked, and the heap's drop locks it
+    /// for writing first: a release waits for that work to end, and work
+    /// after it finds 0.
+    heap: std::sync::RwLock<usize>,
+}
+
+/// A hold on one title heap, this one and no other: a heap made later at
+/// the same address has a life of its own (Codex review of a090f22, P1:
+/// the work a list runs as it closes kept the heap's address, checked it
+/// against the heaps registered, then used it without a lock, so a
+/// concurrent last release could free it between the two, and a heap made
+/// at the same address since passed the check with the old one's start).
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct HeapHold(std::sync::Arc<Life>);
+
+#[cfg(windows)]
+impl HeapHold {
+    /// Runs `f` with the heap if the title has not released it, which keeps
+    /// it until `f` returns: its release waits. `f` must not release a
+    /// title heap.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&Heap) -> R) -> Option<R> {
+        let at = self.0.heap.read().unwrap_or_else(|e| e.into_inner());
+        if *at == 0 {
+            return None;
+        }
+        // SAFETY: the heap's drop sets 0 under the write lock before any of
+        // it goes, and the read lock held until `f` returns keeps it from
+        // doing so meanwhile.
+        Some(f(unsafe { &*(*at as *const Heap) }))
+    }
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -99,6 +142,12 @@ impl Heap {
             .as_ref()
     }
 
+    /// A hold on this heap ([`HeapHold`]).
+    #[cfg(windows)]
+    pub(crate) fn hold(&self) -> HeapHold {
+        HeapHold(self.life.clone())
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
@@ -127,14 +176,6 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     // SAFETY: registered heaps are live (removed when dropped).
     let heap = unsafe { &*(at as *const Heap) };
     Some((heap, heap.index(handle)?))
-}
-
-/// Whether the title heap object at `heap` is a live shader-visible heap
-/// (one the title released is not: its address may hold another object).
-#[cfg(windows)]
-pub(crate) fn live_heap(heap: usize) -> bool {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    heaps.iter().any(|&(_, _, h)| h == heap)
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
@@ -389,6 +430,9 @@ pub(crate) fn give_back(held: &mut Held) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
+        // First, before any of the heap goes: work holding it ends, and
+        // work after finds it gone ([`HeapHold`]).
+        *self.life.heap.write().unwrap_or_else(|e| e.into_inner()) = 0;
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
@@ -895,7 +939,17 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        life: std::sync::Arc::new(Life {
+            heap: std::sync::RwLock::new(0),
+        }),
     });
+    // The box does not move: its address is the heap's for its life.
+    #[cfg(windows)]
+    {
+        *heap.life.heap.write().unwrap_or_else(|e| e.into_inner()) =
+            std::ptr::from_ref::<Heap>(&heap) as usize;
+    }
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
@@ -1067,6 +1121,72 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// Codex review of a090f22, P1: the work a list runs as it closes kept
+    /// the title heap's address, and took a heap made at that address after
+    /// the title released the first for the first. A hold is of one heap:
+    /// gone with it, whatever is made at its address after.
+    #[cfg(windows)]
+    #[test]
+    fn a_hold_ends_with_its_heap_not_with_its_address() {
+        let first = TestHeap::views(8);
+        let at = first.0 as usize;
+        let hold = heap(first.0).hold();
+        assert_eq!(hold.with(|h| h.start), Some(heap(first.0).start));
+        drop(first);
+        assert_eq!(hold.with(|h| h.start), None, "released");
+        // Heaps made until one takes the address (the allocator usually
+        // gives it back at once), and a few more if none does.
+        let mut later = Vec::new();
+        for _ in 0..64 {
+            let h = TestHeap::views(8);
+            let same = h.0 as usize == at;
+            later.push(h);
+            if same {
+                break;
+            }
+        }
+        assert_eq!(hold.with(|h| h.start), None, "another heap");
+        let last = later.last().expect("a heap");
+        assert!(heap(last.0).hold().with(|_| ()).is_some());
+    }
+
+    /// Codex review of a090f22, P1: the close-time work checked the heap
+    /// under the registry's lock, let it go, then used the heap, which a
+    /// concurrent last release could free between the two. A release now
+    /// waits for the work that holds the heap.
+    #[cfg(windows)]
+    #[test]
+    fn a_release_waits_for_work_that_holds_the_heap() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let made = TestHeap::views(8);
+        let this = made.0 as usize;
+        // The thread below releases it.
+        std::mem::forget(made);
+        let hold = heap(this as This).hold();
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let releaser = {
+            let released = released.clone();
+            move || {
+                release(this as This);
+                released.store(true, Ordering::SeqCst);
+            }
+        };
+        let mut thread = None;
+        let start = hold.with(|h| {
+            thread = Some(std::thread::spawn(releaser));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(!released.load(Ordering::SeqCst), "the release waits");
+            h.start
+        });
+        assert!(start.is_some_and(|s| s != 0));
+        thread
+            .expect("a releasing thread")
+            .join()
+            .expect("released");
+        assert!(released.load(Ordering::SeqCst));
+        assert!(hold.with(|_| ()).is_none());
     }
 
     /// BTP 6 places its shader-visible heap in its own memory
