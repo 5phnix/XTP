@@ -2122,6 +2122,9 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            // XTP_FRAME_PROBE: what it would read (`frameprobe::dropped`).
+            #[cfg(feature = "diagnostics")]
+            self.probe_dropped(list, None);
             self.rt_dropped(list, crate::rt_standin::Work::Groups([x, y, z]));
             self.dispatch_dropped(Unready::NoPipeline);
             return;
@@ -2575,6 +2578,28 @@ impl State {
             .collect()
     }
 
+    /// `XTP_FRAME_PROBE` for a dispatch dropped without a host pipeline
+    /// (diagnostics): the tables its compute program says it uses, from its
+    /// console program (`pipeline::Shader::native`), resolved from the
+    /// roots the title bound, and for an indirect one its `arguments`.
+    #[cfg(feature = "diagnostics")]
+    fn probe_dropped(&self, list: &HostList, arguments: Option<(u64, u64)>) {
+        let Some(shader) = crate::pipeline::compute_shader(self.pipeline as This) else {
+            return;
+        };
+        if !crate::frameprobe::wanted(&shader.hash) {
+            return;
+        }
+        let Ok(native) = shader.native() else {
+            return;
+        };
+        let tables = self.probe_tables(&native.used, &[], true);
+        crate::frameprobe::dropped(list, &shader.hash, tables);
+        if let Some((address, len)) = arguments {
+            crate::frameprobe::arguments(list, address, len);
+        }
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -2884,6 +2909,11 @@ impl State {
             return fail("no host signature".into());
         }
         let Some(p) = crate::pipeline::host_pipeline(pipeline as This) else {
+            // XTP_FRAME_PROBE: what it would read, and its arguments.
+            #[cfg(feature = "diagnostics")]
+            if kind == DISPATCH {
+                self.probe_dropped(list, Some((arguments, len)));
+            }
             if kind == DISPATCH {
                 // Le substitut de ray tracing utilise le nombre réel de commandes
                 // comme prédicat GPU. Lui seul a besoin du bridage en cas de rejet.
@@ -2966,6 +2996,9 @@ impl State {
         if let Err(why) = ready {
             return fail(why);
         }
+        // XTP_FRAME_PROBE: the argument records of a probed op.
+        #[cfg(feature = "diagnostics")]
+        crate::frameprobe::arguments(list, arguments, len);
         let stats = self.own.indirect_samples.next(list, pipeline);
         let Some(out) = crate::indirect::bound(
             list,
