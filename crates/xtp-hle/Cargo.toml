@@ -38,6 +38,7 @@ windows-sys = { workspace = true, features = [
 ] }
 # Trigger motors, accessibility settings and in-memory speech synthesis.
 windows = { workspace = true, features = [
+    "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi_Common",
     "Gaming_Input", "Media_ClosedCaptioning", "UI_ViewManagement",
     "Media_Core", "Media_MediaProperties", "Media_SpeechSynthesis",
     "Data_Xml_Dom", "Media_Transcoding", "Storage_Streams", "Win32_Foundation",
