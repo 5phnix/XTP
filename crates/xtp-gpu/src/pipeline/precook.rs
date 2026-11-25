@@ -380,9 +380,9 @@ pub(in crate::pipeline) mod tests {
     fn kept_graphics_pipelines_are_precooked_into_the_library() {
         let test =
             "pipeline::precook::tests::kept_graphics_pipelines_are_precooked_into_the_library";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let vs = translated(
             "vertex",
             HwStage::Vs,

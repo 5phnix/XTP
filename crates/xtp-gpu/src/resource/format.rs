@@ -937,9 +937,9 @@ mod tests {
     fn the_host_renders_shared_exponent_targets_in_half_floats() {
         let test =
             "resource::format::tests::the_host_renders_shared_exponent_targets_in_half_floats";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let own = HostCaps.support1(67);
         if own & CONSOLE_USES == CONSOLE_USES {
             assert_eq!(HostCaps.host_format(67), 67, "{own:#x}");

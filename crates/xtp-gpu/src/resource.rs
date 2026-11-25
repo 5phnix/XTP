@@ -3591,7 +3591,8 @@ mod tests {
     #[cfg(windows)]
     fn through_a_list(test: &str, format: u32, fill: impl Fn(&mut [u8])) -> Option<(u32, Vec<u8>)> {
         use windows::Win32::Graphics::Direct3D12::*;
-        let host = crate::testgpu::device(test)?;
+        let gpu = crate::testgpu::device(test)?;
+        let host = gpu.host();
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -3951,7 +3952,8 @@ mod tests {
     #[test]
     fn host_descriptions_are_ones_warp_creates() {
         if let Some(device) = warp("resource::tests::host_descriptions_are_ones_warp_creates") {
-            host_descriptions_are_ones(&device);
+            // Probes descriptions the device may refuse.
+            crate::testgpu::expect_layer_errors(|| host_descriptions_are_ones(&device));
         }
     }
 
@@ -3961,7 +3963,8 @@ mod tests {
     fn host_descriptions_are_ones_the_host_gpu_creates() {
         let test = "resource::tests::host_descriptions_are_ones_the_host_gpu_creates";
         if let Some(host) = crate::testgpu::device(test) {
-            host_descriptions_are_ones(&host.device);
+            // Probes descriptions the device may refuse.
+            crate::testgpu::expect_layer_errors(|| host_descriptions_are_ones(&host.device));
         }
     }
     #[test]
@@ -4143,9 +4146,10 @@ mod tests {
     #[test]
     fn views_of_a_drawn_target_read_what_the_gpu_drew() {
         let test = "resource::tests::views_of_a_drawn_target_read_what_the_gpu_drew";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let mut held = Vec::new();
         let memory = fresh_memory(&mut held);
         let address = memory.address();
@@ -4188,7 +4192,6 @@ mod tests {
                 assert_eq!(texels[at..at + 4], [64, 128, 191, 255], "texel {x},{y}");
             }
         }
-        assert_eq!(host.log_messages(), None);
         for r in [other, target] {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
@@ -4204,9 +4207,9 @@ mod tests {
     #[test]
     fn aliases_share_only_what_the_host_can_view() {
         let test = "resource::tests::aliases_share_only_what_the_host_can_view";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let mut held = Vec::new();
         let memory = fresh_memory(&mut held);
         let address = memory.address();
@@ -4377,9 +4380,10 @@ mod tests {
     #[test]
     fn a_view_in_another_format_reads_what_the_gpu_wrote() {
         let test = "resource::tests::a_view_in_another_format_reads_what_the_gpu_wrote";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let mut held = Vec::new();
         let memory = fresh_memory(&mut held);
         let address = memory.address();
@@ -4423,7 +4427,6 @@ mod tests {
         // A texture of the target's own format over it is no such alias.
         let same = texture_at(address, &words(&texture(16, 16, R32_FLOAT, 1), [3, 4])).unwrap();
         assert!(!alias_copy(reads.host(), same));
-        assert_eq!(host.log_messages(), None);
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
     }
 
@@ -4435,9 +4438,10 @@ mod tests {
     #[test]
     fn packed_light_is_decoded_into_an_rgba16f_stand_in() {
         let test = "resource::tests::packed_light_is_decoded_into_an_rgba16f_stand_in";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let mut held = Vec::new();
         let written = fresh_memory(&mut held);
         const PACKED: u32 = 256 | 128 << 9 | 64 << 18 | 15 << 27;
@@ -4485,7 +4489,6 @@ mod tests {
                 "texel {x},{y}"
             );
         }
-        assert_eq!(host.log_messages(), None);
         for r in [stand_in, target] {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
@@ -4497,9 +4500,9 @@ mod tests {
     #[test]
     fn a_placed_view_made_before_its_target_follows_it() {
         let test = "resource::tests::a_placed_view_made_before_its_target_follows_it";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let mut held = Vec::new();
         let memory = fresh_memory(&mut held);
         let address = memory.address();
@@ -4541,9 +4544,9 @@ mod tests {
     #[test]
     fn placed_views_go_with_their_memory() {
         let test = "resource::tests::placed_views_go_with_their_memory";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let mut held = Vec::new();
         let memory = fresh_memory(&mut held);
         let address = memory.address();
@@ -4574,9 +4577,9 @@ mod tests {
     #[test]
     fn a_remapping_takes_the_views_it_overlaps() {
         let test = "resource::tests::a_remapping_takes_the_views_it_overlaps";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let mut held = Vec::new();
         let memory = fresh_memory(&mut held);
         let address = memory.address();
@@ -4607,9 +4610,9 @@ mod tests {
     #[test]
     fn a_released_targets_copy_goes_when_its_memory_is_used_again() {
         let test = "resource::tests::a_released_targets_copy_goes_when_its_memory_is_used_again";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let mut held = Vec::new();
         let memory = fresh_memory(&mut held);
         let address = memory.address();
@@ -4643,9 +4646,9 @@ mod tests {
     #[test]
     fn title_filled_textures_go_to_the_pool_and_targets_do_not() {
         let test = "resource::tests::title_filled_textures_go_to_the_pool_and_targets_do_not";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let pooled = |flags: u32| {
             let r = tests_support::committed(&ResourceDesc {
                 flags,
