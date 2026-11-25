@@ -1,34 +1,121 @@
-//! The indices of a host BLAS build, checked on the GPU where the build reads
-//! them (Codex review 11f27db1, P1-2). A check of title memory when the
-//! build is recorded saw another version than the build: the host copy is
-//! refreshed at submission, and a copy or a shader of the same submission
-//! may write it before the build. So each indexed geometry's indices are
-//! copied, as 32-bit ones, into a buffer of the build's own by a pass of
-//! ours, ordered after every earlier write; one past the geometry's
-//! vertices raises the build's flag, and then every index of the build
-//! becomes 0: degenerate triangles, which DXR leaves inactive, so the
-//! build takes none of them, and the refusal is logged once the
-//! submission has run ([`Check`]).
+//! The inputs of a host BLAS build, made by a pass of ours on the GPU,
+//! where the build reads them (Codex review 11f27db1, P1-2). A check of
+//! title memory when the build is recorded saw another version than the
+//! build: the host copy is refreshed at submission, and a copy or a shader
+//! of the same submission may write it before the build. So, ordered after
+//! every earlier write, the pass makes every input of the build in a
+//! buffer of the build's own (`indices.hlsl`):
+//!
+//! - each indexed geometry's indices, as 32-bit ones: copied from 16-bit
+//!   or 32-bit indices, or decoded from the console builder's
+//!   meshlet-packed ones ([`console`]). One past the geometry's vertices,
+//!   or a packed part outside the bytes recorded for it, raises the
+//!   build's flag, and then every index of the build becomes 0: degenerate
+//!   triangles, which give no intersection, so the build takes none of
+//!   them, and the refusal is logged once the submission has run
+//!   ([`Check`]);
+//! - each geometry's vertices: decoded from the console builder's
+//!   quantized ones to `R32G32B32_FLOAT` positions, or copied;
+//! - each geometry's transform, copied.
+//!
+//! The pass reads the title's copies as UAVs, as the instance rewrite does
+//! (`instances::rewrite`): a shader of the title that wrote one earlier in
+//! the submission left it promoted to that state, which a shader resource
+//! read may not take (Codex review dcc6e70a, P1-1). It then returns them to
+//! the common state, as the title's later work and the next pass take
+//! them; the build reads only the pass's buffer, so no title copy is left
+//! in a read state the next pass could not read as a UAV.
 //!
 //! shortcut: a refused build still takes the triangles of its geometries
 //! without indices; only the indexed ones are left out.
+//!
+//! shortcut: a title copy a draw of the same submission read before the
+//! pass is promoted to a read state, which a UAV read may not take; the
+//! debug layer may report it (the instance rewrite shares it).
 
 use super::*;
 use windows::core::s;
 
-/// One indexed geometry's indices, as the pass reads them.
+/// How the pass makes one input of a build (`kind` in `indices.hlsl`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Kind {
+    /// 16-bit indices, made 32-bit.
+    Narrow,
+    /// 32-bit indices.
+    Wide,
+    /// The console builder's meshlet-packed indices ([`console`]): the
+    /// pass reads `limit` bytes of the window at most, and `flip` swaps
+    /// each triangle's first and third corners.
+    Packed { limit: u32, flip: bool },
+    /// The console builder's quantized vertices ([`console`]), the window
+    /// at their header, `stride` bytes apart: decoded to float3 positions.
+    Quantized { stride: u32 },
+    /// Words copied as they are.
+    Words,
+}
+
+impl Kind {
+    fn code(self) -> u32 {
+        match self {
+            Kind::Narrow => 0,
+            Kind::Wide => 1,
+            Kind::Packed { .. } => 2,
+            Kind::Quantized { .. } => 3,
+            Kind::Words => 4,
+        }
+    }
+}
+
+/// What a made input is to its geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Input {
+    /// Its indices, as 32-bit ones.
+    Indices,
+    /// Its vertices, in `format`, `stride` bytes apart, the first `skew`
+    /// bytes into the made copy (copied 2-byte aligned vertices start
+    /// inside a word).
+    Vertices {
+        format: DXGI_FORMAT,
+        stride: u64,
+        skew: u32,
+    },
+    /// Its transform.
+    Transform,
+}
+
+/// One input of a build, as the pass makes it.
 pub(super) struct Job {
     /// Which geometry of the build.
     pub(super) geometry: usize,
-    /// Its indices' host copy, at the 4-byte word they start in.
+    pub(super) input: Input,
+    pub(super) kind: Kind,
+    /// The title's host copy that holds the window.
+    pub(super) shadow: Arc<crate::shadow::Shadow>,
+    /// The window's first byte, a host address: a 16-bit index's, or a
+    /// word's.
     pub(super) source: u64,
-    /// Bytes from `source` to the first index (0 or 2).
-    pub(super) offset: u32,
+    /// The indices, vertices or words it makes.
     pub(super) count: u32,
-    /// 32-bit indices, else 16-bit.
-    pub(super) wide: bool,
-    /// The geometry's vertex count: indices must be below it.
+    /// Indices: the geometry's vertex count, which they must be below.
     pub(super) vertices: u32,
+}
+
+impl Job {
+    /// The bytes it makes.
+    fn bytes(&self) -> u64 {
+        let each = match self.kind {
+            Kind::Quantized { .. } => 12,
+            _ => 4,
+        };
+        u64::from(self.count) * each
+    }
+}
+
+/// The root view the pass reads `source` through, 16-byte aligned as a raw
+/// view's base must be, and the byte of `source` in it (Codex review
+/// dcc6e70a, P1-2).
+pub(super) fn view(source: u64) -> (u64, u32) {
+    (source & !15, (source & 15) as u32)
 }
 
 fn pipeline(device: &ID3D12Device5) -> Option<&'static (ID3D12RootSignature, ID3D12PipelineState)> {
@@ -46,9 +133,13 @@ fn groups(count: u32) -> (u32, u32) {
     (groups.min(65535), groups.div_ceil(65535).max(1))
 }
 
-/// Records, before a BLAS build, the checked copies of `jobs`' indices,
-/// and points each of their geometries at its copy, as 32-bit indices.
-/// `at` is the BLAS's title address, for the log.
+/// The pass's steps (`step` in `indices.hlsl`).
+const CLEAR: u32 = 0;
+const MAKE: u32 = 1;
+const ZERO_IF_FLAGGED: u32 = 2;
+
+/// Records, before a BLAS build, what `jobs` make, and points each of
+/// their geometries at it. `at` is the BLAS's title address, for the log.
 pub(super) fn record(
     rec: &Recorder<'_>,
     title_list: *const Object,
@@ -56,57 +147,110 @@ pub(super) fn record(
     jobs: &[Job],
     at: u64,
 ) -> Option<()> {
-    let Some(first_job) = jobs.first() else {
+    if jobs.is_empty() {
         return Some(());
-    };
-    let (root, pso) = pipeline(rec.device)?;
-    // The flag word, then each geometry's indices, 16-byte aligned.
-    let mut firsts = Vec::with_capacity(jobs.len());
-    let mut bytes = 16u64;
-    for job in jobs {
-        firsts.push(u32::try_from(bytes).ok()?);
-        bytes = bytes
-            .checked_add(u64::from(job.count) * 4)?
-            .next_multiple_of(16);
     }
+    let (root, pso) = pipeline(rec.device)?;
+    // The flag word, then each job's output, 16-byte aligned.
+    let mut bytes = 16u64;
+    let firsts = (jobs.iter())
+        .map(|job| {
+            let first = u32::try_from(bytes).ok()?;
+            bytes = bytes.checked_add(job.bytes())?.next_multiple_of(16);
+            Some(first)
+        })
+        .collect::<Option<Vec<u32>>>()?;
     u32::try_from(bytes).ok()?;
     let built = evicting(|| buffer(rec, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))?;
     rec.list.keep(&built);
-    let flag = flag_slot(rec.device);
+    let indexed = jobs.iter().any(|job| job.input == Input::Indices);
+    // Only indices can raise the flag.
+    let flag = if indexed { flag_slot(rec.device) } else { None };
+    // Each title copy the pass reads, once.
+    let mut sources: Vec<&ID3D12Resource> = Vec::new();
+    for job in jobs {
+        let buffer = &job.shadow.buffer;
+        if !sources.iter().any(|s| s.as_raw() == buffer.as_raw()) {
+            rec.list.keep(buffer);
+            sources.push(buffer);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    rec.list.note_op(|| {
+        format!(
+            "host DXR BLAS inputs made for title address {at:#x}: {} jobs, {bytes} bytes",
+            jobs.len()
+        )
+    });
     // SAFETY: our pass's root signature and pipeline; every root view lies
-    // in a live buffer the list keeps (the indices' host copies were
-    // checked to hold every word read); the built buffer is ours, in the
-    // states named.
+    // in a live buffer the list keeps (each window was checked to lie in
+    // its title copy, a packed index buffer's within its limit); the
+    // buffers are in the states named.
     unsafe {
         let gpu = built.GetGPUVirtualAddress();
         let c = &rec.commands;
         c.SetComputeRootSignature(root);
         c.SetPipelineState(pso);
         c.SetComputeRootUnorderedAccessView(2, gpu);
-        let run = |job: &Job, first: u32, pass: u32| {
+        // Steps that read no title copy name the pass's own buffer.
+        let run = |job: Option<(&Job, u32)>, step: u32| {
+            let Some((job, first)) = job else {
+                let constants = [0, 0, 0, 0, 0, step, 0, 0, 0];
+                c.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
+                c.SetComputeRootUnorderedAccessView(1, gpu);
+                c.Dispatch(1, 1, 1);
+                return;
+            };
+            let (source, offset) = if step == MAKE {
+                view(job.source)
+            } else {
+                (gpu, 0)
+            };
+            let (limit, flip, stride) = match job.kind {
+                Kind::Packed { limit, flip } => (limit, u32::from(flip), 0),
+                Kind::Quantized { stride } => (0, 0, stride),
+                _ => (0, 0, 0),
+            };
             let constants = [
                 job.count,
-                u32::from(job.wide),
+                job.kind.code(),
                 job.vertices,
                 first,
-                job.offset,
-                pass,
+                offset,
+                step,
+                limit,
+                flip,
+                stride,
             ];
-            c.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            c.SetComputeRootShaderResourceView(1, job.source);
-            let (x, y) = if pass == 0 { (1, 1) } else { groups(job.count) };
+            c.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
+            c.SetComputeRootUnorderedAccessView(1, source);
+            let (x, y) = groups(job.count);
             c.Dispatch(x, y, 1);
         };
-        run(first_job, 0, 0);
-        // The title's and our writes of the indices, and the flag's reset,
+        run(None, CLEAR);
+        // The title's and our writes of the inputs, and the flag's reset,
         // before they are read.
         c.ResourceBarrier(&[uav_barrier()]);
         for (job, &first) in jobs.iter().zip(&firsts) {
-            run(job, first, 1);
+            run(Some((job, first)), MAKE);
         }
-        c.ResourceBarrier(&[uav_barrier()]);
-        for (job, &first) in jobs.iter().zip(&firsts) {
-            run(job, first, 2);
+        // What the pass made before it is read; the title's copies back
+        // to the common state.
+        let mut barriers = vec![uav_barrier()];
+        barriers.extend(sources.iter().map(|source| {
+            crate::host::transition(
+                source,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            )
+        }));
+        c.ResourceBarrier(&barriers);
+        if indexed {
+            for (job, &first) in jobs.iter().zip(&firsts) {
+                if job.input == Input::Indices {
+                    run(Some((job, first)), ZERO_IF_FLAGGED);
+                }
+            }
         }
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         if let Some((readback, slot)) = &flag {
@@ -130,10 +274,28 @@ pub(super) fn record(
         }
         for (job, &first) in jobs.iter().zip(&firsts) {
             let t = &mut geometries[job.geometry].Anonymous.Triangles;
-            t.IndexFormat = DXGI_FORMAT_R32_UINT;
-            t.IndexBuffer = gpu + u64::from(first);
+            let made = gpu + u64::from(first);
+            match job.input {
+                Input::Indices => {
+                    t.IndexFormat = DXGI_FORMAT_R32_UINT;
+                    t.IndexBuffer = made;
+                }
+                Input::Vertices {
+                    format,
+                    stride,
+                    skew,
+                } => {
+                    t.VertexFormat = format;
+                    t.VertexBuffer = D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                        StartAddress: made + u64::from(skew),
+                        StrideInBytes: stride,
+                    };
+                }
+                Input::Transform => t.Transform3x4 = made,
+            }
         }
     }
+    decoded(jobs);
     if let Some((_, slot)) = flag {
         // Dropped once the list's submission has run (or the list is reset
         // unsubmitted), which reads the flag.
@@ -145,6 +307,33 @@ pub(super) fn record(
     // Our pass replaced the list's compute root signature and pipeline.
     crate::list::forget_host_bindings(title_list);
     Some(())
+}
+
+/// Counts the geometries decoded from the console builder's formats, and
+/// logs them at powers of two: what a session decodes.
+fn decoded(jobs: &[Job]) {
+    static PACKED: AtomicU64 = AtomicU64::new(0);
+    static VERTICES: AtomicU64 = AtomicU64::new(0);
+    let count = |kind: fn(&Kind) -> bool| jobs.iter().filter(|job| kind(&job.kind)).count() as u64;
+    let packed = count(|kind| matches!(kind, Kind::Packed { .. }));
+    let quantized = count(|kind| matches!(kind, Kind::Quantized { .. }));
+    if packed + quantized == 0 {
+        return;
+    }
+    let before = PACKED.fetch_add(packed, Ordering::Relaxed);
+    let before_quantized = VERTICES.fetch_add(quantized, Ordering::Relaxed);
+    let (was, now) = (
+        before + before_quantized,
+        before + before_quantized + packed + quantized,
+    );
+    if now.ilog2() != was.checked_ilog2().unwrap_or(u32::MAX) {
+        tracing::info!(
+            packed = before + packed,
+            quantized = before_quantized + quantized,
+            "host DXR BLAS geometries decoded on the GPU from the console builder's \
+             meshlet-packed indices and quantized vertices"
+        );
+    }
 }
 
 /// Flag words the GPU copies the builds' flags into, read back on the CPU.
@@ -220,6 +409,11 @@ fn make_flags(device: &ID3D12Device5) -> Option<Flags> {
     }
 }
 
+/// The flag bits (`indices.hlsl`): an index past its vertices; a part of
+/// a packed index buffer outside the bytes recorded for it.
+const PAST_VERTICES: u32 = 1;
+const OUTSIDE: u32 = 2;
+
 /// A build's flag word, read once its submission has run: raised, the
 /// build was refused on the GPU.
 struct Check {
@@ -236,27 +430,37 @@ impl Drop for Check {
             };
             // SAFETY: this check's word of the persistent mapping, which the
             // GPU wrote, if at all, before the submission finished.
-            let raised = unsafe { f.mapped.add(self.slot as usize).read_volatile() } != 0;
+            let raised = unsafe { f.mapped.add(self.slot as usize).read_volatile() };
             f.free.push(self.slot);
             raised
         };
-        if raised {
-            refused_on_gpu(self.at);
+        if raised != 0 {
+            refused_on_gpu(self.at, raised);
         }
     }
 }
 
-/// Logs a BLAS whose indices the GPU found past their vertices (counted;
-/// at powers of two).
-fn refused_on_gpu(at: u64) {
+/// Logs a BLAS whose indices the GPU refused (counted; at powers of two).
+fn refused_on_gpu(at: u64, raised: u32) {
     static REFUSED: AtomicU64 = AtomicU64::new(0);
     let refused = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
     if refused.is_power_of_two() {
+        let why = match (raised & PAST_VERTICES != 0, raised & OUTSIDE != 0) {
+            (true, true) => {
+                "an index past its vertices, and a part of its meshlet-packed indices \
+                 outside the bytes title memory held when the build was recorded"
+            }
+            (false, true) => {
+                "a part of its meshlet-packed indices outside the bytes title memory held \
+                 when the build was recorded"
+            }
+            _ => "an index past its vertices",
+        };
         tracing::warn!(
             address = format_args!("{at:#x}"),
             refused,
-            "host DXR BLAS input refused on the GPU: an index past its vertices, as the build \
-             read it; the build took none of its indexed triangles"
+            "host DXR BLAS input refused on the GPU: {why}, as the build read it; the build \
+             took none of its indexed triangles"
         );
     }
 }

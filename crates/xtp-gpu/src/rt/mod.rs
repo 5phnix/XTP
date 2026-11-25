@@ -3,10 +3,16 @@
 mod allocation;
 mod dispatch;
 pub(crate) use allocation::ResultBuffer;
+#[cfg_attr(
+    not(test),
+    expect(unused_imports, reason = "for draws' traces (task ac895e39)")
+)]
+pub(crate) use dispatch::dispatch_descriptor_tlas_in;
 pub use dispatch::{
     IndirectTlas, dispatch_descriptor_tlas, dispatch_indirect_tlas, prepare_indirect_tlas,
 };
 pub(crate) mod compaction;
+mod console;
 mod indices;
 mod instances;
 #[cfg(feature = "diagnostics")]
@@ -640,6 +646,8 @@ impl Registry {
 /// of one, finds nothing there (its instances are inactive, its rays miss)
 /// instead of a structure in released memory.
 pub(crate) fn release_buffer(owner: Option<usize>, start: u64, end: u64) {
+    #[cfg(test)]
+    tests::released(start, end);
     let (previous, slots) = registry().retire(start, end, Some(owner));
     drop(previous);
     for slot in slots {
@@ -1108,10 +1116,6 @@ impl Builder {
     }
 }
 
-fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u64> {
-    Some(input_range(list, address, bytes, alignment)?.gpu(address))
-}
-
 fn input_range(
     list: &HostList,
     address: u64,
@@ -1190,16 +1194,36 @@ fn invalid<T>(geometry: usize, why: std::fmt::Arguments<'_>) -> Option<T> {
     None
 }
 
-/// Translates indexed or non-indexed triangle descriptions to host addresses.
+/// Whether `shadow`'s buffer holds `bytes` from its host address `host`.
+fn holds(shadow: &crate::shadow::Shadow, host: u64, bytes: u64) -> bool {
+    // SAFETY: plain queries on a live buffer.
+    let (base, width) = unsafe {
+        (
+            shadow.buffer.GetGPUVirtualAddress(),
+            shadow.buffer.GetDesc().Width,
+        )
+    };
+    host.checked_add(bytes)
+        .is_some_and(|end| host >= base && end <= base + width)
+}
+
+/// Translates triangle descriptions for a host build. Each input of each
+/// geometry (indices, vertices, transform) becomes a job of the pass that
+/// makes it in the build's own buffer, where the build reads it
+/// ([`indices`]); the pass sets the geometry's addresses when it is
+/// recorded. The console builder's own formats are decoded there
+/// ([`console`]): `R16_TYPELESS` indices are meshlet-packed, `R32G32_FLOAT`
+/// vertices quantized, and the vertex stride is 15 bits and a flag.
+///
 /// Each input is checked first, and a BLAS with an invalid one is refused
 /// with a log ([`invalid`]): a geometry that is not triangles or has an
-/// unknown format, a vertex stride shorter than a vertex, a vertex or index
-/// count that is no whole number of triangles, vertices, indices or a
-/// transform outside title memory or misaligned, or more geometries or
-/// triangles than DXR allows. Indices past the vertices are checked on the
-/// GPU, in the version the build reads ([`indices`]): each indexed
-/// geometry comes with the job that copies and checks its indices, and its
-/// index buffer is set when that is recorded.
+/// unknown format, a vertex stride shorter than a vertex or past the
+/// builder's 16 bits, a vertex or index count that is no whole number of
+/// triangles, vertices (with their header), indices, packed indices'
+/// parts or a transform outside title memory or misaligned, or more
+/// geometries or triangles than DXR allows. Indices past the vertices,
+/// decoded ones included, are checked on the GPU, in the version the build
+/// reads ([`indices`]).
 ///
 /// # Safety
 /// The active layout supplies NumDescs readable CPU descriptors or pointers to them.
@@ -1207,6 +1231,7 @@ unsafe fn triangles(
     list: &HostList,
     inputs: &Inputs,
 ) -> Option<(Vec<Geometry>, Vec<indices::Job>)> {
+    use indices::{Input, Job, Kind};
     let count = inputs.NumDescs;
     if count > D3D12_RAYTRACING_MAX_GEOMETRIES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE {
         return invalid(0, format_args!("{count} geometries"));
@@ -1241,15 +1266,25 @@ unsafe fn triangles(
         }
         // SAFETY: the geometry type selects Triangles in our own copy.
         let t = unsafe { &mut g.Anonymous.Triangles };
+        // The builder reads 15 bits of stride; bit 15 turns packed triangles.
+        let raw = t.VertexBuffer.StrideInBytes;
+        if raw > console::STRIDE | console::FLIP {
+            return invalid(
+                i,
+                format_args!("vertex stride {raw:#x}, past the builder's 16 bits"),
+            );
+        }
+        let (stride, flip) = (raw & console::STRIDE, raw & console::FLIP != 0);
+        let quantized = t.VertexFormat == DXGI_FORMAT_R32G32_FLOAT;
         let (width, alignment) = match t.VertexFormat {
             DXGI_FORMAT_R32G32B32_FLOAT => (12, 4),
-            DXGI_FORMAT_R32G32_FLOAT => (8, 4),
+            // Quantized, read a word at a time.
+            DXGI_FORMAT_R32G32_FLOAT => (console::QUANTIZED_VERTEX, 4),
             DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (8, 2),
             DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_SNORM => (4, 2),
             format => return invalid(i, format_args!("vertex format {}", format.0)),
         };
-        let stride = t.VertexBuffer.StrideInBytes;
-        if stride < width || stride > u32::MAX.into() || !stride.is_multiple_of(alignment) {
+        if stride < width || !stride.is_multiple_of(alignment) {
             return invalid(
                 i,
                 format_args!("vertex stride {stride} for vertices of {width} bytes"),
@@ -1263,19 +1298,78 @@ unsafe fn triangles(
             return invalid(i, format_args!("no vertex"));
         };
         let start = t.VertexBuffer.StartAddress;
-        let Some(host) = range(list, start, bytes, alignment) else {
-            return invalid(
-                i,
-                format_args!("vertices {start:#x}+{bytes:#x} outside title memory or misaligned"),
-            );
-        };
-        t.VertexBuffer.StartAddress = host;
-        if t.IndexFormat == DXGI_FORMAT_R16_TYPELESS {
-            t.IndexFormat = DXGI_FORMAT_R16_UINT;
+        if quantized {
+            // From their header.
+            let window = start.checked_sub(console::QUANTIZED_HEADER).and_then(|at| {
+                let shadow = input_range(list, at, bytes + console::QUANTIZED_HEADER, 4)?;
+                Some((shadow.gpu(at), shadow))
+            });
+            let Some((source, shadow)) = window else {
+                return invalid(
+                    i,
+                    format_args!(
+                        "quantized vertices {start:#x}+{bytes:#x} or their header outside title \
+                         memory or misaligned"
+                    ),
+                );
+            };
+            jobs.push(Job {
+                geometry: i,
+                input: Input::Vertices {
+                    format: DXGI_FORMAT_R32G32B32_FLOAT,
+                    stride: 12,
+                    skew: 0,
+                },
+                kind: Kind::Quantized {
+                    stride: stride as u32,
+                },
+                shadow,
+                source,
+                count: vertices,
+                vertices: 0,
+            });
+        } else {
+            let Some(shadow) = input_range(list, start, bytes, alignment) else {
+                return invalid(
+                    i,
+                    format_args!(
+                        "vertices {start:#x}+{bytes:#x} outside title memory or misaligned"
+                    ),
+                );
+            };
+            // Copied a word at a time: 2-byte aligned ones start inside one.
+            let host = shadow.gpu(start);
+            let (source, skew) = (host & !3, host & 3);
+            let words = (skew + bytes).div_ceil(4);
+            let Some(words) = u32::try_from(words)
+                .ok()
+                .filter(|&w| holds(&shadow, source, 4 * u64::from(w)))
+            else {
+                return invalid(
+                    i,
+                    format_args!(
+                        "vertices {start:#x}+{bytes:#x} end inside a word past their host copy"
+                    ),
+                );
+            };
+            jobs.push(Job {
+                geometry: i,
+                input: Input::Vertices {
+                    format: t.VertexFormat,
+                    stride,
+                    skew: skew as u32,
+                },
+                kind: Kind::Words,
+                shadow,
+                source,
+                count: words,
+                vertices: 0,
+            });
         }
         let index_size = match t.IndexFormat {
             DXGI_FORMAT_UNKNOWN if t.IndexCount == 0 && t.IndexBuffer == 0 => 0,
-            DXGI_FORMAT_R16_UINT => 2,
+            // R16_TYPELESS: meshlet-packed (`console`).
+            DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_TYPELESS => 2,
             DXGI_FORMAT_R32_UINT => 4,
             format => {
                 return invalid(
@@ -1297,51 +1391,86 @@ unsafe fn triangles(
         }
         total += u64::from(points / 3);
         if index_size != 0 {
-            let (at, n) = (t.IndexBuffer, u64::from(t.IndexCount));
-            let Some(shadow) = input_range(list, at, n * index_size, index_size) else {
-                return invalid(
-                    i,
-                    format_args!("{n} indices at {at:#x} outside title memory or misaligned"),
-                );
+            let n = t.IndexCount;
+            let (kind, shadow, source) = if t.IndexFormat == DXGI_FORMAT_R16_TYPELESS {
+                // From the word its address is in.
+                let at = t.IndexBuffer & !3;
+                let window = (at != 0).then_some(at).and_then(|at| {
+                    let bytes = console::packed_bytes(at, n / 3)?;
+                    let shadow = input_range(list, at, bytes, 4)?;
+                    let (host, limit) = (shadow.gpu(at), bytes.next_multiple_of(4));
+                    let limit = u32::try_from(limit)
+                        .ok()
+                        .filter(|&l| holds(&shadow, host, l.into()))?;
+                    Some((Kind::Packed { limit, flip }, shadow, host))
+                });
+                let Some(window) = window else {
+                    return invalid(
+                        i,
+                        format_args!(
+                            "{n} meshlet-packed indices at {at:#x}: parts outside title memory"
+                        ),
+                    );
+                };
+                window
+            } else {
+                let at = t.IndexBuffer;
+                let bytes = u64::from(n) * index_size;
+                let Some(shadow) = input_range(list, at, bytes, index_size) else {
+                    return invalid(
+                        i,
+                        format_args!("{n} indices at {at:#x} outside title memory or misaligned"),
+                    );
+                };
+                // The pass reads whole words: the last 16-bit index's must
+                // lie in the host copy too.
+                let host = shadow.gpu(at);
+                let end = ((host & 3) + bytes).next_multiple_of(4);
+                if !holds(&shadow, host & !3, end) {
+                    return invalid(
+                        i,
+                        format_args!(
+                            "{n} indices at {at:#x} end 2 bytes before their host copy's end"
+                        ),
+                    );
+                }
+                let kind = if index_size == 4 {
+                    Kind::Wide
+                } else {
+                    Kind::Narrow
+                };
+                (kind, shadow, host)
             };
-            // The check reads whole 4-byte words of the host copy: the last
-            // 16-bit index's word must lie in its buffer too.
-            let host = shadow.gpu(at);
-            let source = host & !3;
-            let end = (host + n * index_size).next_multiple_of(4);
-            // SAFETY: plain queries on a live buffer.
-            let (base, width) = unsafe {
-                (
-                    shadow.buffer.GetGPUVirtualAddress(),
-                    shadow.buffer.GetDesc().Width,
-                )
-            };
-            if end > base + width {
-                return invalid(
-                    i,
-                    format_args!("{n} indices at {at:#x} end 2 bytes before their host copy's end"),
-                );
-            }
-            jobs.push(indices::Job {
+            jobs.push(Job {
                 geometry: i,
+                input: Input::Indices,
+                kind,
+                shadow,
                 source,
-                offset: (host - source) as u32,
-                count: t.IndexCount,
-                wide: index_size == 4,
+                count: n,
                 vertices,
             });
-            t.IndexBuffer = 0;
         }
         if t.Transform3x4 != 0 {
             let at = t.Transform3x4;
-            let Some(host) = range(list, at, 48, 16) else {
+            let Some(shadow) = input_range(list, at, 48, 16) else {
                 return invalid(
                     i,
                     format_args!("a transform at {at:#x} outside title memory or misaligned"),
                 );
             };
-            t.Transform3x4 = host;
+            jobs.push(Job {
+                geometry: i,
+                input: Input::Transform,
+                kind: Kind::Words,
+                source: shadow.gpu(at),
+                shadow,
+                count: 12,
+                vertices: 0,
+            });
         }
+        // Each set to what the pass makes when it is recorded.
+        (t.VertexBuffer.StartAddress, t.IndexBuffer, t.Transform3x4) = (0, 0, 0);
         geometries.push(g);
     }
     if total > u64::from(D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE) {

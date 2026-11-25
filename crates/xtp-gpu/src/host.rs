@@ -1127,6 +1127,12 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Shaders of the list pick buffer views of a view heap's title slots
+    /// when they run: the runs those views read are brought up to date, and
+    /// (shaders writing through them) those they write declared written,
+    /// once per submission whichever lists ask, until a `Copy` or `Run`
+    /// intervenes (`crate::descriptor::host::PickedStep`).
+    Picked(std::sync::Arc<crate::descriptor::host::PickedStep>),
 }
 
 /// Title memory moved by submissions since the last frame-rate line, as
@@ -1266,6 +1272,9 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// The memory values the list waits for, in recorded order: its queue
+    /// submits it once they are met (`queue::wait32`, `queue::wait64`).
+    value_waits: Vec<crate::queue::ValueWait>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     indirect_writers: crate::indirect::Writers,
@@ -1344,6 +1353,16 @@ impl Pending {
                         touches
                             .staging
                             .insert(std::sync::Arc::as_ptr(staging) as usize);
+                    }
+                    // What the submission was given of the heap's listing,
+                    // taken by its first step: the runs refreshed, and the
+                    // runs its shaders write, which go back as `GpuWrite`s.
+                    Step::Picked(step) => {
+                        let (reads, writes) = step.touches(submission);
+                        touches.reads.extend(reads);
+                        back.extend(writes.into_iter().map(|(shadow, from, to)| {
+                            (shadow, from as usize, (to - from) as usize)
+                        }));
                     }
                     _ => {}
                 }
@@ -2972,6 +2991,46 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    /// A memory value the list waits for (`queue::wait32`,
+    /// `queue::wait64`), noted with where it was recorded: after work, and
+    /// after how many of the list's own bottom-of-pipe writes.
+    pub(crate) fn defer_value_wait(&self, mut wait: crate::queue::ValueWait) {
+        let pipelines = !self
+            .pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        let states = !self
+            .states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        let mut deferred = self.deferred();
+        wait.writes_before = deferred.writes.len() as u32;
+        wait.work_before =
+            pipelines || states || !deferred.copies.is_empty() || wait.writes_before > 0;
+        deferred.value_waits.push(wait);
+    }
+
+    /// The memory values the list waits for, in recorded order.
+    pub(crate) fn value_waits(&self) -> Vec<crate::queue::ValueWait> {
+        self.deferred().value_waits.clone()
+    }
+
+    /// The values the list's bottom-of-pipe writes store once it has run
+    /// (timestamps left out): address, value, bytes.
+    pub(crate) fn value_writes(&self) -> Vec<(u64, u64, u8)> {
+        let deferred = self.deferred();
+        let values = deferred
+            .writes
+            .iter()
+            .filter_map(|&(at, what, bytes)| match what {
+                crate::queue::Written::Value(v) => Some((at as u64, v, bytes as u8)),
+                _ => None,
+            });
+        values.collect()
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
@@ -3139,6 +3198,27 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// At each submission of the list, in order with its copies: what the
+    /// buffer views of a view heap's slots that its shaders pick read is
+    /// brought up to date, and what they write declared written
+    /// (`crate::descriptor::host::PickedUse::defer`, once per refresh
+    /// epoch).
+    pub(crate) fn defer_picked(&self, step: std::sync::Arc<crate::descriptor::host::PickedStep>) {
+        self.deferred().copies.push(Step::Picked(step));
+    }
+
+    /// The pipeline the list bound last, as its GPU writes name it
+    /// (`crate::readmap`; 0 without it).
+    pub(crate) fn writer(&self) -> u64 {
+        self.writer.load(Ordering::Relaxed)
+    }
+
+    /// The steps the list runs at each submission (tests).
+    #[cfg(test)]
+    pub(crate) fn steps(&self) -> usize {
+        self.deferred().copies.len()
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
@@ -3262,6 +3342,35 @@ impl HostList {
                     }
                     Kind::Texture
                 }
+                // Each run given as a `Refresh` of it, then each run written
+                // as a `GpuWrite` of it: what the heap's listing gives this
+                // submission (nothing if a list before gave it all, and
+                // nothing has changed since).
+                Step::Picked(step) => {
+                    let (reads, writes) = step.due(batch.submission, batch.title_writes);
+                    for (shadow, from, to) in &reads {
+                        let (address, len) = (*from as usize, (to - from) as usize);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::Refreshes, 1);
+                            add(C::RefreshBytes, len as u64);
+                        }
+                        batch.settle_refresh(shadow, address, len);
+                        batch.add(shadow, address, len);
+                    }
+                    if !writes.is_empty() {
+                        for (_, from, to) in &writes {
+                            batch.settle(*from as usize, (to - from) as usize, false);
+                        }
+                        batch.flush();
+                        for (shadow, from, to) in &writes {
+                            let _snapshot = (!shadow.carded()).then(|| Phase::Snapshots.enter());
+                            let (address, len) = (*from as usize, (to - from) as usize);
+                            shadow.writing_by(batch.submission, address, len, step.writer());
+                        }
+                    }
+                    Kind::Refresh
+                }
             };
             batch.work.steps[kind as usize] += 1;
         }
@@ -3286,6 +3395,9 @@ struct Batch<'a> {
     host: Option<&'a Host>,
     /// The submission's number in the host copies (`shadow::submission`).
     submission: u64,
+    /// Steps that wrote title memory so far ([`Batch::title_written`]):
+    /// what was refreshed before one is refreshed again after it.
+    title_writes: u64,
 }
 
 impl Batch<'_> {
@@ -3389,6 +3501,7 @@ impl Batch<'_> {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.title_writes += 1;
     }
 
     fn flush_before_copy(
@@ -3835,6 +3948,7 @@ impl Meter {
                  {other_ms:.3} ms in other preparation"
             );
             heap_sync.log();
+            crate::descriptor::host::log_picked_frame(frames);
             #[cfg(feature = "diagnostics")]
             crate::indirect::log_counts();
             #[cfg(feature = "diagnostics")]

@@ -91,17 +91,6 @@ impl Gpu {
 thread_local! {
     /// Set while this thread hands the device invalid input on purpose.
     static EXPECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Message ids of known errors this thread's test raises, and the issue
-    /// that tracks them.
-    static KNOWN: std::cell::RefCell<(Vec<i32>, &'static str)> =
-        const { std::cell::RefCell::new((Vec::new(), "")) };
-}
-
-/// For a test that raises known errors (tracked by `issue`) with these
-/// message ids: they are reported on standard error instead of failing it,
-/// so the rest of what it checks still runs under the layer.
-pub(crate) fn known_layer_errors(ids: &[i32], issue: &'static str) {
-    KNOWN.with(|k| *k.borrow_mut() = (ids.to_vec(), issue));
 }
 
 /// Runs `f`, which hands the device invalid input on purpose: the errors
@@ -191,20 +180,14 @@ fn serial() -> bool {
 }
 
 /// Takes the errors this thread raised, those raised on threads that are
-/// no test's, and (run serially) those another test's thread left; known
-/// ones (see [`known_layer_errors`]) are reported on standard error
-/// instead.
+/// no test's, and (run serially) those another test's thread left.
 fn layer_errors() -> Vec<String> {
     let me = thread_name();
-    let (known, issue) = KNOWN.with(|k| k.borrow().clone());
     let serial = serial();
     let mut errors = lock(&LAYER_ERRORS);
-    let (mut taken, mut tolerated) = (Vec::new(), 0);
+    let mut taken = Vec::new();
     errors.retain(|e| {
-        if e.thread == me && known.contains(&e.id) {
-            tolerated += 1;
-            false
-        } else if e.thread == me {
+        if e.thread == me {
             taken.push(format!("{} (message id {})", e.text, e.id));
             false
         } else if !is_test_thread(&e.thread) {
@@ -223,24 +206,8 @@ fn layer_errors() -> Vec<String> {
             true
         }
     });
-    drop(errors);
-    if tolerated > 0 {
-        let _ = writeln!(
-            std::io::stderr(),
-            "KNOWN {me}: {tolerated} D3D12 debug layer error(s) with ids {known:?} ({issue})"
-        );
-    } else if !known.is_empty() && WATCHING_ON.load(std::sync::atomic::Ordering::Relaxed) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "KNOWN {me}: no D3D12 debug layer error with ids {known:?} this run; drop the \
-             allowance once {issue} is fixed"
-        );
-    }
     taken
 }
-
-/// Whether the layer reports to us (see [`watch`]).
-static WATCHING_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Has the debug layer report its errors to [`LAYER_ERRORS`] as they are
 /// raised, on the thread that made the call, before the host moves them
@@ -282,7 +249,6 @@ pub(crate) fn watch(host: &Host) -> bool {
             )
         }
         .map_err(|e| format!("no D3D12 message callback: {e}"))?;
-        WATCHING_ON.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     });
     match watching {

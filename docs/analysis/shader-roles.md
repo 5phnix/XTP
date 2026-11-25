@@ -9,9 +9,10 @@ resolve wrote scene colour over that same 11.8%. All 232 main deferred
 rectangles ran and left the sampled scene colour at zero. A shader's role
 identifies its place in the frame even when its inputs or outputs are empty.
 
-Each row gives the first 16 hex digits of the program container hash and
-the stage reported by the local record list or the system-library dispatch
-notes. Evidence marked *code* is from reading the matching program locally.
+The map covers 388 program hashes. Each row gives the first 16 hex digits
+of the program container hash and the stage reported by the local record
+list, the matching program or the linked analysis. Evidence marked *code*
+is from reading the matching program locally.
 High confidence means the evidence ties the program to the stated
 operation or output. Medium means it supports
 the role but leaves some details or the exact pass open. Low means the role
@@ -78,6 +79,8 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `1cd9bc634417a981` | Pixel | Combines albedo with probe light, a directional-light term and masked local lights, adds a specular term, and scales by exposure for deferred scene colour. | [PIX §11.3][pix113], [Light chain §3.1][tiles], [Lighting terms §3][terms3], [Fallback §8.3][rtf83] | high |
 | `1d2c970773ce2183` | Vertex | Places rectangles in a follow-up lighting pass. | [World black §8.2][black82], code | high |
 | `e070816c3b889df0` | Pixel | Shades rectangles in that follow-up lighting pass. | [World black §8.2][black82] | high |
+| `167501e87c356551` | Vertex | Places the tiled-lighting rectangles from vertex IDs. | [Drops §5.1][drops51] | high |
+| `9727fc3c51b2f11c` | Pixel | Shades the tiled-lighting rectangles over the 40×23 grid. | [Drops §5.1][drops51] | high |
 
 ## Probe and traced lighting
 
@@ -183,6 +186,7 @@ The title's instance-transform and skinning helpers are listed with the
 | `5c09eb42b7a3c362` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
 | `f94e5d8bf4e1cf05` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
 | `ffd93c8a029ff016` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `0ddab4b63b1394e0` | Compute | Belongs to the system acceleration-structure builder. Translation was refused and the kernel's individual output is open. | [Image status §4.1][image41] | medium |
 
 ### Stand-in and fallback paths
 
@@ -227,13 +231,19 @@ dispatches on that path.
 | `c4a269f4eeba3cac` | Pixel | Shades that forward geometry into scene colour. | [World black §8.2][black82] | high |
 | `2da4beb386509b77` | Compute | Builds a depth-weighted colour pyramid for refraction by transparent materials. | [World black §§9.2, 9.6][black92] | high |
 | `731a39171b568298` | Compute | Composites the scene before upscaling, reading half-resolution inputs and writing scene colour and motion vectors. | [PIX §4][pix4], [World black §§8.2, 9.6][black82] | high |
+| `e9f044cc2135ac16` | Compute | Applies in-scattering with an additional fog modifier. Its dispatch and output were not measured separately. | [CPU image §2.1][cpu21], code | medium |
 | `3fe821a8916a4564` | Compute | Updates the small exposure record read by later passes. | [World black §4.3][black43] | high |
+| `2bfdc19dc1f25b3a` | Compute | Writes the lens parameter buffer from the autofocus result and CPU constants. | [CPU image §4.1][cpu41] | high |
+| `c89f7bd38af4f529` | Compute | Resolves half-resolution colour over time using lens parameters and depth. Its output's next reader is open. | [CPU image §4.1][cpu41] | medium |
+| `b2b1ea29bc3987db` | Compute | Appears to be a temporal resolve variant. It was not dispatched in the later PSO sessions and its consumer is open. | [PSO refusals §4.1][pso41], code | low |
 | `30ee260ef303ac7b` | Vertex | Places the full-screen draw that prepares the half-resolution depth-of-field layer. | [World black §9.6][black96], code | high |
 | `f987c56098b9faff` | Pixel | Writes the depth-of-field colour layer with the circle of confusion in alpha. | [World black §9.6][black96] | high |
 | `44fdeb707f882b7d` | Compute | Applies the first blur step to the depth-of-field layer. | [World black §9.6][black96] | high |
 | `03c01507703d7449` | Compute | Applies the following blur step before depth-of-field compositing. | [World black §9.6][black96] | high |
 | `5ec7617b0f7cb43c` | Vertex | Places the full-screen depth-of-field composite draw. | [World black §9.6][black96], code | high |
 | `813a7ead7f09ebd7` | Pixel | Uses depth to composite the blurred layer into the full-size image. | [World black §9.6][black96] | high |
+| `4f4ec7b16673362f` | Pixel | Composites the output image in Series X mode. The cited Series S run did not bind it and the Series X output was not measured there. | [Image comparison §1][fork1], code | medium |
+| `6318f669e4f17d65` | Pixel | Composites the Series S output image. The report confirms translation. A draw and its output were not measured by hash. | [Image comparison §1][fork1], code | medium |
 | `51e19585b4753814` | Compute | Reduces sampled colour across neighbouring lanes and writes two image outputs, including a 960×540 RGBA16F target. The downstream pass is open. | [World black §8.1][black81], code | medium |
 
 Two pixel programs in the pack sample a colour texture, apply a nonlinear
@@ -401,6 +411,168 @@ the shared role at pass level. It leaves individual material variants open.
 | `d5ef4f2bb16d9fa3` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
 | `ad17f5c4f7acac25` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
 
+## Refused and dropped programs
+
+These programs are named by the [refusal census][ref2], whose rows date
+from `1c61fa1`, and by the [PSO logs][pso2] and run reports of other
+builds. Most of them translate on `main` now: the 19 wave64 shadow
+programs since `f992374` ([world-session refusals][waveworld]) and the
+merged geometry halves since [ES/GS §7.2][es72]. None of the rows below
+is still documented as refused; of the programs this group added, only
+`0ddab4b63b1394e0` in the [BVH table][bvh-roles] is. A refusal or an
+incomplete submission can identify a program without showing what its
+output would have fed.
+
+### Shadow compute on the wave64 path
+
+The [refusals study][ref7] identifies 16 cascade programs and three tile
+classifiers from their code. The world-session logs of that time recorded
+refusals for these programs and showed no completed dispatch for any of
+the 19. All 19 translate on `main` since `f992374`.
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `0c028454b58543f0` | Compute | Classifies tiles for shadow rendering. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `191ecaed66eea3b1` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `1d44a723bdebbf27` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `240cb516c1af0bc3` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `31d703207b51549a` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `466ec41d3f9d24c0` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `56f3bf2d9388e5a7` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `65de113e23fa4fdd` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `804b342cb4b9d1e9` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `922e1d0ee1e19a85` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `ab5455fc6abb804f` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `abd7a22106898c66` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `b4b0427232707598` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `b8f3f7979d6bbc50` | Compute | Classifies tiles for shadow rendering. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `be6ce5d849d51127` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `ce79e9eba7ae0348` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld] | medium |
+| `d7db57731ada919b` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `eae3498e6553afa8` | Compute | Classifies tiles for shadow rendering. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `fa0bd10a35bfef3c` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld] | medium |
+
+### Voxelisation geometry
+
+The [refusal census][ref2] counted the export and geometry halves
+separately. Both halves translate on `main` since the [merged geometry
+study's phase 2][es72]. The export half sits in the vertex container and feeds the
+geometry stage.
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `d82a0a5a22471c77` | Geometry | Projects triangles onto their dominant axis for voxelisation. A title draw was not measured. | [Merged geometry §3.2][es32], [Merged geometry §1][es1] | medium |
+| `03861c67cb9ceb8d` | Geometry | Projects triangles onto their dominant axis for voxelisation. A title draw was not measured. | [Merged geometry §3.2][es32], [Merged geometry §1][es1] | medium |
+| `57bc3001951308d7` | Geometry | Projects triangles onto their dominant axis for voxelisation. A title draw was not measured. | [Merged geometry §3.2][es32], [Merged geometry §1][es1] | medium |
+| `31d74f060dce8087` | Geometry | Projects position-only triangle inputs for voxelisation. A title draw was not measured. | [Merged geometry §3.2][es32], [Merged geometry §1][es1] | medium |
+| `595056121e4b69d2` | Export (ES) | Fetches and transforms vertices, supplying positions and texture coordinates for voxelisation. A title draw was not measured. | [Merged geometry §3.2][es32] | medium |
+| `4017ab4a141874cd` | Export (ES) | Fetches vertices and supplies positions alone for voxelisation. A title draw was not measured. | [Merged geometry §3.2][es32] | medium |
+| `01b16737c7da6b94` | Export (ES) | Reads vertex data directly and supplies positions and texture coordinates for voxelisation. A title draw was not measured. | [Merged geometry §3.2][es32] | medium |
+| `12da3b5580f73ed4` | Export (ES) | Reads vertex data directly and supplies positions and texture coordinates for voxelisation. A title draw was not measured. | [Merged geometry §3.2][es32] | medium |
+| `a1430adfd0332446` | Export (ES) | Fetches vertices and supplies positions and texture coordinates for voxelisation. A title draw was not measured. | [Refusals §2][ref2], [Merged geometry §1][es1], code | medium |
+
+### Other geometry and animation
+
+The [mesh survey][mesh34] identifies five programs that exchange data
+through group memory. On 32-lane hosts XTP targets the host's wave size
+by default. The opt-in `XTP_WAVE64_MESH=refuse` is off by default and
+restores the early refusal for comparison. [Wave64 mesh §3.3][mesh33]
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `01c33347724469a5` | Mesh | Builds mesh output using group-shared data. The pass and consumer are open. | [Wave64 mesh §3.4][mesh34], code | low |
+| `29fd13ee162eb134` | Mesh | Builds mesh output using group-shared data. The pass and consumer are open. | [Wave64 mesh §3.4][mesh34], code | low |
+| `b43838907d50bbb1` | Mesh | Builds mesh output using group-shared data. The pass and consumer are open. | [Wave64 mesh §3.4][mesh34], code | low |
+| `f973921e76cf2587` | Mesh | Builds mesh output using group-shared data. The pass and consumer are open. | [Wave64 mesh §3.4][mesh34], code | low |
+| `fe7e1ec48cffda56` | Mesh | Builds mesh output using group-shared data. The pass and consumer are open. | [Wave64 mesh §3.4][mesh34], code | low |
+| `970c4fbb3b017c0e` | Compute | Extracts facial blend-shape data from the network's output. XTP's study did not measure its dispatch or trace downstream use. | [Face animation §1][face1], [Face animation §3][face3] | medium |
+| `e4a7e088c7780ce8` | Compute | Reconstructs normals from the facial animation network's output. XTP's study did not measure its dispatch or trace downstream use. | [Face animation §1][face1], code | medium |
+
+### Pipeline and run reports
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `13dfdd3b1136e407` | Compute | Samples a texture and writes image outputs. The dispatch was dropped during the loading fade and the consumer is open. | [PSO refusals §2][pso2], [World frame §5.1][world51], code | low |
+| `88994c3496045f51` | Compute | Samples a texture and writes image outputs. The pass and consumer are open. | [PSO refusals §2][pso2], code | low |
+| `a25ed0e3d4d521ba` | Compute | Stages image values in group memory and writes an image. The pass and consumer are open. | [Run world §4.2][run42], code | low |
+| `d4111a6e6ea49d91` | Mesh | Supplies mesh geometry for a draw dropped during the loading fade. Its exact contribution is open. | [World frame §5.1][world51], code | medium |
+| `c0a7fe77b1862e10` | Pixel | Samples textures and shades the geometry of that dropped loading-fade draw. Its exact contribution is open. | [World frame §5.1][world51], code | medium |
+| `87bf9e3f2bf2f052` | Compute | Gathers texture values and combines group data into a buffer. The pass and consumer are open. | [Run world §4.2][run42], code | low |
+| `764ca63daec9c616` | Compute | Gathers texture values and updates buffers. The pass and consumer are open. | [Run world §4.2][run42], code | low |
+| `7bdefdfde461f6e3` | Pixel | Samples textures and writes colour targets. The pass is open. | [Run world §4.2][run42], code | low |
+| `2d0cace65bc05bb2` | Pixel | Uses barycentrics to compute a colour output. The pass is open. | [Run world §4.2][run42], code | low |
+| `2561af9577c47289` | Compute | Samples textures and writes image results. The pass and consumer are open. | [Run world §4.2][run42], code | low |
+| `0c0380d9ec648626` | Compute | Reads buffers and textures and writes images. The pass and consumers are open. | [Run world §7.1][run71], code | low |
+| `0ccc14877cbec21e` | Compute | Reads buffers and textures and writes images. The pass and consumers are open. | [Run world §7.1][run71], code | low |
+| `1c8165626a581de4` | Compute | Reads buffers and textures and writes images. The pass and consumers are open. | [Run world §7.1][run71], code | low |
+| `54bcc8478432ba15` | Compute | Reads buffers and textures and writes images. The pass and consumers are open. | [Run world §7.1][run71], code | low |
+| `738350c1a01b713a` | Compute | Reads buffers and textures and writes images. The pass and consumers are open. | [Run world §7.1][run71], code | low |
+| `565cc0b38920b229` | Compute | Reads image data and writes image outputs. The pass and consumers are open. | [Run world §7.1][run71], code | low |
+| `5af5bbc0c3267799` | Compute | Writes buffer records. The pass and consumers are open. | [Run world §7.1][run71], code | low |
+| `51ff151f75cd5759` | Mesh | Reads buffers and emits mesh geometry. The pass is open. | [Run world §7.2][run72], code | low |
+| `7fe75645c406cac6` | Pixel | Samples textures and writes colour targets for that mesh draw. The pass is open. | [Run world §7.2][run72], code | low |
+| `d3e44e754b3eb6aa` | Compute | Processes point data from several buffers and writes a buffer result. Its consumer is open. | [Hang §2][hang2], [Hang §3][hang3] | low |
+| `5b6eed17c131f881` | Compute | Processes indexed data and writes buffers. Its consumer is open. | [Hang §4][hang4], code | low |
+| `269b802f878c24e1` | Compute | Processes buffer records through a bounded loop and writes buffer results. Its consumer is open. | [Hang §4][hang4], code | low |
+| `0e45e59e93b736e4` | Compute | Processes entries from the same table layout as the hang-study programs and writes a buffer result. Its consumer is open. | [Hang §8][hang8], code | low |
+| `6f17771de44c1b0f` | Vertex | Transforms vertices and writes buffer data. The precook comparison found no associated pipeline. | [Precook §3][precook3], code | low |
+
+### Translator survey examples
+
+The survey examples identify resources, operations and output types.
+Their frame bindings and downstream uses remain open.
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `00ae82eaf8b736cf` | Pixel | Samples textures and writes colour targets. The pass is open. | [Scalar data §4][scalar4], code | low |
+| `01d73927f08aed16` | Pixel | Samples textures and writes colour targets. The pass is open. | [Scalar data §4][scalar4], code | low |
+| `257fb752e6b64ce4` | Pixel | Samples textures and writes colour targets. The pass is open. | [Scalar data §4][scalar4], code | low |
+| `077869cd9b1456ee` | Compute | Samples textures and writes images and buffer data. The pass and consumers are open. | [Scalar data §4][scalar4], code | low |
+| `0ae69044bfd15035` | Compute | Samples textures and writes images and buffer data. The pass and consumers are open. | [Scalar data §4][scalar4], code | low |
+| `02523c2a5d6a788d` | Vertex | Samples textures, transforms vertices and writes buffer data. The pass is open. | [Scalar data §4][scalar4], code | low |
+| `0914e7ab5623cd47` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Scalar data §4][scalar4], code | low |
+| `133edc77b7d5e27b` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Scalar data §4][scalar4], code | low |
+| `425c36bb6923788d` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Scalar data §4][scalar4], code | low |
+| `578027faffb06047` | Pixel | Samples textures and performs atomic updates while shading fragments. The pass is open. | [Scalar data §4][scalar4], code | low |
+| `187f053719d2206e` | Pixel | Samples textures and shades fragments using tables embedded in the program. The pass is open. | [Wave64 mesh §9.2][mesh92], code | low |
+| `17761234145ad256` | Pixel | Samples textures and shades fragments using tables embedded in the program. The pass is open. | [Wave64 mesh §9.2][mesh92], code | low |
+| `b2711644ca5566cc` | Compute | Samples textures and writes images using tables embedded in the program. The pass and consumers are open. | [Wave64 mesh §9.2][mesh92], code | low |
+| `ae8d95a27b954ab3` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `f4fd42dc10ebd74d` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `efce39ec51c443c0` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `925d917ce78662eb` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `a91084c089f1d02f` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `ffef6fc85b3c948e` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `4499fa2ae03d0c81` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `9087520fdbab22ca` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `5c7da08ced013cdf` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `c89489afd89ee7f0` | Mesh | Samples textures while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `0bd4d80ad23b106b` | Mesh | Reads images and buffers while preparing mesh output. The pass is open. | [Refusals §2][ref2], code | low |
+| `5ddcaa08d4a51215` | Pixel | Samples textures and writes colour targets. The pass is open. | [Refusals §2][ref2], code | low |
+| `464ea474374b8ecd` | Pixel | Samples textures and writes colour targets. The pass is open. | [Refusals §2][ref2], code | low |
+| `38bf0814e721a1b3` | Pixel | Samples textures and writes colour targets. The pass is open. | [Refusals §2][ref2], code | low |
+| `4afdc95a666116d7` | Pixel | Samples textures and writes colour targets. The pass is open. | [Refusals §2][ref2], code | low |
+| `b84ed91212991569` | Pixel | Samples textures and writes colour targets. The pass is open. | [Refusals §2][ref2], code | low |
+| `2a12fab309f26d20` | Pixel | Samples textures and writes colour targets. The pass is open. | [Refusals §2][ref2], code | low |
+| `f0296ce9fbe481cb` | Pixel | Samples textures and writes both fragment and image outputs. The pass is open. | [Refusals §2][ref2], code | low |
+| `c1dacd75698a5db8` | Pixel | Samples textures and writes both fragment and image outputs. The pass is open. | [Refusals §2][ref2], code | low |
+| `aafcf40b30b9df18` | Pixel | Samples textures and writes both fragment and image outputs. The pass is open. | [Refusals §2][ref2], code | low |
+| `3bc3bfd1cec35a7f` | Compute | Samples textures and writes images and buffer data. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `04f90cb19f940759` | Compute | Samples textures and writes images and buffer data. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `ffa98fdac87e91cb` | Compute | Samples textures and updates images and buffers. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `9ffcaff533995118` | Compute | Reads and writes indexed buffer records. The pass and consumer are open. | [Refusals §2][ref2], code | low |
+| `6871d6e4b3ac9a10` | Compute | Samples textures and writes images using group-shared data. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `5dc3b25986622949` | Compute | Samples textures and writes images using group-shared data. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `6f225b641c5b0708` | Compute | Samples textures and writes images using group-shared data. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `c309eb1b2234e63c` | Compute | Reads images and updates images and buffers. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `de0d2103f217616e` | Compute | Reads images and updates images and buffers. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `2c55789a32b5aec7` | Compute | Reads images and updates images and buffers. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `53c21e950d143cc7` | Compute | Uses sampled values in atomic updates. The pass and consumer are open. | [Refusals §2][ref2], code | low |
+| `25328ea424d08c00` | Compute | Uses group memory to combine values and writes buffer results. The pass and consumer are open. | [Refusals §2][ref2], code | low |
+| `526c84818961beb6` | Compute | Reads textures and updates images and buffers. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `697f2629f7dc5be0` | Compute | Reads textures and updates images and buffers. The pass and consumers are open. | [Refusals §2][ref2], code | low |
+| `a929109552ce1e84` | Compute | Samples textures and writes an image. The pass and consumer are open. | [Refusals §2][ref2], code | low |
+
 ## Coverage of the frame
 
 The frame summary does not enumerate the hashes bound in its main depth
@@ -463,3 +635,31 @@ pipeline records. The bilinear upscaler in the measured frame is XTP's
 [ref62]: refusals.md#62-the-frames-lists-and-what-is-dropped-in-each
 [ref63]: refusals.md#63-ranked-the-refused-programs-that-run-in-the-world
 [fx]: fidelityfx.md
+[ref2]: refusals.md#2-the-census
+[ref7]: refusals.md#7-pick-12-and-the-23-compute-programs-still-refused-for-groups-of-more-than-64-threads
+[waveworld]: ../wave64-on-wave32.md#world-session-refusals-on-32-lane-hosts
+[pso2]: pso-refusals.md#2-the-refusals-in-the-logs
+[pso41]: pso-refusals.md#41-the-95-that-translate
+[pso42]: pso-refusals.md#42-the-21-the-translator-refuses
+[drops51]: drops.md#51-indirect-rectangle-lists-run-victory-346
+[world51]: world-frame.md#51-what-the-frame-lines-show
+[run42]: run-world.md#42-by-shader
+[run71]: run-world.md#71-what-happened
+[run72]: run-world.md#72-where-dred-b-save
+[hang2]: hang.md#2-the-report
+[hang3]: hang.md#3-the-program-and-what-it-reads
+[hang4]: hang.md#4-its-loops-and-those-of-the-two-programs-after-it
+[hang8]: hang.md#8-upstream
+[cpu21]: title-cpu-image.md#21-what-it-is
+[cpu41]: title-cpu-image.md#41-the-chain-present-1-frame-677
+[fork1]: fork-image-diff.md#1-verdict
+[face1]: face-animation.md#1-what-the-fork-found
+[face3]: face-animation.md#3-the-change
+[es1]: es-gs.md#1-summary
+[es32]: es-gs.md#32-eight-programs-surveyed
+[es72]: es-gs.md#72-phase-2-first-piece-task-5baa47be-2026-11-25
+[scalar4]: r1-scalar-data.md#4-the-266-that-remain
+[mesh33]: mesh-wave64.md#33-the-runtime-xtp-gpu-pipelinehostrs-pipeliners
+[mesh34]: mesh-wave64.md#34-lds-order-within-a-console-wave-emitlowermeshrs
+[mesh92]: mesh-wave64.md#92-tables-in-the-code-through-joins-and-first-lanes-fork-pick-4
+[precook3]: precook.md#3-measured-on-the-l4

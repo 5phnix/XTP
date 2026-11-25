@@ -10,7 +10,10 @@
 //! precook` on the title's shader pack ([`precook`]), unless
 //! `--no-precook`: a session after a translator change then finds its
 //! translations and compute pipelines made, and one after none pays a few
-//! seconds for the check.
+//! seconds for the check. A measured run starts the title without it unless
+//! `XTP_PLAY_PRECOOK=1` asks for it ([`precooks`]): after a translator
+//! change the whole precook took 13 to 23 minutes on the PC, and the
+//! session translates and makes each pipeline at its first use anyway.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +37,10 @@ const STOPS: &str = "the script stops here";
 const FRAME_RATE: &str = "xtp_gpu::host";
 /// Cuts the intro movie (crates/xtp-game/src/intro.rs).
 const SKIP_INTRO: &str = "XTP_SKIP_INTRO";
+/// Keeps the title's own watchdog from ending it (crates/xtp-game/src/watchdog.rs).
+const WATCHDOG_HOOK: &str = "XTP_WATCHDOG_HOOK";
+/// Runs `xtp precook` before a measured run too ([`precooks`]).
+const PLAY_PRECOOK: &str = "XTP_PLAY_PRECOOK";
 
 pub struct Options {
     /// Seconds of gameplay before the title is ended.
@@ -87,10 +94,16 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
     let console = console(std::env::var("XTP_CONSOLE").ok().as_deref())?;
     let _session = Session::take()?;
     refuse_a_second_title()?;
-    if options.no_precook {
+    let forced = std::env::var_os(PLAY_PRECOOK).is_some_and(|v| !v.is_empty() && v != "0");
+    if precooks(options.measure.is_some(), options.no_precook, forced) {
+        precook(&xtp, &game)?;
+    } else if options.no_precook {
         println!("play: no precook (--no-precook)");
     } else {
-        precook(&xtp, &game)?;
+        println!(
+            "play: no precook for a measured run: the title translates and makes each pipeline \
+             at its first use (XTP_PLAY_PRECOOK=1 precooks first)"
+        );
     }
     let run = cfg.cache_subdir("play")?.join(stamp(SystemTime::now()));
     let data = run.join("data");
@@ -129,6 +142,19 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
         // keeps it; an XTP_SKIP_INTRO already set is left as it is.
         println!("play: intro movie cut (XTP_PLAY_INTRO=1 keeps it)");
         command.env(SKIP_INTRO, "1");
+    }
+    if hooks_watchdog(
+        options.measure.is_some(),
+        std::env::var_os(WATCHDOG_HOOK).is_some(),
+        std::env::var_os("XTP_PLAY_WATCHDOG").is_some(),
+    ) {
+        // The title ends itself after about 30 s without a finished frame,
+        // which a console never takes but our world frames still can, and
+        // more so under slow diagnostics (docs/analysis/title-crashes.md).
+        // XTP_PLAY_WATCHDOG keeps the title's watchdog armed; an
+        // XTP_WATCHDOG_HOOK already set is left as it is.
+        println!("play: title watchdog hooked (XTP_PLAY_WATCHDOG=1 keeps it armed)");
+        command.env(WATCHDOG_HOOK, "1");
     }
     let mut child = command
         .stdin(Stdio::null())
@@ -256,6 +282,27 @@ fn with_exit(script: &str, measure: Option<u64>) -> String {
 /// `XTP_PLAY_INTRO`.
 fn skips_intro(measured: bool, already_set: bool, keep_intro: bool) -> bool {
     measured && !already_set && !keep_intro
+}
+
+/// Whether a run precooks before the title: a run for the player does, a
+/// measured run only when `XTP_PLAY_PRECOOK=1` asks for it (`forced`), and
+/// none with `--no-precook`. Without a precook, the title translates each
+/// program and makes each host pipeline, compute or graphics, at its first
+/// use, by the functions the precook calls (`xtp_gpu::pipeline`'s `make`
+/// workers: `HostPipeline::new`, the shader cache's `host_shader`, the
+/// pipeline library); a draw or dispatch whose pipeline is not made within
+/// the frame's wait (`XTP_PIPELINE_WAIT_MS`) is dropped until it is. The
+/// title's watchdog is hooked in measured runs ([`hooks_watchdog`]), so a
+/// slow first frame does not end it.
+fn precooks(measured: bool, no_precook: bool, forced: bool) -> bool {
+    !no_precook && (!measured || forced)
+}
+
+/// Whether a run hooks the title's watchdog: measured runs do, unless the
+/// caller set `XTP_WATCHDOG_HOOK` itself (left as it is) or asked for the
+/// title's own watchdog with `XTP_PLAY_WATCHDOG`.
+fn hooks_watchdog(measured: bool, already_set: bool, keep_watchdog: bool) -> bool {
+    measured && !already_set && !keep_watchdog
 }
 
 /// `YYYYMMDD-HHMMSS`, UTC.
@@ -552,6 +599,44 @@ mod tests {
         assert!(
             !skips_intro(true, false, true),
             "XTP_PLAY_INTRO keeps the movie"
+        );
+    }
+
+    #[test]
+    fn measured_runs_skip_the_precook_unless_told_otherwise() {
+        assert!(!precooks(true, false, false));
+        assert!(
+            precooks(false, false, false),
+            "a run for the player precooks"
+        );
+        assert!(
+            precooks(true, false, true),
+            "XTP_PLAY_PRECOOK=1 precooks a measured run"
+        );
+        assert!(
+            !precooks(false, true, false),
+            "--no-precook skips it for the player"
+        );
+        assert!(
+            !precooks(true, true, true),
+            "--no-precook wins over XTP_PLAY_PRECOOK"
+        );
+    }
+
+    #[test]
+    fn measured_runs_hook_the_title_watchdog_unless_told_otherwise() {
+        assert!(hooks_watchdog(true, false, false));
+        assert!(
+            !hooks_watchdog(false, false, false),
+            "a run for the player keeps the title's watchdog"
+        );
+        assert!(
+            !hooks_watchdog(true, true, false),
+            "a caller's own setting stays"
+        );
+        assert!(
+            !hooks_watchdog(true, false, true),
+            "XTP_PLAY_WATCHDOG keeps the title's watchdog armed"
         );
     }
 

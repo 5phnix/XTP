@@ -3426,6 +3426,12 @@ fn card_limits() -> (u64, u64) {
 pub(crate) static CARD_CHANGED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// For tests: GPU copies within a copy in the card's memory that staged
+/// in the card's memory too ([`copy`]).
+#[cfg(test)]
+pub(crate) static CARD_STAGED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Bytes of the card sides alive.
 static CARD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -4635,6 +4641,15 @@ pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// title memory once the list has run. Returns false, recording nothing,
 /// when neither side has a copy: title memory is then all there is, and
 /// the caller copies it on the CPU at submission.
+///
+/// A copy within one host buffer (both ranges in the same copy) goes
+/// through a staging buffer made for it, which the list keeps until it is
+/// reset: one buffer cannot be the source and the destination of a GPU copy
+/// at once. The staging buffer is in the card's memory when the buffer is
+/// ([`Shadow::carded`]), else in system memory. If it cannot be made, this
+/// returns false too (logged, counted): the caller then copies title memory
+/// on the CPU at submission, which misses what shaders wrote to the source
+/// earlier in the list and what they read of the destination later.
 pub(crate) fn copy(list: &HostList, dst: u64, src: u64, len: u64) -> bool {
     if len == 0 {
         return true;
@@ -4652,12 +4667,36 @@ pub(crate) fn copy(list: &HostList, dst: u64, src: u64, len: u64) -> bool {
     };
     let (at, from_at) = (to.offset(dst), from.offset(src));
     let same = from.buffer.as_raw() == to.buffer.as_raw();
-    // Overlapping ranges of one buffer go through a buffer of the list's
-    // own, as if the source were read whole first.
-    let through = if same && from_at < at + len && at < from_at + len {
-        let Some((through, _)) = host.shared_buffer(len) else {
+    // Copies within one buffer go through a staging buffer made for this
+    // copy: one buffer cannot be in COPY_SOURCE and COPY_DEST at once, and
+    // the debug layer rejects a source in COPY_DEST (message 538).
+    // Overlapping ranges then also read the source whole first. A buffer in
+    // the card's memory stages there too, not across the bus.
+    let through = if same {
+        let carded = from.carded();
+        let staging = if carded {
+            crate::host::buffers::card_buffer(&host.device, len)
+        } else {
+            host.shared_buffer(len).map(|(buffer, _)| buffer)
+        };
+        let Some(through) = staging else {
+            static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                tracing::warn!(
+                    count,
+                    len,
+                    carded,
+                    "no staging buffer for a GPU copy within one buffer: copied on the CPU at \
+                     submission, without what shaders of the list wrote or read around it"
+                );
+            }
             return false;
         };
+        #[cfg(test)]
+        if carded {
+            CARD_STAGED.fetch_add(1, Ordering::Relaxed);
+        }
         list.keep(&through);
         Some(through)
     } else {
@@ -4692,15 +4731,10 @@ pub(crate) fn copy(list: &HostList, dst: u64, src: u64, len: u64) -> bool {
                 transition(through, dest, source),
             ]);
             list.list.CopyBufferRegion(b, at, through, 0, len);
-            list.list.ResourceBarrier(&[transition(b, dest, common)]);
-        } else if same {
-            // One buffer is the source and the destination: copied within
-            // it as a destination.
-            let b = &to.buffer;
-            list.list
-                .ResourceBarrier(&[uav_barrier(), transition(b, common, dest)]);
-            list.list.CopyBufferRegion(b, at, b, from_at, len);
-            list.list.ResourceBarrier(&[transition(b, dest, common)]);
+            list.list.ResourceBarrier(&[
+                transition(b, dest, common),
+                transition(through, source, common),
+            ]);
         } else {
             let (a, b) = (&from.buffer, &to.buffer);
             list.list.ResourceBarrier(&[

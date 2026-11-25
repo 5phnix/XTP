@@ -1,7 +1,8 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
 //! cache folder, keyed by the container's content, by the translator that
 //! made it (the fingerprint of `xtp-shader`'s sources, [`xtp_shader::SOURCES`],
-//! and of this file, with the translation settings: [`build`]), so a
+//! and of this file, with every translation setting in the value the
+//! translator uses: [`build`]), so a
 //! changed translator never serves an old translation while a build that
 //! changed only elsewhere keeps them, and by the wave sizes it was made for
 //! (VIctory #223: a translation for a 32-lane host is not a 64-lane one's).
@@ -19,8 +20,8 @@
 //! text length, checksum and UTF-8. The translator's refusals
 //! ([`xtp_shader::ShaderError`]: a malformed container, GFX10 code it
 //! cannot decode or does not handle yet) depend only on the container and
-//! on what `key()` hashes (our executable, its loop limit, the target's
-//! wave sizes), so it would fail the same way again. Without that, every
+//! on what `key()` hashes (the translator, every setting it runs with, the
+//! target's wave sizes), so it would fail the same way again. Without that, every
 //! run translated the same few hundred refused programs again (seconds each
 //! for the large ones) while the title waited for them. Nothing transient
 //! is kept: the host driver's compile, where out of memory and a removed
@@ -72,7 +73,8 @@ pub fn use_shader_cache(dir: PathBuf) {
 /// Lists the cache's folder again and writes its index anew from what is
 /// there (`xtp_pipeline::Cache::reindex`), then trims it to its limit:
 /// whether it could (false: a folder of the cache could not be listed, and
-/// the index is left as it was), and the entries and bytes it holds after;
+/// the index is left as it was, or the listing could not be written as the
+/// index file: the log says which), and the entries and bytes it holds after;
 /// `None` without a cache. The index only sizes the cache, and the sessions
 /// between two precooks can leave it stale (a process stopped between an
 /// entry's rename and its record, an index replaced under another
@@ -99,61 +101,110 @@ fn count<T, E>(counter: &AtomicU64, result: Result<T, E>) -> Result<T, E> {
     result
 }
 
-/// What identifies the translator this build runs: the fingerprint of
-/// `xtp-shader`'s sources ([`xtp_shader::SOURCES`]), this file (the
-/// entries' encoding, [`ENCODING`]) and the translation settings it runs
-/// with (the loop limit, the loops' budget, the DXIL clean-up passes and
-/// the raw structured reads, which any build can change at run time). Not
-/// the whole executable: before, the least change anywhere (the HLE, a log
-/// line, another worker's branch) made every translation again, and each
-/// worktree's sessions started cold.
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
-        let limit = xtp_shader::emit::loop_limit();
-        if limit != xtp_shader::emit::DEFAULT_LOOP_LIMIT {
-            tracing::warn!(limit, "XTP_SHADER_LOOP_LIMIT: translated loops stop sooner");
-        }
-        let budget = xtp_shader::emit::loop_budget();
-        if budget != xtp_shader::emit::DEFAULT_LOOP_BUDGET {
-            tracing::warn!(
-                budget,
-                "XTP_SHADER_LOOP_BUDGET: back edges a lane may take in all loops together (0: no budget)"
-            );
-        }
-        // And the clean-up passes run over the translated code.
-        let passes = xtp_shader::emit::dxil_opt();
-        if passes != 0 {
-            tracing::info!(passes, "XTP_DXIL_OPT: clean-up passes run over translated shaders");
-        }
-        // And structured reads through raw handles (XTP_RAW_STRUCTURED).
-        let raw = u32::from(xtp_shader::emit::raw_structured());
-        // And the loop-limit counter (XTP_SHADER_LOOP_COUNT), in the same
-        // word as the raw reads: bit 1 (0 without it, so the key is the
-        // one it had before the switch).
-        let raw = raw | u32::from(xtp_shader::emit::loop_count()) << 1;
-        if xtp_shader::emit::loop_count() {
-            tracing::info!("XTP_SHADER_LOOP_COUNT: translated loops count the lanes they stop");
-        }
-        build_of(xtp_shader::SOURCES, ENCODING, [limit, budget, passes, raw])
-    })
+/// What identifies the translator a translation made now runs: the
+/// fingerprint of `xtp-shader`'s sources ([`xtp_shader::SOURCES`]), this
+/// file (the entries' encoding, [`ENCODING`]) and every setting the
+/// translation runs with ([`xtp_shader::emit::Settings`]: the loop limits,
+/// the loops' budget, the DXIL clean-up passes, the raw structured reads,
+/// the loop-limit counter), in the values the translator uses. Not the
+/// switches' spelling: `XTP_SHADER_LOOP_LIMIT` unset and set to 16384 give
+/// the same loop limit, and once had the same key, but not the same
+/// counted loops' limit (2^20 against 16384), so a session could get the
+/// other setting's translation. Read at each call, as the translator reads
+/// them: a switch of this thread alone (`with_loop_count`) has its own key.
+/// Not the whole executable: before, the least change anywhere (the HLE, a
+/// log line, another worker's branch) made every translation again, and
+/// each worktree's sessions started cold.
+fn build() -> [u8; 32] {
+    static TRANSLATOR: OnceLock<[u8; 32]> = OnceLock::new();
+    let translator = TRANSLATOR.get_or_init(|| {
+        announce(&xtp_shader::emit::settings());
+        translator_of(xtp_shader::SOURCES, ENCODING)
+    });
+    build_of(translator, &xtp_shader::emit::settings())
+}
+
+/// Says, once, which settings differ from the defaults.
+fn announce(s: &xtp_shader::emit::Settings) {
+    use xtp_shader::emit::{DEFAULT_LOOP_BUDGET, DEFAULT_LOOP_LIMIT};
+    if s.loop_limit != DEFAULT_LOOP_LIMIT {
+        let (limit, counted) = (s.loop_limit, s.counted_loop_limit);
+        tracing::warn!(
+            limit,
+            counted,
+            "XTP_SHADER_LOOP_LIMIT: translated loops stop at another limit"
+        );
+    } else if s.counted_loop_limit != xtp_shader::emit::DEFAULT_COUNTED_LOOP_LIMIT {
+        let counted = s.counted_loop_limit;
+        tracing::warn!(
+            counted,
+            "XTP_SHADER_LOOP_LIMIT: counted loops stop at the general limit"
+        );
+    }
+    if s.loop_budget != DEFAULT_LOOP_BUDGET {
+        let budget = s.loop_budget;
+        tracing::warn!(
+            budget,
+            "XTP_SHADER_LOOP_BUDGET: back edges a lane may take in all loops together (0: no budget)"
+        );
+    }
+    if s.dxil_opt != 0 {
+        let passes = s.dxil_opt;
+        tracing::info!(
+            passes,
+            "XTP_DXIL_OPT: clean-up passes run over translated shaders"
+        );
+    }
+    if !s.raw_structured {
+        tracing::info!("XTP_RAW_STRUCTURED=0: structured reads through typed views");
+    }
+    if s.loop_count {
+        tracing::info!("XTP_SHADER_LOOP_COUNT: translated loops count the lanes they stop");
+    }
 }
 
 /// This file: how entries are encoded and decoded, and which translation
 /// each holds, so a change to it is a new key.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-/// [`build`]'s key from its parts: the translator's sources, the entries'
-/// encoding and the settings (loop limit, loop budget, clean-up passes, raw
-/// structured reads).
-fn build_of(sources: &str, encoding: &[u8], settings: [u32; 4]) -> [u8; 32] {
+/// The translator's part of [`build`]'s key: its sources and the entries'
+/// encoding.
+fn translator_of(sources: &str, encoding: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     for part in [sources.as_bytes(), encoding] {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
-    for setting in settings {
-        h.update(&setting.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// [`build`]'s key from its parts: the translator ([`translator_of`]) and
+/// every setting, field by field (the pattern names them all, so a setting
+/// added to [`xtp_shader::emit::Settings`] does not build until it is here).
+fn build_of(translator: &[u8; 32], settings: &xtp_shader::emit::Settings) -> [u8; 32] {
+    let xtp_shader::emit::Settings {
+        loop_limit,
+        counted_loop_limit,
+        spin_limit,
+        loop_budget,
+        dxil_opt,
+        raw_structured,
+        loop_count,
+    } = *settings;
+    let mut h = blake3::Hasher::new();
+    h.update(translator);
+    for (name, value) in [
+        ("loop limit", loop_limit),
+        ("counted loop limit", counted_loop_limit),
+        ("spin limit", spin_limit),
+        ("loop budget", loop_budget),
+        ("dxil opt", dxil_opt),
+        ("raw structured", u32::from(raw_structured)),
+        ("loop count", u32::from(loop_count)),
+    ] {
+        h.update(&(name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update(&value.to_le_bytes());
     }
     *h.finalize().as_bytes()
 }
@@ -163,7 +214,7 @@ fn build_of(sources: &str, encoding: &[u8], settings: [u32; 4]) -> [u8; 32] {
 /// beside a complete pass, to know a pass for this key was made.
 #[cfg(windows)]
 pub(crate) fn host_key() -> [u8; 32] {
-    key(build(), crate::device::host_target())
+    key(&build(), crate::device::host_target())
 }
 
 /// The translation of a console shader container for a host that runs
@@ -186,7 +237,7 @@ pub(crate) fn host_es_shader(container: &[u8], target: Target) -> Result<HostSha
         |c: &[u8]| xtp_shader::emit::translate_es_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => {
-            let key = key(build(), target);
+            let key = key(&build(), target);
             let earlier = EARLIER
                 .get()
                 .filter(|(now, _)| *now == key)
@@ -218,7 +269,7 @@ pub(crate) fn kept(
     target: Target,
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let key = key(build(), target);
+    let key = key(&build(), target);
     let earlier = EARLIER
         .get()
         .filter(|(now, _)| *now == key)
@@ -1092,17 +1143,10 @@ mod tests {
     #[test]
     fn the_key_is_the_translators_not_the_executables() {
         let _serial = serial();
-        let settings = [
-            xtp_shader::emit::loop_limit(),
-            xtp_shader::emit::loop_budget(),
-            xtp_shader::emit::dxil_opt(),
-            u32::from(xtp_shader::emit::raw_structured()),
-        ];
-        // The loop-limit counter shares the raw reads' word (`build`).
-        let mut settings = settings;
-        settings[3] |= u32::from(xtp_shader::emit::loop_count()) << 1;
-        let ours = build_of(xtp_shader::SOURCES, ENCODING, settings);
-        assert_eq!(*build(), ours, "nothing but these parts");
+        let settings = xtp_shader::emit::settings();
+        let translator = translator_of(xtp_shader::SOURCES, ENCODING);
+        let ours = build_of(&translator, &settings);
+        assert_eq!(build(), ours, "nothing but these parts");
 
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
@@ -1117,7 +1161,7 @@ mod tests {
         assert_eq!(get(ours), Ok(shader()));
         // Another build of the same translator: the key is made again from
         // the same parts, and finds the entry.
-        let rebuilt = build_of(xtp_shader::SOURCES, ENCODING, settings);
+        let rebuilt = build_of(&translator_of(xtp_shader::SOURCES, ENCODING), &settings);
         assert_eq!(get(rebuilt), Ok(shader()));
         assert_eq!(runs(), 1, "shared by both builds");
 
@@ -1125,21 +1169,204 @@ mod tests {
         // (`xtp_shader`'s fingerprint tests), and so does the key.
         let fingerprint = u128::from_str_radix(xtp_shader::SOURCES, 16).unwrap();
         let changed = format!("{:032x}", fingerprint ^ 1);
-        assert_eq!(get(build_of(&changed, ENCODING, settings)), Ok(shader()));
+        let changed = build_of(&translator_of(&changed, ENCODING), &settings);
+        assert_eq!(get(changed), Ok(shader()));
         assert_eq!(runs(), 2, "a changed translator translates again");
-        assert_ne!(
-            build_of(xtp_shader::SOURCES, b"another encoding", settings),
-            ours
+        let encoding = translator_of(xtp_shader::SOURCES, b"another encoding");
+        assert_ne!(build_of(&encoding, &settings), ours);
+    }
+
+    /// A translation kept under the key `before` is not served under
+    /// `after`: the container is translated again, and from then on each
+    /// key finds its own entry.
+    fn rejected_across(before: [u8; 32], after: [u8; 32]) {
+        assert_ne!(before, after, "two keys");
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"a container translated under two settings".as_slice();
+        let runs = AtomicU64::new(0);
+        let get = |key: &[u8; 32], dxil: &[u8]| {
+            let translate = |_: &[u8]| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                Ok(HostShader {
+                    dxil: dxil.to_vec(),
+                    ..shader()
+                })
+            };
+            cached(&cache, key, container, translate).map(|s| s.dxil)
+        };
+        let runs = || runs.load(Ordering::Relaxed);
+        assert_eq!(get(&before, b"before"), Ok(b"before".to_vec()));
+        assert_eq!(get(&before, b"unused"), Ok(b"before".to_vec()));
+        assert_eq!(runs(), 1, "kept under its key");
+        assert_eq!(
+            get(&after, b"after"),
+            Ok(b"after".to_vec()),
+            "the other setting's entry is not reused"
         );
-        for i in 0..settings.len() {
-            let mut other = settings;
-            other[i] ^= 1;
-            assert_ne!(
-                build_of(xtp_shader::SOURCES, ENCODING, other),
-                ours,
-                "setting {i}"
+        assert_eq!(runs(), 2);
+        assert_eq!(get(&before, b"unused"), Ok(b"before".to_vec()));
+        assert_eq!(get(&after, b"unused"), Ok(b"after".to_vec()));
+        assert_eq!(runs(), 2, "each finds its own");
+    }
+
+    /// [`rejected_across`] this build's settings and the same with `change`
+    /// made, for any target.
+    fn a_changed_setting_is_rejected(change: impl FnOnce(&mut xtp_shader::emit::Settings)) {
+        let _serial = serial();
+        let translator = translator_of(xtp_shader::SOURCES, ENCODING);
+        let now = xtp_shader::emit::settings();
+        let mut other = now;
+        change(&mut other);
+        assert_ne!(now, other, "a change");
+        rejected_across(
+            key(&build_of(&translator, &now), Target::ANY),
+            key(&build_of(&translator, &other), Target::ANY),
+        );
+    }
+
+    /// Another value whatever this run's is (Codex review of d286ffd, point
+    /// 6: halving gave 1 again for `XTP_SHADER_LOOP_LIMIT=1`).
+    #[test]
+    fn the_loop_limit_is_in_the_key() {
+        a_changed_setting_is_rejected(|s| s.loop_limit ^= 1);
+    }
+
+    #[test]
+    fn the_counted_loop_limit_is_in_the_key() {
+        a_changed_setting_is_rejected(|s| s.counted_loop_limit ^= 1);
+    }
+
+    #[test]
+    fn the_spin_limit_is_in_the_key() {
+        a_changed_setting_is_rejected(|s| s.spin_limit ^= 1);
+    }
+
+    #[test]
+    fn the_loop_budget_is_in_the_key() {
+        a_changed_setting_is_rejected(|s| s.loop_budget ^= 1);
+    }
+
+    #[test]
+    fn the_dxil_clean_up_passes_are_in_the_key() {
+        a_changed_setting_is_rejected(|s| s.dxil_opt ^= 1);
+    }
+
+    #[test]
+    fn the_raw_structured_reads_are_in_the_key() {
+        a_changed_setting_is_rejected(|s| s.raw_structured = !s.raw_structured);
+    }
+
+    #[test]
+    fn the_loop_limit_counter_is_in_the_key() {
+        a_changed_setting_is_rejected(|s| s.loop_count = !s.loop_count);
+    }
+
+    /// The Codex review of 12556d6: `XTP_SHADER_LOOP_LIMIT` unset and set
+    /// to 16384 give the same loop limit, and had the same key, but the
+    /// counted loops stop at 2^20 in one and 16384 in the other. Now two
+    /// keys: a session of one does not get the other's translation.
+    #[test]
+    fn the_loop_limit_unset_and_set_to_its_default_are_two_keys() {
+        use xtp_shader::emit::{
+            DEFAULT_COUNTED_LOOP_LIMIT, DEFAULT_LOOP_LIMIT, DEFAULT_SPIN_LIMIT,
+        };
+        let _serial = serial();
+        let now = xtp_shader::emit::settings();
+        // What the translator reads from each (`xtp_shader::emit`'s
+        // `loop_limit`, `counted_loop_limit` and `spin_limit`).
+        let unset = xtp_shader::emit::Settings {
+            loop_limit: DEFAULT_LOOP_LIMIT,
+            counted_loop_limit: DEFAULT_COUNTED_LOOP_LIMIT,
+            spin_limit: DEFAULT_SPIN_LIMIT.min(DEFAULT_LOOP_LIMIT),
+            ..now
+        };
+        let explicit = xtp_shader::emit::Settings {
+            loop_limit: 16384,
+            counted_loop_limit: 16384,
+            spin_limit: DEFAULT_SPIN_LIMIT.min(16384),
+            ..now
+        };
+        assert_eq!(unset.loop_limit, explicit.loop_limit, "the review's case");
+        if std::env::var_os("XTP_SHADER_LOOP_LIMIT").is_none() {
+            assert_eq!(
+                (now.loop_limit, now.counted_loop_limit, now.spin_limit),
+                (unset.loop_limit, unset.counted_loop_limit, unset.spin_limit)
             );
         }
+        let translator = translator_of(xtp_shader::SOURCES, ENCODING);
+        rejected_across(
+            key(&build_of(&translator, &unset), Target::ANY),
+            key(&build_of(&translator, &explicit), Target::ANY),
+        );
+    }
+
+    /// The key is read at each translation, as the translator reads its
+    /// settings: a switch on for this thread alone (`with_loop_count`)
+    /// keys what this thread translates, not what others do.
+    #[test]
+    fn a_switch_of_this_thread_keys_its_translations() {
+        let _serial = serial();
+        let translator = translator_of(xtp_shader::SOURCES, ENCODING);
+        let counting = xtp_shader::emit::with_loop_count(build);
+        let settings = xtp_shader::emit::with_loop_count(xtp_shader::emit::settings);
+        assert!(settings.loop_count);
+        assert_eq!(counting, build_of(&translator, &settings));
+        if !xtp_shader::emit::loop_count() {
+            assert_ne!(build(), counting, "off outside it");
+        }
+    }
+
+    /// [`rejected_across`] two targets, under this build's settings.
+    fn another_target_is_rejected(before: Target, after: Target) {
+        let _serial = serial();
+        let build = build();
+        rejected_across(key(&build, before), key(&build, after));
+    }
+
+    /// The host's wave sizes key its translations: the fewest lanes, the
+    /// most, and whether the host has the runtime stride table.
+    #[test]
+    fn the_fewest_host_lanes_are_in_the_key() {
+        let rdna = Target {
+            lanes_min: 32,
+            lanes_max: 64,
+            stride_table: false,
+        };
+        another_target_is_rejected(
+            rdna,
+            Target {
+                lanes_min: 64,
+                ..rdna
+            },
+        );
+    }
+
+    #[test]
+    fn the_most_host_lanes_are_in_the_key() {
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+            stride_table: false,
+        };
+        another_target_is_rejected(
+            nvidia,
+            Target {
+                lanes_max: 64,
+                ..nvidia
+            },
+        );
+    }
+
+    #[test]
+    fn the_stride_table_is_in_the_key() {
+        another_target_is_rejected(
+            Target::ANY,
+            Target {
+                stride_table: true,
+                ..Target::ANY
+            },
+        );
     }
 
     /// After a translator change, a translation made is compared with the

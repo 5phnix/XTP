@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::mask::MaskData;
+use super::mask::{HELPER_BITS, Helpers, MaskData};
 use super::{Lower, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
@@ -182,6 +182,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.active_mask(mask, m, c)?;
+                let on = self.console_bit(mask, c, on)?;
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
@@ -204,6 +205,9 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.active_mask(mask, m, c)?;
+        // A pixel program's helper lanes take part where the section's
+        // lanes hold them (`s_wqm`), as on the console.
+        let on = self.console_bit(mask, c, on)?;
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -413,33 +417,70 @@ impl<'a> Lower<'a> {
         quad && self.s.pixel
     }
 
-    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel program:
-    /// a helper lane takes its own value instead.
+    /// `v_readfirstlane_b32` of `x`, `inst`: the value of the first lane of
+    /// EXEC, one value for the whole wave.
     ///
-    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
-    /// waterfall loop (read the first lane's value, run the lanes that hold
-    /// it, take them out of EXEC) serves helper lanes too. On the host,
-    /// `WaveReadLaneFirst` reads the first lane that is not a helper lane,
-    /// and its result in a helper lane is undefined (D3D12, without SM
-    /// 6.7's `WaveOpsIncludeHelperLanes`). Once only helper lanes are left
-    /// in such a loop it reads no lane, none of them matches, and the loop
-    /// runs to its limit in each: in a title's world, draws of 0.3 to 1.3 s
-    /// each until a submission passed the host's 2 s limit. With its own
-    /// value a helper lane matches in the first pass and leaves. Where the
-    /// value is the same in every lane, its own is the first lane's anyway;
-    /// what a helper lane computes only feeds derivatives and quad reads,
-    /// and its stores are dropped.
-    // Ported from Marvisak/VIctory (0601955, PR #1733) by Vaximous
-    pub(super) fn helper_reads_own(&mut self, own: V, first: V) -> V {
-        if !self.s.pixel {
-            return first;
-        }
+    /// On the console, whole-quad mode puts a pixel program's helper lanes
+    /// in EXEC, and the first lane of EXEC may be one: every lane, helper or
+    /// covered, then takes its value. A pixel program with wave operations
+    /// counts its helper lanes in them (`WaveOpsIncludeHelperLanes`,
+    /// `shader.rs`), so `WaveReadLaneFirst` reads that lane as the console
+    /// does, and a waterfall loop (read the first lane's value, run the lanes
+    /// that hold it, take them out of EXEC) serves its helper lanes in turn:
+    /// none is left reading a lane that never matches it. (Without the
+    /// attribute, `WaveReadLaneFirst` read no helper lane: once only helper
+    /// lanes were left in such a loop, none of them matched, and the loop
+    /// ran to its limit in each, draws of 0.3 to 1.3 s each in a title's
+    /// world.)
+    ///
+    /// Where the program has taken its helper lanes out of EXEC
+    /// ([`Helpers::Out`]), the console reads the first covered lane: so do
+    /// the covered lanes here, and a helper lane, which the console does not
+    /// run there, takes its own value, as in a wave of its own (see
+    /// [`Self::alone`]).
+    pub(super) fn first_lane(&mut self, inst: &Inst, x: V) -> Result<V, Why> {
         let c = self.cur;
-        // Read where the first-lane read is: a discarded lane becomes one.
-        let helper = self
-            .s
-            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
-        self.s.m.select(c, helper, own, first)
+        self.s.flags |= flags::WAVE_OPS;
+        let exec = if self.s.pixel {
+            let e = inst.read(Reg::S(crate::ir::EXEC)).ok_or(HELPER_BITS)?;
+            self.helper_bits.mask(e)
+        } else {
+            Helpers::In
+        };
+        let i32t = self.s.t.i32;
+        match exec {
+            Helpers::In => {
+                Ok(self
+                    .s
+                    .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]))
+            }
+            Helpers::Out => {
+                // The first covered lane: the lowest bit of the ballot of the
+                // covered lanes, whatever the host's wave size (up to 128).
+                let helper = self.is_helper(c);
+                let t = self.s.m.bool(true);
+                let covered = self.s.m.bin(c, Bin::Xor, helper, t);
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let ballot =
+                    self.s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[covered]);
+                let z = self.s.m.i32(0);
+                let mut first = z;
+                for word in (0..4).rev() {
+                    let w = self.s.m.extract(c, ballot, word);
+                    let low = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[w]);
+                    let base = self.s.m.i32(32 * word);
+                    let at = self.s.m.bin(c, Bin::Add, low, base);
+                    let some = self.s.m.cmp(c, pred::NE, w, z);
+                    first = self.s.m.select(c, some, at, first);
+                }
+                let r = self.read_lane_in_wave(x, first);
+                Ok(self.s.m.select(c, helper, x, r))
+            }
+            Helpers::Other => Err(HELPER_BITS),
+        }
     }
 
     /// `x` of the lane of this lane's quad that `perm` names (DPP

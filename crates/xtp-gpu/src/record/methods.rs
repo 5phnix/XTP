@@ -598,7 +598,10 @@ methods! {
     depth_bounds(min: f32, max: f32) => |a, b| vec![w(a), w(b)];
     write32(at: u64, value: u32, flush: u32, flags: u32) => |a, v, f, g| vec![addr(a), w(v), w(f), w(g)];
     write64(at: u64, value: u64, flush: u32, flags: u32) => |a, v, f, g| vec![addr(a), w(v), w(f), w(g)];
-    wait_value(at: u64, comparison: u32, reference: u64) => |a, c, r| vec![addr(a), w(c), w(r)];
+    wait32(at: u64, comparison: u32, reference: u32, mask: u32, flags: u32) =>
+        |a, c, r, m, f| vec![addr(a), w(c), w(r), w(m), w(f)];
+    wait64(at: u64, comparison: u32, reference: u64, flags: u32) =>
+        |a, c, r, f| vec![addr(a), w(c), w(r), w(f)];
     counted() => || vec![];
     allocate_upload(size: u64, alignment: u64) -> *mut u8 => |s, a| vec![w(s), w(a)];
 }
@@ -724,8 +727,8 @@ pub(crate) static PLACES: &[Place] = &[
     place!(LIST 68 => newer_list(68), depth_bounds, LISTED),
     place!(LIST 69 => newer_list(69), write32, LISTED),
     place!(LIST 70 => newer_list(70), write64, LISTED),
-    place!(LIST 71 => newer_list(71), wait_value, LISTED),
-    place!(LIST 72 => newer_list(72), wait_value, LISTED),
+    place!(LIST 71 => newer_list(71), wait32, LISTED),
+    place!(LIST 72 => newer_list(72), wait64, LISTED),
     place!(LIST 73 => newer_list(73), counted, LISTED),
     place!(LIST 78 => newer_list(78), dispatch_x, LISTED),
     place!(LIST 83 => newer_list(83), copy_texture_region_x, LISTED),

@@ -44,6 +44,11 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+Pixel shaders with wave operations take shader model 6.7
+(`WaveOpsIncludeHelperLanes`, so that helper lanes take part in them as they
+do on the console). A GPU without 6.7 refuses those pixel shaders, and their
+draws are skipped.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -187,14 +192,18 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_DXIL_CENSUS=<file>` | (every build) appends one line per translated shader module to the file: its instructions by kind as translated and as written, and whether the clean-up passes were kept |
 | `XTP_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `XTP_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `XTP_APU_DUMP=<dir>` | saves the first 32 Opus streams' packets (up to 256 packets per stream) as `.opuscap` files outside the repository for reference comparison via `XTP_SAMPLE_OPUS` |
 | `XTP_DSP_DUMP=<absolute dir>` | captures the first 32 DSP streams per process outside the repository. Each numbered stream directory holds `params.txt`, `ir.f32le` (omitted if unreadable or over 4 MiB), and the first four commands' buffers and gains as raw little-endian floats. On Windows, compare `.output-before.f32le` with `.output.f32le` to see how the command changed its destination. Disconnect waits for pending writes. |
 | `XTP_WATCHDOG_HOOK=1` | every build: keeps the title's own watchdog from ending it after about 30 s without progress (slow world frames), and logs a warning (at most every 30 s) when it would have; a real deadlock then hangs for ever, with no `crashes.log` entry; known builds only, otherwise a warning and nothing patched |
 | `XTP_TITLE_ASSERTS=continue` | every build: where the title's own assertion would end it because an entry of its archive store could not be made (`int3` at title+0x23d8f03; the entry's header was not read, docs/analysis/archive-null.md), it takes the title's own path for a null object instead, and logs how many times (at once, then at most every 10 s) and a census of that store; hides the failure, it does not fix it; known builds only, otherwise a warning and nothing patched |
 | `XTP_XMEM_LEDGER=1` | every build: counts what the title asks of XMem by category (`XMemAlloc` by allocator id and memory type, committed resources included, the share our `XMemAllocDefault` serves, physical pages, virtual reserves, commits and frees, the budget reported) and logs each category that changed every 10 s: calls, failures, frees, live and peak bytes, bytes asked in all |
 | `XTP_LOW_VA_RESERVE_MIB=<n>` | every Windows build: with the variable unset, a known build with a measured startup request gets a placeholder of that size below 4 GiB (185 MiB for the supported build). An explicit `n` from 1 to 4095 instead supplies up to `n` MiB in pieces when 32-bit placeholder allocations fail. The reserve commits no pages. Set `0` to disable it. |
+| `XTP_PLAY_PRECOOK=1` | `cargo xtask play --measure`: runs `xtp precook` before the title, which a measured run skips by default (the title then translates and makes each pipeline at its first use; docs/analysis/precook.md §7) |
 | `XTP_SKIP_INTRO=1` | every build: cuts the intro movie of the start-up front end (sent to its last frame when it starts), so the world starts loading about 13 s sooner (docs/analysis/intro-skip.md); known builds only, otherwise a warning and nothing changed |
 | `XTP_SKIP_CPU_CHECK=1` | every build: skips the host CPU feature check that `xtp run --execute` performs before starting the title |
 | `XTP_QUEUE_WAIT=0` | every build: a queue told to wait for a fence no signal has reached yet runs what it is given next at once, as before queues held it (to compare frame times); such waits are still counted on the `queue waits for fences so far` line |
+| `XTP_VALUE_WAIT=0` | every build: a queue no longer holds a list that waits for a memory value (`Wait32BitValueX`, `Wait64BitValueX`) another queue or the CPU has not written yet; it runs at once, as before (docs/analysis/cross-queue-waits.md). The waits are still measured on the `list waits for memory values so far` line |
+| `XTP_VALUE_WAIT_LOG=<n>` | every build: logs the first `n` (default 64) list waits for memory values one line each: at submission (queue, address, comparison, reference, how it was met), when a held list is released, and when one runs before it is met (always at least 16 of those) |
 | `XTP_RT_STANDIN=1` | every build: the title's ray-tracing programs that do not translate yet (traced sun and local-light shadows, probe and irradiance-cache gathers, screen probes, reflections, particle collision) have their dropped dispatches' outputs cleared to "every ray missed" (shadow traces' textures lit; others as `XTP_RT_STANDIN_FILL=<program hash or role>[.<output>]=lit\|zero\|keep\|f:<v>\|u:<hex>;…` says); `ab[:<phase s>[:<settle s>]]` alternates off and on within one run; every build logs what each dropped trace would have written (`rt:` lines; docs/analysis/rt-standin.md) |
 | `XTP_FRAMES_IN_FLIGHT=ab[:<phase s>[:<settle s>]]` | every build: one frame in flight off (phase A) and on (phase B) in turn within one run, phases of 20 s by default, the first 3 s of each not measured; each frame-rate line is tagged with its phase and `cargo xtask play` ends with the median per phase (docs/dev/START_HERE.md, "A/B a switch"); `1` on, `0` or unset off |
 | `XTP_DIALOGS=auto` | every build: auto-dismisses `XGameUi` message and error dialogs without opening a window (message dialogs return `cancel_button`, error dialogs complete with `S_OK`; enabled automatically under `--autopilot`; does not affect text entry) |
