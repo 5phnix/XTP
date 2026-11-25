@@ -181,11 +181,6 @@ enum Scene {
 
 /// `ray_test.hlsl` compiled by the Windows SDK's DXC, with `defines`.
 fn ray_program(defines: &[&str]) -> Vec<u8> {
-    compiled("ray_test.hlsl", defines)
-}
-
-/// `file` of this folder compiled by the Windows SDK's DXC, with `defines`.
-fn compiled(file: &str, defines: &[&str]) -> Vec<u8> {
     let dxc = std::env::var_os("XTP_PC_DXC")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -199,7 +194,7 @@ fn compiled(file: &str, defines: &[&str]) -> Vec<u8> {
         .args(["-T", "cs_6_5", "-E", "main", "-Fo"])
         .arg(&binary)
         .args(defines.iter().flat_map(|d| ["-D", d]))
-        .arg(format!("{}/src/rt/{file}", env!("CARGO_MANIFEST_DIR")))
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rt/ray_test.hlsl"))
         .output()
         .unwrap();
     assert!(
@@ -247,23 +242,9 @@ fn spliced_root(host: &Host) -> (u32, ID3D12RootSignature) {
 }
 
 fn trace(host: &Host, title_list: &TitleList, tlas: Scene, output: &TitleBuffer) {
-    let spliced = matches!(tlas, Scene::Spliced(_));
-    let code = ray_program(if spliced { &["SPLICED"] } else { &[] });
-    trace_program(host, title_list, tlas, output, &code);
-}
-
-/// [`trace`] with the compiled ray program `code`, whose output is all of
-/// `output`.
-fn trace_program(
-    host: &Host,
-    title_list: &TitleList,
-    tlas: Scene,
-    output: &TitleBuffer,
-    code: &[u8],
-) {
     let list = title_list.host();
     let spliced = matches!(tlas, Scene::Spliced(_));
-    let bytes = 4 * output.words().len() as u64;
+    let code = ray_program(if spliced { &["SPLICED"] } else { &[] });
     // The commands of an indirect trace come before its PSO and root views.
     let prepared = match tlas {
         // SAFETY: the test's live list and descriptor slot.
@@ -274,8 +255,8 @@ fn trace_program(
         _ => None,
     };
     let shadow = output.shadow();
-    shadow.refresh(list, output.address(), bytes);
-    shadow.gpu_writes(list, output.address(), bytes);
+    shadow.refresh(list, output.address(), 16);
+    shadow.gpu_writes(list, output.address(), 16);
     // SAFETY: the root signature is embedded by DXC or made here. The list keeps
     // both objects and the output shadow, and the caller retains the TLAS through
     // completion.
@@ -284,7 +265,7 @@ fn trace_program(
             crate::testgpu::bind_indexed_heaps(list);
             spliced_root(host)
         } else {
-            (0, host.device.CreateRootSignature(0, code).unwrap())
+            (0, host.device.CreateRootSignature(0, &code).unwrap())
         };
         let pso: ID3D12PipelineState = host
             .device
@@ -334,18 +315,10 @@ fn rt_triangle_translation_requires_the_whole_input_range() {
     let mut geometry = geometry(&vertices, &indices);
     // SAFETY: the test owns the descriptor and all referenced buffers.
     unsafe {
-        let (translated, jobs) = triangles(list.host(), &blas_input(&geometry)).unwrap();
+        let translated = triangles(list.host(), &blas_input(&geometry)).unwrap();
         let t = translated[0].Anonymous.Triangles;
         assert_eq!(t.IndexFormat, DXGI_FORMAT_R16_UINT);
-        // Set when the GPU check of the indices is recorded (`indices`).
-        assert_eq!(t.IndexBuffer, 0);
-        let host = indices.shadow().gpu(indices.address());
-        let job = &jobs[0];
-        assert_eq!((job.geometry, job.count, job.vertices), (0, 3, 3));
-        assert_eq!(
-            (job.source + u64::from(job.offset), job.wide),
-            (host, false)
-        );
+        assert_eq!(t.IndexBuffer, indices.shadow().gpu(indices.address()));
         assert_eq!(
             t.VertexBuffer.StartAddress,
             vertices.shadow().gpu(vertices.address())
@@ -1030,8 +1003,8 @@ fn rt_current_slots_win_over_recorded_ones() {
 }
 
 /// A BLAS input DXR cannot build from is refused before its build is
-/// recorded: a count that is no whole number of triangles, a stride
-/// shorter than a vertex.
+/// recorded: an index past the vertices, a count that is no whole number
+/// of triangles, a stride shorter than a vertex.
 #[test]
 fn rt_invalid_blas_inputs_are_refused_before_their_build() {
     let test = "rt_invalid_blas_inputs_are_refused_before_their_build";
@@ -1048,13 +1021,9 @@ fn rt_invalid_blas_inputs_are_refused_before_their_build() {
     let valid = geometry(&vertices, &indices);
     indices.set_words(|i| [1 << 16, 2][i]);
     assert!(translate(&valid));
-    // Index 3 of three vertices: checked on the GPU, as the build reads it
-    // (`rt_indices_are_checked_as_the_build_reads_them`).
+    // Index 3 of three vertices.
     indices.set_words(|i| [1 << 16, 3][i]);
-    assert!(
-        translate(&valid),
-        "an index past the vertices, checked later"
-    );
+    assert!(!translate(&valid), "an index past the vertices");
     indices.set_words(|i| [1 << 16, 2][i]);
     let mut two = valid;
     two.Anonymous.Triangles.IndexCount = 2;
@@ -1069,436 +1038,4 @@ fn rt_invalid_blas_inputs_are_refused_before_their_build() {
         (t.IndexFormat, t.IndexCount, t.IndexBuffer) = (DXGI_FORMAT_UNKNOWN, 0, 0);
     }
     assert!(translate(&unindexed), "three vertices without indices");
-}
-
-thread_local! {
-    /// Set by a test to refuse the title's structures on its own thread,
-    /// as `XTP_RT_BUILDS=0` does for a whole run ([`builds_on`]).
-    pub(super) static BUILDS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The title's builds refused on this thread until dropped.
-struct BuildsOff;
-
-impl BuildsOff {
-    fn new() -> BuildsOff {
-        BUILDS_OFF.set(true);
-        BuildsOff
-    }
-}
-
-impl Drop for BuildsOff {
-    fn drop(&mut self) {
-        BUILDS_OFF.set(false);
-    }
-}
-
-#[test]
-fn rt_builds_switch_is_off_only_at_zero() {
-    assert!(builds_asked(None));
-    assert!(builds_asked(Some("1")));
-    assert!(!builds_asked(Some("0")));
-    assert!(!builds_asked(Some(" 0 ")));
-}
-
-/// With the title's structures off (`XTP_RT_BUILDS=0`), its BLAS and TLAS
-/// builds, rehydrations and copies are refused, and the empty TLAS is
-/// still made: a trace of the title's TLAS runs on it and every ray misses,
-/// as on the console with an empty structure (under 4a0cdb3 the switch
-/// dropped the empty TLAS too, and with it every trace).
-#[test]
-fn rt_builds_off_keeps_the_empty_tlas_and_traces_miss() {
-    let test = "rt_builds_off_keeps_the_empty_tlas_and_traces_miss";
-    let Some((gpu, rays)) = dxr(test) else {
-        return;
-    };
-    let _off = BuildsOff::new();
-    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
-    vertices.set_words(|i| POSITIONS[i].to_bits());
-    indices.set_words(|i| [1 << 16, 2][i]);
-    let (blas, tlas, copy) = (
-        TitleBuffer::new(1024),
-        TitleBuffer::new(1024),
-        TitleBuffer::new(1024),
-    );
-    let instances = instances_of(&[blas.address()]);
-    let geometry = geometry(&vertices, &indices);
-    let blas_build = Build {
-        DestAccelerationStructureData: blas.address(),
-        Inputs: blas_input(&geometry),
-        ..Default::default()
-    };
-    let producer = TitleList::new();
-    // SAFETY: the title list and every buffer the descriptions name are live.
-    unsafe {
-        assert!(!Builder.build(producer.this(), &blas_build), "a BLAS build");
-        assert!(
-            !Builder.build(producer.this(), &tlas_desc(tlas.address(), &instances)),
-            "a TLAS build"
-        );
-        assert!(!rehydrate(producer.this(), &blas_build), "a rehydration");
-        assert!(
-            !Builder.copy(
-                producer.this(),
-                copy.address(),
-                tlas.address(),
-                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0
-            ),
-            "a copy"
-        );
-    }
-    producer.run();
-    for at in [&blas, &tlas, &copy] {
-        assert!(
-            !registry().structures.contains_key(&at.address()),
-            "no structure at a refused address"
-        );
-    }
-    let list = TitleList::new();
-    assert!(empty_tlas_in(list.host()).is_some(), "the empty TLAS");
-    if !rays {
-        list.run();
-        return;
-    }
-    let slot = Descriptor::new(tlas.address());
-    let out = unwritten();
-    trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
-    list.run();
-    assert_eq!(out.words(), MISSES, "the trace ran on the empty TLAS");
-}
-
-/// The known-bounds triangle (−5, 0, 1), (4, 0, 1), (4, 8, 9), moved `dz`
-/// along z: its bounds are those corners.
-fn bounds_vertices(dz: f32) -> [f32; 9] {
-    [-5., 0., 1. + dz, 4., 0., 1. + dz, 4., 8., 9. + dz]
-}
-
-/// What `ray_bounds.hlsl` reads of that triangle: four hits at
-/// t = 11 + y + dz (it lies in the plane z = 1 + y + dz), then four
-/// misses just past its edges.
-fn bounds_expected(dz: f32) -> [Option<f32>; 8] {
-    let at = |y: f32| Some(11. + y + dz);
-    [at(1.), at(7.), at(0.5), at(0.05), None, None, None, None]
-}
-
-/// Memory the runtime maps outside any title buffer object, as it maps the
-/// title's physical pages: its host copies are loose 4 MiB windows
-/// (`shadow::loose`). Never unmapped: copies made of it outlive the test.
-fn plain_memory(len: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{
-        CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
-    };
-    // SAFETY: a fresh section, mapped whole; the view keeps it.
-    unsafe {
-        let section = CreateFileMappingW(
-            -1isize as _,
-            std::ptr::null(),
-            PAGE_READWRITE,
-            0,
-            len as u32,
-            std::ptr::null(),
-        );
-        assert!(!section.is_null(), "a section");
-        let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
-        windows_sys::Win32::Foundation::CloseHandle(section);
-        assert_ne!(view, 0, "a view");
-        view
-    }
-}
-
-/// Leonida #1816's fixture, reimplemented (watch item 497): a BLAS of known
-/// bounds, (−5, 0, 1) to (4, 8, 9), whose vertices and indices are title
-/// memory, read back by rays near each edge. Once in title buffers, once
-/// in plain title memory, the vertices across a 4 MiB window boundary
-/// (XTP's loose window copies); each built twice, the title's CPU moving
-/// the vertices by 1 along z between the builds. A wrong address
-/// translation gives misses or other distances; a stale copy gives the
-/// first build's distances after the second.
-#[test]
-fn rt_blas_of_known_bounds_from_title_memory() {
-    let test = "rt_blas_of_known_bounds_from_title_memory";
-    let Some((gpu, rays)) = dxr(test) else {
-        return;
-    };
-    if !rays {
-        return;
-    }
-    let program = compiled("ray_bounds.hlsl", &[]);
-    let (vertex_buffer, index_buffer) = (TitleBuffer::new(36), TitleBuffer::new(8));
-    const WINDOW: usize = 4 << 20;
-    let plain = plain_memory(2 * WINDOW);
-    let boundary = (plain + WINDOW) & !(WINDOW - 1);
-    let cases = [
-        (
-            "title buffers",
-            vertex_buffer.address(),
-            index_buffer.address(),
-        ),
-        (
-            "plain title memory, across a window boundary",
-            (boundary - 20) as u64,
-            (boundary + 64) as u64,
-        ),
-    ];
-    for (case, vertices, indices) in cases {
-        // SAFETY: 8 bytes of the case's title memory, 2-byte aligned.
-        unsafe { (indices as *mut [u16; 4]).write_unaligned([0, 1, 2, 0]) };
-        let (blas, tlas) = (TitleBuffer::new(1024), TitleBuffer::new(1024));
-        let instances = instances_of(&[blas.address()]);
-        let slot = Descriptor::new(tlas.address());
-        for dz in [0., 1.] {
-            for (i, v) in bounds_vertices(dz).iter().enumerate() {
-                // SAFETY: 36 bytes of the case's title memory, as its CPU writes them.
-                unsafe { (vertices as *mut u32).add(i).write_unaligned(v.to_bits()) };
-            }
-            let geometry = Geometry {
-                Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
-                Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
-                Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
-                    Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
-                        Transform3x4: 0,
-                        IndexFormat: DXGI_FORMAT_R16_UINT,
-                        VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
-                        IndexCount: 3,
-                        VertexCount: 3,
-                        IndexBuffer: indices,
-                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
-                            StartAddress: vertices,
-                            StrideInBytes: 12,
-                        },
-                    },
-                },
-            };
-            let producer = TitleList::new();
-            // SAFETY: the title list and every range the descriptions name are live.
-            unsafe {
-                assert!(
-                    Builder.build(
-                        producer.this(),
-                        &Build {
-                            DestAccelerationStructureData: blas.address(),
-                            Inputs: blas_input(&geometry),
-                            ..Default::default()
-                        }
-                    ),
-                    "{case}: the BLAS build"
-                );
-                assert!(
-                    Builder.build(producer.this(), &tlas_desc(tlas.address(), &instances)),
-                    "{case}: the TLAS build"
-                );
-            }
-            producer.run();
-            let output = TitleBuffer::new(64);
-            output.set_words(|_| 77);
-            let list = TitleList::new();
-            trace_program(
-                gpu.host(),
-                &list,
-                Scene::Descriptor(slot.handle()),
-                &output,
-                &program,
-            );
-            list.run();
-            let words = output.words();
-            for (ray, want) in bounds_expected(dz).into_iter().enumerate() {
-                let got = (words[2 * ray] == 1).then(|| f32::from_bits(words[2 * ray + 1]));
-                match (got, want) {
-                    (Some(got), Some(want)) => assert!(
-                        (got - want).abs() < 1e-3,
-                        "{case}, dz {dz}: ray {ray} hit at {got}, not {want}"
-                    ),
-                    (None, None) => {}
-                    _ => panic!("{case}, dz {dz}: ray {ray} read {got:?}, not {want:?}"),
-                }
-            }
-        }
-    }
-}
-
-thread_local! {
-    /// Set by a test to make the empty TLAS fail on its own thread
-    /// ([`empty_tlas`]), as an exhausted RT budget would.
-    pub(super) static EMPTY_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The empty TLAS failing on this thread until dropped.
-struct EmptyFails;
-
-impl EmptyFails {
-    fn new() -> EmptyFails {
-        EMPTY_FAILS.set(true);
-        EmptyFails
-    }
-}
-
-impl Drop for EmptyFails {
-    fn drop(&mut self) {
-        EMPTY_FAILS.set(false);
-    }
-}
-
-/// A TLAS of no instance is the shared empty TLAS: it records no build and
-/// so leaves no trailing barrier, and the next entry of a batch records its
-/// own entry barrier (Codex review 11f27db1, P1-1: the next BLAS took it
-/// for ordered and skipped its barrier). A recorded build leaves one.
-#[test]
-fn rt_a_tlas_of_no_instance_leaves_the_next_build_its_barrier() {
-    let test = "rt_a_tlas_of_no_instance_leaves_the_next_build_its_barrier";
-    let Some(_gpu) = dxr(test) else {
-        return;
-    };
-    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
-    vertices.set_words(|i| POSITIONS[i].to_bits());
-    indices.set_words(|i| [1 << 16, 2][i]);
-    let geometry = geometry(&vertices, &indices);
-    let (blas, tlas, first) = (
-        TitleBuffer::new(1024),
-        TitleBuffer::new(1024),
-        TitleBuffer::new(1024),
-    );
-    let instances = instances_of(&[blas.address()]);
-    let no_instance = |at: &TitleBuffer| {
-        let mut desc = tlas_desc(at.address(), &instances);
-        desc.Inputs.NumDescs = 0;
-        desc
-    };
-    // An empty TLAS made and submitted first, which the next takes.
-    let producer = TitleList::new();
-    // SAFETY: the title list and every buffer the descriptions name are live.
-    unsafe { build_one(producer.this(), &no_instance(&first), false, None) };
-    producer.run();
-    let list = TitleList::new();
-    // SAFETY: as above.
-    unsafe {
-        let empty = build_one(list.this(), &no_instance(&tlas), false, None);
-        assert_eq!(
-            empty,
-            Mirrored {
-                registered: true,
-                barrier: false
-            },
-            "a TLAS of no instance"
-        );
-        let built = build_one(
-            list.this(),
-            &Build {
-                DestAccelerationStructureData: blas.address(),
-                Inputs: blas_input(&geometry),
-                ..Default::default()
-            },
-            empty.barrier,
-            None,
-        );
-        assert_eq!(
-            built,
-            Mirrored {
-                registered: true,
-                barrier: true
-            },
-            "a BLAS build"
-        );
-    }
-    list.run();
-}
-
-/// A title TLAS is refused when the empty TLAS it would fall back to cannot
-/// be made: of no instance it would be built as one, and an instance of a
-/// BLAS the host does not have would name a null BLAS (Codex review
-/// 11f27db1, P1-3).
-#[test]
-fn rt_a_tlas_without_its_stand_in_is_refused() {
-    let test = "rt_a_tlas_without_its_stand_in_is_refused";
-    let Some(_gpu) = dxr(test) else {
-        return;
-    };
-    let _fails = EmptyFails::new();
-    let nothing = TitleBuffer::new(1024);
-    let unknown = instances_of(&[nothing.address()]);
-    let tlas: [TitleBuffer; 2] = std::array::from_fn(|_| TitleBuffer::new(1024));
-    let producer = TitleList::new();
-    // SAFETY: the title list and the instance buffer are live.
-    unsafe {
-        let mut none = tlas_desc(tlas[0].address(), &unknown);
-        none.Inputs.NumDescs = 0;
-        assert!(
-            !Builder.build(producer.this(), &none),
-            "a TLAS of no instance"
-        );
-        assert!(
-            !Builder.build(producer.this(), &tlas_desc(tlas[1].address(), &unknown)),
-            "a TLAS of an unknown BLAS"
-        );
-    }
-    producer.run();
-    for t in &tlas {
-        assert!(!registry().structures.contains_key(&t.address()));
-    }
-}
-
-/// The indices a BLAS build reads are checked on the GPU, after every write
-/// before the build in its submission (Codex review 11f27db1, P1-2): valid
-/// in title memory but made invalid by a GPU copy before the build, the
-/// build takes no triangle and every ray misses; invalid in title memory
-/// but made valid by a GPU copy before the build, it is built and hit (the
-/// check of title memory at recording refused it).
-#[test]
-fn rt_indices_are_checked_as_the_build_reads_them() {
-    let test = "rt_indices_are_checked_as_the_build_reads_them";
-    let Some((gpu, rays)) = dxr(test) else {
-        return;
-    };
-    if !rays {
-        return;
-    }
-    let vertices = TitleBuffer::new(24);
-    vertices.set_words(|i| POSITIONS[i].to_bits());
-    // 16-bit indices 0, 1, 2, and 0, 1, 3 (past the three vertices).
-    let (valid, invalid) = ([1 << 16, 2], [1 << 16, 3]);
-    let cases = [
-        ("valid", valid, valid, true),
-        ("made invalid by the GPU", valid, invalid, false),
-        ("made valid by the GPU", invalid, valid, true),
-    ];
-    for (case, in_memory, written, hits) in cases {
-        let indices = TitleBuffer::new(8);
-        indices.set_words(|i| in_memory[i]);
-        let patch = TitleBuffer::new(8);
-        patch.set_words(|i| written[i]);
-        indices.shadow();
-        patch.shadow();
-        let (blas, tlas) = (TitleBuffer::new(1024), TitleBuffer::new(1024));
-        let instances = instances_of(&[blas.address()]);
-        let geometry = geometry(&vertices, &indices);
-        let list = TitleList::new();
-        // The GPU writes the indices' host copy before the build.
-        assert!(crate::shadow::copy(
-            list.host(),
-            indices.address(),
-            patch.address(),
-            8
-        ));
-        // SAFETY: the title list and every buffer the descriptions name are live.
-        unsafe {
-            assert!(
-                Builder.build(
-                    list.this(),
-                    &Build {
-                        DestAccelerationStructureData: blas.address(),
-                        Inputs: blas_input(&geometry),
-                        ..Default::default()
-                    }
-                ),
-                "{case}: the BLAS build is recorded"
-            );
-            assert!(Builder.build(list.this(), &tlas_desc(tlas.address(), &instances)));
-        }
-        list.run();
-        let slot = Descriptor::new(tlas.address());
-        let out = unwritten();
-        let tracing = TitleList::new();
-        trace(gpu.host(), &tracing, Scene::Descriptor(slot.handle()), &out);
-        tracing.run();
-        assert_eq!(out.words(), if hits { hit() } else { MISSES }, "{case}");
-    }
 }

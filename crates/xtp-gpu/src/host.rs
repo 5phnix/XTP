@@ -415,8 +415,6 @@ fn create(software: bool) -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        // DRED 1.2: the markers' texts kept with their breadcrumbs.
-        crate::dred::enable();
         let mut device: Option<ID3D12Device> = None;
         if software {
             let adapter = warp_adapter()?;
@@ -904,10 +902,6 @@ type States =
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        // `XTP_D3D12_DRED=0` (or empty) is off: not set alone.
-        if !crate::dred::asked(std::env::var_os("XTP_D3D12_DRED").as_deref()) {
-            return false;
-        }
         cfg!(feature = "diagnostics") && std::env::var_os("XTP_D3D12_DRED").is_some()
     })
 }
@@ -1980,18 +1974,6 @@ impl Host {
             return String::new();
         };
         let mut text = String::new();
-        // DRED 1.2: the device state, each stopped list's last finished and
-        // first unfinished commands with their markers, the faulting
-        // allocations' ranges. Our markers' texts by list, for a runtime
-        // that keeps none with its breadcrumbs (NVIDIA's did not).
-        #[cfg(feature = "diagnostics")]
-        let notes: Vec<Vec<String>> = recorded
-            .iter()
-            .map(|r| r.notes.iter().map(|(note, _)| note.clone()).collect())
-            .collect();
-        #[cfg(not(feature = "diagnostics"))]
-        let notes: Vec<Vec<String>> = Vec::new();
-        text.push_str(&crate::dred::report(&self.device, runs, &notes));
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
