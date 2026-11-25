@@ -61,6 +61,9 @@ const SHOWN: usize = 512;
 const BUDGET: u64 = 48 << 20;
 /// The title format of R9G9B9E5.
 const R9G9B9E5: u32 = 67;
+/// Presents after a listed frame at which it is reported even if some
+/// probed op's list was never submitted.
+const LATE: u64 = 4;
 
 /// A descriptor a stage reads through a table, as `draw::State` resolves
 /// it for the op.
@@ -124,8 +127,8 @@ struct Read {
 
 struct Op {
     list: usize,
-    /// Title submissions made before it was recorded.
-    after: u64,
+    /// The title submission that ran its list, once one has.
+    submission: Option<u64>,
     program: String,
     reads: Vec<Read>,
 }
@@ -227,7 +230,6 @@ pub(crate) fn stage(list: &HostList, program: &str, tables: Vec<Table>) {
     let Some(frame) = recording() else {
         return;
     };
-    let after = SUBMISSIONS.load(Ordering::Relaxed);
     {
         let mut frames = frames();
         let f = frame_mut(&mut frames, frame);
@@ -252,7 +254,7 @@ pub(crate) fn stage(list: &HostList, program: &str, tables: Vec<Table>) {
         .collect();
     f.ops.push(Op {
         list: key(list),
-        after,
+        submission: None,
         program: program.to_owned(),
         reads,
     });
@@ -576,18 +578,31 @@ pub(crate) fn submitted(runs: &[&HostList]) {
     let presented = crate::queue::presented();
     let done: Vec<Frame> = {
         let mut frames = frames();
+        // Before this submission is counted: what `Host::after` waits for
+        // below is the submissions made so far, not this one. The title
+        // records a frame's lists while the one before is presented, so
+        // a frame is ready once every op it probed has had its list
+        // submitted, or [`LATE`] presents after it at most.
+        let (done, kept) = frames.drain(..).partition(|f: &Frame| {
+            f.frame <= presented && f.ops.iter().all(|o| o.submission.is_some())
+                || presented >= f.frame + LATE
+        });
+        *frames = kept;
         for f in frames.iter_mut() {
             f.submissions.push((number, lists.clone()));
-            for op in f.ops.iter_mut().filter(|o| lists.contains(&o.list)) {
-                for r in op.reads.iter_mut().filter(|r| r.at_submit.is_none()) {
+            for op in f
+                .ops
+                .iter_mut()
+                .filter(|o| o.submission.is_none() && lists.contains(&o.list))
+            {
+                op.submission = Some(number);
+                for r in &mut op.reads {
                     if let Some((address, len)) = r.range {
                         r.at_submit = snapshot(address, len.min(BYTES));
                     }
                 }
             }
         }
-        let (done, kept) = frames.drain(..).partition(|f| f.frame <= presented);
-        *frames = kept;
         done
     };
     if done.is_empty() {
@@ -674,7 +689,10 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
             out,
             "op {} {} {}",
             i + 1,
-            list_name(op.list, op.after),
+            match (op.submission, numbers.get(&op.list)) {
+                (Some(s), Some(n)) => format!("L{n} (submission {s})"),
+                _ => format!("list {:#x} (not submitted)", op.list),
+            },
             op.program
         );
         for r in &op.reads {
@@ -701,7 +719,7 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
                     Some(s) => s.text(len),
                 }
             );
-            let ran = submission_of(f, op.list, op.after).is_some();
+            let ran = op.submission.is_some();
             let on_gpu = match (&r.gpu, gpu) {
                 (Err(why), _) => Err(*why),
                 // Its list never ran: the read-back bytes are not its.
@@ -740,24 +758,51 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
             "texture {:#x} (title format {}, {}):",
             t.address, t.title_format, t.host
         );
+        let decoded = t.after + 1;
         let _ = writeln!(
             out,
-            "  first read by {} in {}: its decoding runs at the start of submission {}",
+            "  first read by {} in {}: its decoding runs at the start of submission {decoded}",
             t.program,
             list_name(t.list, t.after),
-            t.after + 1
         );
+        // Each program and list once, with how many uses.
+        let mut uses: Vec<(bool, &str, usize, u64, u32, usize)> = Vec::new();
         for u in f.textures.iter().filter(|u| u.address == t.address) {
+            let sub = submission_of(f, u.list, u.after).unwrap_or(0);
+            match uses
+                .iter_mut()
+                .find(|x| x.0 == u.write && x.1 == u.program && x.2 == u.list)
+            {
+                Some(x) => x.5 += 1,
+                None => uses.push((u.write, &u.program, u.list, sub, u.title_format, 1)),
+            }
+        }
+        for &(write, program, list, _, format, n) in &uses {
             let _ = writeln!(
                 out,
-                "  {} by {} in {} (title format {}, {})",
-                if u.write { "written" } else { "read" },
-                u.program,
-                list_name(u.list, u.after),
-                u.title_format,
-                u.host
+                "  {} by {program} in {} ({n} uses, title format {format})",
+                if write { "written" } else { "read" },
+                list_name(list, 0)
             );
         }
+        let late: Vec<u64> = uses
+            .iter()
+            .filter(|x| x.0 && x.3 >= decoded)
+            .map(|x| x.3)
+            .collect();
+        let _ = writeln!(
+            out,
+            "  => {}",
+            if !uses.iter().any(|x| x.0) {
+                "no unordered-access writer at this address in the frame's tables".to_owned()
+            } else if late.is_empty() {
+                "every writer's list ran before the decoding".to_owned()
+            } else {
+                format!(
+                    "the decoding runs before writers in submissions {late:?}: their texels show a frame later"
+                )
+            }
+        );
     }
     let _ = writeln!(out, "\n== Title submissions");
     for (n, lists) in &f.submissions {
