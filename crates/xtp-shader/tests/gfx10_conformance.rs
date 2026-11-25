@@ -8,18 +8,19 @@
 //! 2. Decode to the exact same dword length as LLVM MC (100% length agreement).
 //! 3. Match LLVM MC's mnemonic (after accounting for encoding-form suffixes
 //!    such as `_e32`, `_e64`, `_dpp`, `_sdwa`), or match a pinned decoder gap
-//!    or unresolved legacy opcode name.
+//!    or intentional GFX10.1 legacy opcode name.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use xtp_shader::gfx10::{self, Encoding};
 
-/// XTP follows Mesa 22.3.0's GFX10 (gfx1010) column in `aco_opcodes.py`.
-/// LLVM's GFX10.3 `gfx1030_new.s` calls VOP3 0x140 `v_fma_legacy_f32`
-/// and VOP2 0x006 `v_fmac_legacy_f32`. Which forms the console decodes
-/// remains open. These pairs pin the current names for the two opcodes.
-const UNRESOLVED_LEGACY_NAMES: &[(&str, &str)] = &[
+/// LLVM 19.1.7 gates MAD/MAC on `HasMadMacF32Insts` and legacy FMA/FMAC on
+/// `HasFmaLegacy32` (GFX10.3, in the `GFX10_B` decoder namespace).
+/// `gfx1013` combines the GFX10.1 MAD/MAC feature with `GFX10_AEncoding` for BVH.
+/// The title's programs use `v_mad_f32` and `v_mac_f32` alongside BVH instructions,
+/// so XTP keeps the GFX10.1 legacy names at VOP3 0x140 and VOP2 0x006.
+const GFX10_1_LEGACY_NAMES: &[(&str, &str)] = &[
     ("v_fma_legacy_f32", "v_mad_legacy_f32"),
     ("v_fmac_legacy_f32", "v_mac_legacy_f32"),
 ];
@@ -103,9 +104,36 @@ fn strip_llvm_suffix(m: &str) -> &str {
 }
 
 #[test]
+fn decodes_gfx10_1_legacy_mad_mac() {
+    // GFX10.1 encodings from the checked-in LLVM MC corpus.
+    let cases: &[(&[u32], Encoding, u16, &str)] = &[
+        (
+            &[0xd540_0005, 0x000e_0501],
+            Encoding::Vop3,
+            0x140,
+            "v_mad_legacy_f32",
+        ),
+        (&[0x0c0a_0401], Encoding::Vop2, 0x006, "v_mac_legacy_f32"),
+        (
+            &[0xd506_0005, 0x0000_0501],
+            Encoding::Vop3,
+            0x106,
+            "v_mac_legacy_f32",
+        ),
+    ];
+    for &(words, encoding, opcode, name) in cases {
+        let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let inst = gfx10::decode_one(&bytes).unwrap();
+        assert_eq!(inst.words, words);
+        assert_eq!((inst.encoding, inst.opcode), (encoding, opcode));
+        assert_eq!(inst.name(), Some(name));
+    }
+}
+
+#[test]
 fn gfx10_decoder_matches_llvm_mc_corpus() {
     let corpus = load_corpus();
-    let known: BTreeMap<&str, Option<&str>> = UNRESOLVED_LEGACY_NAMES
+    let known: BTreeMap<&str, Option<&str>> = GFX10_1_LEGACY_NAMES
         .iter()
         .map(|&(llvm, xtp)| (llvm, Some(xtp)))
         .chain(KNOWN_DECODER_GAPS.iter().map(|&llvm| (llvm, None)))

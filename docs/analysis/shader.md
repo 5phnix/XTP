@@ -420,8 +420,9 @@ change, then those that do, then geometry, then 32-lane GPUs.
   families against the generated LLVM MC GFX10/GFX10.3 corpus. The checked-in
   data keeps one representative per mnemonic, length and decoder selector
   combination. Regenerate it with `cargo xtask gfx10-corpus`.
-- The test pins nine decoder gaps and two unresolved legacy MAD/MAC versus
-  FMA/FMAC names. It flags pins when the corresponding difference goes away.
+- PR #68 filled the decoder gaps, and the test keeps the legacy MAD/MAC
+  names because the console combines GFX10.1 MAD/MAC with BVH instructions,
+  like `gfx1013`.
 
 **G1 — ES + GS pairing and GS stage data** (M, deps: S0)
 - Goal: `native.rs` returns ES and GS of one pipeline as a pair with the GS
