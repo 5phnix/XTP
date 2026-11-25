@@ -1727,7 +1727,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         #[cfg(feature = "diagnostics")]
-        let mut meshes = crate::meshstat::start(list, self.pipeline, crate::meshstat::Op::Mesh);
+        let mut meshes =
+            crate::meshstat::start(list, self.pipeline, crate::meshstat::Op::Mesh { groups: x });
         let ran = self.prepare_for(list, false, true).and_then(|()| {
             let l6 = list
                 .list

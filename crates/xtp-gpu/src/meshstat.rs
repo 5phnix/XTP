@@ -29,6 +29,11 @@
 //!   before that work ran. The path of GPU-written vertices (skinning).
 //! - **has data**: none of these.
 //!
+//! Beside the classes: mesh dispatches of one group, (1, 1, 1), direct or
+//! every record of an indirect one, by program. xcl #724 found meshes drawn
+//! so empty, from a descriptor table read one register too late (a mesh
+//! program's SGPR base off by one; its ideas only, none of its code).
+//!
 //! Three moments. Recording: each draw, mesh dispatch, dispatch and indirect
 //! execution notes what it reads and what its shaders write (`draw.rs` calls
 //! [`start`], [`read`], [`wrote`], [`root_view`]), into its list's recording
@@ -103,7 +108,9 @@ pub(crate) enum Op {
         indices: u32,
         first: u32,
     },
-    Mesh,
+    Mesh {
+        groups: u32,
+    },
     /// PC numbering of `kind`: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh
     /// dispatch.
     Indirect {
@@ -124,7 +131,7 @@ impl Op {
         match self {
             Op::Draw { .. } => "draw",
             Op::Indexed { .. } => "indexed draw",
-            Op::Mesh => "mesh dispatch",
+            Op::Mesh { .. } => "mesh dispatch",
             Op::Indirect { kind: 0, .. } => "indirect draw",
             Op::Indirect { kind: 1, .. } => "indirect indexed draw",
             Op::Indirect { kind: 2, .. } => "indirect dispatch",
@@ -454,6 +461,8 @@ struct Stats {
     /// Draws reading GPU output (skinned vertices, culled arguments): how
     /// often, since the last line.
     fed: HashMap<Fed, u64>,
+    /// Mesh dispatches of one group ([`one_group`]), by program and kind.
+    single: HashMap<(Program, &'static str), u64>,
     written: Written,
     /// Submissions prepared and not finished, with what they found, in the
     /// order of their probes.
@@ -623,6 +632,48 @@ fn records_empty(
     (seen == active, None)
 }
 
+/// Whether every active record of an indirect dispatch, as read, is one
+/// group, (1, 1, 1): xcl #724's empty meshes were drawn so, from a
+/// descriptor table read one register too late (a mesh program's SGPR base
+/// off by one). False for no active record or records past those read.
+fn records_one_group(stride: u32, max: u32, bytes: &[u8], count: Option<u32>) -> bool {
+    let stride = stride.max(12) as usize;
+    let active = count.map_or(max, |c| c.min(max)) as usize;
+    let seen = active.min(bytes.len() / stride).min(RECORDS);
+    let one = |at: usize| {
+        bytes
+            .get(at..at + 12)
+            .is_some_and(|b| b.chunks(4).all(|w| w == [1, 0, 0, 0]))
+    };
+    seen > 0 && seen == active && (0..seen).all(|i| one(i * stride))
+}
+
+/// Whether a mesh dispatch that ran was one group (direct), or every record
+/// of an indirect one is, as the GPU left them.
+fn one_group(probe: &Probe) -> bool {
+    match probe.op {
+        Op::Mesh { groups } => groups == 1,
+        Op::Indirect {
+            kind: 10,
+            stride,
+            max,
+        } => {
+            let find = |what: What| probe.reads.iter().find(|r| r.what == what);
+            let count = find(What::Count)
+                .and_then(|r| host_bytes(&r.shadow, r.address, 4))
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            find(What::Args).is_some_and(|r| {
+                let n = (stride.max(12) as usize)
+                    .saturating_mul(RECORDS)
+                    .min(r.len as usize);
+                host_bytes(&r.shadow, r.address, n)
+                    .is_some_and(|b| records_one_group(stride, max, &b, count))
+            })
+        }
+        _ => false,
+    }
+}
+
 /// A submission's lists are about to run, their refreshes done: their
 /// draws' ranges are compared with title memory, in the order the GPU runs
 /// them.
@@ -742,6 +793,11 @@ pub(crate) fn finished<'a>(submission: u64, probes: impl Iterator<Item = &'a Arc
         };
         *s.counts.ran.entry(probe.op.label()).or_default() += 1;
         let (class, detail) = classify(probe, &v);
+        if one_group(probe) {
+            *s.single
+                .entry((probe.program, probe.op.label()))
+                .or_default() += 1;
+        }
         s.count(class, probe.program, probe.op.label());
         if v.stale_aliased {
             s.counts.stale_aliased += 1;
@@ -855,6 +911,7 @@ pub(crate) struct Taken {
     top: HashMap<(Class, Program, &'static str), u64>,
     culprits: HashMap<Program, u64>,
     fed: HashMap<Fed, u64>,
+    single: HashMap<(Program, &'static str), u64>,
 }
 
 /// The counts since the last call, over the frames the frame-rate line
@@ -869,6 +926,7 @@ pub(crate) fn take() -> Taken {
         top: std::mem::take(&mut s.top),
         culprits: std::mem::take(&mut s.culprits),
         fed: std::mem::take(&mut s.fed),
+        single: std::mem::take(&mut s.single),
     }
 }
 
@@ -883,6 +941,7 @@ pub(crate) fn log(taken: Taken, frames: f64) {
         top,
         culprits,
         fed,
+        single,
     } = taken;
     let per = |n: u64| n as f64 / frames;
     let c = |class: Class| per(counts.classes[class as usize]);
@@ -983,6 +1042,15 @@ pub(crate) fn log(taken: Taken, frames: f64) {
             per(n)
         );
     }
+    // Mesh dispatches of one group, by program (xcl #724).
+    let mut single: Vec<((Program, &'static str), u64)> = single.into_iter().collect();
+    single.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for ((program, label), n) in single.into_iter().take(8) {
+        tracing::info!(
+            "meshes per frame: {label} of one group (1, 1, 1): {program}: {:.1}",
+            per(n)
+        );
+    }
 }
 
 /// For DirectStorage's raw destinations (title addresses): of the 64 KiB
@@ -1067,6 +1135,19 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_of_one_group_are_told_apart() {
+        let ones = words(&[[1, 1, 1, 0, 0], [1, 1, 1, 0, 0]], 12);
+        assert!(records_one_group(12, 2, &ones, None));
+        let mixed = words(&[[1, 1, 1, 0, 0], [2, 1, 1, 0, 0]], 12);
+        assert!(!records_one_group(12, 2, &mixed, None));
+        // Only the active records count; none active is not one group.
+        assert!(records_one_group(12, 2, &mixed, Some(1)));
+        assert!(!records_one_group(12, 2, &ones, Some(0)));
+        // Records past those read: not known to be one group.
+        assert!(!records_one_group(12, 1000, &ones, None));
+    }
+
+    #[test]
     fn samples_start_where_direct_draws_read() {
         let draw = Op::Draw {
             vertices: 3,
@@ -1084,7 +1165,10 @@ mod tests {
         assert_eq!(sample_at(indexed, r16, 0x2000, 1 << 20), (0x200c, SAMPLE));
         assert_eq!(index_size(42), 4);
         // Other ranges from their start, at most a sample.
-        assert_eq!(sample_at(Op::Mesh, What::View, 0x3000, 100), (0x3000, 100));
+        assert_eq!(
+            sample_at(Op::Mesh { groups: 1 }, What::View, 0x3000, 100),
+            (0x3000, 100)
+        );
         assert_eq!(
             sample_at(indexed, vertex, 0x3000, 1 << 20),
             (0x3000, SAMPLE)
