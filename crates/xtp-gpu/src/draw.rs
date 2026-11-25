@@ -157,6 +157,10 @@ pub(crate) struct State {
     heaps: [usize; 2],
     graphics: Vec<Root>,
     compute: Vec<Root>,
+    /// A spliced trace's structure whose host TLAS the dispatch takes at
+    /// its submission, not found when it was bound ([`State::bind_tlas`]):
+    /// the title's view of it and the TLAS's root parameter.
+    tlas_at_submission: Option<(u64, u32)>,
     /// The title's graphics and compute root signatures, for
     /// [`State::set_root_signature`].
     title_roots: [usize; 2],
@@ -890,6 +894,20 @@ fn root_srv_direct(list: &HostList, address: u64) -> Option<u64> {
     Some(shadow.gpu(address))
 }
 
+/// Why a dispatch of a program spliced with an inline ray query (RT phase
+/// 2b, its root SRV at [`xtp_shader::emit::TLAS_REGISTER`]) does not run:
+/// the title's view of the structure its walk read is not where the walk
+/// read it (`Shader::tlas_descriptor`): no descriptor table bound at that
+/// root parameter, or no view at that offset of it.
+const NO_TLAS_VIEW: &str = "rt: no title view of the structure";
+
+/// Why it does not run either: the host has no TLAS for the structure the
+/// view names that this recording may read (`rt::descriptor_tlas`): none
+/// built, or built in a list not submitted yet. A direct dispatch dropped
+/// for either is one of a trace program without a host pipeline, as before
+/// the splice ([`State::rt_dropped`]).
+const NO_HOST_TLAS: &str = "rt: no host TLAS";
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1490,6 +1508,7 @@ impl State {
         compute: bool,
         limits: [u32; 3],
     ) -> Result<(), &'static str> {
+        self.tlas_at_submission = None;
         #[cfg(feature = "diagnostics")]
         list.twin_reader(&p.name);
         // Depth planes whose twins shaders of the list wrote are drawn
@@ -1684,6 +1703,11 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    // Not a title root view: the host TLAS of a spliced walk.
+                    if srv && slot == xtp_shader::emit::TLAS_REGISTER {
+                        self.bind_tlas(list, stage, param, compute)?;
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::root_srv_in_table(slot);
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -2205,6 +2229,101 @@ impl State {
         Some(counts)
     }
 
+    /// Binds at root parameter `param`, a root SRV, the host TLAS a program
+    /// spliced with an inline ray query reads
+    /// ([`xtp_shader::emit::TLAS_REGISTER`]): the one the host built for the
+    /// structure the title's view names, the view where the program's walk
+    /// read it ([`State::tlas_view`]). `rt::descriptor_tlas` pins it for the
+    /// recording and gives it only once its build is recorded earlier in
+    /// this list or submitted. A compute dispatch whose TLAS the title
+    /// builds in a list not submitted yet takes it at its submission instead
+    /// ([`State::tlas_at_submission`], `rt::dispatch_descriptor_tlas`). Why
+    /// not if it cannot be (the dispatch is dropped).
+    fn bind_tlas(
+        &mut self,
+        list: &HostList,
+        stage: &crate::pipeline::host::Stage,
+        param: u32,
+        compute: bool,
+    ) -> Result<(), &'static str> {
+        let handle = self.tlas_view(stage, compute).ok_or(NO_TLAS_VIEW)?;
+        self.bind_tlas_view(list, handle, param, compute)
+    }
+
+    /// [`State::bind_tlas`] for the title's view at `handle`.
+    fn bind_tlas_view(
+        &mut self,
+        list: &HostList,
+        handle: u64,
+        param: u32,
+        compute: bool,
+    ) -> Result<(), &'static str> {
+        match crate::rt::descriptor_tlas_in(list, handle) {
+            Some(gpu) if compute => self.compute_root(list, param, ComputeRoot::Srv(gpu)),
+            // SAFETY: an open list, which keeps the structure.
+            Some(gpu) => unsafe { list.list.SetGraphicsRootShaderResourceView(param, gpu) },
+            None if compute => self.tlas_at_submission = Some((handle, param)),
+            None => return Err(NO_HOST_TLAS),
+        }
+        Ok(())
+    }
+
+    /// Records a trace dispatch whose host TLAS it takes at its submission
+    /// ([`State::tlas_at_submission`]): `rt::dispatch_descriptor_tlas_in`
+    /// sets the TLAS's root SRV as an indirect argument then, the one
+    /// published in queue order or the empty one (every ray misses). A
+    /// dispatch past D3D12's group limit, which a direct one splits, is
+    /// dropped.
+    fn dispatch_tlas_at_submission(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        handle: u64,
+        param: u32,
+        groups: [u32; 3],
+    ) {
+        if groups.contains(&0) {
+            return;
+        }
+        if groups.iter().any(|&n| n > 65_535) {
+            self.dispatch_dropped(NO_HOST_TLAS.into());
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            let [x, y, z] = groups;
+            self.op_text(format!("dispatch {x}x{y}x{z}, TLAS at submission"), true)
+        });
+        let _timed = crate::timestamps::command(list, crate::timestamps::What::Dispatch, Some(p));
+        if std::mem::take(&mut self.dropped_dispatch) {
+            // SAFETY: an open list; the barrier names no resource.
+            unsafe { list.list.ResourceBarrier(&[crate::host::uav_barrier()]) };
+        }
+        if crate::rt::dispatch_descriptor_tlas_in(list, handle, &p.root, param, groups) {
+            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.dispatch_dropped(NO_HOST_TLAS.into());
+        }
+    }
+
+    /// The title's view of the structure a spliced program's walk reads:
+    /// the descriptor at its site's offset in the table bound at the root
+    /// parameter whose address the site's user SGPR holds
+    /// (`Shader::tlas_descriptor`), in a heap the list has bound.
+    fn tlas_view(&self, stage: &crate::pipeline::host::Stage, compute: bool) -> Option<u64> {
+        self.tlas_view_at(stage.shader.tlas_descriptor()?, compute)
+    }
+
+    /// [`State::tlas_view`] where `d` says.
+    fn tlas_view_at(&self, d: xtp_shader::emit::TlasDescriptor, compute: bool) -> Option<u64> {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(d.slot)) else {
+            return None;
+        };
+        let handle = table.checked_add(u64::from(d.offset))?;
+        self.heap_of(handle)?;
+        Some(handle)
+    }
+
     /// Binds a root SRV as a one-view table (see
     /// [`crate::pipeline::host::bounded_root_srvs`] and
     /// [`State::root_srv_slot`]). Why not if it cannot be (the draw is
@@ -2548,7 +2667,19 @@ impl State {
             return;
         }
         if let Err(why) = self.bind(list, p, true, limits) {
+            if why == NO_TLAS_VIEW || why == NO_HOST_TLAS {
+                self.rt_dropped(list, crate::rt_standin::Work::Groups([x, y, z]));
+            }
             self.dispatch_dropped(why.into());
+            return;
+        }
+        // A trace whose host TLAS was not there to bind: the dispatch takes
+        // the one published at its submission, or the empty one (every ray
+        // misses), and sets its root SRV itself.
+        if let Some((handle, param)) = self.tlas_at_submission.take() {
+            self.dispatch_tlas_at_submission(list, p, handle, param, [x, y, z]);
+            #[cfg(feature = "diagnostics")]
+            meshes.ran();
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -3541,6 +3672,10 @@ impl State {
         let roots = self.pending_compute.take();
         if let Err(why) = ready {
             return fail(why);
+        }
+        // A trace's TLAS taken at submission has no indirect form here yet.
+        if self.tlas_at_submission.take().is_some() {
+            return fail(NO_HOST_TLAS.into());
         }
         // XTP_FRAME_PROBE: the argument records of a probed op.
         #[cfg(feature = "diagnostics")]
@@ -7478,6 +7613,295 @@ float4 ps(V v) : SV_Target { return v.color; }
 
         state.set_root_signature(true, std::ptr::null());
         assert!(state.compute.is_empty());
+    }
+
+    /// A spliced program's dispatch finds the title's view of its structure
+    /// at the descriptor's offset in the table bound at its root parameter,
+    /// in a bound heap: none without a table there (another stage's, root
+    /// constants), and none past the heap's end.
+    #[test]
+    fn the_tlas_view_is_in_the_table_the_walk_read() {
+        let heap = TestHeap::views(16);
+        let title = crate::descriptor::heap(heap.0);
+        let mut state = state(heap.0);
+        let d = xtp_shader::emit::TlasDescriptor {
+            slot: 2,
+            offset: 0x20,
+        };
+        assert_eq!(state.tlas_view_at(d, true), None);
+        state.set_table(true, 2, title.start + 3 * 32);
+        assert_eq!(state.tlas_view_at(d, true), Some(title.start + 4 * 32));
+        assert_eq!(state.tlas_view_at(d, false), None);
+        state.set_table(true, 2, title.start + 15 * 32);
+        assert_eq!(state.tlas_view_at(d, true), None);
+        state.set_constants(true, 2, &[1], 0);
+        assert_eq!(state.tlas_view_at(d, true), None);
+    }
+
+    /// The host device for `test` if it runs inline ray queries (DXR tier
+    /// 1.1); a skip otherwise.
+    fn ray_query_gpu(test: &str) -> Option<crate::testgpu::Gpu> {
+        let gpu = crate::testgpu::device(test)?;
+        let host = gpu.host();
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        // SAFETY: the output is the options structure the feature names.
+        let tier = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS5,
+                (&raw mut caps).cast(),
+                size_of_val(&caps) as u32,
+            )
+        }
+        .map_or(D3D12_RAYTRACING_TIER_NOT_SUPPORTED, |()| {
+            caps.RaytracingTier
+        });
+        if tier.0 < D3D12_RAYTRACING_TIER_1_1.0 {
+            crate::testgpu::skip(test, "inline ray queries require DXR tier 1.1");
+            return None;
+        }
+        Some(gpu)
+    }
+
+    /// One triangle about x = `x` at z = 0, built by `producer` as a title
+    /// TLAS at `at` (not submitted): of `ray_test.hlsl`'s two rays along +z
+    /// from z = -2, at x = 0 and x = 4, the one at `x` hits it two units on.
+    /// Its inputs, which must outlive the build.
+    fn tlas_scene(producer: &TitleList, x: f32, at: u64) -> Vec<TitleBuffer> {
+        // Plain DXR formats: the console builder reads R16_TYPELESS indices
+        // as meshlet-compressed and R32G32_FLOAT vertices as quantized.
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32G32B32_FLOAT,
+        };
+        let (vertices, indices) = (TitleBuffer::new(36), TitleBuffer::new(8));
+        let positions = [x - 1., -1., 0., x, 1., 0., x + 1., -1., 0.];
+        vertices.set_words(|i| positions[i].to_bits());
+        indices.set_words(|i| [1 << 16, 2][i]);
+        let (blas, instances) = (TitleBuffer::new(1024), TitleBuffer::new(64));
+        instances.set_words(|i| match i {
+            0 | 5 | 10 => 1f32.to_bits(),
+            12 => 0xff00_0000,
+            14 => blas.address() as u32,
+            15 => (blas.address() >> 32) as u32,
+            _ => 0,
+        });
+        let geometry = D3D12_RAYTRACING_GEOMETRY_DESC {
+            Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+            Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+            Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                    IndexFormat: DXGI_FORMAT_R16_UINT,
+                    VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                    IndexCount: 3,
+                    VertexCount: 3,
+                    IndexBuffer: indices.address(),
+                    VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                        StartAddress: vertices.address(),
+                        StrideInBytes: 12,
+                    },
+                    ..Default::default()
+                },
+            },
+        };
+        let inputs = |kind, descs| D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: kind,
+            NumDescs: 1,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            Anonymous: descs,
+            ..Default::default()
+        };
+        let blas_inputs = inputs(
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                pGeometryDescs: &geometry,
+            },
+        );
+        let tlas_inputs = inputs(
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                InstanceDescs: instances.address(),
+            },
+        );
+        // SAFETY: the title list and the CPU arrays are live for each call.
+        unsafe {
+            for (dst, inputs) in [(blas.address(), blas_inputs), (at, tlas_inputs)] {
+                assert!(crate::rt::Builder.build(
+                    producer.this(),
+                    &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                        DestAccelerationStructureData: dst,
+                        Inputs: inputs,
+                        ..Default::default()
+                    }
+                ));
+            }
+        }
+        vec![vertices, indices, blas, instances]
+    }
+
+    /// Which TLAS a spliced trace reads. The title's table at the trace's
+    /// root parameter holds a decoy's descriptor at +0x00 and the trace's at
+    /// +0x20 ([`xtp_shader::emit::TlasDescriptor`]), and the trace's names a
+    /// TLAS the title built 0x100 bytes into its buffer. The binding
+    /// ([`State::tlas_view_at`], then `rt::descriptor_tlas_in`) gives the
+    /// host TLAS of that title address, the one its root address gives, not
+    /// the decoy's: the same rays traced through either give the same words,
+    /// and other words through the decoy.
+    ///
+    /// After the test of Xbox2Windows commit 1b753c5828 by tedin7, which
+    /// traces rays through a TLAS published at a non-zero offset, against
+    /// the root address and a decoy (MIT License, Copyright (c) 2026
+    /// Xbox2Windows contributors); written anew here, none of its code.
+    #[test]
+    fn a_trace_reads_the_tlas_its_descriptor_names_not_a_decoy() {
+        let test = "draw::tests::a_trace_reads_the_tlas_its_descriptor_names_not_a_decoy";
+        let Some(gpu) = ray_query_gpu(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let producer = TitleList::new();
+        let scene = |x: f32, at: u64| tlas_scene(&producer, x, at);
+        // The trace's TLAS 0x100 bytes into the title's buffer; the decoy's.
+        let (placed, decoy) = (TitleBuffer::new(4096), TitleBuffer::new(1024));
+        let at = placed.address() + 0x100;
+        let _inputs = [scene(0., at), scene(4., decoy.address())];
+        producer.run();
+        // The title's table: the decoy's descriptor, then the trace's.
+        let heap = TestHeap::views(16);
+        let title = crate::descriptor::heap(heap.0);
+        for (k, address) in [decoy.address(), at].into_iter().enumerate() {
+            let mut srv = [0u32; 10];
+            srv[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+            srv[4] = address as u32;
+            srv[5] = (address >> 32) as u32;
+            let slot = title.start + k as u64 * 32;
+            crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &srv, slot);
+        }
+        let list = TitleList::new();
+        let mut state = state(heap.0);
+        state.set_table(true, 1, title.start);
+        let d = xtp_shader::emit::TlasDescriptor {
+            slot: 1,
+            offset: 0x20,
+        };
+        let view = state.tlas_view_at(d, true).expect("the trace's view");
+        assert_eq!(view, title.start + 0x20);
+        let bound = crate::rt::descriptor_tlas_in(list.host(), view).expect("its host TLAS");
+        // SAFETY: the test's live list.
+        let (root, other) = unsafe {
+            (
+                crate::rt::host_tlas(list.this(), at).expect("the root address's TLAS"),
+                crate::rt::host_tlas(list.this(), decoy.address()).expect("the decoy's"),
+            )
+        };
+        assert_eq!(bound, root);
+        assert_ne!(bound, other);
+        // The same rays through each.
+        let dxc = std::env::var_os("XTP_PC_DXC")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                xtp_shader::emit::validator::Validator::default_path()
+                    .map(|p| p.with_file_name("dxc.exe"))
+            })
+            .expect("Windows SDK DXC for the inline ray test");
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("ray.dxil");
+        let compiled = std::process::Command::new(dxc)
+            .args(["-T", "cs_6_5", "-E", "main", "-Fo"])
+            .arg(&binary)
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rt/ray_test.hlsl"))
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let code = std::fs::read(binary).unwrap();
+        let l = list.host();
+        let outputs: Vec<TitleBuffer> = (0..3).map(|_| TitleBuffer::new(16)).collect();
+        // SAFETY: the root signature is the one DXC embeds; the list keeps it,
+        // the PSO and the outputs' copies, and the structures are pinned.
+        unsafe {
+            let root_signature: ID3D12RootSignature =
+                host.device.CreateRootSignature(0, &code).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root_signature),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            l.keep(&root_signature);
+            l.keep(&pso);
+            for (tlas, output) in [bound, root, other].into_iter().zip(&outputs) {
+                output.set_words(|_| 77);
+                let shadow = output.shadow();
+                shadow.refresh(l, output.address(), 16);
+                shadow.gpu_writes(l, output.address(), 16);
+                l.list.SetPipelineState(&pso);
+                l.list.SetComputeRootSignature(&root_signature);
+                l.list.SetComputeRootShaderResourceView(0, tlas);
+                l.list
+                    .SetComputeRootUnorderedAccessView(1, shadow.gpu(output.address()));
+                l.list.Dispatch(1, 1, 1);
+                l.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+            }
+        }
+        list.run();
+        let [through_table, through_root, through_decoy] = [0, 1, 2].map(|k| outputs[k].words());
+        let two = 2.0f32.to_bits();
+        assert_eq!(through_table, [1, two, 0, 0], "the trace's rays");
+        assert_eq!(through_table, through_root);
+        assert_eq!(through_decoy, [0, 0, 1, two], "the decoy's rays");
+    }
+
+    /// A trace whose TLAS the title builds in another list, not submitted
+    /// yet when the trace is recorded, takes it at its submission
+    /// ([`State::tlas_at_submission`], which `State::dispatch` hands to
+    /// `rt::dispatch_descriptor_tlas_in`); once that list is submitted, the
+    /// trace binds it as it is recorded, a root SRV. A draw has no such way
+    /// round: it is refused.
+    #[test]
+    fn a_trace_takes_a_tlas_not_yet_submitted_at_its_submission() {
+        let test = "draw::tests::a_trace_takes_a_tlas_not_yet_submitted_at_its_submission";
+        let Some(_gpu) = ray_query_gpu(test) else {
+            return;
+        };
+        let producer = TitleList::new();
+        let tlas = TitleBuffer::new(1024);
+        let _inputs = tlas_scene(&producer, 0., tlas.address());
+        let heap = TestHeap::views(16);
+        let title = crate::descriptor::heap(heap.0);
+        let mut srv = [0u32; 10];
+        srv[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+        srv[4] = tlas.address() as u32;
+        srv[5] = (tlas.address() >> 32) as u32;
+        crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &srv, title.start);
+        let list = TitleList::new();
+        let mut state = state(heap.0);
+        state.pending_compute = Some(Vec::new());
+        state
+            .bind_tlas_view(list.host(), title.start, 5, true)
+            .unwrap();
+        assert_eq!(state.tlas_at_submission, Some((title.start, 5)));
+        assert!(state.pending_compute.as_ref().unwrap().is_empty());
+        assert_eq!(
+            state.bind_tlas_view(list.host(), title.start, 5, false),
+            Err(NO_HOST_TLAS)
+        );
+        producer.run();
+        state.tlas_at_submission = None;
+        state
+            .bind_tlas_view(list.host(), title.start, 5, true)
+            .unwrap();
+        assert_eq!(state.tlas_at_submission, None);
+        assert!(matches!(
+            state.pending_compute.as_deref(),
+            Some([(5, ComputeRoot::Srv(gpu))]) if *gpu != 0
+        ));
     }
 
     /// A title heap released while a list records and another made at its

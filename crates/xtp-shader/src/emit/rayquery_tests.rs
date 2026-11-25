@@ -20,9 +20,12 @@
 use std::collections::HashMap;
 
 use super::HostShader;
+use super::lower::rayquery::play::QueryRay;
 use super::lower::rayquery::proof::{self, Play, Prover};
 use super::lower::rayquery::world::{self, Blas, Instance, Rng, Root, Tri, World};
-use super::lower::rayquery::{Kind, Site, Source, TLAS_REGISTER, asm, ray_flags, splice};
+use super::lower::rayquery::{
+    self, Kind, Site, Source, TLAS_REGISTER, TlasDescriptor, asm, ray_flags, splice,
+};
 use crate::dxbc::{Container, FourCC};
 use crate::ir::{EXEC, Program, Reg};
 use crate::native::{
@@ -247,16 +250,14 @@ fn translate_with(
         parts: vec![],
     };
     let p = ir(native);
-    if prove {
-        proof::prove(&p, native, site).map_err(|f| crate::ShaderError::Unsupported {
-            offset: f.offset,
-            what: f.why,
-        })?;
-    }
-    let p = splice(p, site).map_err(|what| crate::ShaderError::Unsupported {
-        offset: site.header,
-        what,
-    })?;
+    let p = if prove {
+        rayquery::spliced(p, native, site)?
+    } else {
+        splice(p, site).map_err(|what| crate::ShaderError::Unsupported {
+            offset: site.header,
+            what,
+        })?
+    };
     let st = crate::structure::structure(&p);
     let res = crate::resource::track_native(&p, native, st.as_ref().ok())?;
     let io = crate::io::raise(&p, native)?;
@@ -425,6 +426,86 @@ fn rayquery_refuses_walks_with_effects_the_query_lacks() {
     // ... which the code after the walk reads (0xd8: ds_read_b32 v1, v0).
     let read = patched(&stack, 0xd8, &[0xD8D8_0000, 0x0100_0000]);
     assert_eq!(splice(ir(&read), &SITE).err(), effect);
+    // ... or reads through a VALU operand (Codex review of eb7d7d8, point
+    // 4; 0xd8: v_mov_b32 v1, src_lds_direct, then s_nop 0).
+    let direct = patched(&stack, 0xd8, &[0x7E02_02FE, 0xBF80_0000]);
+    assert_eq!(splice(ir(&direct), &SITE).err(), effect);
+}
+
+/// What the proof cannot check is refused before it plays (Codex review of
+/// eb7d7d8): ray flags the host's answer does not model, FORCE_OPAQUE
+/// missing among them (point 1: the lowering commits no candidate, so a
+/// non-opaque triangle would be missed), and a kept register other than
+/// EXEC, which the play does not compare (point 6).
+#[test]
+fn rayquery_refuses_sites_the_proof_cannot_check() {
+    let p = ir(&native());
+    let flags = Some("a ray query with ray flags the proof has no model of");
+    let without_opaque = Site {
+        flags: ray_flags::CULL_BACK_FACING_TRIANGLES,
+        ..SITE
+    };
+    assert_eq!(splice(p.clone(), &without_opaque).err(), flags);
+    // RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH.
+    let first_hit = Site {
+        flags: ray_flags::FORCE_OPAQUE | 0x04,
+        ..SITE
+    };
+    assert_eq!(splice(p.clone(), &first_hit).err(), flags);
+    let kept = Site {
+        kept: &[Reg::V(1)],
+        ..SITE
+    };
+    assert_eq!(
+        splice(p, &kept).err(),
+        Some("a ray-tracing walk that keeps a register other than EXEC")
+    );
+    // The review's counterexample: family A's site without FORCE_OPAQUE.
+    let (native, site) = family_a();
+    let site = Site {
+        flags: ray_flags::CULL_BACK_FACING_TRIANGLES,
+        ..site
+    };
+    assert_eq!(
+        proof::prove(&ir(&native), &native, &site)
+            .map(|_| ())
+            .map_err(|f| f.why),
+        Err("a ray query with ray flags the proof has no model of")
+    );
+}
+
+/// The host's answer sets a lane aside (an edge, or fragile) only where the
+/// ambiguity can change it (Codex review of eb7d7d8, point 3): a triangle
+/// at t-max behind a clear hit, or a grazed one past it, changes nothing;
+/// alone at t-max, or grazed before the hit, it does.
+#[test]
+fn rayquery_host_answer_sets_aside_only_lanes_it_may_change() {
+    let ray = |t_max: f32| QueryRay {
+        origin: [1.0, 1.0, 0.0],
+        direction: [0.0, 0.0, 1.0],
+        t_min: 0.0,
+        t_max,
+        mask: 0xd5,
+        flags: ray_flags::FORCE_OPAQUE | ray_flags::CULL_BACK_FACING_TRIANGLES,
+    };
+    let world = |tris: Vec<Tri>| {
+        one_instance(Blas {
+            leaves: tris.into_iter().map(|t| vec![t]).collect(),
+            cycle: None,
+        })
+    };
+    let answer = world(vec![a_at(3.0), a_at(5.0)]).query(&ray(5.0));
+    assert!(answer.hit && !answer.edge && !answer.fragile, "{answer:?}");
+    assert_eq!(answer.t, 3.0);
+    let answer = world(vec![a_at(5.0)]).query(&ray(5.0));
+    assert!(!answer.hit && answer.edge, "{answer:?}");
+    // A's shape moved to x = 1: the ray runs on its edge from (1, 0).
+    let grazed = |z: f32| -> Tri { [[1.0, 0.0, z], [1.0, 4.0, z], [5.0, 0.0, z]] };
+    let answer = world(vec![a_at(3.0), grazed(7.0)]).query(&ray(100.0));
+    assert!(answer.hit && !answer.fragile, "{answer:?}");
+    assert_eq!(answer.t, 3.0);
+    let answer = world(vec![a_at(3.0), grazed(2.0)]).query(&ray(100.0));
+    assert!(answer.fragile, "{answer:?}");
 }
 
 /// Without a site the program is not spliced: the walk stays, and the
@@ -1647,6 +1728,147 @@ fn rayquery_proof_refuses_what_the_walk_does_not_do() {
     }
 }
 
+/// Rays DXR leaves undefined (a device may hang on them: a zero or NaN
+/// direction, a NaN origin, a t-max below t-min or NaN) miss, as the
+/// console's walk and the proof's host do; the other lanes of the wave
+/// trace as before. On WARP, family A's program over two triangles that
+/// cover its rays' square at z = 5.
+#[test]
+fn rayquery_family_a_misses_rays_dxr_leaves_undefined_on_warp() {
+    let (native, site) = family_a();
+    let cs = translate_with(&without_lds(&native), &site, false).unwrap();
+    let Ok(host) = super::host::Host::new(true) else {
+        eprintln!("no WARP device; skipped");
+        return;
+    };
+    let square = Blas {
+        leaves: vec![
+            vec![a_at(5.0)],
+            vec![[[4.0, 4.0, 5.0], [4.0, 0.0, 5.0], [0.0, 4.0, 5.0]]],
+        ],
+        cycle: None,
+    };
+    let w = one_instance(square);
+    let scene = warp::Scene {
+        blases: w
+            .blases
+            .iter()
+            .map(|b| b.triangles().copied().collect())
+            .collect(),
+        instances: w
+            .instances
+            .iter()
+            .map(|i| (i.to_world(), i.id, i.mask, i.contribution, i.flags, i.blas))
+            .collect(),
+    };
+    let undefined: [([f32; 3], [f32; 3], f32); 5] = [
+        ([1.0, 0.5, 0.0], [0.0, 0.0, 0.0], 20.0),
+        ([f32::NAN, 0.5, 0.0], [0.0, 0.0, 1.0], 20.0),
+        ([1.0, 0.5, 0.0], [0.0, f32::NAN, 1.0], 20.0),
+        ([1.0, 0.5, 0.0], [0.0, 0.0, 1.0], -1.0),
+        ([1.0, 0.5, 0.0], [0.0, 0.0, 1.0], f32::NAN),
+    ];
+    let mut records = Vec::new();
+    for l in 0..THREADS as usize {
+        // Lanes off the square's diagonal, straight up to z = 5.
+        let fine = (
+            [
+                0.25 + (l % 6) as f32 * 0.25,
+                0.25 + (l / 6) as f32 * 0.1,
+                0.0,
+            ],
+            [0.0, 0.0, 1.0],
+            20.0,
+        );
+        let (origin, direction, t_max) = undefined.get(l % 8).copied().unwrap_or(fine);
+        for x in origin
+            .into_iter()
+            .chain([t_max])
+            .chain(direction)
+            .chain([0.0])
+        {
+            records.extend(x.to_le_bytes());
+        }
+    }
+    let views = [
+        warp::View::Srv(records),
+        warp::View::Srv(vec![0; 256]),
+        warp::View::Out(THREADS),
+        warp::View::Srv(u32::MAX.to_le_bytes().to_vec()),
+    ];
+    let out = match warp::run(&host, &cs, &scene, &views, true) {
+        Ok(Some(out)) => out,
+        Ok(None) => {
+            eprintln!("WARP has no ray-tracing tier 1.1; skipped");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+    for (l, &got) in out.iter().enumerate() {
+        let got = f32::from_bits(got);
+        if l % 8 < undefined.len() {
+            assert_eq!(got, f32::MAX, "lane {l}: an undefined ray misses");
+        } else {
+            assert!((got - 5.04).abs() < 1e-4, "lane {l}: {got}");
+        }
+    }
+}
+
+/// The structure's descriptor is found where the dispatch looks: in the
+/// table whose address the site's user SGPR holds, at the site's offset; a
+/// site whose SGPR starts no table, or holds root constants, has none, and
+/// its walk is not spliced.
+#[test]
+fn rayquery_finds_the_structure_s_table_or_refuses_the_site() {
+    let (native, site) = family_a();
+    assert_eq!(
+        rayquery::table_of(&native, &site.tlas),
+        Some(TlasDescriptor {
+            slot: 0,
+            offset: 0x20
+        })
+    );
+    // A second table at user SGPR 1, root parameter 3, with two ranges.
+    let mut two = native.clone();
+    let range = |table_offset_dwords| RootParam {
+        root: RootType::Table,
+        table_offset_dwords,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 1,
+        slot: 3,
+    };
+    two.layout.extend([range(0), range(8)]);
+    let at_1 = Source {
+        user_sgpr: 1,
+        offset: 0x40,
+    };
+    assert_eq!(
+        rayquery::table_of(&two, &at_1),
+        Some(TlasDescriptor {
+            slot: 3,
+            offset: 0x40
+        })
+    );
+    // No parameter at SGPR 2; root constants at SGPR 0.
+    let at_2 = Source {
+        user_sgpr: 2,
+        offset: 0x20,
+    };
+    assert_eq!(rayquery::table_of(&two, &at_2), None);
+    let mut constants = native.clone();
+    constants.layout[0].root = RootType::Constants;
+    assert_eq!(rayquery::table_of(&constants, &site.tlas), None);
+    let refused =
+        |native: &NativeProgram, site: &Site| match rayquery::spliced(ir(native), native, site) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => what,
+            other => panic!("{:?}", other.map(|_| ())),
+        };
+    let why = "a ray-tracing walk whose structure is not in one descriptor table";
+    assert_eq!(refused(&constants, &site), why);
+    assert_eq!(refused(&native, &Site { tlas: at_2, ..site }), why);
+}
+
 /// The proof of the walks `rayquery::SITES` names, for a
 /// container of the title's given by path (`XTP_RT_CONTAINER`; its bytes
 /// never enter the repository): each report, or the failure with its world,
@@ -1668,12 +1890,48 @@ fn rayquery_proves_a_title_container_by_play() {
         let started = std::time::Instant::now();
         let report = proof::prove(&ir(&native), &native, site).unwrap_or_else(|f| panic!("{f:?}"));
         eprintln!("{report:?} in {:?}", started.elapsed());
+        // Where the dispatch finds the title's descriptor of the structure.
+        let tlas = rayquery::tlas_descriptor(&native).expect("the structure's table");
+        eprintln!("{tlas:?}");
         proven += 1;
     }
     assert!(proven > 0, "no site in this container");
-    // As `xtp translate --validate` does: translated, spliced, valid.
+    // As the runtime translates it: spliced and valid.
     let cs = super::translate(&data).unwrap_or_else(|e| panic!("{e}"));
     check_dxil(&cs);
+    // What the host binds for it: whether it writes through views picked at
+    // run time (which make every host copy suspect), its root views.
+    eprintln!(
+        "run-time buffers {:#x}, root SRVs {:?}, root UAVs {:?}, user data {}",
+        cs.run_time_buffers,
+        cs.root_srvs,
+        cs.root_uavs,
+        cs.user_data.len()
+    );
+    // Its DXIL, for a look at its loops (`dxc -dumpbin`), where
+    // `XTP_RT_DXIL_OUT` says: outside the repository, as the container.
+    if let Some(out) = std::env::var_os("XTP_RT_DXIL_OUT") {
+        std::fs::write(out, &cs.dxil).unwrap();
+    }
+    // With `XTP_TEST_ADAPTER=hardware` (or unset), its compute pipeline on
+    // the default hardware adapter, translated for that adapter's waves: a
+    // driver's compiler that fails on it fails this process only (VIctory
+    // #2309 saw one recurse until its stack overflowed).
+    match super::host::Host::new(false) {
+        Ok(host) => {
+            let adapters = super::host::adapters().unwrap_or_default();
+            let cs = super::translate_for(&data, host.target()).unwrap_or_else(|e| panic!("{e}"));
+            let started = std::time::Instant::now();
+            host.compute_pipeline(&cs)
+                .unwrap_or_else(|e| panic!("{adapters:?}: {e}"));
+            eprintln!(
+                "compute pipeline made on {:?} in {:?}",
+                adapters.first(),
+                started.elapsed()
+            );
+        }
+        Err(e) => eprintln!("no device for its pipeline: {e}"),
+    }
 }
 
 /// Lane 0's ray, planted for group 0 with only lane 0 in the tile mask.

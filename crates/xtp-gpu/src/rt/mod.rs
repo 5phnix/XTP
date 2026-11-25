@@ -3,10 +3,6 @@
 mod allocation;
 mod dispatch;
 pub(crate) use allocation::ResultBuffer;
-#[cfg_attr(
-    not(test),
-    expect(unused_imports, reason = "for draws' traces (task ac895e39)")
-)]
 pub(crate) use dispatch::dispatch_descriptor_tlas_in;
 pub use dispatch::{
     IndirectTlas, dispatch_descriptor_tlas, dispatch_indirect_tlas, prepare_indirect_tlas,

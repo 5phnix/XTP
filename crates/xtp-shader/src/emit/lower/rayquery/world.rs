@@ -280,21 +280,30 @@ impl World {
 
     /// DXR's answer to `ray`: closest hit, opaque, culling as its flags and
     /// the instances' say, a hit at t-min < t < t-max (the specification's
-    /// rule; WARP keeps one at t-max, which `edge` leaves out).
+    /// rule; WARP keeps one at t-max, which `edge` leaves out). Its flags
+    /// are [`ray_flags::MODELLED`]'s, FORCE_OPAQUE among them (`splice`
+    /// refuses a site with others).
+    ///
+    /// A lane is an edge or fragile only where the ambiguity can change the
+    /// answer (Codex review of eb7d7d8, point 3): a candidate at t-min, or at
+    /// t-max with no clear hit nearer; a triangle whose edge the ray grazes,
+    /// at or before the nearest clear hit; one the ray runs along, whose t
+    /// and facing rounding decides.
     pub fn query(&self, ray: &QueryRay) -> Answer {
         let (t_min, t_max) = (f64::from(ray.t_min), f64::from(ray.t_max));
-        let mut best: Option<f64> = None;
-        let (mut edge, mut fragile) = (false, false);
         let (o, d) = (wide(ray.origin), wide(ray.direction));
         let cull_back = ray.flags & ray_flags::CULL_BACK_FACING_TRIANGLES != 0;
         if self.root == Root::Empty {
             return Answer {
                 hit: false,
                 t: ray.t_max,
-                edge,
-                fragile,
+                edge: false,
+                fragile: false,
             };
         }
+        // The triangles the ray may hit, by t: (t, inside, grazing).
+        let mut candidates: Vec<(f64, bool, bool)> = Vec::new();
+        let mut along = false;
         for inst in &self.instances {
             if u32::from(inst.mask) & ray.mask == 0 {
                 continue;
@@ -308,24 +317,38 @@ impl World {
                     * len(sub(wide(tri[2]), wide(tri[0])))
                     * len(od);
                 let in_range = m.t > t_min - 1e-4 && m.t < t_max * (1.0 + 1e-4) + 1e-4;
-                if in_range && (m.grazes() || m.det.abs() < 1e-7 * scale) {
-                    fragile = true;
-                }
-                if !m.inside() {
-                    continue;
-                }
+                // Its t and its facing are rounding's: the lane is fragile
+                // wherever the triangle lies.
+                along |= in_range && m.det.abs() < 1e-7 * scale;
                 let front = (m.det > 0.0) != (inst.flags & FRONT_CCW != 0);
                 if cull_back && inst.flags & CULL_DISABLE == 0 && !front {
                     continue;
                 }
-                if near(m.t, t_min) || near(m.t, t_max) {
-                    edge = true;
-                }
-                if m.t > t_min && m.t < t_max && best.is_none_or(|b| m.t < b) {
-                    best = Some(m.t);
+                let grazes = in_range && m.grazes();
+                if m.inside() || grazes {
+                    candidates.push((m.t, m.inside(), grazes));
                 }
             }
         }
+        let best = candidates
+            .iter()
+            .filter(|c| c.1 && c.0 > t_min && c.0 < t_max)
+            .map(|c| c.0)
+            .reduce(f64::min);
+        // The nearest hit no rounding takes away: not at an end of the ray,
+        // and not grazing an edge. What lies past it changes nothing.
+        let clear = candidates
+            .iter()
+            .filter(|c| c.1 && !c.2 && c.0 > t_min && c.0 < t_max)
+            .filter(|c| !near(c.0, t_min) && !near(c.0, t_max))
+            .map(|c| c.0)
+            .reduce(f64::min);
+        let before_clear = |t: f64| clear.is_none_or(|b| t < b || near(t, b));
+        let edge = candidates
+            .iter()
+            .filter(|c| c.1)
+            .any(|c| near(c.0, t_min) || (near(c.0, t_max) && clear.is_none()));
+        let fragile = along || candidates.iter().any(|c| c.2 && before_clear(c.0));
         Answer {
             hit: best.is_some(),
             t: best.map_or(ray.t_max, |t| t as f32),
