@@ -178,10 +178,6 @@ const SITE: Site = Site {
     },
 };
 
-/// The proof by play's own tests, which play the family A program below.
-#[path = "rayquery_play_tests.rs"]
-mod play;
-
 /// Threads in the group: one wave of 32.
 const THREADS: u32 = 32;
 

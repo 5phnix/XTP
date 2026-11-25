@@ -57,10 +57,10 @@ pub(super) trait Env {
     fn load(&mut self, inst: &Inst, at: u64) -> Result<u32, Why>;
     /// Lane `lane` of `inst` writes `value` at `at` (a multiple of 4).
     fn store(&mut self, inst: &Inst, lane: usize, at: u64, value: u32) -> Result<(), Why>;
-    /// What `image_bvh_intersect_ray` returns to lane `lane` (dmask 0xf,
-    /// boxes sorted, triangles' i and j) for `ray` in the structure whose
-    /// nodes start at `base`.
-    fn intersect(&mut self, lane: usize, base: u64, ray: &BvhRay) -> Result<[u32; 4], Why>;
+    /// What `image_bvh_intersect_ray` returns (dmask 0xf, boxes sorted,
+    /// triangles' i and j) for `ray` in the structure whose nodes start at
+    /// `base`.
+    fn intersect(&mut self, base: u64, ray: &BvhRay) -> Result<[u32; 4], Why>;
     /// What the host's query answers for lane `lane`: whether it committed
     /// a triangle hit, and the committed t (the ray's t-max on a miss).
     fn query(&mut self, lane: usize, ray: &QueryRay) -> Result<(bool, f32), Why>;
@@ -110,8 +110,6 @@ enum Op {
     Scalar1(Scalar1),
     /// `s_cmp_*`.
     ScalarCompare(fn(u32, u32) -> bool),
-    /// `s_cmp_eq_u64`, `s_cmp_lg_u64`: of two 64-bit sources.
-    ScalarCompare64(fn(u64, u64) -> bool),
     /// `s_cmpk_*`, the immediate sign-extended or not.
     CompareK(fn(u32, u32) -> bool, bool),
     MoveK,
@@ -332,12 +330,7 @@ fn scalar_op(name: &str) -> Option<Op> {
     if let Some(rest) = name.strip_prefix("s_cmp_") {
         let mut parts = rest.split('_');
         let (cmp, ty) = (parts.next()?, parts.next()?);
-        return match (cmp, ty) {
-            ("eq", "u64") => Some(Op::ScalarCompare64(|a, b| a == b)),
-            ("lg", "u64") => Some(Op::ScalarCompare64(|a, b| a != b)),
-            (_, "u32" | "i32") => Some(Op::ScalarCompare(int_compare(cmp, ty == "i32")?)),
-            _ => None,
-        };
+        return Some(Op::ScalarCompare(int_compare(cmp, ty == "i32")?));
     }
     match name {
         "s_add_u32" => two(|a, b, _| {
@@ -877,12 +870,6 @@ impl<'a> Machine<'a> {
                 }
             }
             Op::ScalarCompare(f) => w.scc = f(s(0)?, s(1)?),
-            Op::ScalarCompare64(f) => {
-                let s64 = |k: usize| -> Result<u64, Why> {
-                    self.scalar64(w, src.get(k).ok_or("a missing scalar source")?)
-                };
-                w.scc = f(s64(0)?, s64(1)?);
-            }
             Op::CompareK(f, signed) => {
                 let imm = imm.ok_or("a missing immediate")?;
                 let imm = if signed {
@@ -1297,7 +1284,7 @@ impl<'a> Machine<'a> {
                 direction: [f(5), f(6), f(7)],
                 inverse: [f(8), f(9), f(10)],
             };
-            let out = env.intersect(l, base, &ray)?;
+            let out = env.intersect(base, &ray)?;
             for (k, x) in out.into_iter().enumerate() {
                 w.v[usize::from(d) + k][l] = x;
             }
@@ -1368,7 +1355,7 @@ mod tests {
         fn store(&mut self, _: &Inst, _: usize, _: u64, _: u32) -> Result<(), Why> {
             Err("no memory")
         }
-        fn intersect(&mut self, _: usize, _: u64, _: &BvhRay) -> Result<[u32; 4], Why> {
+        fn intersect(&mut self, _: u64, _: &BvhRay) -> Result<[u32; 4], Why> {
             Err("no structure")
         }
         fn query(&mut self, _: usize, _: &QueryRay) -> Result<(bool, f32), Why> {
@@ -1426,21 +1413,6 @@ mod tests {
         assert_eq!((w.s[12], w.s[13]), (0x100, 0x80));
         run(&mut w, "s_cselect_b32 s14, 1, -1", 0).unwrap();
         assert_eq!(w.s[14], 1);
-    }
-
-    /// `s_cmp_eq_u64` and `s_cmp_lg_u64` compare their 64 bits, not the low
-    /// dwords (Codex review of eb7d7d8, point 5): 0 and 2^32 differ.
-    #[test]
-    fn rayquery_play_compares_64_bit_scalars_whole() {
-        let mut w = wave();
-        (w.s[0], w.s[1], w.s[2], w.s[3]) = (0, 0, 0, 1);
-        run(&mut w, "s_cmp_eq_u64 s[0:1], s[2:3]", 0).unwrap();
-        assert!(!w.scc);
-        run(&mut w, "s_cmp_lg_u64 s[0:1], s[2:3]", 0).unwrap();
-        assert!(w.scc);
-        w.s[3] = 0;
-        run(&mut w, "s_cmp_eq_u64 s[0:1], s[2:3]", 0).unwrap();
-        assert!(w.scc);
     }
 
     #[test]

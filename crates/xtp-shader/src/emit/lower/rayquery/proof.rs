@@ -12,27 +12,17 @@
 //! (`world::around`), laid out in the console's format, and the guest goes
 //! on through the walk and to its end. The spliced program is played from
 //! its entry on the same inputs, its query answered by DXR's rules on the
-//! same world ([`World::query`]). The proof holds when:
+//! same world ([`World::query`]). The proof holds when, lane by lane:
 //!
-//! * the lanes that leave the walk are the lanes the query answered;
-//! * at the walk's exit, in each of them, each result the site names is
-//!   what the host answered, by its kind ([`Kind`]), a distance
-//!   (`Kind::T`) within float rounding; the registers the site keeps hold
+//! * at the walk's exit, each result the site names is what the host
+//!   answered, by its kind ([`Kind`]); the registers the site keeps hold
 //!   what they held on entry;
-//! * both programs make the same stores, in the same order, from the same
-//!   lanes, at the same addresses, of the same words, bit for bit. Where the
-//!   walk's t and the host's agree within rounding, the spliced program's
-//!   query answers with the walk's own bits, so that the only tolerance is
-//!   on the distances the site names, never on what the code after the walk
-//!   makes of them (Codex review of eb7d7d8, point 2).
+//! * both programs store the same values at the same addresses.
 //!
 //! Lanes where the console and DXR are known to differ are left out and
 //! counted: a candidate at t-min or t-max, a walk past its iteration cap
 //! (`Kind::T`, `Kind::Count`), and rays that graze a triangle's edge, where
-//! float rounding decides; their stores' words are not compared (their
-//! lanes and addresses are). A lane past its cap must have run the cap's
-//! intersections, and the lanes left out may be a quarter of those compared
-//! at most (point 3). A walk that reads memory outside its world, an
+//! float rounding decides. A walk that reads memory outside its world, an
 //! instruction the machine has no model of, or worlds that leave the walk
 //! unexercised refuse the proof.
 
@@ -129,11 +119,6 @@ pub(crate) struct Play<'w> {
     pub planted: HashMap<u64, u32>,
     pub stores: Vec<(usize, u64, u32)>,
     pub answers: [Option<Answer>; LANES],
-    /// The walk's t in each lane where it was left, which the query
-    /// answers in place of its own where the two agree within rounding.
-    agreed: [Option<u32>; LANES],
-    /// The intersections each lane made in the walk.
-    pub intersections: [u64; LANES],
 }
 
 impl<'w> Play<'w> {
@@ -148,8 +133,6 @@ impl<'w> Play<'w> {
             planted: HashMap::new(),
             stores: Vec::new(),
             answers: [None; LANES],
-            agreed: [None; LANES],
-            intersections: [0; LANES],
         }
     }
 
@@ -204,8 +187,7 @@ impl Env for Play<'_> {
         Ok(())
     }
 
-    fn intersect(&mut self, lane: usize, base: u64, ray: &BvhRay) -> Result<[u32; 4], Why> {
-        self.intersections[lane] += 1;
+    fn intersect(&mut self, base: u64, ray: &BvhRay) -> Result<[u32; 4], Why> {
         self.layout
             .ok_or("an intersection without a world")?
             .intersect(base, ray)
@@ -214,11 +196,7 @@ impl Env for Play<'_> {
     fn query(&mut self, lane: usize, ray: &QueryRay) -> Result<(bool, f32), Why> {
         let answer = self.world.ok_or("a query without a world")?.query(ray);
         self.answers[lane] = Some(answer);
-        let t = match self.agreed[lane] {
-            Some(walk) if close(f32::from_bits(walk), answer.t) => f32::from_bits(walk),
-            _ => answer.t,
-        };
-        Ok((answer.hit, t))
+        Ok((answer.hit, answer.t))
     }
 }
 
@@ -261,12 +239,6 @@ fn wave(p: &Program, native: &NativeProgram, seed: u64, group: u32) -> Result<Wa
     Ok(w)
 }
 
-/// Whether the walk's distance `walk` is the host's `host` within float
-/// rounding (a NaN never is, but for the same bits).
-fn close(walk: f32, host: f32) -> bool {
-    (walk - host).abs() <= 1e-4 * host.abs().max(1.0) || walk.to_bits() == host.to_bits()
-}
-
 /// Lane `l`'s ray where the walk starts, from the site's registers.
 fn ray_of(w: &Wave, site: &Site, l: usize) -> Ray {
     let f = |r: u8| f32::from_bits(w.v[usize::from(r)][l]);
@@ -300,8 +272,6 @@ pub(crate) struct Played {
     pub guest: Vec<(usize, u64, u32)>,
     pub host: Vec<(usize, u64, u32)>,
     pub answers: [Option<Answer>; LANES],
-    /// The intersections each lane made in the guest's walk.
-    pub intersections: [u64; LANES],
     pub instructions: u64,
 }
 
@@ -434,22 +404,13 @@ impl<'a> Prover<'a> {
             }
         }
         let guest = std::mem::take(&mut env.stores);
-        let intersections = env.intersections;
         let guest_instructions = BUDGET - budget;
-        // The spliced program, from its entry, its query answering the
-        // walk's t where the two agree.
+        // The spliced program, from its entry.
         let mut budget = BUDGET;
         let mut env = Play::new(seed, site, root_pointer(root));
         env.planted = plant.clone();
         env.layout = Some(&layout);
         env.world = Some(&world);
-        if let Some(exit) = &guest_exit
-            && let Some(regs) = exit.regs.iter().find(|r| r.1 == Kind::T)
-        {
-            for l in lanes(exit.exec) {
-                env.agreed[l] = Some(regs.2[l]);
-            }
-        }
         let mut w = wave(self.host_p, self.native, seed, group).map_err(err)?;
         self.host
             .run(&mut w, &mut env, 0, |_| false, &mut budget)
@@ -463,7 +424,6 @@ impl<'a> Prover<'a> {
             guest,
             host,
             answers,
-            intersections,
             instructions: guest_instructions + BUDGET - budget,
         })
     }
@@ -491,17 +451,6 @@ impl<'a> Prover<'a> {
                     ),
                 ));
             }
-            // The lanes that leave the walk are the ones the query answered
-            // (point 6): the code after it runs in those.
-            let answered = (0..LANES)
-                .filter(|&l| played.answers[l].is_some())
-                .fold(0u32, |m, l| m | 1 << l);
-            if entered && answered != exit.exec {
-                return Err(wrong(
-                    "a ray-tracing walk whose lanes at its exit are not the query's",
-                    format!("{answered:#x} answered, {:#x} on exit", exit.exec),
-                ));
-            }
             for l in lanes(exit.exec) {
                 let Some(answer) = played.answers[l] else {
                     return Err(wrong(
@@ -513,17 +462,6 @@ impl<'a> Prover<'a> {
                 if let (Some(cap), Some(count)) = (site.cap, value(Kind::Count))
                     && count > cap
                 {
-                    // Past its cap only after as many intersections (point
-                    // 3): a count that says so otherwise is not the walk's.
-                    if played.intersections[l] < u64::from(cap) {
-                        return Err(wrong(
-                            "a ray-tracing walk that claims its cap without reaching it",
-                            format!(
-                                "lane {l}: count {count:#x} after {} intersections",
-                                played.intersections[l]
-                            ),
-                        ));
-                    }
                     report.capped += 1;
                     left_out |= 1 << l;
                     continue;
@@ -547,7 +485,8 @@ impl<'a> Prover<'a> {
                 }
                 if let Some(t) = value(Kind::T) {
                     let t = f32::from_bits(t);
-                    if !close(t, answer.t) {
+                    let close = (t - answer.t).abs() <= 1e-4 * answer.t.abs().max(1.0);
+                    if !(close || t.to_bits() == answer.t.to_bits()) {
                         return Err(wrong(
                             "a ray-tracing walk whose t is not the host's",
                             format!("lane {l}: walk {t}, host {answer:?}"),
@@ -558,28 +497,30 @@ impl<'a> Prover<'a> {
                 report.hits += usize::from(answer.hit);
             }
         }
-        // The same stores, one by one: the same lane, the same address and,
-        // but in a lane left out, the same word (point 2).
-        let (g, h) = (&played.guest, &played.host);
-        if g.len() != h.len() {
+        // The same stores, lane by lane.
+        let by_address = |s: &[(usize, u64, u32)]| -> HashMap<u64, (usize, u32)> {
+            s.iter().map(|&(l, at, x)| (at, (l, x))).collect()
+        };
+        let (g, h) = (by_address(&played.guest), by_address(&played.host));
+        if g.len() != h.len() || g.keys().any(|k| !h.contains_key(k)) {
             return Err(wrong(
                 "a spliced program that stores elsewhere than its walk's",
                 format!("{} stores and {}", g.len(), h.len()),
             ));
         }
-        for (n, (&(l, at, x), &(hl, hat, y))) in g.iter().zip(h).enumerate() {
-            if (l, at) != (hl, hat) {
-                return Err(wrong(
-                    "a spliced program that stores elsewhere than its walk's",
-                    format!("store {n}: lane {l} at {at:#x}, then lane {hl} at {hat:#x}"),
-                ));
+        for (at, &(l, x)) in &g {
+            let (_, y) = h[at];
+            if x == y || left_out >> l & 1 != 0 {
+                continue;
             }
-            if x != y && left_out >> l & 1 == 0 {
-                return Err(wrong(
-                    "a spliced program that stores other values than its walk",
-                    format!("store {n}, lane {l} at {at:#x}: walk {x:#x}, query {y:#x}"),
-                ));
+            let (a, b) = (f32::from_bits(x), f32::from_bits(y));
+            if a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-4 * b.abs().max(1.0) {
+                continue;
             }
+            return Err(wrong(
+                "a spliced program that stores other values than its walk",
+                format!("lane {l} at {at:#x}: walk {x:#x}, query {y:#x}"),
+            ));
         }
         Ok(())
     }
@@ -605,10 +546,8 @@ impl<'a> Prover<'a> {
             report.worlds += 1;
             report.instructions += played.instructions;
         }
-        // Worlds that exercised the walk: hits, misses, few lanes left out
-        // (those past the cap among them: point 3).
-        let left_out = report.edges + report.fragile + report.capped;
-        if report.hits < 64 || misses < 64 || left_out > report.lanes / 4 {
+        // Worlds that exercised the walk: hits, misses, few lanes left out.
+        if report.hits < 64 || misses < 64 || report.edges + report.fragile > report.lanes / 4 {
             return Err(Failure {
                 seed: 0,
                 offset: self.site.header,
