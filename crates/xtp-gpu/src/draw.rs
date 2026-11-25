@@ -141,6 +141,13 @@ impl IncompleteTargets {
     }
 }
 
+/// Cache entries first created while preparing one bind.
+enum NewDescriptor {
+    Table((u64, u64)),
+    RootSrv((usize, u64, usize, u64)),
+    RootUav((usize, usize, u64, u64)),
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -183,6 +190,7 @@ pub(crate) struct State {
     /// reset or released and the recording has gone (after its submission,
     /// if the list is reset while it runs).
     recording: crate::descriptor::Recording,
+    new_descriptors: Vec<NewDescriptor>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// View heaps whose buffer views of slots picked at run time this
@@ -1258,6 +1266,36 @@ impl State {
         compute: bool,
         limits: [u32; 3],
     ) -> Result<(), &'static str> {
+        self.with_bind_descriptors(|state| state.bind_stages(list, p, compute, limits))
+    }
+
+    fn with_bind_descriptors(
+        &mut self,
+        bind: impl FnOnce(&mut Self) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        let held = self.recording.checkpoint();
+        self.new_descriptors.clear();
+        let result = bind(self);
+        if result.is_err() {
+            for entry in self.new_descriptors.drain(..) {
+                match entry {
+                    NewDescriptor::Table(key) => self.fresh_tables.remove(&key),
+                    NewDescriptor::RootSrv(key) => self.root_srv_slots.remove(&key),
+                    NewDescriptor::RootUav(key) => self.root_uav_slots.remove(&key),
+                };
+            }
+            self.recording.reject(held);
+        }
+        result
+    }
+
+    fn bind_stages(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        limits: [u32; 3],
+    ) -> Result<(), &'static str> {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -1943,6 +1981,7 @@ impl State {
                 self.recording.range(list, heap, slot, 1);
                 host.raw_uav_at(slot, &copy.buffer, window);
                 self.root_uav_slots.insert(key, slot);
+                self.new_descriptors.push(NewDescriptor::RootUav(key));
                 slot
             }
         };
@@ -2043,6 +2082,7 @@ impl State {
             return Err("no dynamic slot for a root SRV");
         };
         self.root_srv_slots.insert(key, slot);
+        self.new_descriptors.push(NewDescriptor::RootSrv(key));
         Ok((host, slot))
     }
 
@@ -2478,9 +2518,10 @@ impl State {
                 // a wild address on AMD and the device is removed (#59).
                 // The draw or dispatch is dropped instead.
                 self.table_failed = true;
-                continue;
+                break;
             };
             self.fresh_tables.insert(key, first);
+            self.new_descriptors.push(NewDescriptor::Table(key));
             // Held until the recording goes (after its submission, if the
             // list is reset while it runs).
             self.recording
@@ -5096,6 +5137,37 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut c = state(heap.0);
         heaps(&mut c, la.host());
         assert_eq!(slot(&mut c, &la, Some(16)), first);
+    }
+
+    #[test]
+    fn rejected_bind_releases_only_its_new_descriptors() {
+        let test = "draw::tests::rejected_bind_releases_only_its_new_descriptors";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let heap = TestHeap::views(16);
+        let views = crate::descriptor::heap(heap.0).host().unwrap();
+        let src = TitleBuffer::new(1 << 16);
+        let list = TitleList::new();
+        let l = list.host();
+        let mut state = state(heap.0);
+        heaps(&mut state, l);
+        let address = src.address();
+        let kept = state.root_srv_slot(l, Some(address + 4)).unwrap().1;
+        let before = state.recording.checkpoint();
+        for _ in 0..3 {
+            let result = state.with_bind_descriptors(|state| {
+                assert_eq!(state.root_srv_slot(l, Some(address + 4))?.1, kept);
+                state.root_srv_slot(l, Some(address + 8))?;
+                state.root_srv_slot(l, Some(address + 16))?;
+                Err("later stage rejected")
+            });
+            assert!(result.is_err());
+            assert_eq!(state.root_srv_slots.len(), 1);
+            assert_eq!(state.recording.checkpoint(), before);
+            assert_eq!(views.shared_count(), (1, 1));
+            assert_eq!(views.dynamic_use().0, 1 + SHARED_CHUNK);
+        }
     }
 
     #[test]
