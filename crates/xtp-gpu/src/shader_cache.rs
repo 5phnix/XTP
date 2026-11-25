@@ -73,7 +73,8 @@ pub fn use_shader_cache(dir: PathBuf) {
 /// Lists the cache's folder again and writes its index anew from what is
 /// there (`xtp_pipeline::Cache::reindex`), then trims it to its limit:
 /// whether it could (false: a folder of the cache could not be listed, and
-/// the index is left as it was), and the entries and bytes it holds after;
+/// the index is left as it was, or the listing could not be written as the
+/// index file: the log says which), and the entries and bytes it holds after;
 /// `None` without a cache. The index only sizes the cache, and the sessions
 /// between two precooks can leave it stale (a process stopped between an
 /// entry's rename and its record, an index replaced under another
