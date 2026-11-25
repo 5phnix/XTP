@@ -146,6 +146,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn phases_inside_a_submission_wait_stay_off_the_preparation_clock() {
+        let Some(host) = crate::testgpu::device("phases_inside_a_submission_wait") else {
+            return;
+        };
+        let start = Instant::now();
+        let waited = super::super::waited_here();
+        let _recording = Recording::start(start, waited);
+        {
+            let _copy = Phase::Copies.enter();
+            host.waiting(|| {
+                let _watch = Phase::Watch.enter();
+                host.waiting(|| {
+                    let _snapshot = Phase::Snapshots.enter();
+                    std::thread::sleep(Duration::from_millis(1));
+                });
+            });
+        }
+        let now = Instant::now();
+        let after = super::super::waited_here();
+        let mut clock = CLOCK.take().unwrap();
+        clock.advance(now, after);
+        assert!(after > waited);
+        assert_eq!(clock.times[Phase::Watch as usize], Duration::ZERO);
+        assert_eq!(clock.times[Phase::Snapshots as usize], Duration::ZERO);
+        assert_eq!(
+            clock.times.iter().sum::<Duration>(),
+            now - start - Duration::from_micros(after - waited)
+        );
+    }
+
+    #[test]
     fn nested_watch_and_staging_wait_are_exclusive() {
         let start = Instant::now();
         let mut clock = Clock {

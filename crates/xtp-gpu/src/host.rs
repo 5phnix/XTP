@@ -1385,6 +1385,7 @@ impl Host {
         // sweep, and this submission must take its snapshots afterwards.
         if crate::shadow::refresh_due(batch.submission) {
             self.drain();
+            let _copy = Phase::Copies.enter();
             crate::shadow::refresh_everything(batch.submission);
         }
         if batch.submission.is_multiple_of(32) {
@@ -1406,7 +1407,10 @@ impl Host {
         // (`shadow::cards_around`): what their CPU side took goes up first,
         // and what the shaders wrote is found on the card after the lists,
         // in the same submission.
-        let (cards_first, cards_last) = crate::shadow::cards_around(batch.submission);
+        let (cards_first, cards_last) = {
+            let _copy = crate::shadow::cards().then(|| Phase::Copies.enter());
+            crate::shadow::cards_around(batch.submission)
+        };
         if let Some(first) = cards_first {
             lists.insert(0, Some(first));
             firsts.iter_mut().skip(1).for_each(|at| *at += 1);
@@ -1584,6 +1588,20 @@ impl Host {
         {
             self.settle(value);
         }
+    }
+
+    /// The live host copy covering a fill when an earlier submission is
+    /// writing part of it. A label or an alias alone cannot supply it.
+    pub(crate) fn fill_source(
+        &self,
+        address: u64,
+        len: u64,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        let writer = self
+            .timeline
+            .fill_writer(address as usize, address.checked_add(len)? as usize)?;
+        let shadow = crate::shadow::existing(address, len)?;
+        (std::sync::Arc::as_ptr(&shadow) as usize == writer).then_some(shadow)
     }
 
     /// Runs `signal` once every submission made so far has finished: at

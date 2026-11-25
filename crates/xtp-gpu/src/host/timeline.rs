@@ -168,6 +168,22 @@ impl<W> Timeline<W> {
             .map(|e| e.value)
     }
 
+    /// A host copy with a pending GPU write overlapping this input. Its
+    /// identity is a recording hint only. Submission-time refresh still
+    /// resolves other writers, labels and intervening title writes.
+    pub(super) fn fill_writer(&self, from: usize, to: usize) -> Option<usize> {
+        if from >= to {
+            return None;
+        }
+        self.entries()
+            .iter()
+            .rev()
+            .filter(|entry| entry.writes.overlaps(from, to))
+            .flat_map(|entry| entry.shaders.iter().chain(&entry.copies))
+            .find(|&&(_, a, b)| a < to && from < b)
+            .map(|&(copy, ..)| copy)
+    }
+
     /// For title memory `pages` about to show other pages (a page
     /// mapping): the newest submission not finished yet whose GPU work
     /// touches them, writing or reading them, as for a step that writes
