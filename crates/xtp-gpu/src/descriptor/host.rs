@@ -701,6 +701,12 @@ struct Viewed {
 struct Made {
     /// The record (view index and generation; 0 when not made).
     keys: Vec<u64>,
+    /// The record ([`super::record_key`]) the title last wrote at each slot
+    /// through its view calls and descriptor copies (a mirror that is not
+    /// for a draw), or that the look for records copied in as bytes last
+    /// found there ([`HostHeap::copied_records`]): a record found there
+    /// that is neither was copied in as bytes, with no call.
+    written: Vec<u64>,
     /// For a texture view, the host texture the slot views (0: none, the
     /// slot is null) and, for a texture the title placed itself, the
     /// resource made for its memory (see [`HostHeap::mirror`]).
@@ -1539,6 +1545,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(Made {
                 keys: vec![0; count as usize],
+                written: vec![0; count as usize],
                 textures: HashMap::new(),
                 waiting: Vec::new(),
                 queued: vec![false; if sampler { 0 } else { count as usize }],
@@ -2134,6 +2141,11 @@ impl HostHeap {
         if header_at(handle) != header {
             // Published meanwhile.
             return Err(Unmade::Rewritten);
+        }
+        if !for_draw {
+            // The title's own write, through a call: not a record it copied
+            // in as bytes ([`HostHeap::copied_records`]).
+            made.written[index as usize] = super::record_key(header);
         }
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -3171,6 +3183,31 @@ fn fills_texture(view: &View) -> bool {
     }
 }
 
+/// What a title slot the title copied a record into as bytes holds
+/// ([`HostHeap::copied_kind`]), for the count of such slots and of those
+/// shaders pick by index (`super::sync_heaps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopiedKind {
+    /// A view of a texture the title fills ([`fills_texture`]): one that
+    /// shaders pick by index, unless a draw read the slot through a table
+    /// within [`TABLED_FRAMES`] frames (`tabled`: such draws make it).
+    Texture { tabled: bool },
+    /// A buffer view ([`buffer_range`]); `picked`: shaders that pick
+    /// buffers at run time read the heap (its sweeps ran in this frame or
+    /// the one before). The sweeps run with `XTP_RUN_TIME_VIEWS=1` only
+    /// ([`run_time_views`]): without it no buffer view counts as picked,
+    /// and such shaders read null views whatever the title wrote.
+    Buffer { picked: bool },
+    /// A slot of a sampler heap.
+    Sampler,
+    /// Another view of ours: a constant buffer, a texture the host renders
+    /// to or writes.
+    Other,
+    /// No view of ours: bytes that hold no record, or a view of a resource
+    /// the title released.
+    None,
+}
+
 /// [`HostHeap::tabled`]'s stamp for `frame`.
 fn stamp_of(frame: u64) -> u32 {
     (frame as u32).wrapping_add(1)
@@ -3361,6 +3398,60 @@ impl HostHeap {
             .get(index as usize)
             .map_or(0, |s| s.load(Ordering::Relaxed));
         stamp != 0 && u64::from(stamp_of(clock).wrapping_sub(stamp)) <= frames
+    }
+
+    /// Of the records `keys` ([`super::record_key`]) that the look for
+    /// records copied in as bytes (`super::sync_heaps`) found at title
+    /// slots `first`, `first + 1`, ...: those the title wrote with no call,
+    /// each with whether its host slot was made from it. Neither did the
+    /// title's calls (view creation, descriptor copies) write them last,
+    /// nor did an earlier look find them; each is noted found, so that it
+    /// counts once. Slots past the host heap are left out.
+    pub(crate) fn copied_records(&self, first: u32, keys: &[u64]) -> Vec<(u32, bool)> {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = &mut *made;
+        let mut copied = Vec::new();
+        for (index, &key) in (first..).zip(keys) {
+            let Some(written) = made.written.get_mut(index as usize) else {
+                break;
+            };
+            if *written != key {
+                *written = key;
+                copied.push((index, key != 0 && made.keys[index as usize] == key));
+            }
+        }
+        copied
+    }
+
+    /// What title slot `index`, which the title copied a record into as
+    /// bytes ([`HostHeap::copied_records`]), holds for the shaders that may
+    /// read it: `view` (`None`: no view of ours).
+    pub(crate) fn copied_kind(&self, index: u32, view: Option<&View>) -> CopiedKind {
+        if self.sampler {
+            return CopiedKind::Sampler;
+        }
+        let Some(view) = view else {
+            return CopiedKind::None;
+        };
+        if fills_texture(view) {
+            let clock = self.clock(pass_frame());
+            return CopiedKind::Texture {
+                tabled: self.tabled_within(index, clock, TABLED_FRAMES),
+            };
+        }
+        if buffer_range(view).is_some() {
+            return CopiedKind::Buffer {
+                picked: self.swept_lately(),
+            };
+        }
+        CopiedKind::Other
+    }
+
+    /// Whether shaders that pick buffers at run time read this heap in this
+    /// frame or the one before (its sweeps ran: [`HostHeap::picked_spans`]).
+    fn swept_lately(&self) -> bool {
+        let sweeps = self.picked.lock().unwrap_or_else(|e| e.into_inner());
+        sweeps.began.is_some() && crate::frame::current().saturating_sub(sweeps.frame) <= 1
     }
 
     /// The work of a pass over the textures shaders pick from this heap by
@@ -5174,6 +5265,22 @@ mod tests {
         assert_eq!(kept, Some(copy.buffer.as_raw() as usize));
     }
 
+    /// Waits until title texture `r`'s host copy is resident, at most 5 s.
+    /// Host copies are made resident in the background (`resource/
+    /// residency.rs`: a fence the driver signals when it is done), and until
+    /// then lookups find none and a slot made over the texture is null.
+    /// Issue #54: the two placed-texture tests below made their slot at
+    /// once, and now and then (a serial run under the debug layer on WARP,
+    /// CI's gpu-debug-layer run of PR #26) before the fence: the slot was
+    /// null, or `host_copy` found none.
+    fn resident(r: crate::object::This) {
+        let started = std::time::Instant::now();
+        while crate::resource::host_resource(r).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never resident");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// A slot viewing a texture the title placed itself follows the
     /// resource made for that memory: when a texture the GPU writes comes
     /// there (#643), the slot is made again over its copy, although the
@@ -5212,11 +5319,18 @@ mod tests {
                 .map(|t| t.as_raw() as usize)
         };
         let host_of = |r: This| crate::resource::host_resource(r).map(|t| t.as_raw() as usize);
+        // The texture made for the memory, resident before the slot is made
+        // (see `resident`).
+        let before = crate::resource::texture_at(address, &resource).unwrap();
+        resident(before);
         assert!(matches!(
             host.mirror(1, handle, true),
             Some(View::Shader(..))
         ));
-        let before = crate::resource::texture_at(address, &resource).unwrap();
+        assert_eq!(
+            crate::resource::texture_at(address, &resource),
+            Some(before)
+        );
         // Taken now: once replaced, `before` may be released at any time
         // (and its address reused); its copy stays while this holds it.
         let old = crate::resource::host_copy(before).expect("a host copy");
@@ -5241,6 +5355,7 @@ mod tests {
             &mut rt,
         );
         assert_eq!(made, S_OK);
+        resident(rt);
         assert!(matches!(
             host.mirror(1, handle, true),
             Some(View::Shader(..))
@@ -5404,11 +5519,18 @@ mod tests {
                 .map(|t| t.as_raw() as usize)
         };
         let host_of = |r: This| crate::resource::host_resource(r).map(|t| t.as_raw() as usize);
+        // The texture made for the memory, resident before the slot is made
+        // (see `resident`).
+        let written = crate::resource::texture_at(address, &resource).unwrap();
+        resident(written);
         assert!(matches!(
             host.mirror(1, handle, true),
             Some(View::Unordered(..))
         ));
-        let written = crate::resource::texture_at(address, &resource).unwrap();
+        assert_eq!(
+            crate::resource::texture_at(address, &resource),
+            Some(written)
+        );
         assert!(host_of(written).is_some());
         assert_eq!(
             kept(host, 1),
