@@ -326,7 +326,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     drop(uploads);
     #[cfg(all(windows, feature = "diagnostics"))]
     // SAFETY: le titre réinitialise une de nos listes.
-    unsafe { &(*this.cast::<List>()).bounds_set }.store(false, std::sync::atomic::Ordering::Relaxed);
+    unsafe { &(*this.cast::<List>()).bounds_set }
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     #[cfg(windows)]
     keep_pipeline(this, pipeline);
     #[cfg(windows)]
@@ -1727,24 +1728,30 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     at
 }
 
-/// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
-/// arguments, nothing returned.
+/// Ignore les signatures racines (fournies par nos pipelines) et les
+/// indications d'ordre de profondeur et de fréquence d'ombrage.
 extern "system" fn ignored_state(_: This) {}
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) static BOUNDED_LISTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-extern "system" fn depth_bounds(_this: This, _min: f32, _max: f32) {
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use std::sync::atomic::Ordering::Relaxed;
         // SAFETY: une liste du titre. Chaque enregistrement compte une seule fois.
-        if !unsafe { &(*_this.cast::<List>()).bounds_set }.swap(true, Relaxed) {
+        if !unsafe { &(*this.cast::<List>()).bounds_set }.swap(true, Relaxed) {
             BOUNDED_LISTS.fetch_add(1, Relaxed);
         }
     }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this).and_then(|l| l.bounds_list.as_ref()) {
+        // SAFETY: liste ouverte sur un périphérique qui accepte les bornes.
+        unsafe { list.OMSetDepthBounds(min, max) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, min, max);
 }
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
