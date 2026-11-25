@@ -7,6 +7,9 @@
 //! to time it against their plain copies (`XTP_SHADOW_ONCE=0` brings back
 //! all of W1's before). `XTP_COPYBACK_CENSUS=1` (or `all`) adds the
 //! copy-back's first-touch census ([`crate::shadow::census`]) to the line.
+//! A second line gives the work of the copies in the card's memory
+//! ([`crate::shadow::cards`]); the first line's snapshots and copy-back
+//! compare are those of the copies in system memory.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -83,8 +86,41 @@ pub(crate) enum C {
     SnapshotUs,
     Mirrors,
     MirrorBytes,
+    /// Copies in the card's memory (`shadow::cards`): shader-written ranges
+    /// declared (no snapshot taken); plans of submissions and their time
+    /// in microseconds; ranges of CPU sides sent up and their bytes; pieces
+    /// hashed before and after the lists; bytes of GPU copies' destinations
+    /// fetched; at copy-back, bytes of pieces compared on the card, bytes
+    /// of those the card found changed, and the copy-back's time there in
+    /// microseconds.
+    CardDeclared,
+    CardPlans,
+    CardPlanUs,
+    CardUps,
+    CardUpBytes,
+    CardSpans,
+    CardFetched,
+    CardCompared,
+    CardChanged,
+    CardBackUs,
+    /// `XTP_FULL_REFRESH=<n>`: host copies taken whole before a
+    /// submission, their bytes and time in microseconds.
+    FullRefreshes,
+    FullRefreshBytes,
+    FullRefreshUs,
+    /// Of those, bytes of 64 KiB pieces the copies held otherwise than
+    /// title memory while the write tracking had them current: missed
+    /// writes.
+    FullRefreshMissed,
+    /// Of `BackCompared` (copies in system memory): bytes in windows of
+    /// loose memory, in title buffers under 1 MiB, under the card's least
+    /// size, and of that size or more (past the card's budget).
+    BackComparedLoose,
+    BackComparedSmall,
+    BackComparedMid,
+    BackComparedBig,
 }
-const COUNTERS: usize = 42;
+const COUNTERS: usize = 60;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -203,6 +239,42 @@ pub(crate) fn log(frames: f64) {
         crate::shadow::MIRRORS.load(Relaxed) as f64 / 1e6,
         crate::shadow::mirror_phase(),
     );
+    if c[C::FullRefreshes as usize] > 0.0 {
+        tracing::info!(
+            "full refreshes per frame (XTP_FULL_REFRESH): {:.1}, {:.1} MB in {:.1} ms, {:.2} MB              of pieces the write tracking missed",
+            c[C::FullRefreshes as usize],
+            mb(c[C::FullRefreshBytes as usize]),
+            ms(c[C::FullRefreshUs as usize]),
+            mb(c[C::FullRefreshMissed as usize]),
+        );
+    }
+    if c[C::BackCompared as usize] > 0.0 {
+        tracing::info!(
+            "copy-back compared in system memory per frame, by copy: loose windows {:.1} MB,              buffers under 1 MiB {:.1} MB, under the card's least size {:.1} MB, past the              card's budget {:.1} MB",
+            mb(c[C::BackComparedLoose as usize]),
+            mb(c[C::BackComparedSmall as usize]),
+            mb(c[C::BackComparedMid as usize]),
+            mb(c[C::BackComparedBig as usize]),
+        );
+    }
+    if let Some(cards) = crate::shadow::card_summary() {
+        tracing::info!(
+            "copies on the card per frame ({cards}): {:.0} ranges declared, no snapshot; {:.1} \
+             plans in {:.2} ms; up {:.1} MB in {:.0} ranges; {:.0} pieces hashed before and \
+             after; fetched {:.2} MB; at copy-back compared {:.1} MB on the card, {:.2} MB \
+             changed, merged in {:.2} ms",
+            c[C::CardDeclared as usize],
+            c[C::CardPlans as usize],
+            ms(c[C::CardPlanUs as usize]),
+            mb(c[C::CardUpBytes as usize]),
+            c[C::CardUps as usize],
+            c[C::CardSpans as usize],
+            mb(c[C::CardFetched as usize]),
+            mb(c[C::CardCompared as usize]),
+            mb(c[C::CardChanged as usize]),
+            ms(c[C::CardBackUs as usize]),
+        );
+    }
     // With `XTP_COPYBACK_CENSUS`: what the CPU touches of what came back.
     crate::shadow::census::log(frames);
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
