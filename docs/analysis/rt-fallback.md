@@ -168,6 +168,9 @@ title code runs (next to the watchdog and assertion hooks).
   0x14 bytes). A mismatch writes nothing. The title's bytes stay outside
   the repository. The opt-in test `rt_path::tests::sites_in_the_sample_game`
   (`XTP_SAMPLE_GAME=<title folder>`) checks the hashes against a dump.
+  On 2026-11-25 the image was mapped at `0x7ffa75f40000` (relocated) with
+  `xtp run` without `--execute`. Both sites matched and were written:
+  `ray-tracing scene predicate answers no … sites=2`.
 - **In `ab`**: a thread of ours (`xtp-rt-path`) reads the clock every 5 ms
   and flips both entries after the present that ends a phase. That is not
   a frame boundary of the title, so the frame across a flip can see both
