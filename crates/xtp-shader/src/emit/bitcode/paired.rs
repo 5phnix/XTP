@@ -12,8 +12,6 @@ use std::collections::HashMap;
 
 #[derive(Clone, Default)]
 pub(super) struct Halves {
-    #[cfg(debug_assertions)]
-    pub(super) branches: Vec<V>,
     /// Missing entries have the same value in both lanes.
     upper: HashMap<V, V>,
     /// A guarded region has a distinct copy for the upper lanes.
@@ -33,35 +31,6 @@ impl Halves {
 }
 
 impl Module {
-    /// Les deux copies suivent le même branchement, gardes de lane exclues.
-    /// Les phi de boucle ont deux noms SSA ; on compare leurs entrées une
-    /// fois les arêtes arrière renseignées, en visitant chaque paire une fois.
-    #[cfg(debug_assertions)]
-    pub fn assert_paired_branches(&self) {
-        let Some(pair) = &self.paired else { return };
-        let mut pending = pair.branches.clone();
-        let mut seen = std::collections::HashSet::new();
-        while let Some(v) = pending.pop() {
-            let hi = pair.value(v);
-            if v == hi || !seen.insert(v) {
-                continue;
-            }
-            let (V::Inst(lo), V::Inst(hi)) = (v, hi) else {
-                unreachable!()
-            };
-            let mut op = self.insts[lo as usize].op.clone();
-            debug_assert!(!matches!(op, Op::AtomicRmw(..) | Op::CmpXchg(..)));
-            map_operands(&mut op, |arg| {
-                pending.push(arg);
-                pair.value(arg)
-            });
-            debug_assert_eq!(
-                op, self.insts[hi as usize].op,
-                "condition de branchement différente entre les demi-waves"
-            );
-        }
-    }
-
     pub fn pair_lanes(&mut self) {
         self.paired = Some(Box::default());
     }
@@ -164,8 +133,8 @@ impl Module {
             pair.blocks.insert(join, high_join);
         }
         pair.guards.insert(join, (low_join, high_head));
-        self.terminate_one(head, Term::CondBr(g, then, low_join));
-        self.terminate_one(high_head, Term::CondBr(high_g, high_then, high_join));
+        self.terminate(head, Term::CondBr(g, then, low_join));
+        self.terminate(high_head, Term::CondBr(high_g, high_then, high_join));
     }
 
     pub fn guard_end(&mut self, then: usize, join: usize) {
