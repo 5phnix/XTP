@@ -55,7 +55,7 @@ const GATHER_AT_LEVEL: u32 = 1 << 16;
 /// plus 8 × a slice ([`Lower::cube_view`]): the host view's dimension
 /// (cube or cube array) is not known.
 pub(super) const CUBE_FACE_UNTRACED: Why =
-    "a cube sample whose face operand is neither a face id nor a face id plus 8 × a slice";
+    "a cube sample whose face operand is neither a face id nor a face id plus 8 times a slice";
 
 /// How far [`Lower::layer_of`] follows a face operand back.
 const LAYER_DEPTH: u32 = 12;
@@ -112,10 +112,14 @@ const EIGHT: u32 = 0x4100_0000;
 /// two face-coordinate derivatives per direction (see [`Lower::image`]).
 fn cube_face_at(f: SampleForm, a16: bool) -> (usize, Option<u32>) {
     let whole = usize::from(f.o) + usize::from(f.b) + usize::from(f.c);
-    let grads = if f.d { 2 } else { 0 };
+    let grads: usize = if f.d { 2 } else { 0 };
     let per_direction = if f.g16 { grads.div_ceil(2) } else { grads };
     let first = whole + 2 * per_direction;
-    if a16 { (first + 1, Some(0)) } else { (first + 2, None) }
+    if a16 {
+        (first + 1, Some(0))
+    } else {
+        (first + 2, None)
+    }
 }
 
 fn sample_form(name: &str) -> Option<SampleForm> {
@@ -1303,7 +1307,8 @@ impl<'a> Lower<'a> {
             return Layer::Unknown;
         };
         let d = depth - 1;
-        let op = |l: &Self, k: usize, seen: &mut HashSet<Value>| l.layer_of_operand(inst, f, k, d, seen);
+        let op =
+            |l: &Self, k: usize, seen: &mut HashSet<Value>| l.layer_of_operand(inst, f, k, d, seen);
         let some_face = |l: Layer| matches!(l, Layer::Face | Layer::Slice);
         match inst.name() {
             "v_cubeid_f32" => Layer::Face,
@@ -1317,9 +1322,7 @@ impl<'a> Lower<'a> {
                 let acc = inst.read(Reg::V(reg));
                 let by_eight = (0..2).any(|k| self.constant(inst, f, k) == Some(EIGHT));
                 match acc {
-                    Some(acc) if by_eight && some_face(self.layer_of(acc, d, seen)) => {
-                        Layer::Slice
-                    }
+                    Some(acc) if by_eight && some_face(self.layer_of(acc, d, seen)) => Layer::Slice,
                     _ => Layer::Unknown,
                 }
             }
