@@ -41,7 +41,11 @@ static MAP: OnceLock<Mutex<Map>> = OnceLock::new();
 /// Called with the original executable's digest and its local cache file.
 /// Learning in memory also works if the cache is unavailable.
 pub fn configure_copy_back(path: Option<PathBuf>) {
-    if std::env::var("XTP_READMAP").as_deref() == Ok("0") {
+    // Opt-in (`XTP_READMAP=1`) until the title's own WriteFile/fwrite of a
+    // pending page is handled: those kernel reads don't fault, so they would
+    // fail with ERROR_NOACCESS (Claude review of bdc9263, 2026-11-25). Unit
+    // tests turn it on through this call.
+    if !cfg!(test) && std::env::var("XTP_READMAP").as_deref() != Ok("1") {
         return;
     }
     // The census installs independent one-shot guards on the same pages.

@@ -127,7 +127,7 @@ impl Pending {
     /// Makes the host pipeline (once); true for the call that made it,
     /// which runs `counted` before signalling it finished: whoever sees
     /// `finished` sees what `counted` counted.
-    fn make(&self, counted: impl FnOnce()) -> bool {
+    pub(super) fn make(&self, counted: impl FnOnce()) -> bool {
         let mut first = false;
         self.made.get_or_init(|| {
             first = true;

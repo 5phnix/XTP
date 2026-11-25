@@ -725,6 +725,7 @@ mod tests {
                 .expect("rectangle pipeline with depth bounds");
             let list = TitleList::new();
             let target = Target::new(&host.device, 1);
+            crate::testgpu::bind_indexed_heaps(host, list.host());
             target.bind(list.host(), &pso.root, &pso.pso);
             let depth = stored.map(|z| {
                 let title = committed(&depth_unordered(W.into(), H, 40));

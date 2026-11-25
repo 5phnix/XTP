@@ -648,6 +648,16 @@ impl<'a> Lower<'a> {
         if let Some(f) = self.console_flat {
             return f;
         }
+        let shape = self.s.threads.expect("compute");
+        if shape[1..] != [1, 1] {
+            // Sur NVIDIA, deux waves d'une tuile 2D peuvent avoir le même
+            // premier indice arrondi (0xkn0wh3r3, VIctory #2126). Déclarer
+            // le groupe sur une ligne donne à chaque wave sa plage alignée.
+            // Les coordonnées console se déduisent de la forme d'origine,
+            // comme pour les dérivées implicites et les lanes appariées.
+            self.flat_group = Some(shape);
+            self.s.threads = Some([shape.iter().product(), 1, 1]);
+        }
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         let flat = self.s.op(

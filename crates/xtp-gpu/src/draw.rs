@@ -71,6 +71,76 @@ pub(crate) struct IndexView {
     pub(crate) format: u32,
 }
 
+/// Copies des vues liées quand une sortie manque. Le titre peut écraser ses
+/// descripteurs ou changer de pipeline entre OMSetRenderTargets et le dessin.
+#[derive(Default)]
+struct IncompleteTargets {
+    colors: Vec<SavedTarget>,
+    depth: Option<(ID3D12Resource, Option<D3D12_DEPTH_STENCIL_VIEW_DESC>)>,
+    pipeline: usize,
+}
+
+enum SavedTarget {
+    Real(ID3D12Resource, Option<D3D12_RENDER_TARGET_VIEW_DESC>),
+    Missing(D3D12_RENDER_TARGET_VIEW_DESC),
+}
+
+fn null_view(
+    mut desc: D3D12_RENDER_TARGET_VIEW_DESC,
+    pipeline: usize,
+    slot: usize,
+) -> D3D12_RENDER_TARGET_VIEW_DESC {
+    if let Some((format, multisampled)) = crate::pipeline::null_target_view(pipeline as This, slot)
+    {
+        if format.0 != 0 {
+            desc.Format = format;
+        }
+        desc.ViewDimension = if multisampled {
+            D3D12_RTV_DIMENSION_TEXTURE2DMS
+        } else {
+            D3D12_RTV_DIMENSION_TEXTURE2D
+        };
+    }
+    desc
+}
+
+impl IncompleteTargets {
+    fn rebind(&mut self, list: &HostList, pipeline: usize) {
+        if self.pipeline == pipeline {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let rtvs: Vec<_> = self
+            .colors
+            .iter()
+            .enumerate()
+            .map(|(slot, view)| match view {
+                SavedTarget::Real(texture, desc) => host.rtv(texture, desc.as_ref()),
+                SavedTarget::Missing(desc) => host.rtv(
+                    None::<&ID3D12Resource>,
+                    Some(&null_view(*desc, pipeline, slot)),
+                ),
+            })
+            .collect();
+        let dsv = self
+            .depth
+            .as_ref()
+            .map(|(texture, desc)| host.dsv(texture, desc.as_ref()));
+        // SAFETY: ces vues viennent d’être recréées dans les tas CPU de l’hôte.
+        unsafe {
+            list.list.OMSetRenderTargets(
+                rtvs.len() as u32,
+                Some(rtvs.as_ptr()),
+                false,
+                dsv.as_ref().map(std::ptr::from_ref),
+            )
+        };
+        self.pipeline = pipeline;
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -83,6 +153,8 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    missing_targets: u8,
+    incomplete_targets: Option<Box<IncompleteTargets>>,
     depth: usize,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
@@ -721,14 +793,22 @@ impl State {
             return;
         };
         self.targets.clear();
+        self.missing_targets = 0;
         let mut rtvs = Vec::new();
         #[cfg(feature = "diagnostics")]
         let mut hole = false;
         // AgneyaK identified this slot shift in Marvisak/VIctory#1613 (736fa790).
         // Each shader output keeps its slot; only real resources need transitions.
-        for &handle in handles {
-            let record = crate::descriptor::rtv_record(handle);
+        let views: [_; 8] = std::array::from_fn(|slot| {
+            let record = handles
+                .get(slot)
+                .and_then(|&h| crate::descriptor::rtv_record(h));
             let texture = record.and_then(|r| crate::resource::host_resource(r.resource));
+            (record, texture)
+        });
+        let views = &views[..handles.len().min(8)];
+        self.incomplete_targets = views.iter().any(|(_, t)| t.is_none()).then(Box::default);
+        for (slot, &(record, texture)) in views.iter().enumerate() {
             if let (Some(record), Some(texture)) = (record, texture) {
                 #[cfg(feature = "diagnostics")]
                 if hole {
@@ -741,7 +821,11 @@ impl State {
                     texture,
                     record.desc().map(|d| d.Format.0 as u32),
                 );
-                rtvs.push(host.rtv(texture, record.desc().as_ref()));
+                let desc = record.desc();
+                rtvs.push(host.rtv(texture, desc.as_ref()));
+                if let Some(saved) = &mut self.incomplete_targets {
+                    saved.colors.push(SavedTarget::Real(texture.clone(), desc));
+                }
             } else {
                 use crate::resource::format::{Caps, HostCaps, uses};
                 #[cfg(feature = "diagnostics")]
@@ -749,7 +833,8 @@ impl State {
                     hole = true;
                     crate::list::cuts::MISSING_TARGET.fetch_add(1, Ordering::Relaxed);
                 }
-                let format = record
+                self.missing_targets |= 1 << slot;
+                let fallback = record
                     .and_then(|r| {
                         r.desc().map(|d| d.Format).or_else(|| {
                             crate::resource::texture_memory(r.resource).map(|(_, d)| {
@@ -760,11 +845,22 @@ impl State {
                     .filter(|f| HostCaps.support1(f.0 as u32) & uses::RENDER_TARGET != 0)
                     .unwrap_or(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM);
                 let null = D3D12_RENDER_TARGET_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                    Format: fallback,
+                    ViewDimension: match record.and_then(|r| r.desc()).map(|d| d.ViewDimension) {
+                        Some(
+                            D3D12_RTV_DIMENSION_TEXTURE2DMS | D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY,
+                        ) => D3D12_RTV_DIMENSION_TEXTURE2DMS,
+                        _ => D3D12_RTV_DIMENSION_TEXTURE2D,
+                    },
                     ..Default::default()
                 };
-                rtvs.push(host.rtv(None::<&ID3D12Resource>, Some(&null)));
+                rtvs.push(host.rtv(
+                    None::<&ID3D12Resource>,
+                    Some(&null_view(null, self.pipeline, slot)),
+                ));
+                if let Some(saved) = &mut self.incomplete_targets {
+                    saved.colors.push(SavedTarget::Missing(null));
+                }
             }
         }
         self.depth = 0;
@@ -773,8 +869,15 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            let desc = record.depth_desc();
+            if let Some(saved) = &mut self.incomplete_targets {
+                saved.depth = Some((texture.clone(), desc));
+            }
+            Some(host.dsv(texture, desc.as_ref()))
         });
+        if let Some(saved) = &mut self.incomplete_targets {
+            saved.pipeline = self.pipeline;
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -837,7 +940,9 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return Err(Unready::NoPipeline);
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) =
+            crate::pipeline::graphics_pipeline(self.pipeline as This, self.missing_targets)
+        else {
             return Err(Unready::NoPipeline);
         };
         if p.compute || p.mesh != mesh {
@@ -851,6 +956,9 @@ impl State {
                 (false, false) => "a vertex pipeline bound",
             }
             .into());
+        }
+        if let Some(saved) = &mut self.incomplete_targets {
+            saved.rebind(list, self.pipeline);
         }
         self.bind(list, p, false, [0; 3])?;
         let l = &list.list;
@@ -4483,10 +4591,6 @@ float4 ps(V v) : SV_Target { return v.color; }
         }
 
         fn new(host: &Host, inputs: bool) -> Painter {
-            Self::with_targets(host, inputs, 1)
-        }
-
-        fn with_targets(host: &Host, inputs: bool, targets: usize) -> Painter {
             use windows::Win32::Graphics::Dxgi::Common::*;
             let entry = if inputs {
                 s!("vs_inputs")
@@ -4522,8 +4626,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                 let mut blend = D3D12_BLEND_DESC::default();
                 blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
                 let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
-                formats[..targets].fill(DXGI_FORMAT_R8G8B8A8_UNORM);
-                blend.IndependentBlendEnable = (targets > 1).into();
+                formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
                 let pso = device
                     .CreateGraphicsPipelineState(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                         pRootSignature: std::mem::transmute_copy(&root),
@@ -4547,7 +4650,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                             NumElements: layout.len() as u32,
                         },
                         PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                        NumRenderTargets: targets as u32,
+                        NumRenderTargets: 1,
                         RTVFormats: formats,
                         SampleDesc: DXGI_SAMPLE_DESC {
                             Count: 1,
@@ -4779,7 +4882,60 @@ float4 ps(V v) : SV_Target { return v.color; }
         };
         let host = gpu.host();
         let null = std::ptr::null();
-        let painter = Painter::with_targets(host, false, 2);
+
+        use xtp_shader::{
+            HwStage,
+            emit::{HostShader, rect_gs::probe},
+        };
+        let shader = |name, stage, dxil| {
+            crate::pipeline::test_shader(
+                name,
+                HostShader {
+                    stage,
+                    dxil,
+                    group_base: None,
+                    user_data: vec![],
+                    samplers: vec![],
+                    static_samplers: vec![],
+                    root_cbvs: vec![],
+                    root_srvs: vec![],
+                    root_uavs: vec![],
+                    stride_table: false,
+                    run_time_buffers: 0,
+                },
+            )
+        };
+        let vs = probe::vertex(
+            &[[-1., -1., 0., 1.], [-1., 3., 0., 1.], [3., -1., 0., 1.]],
+            &[[1.; 4]; 3],
+            &[1; 3],
+        );
+        let mut graphics = crate::pipeline::host::GraphicsState::default();
+        graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        graphics.targets.NumRenderTargets = 2;
+        graphics.targets.RTFormats[0] = DXGI_FORMAT(10);
+        graphics.targets.RTFormats[1] = DXGI_FORMAT(28);
+        // Désactive le test de profondeur de cette sonde couleur.
+        #[repr(C)]
+        struct Depth(u32, D3D12_DEPTH_STENCIL_DESC);
+        let depth = Depth(
+            11,
+            D3D12_DEPTH_STENCIL_DESC {
+                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                ..Default::default()
+            },
+        );
+        // SAFETY: sous-objet complet dans le format du flux.
+        unsafe { graphics.read(11, (&raw const depth).cast()) };
+        let pipeline = crate::pipeline::test_graphics_pipeline(
+            vec![
+                shader("vertex", HwStage::Vs, vs),
+                shader("pixel", HwStage::Ps, probe::pixel()),
+            ],
+            graphics,
+            &[0, 1],
+        );
+        let painter = Painter::new(host, false);
         for typed in [false, true] {
             let title = committed(&target(u64::from(SIDE), SIDE, 28));
             let tex = crate::resource::host_resource(title).unwrap();
@@ -4798,11 +4954,19 @@ float4 ps(V v) : SV_Target { return v.color; }
                     .ClearRenderTargetView(host.rtv(tex, None), &[0.; 4], None);
             }
             painter.bind(list.host());
-            State::default().set_targets(list.host(), &handles, 0);
-            // SAFETY: a bound graphics pipeline; only slot zero has writes enabled.
-            unsafe {
-                list.host().list.DrawInstanced(3, 1, 0, 0);
+            crate::testgpu::bind_indexed_heaps(host, list.host());
+            let mut state = State::default();
+            // Les deux ordres de liaison doivent sélectionner la même variante.
+            if typed {
+                state.set_pipeline(pipeline);
             }
+            state.set_targets(list.host(), &handles, 0);
+            state.set_pipeline(pipeline);
+            state
+                .prepare(list.host(), false)
+                .expect("le dessin est prêt");
+            // SAFETY: le pipeline et les vues sont ceux sélectionnés par la préparation réelle.
+            unsafe { list.host().list.DrawInstanced(3, 1, 0, 0) };
             list.run();
             let image = read_back(host, tex, 4);
             crate::object::slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
@@ -4815,6 +4979,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                 "slot 1 overwritten (typed null: {typed})"
             );
         }
+        crate::object::slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
     }
 
     /// An indirect rectangle draw end to end, as `indirect_rectangles`
