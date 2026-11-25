@@ -62,7 +62,7 @@ fn rt_triangle_translation_requires_the_whole_input_range() {
     }
 }
 
-fn trace(host: &Host, list: &HostList, tlas: &ID3D12Resource, output: &TitleBuffer) {
+fn trace(host: &Host, list: &HostList, tlas: u64, output: &TitleBuffer) {
     let dxc = std::env::var_os("XTP_PC_DXC")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -106,8 +106,7 @@ fn trace(host: &Host, list: &HostList, tlas: &ID3D12Resource, output: &TitleBuff
         list.keep(&pso);
         list.list.SetPipelineState(&pso);
         list.list.SetComputeRootSignature(&root);
-        list.list
-            .SetComputeRootShaderResourceView(0, tlas.GetGPUVirtualAddress());
+        list.list.SetComputeRootShaderResourceView(0, tlas);
         list.list
             .SetComputeRootUnorderedAccessView(1, shadow.gpu(output.address()));
         list.list.Dispatch(1, 1, 1);
@@ -145,54 +144,87 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
     let output = TitleBuffer::new(16);
     output.set_words(|_| u32::MAX);
     let geometry = geometry(&vertices, &indices);
-    let builder = Builder::default();
-    // SAFETY: a real title list and live CPU geometry descriptions.
+    let blas = TitleBuffer::new(1024);
+    let cloned = TitleBuffer::new(1024);
+    let first = TitleBuffer::new(1024);
+    let second = TitleBuffer::new(1024);
+    let instances = TitleBuffer::new(64);
+    instances.set_words(|i| match i {
+        0 | 5 | 10 => 1f32.to_bits(),
+        12 => 0xff00_0000,
+        _ => 0,
+    });
+    let address = TitleBuffer::new(8);
+    address.set_words(|i| (cloned.address() >> (32 * i)) as u32);
+    // This list writes the BLAS address on the GPU. The CPU instance still points to zero.
+    instances.shadow();
+    assert!(crate::shadow::copy(
+        list.host(),
+        instances.address() + 56,
+        address.address(),
+        8
+    ));
+    let tlas_desc = |dst| Build {
+        DestAccelerationStructureData: dst,
+        Inputs: Inputs {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+            NumDescs: 1,
+            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                InstanceDescs: instances.address(),
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let displaced = TitleBuffer::new(24);
+    displaced.set_words(|i| (positions[i] + 16.).to_bits());
+    let changed = self::geometry(&displaced, &indices);
+    let after_refit = TitleBuffer::new(16);
+    after_refit.set_words(|_| u32::MAX);
+    // SAFETY: the title list and all CPU arrays are live for each call. The recording
+    // retains every GPU input, including both generations after their title resources go.
     unsafe {
-        assert!(builder.build(
+        assert!(build(
             list.this(),
             &Build {
-                DestAccelerationStructureData: 0x1000,
+                DestAccelerationStructureData: blas.address(),
                 Inputs: blas_input(&geometry),
                 ..Default::default()
             }
         ));
-        assert!(builder.copy(
+        assert!(copy(
             list.this(),
-            0x2000,
-            0x1000,
+            cloned.address(),
+            blas.address(),
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0
         ));
-    }
-    let table = builder.blas.lock().unwrap();
-    let (source, clone) = (&table[&0x1000], &table[&0x2000]);
-    // SAFETY: the upload holds one aligned instance, and its referenced clone
-    // and the TLAS are live until the title queue has executed both rays.
-    let tlas = unsafe {
-        let clone_address = clone.GetGPUVirtualAddress();
-        assert_ne!(source.GetGPUVirtualAddress(), clone_address);
-        let (address, ptr) = list.host().scratch(64).unwrap();
-        ptr.cast::<D3D12_RAYTRACING_INSTANCE_DESC>()
-            .write(D3D12_RAYTRACING_INSTANCE_DESC {
-                Transform: [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.],
-                _bitfield1: 0xff000000,
-                _bitfield2: 0,
-                AccelerationStructure: clone_address,
-            });
-        Recorder::new(list.host())
-            .unwrap()
-            .build(&Inputs {
-                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                NumDescs: 1,
-                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                    InstanceDescs: address,
-                },
+        assert!(host_tlas(cloned.address()).is_none());
+        assert!(build(list.this(), &tlas_desc(first.address())));
+        let mut updated = blas_input(&changed);
+        updated.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(1 << 24);
+        assert!(build(
+            list.this(),
+            &Build {
+                DestAccelerationStructureData: cloned.address(),
+                SourceAccelerationStructureData: cloned.address(),
+                Inputs: updated,
                 ..Default::default()
-            })
-            .unwrap()
-    };
-    drop(table);
-    drop(builder);
-    trace(host, list.host(), &tlas, &output);
+            }
+        ));
+        assert!(build(list.this(), &tlas_desc(second.address())));
+        let a = host_tlas_for_list(list.this(), first.address()).unwrap();
+        let b = host_tlas_for_list(list.this(), second.address()).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(host_tlas(first.address()), Some(a));
+        assert_eq!(host_tlas(second.address()), Some(b));
+        let released = first.address();
+        drop((blas, cloned, first, second));
+        assert_eq!(host_tlas(released), None);
+        trace(host, list.host(), a, &output);
+        trace(host, list.host(), b, &after_refit);
+    }
     list.run();
     assert_eq!(output.words(), [1, 2.0f32.to_bits(), 0, 0]);
+    assert_eq!(after_refit.words(), [0, 0, 0, 0]);
 }

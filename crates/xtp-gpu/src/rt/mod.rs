@@ -1,7 +1,10 @@
 //! Host DXR builds recorded alongside the title's builder commands.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+mod instances;
+
+pub(crate) use instances::BlasMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -75,6 +78,11 @@ fn buffer(
     resource
 }
 
+fn width(buffer: &ID3D12Resource) -> u64 {
+    // SAFETY: the borrowed COM resource is live for this synchronous descriptor query.
+    unsafe { buffer.GetDesc().Width }
+}
+
 struct Recorder<'a> {
     device: &'a ID3D12Device5,
     commands: ID3D12GraphicsCommandList4,
@@ -90,7 +98,11 @@ impl<'a> Recorder<'a> {
         })
     }
 
-    fn build(&self, inputs: &Inputs) -> Option<ID3D12Resource> {
+    fn build(
+        &self,
+        inputs: &Inputs,
+        reuse: Option<Arc<ID3D12Resource>>,
+    ) -> Option<Arc<ID3D12Resource>> {
         let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
         // SAFETY: the caller owns all geometry descriptions for this call.
         unsafe {
@@ -100,11 +112,15 @@ impl<'a> Recorder<'a> {
         if sizes.ResultDataMaxSizeInBytes == 0 {
             return None;
         }
-        let result = buffer(
-            self.device,
-            sizes.ResultDataMaxSizeInBytes,
-            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-        )?;
+        // A retired allocation can serve a later generation at the same title address.
+        let result = match reuse {
+            Some(resource) if width(&resource) >= sizes.ResultDataMaxSizeInBytes => resource,
+            _ => Arc::new(buffer(
+                self.device,
+                sizes.ResultDataMaxSizeInBytes,
+                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+            )?),
+        };
         let mut scratch = self
             .list
             .rt_scratch
@@ -113,11 +129,7 @@ impl<'a> Recorder<'a> {
         let bytes = sizes.ScratchDataSizeInBytes;
         let mut scratch_address = 0;
         if bytes != 0 {
-            if scratch.as_ref().is_none_or(|buffer| {
-                // SAFETY: the list holds the scratch resource while GetDesc reads its width.
-                let width = unsafe { buffer.GetDesc().Width };
-                width < bytes
-            }) {
+            if scratch.as_ref().is_none_or(|buffer| width(buffer) < bytes) {
                 *scratch = Some(buffer(
                     self.device,
                     bytes,
@@ -126,10 +138,11 @@ impl<'a> Recorder<'a> {
             }
             let current = scratch.as_ref()?;
             self.list.keep(current);
-            // SAFETY: a live default-heap buffer.
+            // SAFETY: current is a buffer in UAV state of at least the host prebuild scratch size.
+            // The list kept this exact allocation even if its scratch slot is replaced later.
             scratch_address = unsafe { current.GetGPUVirtualAddress() };
         }
-        self.list.keep(&result);
+        self.list.keep_rt_result(&result);
         // SAFETY: all GPU ranges are owned by this recording. The global barriers order prior
         // geometry writers, scratch reuse on the host queue and subsequent reads of the result.
         unsafe {
@@ -148,7 +161,7 @@ impl<'a> Recorder<'a> {
         Some(result)
     }
 
-    fn clone_structure(&self, source: &ID3D12Resource) -> Option<ID3D12Resource> {
+    fn clone_structure(&self, source: &ID3D12Resource) -> Option<Arc<ID3D12Resource>> {
         // SAFETY: source is a live AS previously built by this module.
         let bytes = unsafe { source.GetDesc().Width };
         let dest = buffer(
@@ -156,8 +169,8 @@ impl<'a> Recorder<'a> {
             bytes,
             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
         )?;
-        self.list.keep(source);
-        self.list.keep(&dest);
+        let dest = Arc::new(dest);
+        self.list.keep_rt_result(&dest);
         // SAFETY: independent AS resources in the required state, retained through execution.
         unsafe {
             self.commands.CopyRaytracingAccelerationStructure(
@@ -171,75 +184,180 @@ impl<'a> Recorder<'a> {
     }
 }
 
-/// BLAS recorded through a live title builder. Lists retain each generation they reference.
-#[derive(Default)]
-pub struct Builder {
-    blas: Mutex<BTreeMap<u64, ID3D12Resource>>,
+#[derive(Clone)]
+struct Structure {
+    result: Arc<ID3D12Resource>,
+    // Only TLAS generations refer to a snapshot of the BLAS address space.
+    instances: Option<Arc<BlasMap>>,
+    owner: Option<usize>,
 }
 
-impl Builder {
-    /// Mirrors a new triangle BLAS. A later unsupported build at the same address invalidates it.
-    ///
-    /// # Safety
-    /// `list` is a live title list, and the active CPU arrays in `desc` follow the builder ABI.
-    pub unsafe fn build(&self, list: *const Object, desc: &Build) -> bool {
-        let dst = desc.DestAccelerationStructureData;
-        let built = (|| {
-            if dst == 0
-                || desc.Inputs.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL
-                || desc
-                    .Inputs
-                    .Flags
-                    .contains(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
-            {
-                return None;
-            }
-            let list = crate::list::host_list(list)?;
-            let recorder = Recorder::new(list)?;
-            // SAFETY: the descriptors are borrowed from this title call only.
-            let geometries = unsafe { triangles(list, &desc.Inputs) }?;
-            let inputs = Inputs {
-                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                    pGeometryDescs: geometries.as_ptr(),
+impl Structure {
+    fn retain(&self, list: &HostList) {
+        list.keep_rt_result(&self.result);
+        if let Some(map) = &self.instances {
+            list.keep_rt_map(map);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Registry {
+    structures: BTreeMap<u64, Structure>,
+    snapshot: Option<Arc<BlasMap>>,
+}
+
+static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
+    structures: BTreeMap::new(),
+    snapshot: None,
+});
+
+fn registry() -> std::sync::MutexGuard<'static, Registry> {
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Registry {
+    fn replace(
+        &mut self,
+        dst: u64,
+        built: Option<(Arc<ID3D12Resource>, Option<Arc<BlasMap>>)>,
+    ) -> bool {
+        let old = self.structures.remove(&dst);
+        if old.is_some_and(|s| s.instances.is_none()) || matches!(built, Some((_, None))) {
+            self.snapshot = None;
+        }
+        if let Some((result, instances)) = built {
+            self.structures.insert(
+                dst,
+                Structure {
+                    result,
+                    instances,
+                    owner: crate::shadow::buffer_owner(dst),
                 },
-                ..desc.Inputs
-            };
-            recorder.build(&inputs)
-        })();
-        self.replace(dst, built)
-    }
-
-    /// Mirrors a clone, or invalidates the destination for another copy mode.
-    ///
-    /// # Safety
-    /// `list` is a live title list.
-    pub unsafe fn copy(&self, list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
-        let copied = (|| {
-            if dst == 0 || mode != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0 {
-                return None;
-            }
-            let source = self
-                .blas
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&src)?
-                .clone();
-            Recorder::new(crate::list::host_list(list)?)?.clone_structure(&source)
-        })();
-        self.replace(dst, copied)
-    }
-
-    fn replace(&self, dst: u64, result: Option<ID3D12Resource>) -> bool {
-        let mut table = self.blas.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(resource) = result {
-            table.insert(dst, resource);
+            );
             true
         } else {
-            table.remove(&dst);
             false
         }
     }
+
+    fn blas_map(&mut self) -> Option<Arc<BlasMap>> {
+        if self.snapshot.is_none() {
+            self.snapshot = Some(Arc::new(BlasMap::new(&self.structures)?));
+        }
+        self.snapshot.clone()
+    }
+}
+
+pub(crate) fn release_buffer(resource: usize, start: u64, end: u64) {
+    let mut table = registry();
+    let released: Vec<_> = table
+        .structures
+        .range(start..end)
+        .filter(|(_, s)| s.owner == Some(resource))
+        .map(|(&address, _)| address)
+        .collect();
+    for address in released {
+        table.replace(address, None);
+    }
+}
+
+/// Resolves one descriptor's title TLAS address at the time of lookup.
+/// Use `host_tlas_for_list` when recording a GPU command to retain that generation.
+pub fn host_tlas(title_tlas: u64) -> Option<u64> {
+    let table = registry();
+    let entry = table.structures.get(&title_tlas)?;
+    entry.instances.as_ref()?;
+    // SAFETY: the registry holds the TLAS resource throughout the lookup.
+    Some(unsafe { entry.result.GetGPUVirtualAddress() })
+}
+
+/// Resolves and pins the TLAS and its possible BLAS references for this recording.
+///
+/// # Safety
+/// `list` is a live title command list.
+pub unsafe fn host_tlas_for_list(list: *const Object, title_tlas: u64) -> Option<u64> {
+    let list = crate::list::host_list(list)?;
+    let table = registry();
+    let entry = table.structures.get(&title_tlas)?;
+    entry.instances.as_ref()?;
+    entry.retain(list);
+    // SAFETY: the list owns this resource until the GPU has finished the recording.
+    Some(unsafe { entry.result.GetGPUVirtualAddress() })
+}
+
+/// Mirrors a title build and invalidates an older destination on failure.
+///
+/// # Safety
+/// `title_list` is a live title list and the active CPU arrays follow the builder ABI.
+pub unsafe fn build(title_list: *const Object, desc: &Build) -> bool {
+    let dst = desc.DestAccelerationStructureData;
+    let reuse = {
+        let mut table = registry();
+        let previous = table.structures.remove(&dst);
+        if previous
+            .as_ref()
+            .is_some_and(|entry| entry.instances.is_none())
+        {
+            table.snapshot = None;
+        }
+        previous
+            .map(|s| s.result)
+            .filter(|r| Arc::strong_count(r) == 1)
+    };
+    let built = (|| {
+        if dst == 0 {
+            return None;
+        }
+        // The title supplies full geometry on refits. Rebuilding it also handles
+        // changed index data without relying on DXR's fixed-topology update contract.
+        let mut inputs = desc.Inputs;
+        inputs.Flags &= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY;
+        let list = crate::list::host_list(title_list)?;
+        let recorder = Recorder::new(list)?;
+        match inputs.Type {
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL => {
+                // SAFETY: the descriptors are borrowed from this title call only.
+                let geometries = unsafe { triangles(list, &inputs) }?;
+                let inputs = Inputs {
+                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        pGeometryDescs: geometries.as_ptr(),
+                    },
+                    ..inputs
+                };
+                Some((recorder.build(&inputs, reuse)?, None))
+            }
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
+                let map = registry().blas_map()?;
+                let inputs = instances::rewrite(&recorder, title_list, &inputs, &map)?;
+                Some((recorder.build(&inputs, reuse)?, Some(map)))
+            }
+            _ => None,
+        }
+    })();
+    registry().replace(dst, built)
+}
+
+/// Mirrors a clone across title builders.
+///
+/// # Safety
+/// `list` is a live title list.
+pub unsafe fn copy(list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
+    let copied = (|| {
+        if dst == 0 || mode != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0 {
+            return None;
+        }
+        let source = registry().structures.get(&src)?.clone();
+        let recorder = Recorder::new(crate::list::host_list(list)?)?;
+        source.retain(recorder.list);
+        Some((recorder.clone_structure(&source.result)?, source.instances))
+    })();
+    registry().replace(dst, copied)
 }
 
 fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u64> {
