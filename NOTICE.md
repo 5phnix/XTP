@@ -25,6 +25,12 @@ and licences, stated at the top of the files concerned.
 - Admission du constructeur entier d'après 0xkn0wh3r3 dans
   Marvisak/VIctory#2118 (`60632d3f`, GPL-3.0).
 
+## Samplers immédiats choisis par branchement
+
+Choix du registre statique adapté de MartinIndra02 dans fxceless/victory-fork#25
+(`cb80bf0`). Dessin de vérification adapté de JRamos1993 dans le même fork,
+#718 (`77f83f9`). Ces deux contributions sont sous GPL-3.0.
+
 ## References that are not copied
 
 The following projects are studied as references only. **No code is copied
