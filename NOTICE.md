@@ -25,6 +25,14 @@ and licences, stated at the top of the files concerned.
 - Admission du constructeur entier d'après 0xkn0wh3r3 dans
   Marvisak/VIctory#2118 (`60632d3f`, GPL-3.0).
 
+## Tri des signatures DXIL
+
+`sort_signature_rows` adapte en Rust le `std::sort` de la STL Microsoft pour
+reproduire l’ordre des éléments de même clé dans les signatures DXIL.
+Copyright (c) Microsoft Corporation.
+[Code source](https://github.com/microsoft/STL/blob/vs-2022-17.14/stl/inc/algorithm)
+· [Licence Apache-2.0 WITH LLVM-exception](LICENSES/Microsoft-STL.txt).
+
 ## References that are not copied
 
 The following projects are studied as references only. **No code is copied

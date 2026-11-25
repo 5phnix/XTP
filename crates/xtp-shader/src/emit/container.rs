@@ -64,6 +64,7 @@ impl SigElement {
     }
 }
 
+/// Adapté de la STL Microsoft, Copyright (c) Microsoft Corporation, Apache-2.0 WITH LLVM-exception.
 /// Lors du partitionnement, le std::sort de DXC (MSVC) peut permuter des
 /// lignes de même clé. dxil.dll reconstruit la signature et la compare
 /// octet par octet. Seuls les indices bougent, les noms gardent l'ordre DXIL.
