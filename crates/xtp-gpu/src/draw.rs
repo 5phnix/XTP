@@ -1791,11 +1791,10 @@ impl State {
 /// `first` runs as a triangle list: six a rectangle from 0, in the buffers
 /// they were expanded into (`expanded`); for a pipeline without per-vertex
 /// inputs (corners from the vertex id), each rectangle's first triangle:
-/// the title's draw, with whole rectangles.
+/// the title's draw, with whole rectangles, whose fourth corners the
+/// pipeline's geometry stage makes ([`crate::rectangles::geometry_stage`]).
 /// Its shader sees vertex ids from 0, the start left out, on the host as on
 /// the console (docs/analysis/drops.md §5.1.1).
-/// shortcut: such a rectangle misses its fourth corner (VIctory #255's
-/// remap would run the vertex shader for it).
 fn rectangle_vertices(vertices: u32, first: u32, expanded: bool) -> (u32, u32) {
     let rects = vertices / 3;
     if expanded {
@@ -2064,9 +2063,10 @@ impl State {
 }
 
 /// Logs a pipeline whose indirect rectangles make their corners from the
-/// vertex id (see [`crate::rectangles`]), once each: their fourth corners
-/// are not made. Cheap on every draw: a recording thread looks in its own
-/// set first, so the shared one is locked once per thread and pipeline.
+/// vertex id (see [`crate::rectangles`]), once each: its geometry stage
+/// makes their fourth corners. Cheap on every draw: a recording thread
+/// looks in its own set first, so the shared one is locked once per thread
+/// and pipeline.
 fn note_vertex_id_rectangles(p: &HostPipeline) {
     thread_local! {
         /// The host pipelines this thread has seen, by address.
@@ -2082,8 +2082,9 @@ fn note_vertex_id_rectangles(p: &HostPipeline) {
         seen.push(p.name.clone());
         tracing::info!(
             pipeline = %p.name,
-            "indirect rectangles without vertex inputs: each rectangle's first triangle, no fourth \
-             corner (vertex ids from 0 in each record, as on the console)"
+            "indirect rectangles without vertex inputs: each rectangle's three vertices, the fourth \
+             corner made by the pipeline's geometry stage unless its creation said otherwise \
+             (vertex ids from 0 in each record, as on the console)"
         );
     }
 }
@@ -2682,6 +2683,23 @@ void main(uint3 id : SV_DispatchThreadID) {
             want[8 * l] = 101 + 4 * l as u32;
             want[8 * l + 4] = 201 + 4 * l as u32;
         }
+        // A pass makes waiting views for 8 ms and leaves the rest to the
+        // next frames' passes (`picked_spans`): on a loaded machine one pass
+        // may not make all four (xtp-farm-2 at 2a63867 made those of slots 0
+        // to 2, and group 1 read zeros). So passes go on, as the first lists
+        // of the frames that follow make them, until none waits: one view a
+        // pass at least, four passes at most. Then the dispatch runs in the
+        // first list of a frame of its own, which brings their memory up to
+        // date.
+        let views = title.host().unwrap();
+        let mut passes = 0;
+        while views.waiting() > 0 {
+            passes += 1;
+            assert!(passes <= 4, "each pass makes one waiting view at least");
+            views.forget_picked_pass();
+            run(true);
+        }
+        views.forget_picked_pass();
         assert_eq!(run(true), want);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());

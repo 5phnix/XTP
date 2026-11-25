@@ -51,14 +51,25 @@
 //! the records of one draw; records whose expanded vertices do not fit draw
 //! nothing.
 //!
-//! shortcut: as in [`crate::primitive`], the fourth corner is computed from
-//! vertex inputs, not vertex shader outputs; formats unknown to
-//! [`crate::primitive::components`] and components past the vertex stride
-//! keep the first vertex's bytes. A pipeline without per-vertex inputs (one
-//! that makes its corners from the vertex id) draws each rectangle's first
-//! triangle: the record as the title wrote it, with `3 * rects` vertices, as
-//! a direct rectangle draw of such a pipeline does. Its fourth corner is not
-//! made (VIctory #255's remap would run the vertex shader for it). Its
+//! shortcut: as in [`crate::primitive`], the fourth corner of a pipeline with
+//! per-vertex inputs is computed from the vertex inputs, not the vertex
+//! shader's outputs, and v1 is taken for the corner whatever the order:
+//! `v3 = v0 + v2 - v1` is right for a corner at v1 (top right, top left,
+//! bottom left), and makes a parallelogram for a corner at v0 or v2 (for
+//! the tiled lighting's top left, bottom left, top right, (0, 0), (0, 1),
+//! (1, 0) with y down, it gives (1, -1), above the top right, where the far
+//! corner is (1, 1); those rectangles have no vertex input, see below).
+//! Formats unknown to [`crate::primitive::components`] and
+//! components past the vertex stride keep the first vertex's bytes.
+//!
+//! A pipeline without per-vertex inputs (one that makes its corners from
+//! the vertex id) draws the record as the title wrote it, with `3 * rects`
+//! vertices, as a direct rectangle draw of such a pipeline does: each
+//! rectangle a triangle, the half on its corner's side. Its geometry stage
+//! ([`geometry_stage`], made with the pipeline) adds the other half, with
+//! the fourth corner from the vertex shader's outputs whichever vertex the
+//! corner is; a pipeline made without it (refused by the driver with it,
+//! or a pixel shader that reads the primitive id) keeps one triangle. Its
 //! shader sees vertex ids that count from 0 in every record, as on the
 //! console: D3D12's `SV_VertexID` leaves out the start vertex (a test draws
 //! a record from vertex 6 with ids 0 to 2), and so does the console's v0,
@@ -84,6 +95,10 @@ use crate::host::{HostList, host, transition, uav_barrier};
 use crate::pipeline::host::Input;
 use crate::primitive;
 use crate::shadow::Shadow;
+
+mod geometry;
+
+pub(crate) use geometry::geometry_stage;
 
 /// A list's vertex scratch, shared by the records of one draw.
 pub(crate) const SCRATCH_BYTES: u64 = 8 << 20;
