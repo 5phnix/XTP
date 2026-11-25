@@ -1337,6 +1337,7 @@ mod tests {
         let native = xtp_shader::NativeProgram {
             stage: xtp_shader::HwStage::Ms,
             wave64: true,
+            float_mode: 0,
             vgprs: 16,
             layout: Vec::new(),
             used: Vec::new(),

@@ -1150,6 +1150,7 @@ mod tests {
         NativeProgram {
             stage: crate::HwStage::Ms,
             wave64: true,
+            float_mode: 0,
             vgprs: 16,
             layout: vec![RootParam {
                 root: RootType::Table,

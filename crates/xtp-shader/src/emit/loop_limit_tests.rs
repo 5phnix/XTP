@@ -142,6 +142,7 @@ fn program(loops: Loops, bound: u32) -> crate::NativeProgram {
     crate::NativeProgram {
         stage: crate::HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 16,
         layout: vec![param(RootType::Table, 0), param(RootType::Constants, 1)],
         used: vec![UsedResource {

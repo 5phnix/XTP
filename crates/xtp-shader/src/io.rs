@@ -578,6 +578,7 @@ mod tests {
         NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
+            float_mode: 0,
             vgprs: 256,
             layout: vec![],
             used: vec![],
@@ -694,6 +695,7 @@ mod tests {
             let native = NativeProgram {
                 stage: HwStage::Ms,
                 wave64: true,
+                float_mode: 0,
                 vgprs: 256,
                 layout: vec![],
                 used: vec![],

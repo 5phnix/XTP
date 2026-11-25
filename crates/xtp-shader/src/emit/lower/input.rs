@@ -108,6 +108,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
+                Reg::FloatMode => Val::I32(self.s.m.i32(self.x.native.float_mode.into())),
                 Reg::V(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
@@ -961,6 +962,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
+            float_mode: 0,
             vgprs: 4,
             layout: vec![],
             used: vec![],
@@ -1104,6 +1106,7 @@ mod tests {
             let native = NativeProgram {
                 stage: HwStage::Ps,
                 wave64: false,
+                float_mode: 0,
                 vgprs: 8,
                 layout: vec![],
                 used: vec![],
