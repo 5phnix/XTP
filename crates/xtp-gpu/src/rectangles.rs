@@ -1019,7 +1019,8 @@ pub(crate) fn expand(
     (records, stride, max): (Records, u32, u32),
     index: Option<crate::draw::IndexView>,
     count: Option<(&Arc<Shadow>, u64)>,
-    stats: Option<u64>,
+    stats: Option<(u64, u32)>,
+    writes: crate::indirect::Writes,
 ) -> Result<Prepared, &'static str> {
     if stride < if index.is_some() { 20 } else { 16 }
         || !stride.is_multiple_of(4)
@@ -1149,10 +1150,25 @@ pub(crate) fn expand(
         .map_err(|_| "no immediate writes on the host list")?;
 
     // The title's buffers, as the title left them at this place.
-    let src_args = match records {
+    let (src_args, count_gpu, stride) = match records {
         Records::Title(args, at) => {
             args.refresh(list, at, u64::from(stride) * u64::from(max.max(1)));
-            args.gpu(at)
+            if let Some((s, at)) = count {
+                s.refresh(list, at, 4);
+            }
+            let bounded = crate::indirect::bound(
+                list,
+                (&args.buffer, args.offset(at)),
+                (u32::from(index.is_some()), stride, max),
+                count.map(|(s, at)| (&s.buffer, s.offset(at))),
+                stats,
+                writes,
+                crate::indirect::Output::Uav,
+            )
+            .ok_or("not bounded (no clamp)")?;
+            // SAFETY: la liste conserve le tampon du compteur et des commandes bornées.
+            let gpu = unsafe { bounded.buffer.GetGPUVirtualAddress() } + bounded.offset;
+            (gpu + 4, gpu, 24)
         }
         Records::Direct(words) => {
             let (buffer, data) = host()
@@ -1162,40 +1178,27 @@ pub(crate) fn expand(
             // SAFETY: a fresh mapped buffer retained until the recording retires.
             unsafe {
                 data.cast::<[u32; 5]>().write_unaligned(words);
-                buffer.GetGPUVirtualAddress()
+                let gpu = buffer.GetGPUVirtualAddress();
+                (gpu, gpu, stride)
             }
         }
     };
     if let Some((v, _, shadow)) = &indices {
         shadow.refresh(list, v.address, v.size.into());
     }
-    if let Some((s, at)) = count {
-        s.refresh(list, at, 4);
-    }
     for s in &sources {
         s.shadow.refresh(list, s.address, u64::from(s.size));
     }
-    if matches!(records, Records::Title(..))
-        && !crate::indirect::rewrite(
-            list,
-            src_args,
-            (u32::from(index.is_some()), stride, max),
-            count.map(|(s, at)| s.gpu(at)),
-            None,
-            stats,
-        )
-    {
-        return Err("not bounded (no clamp)");
-    }
+    let _expanding =
+        crate::timestamps::command(list, crate::timestamps::What::RectangleExpansion, None);
 
     let direct = matches!(records, Records::Direct(_));
     let args_gpu = args_buffer.gpu();
     let (counter, records) = (args_gpu, args_gpu + COUNTER_BYTES);
-    let count_gpu = count.map_or(src_args, |(s, at)| s.gpu(at));
     let rewrite = [
         max,
         stride,
-        u32::from(count.is_some()),
+        u32::from(!direct),
         source_limit,
         capacity,
         u32::from(need_vertices),
@@ -1708,6 +1711,7 @@ mod tests {
                 None,
                 Some((&count_copy, count.address())),
                 None,
+                Default::default(),
             )
             .expect("expanded")
         };
@@ -1780,6 +1784,7 @@ mod tests {
             None,
             None,
             None,
+            Default::default(),
         )
         .unwrap();
         let left = run_and_read(&list, &mut held, max as usize, &[]);
@@ -1841,6 +1846,7 @@ mod tests {
                 Some(index),
                 None,
                 None,
+                Default::default(),
             )
             .expect("expanded");
             let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
@@ -1884,6 +1890,7 @@ mod tests {
             None,
             None,
             None,
+            Default::default(),
         )
         .expect("expanded");
         let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
@@ -1938,6 +1945,7 @@ mod tests {
             None,
             Some((&count_copy, count.address())),
             None,
+            Default::default(),
         )
         .expect("expanded");
         assert!(prepared.views.is_empty());
@@ -2026,6 +2034,7 @@ mod tests {
             None,
             None,
             None,
+            Default::default(),
         )
         .expect("expanded");
         let (_, layouts) = scratch_layout(&[(0, 10), (2, 6)], SCRATCH_BYTES).expect("a layout");
