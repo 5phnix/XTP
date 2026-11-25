@@ -264,7 +264,10 @@ impl<'a> Lower<'a> {
     ///
     /// The view's kind comes from how the program uses the descriptor
     /// (its own access, or a twin load's), else from what the load is:
-    /// [`Self::unused_descriptor`].
+    /// [`Self::unused_descriptor`]. A constant buffer's size has no query:
+    /// its dwords are data only where something other than its
+    /// `s_buffer_load`s and joins with numbers reads them
+    /// ([`Self::reused_after_access`]), and then the program stops.
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
@@ -368,6 +371,17 @@ impl<'a> Lower<'a> {
                         let raw = match used.map(|u| u.kind) {
                             Some(ResourceType::Srv) => 11,
                             Some(ResourceType::Uav) => 11 | 0x1000,
+                            // A constant buffer whose registers the program
+                            // gives to numbers after its last access, which
+                            // joins take (r1smem's group B: a CBV table
+                            // entry the console compiler reads uniformly):
+                            // no dword is read as data (`smem_data.rs`).
+                            Some(_) if self.reused_after_access(site, &dwords) => {
+                                for v in dwords.into_iter().flatten() {
+                                    self.vals.insert(v, Val::Missing(OTHER));
+                                }
+                                return Ok(());
+                            }
                             Some(_) => return Err("a constant buffer's descriptor read as data"),
                             None => self.slot_raw_kind(&src),
                         };

@@ -105,6 +105,8 @@ mod mesh_tests;
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
 pub(crate) mod lower;
 #[cfg(all(test, windows))]
+mod r1_tests;
+#[cfg(all(test, windows))]
 mod raw_tests;
 pub mod rect_gs;
 mod sampler;

@@ -75,6 +75,7 @@ mod mesh;
 mod operand;
 mod salu;
 mod smem;
+mod smem_data;
 mod spin;
 #[cfg(test)]
 mod tests;
