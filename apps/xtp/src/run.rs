@@ -171,8 +171,6 @@ pub fn run(
     unsafe { xtp_game::watchdog::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
     // SAFETY: as above.
     unsafe { xtp_game::asserts::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
-    // SAFETY: as above; the image stays mapped for the process.
-    unsafe { xtp_game::rt_path::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
     xtp_hle::runtime::set_main_image(image.base());
     xtp_hle::runtime::set_image_path(image.base(), &exe);
     println!(
