@@ -66,9 +66,6 @@ struct Line {
     held: std::collections::VecDeque<Held>,
     /// When the queue last moved, while it holds something.
     since: Option<std::time::Instant>,
-    /// Exercise fence wake-ups without the stuck-queue fallback.
-    #[cfg(test)]
-    wait_indefinitely: bool,
     /// Whether it is in [`WAITING`], with a reference to the queue (so a
     /// queue the title releases runs what it holds first).
     listed: bool,
@@ -161,17 +158,6 @@ const FORCED: usize = 3;
 /// past this the queue runs on, logged, as it did before waits held.
 #[cfg(windows)]
 const STUCK: std::time::Duration = std::time::Duration::from_secs(4);
-
-#[cfg(windows)]
-impl Line {
-    fn stuck(&self) -> bool {
-        #[cfg(test)]
-        if self.wait_indefinitely {
-            return false;
-        }
-        self.since.is_some_and(|t| t.elapsed() >= STUCK)
-    }
-}
 
 /// What a queue runs before its waits are over.
 #[cfg(windows)]
@@ -277,7 +263,7 @@ fn run_line(host: &crate::host::Host, q: usize, force: Option<Force>) -> bool {
         if let Held::Wait(fence, value) = next
             && !over(fence, value)
         {
-            if !forcing && !line.stuck() {
+            if !forcing && !line.since.is_some_and(|t| t.elapsed() >= STUCK) {
                 line.held.push_front(next);
                 break;
             }
@@ -1043,28 +1029,6 @@ mod tests {
         use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
         use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-        /// Other tests submit to the same host and can release held lists or
-        /// finish pending write-backs. Give this test its own host and queues.
-        fn isolated_device(test: &str) -> Option<&'static crate::host::Host> {
-            const CHILD: &str = "XTP_TEST_ISOLATED_QUEUE";
-            if std::env::var(CHILD).as_deref() == Ok(test) {
-                return device(test);
-            }
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([test, "--exact", "--nocapture"])
-                .env(CHILD, test)
-                .env_remove("XTP_SYNC_SUBMIT")
-                .stderr(std::process::Stdio::inherit())
-                .output()
-                .unwrap();
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                out.status.success() && stdout.contains("1 passed"),
-                "{test}: {stdout}"
-            );
-            None
-        }
-
         /// A title queue: 0 direct (graphics), 2 compute.
         fn new_queue(kind: u32) -> This {
             let null = std::ptr::null();
@@ -1172,18 +1136,15 @@ mod tests {
         #[test]
         fn a_queue_waiting_for_a_cpu_signal_runs_on_without_another_call() {
             let test = "queue::tests::waits::a_queue_waiting_for_a_cpu_signal_runs_on_without_another_call";
-            let Some(host) = isolated_device(test) else {
-                return;
-            };
+            let Some(host) = device(test) else { return };
             let kernel = Kernel::new(host);
             let (data, read) = (TitleBuffer::new(256), TitleBuffer::new(256));
             // A host copy, as if a draw had read the buffer before.
             let _ = data.shadow();
             let (compute, fence, done) = (new_queue(2), new_fence(), new_fence());
+            assert_eq!(wait(compute, fence, 1), S_OK);
             let reader = TitleList::new();
             kernel.dispatch(reader.host(), Pass::Copy, data.address(), read.address());
-            lock(&queue(compute).line).wait_indefinitely = true;
-            assert_eq!(wait(compute, fence, 1), S_OK);
             submit(compute, &reader);
             assert_eq!(signal(compute, done, 1), S_OK);
             assert!(holding(compute));
@@ -1310,10 +1271,7 @@ mod tests {
         #[test]
         fn a_page_mapping_waits_only_for_the_submissions_touching_its_pages() {
             let test = "queue::tests::waits::a_page_mapping_waits_only_for_the_submissions_touching_its_pages";
-            let Some(host) = isolated_device(test) else {
-                return;
-            };
-            host.finish_on_caller();
+            let Some(host) = device(test) else { return };
             crate::resource::use_page_mapper(note_mapping);
             let kernel = Kernel::new(host);
             // A page each: buffers are 64 KiB aligned.
@@ -1321,14 +1279,26 @@ mod tests {
             let queue = new_queue(0);
             let writer = TitleList::new();
             kernel.dispatch(writer.host(), Pass::Fill, scratch.address(), old.address());
+            let open = host.hold_queue();
             submit(queue, &writer);
             assert_eq!(unmap_page(queue, elsewhere.address()), S_OK);
             assert!(mapped(elsewhere.address()).is_some(), "mapped at once");
             assert!(writer.host().running(), "the writer not waited for");
             assert!(old.words().iter().all(|&w| w == 0), "nothing written back");
-            assert_eq!(unmap_page(queue, old.address()), S_OK);
+            let (q, at) = (queue as usize, old.address());
+            let (done, returned) = std::sync::mpsc::channel();
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    let _ = done.send(unmap_page(q as This, at));
+                });
+                let waited = returned.recv_timeout(std::time::Duration::from_millis(300));
+                assert!(waited.is_err(), "the mapping waits for the writer");
+                assert_eq!(mapped(at), None);
+                open();
+                assert_eq!(returned.recv().unwrap(), S_OK);
+            });
             assert_eq!(
-                mapped(old.address()),
+                mapped(at),
                 Some(filled()),
                 "the old pages got what it wrote"
             );
