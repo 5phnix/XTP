@@ -4324,7 +4324,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             if read == (Some(0x22), Some(0x66)) {
                 break;
             }
-            assert!(passes < 4, "the latest bytes: {read:?} after {passes} passes");
+            assert!(
+                passes < 4,
+                "the latest bytes: {read:?} after {passes} passes"
+            );
         }
         // Nothing changed since: the write-watched placed texture is found
         // clean and not uploaded; the texture object's memory (the test's
