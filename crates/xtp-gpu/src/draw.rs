@@ -1873,6 +1873,9 @@ impl State {
         let pass = host.texture_pass()?;
         let started = std::time::Instant::now();
         let mut counts = PassCounts::default();
+        // The slots this pass uploads, first and again (`XTP_PASS_DUMP`).
+        #[cfg(feature = "diagnostics")]
+        let mut uploads: (Vec<u32>, Vec<u32>) = Default::default();
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1979,6 +1982,8 @@ impl State {
             }
             readable(list, &sampled, &view);
             crate::descriptor::host::note_heap_texture(index, at, texture, "uploaded first");
+            #[cfg(feature = "diagnostics")]
+            uploads.0.push(index);
             counts.uploaded += 1;
             host.texture_slot_done(index, write);
         }
@@ -2131,6 +2136,8 @@ impl State {
                     texture,
                     "changed: uploaded again",
                 );
+                #[cfg(feature = "diagnostics")]
+                uploads.1.push(index);
             }
         }
         if let Some(last) = last {
@@ -2138,6 +2145,21 @@ impl State {
         }
         counts.bytes = spent + refreshes.made();
         counts.us = started.elapsed().as_micros() as u64;
+        // In the pass dump (`XTP_PASS_DUMP`), as an op of this list: the
+        // slots whose uploads run before this list's commands and after the
+        // lists submitted before it, against the draws that pick them
+        // (faces black in the G-buffer: Samuel's watch 38, item 490).
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!(
+                "texture pass of heap {:#x}, frame {}: uploaded first {:?}, uploaded again {:?}; {} due left",
+                title.start,
+                pass.frame,
+                uploads.0,
+                uploads.1,
+                pass.left(&counts)
+            )
+        });
         host.texture_pass_done(&pass, counts);
         Some(counts)
     }
