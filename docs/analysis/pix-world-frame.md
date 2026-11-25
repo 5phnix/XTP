@@ -290,8 +290,32 @@ a capture shows only through a replay.
   uses) and `COLOR1`; a program that writes real albedo (`63051e97…`)
   reads neither `COLOR2` nor `TEXCOORD10`. Its mesh shader computes
   `COLOR2` with multiply-adds of values read from buffers, 0 on one path
-  (a `phi` with 0). Next: the texture and buffer inputs of that program
-  in a late frame (§10).
+  (a `phi` with 0, taken only by threads without a vertex). Next: the
+  texture and buffer inputs of that program in a late frame (§10).
+- **The view heap's mirror (watch item 181).** The buffers `COLOR2` is
+  computed from are taken from the heap at `(u9 + 128) >> 5`, `(u9 + 160)
+  >> 5` and nearby (and `(u8 + 160) >> 5`). In frame 806 the program's u9
+  is 0x23d8260: slots **1,174,547 to 1,174,555, past the 737,856 slots XTP
+  mirrors** of the title's 1,245,184, so they read zeros. Counting every
+  mesh dispatch by where its u9 table falls:
+
+  | Frame | Pass | Ops past the mirror | Depth after | Albedo after |
+  |---|---|---|---|---|
+  | 806 | P62, depth pre-pass | 180 of 180 | 8.3 % | |
+  | 806 | P351, first G-buffer pass | 222 of 222 | 18.0 % | 7.7 %, at most 1/255 |
+  | 806 | P353, P354, P356, P364, P370 | 0 of 324 | unchanged | unchanged |
+  | 806 | P358 | 140 of 140 | unchanged | unchanged |
+  | 806 | P417 | 0 of 124 | unchanged | 9.3 %, up to 0.44 |
+  | 805 | P58, depth pre-pass | 16 of 157 | 8.3 % | |
+  | 805 | P474, first G-buffer pass | 0 of 184 | 11.8 % | 3.2 %, about 0 |
+  | 1007 | P26, depth pre-pass | 99 of 99 | 16.3 % | |
+  | 1007 | P462, P480 | 0 of 66 | unchanged | 0 % |
+
+  Draws past the mirror read null descriptors, and a draw that the depth
+  pre-pass missed adds nothing afterwards (the G-buffer tests depth EQUAL).
+  But passes wholly inside the mirror (805's P474, 1007's P462 and P480)
+  leave the albedo at 0 too: the mirror explains part of the black, not
+  all of it.
 
 ## 8. Tools and commands
 
