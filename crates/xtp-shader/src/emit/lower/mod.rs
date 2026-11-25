@@ -64,6 +64,7 @@ mod compare;
 mod descriptor;
 mod export;
 mod flow;
+pub(super) mod geometry;
 mod image;
 mod input;
 mod integer;
