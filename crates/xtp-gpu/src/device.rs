@@ -582,6 +582,7 @@ pub(crate) fn log_frame() {
         line.push_str(&part);
     }
     tracing::info!("{line}");
+    resource::log_placed_views();
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the

@@ -874,6 +874,9 @@ pub(crate) struct HostTexture {
     pub(crate) bytes: u64,
     /// Of them, what its stand-in format takes beyond the title's.
     extra: u64,
+    /// Which title creation path allocated this copy. Shared views do not
+    /// allocate another copy.
+    origin: TextureOrigin,
     /// Whether its memory is resident yet (its own, or its pool heap's):
     /// until then nothing hands it to the GPU ([`HostTexture::ready`]).
     residency: Arc<residency::Residency>,
@@ -895,7 +898,13 @@ impl HostTexture {
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
-        format::note_texture(false, self.bytes, self.extra, self.slot.is_some());
+        format::note_texture(
+            false,
+            self.bytes,
+            self.extra,
+            self.slot.is_some(),
+            self.origin,
+        );
     }
 }
 
@@ -1126,7 +1135,12 @@ pub(crate) fn host_desc(
 /// creations are logged before and after the call with their size and the
 /// video memory budget, so a stall names its texture.
 #[cfg(windows)]
-fn host_texture(desc: &ResourceDesc, state: u32, clear: Option<[u32; 5]>) -> Option<HostTexture> {
+fn host_texture(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: Option<[u32; 5]>,
+    origin: TextureOrigin,
+) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     if desc.dimension == BUFFER {
         return None;
@@ -1197,7 +1211,7 @@ fn host_texture(desc: &ResourceDesc, state: u32, clear: Option<[u32; 5]>) -> Opt
             if slot.is_some() { " pooled" } else { "" }
         )
     });
-    format::note_texture(true, bytes, extra, slot.is_some());
+    format::note_texture(true, bytes, extra, slot.is_some(), origin);
     let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
     Some(HostTexture {
         texture,
@@ -1210,6 +1224,7 @@ fn host_texture(desc: &ResourceDesc, state: u32, clear: Option<[u32; 5]>) -> Opt
         content: decode::revision().into(),
         bytes,
         extra,
+        origin,
         residency,
         slot,
     })
@@ -1516,6 +1531,16 @@ fn resource<'a>(this: This) -> &'a Resource {
     unsafe { &*this.cast::<Resource>() }
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum TextureOrigin {
+    Committed,
+    HeapOffset,
+    Address,
+    PlacedView,
+    External,
+}
+
 // The creation methods' own arguments, passed on, and how the resource is
 // made (for the alias log).
 #[allow(clippy::too_many_arguments)]
@@ -1553,7 +1578,16 @@ fn hand_out_resource(
                 // SAFETY: the title passes a whole clear value.
                 unsafe { clear.cast::<[u32; 5]>().read_unaligned() }
             });
-            (host_texture(&desc, state, clear).map(Arc::new), false)
+            let origin = match &backing {
+                Backing::Committed(_) => TextureOrigin::Committed,
+                Backing::Placed { .. } => TextureOrigin::HeapOffset,
+                Backing::Address(_) if how == PLACED_VIEW => TextureOrigin::PlacedView,
+                Backing::Address(_) => TextureOrigin::Address,
+            };
+            (
+                host_texture(&desc, state, clear, origin).map(Arc::new),
+                false,
+            )
         }
     };
     let resource = Box::new(Resource {
@@ -1895,13 +1929,15 @@ static PLACED_TEXTURES: std::sync::Mutex<PlacedTextures> =
 type PlacedTextures = std::collections::BTreeMap<(u64, [u32; 14]), PlacedView>;
 
 /// A placed view's resource, the alias count it was last matched at and
-/// the bytes it covers.
+/// the bytes it covers. New entries can be invalidated while being made.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy)]
 struct PlacedView {
-    resource: usize,
+    resource: Option<usize>,
     changes: u64,
     len: u64,
+    /// Nonzero while a thread is making a copy outside the map lock.
+    building: u64,
 }
 
 /// The most bytes a placed view's texture has covered: how far before a
@@ -1913,6 +1949,13 @@ static LONGEST_PLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// log).
 #[cfg(windows)]
 const PLACED_VIEW: &str = "placed view";
+
+#[cfg(windows)]
+static NEXT_PLACEMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[cfg(windows)]
+static UNMAPPED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static INVALIDATED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Resources of placed views no longer in [`PLACED_TEXTURES`], with when
 /// they left it: released [`GRACE`] later, as a caller of `texture_at` may
@@ -1929,18 +1972,16 @@ const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// those waiting for longer.
 #[cfg(windows)]
 fn release_later(resources: Vec<usize>) {
+    let mut waiting = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
-    RELEASED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .extend(resources.into_iter().map(|r| (now, r)));
-    release_waiting(GRACE);
+    waiting.extend(resources.into_iter().map(|r| (now, r)));
+    drop(waiting);
+    release_waiting(now, GRACE);
 }
 
 /// Releases the resources that have waited `grace` or more.
 #[cfg(windows)]
-fn release_waiting(grace: std::time::Duration) {
-    let now = std::time::Instant::now();
+fn release_waiting(now: std::time::Instant, grace: std::time::Duration) {
     let mut waiting = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
     let due = waiting
         .iter()
@@ -1951,6 +1992,29 @@ fn release_waiting(grace: std::time::Duration) {
     for r in due {
         resource_release(r as This);
     }
+}
+
+/// Give back expired placed views even if streaming stops remapping memory.
+#[cfg(windows)]
+pub(crate) fn reap_placed_views() {
+    release_waiting(std::time::Instant::now(), GRACE);
+}
+
+#[cfg(windows)]
+pub(crate) fn log_placed_views() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let cached = placed_textures().len();
+    let retiring = RELEASED.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let (same_address, shared) = alias::counts();
+    tracing::info!(
+        cached,
+        retiring,
+        unmapped = UNMAPPED_VIEWS.load(Relaxed),
+        invalidated = INVALIDATED_VIEWS.load(Relaxed),
+        same_address,
+        shared,
+        "placed texture views"
+    );
 }
 
 #[cfg(windows)]
@@ -1965,10 +2029,13 @@ fn placed_textures() -> std::sync::MutexGuard<'static, PlacedTextures> {
 /// run).
 #[cfg(windows)]
 pub(crate) fn memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     let (start, end) = (at as u64, (at as u64).saturating_add(len as u64));
-    let from = start.saturating_sub(LONGEST_PLACED.load(std::sync::atomic::Ordering::Relaxed));
     let gone: Vec<usize> = {
         let mut map = placed_textures();
+        let from = start.saturating_sub(LONGEST_PLACED.load(std::sync::atomic::Ordering::Relaxed));
         let keys: Vec<_> = map
             .range((from, [0; 14])..(end, [0; 14]))
             .filter(|((address, _), view)| address.saturating_add(view.len.max(1)) > start)
@@ -1976,10 +2043,11 @@ pub(crate) fn memory_remapped(at: usize, len: usize) {
             .collect();
         keys.iter()
             .filter_map(|k| map.remove(k))
-            .map(|view| view.resource)
+            .filter_map(|view| view.resource)
             .collect()
     };
     if !gone.is_empty() {
+        INVALIDATED_VIEWS.fetch_add(gone.len() as u64, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
             at = format_args!("{at:#x}"),
             len,
@@ -2002,14 +2070,16 @@ fn forget_shared_views(address: u64) {
         let keys: Vec<_> = map
             .range((address, [0; 14])..=(address, [u32::MAX; 14]))
             .filter(|(_, view)| {
-                let r = resource(view.resource as This);
-                r.shared && alias::current(address, &r.desc).is_none()
+                view.resource.is_some_and(|made| {
+                    let r = resource(made as This);
+                    r.shared && alias::current(address, &r.desc).is_none()
+                })
             })
             .map(|(k, _)| *k)
             .collect();
         keys.iter()
             .filter_map(|k| map.remove(k))
-            .map(|view| view.resource)
+            .filter_map(|view| view.resource)
             .collect()
     };
     if !gone.is_empty() {
@@ -2035,75 +2105,156 @@ fn forget_shared_views(address: u64) {
 /// again).
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    texture_lookup(address, desc).ready()
+}
+
+/// What [`texture_lookup`] found for a placed view.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacedLookup {
+    /// The resource made for that memory, its host copy resident.
+    Ready(This),
+    /// None yet: another thread is still making the first one.
+    Building,
+    /// None: no mapped page, a failed creation, or a host copy not
+    /// resident yet.
+    Absent,
+}
+
+#[cfg(windows)]
+impl PlacedLookup {
+    pub(crate) fn ready(self) -> Option<This> {
+        match self {
+            PlacedLookup::Ready(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// [`texture_at`], telling a view another thread is still making from one
+/// there is none for.
+#[cfg(windows)]
+pub(crate) fn texture_lookup(address: u64, desc: &[u32; 14]) -> PlacedLookup {
+    texture_lookup_with(address, desc, |d| {
+        let mut out = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        (at_address(address, d, std::ptr::null(), iid, &mut out, PLACED_VIEW) == S_OK)
+            .then_some(out)
+    })
+}
+
+#[cfg(all(test, windows))]
+fn texture_at_with(
+    address: u64,
+    desc: &[u32; 14],
+    make: impl FnOnce(ResourceDesc) -> Option<This>,
+) -> Option<This> {
+    texture_lookup_with(address, desc, make).ready()
+}
+
+#[cfg(windows)]
+fn texture_lookup_with(
+    address: u64,
+    desc: &[u32; 14],
+    make: impl FnOnce(ResourceDesc) -> Option<This>,
+) -> PlacedLookup {
+    use std::sync::atomic::Ordering::Relaxed;
+    let found = |r: Option<This>| r.map_or(PlacedLookup::Absent, PlacedLookup::Ready);
+    if address == 0 {
+        return PlacedLookup::Absent;
+    }
     let desc = canonical_resource_desc(*desc);
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
-        return None;
+        return PlacedLookup::Absent;
     }
     let key = (address, desc);
-    let usable = |r: This| ready_host(r).is_some().then_some(r);
-    let changes = alias::changes();
-    // The resource made so far, if it is still the one to use.
-    let before = {
-        let mut map = placed_textures();
-        match map.get_mut(&key) {
-            Some(view) => {
-                let made = view.resource as This;
-                let current = resource(made).host.clone();
-                let stale = view.changes != changes
-                    && alias::current(address, &d)
-                        .is_some_and(|now| !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &now)));
-                view.changes = changes;
-                if !stale {
-                    return usable(made);
-                }
-                Some(made)
-            }
-            None => None,
-        }
+    let usable = |r: usize| {
+        let r = r as This;
+        ready_host(r).is_some().then_some(r)
     };
-    let mut out = std::ptr::null();
-    let iid = &RESOURCE_IIDS[0];
-    let made = at_address(address, d, std::ptr::null(), iid, &mut out, PLACED_VIEW) == S_OK;
+    let changes = alias::changes();
+    let (ticket, len) = {
+        let mut map = placed_textures();
+        if let Some(view) = map.get_mut(&key) {
+            if view.building != 0 {
+                return view
+                    .resource
+                    .and_then(usable)
+                    .map_or(PlacedLookup::Building, PlacedLookup::Ready);
+            }
+            if let Some(made) = view.resource {
+                let stale = view.changes != changes
+                    && alias::current(address, &d).is_some_and(|now| {
+                        !resource(made as This)
+                            .host
+                            .as_ref()
+                            .is_some_and(|c| Arc::ptr_eq(c, &now))
+                    });
+                if !stale {
+                    view.changes = changes;
+                    return found(usable(made));
+                }
+            }
+        }
+        // Publish the range before dropping the lock. A remap can now
+        // cancel this creation even while the driver is allocating it.
+        let len = footprint(&d).map_or(1, |info| info.size);
+        LONGEST_PLACED.fetch_max(len, Relaxed);
+        let ticket = NEXT_PLACEMENT.fetch_add(1, Relaxed);
+        let view = map.entry(key).or_insert(PlacedView {
+            resource: None,
+            changes,
+            len,
+            building: 0,
+        });
+        view.building = ticket;
+        (ticket, len)
+    };
+    // The indexed upload pass already defers views of unmapped pages.
+    // Table draws and later descriptor checks also reach this path.
+    // Keep GPU-writeable copies and aliases of live GPU sources eligible.
+    let out = if host_flags(d.flags) & alias::WRITABLE != 0
+        || alias::has_sources(address)
+        || crate::texture::any_committed(address as *const u8, len as usize)
+    {
+        make(d)
+    } else {
+        UNMAPPED_VIEWS.fetch_add(1, Relaxed);
+        None
+    };
     let mut map = placed_textures();
-    if !made {
-        // `before` may be released by now (its memory remapped while this
-        // one was made): only what the map holds now is handed out.
-        return map.get(&key).and_then(|view| usable(view.resource as This));
-    }
-    let len = footprint(&d).map_or(0, |info| info.size);
-    LONGEST_PLACED.fetch_max(len, std::sync::atomic::Ordering::Relaxed);
-    match map.get_mut(&key) {
-        // Another thread made or replaced it meanwhile: theirs stays, ours
-        // was never handed out.
-        Some(view) if Some(view.resource as This) != before => {
-            let theirs = usable(view.resource as This);
-            drop(map);
+    let Some(view) = map.get_mut(&key).filter(|v| v.building == ticket) else {
+        let current = match map.get(&key) {
+            Some(v) => match v.resource.and_then(usable) {
+                Some(r) => PlacedLookup::Ready(r),
+                None if v.building != 0 => PlacedLookup::Building,
+                None => PlacedLookup::Absent,
+            },
+            None => PlacedLookup::Absent,
+        };
+        drop(map);
+        if let Some(out) = out {
             resource_release(out);
-            theirs
         }
-        Some(view) => {
-            let replaced = std::mem::replace(&mut view.resource, out as usize);
-            view.changes = changes;
-            view.len = len;
-            let ours = usable(out);
-            drop(map);
-            release_later(vec![replaced]);
-            ours
-        }
-        None => {
-            map.insert(
-                key,
-                PlacedView {
-                    resource: out as usize,
-                    changes,
-                    len,
-                },
-            );
-            usable(out)
-        }
+        return current;
+    };
+    view.building = 0;
+    // Recorded even when the creation failed, as before a creation was made
+    // outside the lock: a failed rebuild is not tried again on every lookup
+    // (a slow creation on the title's thread), only at the next change.
+    view.changes = changes;
+    let replaced = out.and_then(|out| view.resource.replace(out as usize));
+    let current = view.resource.and_then(usable);
+    if view.resource.is_none() {
+        map.remove(&key);
     }
+    drop(map);
+    if let Some(replaced) = replaced {
+        release_later(vec![replaced]);
+    }
+    found(current)
 }
 
 /// The buffer a GPU-written texture's texels go through into a texture of
@@ -2890,7 +3041,8 @@ fn own_texture(
     texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     state: u32,
 ) -> HostTexture {
-    format::note_texture(true, 0, 0, false);
+    let origin = TextureOrigin::External;
+    format::note_texture(true, 0, 0, false, origin);
     HostTexture {
         texture,
         state: state.into(),
@@ -2900,6 +3052,7 @@ fn own_texture(
         content: decode::revision().into(),
         bytes: 0,
         extra: 0,
+        origin,
         residency: Arc::new(residency::Residency::resident()),
         slot: None,
     }
@@ -3325,6 +3478,29 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 pub(crate) mod tests_support {
     use super::*;
     use windows::Win32::Graphics::Direct3D12::*;
+
+    /// Runs `f` while the placed view of `desc` at `address` looks as if
+    /// another thread were still making its first copy: [`texture_at`]
+    /// finds none there. The entry as it was comes back after.
+    pub(crate) fn while_placed_building(address: u64, desc: &[u32; 14], f: impl FnOnce()) {
+        let key = (address, canonical_resource_desc(*desc));
+        let saved = placed_textures().remove(&key);
+        placed_textures().insert(
+            key,
+            PlacedView {
+                resource: None,
+                changes: alias::changes(),
+                len: 1,
+                building: u64::MAX,
+            },
+        );
+        f();
+        let mut map = placed_textures();
+        map.remove(&key);
+        if let Some(saved) = saved {
+            map.insert(key, saved);
+        }
+    }
 
     /// A `width` x `height` depth texture in `format` that the title also
     /// asks unordered access for (it gets a colour twin).
@@ -4280,7 +4456,7 @@ mod tests {
             return view;
         }
         let key = (address, canonical_resource_desc(*desc));
-        let view = placed_textures()[&key].resource as This;
+        let view = placed_textures()[&key].resource.expect("a published view") as This;
         resident(view);
         texture_at(address, desc).unwrap()
     }
@@ -4664,7 +4840,13 @@ mod tests {
         // SAFETY: this test owns the view and has not used it yet. WARP normally
         // keeps format 67. Give it the same host copy used on RTX hardware.
         let view = unsafe { &mut *stand_in.cast_mut().cast::<Resource>() };
-        view.host = host_texture(&texture(16, 16, RGBA16F, 1), 0, None).map(Arc::new);
+        view.host = host_texture(
+            &texture(16, 16, RGBA16F, 1),
+            0,
+            None,
+            TextureOrigin::Address,
+        )
+        .map(Arc::new);
         resident(stand_in);
         let to = host_copy(stand_in).unwrap();
         let elsewhere = fresh_memory(&mut held);
@@ -4803,6 +4985,71 @@ mod tests {
         assert_eq!(Arc::strong_count(&copy), 1, "the resource let go of it");
         let again = texture_at(address, &view).unwrap();
         assert!(!Arc::ptr_eq(&host_copy(again).unwrap(), &copy));
+        memory_remapped(address as usize, KIB_64 as usize);
+        release_views_at(address);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_read_only_placed_view_waits_for_its_first_mapped_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let test = "resource::tests::a_read_only_placed_view_waits_for_its_first_mapped_page";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let desc = texture(256, 256, 28, 1);
+        let len = footprint(&desc).unwrap().size as usize;
+        let view = words(&desc, [0, 0]);
+        // SAFETY: reserve an OS-selected range and commit one page inside it.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null() && len > 4096);
+        let address = base as u64;
+        assert!(texture_at_with(address, &view, |_| panic!("no host allocation")).is_none());
+        assert!(!placed_textures().contains_key(&(address, view)));
+        // SAFETY: the second page is within the reservation.
+        let page = unsafe { VirtualAlloc(base.add(4096), 4096, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!page.is_null());
+        assert!(texture_at(address, &view).is_some());
+        memory_remapped(address as usize, len);
+        release_views_at(address);
+        // SAFETY: release the original reservation once the view is gone.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_remap_cancels_a_placed_view_still_being_created() {
+        let test = "resource::tests::a_remap_cancels_a_placed_view_still_being_created";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        let view = words(&texture(16, 16, 28, 1), [0, 0]);
+        let mut old = None;
+        let stale = texture_at_with(address, &view, |d| {
+            assert!(texture_at_with(address, &view, |_| panic!("already building")).is_none());
+            let mut out = std::ptr::null();
+            let iid = &RESOURCE_IIDS[0];
+            assert_eq!(
+                at_address(address, d, std::ptr::null(), iid, &mut out, PLACED_VIEW),
+                S_OK
+            );
+            old = resource(out).host.clone();
+            memory_remapped(address as usize, KIB_64 as usize);
+            Some(out)
+        });
+        assert!(stale.is_none());
+        assert_eq!(
+            Arc::strong_count(&old.unwrap()),
+            1,
+            "unpublished copy released"
+        );
+        assert!(texture_at(address, &view).is_some());
         memory_remapped(address as usize, KIB_64 as usize);
         release_views_at(address);
     }

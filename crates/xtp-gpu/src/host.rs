@@ -1371,6 +1371,7 @@ impl Host {
     /// Runs a title submission (the lists of one `ExecuteCommandLists`),
     /// counted for the frame-rate line once it has finished.
     pub(crate) fn submit(&self, runs: &[&HostList]) {
+        crate::resource::reap_placed_views();
         #[cfg(feature = "diagnostics")]
         crate::passdump::submitted(runs);
         #[cfg(feature = "diagnostics")]

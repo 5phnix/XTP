@@ -212,11 +212,21 @@ pub(super) fn written_beside(
     })
 }
 
+static SEEN: AtomicU64 = AtomicU64::new(0);
+static SHARED: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn counts() -> (u64, u64) {
+    let shared = SHARED.load(Ordering::Relaxed);
+    (SEEN.load(Ordering::Relaxed), shared)
+}
+
 /// Logs the first aliases met over a GPU-written texture (then every
 /// power of two), shared or not and why.
 fn note(address: u64, want: &ResourceDesc, how: &str, with: Option<usize>, why: &str, on: bool) {
-    static SEEN: AtomicU64 = AtomicU64::new(0);
     let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if on && with.is_some() {
+        SHARED.fetch_add(1, Ordering::Relaxed);
+    }
     if n > 64 && !n.is_power_of_two() {
         return;
     }
@@ -299,7 +309,6 @@ pub(super) fn unregister(address: u64, resource: usize) {
     }
 }
 
-#[cfg(test)]
 pub(super) fn has_sources(address: u64) -> bool {
     sources().contains_key(&address)
 }
