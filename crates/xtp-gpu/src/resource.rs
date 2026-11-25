@@ -12,7 +12,7 @@ mod alias;
 pub(crate) mod decode;
 pub(crate) mod format;
 #[cfg(windows)]
-mod pool;
+pub(crate) mod pool;
 #[cfg(windows)]
 mod ranges;
 #[cfg(windows)]
