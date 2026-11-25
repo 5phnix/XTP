@@ -1899,6 +1899,11 @@ fn rayquery_proves_a_title_container_by_play() {
     // As the runtime translates it: spliced and valid.
     let cs = super::translate(&data).unwrap_or_else(|e| panic!("{e}"));
     check_dxil(&cs);
+    // Its DXIL, for a look at its loops (`dxc -dumpbin`), where
+    // `XTP_RT_DXIL_OUT` says: outside the repository, as the container.
+    if let Some(out) = std::env::var_os("XTP_RT_DXIL_OUT") {
+        std::fs::write(out, &cs.dxil).unwrap();
+    }
     // With `XTP_TEST_ADAPTER=hardware` (or unset), its compute pipeline on
     // the default hardware adapter, translated for that adapter's waves: a
     // driver's compiler that fails on it fails this process only (VIctory
