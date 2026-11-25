@@ -1555,6 +1555,13 @@ impl Host {
         self.executing.load(Ordering::SeqCst)
     }
 
+    /// The host queue: reserved textures' tile mappings
+    /// (`resource::pool::Tiles`) are queued on it, in order with the
+    /// submissions.
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
     /// The host fence value the GPU has reached (all ones once the device
     /// is removed).
     pub(crate) fn completed(&self) -> u64 {

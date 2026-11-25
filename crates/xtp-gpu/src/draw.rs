@@ -1772,6 +1772,7 @@ impl State {
                 // Its host texture is made below unless a draw made it: it
                 // waits if the video memory left cannot take it.
                 if len as u64 > video_left {
+                    crate::texture::note_left_for_room(len as u64);
                     counts.left += 1;
                     counts.full = 1;
                     once!(
