@@ -10,9 +10,10 @@ rectangles ran and left the sampled scene colour at zero. A shader's role
 identifies its place in the frame even when its inputs or outputs are empty.
 
 Each row gives the first 16 hex digits of the program container hash and
-the stage reported by the local record list. Evidence marked *code* is from
-reading the matching program locally. High confidence means the evidence
-ties the program to the stated operation or output. Medium means it supports
+the stage reported by the local record list or the system-library dispatch
+notes. Evidence marked *code* is from reading the matching program locally.
+High confidence means the evidence ties the program to the stated
+operation or output. Medium means it supports
 the role but leaves some details or the exact pass open. Low means the role
 is tentative. Confidence is about the stated role, including any narrower
 qualification in the row.
@@ -44,7 +45,7 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `94d281151ca58b4f` | Pixel | Writes material targets in the first G-buffer pass. | [PIX §7][pix7] | high |
 | `63051e97862e7dad` | Pixel | Writes later G-buffer material data, including albedo independent of the second vertex colour. | [PIX §7][pix7] | high |
 | `57a27c5e2e1d62a9` | Pixel | Writes material data in a later G-buffer pass that adds albedo. | [PIX §7][pix7] | high |
-| `f0c91b4d2578f5bf` | Compute | Resolves G-buffer and depth inputs into packed material targets, a material-class depth plane and an initial HDR scene colour. | [PIX §§4, 5.2][pix4], [Image status §4.1][image41] | high |
+| `f0c91b4d2578f5bf` | Compute | Resolves G-buffer and depth inputs into packed material targets, a material-class depth plane and an initial HDR scene colour. | [PIX §§4, 5.2][pix4], [Image status §4.1][image41], [Fallback §8.3][rtf83] | high |
 
 ## Local lights and deferred shading
 
@@ -59,14 +60,14 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `7f4b62129572a14d` | Vertex | Places a second light proxy shape in the same cluster grid. | [Light chain §3.1][tiles] | high |
 | `5ad3a82b1c3cc63a` | Pixel | Marks light coverage in cluster masks where the light proxies rasterise. | [Light chain §3.1][tiles], [GPU frame §10.11][gpu1011] | high |
 | `7c90a988167650a1` | Compute | Reads the rasterised cluster buffer and prepares a secondary cluster buffer. | [Light chain §§3.1, 5][tiles] | high |
-| `bad01f53f53248e5` | Compute | Classifies materials on the 80×45 grid and counts work for indirect lighting dispatches. | [Light chain §3.1][tiles], [PIX §11.3][pix113] | high |
-| `11eeb27c2d15980d` | Compute | Merges cluster masks across each tile's depth range, filters excluded lights and writes the 13-slice tile mask. | [Light chain §§3.1–3.3][tiles] | high |
-| `fea2b7d3f17b504f` | Compute | Builds coarse material classification over the 10×6 tile grid. | [Light chain §3.1][tiles], code | high |
+| `bad01f53f53248e5` | Compute | Classifies materials on the 80×45 grid and counts work for indirect lighting dispatches. | [Light chain §3.1][tiles], [PIX §11.3][pix113], [Ray tracing §1][rt1] | high |
+| `11eeb27c2d15980d` | Compute | Merges cluster masks across each tile's depth range, filters excluded lights and writes the 13-slice tile mask. | [Light chain §§3.1–3.3][tiles], [Ray tracing §1][rt1] | high |
+| `fea2b7d3f17b504f` | Compute | Builds coarse material classification over the 10×6 tile grid. | [Light chain §3.1][tiles], code, [Ray tracing §1][rt1] | high |
 | `0a5ecfee6b79e13b` | Compute | Reads tile masks and queues shadow-ray work for individual lights. | [Light chain §3.1][tiles], code | high |
 | `5cf00dc39042edaf` | Compute | Queues shadow-ray work in the same chain with additional shadow sampling and image writes. | [Light chain §3.1][tiles], code | high |
-| `495c6013589afd60` | Compute | Converts the queued shadow-ray count into indirect dispatch arguments. | [Light chain §3.1][tiles] | high |
-| `32ed072b9f845048` | Compute | Traces local-light shadows and supplies shadow distances for a deferred light type. | [PIX §5.3][pix53], [Lighting terms §4.4][terms44] | high |
-| `559d9f0184e15fe3` | Compute | Traces the queued local-light shadow rays for checkerboard visibility masks. | [Light chain §3.1][tiles], [Ray tracing §2][rt2] | high |
+| `495c6013589afd60` | Compute | Converts the queued shadow-ray count into indirect dispatch arguments. | [Light chain §3.1][tiles], [Ray tracing §4][rt4] | high |
+| `32ed072b9f845048` | Compute | Traces local-light shadows and supplies shadow distances for a deferred light type. | [PIX §5.3][pix53], [Lighting terms §4.4][terms44], [DXR §4.1][dxr41], [DXR trace addresses][r4tile], [Fallback §8.2][rtf82] | high |
+| `559d9f0184e15fe3` | Compute | Traces the queued local-light shadow rays for checkerboard visibility masks. | [Light chain §3.1][tiles], [Ray tracing §2][rt2], [DXR §4.1][dxr41], [DXR trace addresses][r4dxr], [Fallback §8.2][rtf82] | high |
 | `0ea6fac38d096770` | Compute | Filters the traced shadow results into the wide tile visibility texture. | [Light chain §3.1][tiles], code | high |
 | `307e048e4cdd99d4` | Compute | Clears light bits from tile masks where the shadow visibility marks them occluded. | [Light chain §§3.1–3.2][tiles] | high |
 | `fb9c7f430da14c4c` | Compute | Computes sky spherical-harmonic sums and lighting scale factors, including the directional-light scale read by deferred shading, from exposure, sky texture and constant inputs. | [Lighting terms §4.3][terms43] | high |
@@ -74,7 +75,7 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `5741294cf872ffb9` | Compute | Writes the 80×45 R8 per-tile mask used to gate directional-light deferred rectangles. | [Lighting terms §4.3][terms43] | high |
 | `f11c3ddeaeb7d602` | Compute | Reduces the 80×45 R8 directional-light tile mask to the 10×6 R8 mask read by the deferred-light rectangle vertex stage. | [Lighting terms §4.3][terms43] | high |
 | `25ebc92075b62822` | Vertex | Places deferred-light rectangles over the material tiles tested against the class depth plane. | [PIX §5.1][pix51], [World black §8.2][black82] | high |
-| `1cd9bc634417a981` | Pixel | Combines albedo with probe light, a directional-light term and masked local lights, adds a specular term, and scales by exposure for deferred scene colour. | [PIX §11.3][pix113], [Light chain §3.1][tiles], [Lighting terms §3][terms3] | high |
+| `1cd9bc634417a981` | Pixel | Combines albedo with probe light, a directional-light term and masked local lights, adds a specular term, and scales by exposure for deferred scene colour. | [PIX §11.3][pix113], [Light chain §3.1][tiles], [Lighting terms §3][terms3], [Fallback §8.3][rtf83] | high |
 | `1d2c970773ce2183` | Vertex | Places rectangles in a follow-up lighting pass. | [World black §8.2][black82], code | high |
 | `e070816c3b889df0` | Pixel | Shades rectangles in that follow-up lighting pass. | [World black §8.2][black82] | high |
 
@@ -82,8 +83,8 @@ are open. The two skinned shadow programs have their own pass evidence.
 
 | Hash | Stage | Role | Evidence | Confidence |
 |---|---|---|---|---|
-| `39f0e9aeb156a61c` | Compute | Selects active screen-probe rays and prepares tracing work. | [Light chain §4][probes] | high |
-| `f22a76fcb967ee59` | Compute | Traces screen-probe rays against the acceleration structure and writes hit records for indirect diffuse lighting. | [Light chain §4][probes] | high |
+| `39f0e9aeb156a61c` | Compute | Selects active screen-probe rays and prepares tracing work. | [Light chain §4][probes], [DXR trace addresses][r4probe] | high |
+| `f22a76fcb967ee59` | Compute | Traces screen-probe rays against the acceleration structure and writes hit records for indirect diffuse lighting. | [Light chain §4][probes], [DXR §4.1][dxr41], [DXR trace addresses][r4probe], [Fallback §8.2][rtf82] | high |
 | `b48d48f8304e5bd3` | Compute | Handles rays that missed and writes their contribution for probe injection. | [Light chain §4][probes] | high |
 | `6bb493a39685ddcc` | Compute | Combines run-time ray results with the miss path and deposits them in the screen-probe atlas. | [Light chain §4][probes] | high |
 | `8cb27ccf2d50c606` | Compute | Filters the probe atlas after injection. | [Light chain §4][probes], [PIX §11.3][pix113] | high |
@@ -93,13 +94,119 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `34fb51b8a0312e82` | Compute | Accumulates the current probe lighting with history and writes packed indirect light for deferred shading. | [PIX §11.3][pix113], [Light chain §4][probes] | high |
 | `dce085c07b9414b6` | Compute | Reads lighting textures and writes packed light that deferred shading samples through a shared-exponent view. | [PIX §11.4][pix114], code | medium |
 | `71883e40620a567a` | Compute | Updates a packed lighting texture also written by the probe temporal resolve. Its separate contribution is open. | [PIX §11.4][pix114], code | medium |
-| `f607780aa8e502d0` | Compute | Traces shadow rays for the irradiance cache. | [PIX §5.3][pix53], [Ray tracing §2][rt2] | high |
-| `3592426e3e9142d8` | Compute | Traces the primary gather for light probes. | [PIX §5.3][pix53], [Ray tracing §2][rt2] | high |
-| `36f04a4ed0ad1d9b` | Compute | Traces the probe gather for transparent surfaces. | [PIX §5.3][pix53], [Ray tracing §2][rt2] | high |
-| `b58eb3ca6ee46427` | Compute | Gathers ray records for the irradiance cache. | [PIX §5.3][pix53], [Ray tracing §2][rt2] | high |
-| `6d7fe7745ab9c6d8` | Compute | Traces reflection visibility for screen rays, including a use in transparent rendering. | [PIX §5.3][pix53], [Ray tracing §2][rt2] | high |
-| `0873f80dd84a3c5c` | Compute | Traverses the acceleration structure and stores ray results. A frame binding and the result's consumer are open. | [Light chain §1][light1], code | medium |
-| `caf96a3229145fa6` | Compute | Tests GPU particles for collisions against the acceleration structure. | [PIX §5.3][pix53], [Ray tracing §2][rt2] | high |
+| `f607780aa8e502d0` | Compute | Traces shadow rays for the irradiance cache. | [PIX §5.3][pix53], [Ray tracing §2][rt2], [DXR §4.1][dxr41], [DXR trace addresses][r4dxr], [Fallback §§3, 8.2][rtf3] | high |
+| `3592426e3e9142d8` | Compute | Traces the primary gather for light probes. | [PIX §5.3][pix53], [Ray tracing §2][rt2], [DXR §4.1][dxr41], [DXR trace addresses][r4dxr], [Fallback §§3, 8.2][rtf3] | high |
+| `36f04a4ed0ad1d9b` | Compute | Traces the probe gather for transparent surfaces. | [PIX §5.3][pix53], [Ray tracing §2][rt2], [DXR §4.1][dxr41], [DXR trace addresses][r4dxr], [Fallback §§3, 8.2][rtf3] | high |
+| `b58eb3ca6ee46427` | Compute | Gathers ray records for the irradiance cache. | [PIX §5.3][pix53], [Ray tracing §2][rt2], [DXR §4.1][dxr41], [DXR trace addresses][r4dxr], [Fallback §§3, 8.2][rtf3] | high |
+| `6d7fe7745ab9c6d8` | Compute | Traces reflection visibility for screen rays, including a use in transparent rendering. | [PIX §5.3][pix53], [Ray tracing §2][rt2], [DXR §4.1][dxr41], [DXR trace addresses][r4dxr], [Image comparison §4][fork4], [Fallback §8.2][rtf82] | high |
+| `0873f80dd84a3c5c` | Compute | Traverses the acceleration structure and stores ray results. A frame binding and the result's consumer are open. | [Light chain §1][light1], code, [Image comparison §4][fork4] | medium |
+| `caf96a3229145fa6` | Compute | Tests GPU particles for collisions against the acceleration structure. | [PIX §5.3][pix53], [Ray tracing §2][rt2], [DXR §4.1][dxr41], [Fallback §8.2][rtf82] | high |
+
+## Ray tracing
+
+The [stand-in study][rt2] tied nine of the thirteen traces it tracked to
+dropped dispatches in frame 707. The four distant sun-shadow variants
+were absent from that frame, which used shadow cascades. The tables below
+add variants and related passes. The local-light traces are listed under
+[local lights][local-lights], and the main gathers, reflection trace and
+particle collision are under [probe and traced lighting][traced-lighting].
+
+### Shadow traces and mask preparation
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `a1b20bc47e3c9597` | Compute | Traces sun-shadow visibility beyond the shadow cascades. Not dispatched in frame 707; consumer open. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | medium |
+| `e8c962358d862e3f` | Compute | Traces sun-shadow visibility beyond the shadow cascades. Not dispatched in frame 707; consumer open. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | medium |
+| `17829ac71aab4e8d` | Compute | Traces sun-shadow visibility beyond the shadow cascades. Not dispatched in frame 707; consumer open. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | medium |
+| `afeea48bbb9913ad` | Compute | Traces sun-shadow visibility beyond the shadow cascades. Not dispatched in frame 707; consumer open. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | medium |
+| `5f13c9550dc4ab39` | Compute | Traces irradiance-cache shadows when far-field tracing is disabled. | [Fallback §3][rtf3], code | high |
+| `e22a5d3d6857a2f5` | Compute | Clears the local-light shadow-mask counters before indirect dispatch arguments are built. | [Ray tracing §§2, 4][rt4] | high |
+
+### Probe and irradiance gathers
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `aeb93e0888250bd3` | Compute | Traces the primary light-probe gather with far-field tracing disabled. | [Ray tracing §3][rt3], [Fallback §3][rtf3], code | high |
+| `a74a0746279f960d` | Compute | Traces the irradiance-cache gather with far-field tracing disabled. | [Ray tracing §3][rt3], [Fallback §3][rtf3], code | high |
+| `3d121c93c7f9a057` | Compute | Traces the transparent-surface probe gather with far-field tracing disabled. | [Ray tracing §3][rt3], [Fallback §3][rtf3], code | high |
+| `c519f7a7946e3702` | Compute | Copies gather data into the irradiance-cache atlas and writes auxiliary buffers. | [Ray tracing §4][rt4], [Fallback §8.3][rtf83] | high |
+| `ab619d0b7b7684d2` | Compute | Reads the irradiance-cache atlas while mixing lighting inputs. | [Fallback §§5, 8.3][rtf83] | high |
+| `6a62009bc6a4146e` | Compute | Mixes lighting inputs in the probe system. Its atlas read is open. | [Fallback §5][rtf5] | medium |
+
+### Reflections
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `2cc4c197ee29e291` | Compute | Prepares tiles for reflection rays. The exact tile layout is open. | [Image comparison §§1, 4][fork4] | medium |
+
+### BVH build and refit helpers
+
+The [refusals study][ref62] identifies 34 compute programs from the
+system library in the acceleration-structure list. The individual
+kernel operations and their split between build and refit are open.
+The title's instance-transform and skinning helpers are listed with the
+[other programs from that study][refusal-roles].
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `3b90165a77d95cdf` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `f6e47efa50226beb` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `caa78b8ca62bc3d6` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `5552dac6a2b7a1fd` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `198f6dfd2b81bcea` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `5062bc7a48e842f8` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `5279ae36796c31fc` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `c42a31951201f9a0` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `162216b9cfd91aaf` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `28918b7150a7aad5` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `3df629ffc3d0a2a6` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `6f6a359d1166bb27` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `f28a33a89eaa2caa` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `4b5aedc0e96b0770` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `a63e2dfc25ba3155` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `bb55c842c391589f` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `cb9647e77864cb3a` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `7bb5b1b91d283a28` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `a197f50cd8481541` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `c85822de2e41cfaa` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `190fbf0ebe040169` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `4ddd6f9702fab2a7` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `5e68767498c57eb6` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `14394a322f6dd5c2` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `e63d22c4def9ba6a` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `e95858837a9aa22d` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `f6eb6498409ca974` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `3cea4534bbc15632` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `894c91654720595f` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `9205d2655bf8cc88` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `35e51bb27a463294` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `5c09eb42b7a3c362` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `f94e5d8bf4e1cf05` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+| `ffd93c8a029ff016` | Compute | Runs a kernel in the system acceleration-structure builder. | [Refusals §6.3][ref63] | medium |
+
+### Stand-in and fallback paths
+
+XTP's [miss stand-in][rt1] is opt-in (`XTP_RT_STANDIN`, off by default).
+When it is on, it fills outputs for dropped traces under the original
+dispatch hashes. By default it clears only their texture outputs, to
+"every ray missed"; buffer outputs are filled only as
+`XTP_RT_STANDIN_FILL` says. The voxel and fallback variants below have
+their own hashes. The [fallback A/B][rtf82] observed the primary-probe
+and transparent-probe fallback dispatches and [measured their
+outputs][rtf83]. The irradiance cache skips its gather and shadow
+dispatches on that path.
+
+| Hash | Stage | Role | Evidence | Confidence |
+|---|---|---|---|---|
+| `1a1c5c02e73751b6` | Compute | Uses the voxel scene for the primary light-probe gather. | [Ray tracing §3][rt3] | medium |
+| `64673ea7805c27be` | Compute | Uses the voxel scene for the irradiance-cache gather. | [Ray tracing §3][rt3] | medium |
+| `d7752c9f275803d8` | Compute | Uses the voxel scene for the transparent-surface probe gather. | [Ray tracing §3][rt3] | medium |
+| `05767b5d544b0c7a` | Compute | Uses the voxel scene for the screen-probe rays. | [Ray tracing §3][rt3] | medium |
+| `12f7da9158b1ce24` | Compute | Runs the voxel variant of the deferred gather. Its outputs are open. | [Ray tracing §3][rt3] | medium |
+| `81560230fcde2b0a` | Compute | Runs the primary-probe fallback gather and writes a single-channel gather texture. | [Fallback §§3, 8.3][rtf83] | high |
+| `29dc558346584906` | Compute | Gathers and shades the fallback probes for transparent surfaces, writing the two 32×16 textures. | [Ray tracing §3][rt3], [Fallback §8.3][rtf83] | high |
+| `a953d5b93efe8424` | Compute | Supplies the fallback variant for screen-probe rays. Its outputs are open. | [Ray tracing §3][rt3], [Fallback §4][rtf4] | medium |
+| `62543c14e97e7ed7` | Compute | Supplies the fallback variant of the deferred gather. Its outputs are open. | [Ray tracing §3][rt3] | medium |
 
 ## Sky, fog and post-processing
 
@@ -108,7 +215,7 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `53e3931a17a13ac5` | Compute | Builds the atmospheric transmittance lookup texture. | [World black §8.3][black83] | high |
 | `545138fdb1d94e1b` | Compute | Builds the multiple-scattering lookup texture used in sky preparation. | [World black §8.3][black83] | high |
 | `26b8bbb2e7ae4dc6` | Compute | Uses transmittance and multiple scattering to generate the 192×108 sky-view lookup textures. | [World black §8.3][black83] | high |
-| `348e1e8c414c7eca` | Compute | Evaluates the sky from scene depth, exposure and atmospheric lookup textures and writes scene colour. | [PIX §4][pix4], [World black §8.2][black82] | high |
+| `348e1e8c414c7eca` | Compute | Evaluates the sky from scene depth, exposure and atmospheric lookup textures and writes scene colour. | [PIX §4][pix4], [World black §8.2][black82], [Fallback §8.3][rtf83] | high |
 | `d91fdb5004fdadf1` | Vertex | Places the sky dome geometry. | [World black §8.2][black82] | high |
 | `3ae25b11290cadde` | Pixel | Shades the rasterised sky dome. | [World black §§8.2, 8.4][black82] | high |
 | `6e750a37b1da6949` | Vertex | Places geometry for the cloud draw. | [World black §8.2][black82] | high |
@@ -184,8 +291,8 @@ no output bindings.
 
 These roles come from other world frames and include work that prepares
 geometry or lighting before the main passes. Pass and output associations
-come from the capture notes. The acceleration-structure builder also has
-system-library programs outside the pack, which are left for a separate map.
+come from the capture notes. The system library's acceleration-structure
+programs are listed in the [BVH table][bvh-roles].
 
 | Hash | Stage | Role | Evidence | Confidence |
 |---|---|---|---|---|
@@ -233,7 +340,7 @@ system-library programs outside the pack, which are left for a separate map.
 | `b3e7781d53ff8326` | Compute | Updates buffers for hair strands. The exact strand operation is open. | [Refusals §6.3][ref63] | medium |
 | `02384a60fda6f2d0` | Compute | Processes buffers in the visual-effects pass. The consumers are open. | [Refusals §6.3][ref63] | low |
 | `aab1b3c7248ee5de` | Compute | Queues work records and writes an image result in the traced-lighting lists. The downstream consumer is open. | [Refusals §6.3][ref63], code | low |
-| `e30970f1727063fd` | Compute | Prepares transforms for impostor instances in the ray-tracing acceleration structure. | [Refusals §6.3][ref63] | medium |
+| `e30970f1727063fd` | Compute | Prepares transforms for impostor instances in the ray-tracing acceleration structure. | [Refusals §6.3][ref63], [Refusals §6.2][ref62] | medium |
 | `82a2ad6d07417d36` | Compute | Skins geometry into vertex buffers for the ray-tracing acceleration structure. | [Refusals §6.3][ref63] | medium |
 | `90a0692af4320129` | Compute | Skins geometry into vertex buffers for the ray-tracing acceleration structure. | [Refusals §6.3][ref63] | medium |
 | `21d27f785da6d2b1` | Compute | Processes indexed records and writes vector results to buffers. The pass is open. | [Refusals §6.1][ref61], code | low |
@@ -321,7 +428,24 @@ pipeline records. The bilinear upscaler in the measured frame is XTP's
 [terms43]: lighting-terms.md#43-the-directional-light
 [terms44]: lighting-terms.md#44-the-lamps
 [terms7]: lighting-terms.md#7-sessions-lightterms-1-and-lightterms-2
+[local-lights]: #local-lights-and-deferred-shading
+[traced-lighting]: #probe-and-traced-lighting
+[refusal-roles]: #other-programs-named-in-the-refusals-study
+[bvh-roles]: #bvh-build-and-refit-helpers
+[rt1]: rt-standin.md#1-summary
 [rt2]: rt-standin.md#2-the-world-frame-pass-by-pass
+[rt3]: rt-standin.md#3-the-titles-own-switch
+[rt4]: rt-standin.md#4-what-the-lighting-reads-from-the-traces
+[dxr41]: rt-dxr.md#41-two-families
+[r4dxr]: r4-dxr.md
+[r4probe]: r4-dxr.md#screen-probe-rays
+[r4tile]: r4-dxr.md#tile-mask-ray-and-output-in-the-prototype
+[rtf3]: rt-fallback.md#3-the-probe-systems-dispatch-steps
+[rtf4]: rt-fallback.md#4-the-other-callers
+[rtf5]: rt-fallback.md#5-forcing-the-fallback-xtp_rt_path
+[rtf82]: rt-fallback.md#82-the-path-changes
+[rtf83]: rt-fallback.md#83-probes-irradiance-cache-lighting
+[fork4]: fork-image-diff.md#4-zero-lighting
 [gpu104]: gpu-frame.md#104-the-frame-and-the-gpu-by-kind
 [gpu105]: gpu-frame.md#105-by-program-the-top-20
 [gpu107]: gpu-frame.md#107-the-top-costs-why-and-who-owns-them

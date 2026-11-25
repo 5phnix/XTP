@@ -234,7 +234,8 @@ The ordering tests of G3 and G4 (`list::tests::gpu`) record small compute
 kernels into title lists, standing in for the title's passes:
 
 - dispatch, copy, dispatch in one submission;
-- whole-buffer copies and memory copies, overlapping ones within one buffer;
+- whole-buffer copies and memory copies, among them copies within one
+  buffer (staged in a buffer of their own, overlapping or not);
 - a copy without host copies, which stays on the CPU;
 - memory writes read by a later dispatch.
 

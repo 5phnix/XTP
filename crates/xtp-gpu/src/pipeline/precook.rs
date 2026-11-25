@@ -211,7 +211,8 @@ pub fn refusals() -> Option<String> {
 pub const LIBRARY_REBUILD_BYTES: u64 = 2 << 30;
 
 /// What a precook's pipelines depend on besides the pack and the
-/// translator: the descriptions sessions kept and the library file.
+/// translator: the descriptions sessions kept, the library file, and the
+/// settings that change a pipeline without changing a translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cache {
     /// The BLAKE3 of the file of kept descriptions, in hexadecimal; `none`
@@ -219,21 +220,92 @@ pub struct Cache {
     pub recorded: String,
     /// The library file's size (0: none).
     pub library: u64,
+    /// [`PipelineSettings::text`] of this run's.
+    pub settings: String,
 }
 
 /// The cache's state now ([`Cache`]); an empty one without a pipeline
 /// cache folder.
 pub fn cache() -> Result<Cache, String> {
+    let settings = PipelineSettings::now().text();
     let Some(dir) = super::library::dir() else {
         return Ok(Cache {
             recorded: "none".into(),
             library: 0,
+            settings,
         });
     };
     Ok(Cache {
         recorded: digest_in(dir)?,
         library: super::library::file_bytes().unwrap_or(0),
+        settings,
     })
+}
+
+/// What changes the host pipelines besides the translations (the key
+/// their cache entries are kept under) and the title's descriptions: each
+/// setting and host capability that changes a pipeline's description (its
+/// root signature, the state the host makes) or whether it is made at all,
+/// by its effective value. A precook's note says it, and a pass for other
+/// settings is a whole pass (Codex review of d286ffd, point 1: with
+/// `XTP_ROOT_SRV_DIRECT=1` set after a pass, the note still said up to
+/// date, its translation key the same, and no pipeline of the new root
+/// signatures was made: a session made each at its first use).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineSettings {
+    /// Root SRVs bound as one-view tables, not root descriptors
+    /// (`XTP_ROOT_SRV_DIRECT` unset): the root signatures.
+    pub root_srv_tables: bool,
+    /// Wave64 mesh programs refused on hosts without 64-lane waves
+    /// (`XTP_WAVE64_MESH=refuse`): which mesh pipelines are made.
+    pub wave64_mesh_refused: bool,
+    /// The host's wave sizes and shader model: which programs it runs.
+    pub lanes: Option<(u32, u32)>,
+    pub model: Option<(u32, u32)>,
+    /// The host has a depth bounds test (in a pipeline's state) and mesh
+    /// shaders (whether mesh pipelines are made).
+    pub depth_bounds: bool,
+    pub mesh_shaders: bool,
+}
+
+impl PipelineSettings {
+    /// This run's (the host must be made for its capabilities).
+    pub fn now() -> PipelineSettings {
+        let host = crate::host::host();
+        PipelineSettings {
+            root_srv_tables: super::host::bounded_root_srvs(),
+            wave64_mesh_refused: super::host::wave64_mesh_refused(),
+            lanes: crate::device::host_wave_lanes(),
+            model: crate::device::host_shader_model(),
+            depth_bounds: host.is_some_and(|h| h.depth_bounds),
+            mesh_shaders: host.is_some_and(|h| h.mesh_shaders()),
+        }
+    }
+
+    /// One line that says them all, as the note keeps it.
+    pub fn text(&self) -> String {
+        let pair = |p: Option<(u32, u32)>, sep: char| {
+            p.map_or_else(|| "unknown".to_owned(), |(a, b)| format!("{a}{sep}{b}"))
+        };
+        let yes = |b: bool| if b { "yes" } else { "no" };
+        format!(
+            "root-srv {} wave64-mesh {} lanes {} model {} depth-bounds {} mesh {}",
+            if self.root_srv_tables {
+                "tables"
+            } else {
+                "direct"
+            },
+            if self.wave64_mesh_refused {
+                "refused"
+            } else {
+                "translated"
+            },
+            pair(self.lanes, '-'),
+            pair(self.model, '.'),
+            yes(self.depth_bounds),
+            yes(self.mesh_shaders),
+        )
+    }
 }
 
 /// The BLAKE3 of the file of kept descriptions in `dir` now, in
@@ -713,6 +785,36 @@ pub fn finish() -> Result<(), String> {
 
 #[cfg(test)]
 pub(in crate::pipeline) mod tests {
+    /// Each pipeline setting changes the note's line ([`PipelineSettings`]).
+    #[test]
+    fn each_pipeline_setting_changes_its_line() {
+        let base = super::PipelineSettings {
+            root_srv_tables: true,
+            wave64_mesh_refused: false,
+            lanes: Some((32, 32)),
+            model: Some((6, 7)),
+            depth_bounds: true,
+            mesh_shaders: true,
+        };
+        assert_eq!(
+            base.text(),
+            "root-srv tables wave64-mesh translated lanes 32-32 model 6.7 depth-bounds yes mesh yes"
+        );
+        let changed: [fn(&mut super::PipelineSettings); 6] = [
+            |s| s.root_srv_tables = false,
+            |s| s.wave64_mesh_refused = true,
+            |s| s.lanes = Some((32, 64)),
+            |s| s.model = None,
+            |s| s.depth_bounds = false,
+            |s| s.mesh_shaders = false,
+        ];
+        for (i, change) in changed.iter().enumerate() {
+            let mut other = base;
+            change(&mut other);
+            assert_ne!(other.text(), base.text(), "setting {i}");
+        }
+    }
+
     use super::*;
 
     /// A container's stage is its translated program's; none without one.
@@ -760,6 +862,18 @@ pub(in crate::pipeline) mod tests {
         profile: windows::core::PCSTR,
         container: &[u8],
     ) -> Arc<Shader> {
+        translated_with(stage, kind, source, profile, container, |_| {})
+    }
+
+    /// [`translated`], its translation's bindings changed by `edit`.
+    fn translated_with(
+        stage: &'static str,
+        kind: HwStage,
+        source: Option<&str>,
+        profile: windows::core::PCSTR,
+        container: &[u8],
+        edit: impl FnOnce(&mut xtp_shader::emit::HostShader),
+    ) -> Arc<Shader> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         let translated = source.map(|source| {
             let mut blob = None;
@@ -787,20 +901,22 @@ pub(in crate::pipeline) mod tests {
                 )
                 .to_vec()
             };
+            let mut host = xtp_shader::emit::HostShader {
+                stage: kind,
+                dxil,
+                group_base: None,
+                user_data: vec![],
+                samplers: vec![],
+                static_samplers: vec![],
+                root_cbvs: vec![],
+                root_srvs: vec![],
+                root_uavs: vec![],
+                stride_table: false,
+                run_time_buffers: 0,
+            };
+            edit(&mut host);
             super::super::Translated {
-                host: xtp_shader::emit::HostShader {
-                    stage: kind,
-                    dxil,
-                    group_base: None,
-                    user_data: vec![],
-                    samplers: vec![],
-                    static_samplers: vec![],
-                    root_cbvs: vec![],
-                    root_srvs: vec![],
-                    root_uavs: vec![],
-                    stride_table: false,
-                    run_time_buffers: 0,
-                },
+                host,
                 used: vec![],
                 wave64: false,
             }
@@ -1123,5 +1239,54 @@ pub(in crate::pipeline) mod tests {
         let loaded = counts().loaded;
         assert!(HostPipeline::new(&shaders, Some(&state)).is_some());
         assert!(counts().loaded > loaded, "loaded for the same topology");
+    }
+
+    /// A pipeline is named by its root signature as well as by its
+    /// translated code: two compute programs whose DXIL is byte for byte
+    /// the same but whose bindings differ (a root CBV more) are two
+    /// pipelines, and the precook does not answer the second by the
+    /// first's name. (Whether a pipeline is answered by its name is told
+    /// by the stand-in it gets: counts are the process's.)
+    #[test]
+    fn the_same_code_with_another_root_signature_is_another_pipeline() {
+        let test = "pipeline::precook::tests::the_same_code_with_another_root_signature_is_another_pipeline";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !super::super::library::has_library() {
+            return;
+        }
+        let source = "[numthreads(11, 3, 1)] void main() {}";
+        let plain = translated(
+            "compute",
+            HwStage::Cs,
+            Some(source),
+            windows::core::s!("cs_5_1"),
+            b"precook root test: plain",
+        );
+        let rooted = translated_with(
+            "compute",
+            HwStage::Cs,
+            Some(source),
+            windows::core::s!("cs_5_1"),
+            b"precook root test: a root CBV more",
+            |host| host.root_cbvs = vec![0],
+        );
+        let dxil = |s: &Shader| s.translated().map(|t| t.host.dxil.clone());
+        assert_eq!(dxil(&plain), dxil(&rooted), "the same code");
+        let precooked = |shader: &Arc<Shader>| {
+            super::super::library::without_loading(|| {
+                HostPipeline::new(std::slice::from_ref(shader), None).expect("a pipeline")
+            })
+        };
+        let is_stand_in = |p: &HostPipeline| super::super::library::is_stand_in(&p.pso);
+        // Made or answered by its name, then by its name.
+        let _ = precooked(&plain);
+        assert!(is_stand_in(&precooked(&plain)), "held by its name");
+        assert!(
+            !is_stand_in(&precooked(&rooted)),
+            "another root signature: not answered by the plain one's name"
+        );
+        assert!(is_stand_in(&precooked(&rooted)), "then by its own");
     }
 }

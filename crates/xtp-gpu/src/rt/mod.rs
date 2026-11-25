@@ -3,10 +3,17 @@
 mod allocation;
 mod dispatch;
 pub(crate) use allocation::ResultBuffer;
+#[cfg_attr(
+    not(test),
+    expect(unused_imports, reason = "for draws' traces (task ac895e39)")
+)]
+pub(crate) use dispatch::dispatch_descriptor_tlas_in;
 pub use dispatch::{
     IndirectTlas, dispatch_descriptor_tlas, dispatch_indirect_tlas, prepare_indirect_tlas,
 };
 pub(crate) mod compaction;
+mod console;
+mod indices;
 mod instances;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod probe;
@@ -145,29 +152,41 @@ struct Recorder<'a> {
     list: &'a HostList,
 }
 
-/// Whether the host records DXR work: the title's acceleration structure
-/// builds, copies and rehydrations, the empty TLAS and the trace commands.
-/// `XTP_RT_BUILDS=0` turns it all off, a diagnostic for sessions that do
-/// not test ray tracing: the title's structures are then refused, and
-/// traces that need a TLAS are dropped. Default: on.
+/// Whether the host mirrors the title's acceleration structure builds,
+/// copies and rehydrations. `XTP_RT_BUILDS=0` refuses them all, a
+/// diagnostic for sessions that do not test ray tracing (one of these
+/// builds hung the GPU in a DRED session). The empty TLAS and the trace
+/// commands stay: a trace then binds the empty TLAS and every ray misses,
+/// as on the console with an empty structure. Default: on.
 fn builds_on() -> bool {
+    #[cfg(test)]
+    if tests::BUILDS_OFF.get() {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("XTP_RT_BUILDS").map_or(true, |v| v.trim() != "0");
+        let on = builds_asked(std::env::var("XTP_RT_BUILDS").ok().as_deref());
         if !on {
             tracing::warn!(
-                "XTP_RT_BUILDS=0: no host DXR work is recorded (the title's acceleration                  structures are refused, traces that need a TLAS are dropped)"
+                "XTP_RT_BUILDS=0: the title's acceleration structure builds, copies and \
+                 rehydrations are refused; traces bind an empty TLAS (every ray misses)"
             );
         }
         on
     })
 }
 
+/// Whether `XTP_RT_BUILDS`'s value leaves the title's builds on: anything
+/// but `0`.
+fn builds_asked(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
 impl<'a> Recorder<'a> {
+    /// A recorder of host DXR work into `list`, whatever `XTP_RT_BUILDS`
+    /// says: the empty TLAS and the trace commands are recorded either way
+    /// ([`builds_on`] gates the title's builds, copies and rehydrations).
     fn new(list: &'a HostList) -> Option<Self> {
-        if !builds_on() {
-            return None;
-        }
         Some(Self {
             device: device(crate::host::made()?)?,
             commands: list.list.cast().ok()?,
@@ -627,6 +646,8 @@ impl Registry {
 /// of one, finds nothing there (its instances are inactive, its rays miss)
 /// instead of a structure in released memory.
 pub(crate) fn release_buffer(owner: Option<usize>, start: u64, end: u64) {
+    #[cfg(test)]
+    tests::released(start, end);
     let (previous, slots) = registry().retire(start, end, Some(owner));
     drop(previous);
     for slot in slots {
@@ -692,6 +713,10 @@ pub(crate) fn host_tlas_in(list: &HostList, title_tlas: u64) -> Option<u64> {
 /// that BLAS, with mask 0, for an instance of a BLAS the host does not have
 /// ([`instances::rewrite`]), and is that TLAS when it has no instance.
 fn empty_tlas(rec: &Recorder<'_>) -> Option<(Arc<ResultBuffer>, Arc<ResultBuffer>)> {
+    #[cfg(test)]
+    if tests::EMPTY_FAILS.get() {
+        return None;
+    }
     /// The TLAS and the BLAS its instance names, which must outlive it.
     static EMPTY: Mutex<Option<(Structure, Arc<ResultBuffer>)>> = Mutex::new(None);
     let mut shared = EMPTY.lock().unwrap_or_else(|e| e.into_inner());
@@ -819,6 +844,17 @@ fn descriptor_address(handle: u64) -> Option<u64> {
     })
 }
 
+/// What mirroring one title build did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Mirrored {
+    /// The structure is published at its title address.
+    registered: bool,
+    /// A build was recorded, and so its trailing UAV barrier, which orders
+    /// the next build of a batch: a TLAS of no instance is the shared empty
+    /// TLAS and records none.
+    barrier: bool,
+}
+
 /// Mirrors a title build and invalidates an older destination on failure.
 ///
 /// # Safety
@@ -828,12 +864,16 @@ unsafe fn build_one(
     desc: &Build,
     ordered: bool,
     title_bytes: Option<u64>,
-) -> bool {
+) -> Mirrored {
     let dst = desc.DestAccelerationStructureData;
     if dst == 0 || !builds_on() {
-        return false;
+        return Mirrored {
+            registered: false,
+            barrier: false,
+        };
     }
     let generation = registry().begin(dst, title_bytes);
+    let barrier = std::cell::Cell::new(false);
     let built = (|| {
         if !generation.known_extent {
             return None;
@@ -853,7 +893,12 @@ unsafe fn build_one(
         match inputs.Type {
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL => {
                 // SAFETY: the descriptors are borrowed from this title call only.
-                let geometries = unsafe { triangles(list, &inputs) }?;
+                let (mut geometries, jobs) = unsafe { triangles(list, &inputs) }?;
+                if !jobs.is_empty() {
+                    // Its own barriers order what came before the build.
+                    indices::record(&recorder, title_list, &mut geometries, &jobs, dst)?;
+                }
+                let ordered = ordered || !jobs.is_empty();
                 let inputs = Inputs {
                     DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
@@ -861,32 +906,44 @@ unsafe fn build_one(
                     },
                     ..inputs
                 };
-                recorder.build(&inputs, Some(dst), ordered)
+                let built = recorder.build(&inputs, Some(dst), ordered)?;
+                barrier.set(true);
+                Some(built)
             }
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
                 // The empty TLAS traces fall back to, made before they bind
                 // their state, and its BLAS, which stands in for the BLAS of
-                // an instance the host does not have.
-                let empty = empty_tlas(&recorder);
-                let stand_in = empty.as_ref().map_or(0, |(_, blas)| blas.gpu());
-                let (inputs, map) = instances::rewrite(&recorder, title_list, &inputs, stand_in)?;
-                if inputs.NumDescs == 0
-                    && let Some((tlas, blas)) = empty.clone()
-                {
+                // an instance the host does not have. Without them, such an
+                // instance would name a null BLAS and a TLAS of no instance
+                // would be built as one, the two cases they stand in for
+                // (WARP faults on both): the TLAS is refused.
+                let Some((empty, stand_in)) = empty_tlas(&recorder) else {
+                    tracing::warn!(
+                        address = format_args!("{dst:#x}"),
+                        "host DXR TLAS refused: no empty TLAS to stand in for its missing BLAS"
+                    );
+                    return None;
+                };
+                let (inputs, map) =
+                    instances::rewrite(&recorder, title_list, &inputs, stand_in.gpu())?;
+                if inputs.NumDescs == 0 {
                     // WARP divides by zero building a TLAS of no instance:
                     // the empty TLAS, which no ray hits either.
                     return Some(Structure {
                         producer: Producer::recorded(list),
-                        result: tlas,
+                        result: empty,
                         instances: Some(map),
                         compacted_size: None,
-                        holds: Some(blas),
+                        holds: Some(stand_in),
                     });
                 }
+                // The rewrite's barriers order what came before this build.
+                let built = recorder.build(&inputs, Some(dst), true)?;
+                barrier.set(true);
                 Some(Structure {
                     instances: Some(map),
-                    holds: empty.map(|(_, blas)| blas),
-                    ..recorder.build(&inputs, Some(dst), ordered || inputs.NumDescs != 0)?
+                    holds: Some(stand_in),
+                    ..built
                 })
             }
             _ => None,
@@ -899,7 +956,10 @@ unsafe fn build_one(
     if let Some(list) = crate::list::host_list(title_list) {
         generation.submit(list, built.clone());
     }
-    registry().finish(dst, generation.generation, built)
+    Mirrored {
+        registered: registry().finish(dst, generation.generation, built),
+        barrier: barrier.get(),
+    }
 }
 
 /// What the host could not record at a title address.
@@ -947,7 +1007,7 @@ pub unsafe fn rehydrate(list: *const Object, desc: &Build) -> bool {
 /// The list and CPU arrays obey the same contract as `rehydrate`.
 pub unsafe fn rehydrate_sized(list: *const Object, desc: &Build, title_bytes: Option<u64>) -> bool {
     // SAFETY: the caller supplies the same live inputs required by build.
-    let recorded = unsafe { build_one(list, desc, false, title_bytes) };
+    let recorded = unsafe { build_one(list, desc, false, title_bytes) }.registered;
     #[cfg(feature = "diagnostics")]
     if probe::enabled() {
         let sampled = recorded
@@ -971,11 +1031,13 @@ impl Builder {
     /// `list` is a live title command list and the CPU geometry arrays are valid for the call.
     pub unsafe fn build(&self, list: *const Object, desc: &Build) -> bool {
         // SAFETY: the caller supplies the list and geometry arrays.
-        unsafe { build_one(list, desc, false, None) }
+        unsafe { build_one(list, desc, false, None) }.registered
     }
 
     /// Records a contiguous batch. The preceding build's final UAV barrier also
-    /// orders scratch reuse and AS dependencies for the following entry.
+    /// orders scratch reuse and AS dependencies for the following entry; an
+    /// entry that recorded no build (a TLAS of no instance, a refused one)
+    /// leaves the next its own entry barrier.
     ///
     /// # Safety
     /// The list and descriptors obey the single-build contract. No external GPU commands
@@ -1000,8 +1062,8 @@ impl Builder {
     ) {
         let mut ordered = false;
         for (desc, title_bytes) in descs {
-            // SAFETY: the batch supplies live inputs. Only a completed build leaves a trailing barrier.
-            ordered = unsafe { build_one(list, desc, ordered, title_bytes) };
+            // SAFETY: the batch supplies live inputs. Only a recorded build leaves a trailing barrier.
+            ordered = unsafe { build_one(list, desc, ordered, title_bytes) }.barrier;
         }
     }
 
@@ -1052,10 +1114,6 @@ impl Builder {
         }
         registry().finish(dst, generation.generation, copied)
     }
-}
-
-fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u64> {
-    Some(input_range(list, address, bytes, alignment)?.gpu(address))
 }
 
 fn input_range(
@@ -1136,52 +1194,50 @@ fn invalid<T>(geometry: usize, why: std::fmt::Arguments<'_>) -> Option<T> {
     None
 }
 
-/// The largest of the `count` indices of `size` bytes at title `address`,
-/// as title memory holds them now, read through the kernel (unmapped pages
-/// read as zeros, guarded ones raise nothing).
-fn largest_index(address: u64, count: u64, size: u64) -> u32 {
-    let Some(len) = count
-        .checked_mul(size)
-        .and_then(|n| usize::try_from(n).ok())
-    else {
-        return u32::MAX;
+/// Whether `shadow`'s buffer holds `bytes` from its host address `host`.
+fn holds(shadow: &crate::shadow::Shadow, host: u64, bytes: u64) -> bool {
+    // SAFETY: plain queries on a live buffer.
+    let (base, width) = unsafe {
+        (
+            shadow.buffer.GetGPUVirtualAddress(),
+            shadow.buffer.GetDesc().Width,
+        )
     };
-    let mut bytes = vec![0u8; len];
-    crate::host::copy_mapped(bytes.as_mut_ptr(), address as *const u8, len, false);
-    if size == 2 {
-        let (indices, _) = bytes.as_chunks::<2>();
-        indices
-            .iter()
-            .map(|&i| u32::from(u16::from_le_bytes(i)))
-            .max()
-            .unwrap_or(0)
-    } else {
-        let (indices, _) = bytes.as_chunks::<4>();
-        indices
-            .iter()
-            .map(|&i| u32::from_le_bytes(i))
-            .max()
-            .unwrap_or(0)
-    }
+    host.checked_add(bytes)
+        .is_some_and(|end| host >= base && end <= base + width)
 }
 
-/// Translates indexed or non-indexed triangle descriptions to host addresses.
+/// Translates triangle descriptions for a host build. Each input of each
+/// geometry (indices, vertices, transform) becomes a job of the pass that
+/// makes it in the build's own buffer, where the build reads it
+/// ([`indices`]); the pass sets the geometry's addresses when it is
+/// recorded. The console builder's own formats are decoded there
+/// ([`console`]): `R16_TYPELESS` indices are meshlet-packed, `R32G32_FLOAT`
+/// vertices quantized, and the vertex stride is 15 bits and a flag.
+///
 /// Each input is checked first, and a BLAS with an invalid one is refused
 /// with a log ([`invalid`]): a geometry that is not triangles or has an
-/// unknown format, a vertex stride shorter than a vertex, a vertex or index
-/// count that is no whole number of triangles, vertices, indices or a
-/// transform outside title memory or misaligned, an index past the
-/// vertices (as title memory holds them when the build is recorded), or
-/// more geometries or triangles than DXR allows.
+/// unknown format, a vertex stride shorter than a vertex or past the
+/// builder's 16 bits, a vertex or index count that is no whole number of
+/// triangles, vertices (with their header), indices, packed indices'
+/// parts or a transform outside title memory or misaligned, or more
+/// geometries or triangles than DXR allows. Indices past the vertices,
+/// decoded ones included, are checked on the GPU, in the version the build
+/// reads ([`indices`]).
 ///
 /// # Safety
 /// The active layout supplies NumDescs readable CPU descriptors or pointers to them.
-unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
+unsafe fn triangles(
+    list: &HostList,
+    inputs: &Inputs,
+) -> Option<(Vec<Geometry>, Vec<indices::Job>)> {
+    use indices::{Input, Job, Kind};
     let count = inputs.NumDescs;
     if count > D3D12_RAYTRACING_MAX_GEOMETRIES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE {
         return invalid(0, format_args!("{count} geometries"));
     }
     let mut geometries = Vec::new();
+    let mut jobs = Vec::new();
     let mut total = 0u64;
     for i in 0..count as usize {
         // SAFETY: the caller provides NumDescs CPU descriptions in the selected layout.
@@ -1210,15 +1266,25 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
         }
         // SAFETY: the geometry type selects Triangles in our own copy.
         let t = unsafe { &mut g.Anonymous.Triangles };
+        // The builder reads 15 bits of stride; bit 15 turns packed triangles.
+        let raw = t.VertexBuffer.StrideInBytes;
+        if raw > console::STRIDE | console::FLIP {
+            return invalid(
+                i,
+                format_args!("vertex stride {raw:#x}, past the builder's 16 bits"),
+            );
+        }
+        let (stride, flip) = (raw & console::STRIDE, raw & console::FLIP != 0);
+        let quantized = t.VertexFormat == DXGI_FORMAT_R32G32_FLOAT;
         let (width, alignment) = match t.VertexFormat {
             DXGI_FORMAT_R32G32B32_FLOAT => (12, 4),
-            DXGI_FORMAT_R32G32_FLOAT => (8, 4),
+            // Quantized, read a word at a time.
+            DXGI_FORMAT_R32G32_FLOAT => (console::QUANTIZED_VERTEX, 4),
             DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (8, 2),
             DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_SNORM => (4, 2),
             format => return invalid(i, format_args!("vertex format {}", format.0)),
         };
-        let stride = t.VertexBuffer.StrideInBytes;
-        if stride < width || stride > u32::MAX.into() || !stride.is_multiple_of(alignment) {
+        if stride < width || !stride.is_multiple_of(alignment) {
             return invalid(
                 i,
                 format_args!("vertex stride {stride} for vertices of {width} bytes"),
@@ -1232,19 +1298,78 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
             return invalid(i, format_args!("no vertex"));
         };
         let start = t.VertexBuffer.StartAddress;
-        let Some(host) = range(list, start, bytes, alignment) else {
-            return invalid(
-                i,
-                format_args!("vertices {start:#x}+{bytes:#x} outside title memory or misaligned"),
-            );
-        };
-        t.VertexBuffer.StartAddress = host;
-        if t.IndexFormat == DXGI_FORMAT_R16_TYPELESS {
-            t.IndexFormat = DXGI_FORMAT_R16_UINT;
+        if quantized {
+            // From their header.
+            let window = start.checked_sub(console::QUANTIZED_HEADER).and_then(|at| {
+                let shadow = input_range(list, at, bytes + console::QUANTIZED_HEADER, 4)?;
+                Some((shadow.gpu(at), shadow))
+            });
+            let Some((source, shadow)) = window else {
+                return invalid(
+                    i,
+                    format_args!(
+                        "quantized vertices {start:#x}+{bytes:#x} or their header outside title \
+                         memory or misaligned"
+                    ),
+                );
+            };
+            jobs.push(Job {
+                geometry: i,
+                input: Input::Vertices {
+                    format: DXGI_FORMAT_R32G32B32_FLOAT,
+                    stride: 12,
+                    skew: 0,
+                },
+                kind: Kind::Quantized {
+                    stride: stride as u32,
+                },
+                shadow,
+                source,
+                count: vertices,
+                vertices: 0,
+            });
+        } else {
+            let Some(shadow) = input_range(list, start, bytes, alignment) else {
+                return invalid(
+                    i,
+                    format_args!(
+                        "vertices {start:#x}+{bytes:#x} outside title memory or misaligned"
+                    ),
+                );
+            };
+            // Copied a word at a time: 2-byte aligned ones start inside one.
+            let host = shadow.gpu(start);
+            let (source, skew) = (host & !3, host & 3);
+            let words = (skew + bytes).div_ceil(4);
+            let Some(words) = u32::try_from(words)
+                .ok()
+                .filter(|&w| holds(&shadow, source, 4 * u64::from(w)))
+            else {
+                return invalid(
+                    i,
+                    format_args!(
+                        "vertices {start:#x}+{bytes:#x} end inside a word past their host copy"
+                    ),
+                );
+            };
+            jobs.push(Job {
+                geometry: i,
+                input: Input::Vertices {
+                    format: t.VertexFormat,
+                    stride,
+                    skew: skew as u32,
+                },
+                kind: Kind::Words,
+                shadow,
+                source,
+                count: words,
+                vertices: 0,
+            });
         }
         let index_size = match t.IndexFormat {
             DXGI_FORMAT_UNKNOWN if t.IndexCount == 0 && t.IndexBuffer == 0 => 0,
-            DXGI_FORMAT_R16_UINT => 2,
+            // R16_TYPELESS: meshlet-packed (`console`).
+            DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_TYPELESS => 2,
             DXGI_FORMAT_R32_UINT => 4,
             format => {
                 return invalid(
@@ -1266,38 +1391,92 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
         }
         total += u64::from(points / 3);
         if index_size != 0 {
-            let (at, n) = (t.IndexBuffer, u64::from(t.IndexCount));
-            let Some(host) = range(list, at, n * index_size, index_size) else {
-                return invalid(
-                    i,
-                    format_args!("{n} indices at {at:#x} outside title memory or misaligned"),
-                );
+            let n = t.IndexCount;
+            let (kind, shadow, source) = if t.IndexFormat == DXGI_FORMAT_R16_TYPELESS {
+                // From the word its address is in.
+                let at = t.IndexBuffer & !3;
+                let window = (at != 0).then_some(at).and_then(|at| {
+                    let bytes = console::packed_bytes(at, n / 3)?;
+                    let shadow = input_range(list, at, bytes, 4)?;
+                    let (host, limit) = (shadow.gpu(at), bytes.next_multiple_of(4));
+                    let limit = u32::try_from(limit)
+                        .ok()
+                        .filter(|&l| holds(&shadow, host, l.into()))?;
+                    Some((Kind::Packed { limit, flip }, shadow, host))
+                });
+                let Some(window) = window else {
+                    return invalid(
+                        i,
+                        format_args!(
+                            "{n} meshlet-packed indices at {at:#x}: parts outside title memory"
+                        ),
+                    );
+                };
+                window
+            } else {
+                let at = t.IndexBuffer;
+                let bytes = u64::from(n) * index_size;
+                let Some(shadow) = input_range(list, at, bytes, index_size) else {
+                    return invalid(
+                        i,
+                        format_args!("{n} indices at {at:#x} outside title memory or misaligned"),
+                    );
+                };
+                // The pass reads whole words: the last 16-bit index's must
+                // lie in the host copy too.
+                let host = shadow.gpu(at);
+                let end = ((host & 3) + bytes).next_multiple_of(4);
+                if !holds(&shadow, host & !3, end) {
+                    return invalid(
+                        i,
+                        format_args!(
+                            "{n} indices at {at:#x} end 2 bytes before their host copy's end"
+                        ),
+                    );
+                }
+                let kind = if index_size == 4 {
+                    Kind::Wide
+                } else {
+                    Kind::Narrow
+                };
+                (kind, shadow, host)
             };
-            let largest = largest_index(at, n, index_size);
-            if largest >= vertices {
-                return invalid(
-                    i,
-                    format_args!("index {largest} at {at:#x} past its {vertices} vertices"),
-                );
-            }
-            t.IndexBuffer = host;
+            jobs.push(Job {
+                geometry: i,
+                input: Input::Indices,
+                kind,
+                shadow,
+                source,
+                count: n,
+                vertices,
+            });
         }
         if t.Transform3x4 != 0 {
             let at = t.Transform3x4;
-            let Some(host) = range(list, at, 48, 16) else {
+            let Some(shadow) = input_range(list, at, 48, 16) else {
                 return invalid(
                     i,
                     format_args!("a transform at {at:#x} outside title memory or misaligned"),
                 );
             };
-            t.Transform3x4 = host;
+            jobs.push(Job {
+                geometry: i,
+                input: Input::Transform,
+                kind: Kind::Words,
+                source: shadow.gpu(at),
+                shadow,
+                count: 12,
+                vertices: 0,
+            });
         }
+        // Each set to what the pass makes when it is recorded.
+        (t.VertexBuffer.StartAddress, t.IndexBuffer, t.Transform3x4) = (0, 0, 0);
         geometries.push(g);
     }
     if total > u64::from(D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE) {
         return invalid(0, format_args!("{total} triangles"));
     }
-    Some(geometries)
+    Some((geometries, jobs))
 }
 
 #[cfg(test)]

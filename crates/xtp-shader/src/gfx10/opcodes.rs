@@ -336,6 +336,7 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x003, "v_add_f32"),
     (0x004, "v_sub_f32"),
     (0x005, "v_subrev_f32"),
+    // The console combines GFX10.1 MAD/MAC with BVH instructions, like gfx1013.
     (0x006, "v_mac_legacy_f32"),
     (0x007, "v_mul_legacy_f32"),
     (0x008, "v_mul_f32"),
@@ -661,6 +662,7 @@ pub(super) const VOPC: &[(u16, &str)] = &[
 ];
 
 pub(super) const VOP3: &[(u16, &str)] = &[
+    // The console combines GFX10.1 MAD/MAC with BVH instructions, like gfx1013.
     (0x140, "v_mad_legacy_f32"),
     (0x141, "v_mad_f32"),
     (0x142, "v_mad_i32_i24"),

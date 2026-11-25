@@ -146,6 +146,20 @@ pub unsafe fn dispatch_descriptor_tlas(
     let Some(list) = crate::list::host_list(title_list) else {
         return false;
     };
+    dispatch_descriptor_tlas_in(list, handle, root, param, groups)
+}
+
+/// [`dispatch_descriptor_tlas`] for the host recording itself, which draws
+/// have where the title list is not at hand. The currently bound compute
+/// root signature is `root` and `param` is its acceleration-structure root
+/// SRV.
+pub(crate) fn dispatch_descriptor_tlas_in(
+    list: &HostList,
+    handle: u64,
+    root: &ID3D12RootSignature,
+    param: u32,
+    groups: [u32; 3],
+) -> bool {
     dispatch(list, trace_address(handle), root, param, groups).is_some()
 }
 
