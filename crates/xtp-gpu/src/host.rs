@@ -415,6 +415,8 @@ fn create(software: bool) -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
+        // DRED 1.2: the markers' texts kept with their breadcrumbs.
+        crate::dred::enable();
         let mut device: Option<ID3D12Device> = None;
         if software {
             let adapter = warp_adapter()?;
@@ -1974,6 +1976,10 @@ impl Host {
             return String::new();
         };
         let mut text = String::new();
+        // DRED 1.2: the device state, each stopped list's last finished and
+        // first unfinished commands with their markers, the faulting
+        // allocations' ranges.
+        text.push_str(&crate::dred::report(&self.device, runs));
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
