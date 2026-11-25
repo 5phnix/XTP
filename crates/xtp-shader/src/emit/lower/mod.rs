@@ -73,6 +73,8 @@ mod lds;
 mod mask;
 mod mesh;
 mod operand;
+// Inline ray queries in place of traversal walks (RT phase 2b).
+pub(super) mod rayquery;
 mod salu;
 mod smem;
 mod smem_data;
@@ -1079,6 +1081,9 @@ impl<'a> Lower<'a> {
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         if let Some(r) = self.merged_inst(b, i) {
+            return r;
+        }
+        if let Some(r) = self.ray_query(b, i) {
             return r;
         }
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];

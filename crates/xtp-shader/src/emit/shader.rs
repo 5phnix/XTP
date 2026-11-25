@@ -161,6 +161,7 @@ pub(crate) mod flags {
     pub const INT64: u64 = 1 << 20;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const ATOMIC_INT64_TYPED: u64 = 1 << 27;
+    pub const RAYTRACING_TIER_1_1: u64 = 1 << 25;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
     pub const ATOMIC_INT64_HEAP: u64 = 1 << 32;
@@ -216,6 +217,10 @@ pub(crate) struct Shader {
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
     pub root_uavs: Vec<(u8, V)>,
+    /// The register of the root SRV of `root_srvs` that holds the
+    /// acceleration structure of inline ray queries (`lower/rayquery.rs`):
+    /// declared as one (resource kind 16), not as a raw buffer.
+    pub tlas: Option<u8>,
     /// Handle of the runtime stride table (`t0` in [`STRIDE_SPACE`]), if
     /// read.
     pub stride_table: Option<V>,
@@ -297,6 +302,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            tlas: None,
             stride_table: None,
             flags: 0,
             nonuniform_handles: 0,
@@ -649,6 +655,14 @@ impl Shader {
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
                 for (n, (space, register)) in specs.into_iter().enumerate() {
+                    if space == ROOT_CBV_SPACE && self.tlas.map(u32::from) == Some(register) {
+                        let i32t = self.t.i32;
+                        let md =
+                            super::lower::rayquery::tlas_md(&mut self.m, i32t, n as u32, empty);
+                        list.push(Some(md));
+                        bindings.push(super::lower::rayquery::tlas_binding());
+                        continue;
+                    }
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -907,6 +921,9 @@ impl Shader {
         }
         if self.flags & flags::ATOMIC_INT64_TYPED != 0 {
             features |= 0x40_0000;
+        }
+        if self.flags & flags::RAYTRACING_TIER_1_1 != 0 {
+            features |= 0x10_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

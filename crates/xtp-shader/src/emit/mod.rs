@@ -110,6 +110,8 @@ pub(crate) mod lower;
 mod r1_tests;
 #[cfg(all(test, windows))]
 mod raw_tests;
+#[cfg(all(test, windows))]
+mod rayquery_tests;
 pub mod rect_gs;
 mod sampler;
 #[cfg(test)]
@@ -143,6 +145,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::opt::dxil_opt;
 pub(crate) use lower::geometry::GsShape;
+/// The root SRV register of an inline ray query's acceleration structure.
+pub use lower::rayquery::TLAS_REGISTER;
 pub use sampler::StaticSampler;
 pub use shader::{
     ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
@@ -568,6 +572,7 @@ pub fn translate_program_for(
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)
         .map_err(|e| (Step::Decode, e))?;
     let p = lower::geometry::prepared(p, native.stage).map_err(|e| (Step::Decode, e))?;
+    let p = lower::rayquery::prepared(p, native).map_err(|e| (Step::Decode, e))?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
