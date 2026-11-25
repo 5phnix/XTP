@@ -400,6 +400,70 @@ fn root_uav_program(words: &[u32], threads: [u32; 3], wave64: bool) -> NativePro
     n
 }
 
+#[cfg(windows)]
+#[test]
+fn phi_reads_the_spilled_word_only_on_the_edge_that_keeps_it() {
+    use super::host::{Dispatch, Host, Root, View};
+    let words = [
+        PTR.as_slice(),
+        &[
+            0xF404_0201,
+            0xFA00_0000,
+            0xF404_0101,
+            0xFA00_0008,
+            0xBF06_8004,
+            0xBF85_0001,
+            0xBE85_0389,
+            0xBE8A_03C1,
+            0xBE8B_03FF,
+            0x3101_4FAC,
+            0x7E04_0205,
+            0xE070_0000,
+            0x8002_0200,
+            END,
+        ],
+    ]
+    .concat();
+    let mut n = root_uav_program(&words, [1; 3], false);
+    n.layout.push(param(RootType::Constants, 18, 2, 6));
+    let bytes = crate::dxbc::build(&[]);
+    let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&cs).unwrap();
+    for (condition, expected) in [(0, 71), (1, 9)] {
+        let mut ud = vec![0; cs.user_data_dwords() as usize];
+        for u in cs
+            .user_data
+            .iter()
+            .filter(|u| u.root == RootType::Constants)
+        {
+            ud[u.index as usize] = if u.dword == 0 { condition } else { 71 };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::Table {
+                                sampler: false,
+                                index: 0,
+                            },
+                        ),
+                    ],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1; 3],
+                },
+            )
+            .unwrap();
+        assert_eq!(out[0], [expected]);
+    }
+}
+
 /// Ported from fxceless's VIctory fork #646 (head 170c24269) by mynzjerko.
 /// Une barrière sépare le comptage d'EXEC de l'écriture dans la vue racine.
 #[cfg(windows)]

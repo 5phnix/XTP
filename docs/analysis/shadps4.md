@@ -203,9 +203,35 @@ XTP now tracks each loaded SSA word by root parameter and dword
 (`resource/spill.rs`, ported from VIctory `27c3dc9d5`). It packs the
 constants and descriptor-table offsets the shader reads into the existing
 per-dispatch root constants. Root views use their existing slot bindings.
-On the L4 all 34 reached a later instruction. Thirteen reached emission
+At `6e99955` on the L4 all 34 reached a later instruction. Thirteen reached emission
 and stopped at a root UAV or typed root view. The other 21 stopped during
 address tracking. None emitted DXIL.
+
+Les 13 refus de vue racine disparaissent avec une table D3D12 d'un UAV
+brut par slot. La vue couvre la copie hôte du tampon et le shader ajoute
+la distance entre le début aligné de la vue et l'adresse donnée par le
+titre. Cela sert aussi pour les compteurs. Les accès par demi-mot
+préservent les octets voisins. Un DispatchX en unités de threads transmet
+les trois dimensions au shader du constructeur. Dans un groupe de queue,
+les écritures et les comptages d'EXEC respectent ces limites, y compris
+lorsque deux vagues hôtes exécutent une vague console et échangent via LDS.
+
+Origine du premier accès refusé dans les 21 autres programmes du relevé
+initial. Les préfixes identifient les empreintes BLAKE3 de la session.
+
+| Programmes | Première adresse | Résolution |
+|---|---|---|
+| 6 · `9205d265`, `894c9165`, `a63e2dfc`, `198f6dfd`, `cb9647e7`, `4b5aedc0` | Une constante donne une adresse en unités de 256 octets. Le champ lu tient dans les huit bits libérés. | Les deux moitiés doivent provenir du même décalage. L'hôte lie la copie du tampon et le shader lit le champ dans une SRV brute. |
+| 8 · `a197f50c`, `f28a33a8`, `c85822de`, `6f6a359d`, `162216b9`, `7bb5b1b9`, `3df629ff`, `ffd93c8a` | Deux dwords consécutifs de constantes forment une adresse complète. | Les lectures à déplacement fixe utilisent une SRV si les mots appartiennent au même paramètre. Pour une copie en VGPR, les lanes qui lisent doivent avoir exécuté les deux copies. Plusieurs variantes calculent ensuite un index avec une retenue 64 bits à partir de données lues sur le GPU. |
+| 2 · `190fbf0e`, `f6e47efa` | Une paire intérieure aux constantes déportées sert de pointeur. Le premier programme lui ajoute un index par lane dès la première lecture. | La paire seule peut désigner une vue. Les accès suivants parcourent la mémoire et comprennent des opérations atomiques globales. |
+| 2 · `5279ae36`, `35e51bb2` | La lane reconstruit une adresse et y insère un numéro de champ. | La paire varie entre lanes. Une vue uniforme liée au début du dispatch ne suffit pas. |
+| 3 · `5e687674`, `5062bc7a`, `3cea4534` | Le tampon source contient lui-même l'adresse de la prochaine ressource. | Les deux premiers lisent à une adresse indexée par lane, le troisième y écrit. La ressource de destination n'est connue qu'à l'exécution sur le GPU. |
+
+Pour ces parcours indirects, le fork associe les pages d'adresses du titre
+à des vues utilisables par le shader. XTP dispose des copies côté hôte.
+Le shader aurait besoin de la correspondance décrite en §5.4 pour choisir
+la copie, vérifier les limites et conserver l'identité des écritures et
+des opérations atomiques.
 
 **Image impact:** the largest dispatch count of all classes (223 a frame),
 but the builder only makes the ray-tracing structure. Nothing is lit by it
