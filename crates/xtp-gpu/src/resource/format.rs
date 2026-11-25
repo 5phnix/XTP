@@ -1321,7 +1321,7 @@ mod tests {
             (11, 12), // RGBA16 UNORM as UINT
             (42, 43), // R32 UINT as SINT
             (56, 57), // R16 UNORM as UINT
-            (61, 65), // R8 UNORM as A8
+            (61, 62), // R8 UNORM as UINT
         ] {
             assert!(castable(own, view), "{own} as {view}");
         }
@@ -1334,6 +1334,8 @@ mod tests {
             (54, 56), // R16 FLOAT as UNORM
             (87, 88), // two families
             (28, 87),
+            (61, 65), // A8_UNORM appartient à sa propre famille DXGI.
+            (65, 61),
             (41, 40), // R32 FLOAT as depth
             (45, 46), // depth with stencil
             (95, 96), // BC6H
