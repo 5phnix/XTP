@@ -159,6 +159,10 @@ pub(crate) struct State {
     targets: Vec<usize>,
     missing_targets: u8,
     incomplete_targets: Option<Box<IncompleteTargets>>,
+    /// The targets and depth the title set last, as the host made their
+    /// views (`set_targets`): set again after a pass of ours between its
+    /// commands (`State::after_our_pass`).
+    title_views: Option<Box<IncompleteTargets>>,
     depth: usize,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
@@ -765,6 +769,34 @@ impl State {
         self.host_heaps = [0; 2];
     }
 
+    /// A pass of ours was recorded between the title's commands
+    /// (`HostList::planes_now`, which set the viewports and scissors back):
+    /// it set a descriptor heap, a graphics root signature, a pipeline, a
+    /// depth target and the topology of its own. The title's targets and
+    /// topology are set again here; heaps, root signatures and pipeline by
+    /// the next `bind`, which also sets every root argument
+    /// (`forget_host`). The pass leaves the blend factor, stencil reference
+    /// and depth bounds alone.
+    fn after_our_pass(&mut self, list: &HostList) {
+        self.forget_host();
+        // The pass leaves a triangle list: what the console's own
+        // topologies are drawn as too (`set_topology`).
+        if !matches!(
+            self.topology,
+            0 | 4 | RECTANGLES | TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP
+        ) {
+            self.set_topology(list, self.topology);
+        }
+        match &mut self.title_views {
+            Some(views) => {
+                views.pipeline = usize::MAX;
+                views.rebind(list, self.pipeline);
+            }
+            // SAFETY: an open list.
+            None => unsafe { list.list.OMSetRenderTargets(0, None, false, None) },
+        }
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
@@ -848,6 +880,7 @@ impl State {
         };
         self.targets.clear();
         self.missing_targets = 0;
+        let mut title_views = IncompleteTargets::default();
         let mut rtvs = Vec::new();
         #[cfg(feature = "diagnostics")]
         let mut hole = false;
@@ -877,6 +910,9 @@ impl State {
                 );
                 let desc = record.desc();
                 rtvs.push(host.rtv(texture, desc.as_ref()));
+                title_views
+                    .colors
+                    .push(SavedTarget::Real(texture.clone(), desc));
                 if let Some(saved) = &mut self.incomplete_targets {
                     saved.colors.push(SavedTarget::Real(texture.clone(), desc));
                 }
@@ -912,6 +948,7 @@ impl State {
                     None::<&ID3D12Resource>,
                     Some(&null_view(null, self.pipeline, slot)),
                 ));
+                title_views.colors.push(SavedTarget::Missing(null));
                 if let Some(saved) = &mut self.incomplete_targets {
                     saved.colors.push(SavedTarget::Missing(null));
                 }
@@ -924,11 +961,14 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             let desc = record.depth_desc();
+            title_views.depth = Some((texture.clone(), desc));
             if let Some(saved) = &mut self.incomplete_targets {
                 saved.depth = Some((texture.clone(), desc));
             }
             Some(host.dsv(texture, desc.as_ref()))
         });
+        title_views.pipeline = self.pipeline;
+        self.title_views = Some(Box::new(title_views));
         if let Some(saved) = &mut self.incomplete_targets {
             saved.pipeline = self.pipeline;
         }
@@ -1225,6 +1265,12 @@ impl State {
     ) -> Result<(), &'static str> {
         #[cfg(feature = "diagnostics")]
         list.twin_reader(&p.name);
+        // Depth planes whose twins shaders of the list wrote are drawn
+        // before anything of this draw or dispatch is set
+        // (`HostList::planes_now`).
+        if list.planes_now() {
+            self.after_our_pass(list);
+        }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -3351,11 +3397,13 @@ const QUAD_STRIP: u32 = 20;
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
+    list.note_viewports(viewports);
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
     // SAFETY: an open list.
     unsafe { list.list.RSSetScissorRects(rects) };
+    list.note_scissors(rects);
 }
 
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {

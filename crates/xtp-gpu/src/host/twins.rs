@@ -34,12 +34,43 @@ pub(super) struct TwinUse {
     /// The draw or dispatch being prepared writes the twin.
     writing: bool,
     /// The depth plane's twin holds what the plane lacks although the list
-    /// copied the twins since: the plane's pass waits for the list's close.
+    /// copied the twins since: the plane's pass waits for the next draw or
+    /// dispatch (`planes_now`) or the list's close.
     late: bool,
 }
 
-/// The twins a list uses, by twin.
-pub(super) type TwinUses = std::collections::HashMap<usize, TwinUse>;
+/// The twins a list uses, by twin, and the viewports and scissor rectangles
+/// the title set in it last: a plane's pass recorded between its commands
+/// sets them back (`planes_now`).
+#[derive(Default)]
+pub(super) struct TwinUses {
+    by_twin: std::collections::HashMap<usize, TwinUse>,
+    /// `None`: the title set none.
+    viewports: Option<Vec<D3D12_VIEWPORT>>,
+    scissors: Option<Vec<RECT>>,
+}
+
+impl TwinUses {
+    /// The list is reset: it uses nothing, nothing is set in it.
+    pub(super) fn clear(&mut self) {
+        *self = TwinUses::default();
+    }
+}
+
+/// `XTP_PLANE_NOW=0`: a depth plane is drawn from its twin only when its
+/// list closes, as before `planes_now`.
+fn plane_now() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("XTP_PLANE_NOW").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!(
+                "XTP_PLANE_NOW=0: depth planes are drawn from their twins when their list closes"
+            );
+        }
+        on
+    })
+}
 
 /// A copy the prelude records: the depth texture, its twin, and whether
 /// into the twin.
@@ -112,6 +143,7 @@ impl HostList {
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let u = twins
+            .by_twin
             .entry(Arc::as_ptr(&twin) as usize)
             .or_insert_with(|| TwinUse {
                 depth: depth.clone(),
@@ -142,9 +174,13 @@ impl HostList {
             (false, _) => {}
         }
         // shortcut: the depth plane's twin is not drawn into the plane
-        // here: the pass sets a pipeline and a target of ours, which a list
-        // still recording the title's commands cannot take. This use sees
-        // the plane as it was; the pass runs when the list closes.
+        // here: the pass sets a pipeline and a target of ours, which the
+        // draw or dispatch being bound cannot take. This use sees the plane
+        // as it was; the pass runs before the next draw or dispatch
+        // (`planes_now`) or when the list closes. Draws and dispatches run
+        // `planes_now` first, so this is left to the copies, resolves and
+        // clears of `crate::list`, and to a draw that writes the twin and
+        // binds its depth texture as target.
         if copy && !colour && twin.plane.is_some() {
             u.late = true;
         }
@@ -178,14 +214,118 @@ impl HostList {
 
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
-    /// pass needs; the twin is left in the unordered access state. Only for
-    /// a list that records nothing of the title's afterwards.
+    /// pass needs; the twin is left in the unordered access state. At the
+    /// list's close, or between the title's commands through `planes_now`,
+    /// whose caller then sets the title's state again.
     fn pass_plane(&self, depth: &Arc<HostTexture>, twin: &Twin) {
         let Some(plane) = &twin.plane else { return };
         self.move_to(depth, DEPTH_WRITE);
         self.move_to(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
         self.move_to(plane, UNORDERED_ACCESS);
+    }
+
+    /// Before a draw or dispatch sets anything (`draw::State::bind`): the
+    /// depth planes whose twins shaders of this list wrote since their last
+    /// pass are drawn now, with the copy of the stencil plane, not when the
+    /// list closes, so that what reads them next in the list finds them.
+    /// The material resolve and the tiled lighting's classification write
+    /// each pixel's material class into such a twin, which passes then read
+    /// as depth; before, they saw the classes of the frame before.
+    /// Done for whatever comes next (a pass more if it is another write of
+    /// the twin, never a wrong one): which textures a draw reads is known
+    /// only while its tables are made, after its pipeline is set. The depth
+    /// texture is left in the state the list had it in (readable by shaders
+    /// if the list had not used it yet, as at the close).
+    /// True if a pass was recorded: it set a descriptor heap, a graphics
+    /// root signature, a pipeline, a depth target, a viewport, a scissor
+    /// and the topology of its own. The title's viewports and scissors are
+    /// set back here, the caller sets the rest
+    /// (`draw::State::after_our_pass`).
+    /// shortcut: an occlusion query open at that point counts the pass's
+    /// samples (more visible, never less).
+    /// `XTP_PLANE_NOW=0` keeps the old way.
+    ///
+    /// Ported from ZSlayerHQ/victory-world-runtime#8 (ef8bcaba2) by
+    /// Geckomacabre. Their version leaves the depth texture in the depth
+    /// write state and does not take up a plane whose copy the list already
+    /// made (`late`).
+    pub(crate) fn planes_now(&self) -> bool {
+        if !plane_now() {
+            return false;
+        }
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        if twins.by_twin.is_empty() {
+            return false;
+        }
+        let due: Vec<_> = twins
+            .by_twin
+            .values_mut()
+            .filter(|u| u.twin.plane.is_some() && (u.behind[0] == Some(true) || u.late))
+            .map(|u| {
+                // No copy if the list copied since the last write and only
+                // the pass is left.
+                let copy = u.behind[0] == Some(true);
+                u.behind[0] = Some(false);
+                u.late = false;
+                (u.depth.clone(), u.twin.clone(), copy)
+            })
+            .collect();
+        if due.is_empty() {
+            return false;
+        }
+        let (viewports, scissors) = (twins.viewports.clone(), twins.scissors.clone());
+        drop(twins);
+        for (depth, twin, copy) in &due {
+            let state = self.state_now(depth).unwrap_or(SHADER_RESOURCE);
+            if *copy {
+                self.twin_copy(depth, twin, false);
+            }
+            #[cfg(feature = "diagnostics")]
+            stale::pass(true);
+            self.pass_plane(depth, twin);
+            self.move_to(depth, state);
+        }
+        // SAFETY: an open list.
+        unsafe {
+            if let Some(viewports) = &viewports {
+                self.list.RSSetViewports(viewports);
+            }
+            if let Some(scissors) = &scissors {
+                self.list.RSSetScissorRects(scissors);
+            }
+        }
+        true
+    }
+
+    /// The state this list leaves `copy` in at this point, if it used it
+    /// already.
+    fn state_now(&self, copy: &Arc<HostTexture>) -> Option<u32> {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.get(&(Arc::as_ptr(copy) as usize)).map(|s| s.1)
+    }
+
+    /// `draw::viewports`: the viewports the title sets, which `planes_now`
+    /// sets back after its pass.
+    pub(crate) fn note_viewports(&self, viewports: &[D3D12_VIEWPORT]) {
+        if !plane_now() {
+            return;
+        }
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let noted = twins.viewports.get_or_insert_with(Vec::new);
+        noted.clear();
+        noted.extend_from_slice(viewports);
+    }
+
+    /// `draw::scissors`: the same for the scissor rectangles.
+    pub(crate) fn note_scissors(&self, rects: &[RECT]) {
+        if !plane_now() {
+            return;
+        }
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let noted = twins.scissors.get_or_insert_with(Vec::new);
+        noted.clear();
+        noted.extend_from_slice(rects);
     }
 
     /// Before the list closes: the depth textures whose twins it wrote last
@@ -195,6 +335,7 @@ impl HostList {
     pub(super) fn twins_to_depth(&self) {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let written: Vec<_> = twins
+            .by_twin
             .values_mut()
             .filter(|u| u.behind[0] == Some(true) || u.late)
             .map(|u| {
@@ -226,7 +367,7 @@ impl HostList {
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-        for u in twins.values_mut().filter(|u| u.writing) {
+        for u in twins.by_twin.values_mut().filter(|u| u.writing) {
             u.writing = false;
             u.behind[0] = Some(true);
         }
@@ -238,7 +379,7 @@ impl HostList {
     pub(super) fn twin_syncs(&self) -> Vec<TwinSync> {
         let mut syncs = Vec::new();
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-        for u in twins.values() {
+        for u in twins.by_twin.values() {
             let real = u.twin.behind.load(Ordering::Relaxed);
             let mut behind = [real & 1 != 0, real & 2 != 0];
             for side in [0, 1] {
@@ -483,8 +624,9 @@ float plane(float4 p : SV_Position) : SV_Depth {
 "#;
 
 /// Views of twins the pass reads, in a heap of ours used as a ring.
-/// shortcut: a view must last until its list has run; with one or two
-/// passes a frame the ring is far from coming round.
+/// shortcut: a view must last until its list has run; with a few passes a
+/// frame (one per write of a twin, before the next draw or dispatch or at
+/// the list's close) the ring is far from coming round.
 const PLANE_VIEWS: u32 = 256;
 
 /// What the pass draws with: the heap of its views of twins, and per kind
@@ -659,8 +801,8 @@ impl PlanePass {
 /// plane of `depth`, into that plane: `depth` in the depth-write state,
 /// `plane` readable by pixel shaders. The pass sets the list's descriptor
 /// heap, graphics root signature, pipeline, depth target, viewport,
-/// scissor and topology and puts none of them back: it is for a list that
-/// records nothing of the title's after it.
+/// scissor and topology and puts none of them back (at a list's close, or
+/// through `HostList::planes_now`, whose callers set the title's again).
 pub(super) fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
@@ -1056,6 +1198,187 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 8], pattern[at..at + 8], "row {row}");
         }
+        release(depth);
+    }
+
+    /// Writes into the twin of the depth plane of `depth`, as a shader of
+    /// the list would, class `left` in the two left columns and `right`
+    /// elsewhere (steps of 1/65535, 4×4).
+    fn write_classes(list: &HostList, depth: This, left: u16, right: u16) {
+        assert!(list.twin_use(depth, true, true));
+        let plane = crate::resource::twin(depth)
+            .and_then(|t| t.plane.clone())
+            .expect("a depth plane twin");
+        let mut steps = vec![0u8; 1024];
+        for row in 0..4 {
+            for x in 0..4 {
+                let class = if x < 2 { left } else { right };
+                steps[row * 256 + x * 2..][..2].copy_from_slice(&class.to_le_bytes());
+            }
+        }
+        list.move_to(&plane, COPY_DEST);
+        fill(list, &plane.texture, 0, &steps);
+        list.move_to(&plane, UNORDERED_ACCESS);
+        list.twins_written();
+    }
+
+    /// A title pipeline that draws the whole screen at the depth of class
+    /// `class` (the step times the float nearest 1/65535, as the lighting's
+    /// vertices do), tested "equal" without writes against a console D16S8
+    /// depth (D24S8 on the host), in white into an RGBA8 target.
+    fn equal_pipeline(class: u16) -> This {
+        use xtp_shader::HwStage;
+        use xtp_shader::emit::{HostShader, rect_gs::probe};
+        let shader = |name, stage, dxil| {
+            crate::pipeline::test_shader(
+                name,
+                HostShader {
+                    stage,
+                    dxil,
+                    group_base: None,
+                    user_data: vec![],
+                    samplers: vec![],
+                    static_samplers: vec![],
+                    root_cbvs: vec![],
+                    root_srvs: vec![],
+                    root_uavs: vec![],
+                    stride_table: false,
+                    run_time_buffers: 0,
+                },
+            )
+        };
+        let z = f32::from(class) * f32::from_bits(0x3780_0080);
+        let vs = probe::vertex(
+            &[[-1., -1., z, 1.], [-1., 3., z, 1.], [3., -1., z, 1.]],
+            &[[1.; 4]; 3],
+            &[1; 3],
+        );
+        let mut graphics = crate::pipeline::host::GraphicsState::default();
+        graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        graphics.targets.NumRenderTargets = 1;
+        graphics.targets.RTFormats[0] = DXGI_FORMAT(28);
+        #[repr(C)]
+        struct Depth(u32, D3D12_DEPTH_STENCIL_DESC);
+        let test = Depth(
+            11,
+            D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                DepthFunc: D3D12_COMPARISON_FUNC_EQUAL,
+                ..Default::default()
+            },
+        );
+        #[repr(C)]
+        struct Format(u32, u32);
+        let format = Format(16, D16_UNORM_S8_UINT);
+        // SAFETY: whole subobjects in the stream's layout.
+        unsafe {
+            graphics.read(11, (&raw const test).cast());
+            graphics.read(16, (&raw const format).cast());
+        }
+        crate::pipeline::test_graphics_pipeline(
+            vec![
+                shader("vertex", HwStage::Vs, vs),
+                shader("pixel", HwStage::Ps, probe::pixel()),
+            ],
+            graphics,
+            &[0],
+        )
+    }
+
+    /// The console's D16S8 depth, which the material resolve writes
+    /// (classes in 16-bit steps) and the lighting tests.
+    const D16_UNORM_S8_UINT: u32 = 118;
+
+    /// The tiled lighting: shaders write each pixel's class into the twin
+    /// of the depth plane, then a draw of the same list tests a class
+    /// "equal" against the plane. The plane holds the classes of the frame
+    /// before (65 everywhere); this frame writes 129 on the left. The draw
+    /// of class 129, bound by `draw::State` as the title's are, must light
+    /// the left: the plane's pass comes before it (`planes_now`). Before,
+    /// the pass waited for the list's close and the draw found only 65:
+    /// nothing was lit (`XTP_PLANE_NOW=0` fails this test). The title's
+    /// scissor (the top half) and its target are back after the pass.
+    #[test]
+    fn classes_written_in_a_list_are_tested_equal_in_the_same_list() {
+        use crate::resource::tests_support::{committed, read_back, target};
+        let test =
+            "host::twins::tests::classes_written_in_a_list_are_tested_equal_in_the_same_list";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let depth = depth(4, 4, D16_UNORM_S8_UINT);
+        assert!(crate::resource::twin_view(depth, None).is_some());
+        let twin = crate::resource::twin(depth).expect("a twin");
+        let plane = twin.plane.clone().expect("a depth plane twin");
+        // SAFETY: live textures.
+        let (d, p) = unsafe {
+            (
+                crate::resource::host_resource(depth).unwrap().GetDesc(),
+                plane.texture.GetDesc(),
+            )
+        };
+        // R24G8 typeless for the depth, R16 typeless for its plane's twin.
+        assert_eq!((d.Format.0, p.Format.0), (44, 53));
+        let colour = committed(&target(4, 4, 28));
+        let texture = crate::resource::host_resource(colour).unwrap();
+        let null = std::ptr::null();
+        let mut records = [[0u64; 16]; 2];
+        let handles = records.each_mut().map(|slot| slot.as_mut_ptr() as u64);
+        crate::descriptor::create_rtv(null, colour, null.cast(), handles[0]);
+        crate::descriptor::create_dsv(null, depth, null.cast(), handles[1]);
+        let pipeline = equal_pipeline(129);
+
+        // The frame before: 65 everywhere, in the plane at the close.
+        let before = crate::testgpu::TitleList::new();
+        write_classes(before.host(), depth, 65, 65);
+        before.run();
+
+        let frame = crate::testgpu::TitleList::new();
+        let list = frame.host();
+        crate::testgpu::bind_indexed_heaps(host, list);
+        write_classes(list, depth, 129, 65);
+        crate::list::ensure_state(list, colour, 0x4);
+        // SAFETY: an open list and a live RGBA8 target.
+        unsafe {
+            list.list
+                .ClearRenderTargetView(host.rtv(texture, None), &[0.; 4], None);
+        }
+        let mut state = crate::draw::State::default();
+        state.set_targets(list, &handles[..1], handles[1]);
+        crate::draw::viewports(
+            list,
+            &[D3D12_VIEWPORT {
+                Width: 4.0,
+                Height: 4.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }],
+        );
+        crate::draw::scissors(
+            list,
+            &[RECT {
+                right: 4,
+                bottom: 2,
+                ..Default::default()
+            }],
+        );
+        state.set_topology(list, 4);
+        state.set_pipeline(pipeline);
+        state.draw(list, 3, 1, 0, 0);
+        frame.run();
+
+        let image = read_back(host, texture, 0x4);
+        for row in 0..4 {
+            for x in 0..4 {
+                let lit = image[row * 256 + x * 4];
+                let want = if x < 2 && row < 2 { 255 } else { 0 };
+                assert_eq!(lit, want, "pixel {x},{row}");
+            }
+        }
+        crate::object::slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
+        release(colour);
         release(depth);
     }
 
