@@ -129,6 +129,14 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     Some((heap, heap.index(handle)?))
 }
 
+/// Whether the title heap object at `heap` is a live shader-visible heap
+/// (one the title released is not: its address may hold another object).
+#[cfg(windows)]
+pub(crate) fn live_heap(heap: usize) -> bool {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps.iter().any(|&(_, _, h)| h == heap)
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap.
 #[cfg(windows)]
@@ -449,33 +457,71 @@ pub(crate) extern "system" fn create_rtv(
     desc: *const [u32; 6],
     handle: u64,
 ) {
+    target_record(RTV_TAG, resource, desc, handle);
+}
+
+/// Device method: a depth view, recorded as render target views are.
+pub(crate) extern "system" fn create_dsv(
+    _: This,
+    resource: This,
+    desc: *const [u32; 6],
+    handle: u64,
+) {
+    target_record(DSV_TAG, resource, desc, handle);
+}
+
+/// Records a render target or depth view (`tag`) at `handle`, in one write
+/// under [`RECORDS`] (a depth view's tag was written over a render target
+/// record's after it, so a reader could find the latter).
+fn target_record(tag: u32, resource: This, desc: *const [u32; 6], handle: u64) {
     if handle == 0 {
         return;
     }
     // SAFETY: the title passes a description or null.
     let described = unsafe { desc.as_ref() };
     let record = RtvRecord {
-        tag: RTV_TAG,
+        tag,
         described: u32::from(described.is_some()),
         resource,
         desc: described.copied().unwrap_or_default(),
     };
+    let _records = records_written();
     // SAFETY: the handle is a descriptor slot, at least 112 bytes.
     unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
 }
 
-/// Device method: a depth view, recorded as render target views are.
-pub(crate) extern "system" fn create_dsv(
-    this: This,
-    resource: This,
-    desc: *const [u32; 6],
-    handle: u64,
-) {
-    create_rtv(this, resource, desc, handle);
-    if handle != 0 {
-        // SAFETY: just written by `create_rtv`.
-        unsafe { (handle as *mut u32).write_unaligned(DSV_TAG) };
-    }
+/// The one lock of every access XTP makes to the records it keeps in
+/// descriptor memory (Codex review of 244cf78, finding 7): view creation
+/// writes a record's header (tag, view index, generation) under it, the
+/// device's descriptor copies copy under it, and every read of a header
+/// ([`header`], [`view`], render target and depth records) takes it, so no
+/// read finds half of one record and half of another (two threads at the
+/// same slot were a data race: `record` wrote under [`VIEWS`] only, and
+/// copies took no lock at all). Readers share it; it is held for the
+/// access alone, never while taking another lock.
+/// shortcut: a title that copies descriptors with its own stores, not the
+/// device's methods, takes no lock; what it leaves is read as before (a
+/// record of another view, or none).
+static RECORDS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// [`RECORDS`] for a read.
+fn records_read() -> std::sync::RwLockReadGuard<'static, ()> {
+    RECORDS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`RECORDS`] for a write.
+fn records_written() -> std::sync::RwLockWriteGuard<'static, ()> {
+    RECORDS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The record header at `handle` (tag, view index, generation), read under
+/// [`RECORDS`]: one the title's view creation or descriptor copies wrote
+/// whole, never part of one.
+pub(crate) fn header(handle: u64) -> [u32; 3] {
+    let _records = records_read();
+    // SAFETY: the handle is a descriptor slot in title memory, at least 16
+    // bytes.
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
 }
 const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
@@ -580,8 +626,11 @@ fn record(handle: u64, view: View) {
         }
     };
     let generation = views.list[i as usize].1;
-    // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-    unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    {
+        let _records = records_written();
+        // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+        unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    }
     drop(views);
     #[cfg(windows)]
     mirror(handle);
@@ -621,8 +670,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
     }
-    // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let [tag, i, generation] = header(handle);
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
@@ -708,8 +756,11 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        {
+            let _records = records_written();
+            // SAFETY: both ranges are descriptor slots the title owns.
+            unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
@@ -782,6 +833,7 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     if handle == 0 {
         return None;
     }
+    let _records = records_read();
     // SAFETY: the handle is a descriptor slot the title passes back.
     let record = unsafe { (handle as *const RtvRecord).read_unaligned() };
     (record.tag == tag).then_some(record)

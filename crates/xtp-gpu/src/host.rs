@@ -1015,6 +1015,9 @@ impl Drop for DynamicLease {
     }
 }
 
+/// Work a list runs as it closes ([`HostList::at_close`]).
+type Closing = Box<dyn FnOnce(&HostList) + Send>;
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1040,6 +1043,10 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Times `refreshed` was emptied ([`HostList::refresh_epoch`]).
+    refresh_epoch: u64,
+    /// Work the list runs as it closes ([`HostList::at_close`]).
+    closing: Vec<Closing>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1515,6 +1522,9 @@ impl Host {
         let reached = unsafe { self.fence.GetCompletedValue() };
         let seen = std::time::Instant::now();
         self.timeline.finish(reached, |p| self.complete(p, seen));
+        // Raw views of the stride tables that the fence has reached go
+        // back to their pools now, however long their heap stays unused.
+        crate::descriptor::host::fence_reached();
     }
 
     /// Finishes every submission up to the one that signals `value`,
@@ -2097,6 +2107,11 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // What the recording asked to run as it closes ([`HostList::at_close`]).
+        let closing = std::mem::take(&mut self.deferred().closing);
+        for work in closing {
+            work(self);
+        }
         // Depth textures whose twins the list wrote last get what was
         // written (`twins`).
         self.twins_to_depth();
@@ -2401,6 +2416,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.refresh_epoch += 1;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2424,6 +2440,19 @@ impl HostList {
             return;
         }
         deferred.copies.push(Step::Fill(dst, src, len));
+    }
+
+    /// Counts the title copies after which [`HostList::defer_refresh`]
+    /// refreshes a range again: a caller that refreshed what it reads at
+    /// one count has nothing to refresh again while it holds.
+    pub(crate) fn refresh_epoch(&self) -> u64 {
+        self.deferred().refresh_epoch
+    }
+
+    /// Runs `work` as the list closes (before its commands end), in the
+    /// order given; dropped with the recording if it never closes.
+    pub(crate) fn at_close(&self, work: impl FnOnce(&HostList) + Send + 'static) {
+        self.deferred().closing.push(Box::new(work));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2651,6 +2680,7 @@ impl HostList {
             .copies
             .push(Step::Run(Box::new(work), writes, reads));
         deferred.refreshed.clear();
+        deferred.refresh_epoch += 1;
     }
 
     /// As [`HostList::defer`], for work that writes only host memory (and
