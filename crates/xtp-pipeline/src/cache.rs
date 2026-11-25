@@ -53,13 +53,37 @@ struct Record {
     modified: SystemTime,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Index {
     files: HashMap<CacheKey, Record>,
     oldest: BTreeSet<(SystemTime, [u8; 32])>,
     bytes: u64,
     hits: u64,
     active: HashMap<CacheKey, (usize, Arc<Flight>)>,
+    /// Where each change to `files` is appended once the cache is open
+    /// ([`disk::INDEX_FILE`]).
+    journal: Option<disk::Journal>,
+}
+
+impl std::fmt::Debug for Index {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Index")
+            .field("entries", &self.files.len())
+            .field("bytes", &self.bytes)
+            .field("hits", &self.hits)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How a cache's entries were known when it was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opened {
+    /// From its index file.
+    Index,
+    /// From its folder's entries: no index file, or a damaged one.
+    Scan,
+    /// Disk storage is off.
+    Off,
 }
 
 #[derive(Debug)]
@@ -68,6 +92,7 @@ struct Store {
     limit: u64,
     index: Mutex<Index>,
     warned_write_failure: AtomicBool,
+    opened: Opened,
 }
 
 // Opening the same directory twice in this process must also share its pins.
@@ -89,6 +114,18 @@ impl Cache {
 
     /// Indexes existing entries and prunes oldest publications first. Concurrent
     /// opens of the same root must agree on its limit. Zero disables disk storage.
+    ///
+    /// The entries are read from the index file at the root
+    /// ([`disk::INDEX_FILE`]): one file, where looking at each entry took
+    /// minutes for a cache of 157,805 (2026-11-25: sessions killed at 300 s
+    /// before the title drew). Without one, or with a damaged one, the
+    /// folder's entries are listed (their sizes and times, no file opened)
+    /// and the index written. Every publication and removal is appended to
+    /// it after. The index only sizes the cache: a read looks for its
+    /// entry's file whatever the index says, and checks it, so an index
+    /// that misses entries (written by a build without one) or lists gone
+    /// ones costs disk room or a stale count, never a wrong answer;
+    /// [`Cache::reindex`] sets it right.
     pub fn open_with_limit(root: impl Into<PathBuf>, limit: u64) -> Result<Self> {
         let root = root.into();
         xtp_core::ensure_outside_repo(&root)?;
@@ -109,15 +146,44 @@ impl Cache {
             return Ok(Self { store });
         }
         let mut index = Index::default();
+        let mut opened = Opened::Off;
         if limit != 0 {
-            index.scan(&root);
+            let started = std::time::Instant::now();
+            opened = match disk::read_index(&root) {
+                Some(changes) => {
+                    let records = changes.len();
+                    for change in changes {
+                        index.apply(change);
+                    }
+                    // Mostly changes since its snapshot: a new snapshot.
+                    if records > 2 * index.files.len() + 4096 {
+                        index.snapshot(&root);
+                    }
+                    Opened::Index
+                }
+                None => {
+                    index.scan(&root);
+                    index.snapshot(&root);
+                    Opened::Scan
+                }
+            };
+            index.journal = Some(disk::Journal::new(&root));
             index.trim(&root, limit);
+            tracing::info!(
+                root = %root.display(),
+                entries = index.files.len(),
+                bytes = index.bytes,
+                from = ?opened,
+                ms = started.elapsed().as_millis() as u64,
+                "cache opened"
+            );
         }
         let store = Arc::new(Store {
             root: root.clone(),
             limit,
             index: Mutex::new(index),
             warned_write_failure: AtomicBool::new(false),
+            opened,
         });
         stores.retain(|_, store| store.strong_count() > 0);
         stores.insert(root, Arc::downgrade(&store));
@@ -136,6 +202,32 @@ impl Cache {
             bytes: index.bytes,
             hits: index.hits,
         }
+    }
+
+    /// How the entries were known when this cache was first opened in this
+    /// process.
+    pub fn opened(&self) -> Opened {
+        self.store.opened
+    }
+
+    /// Lists the folder's entries again (their sizes and times: no file is
+    /// opened) and writes the index anew from them, then prunes to the
+    /// limit: for entries the index misses (written by a build that kept
+    /// none, or appended to an index another process replaced) and gone
+    /// ones it still lists. The cache waits meanwhile: for a process that
+    /// can (`xtp precook`), not one a title waits on.
+    pub fn reindex(&self) {
+        if self.store.limit == 0 {
+            return;
+        }
+        let mut index = lock(&self.store.index);
+        let mut scanned = Index::default();
+        scanned.scan(&self.store.root);
+        index.files = scanned.files;
+        index.oldest = scanned.oldest;
+        index.bytes = scanned.bytes;
+        index.snapshot(&self.store.root);
+        index.trim(&self.store.root, self.store.limit);
     }
 
     /// Returns an owned snapshot which remains readable after eviction.
@@ -329,9 +421,10 @@ impl Index {
                 );
                 let key =
                     CacheKey(blake3::Hash::from_hex(hash).expect("validated hexadecimal key"));
-                if let Ok(size) = disk::indexed_size(&file.path(), meta.len()) {
-                    self.insert(key, size, modified);
-                }
+                // The directory entry's size and time: no file opened (on
+                // Windows the listing holds them), where reading each
+                // header took minutes cold.
+                self.insert(key, disk::payload_size(meta.len()), modified);
             }
         }
     }
@@ -348,12 +441,57 @@ impl Index {
         self.oldest.insert((modified, *key.0.as_bytes()));
         self.files.insert(key, Record { bytes, modified });
         self.bytes += bytes;
+        if let Some(journal) = &mut self.journal {
+            journal.append(&disk::Change::Published {
+                key: *key.0.as_bytes(),
+                bytes,
+                modified,
+            });
+        }
     }
 
     fn forget(&mut self, key: CacheKey) {
         if let Some(old) = self.files.remove(&key) {
             self.oldest.remove(&(old.modified, *key.0.as_bytes()));
             self.bytes -= old.bytes;
+            if let Some(journal) = &mut self.journal {
+                journal.append(&disk::Change::Removed {
+                    key: *key.0.as_bytes(),
+                });
+            }
+        }
+    }
+
+    /// A change read from the index file (before the journal is open).
+    fn apply(&mut self, change: disk::Change) {
+        match change {
+            disk::Change::Published {
+                key,
+                bytes,
+                modified,
+            } => self.insert(CacheKey(key.into()), bytes, modified),
+            disk::Change::Removed { key } => self.forget(CacheKey(key.into())),
+        }
+    }
+
+    /// Replaces the index file with these entries; appends go to the new
+    /// one. One that cannot be written leaves the old one, and the cache
+    /// works as well: the next open may look at every entry.
+    fn snapshot(&mut self, root: &Path) {
+        let entries = self.files.iter().map(|(key, r)| disk::Change::Published {
+            key: *key.0.as_bytes(),
+            bytes: r.bytes,
+            modified: r.modified,
+        });
+        match disk::write_index(root, entries) {
+            Ok(()) => {
+                if let Some(journal) = &mut self.journal {
+                    journal.reopen();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(root = %root.display(), error = %e, "cache index not written")
+            }
         }
     }
 
@@ -559,9 +697,10 @@ mod tests {
             .open(&path)
             .unwrap();
         let cache = Cache::open(tmp.path()).unwrap();
-        assert_eq!(cache.stats().entries, 0);
+        // The index lists it, though it cannot be read now.
+        assert_eq!(cache.stats().entries, 1);
         assert_eq!(&*cache.get_or_convert(&conv, b"a").unwrap(), b"A");
-        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.stats().entries, 1);
         cache.get_or_convert(&conv, b"b").unwrap();
         drop(held);
         assert_eq!(&*cache.get_or_convert(&conv, b"a").unwrap(), b"A");
@@ -878,7 +1017,11 @@ mod tests {
         }
         let foreign = paths[0].with_file_name("user-file");
         fs::write(&foreign, b"keep").unwrap();
+        // A folder of entries without an index (written before there was
+        // one): listed at open.
+        fs::remove_file(tmp.path().join(disk::INDEX_FILE)).unwrap();
         let cache = Cache::open_with_limit(tmp.path(), 6).unwrap();
+        assert_eq!(cache.opened(), Opened::Scan);
         assert!(!paths[0].exists());
         assert!(paths[1].is_file() && paths[2].is_file());
         assert_eq!(
@@ -898,5 +1041,162 @@ mod tests {
         assert!(paths[1].is_file());
         assert_eq!(fs::read(&paths[2]).unwrap(), b"abc");
         assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+    }
+
+    fn upper(version: u32) -> Upper {
+        Upper {
+            version,
+            runs: AtomicUsize::new(0),
+        }
+    }
+
+    /// An open reads the index file the first one wrote, with what was
+    /// published and pruned since appended: the same entries and bytes a
+    /// listing of the folder gives. An entry file written behind its back
+    /// (by a build without an index) is not counted, but still read; a
+    /// reindex counts it. A damaged index makes the next open list the
+    /// folder, and write the index again.
+    #[test]
+    fn opening_reads_the_index_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let conv = upper(1);
+        {
+            let cache = Cache::open_with_limit(&root, 9).unwrap();
+            assert_eq!(cache.opened(), Opened::Scan, "no index yet");
+            for input in [b"one".as_slice(), b"two", b"three"] {
+                cache.get_or_convert(&conv, input).unwrap();
+            }
+            // "one" went for "three": the index says so too.
+            assert_eq!(cache.stats().entries, 2);
+        }
+        let stray = upper(2);
+        let stray_path = {
+            let cache = Cache::open_with_limit(&root, 9).unwrap();
+            assert_eq!(cache.opened(), Opened::Index);
+            assert_eq!(
+                (cache.stats().entries, cache.stats().bytes),
+                (2, 8),
+                "two and three"
+            );
+            cache.path_for(&CacheKey::new(&stray, b"x"))
+        };
+        disk::Staged::write(&stray_path, b"X")
+            .unwrap()
+            .publish(&stray_path)
+            .unwrap();
+        {
+            let cache = Cache::open_with_limit(&root, 9).unwrap();
+            assert_eq!(cache.opened(), Opened::Index);
+            assert_eq!(cache.stats().entries, 2, "the stray file is not listed");
+            cache.reindex();
+            assert_eq!(cache.stats().entries, 3, "until a reindex");
+            assert_eq!(&*cache.get_or_convert(&stray, b"x").unwrap(), b"X");
+            assert_eq!(stray.runs.load(Ordering::Relaxed), 0, "read, not made");
+        }
+        let index = root.join(disk::INDEX_FILE);
+        let mut bytes = fs::read(&index).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&index, &bytes).unwrap();
+        {
+            let cache = Cache::open_with_limit(&root, 9).unwrap();
+            assert_eq!(cache.opened(), Opened::Scan, "a damaged index");
+            assert_eq!(cache.stats().entries, 3);
+        }
+        fs::write(&index, &bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(disk::read_index(&root), None, "a torn record");
+        let cache = Cache::open_with_limit(&root, 9).unwrap();
+        assert_eq!(cache.opened(), Opened::Scan);
+        drop(cache);
+        let cache = Cache::open_with_limit(&root, 9).unwrap();
+        assert_eq!(cache.opened(), Opened::Index, "written again");
+        assert_eq!((cache.stats().entries, cache.stats().bytes), (3, 9));
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 3);
+    }
+
+    /// The index's records round-trip, and a changed byte is damage.
+    #[test]
+    fn index_records_round_trip_and_reject_damage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let modified = SystemTime::UNIX_EPOCH + Duration::new(1_795_600_000, 123_456_700);
+        let changes = [
+            disk::Change::Published {
+                key: [7; 32],
+                bytes: 42,
+                modified,
+            },
+            disk::Change::Removed { key: [7; 32] },
+        ];
+        disk::write_index(tmp.path(), changes.into_iter()).unwrap();
+        assert_eq!(disk::read_index(tmp.path()), Some(changes.to_vec()));
+        let path = tmp.path().join(disk::INDEX_FILE);
+        let good = fs::read(&path).unwrap();
+        for at in [0, 16, 20, 60, good.len() - 1] {
+            let mut bad = good.clone();
+            bad[at] ^= 1;
+            fs::write(&path, &bad).unwrap();
+            assert_eq!(disk::read_index(tmp.path()), None, "byte {at}");
+        }
+        fs::remove_file(&path).unwrap();
+        assert_eq!(disk::read_index(tmp.path()), None, "none");
+    }
+
+    /// Opening a real cache folder (`XTP_CACHE_PROBE`), three ways: each
+    /// entry's header read (what an open did before the index), the folder
+    /// listed (the open without an index), and the index file read (written
+    /// to a folder of its own: the probed one is not changed). Run with
+    /// `--ignored --nocapture`, cold for the first figure that matters.
+    #[test]
+    #[ignore = "a probe of a real cache folder (XTP_CACHE_PROBE)"]
+    fn probe_opening_a_real_cache() {
+        let Some(root) = std::env::var_os("XTP_CACHE_PROBE").map(PathBuf::from) else {
+            eprintln!("XTP_CACHE_PROBE is not set");
+            return;
+        };
+        let way = std::env::var("XTP_CACHE_PROBE_WAY").unwrap_or_default();
+        let timed = |what: &str, f: &dyn Fn() -> (usize, u64)| {
+            let started = std::time::Instant::now();
+            let (entries, bytes) = f();
+            println!(
+                "{what}: {entries} entries, {bytes} bytes, {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
+        };
+        if way.is_empty() || way == "headers" {
+            timed("headers read", &|| {
+                let mut entries = (0, 0);
+                for shard in fs::read_dir(&root).unwrap().flatten() {
+                    if !shard.file_type().is_ok_and(|t| t.is_dir()) {
+                        continue;
+                    }
+                    for file in fs::read_dir(shard.path()).unwrap().flatten() {
+                        let Ok(meta) = file.metadata() else { continue };
+                        if let Ok(size) = disk::indexed_size(&file.path(), meta.len()) {
+                            entries.0 += 1;
+                            entries.1 += size;
+                        }
+                    }
+                }
+                entries
+            });
+        }
+        let mut index = Index::default();
+        if way.is_empty() || way == "listing" {
+            timed("folder listed", &|| {
+                let mut index = Index::default();
+                index.scan(&root);
+                (index.files.len(), index.bytes)
+            });
+        }
+        index.scan(&root);
+        let copy = tempfile::tempdir().unwrap();
+        index.snapshot(copy.path());
+        timed("index read", &|| {
+            let mut read = Index::default();
+            for change in disk::read_index(copy.path()).unwrap() {
+                read.apply(change);
+            }
+            (read.files.len(), read.bytes)
+        });
     }
 }
