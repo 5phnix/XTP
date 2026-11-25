@@ -19,10 +19,12 @@
 //! TLAS there at the dispatch (section 7); that binding is RT phase 2c.
 //!
 //! Gate (section 5.2): a program is spliced only when [`SITES`] names it,
-//! by the fingerprint of its code ([`fingerprint`]), and only once its walk
-//! is proven by play on synthetic worlds (section 5.3). No walk is proven
-//! yet, so [`SITES`] is empty and no translation changes; the tests splice a
-//! walk of their own (`emit/rayquery_tests.rs`) through [`splice`].
+//! by the fingerprint of its code ([`fingerprint`]), and only when its walk
+//! is proven by play on synthetic worlds at its translation (section 5.3,
+//! [`proof`]): the program played with its walk ([`play`]) and played with
+//! the host query in its place give the same answers ([`world`]). A walk the
+//! play does not prove stays refused, as before. The tests prove a walk of
+//! their own (`emit/rayquery_tests.rs`).
 //!
 //! The method (result kinds, a host query standing for the walk, a proof
 //! by play) is the person's AnyPS5 design (`RayQueryResults`,
@@ -30,6 +32,12 @@
 //! code of it is copied (rt-dxr.md section 2.2).
 
 use std::collections::{HashMap, HashSet};
+
+#[cfg(test)]
+pub(crate) mod asm;
+pub(crate) mod play;
+pub(crate) mod proof;
+pub(crate) mod world;
 
 use super::super::bitcode::{Attr, Cast, Md, Module, Term, Ty, V, pred};
 use super::super::container::Binding;
@@ -48,7 +56,7 @@ pub const TLAS_REGISTER: u8 = 240;
 /// DXR ray flags (`RAY_FLAG_*`).
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "no walk is proven yet: only the tests make sites")
+    expect(dead_code, reason = "no site is named yet: only the tests make sites")
 )]
 pub(crate) mod ray_flags {
     pub const FORCE_OPAQUE: u32 = 0x01;
@@ -81,9 +89,11 @@ pub(crate) enum Kind {
     /// `rayquery_tests`), which the rule leaves to the implementation.
     T,
     /// An iteration count that the code after the walk only compares with
-    /// the walk's cap: 0 on the host, which has no cap (section 9). A walk
-    /// that passes the cap (0xfffe in family A) counts as a hit at its
-    /// current t-max on the console; the host answers the whole query.
+    /// the walk's cap ([`Site::cap`]): 0 on the host, which has no cap
+    /// (section 9). A walk that passes the cap (0xfffe in family A) counts
+    /// as a hit at its current t-max on the console; the host answers the
+    /// whole query. The proof leaves such lanes out, and checks that the
+    /// code after the walk stores the same values for the others.
     Count,
 }
 
@@ -135,11 +145,35 @@ pub(crate) struct Site {
     pub flags: u32,
     /// The VGPRs the code after the walk reads of it, with what each holds.
     pub results: &'static [(u8, Kind)],
+    /// Registers the walk changes and gives back as it found them, which
+    /// the code after it reads (EXEC, which a walk narrows to lanes and
+    /// restores): proven by play.
+    pub kept: &'static [Reg],
+    /// The iteration count past which the walk gives up ([`Kind::Count`]).
+    pub cap: Option<u32>,
+    /// Where the guest structure's buffer descriptor is: the dispatch looks
+    /// the host TLAS up from its address (section 8), one per descriptor.
+    pub tlas: Source,
 }
 
-/// The walks to splice, by the [`fingerprint`] of their program's code:
-/// empty until a walk is proven by play (section 5.3).
+/// A buffer descriptor in a user-data table: the user SGPR that holds the
+/// table's address, and the descriptor's byte offset in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Source {
+    pub user_sgpr: u8,
+    pub offset: u16,
+}
+
+/// The walks to splice, by the [`fingerprint`] of their program's code.
+/// Each is described by hand from its disassembly (never committed) and
+/// proven by play at translation: none yet.
 const SITES: &[(u64, Site)] = &[];
+
+/// The site [`SITES`] names for a program's code, if any.
+pub(crate) fn site_of(code: &[u8]) -> Option<&'static Site> {
+    let key = fingerprint(code);
+    SITES.iter().find(|(k, _)| *k == key).map(|(_, s)| s)
+}
 
 /// FNV-1a (64 bits) of a program's code: how [`SITES`] names it.
 pub(crate) fn fingerprint(code: &[u8]) -> u64 {
@@ -148,15 +182,19 @@ pub(crate) fn fingerprint(code: &[u8]) -> u64 {
     })
 }
 
-/// The program with the walk [`SITES`] names for it spliced, or as it is.
-/// Runs on the IR before anything else reads it (after
-/// `geometry::prepared`): the resource tracker then never sees the walk's
-/// node reads.
+/// The program with the walk [`SITES`] names for it spliced, once proven
+/// by play, or as it is. Runs on the IR before anything else reads it
+/// (after `geometry::prepared`): the resource tracker then never sees the
+/// walk's node reads. A walk the play does not prove is refused where the
+/// play stopped.
 pub(crate) fn prepared(p: Program, native: &NativeProgram) -> Result<Program, ShaderError> {
-    let key = fingerprint(&native.code);
-    let Some((_, site)) = SITES.iter().find(|(k, _)| *k == key) else {
+    let Some(site) = site_of(&native.code) else {
         return Ok(p);
     };
+    proof::prove(&p, native, site).map_err(|f| ShaderError::Unsupported {
+        offset: f.offset,
+        what: f.why,
+    })?;
     splice(p, site).map_err(|what| ShaderError::Unsupported {
         offset: site.header,
         what,
@@ -223,8 +261,9 @@ fn next_value(p: &Program) -> u32 {
 ///   the block that enters the walk, and EXEC there (it runs in the lanes
 ///   that entered the walk);
 /// * it writes each register of `site.results`; the code after the walk
-///   reads those instead of what the walk left. Any other value of the
-///   walk read after it refuses the splice;
+///   reads those instead of what the walk left, and reads the registers of
+///   `site.kept` as they were where the walk started. Any other value of
+///   the walk read after it refuses the splice;
 /// * then what only the walk read is removed ([`dead_code`]).
 pub(crate) fn splice(mut p: Program, site: &Site) -> Result<Program, Why> {
     if p.wave64 {
@@ -368,7 +407,20 @@ pub(crate) fn splice(mut p: Program, site: &Site) -> Result<Program, Why> {
     };
     let results: Vec<(u8, Kind, Value)> =
         site.results.iter().map(|&(r, k)| (r, k, fresh())).collect();
-    let result_of = |reg: Reg| results.iter().find(|r| Reg::V(r.0) == reg).map(|r| r.2);
+    // A kept register reads its value from before the walk.
+    let mut kept: Vec<(Reg, Value)> = Vec::new();
+    for &reg in site.kept {
+        let v = value_at_end(&p, pre, reg)
+            .ok_or("a kept register without a value where the walk starts")?;
+        kept.push((reg, v));
+    }
+    let result_of = |reg: Reg| {
+        results
+            .iter()
+            .find(|r| Reg::V(r.0) == reg)
+            .map(|r| r.2)
+            .or_else(|| kept.iter().find(|k| k.0 == reg).map(|k| k.1))
+    };
     // The exit block's phis: what each register holds when the walk is
     // left. The new instruction's result, or the value from before the walk
     // when every way out of it brings that one (the skip path is no way
