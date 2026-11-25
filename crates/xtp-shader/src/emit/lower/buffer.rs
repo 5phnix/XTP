@@ -63,41 +63,21 @@ enum RawView {
     },
     Built {
         handle: V,
+        stride: u32,
         records: u32,
-        desc: BufferDescriptor,
+        mode: BufferOob,
     },
-}
-
-impl RawView {
-    /// Distance physique entre deux dwords logiquement consécutifs.
-    fn word_stride(self) -> u32 {
-        match self {
-            Self::Built { desc, .. } if desc.swizzle_enable => 4 * desc.index_stride,
-            _ => 4,
-        }
-    }
 }
 
 /// The scalar offset moves the base. Only the VGPR and instruction
 /// offsets (and the component being transferred) are within the element.
 #[derive(Clone, Copy)]
 struct BufferAddress {
-    valid: V,
     index: Option<V>,
     within: V,
     scalar: Option<V>,
     base: u32,
     dynamic_base: Option<V>,
-}
-
-/// Plage commune aux composantes du transfert. `remaining` compte les octets
-/// logiques avant la fin de l'élément ou du tampon, avant ajout de SOFFSET.
-#[derive(Clone, Copy)]
-struct RawRange {
-    byte: V,
-    valid: V,
-    remaining: V,
-    word_stride: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,29 +157,38 @@ impl<'a> Lower<'a> {
         off: V,
         format: u8,
         channels: u32,
-        word_stride: u32,
     ) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
+        let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
+            let mask = l.s.m.i8((1u8 << n) - 1);
+            let r = l.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                l.s.t.res_ret,
+                139,
+                &[h, at, u, mask, align],
+            );
+            (0..n)
+                .map(|k| {
+                    let x = l.s.m.extract(c, r, k);
+                    l.as_int(x)
+                })
+                .collect()
+        };
         let words = if total < 32 {
             // A byte or half inside the dword that holds it.
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let w = self.raw_words(h, at, 1)[0];
+            let w = load(self, at, 1)[0];
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
-        } else if word_stride == 4 || total == 32 {
-            self.raw_words(h, off, total / 32)
         } else {
-            (0..total / 32)
-                .map(|k| {
-                    let delta = self.s.m.i32(k * word_stride);
-                    let at = self.s.m.bin(c, Bin::Add, off, delta);
-                    self.raw_words(h, at, 1)[0]
-                })
-                .collect()
+            load(self, off, total / 32)
         };
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
@@ -363,26 +352,22 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let add_tid = built.is_some_and(|(d, _)| d.add_tid_enable);
-        let mut valid = self.s.m.bool(true);
         let index = if add_tid {
             let lane = self.buffer_lane();
-            Some(index.map_or(lane, |i| self.raw_add(i, lane, &mut valid)))
+            Some(index.map_or(lane, |i| self.s.m.bin(c, Bin::Add, i, lane)))
         } else {
             index
         };
-        let built_format =
-            format.is_some() && built.is_some_and(|(d, _)| index.is_some() || d.swizzle_enable);
         let raw = !typed
             && !used.is_some_and(|r| r.kind == ResourceType::Cbv)
-            && (built.is_some_and(|(d, _)| {
-                crate::emit::raw_structured() || add_tid || d.swizzle_enable
-            }) || self.through_table(index, used, src)?
+            && (built.is_some() && (crate::emit::raw_structured() || add_tid)
+                || self.through_table(index, used, src)?
                 || (index.is_some() && crate::emit::raw_structured()));
         let mut within = self.s.m.i32(u32::from(*offset));
         if *offen {
             let o = vaddr(self, u8::from(*idxen))?;
-            within = if raw || built_format {
-                self.raw_add(within, o, &mut valid)
+            within = if raw {
+                self.raw_add(within, o)
             } else {
                 self.s.m.bin(c, Bin::Add, within, o)
             };
@@ -393,7 +378,6 @@ impl<'a> Lower<'a> {
         };
         let (base, dynamic_base) = self.built_offset(src)?;
         let address = BufferAddress {
-            valid,
             index,
             within,
             scalar,
@@ -401,7 +385,7 @@ impl<'a> Lower<'a> {
             dynamic_base,
         };
         let mut off = within;
-        if !raw && !built_format {
+        if !raw {
             if let Some(so) = scalar {
                 off = self.s.m.bin(c, Bin::Add, off, so);
             }
@@ -460,11 +444,15 @@ impl<'a> Lower<'a> {
         let raw_view = |l: &mut Self| -> Result<RawView, Why> {
             Ok(match built {
                 Some((desc, records)) => {
+                    if desc.swizzle_enable {
+                        return Err("a swizzled raw buffer descriptor");
+                    }
                     let handle = l.handle(site, src, false, (11 | u, 0))?;
                     RawView::Built {
                         handle,
+                        stride: desc.stride,
                         records,
-                        desc,
+                        mode: desc.oob_select,
                     }
                 }
                 _ if l.raw_through_table(src) => {
@@ -615,9 +603,7 @@ impl<'a> Lower<'a> {
         // (What can stop the load is checked before its guarded block.)
         let stride = used.map_or(0, |u| u.stride);
         match *format {
-            Some(_) if index.is_some() && built.is_none() => {
-                return Err("a typed-format load by index");
-            }
+            Some(_) if index.is_some() => return Err("a typed-format load by index"),
             Some(_) => {}
             None if typed => {
                 if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
@@ -631,26 +617,17 @@ impl<'a> Lower<'a> {
         }
         let xs = self.guarded_load(lane_guard, |l| {
             if let Some(f) = *format {
-                let (bits, _) = buffer_format(f).ok_or("a buffer format")?;
-                let width = bits.iter().sum::<u32>() / 8;
-                if built_format {
-                    let view = raw_view(l)?;
-                    let range = l.raw_range(view, address);
-                    let valid = l.raw_fits(range, width);
-                    return l.guarded_values(Some(valid), |l| {
-                        let h = l.raw_handle(view, 11 | u);
-                        l.format_load(h, range.byte, f, count, range.word_stride)
-                    });
-                }
                 if l.raw_through_table(src) {
                     // The format's bytes (a byte or a half is read in its
                     // dword, which the view's bytes hold whole).
+                    let width = buffer_format(f)
+                        .map_or(4, |(bits, _)| (bits.iter().sum::<u32>() / 8).max(1));
                     return l.runtime_access(src, None, off, width, 11 | u, |l, h, byte| {
-                        l.format_load(h, byte, f, count, 4)
+                        l.format_load(h, byte, f, count)
                     });
                 }
                 let h = l.handle(site, src, false, (11 | u, 0))?;
-                return l.format_load(h, off, f, count, 4);
+                return l.format_load(h, off, f, count);
             }
             let c = l.cur;
             let r = if typed {
@@ -670,7 +647,9 @@ impl<'a> Lower<'a> {
                 let (h, coords) = match index {
                     _ if raw => {
                         let view = raw_view(l)?;
-                        return l.raw_load(view, address, 11 | u, count);
+                        return l.raw_components(view, address, 11 | u, count, |l, h, byte, _| {
+                            Ok(vec![l.raw_dword(h, byte)])
+                        });
                     }
                     Some(index) => (l.handle(site, src, false, (12 | u, stride))?, [index, off]),
                     None => (l.handle(site, src, false, (11 | u, 0))?, [off, iu]),
@@ -766,79 +745,6 @@ impl<'a> Lower<'a> {
         self.s.m.bin(self.cur, Bin::And, flat, mask)
     }
 
-    fn raw_handle(&mut self, view: RawView, props: u32) -> V {
-        match view {
-            RawView::Table(e) => {
-                self.s
-                    .heap_handle(self.cur, e.raw, false, e.nonuniform, (props, 0))
-            }
-            RawView::Structured { handle, .. } | RawView::Built { handle, .. } => handle,
-        }
-    }
-
-    /// Une vue D3D du tas renvoie zéro pour chaque dword hors de sa plage.
-    /// Le masque supplémentaire reproduit la limite logique de l'élément GFX10.
-    fn raw_load(
-        &mut self,
-        view: RawView,
-        address: BufferAddress,
-        props: u32,
-        count: u32,
-    ) -> Result<Vec<V>, Why> {
-        let range = self.raw_range(view, address);
-        let byte = range.byte;
-        let first = self.raw_fits(range, 4);
-        // Une entrée de table vide peut désigner un slot de texture. Créer le
-        // handle et lire uniquement si le premier dword est accessible.
-        self.guarded_values(Some(first), |l| {
-            let h = l.raw_handle(view, props);
-            if count == 1 {
-                return Ok(l.raw_words(h, byte, 1));
-            }
-            let zero = l.s.m.i32(0);
-            let mut valid = vec![l.s.m.bool(true)];
-            for n in 2..=count {
-                valid.push(l.raw_fits(range, n * 4));
-            }
-            if view.word_stride() != 4 {
-                // Le swizzle entrelace les dwords de plusieurs indices.
-                let mut words = Vec::new();
-                for (k, &ok) in valid.iter().enumerate() {
-                    let delta = l.s.m.i32(k as u32 * view.word_stride());
-                    let at = l.s.m.bin(l.cur, Bin::Add, byte, delta);
-                    let safe = l.s.m.select(l.cur, ok, at, byte);
-                    let word = l.raw_words(h, safe, 1)[0];
-                    words.push(l.s.m.select(l.cur, ok, word, zero));
-                }
-                return Ok(words);
-            }
-            if matches!(view, RawView::Built { .. }) {
-                // Un SRV racine n'a pas de borne D3D. Choisir la largeur
-                // exacte du préfixe valide avant la lecture physique.
-                let mut words = vec![zero; count as usize];
-                for n in (1..=count as usize).rev() {
-                    let ok = if n == count as usize {
-                        valid[n - 1]
-                    } else {
-                        let no = l.s.m.bool(false);
-                        l.s.m.select(l.cur, valid[n], no, valid[n - 1])
-                    };
-                    let at = l.begin_guarded(Some(ok));
-                    let prefix = l.raw_words(h, byte, n as u32);
-                    let pairs: Vec<_> = prefix.into_iter().zip(words.iter().copied()).collect();
-                    words[..n].copy_from_slice(&l.end_guarded(at, &pairs));
-                }
-                return Ok(words);
-            }
-            let words = l.raw_words(h, byte, count);
-            Ok(words
-                .into_iter()
-                .zip(valid)
-                .map(|(w, ok)| l.s.m.select(l.cur, ok, w, zero))
-                .collect())
-        })
-    }
-
     /// MUBUF checks DWORDX2/3/4 one component at a time (ISA section 8.1.5).
     fn raw_components(
         &mut self,
@@ -848,14 +754,18 @@ impl<'a> Lower<'a> {
         count: u32,
         mut access: impl FnMut(&mut Self, V, V, usize) -> Result<Vec<V>, Why>,
     ) -> Result<Vec<V>, Why> {
-        let range = self.raw_range(view, address);
         let mut out = Vec::new();
         for k in 0..count {
-            let valid = self.raw_fits(range, 4 * (k + 1));
-            let delta = self.s.m.i32(range.word_stride * k);
-            let byte = self.s.m.bin(self.cur, Bin::Add, range.byte, delta);
+            let delta = self.s.m.i32(4 * k);
+            let within = self.raw_add(address.within, delta);
+            let (byte, valid) = self.raw_coordinate(view, BufferAddress { within, ..address }, 4);
             let xs = self.guarded_values(Some(valid), |l| {
-                let h = l.raw_handle(view, props);
+                let h = match view {
+                    RawView::Table(e) => {
+                        l.s.heap_handle(l.cur, e.raw, false, e.nonuniform, (props, 0))
+                    }
+                    RawView::Structured { handle, .. } | RawView::Built { handle, .. } => handle,
+                };
                 access(l, h, byte, k as usize)
             })?;
             out.extend(xs);
@@ -863,9 +773,10 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
-    /// Conserve la retenue dans le prédicat pour qu'une adresse au-delà
-    /// de 4 Gio ne revienne jamais au début de la vue D3D.
-    fn raw_add(&mut self, a: V, b: V, valid: &mut V) -> V {
+    /// Saturate an overflowing byte address. No complete dword fits at
+    /// u32::MAX, so a later component or base displacement cannot wrap
+    /// an invalid access back to the start of the view.
+    fn raw_add(&mut self, a: V, b: V) -> V {
         let zero = self.s.m.i32(0);
         if a == zero {
             return b;
@@ -873,131 +784,93 @@ impl<'a> Lower<'a> {
         if b == zero {
             return a;
         }
-        let sum = self.s.m.bin(self.cur, Bin::Add, a, b);
-        let fits = self.s.m.cmp(self.cur, pred::IUGE, sum, a);
-        *valid = self.s.m.bin(self.cur, Bin::And, *valid, fits);
-        sum
-    }
-
-    fn raw_scale(&mut self, value: V, factor: u32, valid: &mut V) -> V {
-        let limit = self
-            .s
-            .m
-            .i32(u32::MAX.checked_div(factor).unwrap_or(u32::MAX));
-        let fits = self.s.m.cmp(self.cur, pred::IULE, value, limit);
-        *valid = self.s.m.bin(self.cur, Bin::And, *valid, fits);
-        let factor = self.s.m.i32(factor);
-        self.s.m.bin(self.cur, Bin::Mul, value, factor)
-    }
-
-    fn raw_fits(&mut self, r: RawRange, width: u32) -> V {
-        let span = (width - 1) / 4 * r.word_stride + (width - 1) % 4;
-        let last = self.s.m.i32(u32::MAX - span);
-        let fits = self.s.m.cmp(self.cur, pred::IULE, r.byte, last);
-        let width = self.s.m.i32(width);
-        let inside = self.s.m.cmp(self.cur, pred::IUGE, r.remaining, width);
-        let fits = self.s.m.bin(self.cur, Bin::And, fits, inside);
-        self.s.m.bin(self.cur, Bin::And, r.valid, fits)
-    }
-
-    /// RDNA2 §8.1.5. Chaque groupe de INDEX_STRIDE indices entrelace ses
-    /// dwords. Les octets sont contigus à l'intérieur de chaque dword.
-    fn swizzled_offset(&mut self, index: V, within: V, desc: BufferDescriptor, valid: &mut V) -> V {
         let c = self.cur;
-        let mask = self.s.m.i32(desc.index_stride - 1);
-        let group_mask = self.s.m.i32(!(desc.index_stride - 1));
-        let group = self.s.m.bin(c, Bin::And, index, group_mask);
-        let lane = self.s.m.bin(c, Bin::And, index, mask);
-        let four = self.s.m.i32(4);
-        let lane = self.s.m.bin(c, Bin::Mul, lane, four);
-        let not3 = self.s.m.i32(!3);
-        let three = self.s.m.i32(3);
-        let row = self.s.m.bin(c, Bin::And, within, not3);
-        let sub = self.s.m.bin(c, Bin::And, within, three);
-        let row = self.raw_scale(row, desc.index_stride, valid);
-        let group = self.raw_scale(group, desc.stride, valid);
-        let start = self.raw_add(group, row, valid);
-        let in_row = self.s.m.bin(c, Bin::Add, lane, sub);
-        self.raw_add(start, in_row, valid)
+        let sum = self.s.m.bin(c, Bin::Add, a, b);
+        let carry = self.s.m.cmp(c, pred::IULT, sum, a);
+        let max = self.s.m.i32(u32::MAX);
+        self.s.m.select(c, carry, max, sum)
     }
 
-    fn raw_range(&mut self, view: RawView, a: BufferAddress) -> RawRange {
+    /// Whether all `width` bytes from `byte` fit, including near 2^32.
+    fn fits(&mut self, byte: V, width: u32, size: V) -> V {
+        let c = self.cur;
+        let width = self.s.m.i32(width);
+        let room = self.s.m.cmp(c, pred::IUGE, size, width);
+        let last = self.s.m.bin(c, Bin::Sub, size, width);
+        let inside = self.s.m.cmp(c, pred::IULE, byte, last);
+        self.s.m.bin(c, Bin::And, room, inside)
+    }
+
+    fn raw_coordinate(&mut self, view: RawView, a: BufferAddress, width: u32) -> (V, V) {
         let c = self.cur;
         let zero = self.s.m.i32(0);
-        let max = self.s.m.i32(u32::MAX);
         let index = a.index.unwrap_or(zero);
-        let mut valid = a.valid;
-        let (mut byte, limit) = match view {
-            RawView::Table(e) => {
-                let raw = self.s.m.cmp(c, pred::EQ, e.stride, zero);
-                let four = self.s.m.i32(4);
-                let (at, limit) = if a.index.is_some() {
-                    let in_count = self.s.m.cmp(c, pred::IULT, index, e.count);
-                    let indexed = self.s.m.bin(c, Bin::Or, raw, in_count);
-                    valid = self.s.m.bin(c, Bin::And, valid, indexed);
-                    // Le nombre d'éléments de la table est borné par la vue
-                    // D3D. Pour un index valide, ce produit tient sur 32 bits.
-                    let at = self.s.m.bin(c, Bin::Mul, index, e.stride);
-                    let bytes = self.s.m.bin(c, Bin::Mul, e.count, four);
-                    (at, self.s.m.select(c, raw, bytes, e.stride))
-                } else {
-                    let element = self.s.m.select(c, raw, four, e.stride);
-                    (zero, self.s.m.bin(c, Bin::Mul, e.count, element))
-                };
-                let byte = self.raw_add(at, a.within, &mut valid);
-                (self.raw_add(byte, e.bias, &mut valid), Some(limit))
+        let displaced = a.scalar.map_or(a.within, |so| self.raw_add(a.within, so));
+        if let RawView::Table(e) = view {
+            let four = self.s.m.i32(4);
+            let raw = self.s.m.cmp(c, pred::EQ, e.stride, zero);
+            let element = self.s.m.select(c, raw, four, e.stride);
+            let size = self.s.m.bin(c, Bin::Mul, e.count, element);
+            let mut byte = displaced;
+            let mut valid = self.s.m.bool(true);
+            if a.index.is_some() {
+                let at = self.s.m.bin(c, Bin::Mul, index, e.stride);
+                byte = self.raw_add(at, displaced);
+                let in_count = self.s.m.cmp(c, pred::IULT, index, e.count);
+                let inside = self.fits(a.within, width, e.stride);
+                let structured = self.s.m.bin(c, Bin::And, in_count, inside);
+                valid = self.s.m.bin(c, Bin::Or, raw, structured);
             }
-            RawView::Structured { stride, .. } => {
-                let at = self.raw_scale(index, stride, &mut valid);
-                let byte = self.raw_add(at, a.within, &mut valid);
-                (byte, Some(self.s.m.i32(stride)))
-            }
-            RawView::Built { records, desc, .. } => {
-                let byte = if desc.swizzle_enable {
-                    self.swizzled_offset(index, a.within, desc, &mut valid)
-                } else {
-                    let at = self.raw_scale(index, desc.stride, &mut valid);
-                    self.raw_add(at, a.within, &mut valid)
-                };
-                let mode =
-                    if desc.oob_select == BufferOob::Raw && desc.swizzle_enable && desc.stride != 0
-                    {
-                        BufferOob::Structured
-                    } else {
-                        desc.oob_select
-                    };
-                let count = self.s.m.i32(records);
-                if matches!(mode, BufferOob::Index | BufferOob::Structured) {
-                    let in_count = self.s.m.cmp(c, pred::IULT, index, count);
-                    valid = self.s.m.bin(c, Bin::And, valid, in_count);
-                }
-                let limit = match mode {
-                    BufferOob::Structured => Some(self.s.m.i32(desc.stride)),
-                    BufferOob::Index => None,
-                    BufferOob::Nonempty if records == 0 => Some(zero),
-                    BufferOob::Nonempty => None,
-                    BufferOob::Raw => Some(count),
-                };
-                (byte, limit)
-            }
+            let fits = self.fits(byte, width, size);
+            valid = self.s.m.bin(c, Bin::And, valid, fits);
+            return (self.s.m.bin(c, Bin::Add, byte, e.bias), valid);
+        }
+
+        // The host supplies a D3D view for a heap descriptor. For a
+        // descriptor assembled by the program its GFX10 words are known,
+        // including NUM_RECORDS and OOB_SELECT (RDNA2 ISA section 8.1.5).
+        let (stride, records, mode) = match view {
+            RawView::Structured { stride, .. } => (stride, None, BufferOob::Structured),
+            RawView::Built {
+                stride,
+                records,
+                mode,
+                ..
+            } => (stride, Some(records), mode),
+            RawView::Table(_) => unreachable!(),
         };
-        // IntrinsicsAMDGPU.td (raw_buffer_load) exclut SOFFSET du contrôle
-        // de bornes et du swizzle. Il déplace seulement la base physique.
-        let remaining = limit.map_or(max, |size| {
-            let inside = self.s.m.cmp(c, pred::IULE, a.within, size);
-            let left = self.s.m.bin(c, Bin::Sub, size, a.within);
-            self.s.m.select(c, inside, left, zero)
-        });
+        let stride_v = self.s.m.i32(stride);
+        let records_v = self.s.m.i32(records.unwrap_or(u32::MAX));
+        let in_count = self.s.m.cmp(c, pred::IULT, index, records_v);
+        let in_bounds = match mode {
+            BufferOob::Structured => {
+                let inside = if records.is_some() {
+                    self.s.m.cmp(c, pred::IULT, a.within, stride_v)
+                } else {
+                    self.fits(a.within, width, stride_v)
+                };
+                self.s.m.bin(c, Bin::And, in_count, inside)
+            }
+            BufferOob::Index => in_count,
+            BufferOob::Nonempty => self.s.m.bool(records != Some(0)),
+            BufferOob::Raw => self.fits(displaced, width, records_v),
+        };
+        let max_index = self
+            .s
+            .m
+            .i32(u32::MAX.checked_div(stride).unwrap_or(u32::MAX));
+        let no_wrap = self.s.m.cmp(c, pred::IULE, index, max_index);
+        let valid = self.s.m.bin(c, Bin::And, in_bounds, no_wrap);
+        let at = self.s.m.bin(c, Bin::Mul, index, stride_v);
+        let mut byte = self.raw_add(at, displaced);
         let base = self.s.m.i32(a.base);
-        for offset in [Some(base), a.dynamic_base, a.scalar].into_iter().flatten() {
-            byte = self.raw_add(byte, offset, &mut valid);
+        byte = self.raw_add(byte, base);
+        if let Some(extra) = a.dynamic_base {
+            byte = self.raw_add(byte, extra);
         }
-        RawRange {
-            byte,
-            valid,
-            remaining,
-            word_stride: view.word_stride(),
-        }
+        let last = self.s.m.i32(u32::MAX - (width - 1));
+        let fits = self.s.m.cmp(c, pred::IULE, byte, last);
+        (byte, self.s.m.bin(c, Bin::And, valid, fits))
     }
 
     fn raw_store_dword(&mut self, h: V, byte: V, value: V) {
@@ -1014,9 +887,9 @@ impl<'a> Lower<'a> {
         );
     }
 
-    fn raw_words(&mut self, h: V, byte: V, count: u32) -> Vec<V> {
+    fn raw_dword(&mut self, h: V, byte: V) -> V {
         let undef = self.s.m.undef(self.s.t.i32);
-        let mask = self.s.m.i8((1 << count) - 1);
+        let mask = self.s.m.i8(1);
         let align = self.s.m.i32(4);
         let r = self.s.op(
             self.cur,
@@ -1026,12 +899,8 @@ impl<'a> Lower<'a> {
             139,
             &[h, byte, undef, mask, align],
         );
-        (0..count)
-            .map(|k| {
-                let x = self.s.m.extract(self.cur, r, k);
-                self.as_int(x)
-            })
-            .collect()
+        let x = self.s.m.extract(self.cur, r, 0);
+        self.as_int(x)
     }
 
     /// Whether a raw access of `src`'s buffer (an untyped load, store or
@@ -1055,7 +924,7 @@ impl<'a> Lower<'a> {
     /// view the runtime stride table names for `src`'s slot, in the lanes
     /// where an access of `width` bytes at byte `off` (of element `index`,
     /// or by offset alone) passes the table's range checks
-    /// ([`Self::raw_range`]); what it gives is 0 in the others. `props`
+    /// ([`Self::raw_coordinate`]); what it gives is 0 in the others. `props`
     /// are the raw handle's (11, with the UAV bit for unordered access). The
     /// caller's guard, if any, is around it: nothing is read for a lane
     /// that must not access.
@@ -1070,20 +939,18 @@ impl<'a> Lower<'a> {
     ) -> Result<Vec<V>, Why> {
         let e = self.stride_entry(src)?;
         let address = BufferAddress {
-            valid: self.s.m.bool(true),
             index,
             within: off,
             scalar: None,
             base: 0,
             dynamic_base: None,
         };
-        let range = self.raw_range(RawView::Table(e), address);
-        let valid = self.raw_fits(range, width);
+        let (byte, valid) = self.raw_coordinate(RawView::Table(e), address, width);
         self.note_run_time(src, props);
         self.guarded_values(Some(valid), |l| {
             let h =
                 l.s.heap_handle(l.cur, e.raw, false, e.nonuniform, (props, 0));
-            access(l, h, range.byte)
+            access(l, h, byte)
         })
     }
 
