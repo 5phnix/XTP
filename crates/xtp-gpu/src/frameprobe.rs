@@ -687,8 +687,11 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
                     Some(s) => s.text(len),
                 }
             );
+            let ran = submission_of(f, op.list, op.after).is_some();
             let on_gpu = match (&r.gpu, gpu) {
                 (Err(why), _) => Err(*why),
+                // Its list never ran: the read-back bytes are not its.
+                (Ok(_), _) if !ran => Err("its list was not submitted"),
                 (Ok(_), None) => Err("not read back"),
                 (Ok((at, n)), Some(bytes)) => bytes
                     .get(*at as usize..(at + n) as usize)
