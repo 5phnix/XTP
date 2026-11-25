@@ -4985,8 +4985,8 @@ mod tests {
     }
 
     /// Held by the tests that count on what reads learned of pages
-    /// ([`Pages`]): the guard's tests report all title memory changed
-    /// (`crate::watch::tests::serial`), which forgets it.
+    /// ([`Pages`]): the guard tests reset the same page-read cache in
+    /// [`crate::watch::tests::serial`].
     fn learned() -> std::sync::MutexGuard<'static, ()> {
         crate::watch::tests::serial()
     }

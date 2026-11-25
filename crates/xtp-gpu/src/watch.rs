@@ -1229,7 +1229,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // guards' lock, which reads may wait for).
     drop(crate::shadow::title_changing(at, len));
     crate::resource::memory_remapped(at, len);
-    let range = blocks(at, len);
+    forget_guards(blocks(at, len));
+}
+
+fn forget_guards(range: Range<usize>) {
     let mut lock = settled(range.clone());
     let g = &mut *lock;
     g.owners.forget(range.clone());
@@ -1412,7 +1415,10 @@ pub(crate) mod tests {
     pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: Mutex<()> = Mutex::new(());
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        title_memory_remapped(0, usize::MAX);
+        // Reset the guards and the page-read cache these tests share. A
+        // title remap would also evict live GPU resources in parallel tests.
+        drop(crate::shadow::title_changing(0, usize::MAX));
+        forget_guards(blocks(0, usize::MAX));
         same().clear();
         serial
     }

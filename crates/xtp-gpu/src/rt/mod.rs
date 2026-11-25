@@ -642,8 +642,6 @@ impl Registry {
 /// of one, finds nothing there (its instances are inactive, its rays miss)
 /// instead of a structure in released memory.
 pub(crate) fn release_buffer(owner: Option<usize>, start: u64, end: u64) {
-    #[cfg(test)]
-    tests::released(start, end);
     let (previous, slots) = registry().retire(start, end, Some(owner));
     drop(previous);
     for slot in slots {

@@ -921,71 +921,47 @@ fn rt_spares_serve_later_generations_once_free() {
     assert!(table.spares.is_empty());
 }
 
-/// The ranges of title memory released so far ([`release_buffer`]).
-static RELEASED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-
-/// Notes a release of title memory `[start, end)`.
-pub(super) fn released(start: u64, end: u64) {
-    RELEASED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((start, end));
-}
-
-/// The releases of title memory so far whose range holds `at`. Another
-/// test's report of a remap of all title memory (`watch`'s tests report
-/// one over the whole address space) retires every structure and spare of
-/// the registry, whichever test made them.
-fn releases_over(at: u64) -> usize {
-    (RELEASED.lock().unwrap_or_else(|e| e.into_inner()).iter())
-        .filter(|&&(start, end)| (start..end).contains(&at))
-        .count()
-}
-
 /// A TLAS rebuilt every frame at one title address alternates between two
 /// results instead of allocating one a frame: the last generation stays in
 /// its slot until the next is submitted, the one before is free again.
-/// The reused result traces as the last build. A try that a release of
-/// the TLAS's memory cut into, which retired its generations, runs again.
+/// The reused result traces as the last build.
 #[test]
 fn rt_tlas_rebuilds_reuse_a_result_nothing_holds() {
     let test = "rt_tlas_rebuilds_reuse_a_result_nothing_holds";
     let Some((gpu, rays)) = dxr(test) else {
         return;
     };
-    let (first, rebuilt, traced) = (0..5)
-        .find_map(|_| {
-            let world = World::new();
-            let tlas = world.tlas.address();
-            let releases = releases_over(tlas);
-            let generation = || registry().structures.get(&tlas).map(|s| s.result.gpu());
-            let first = generation()?;
-            let rebuilt = (0..4)
-                .map(|_| {
-                    let list = TitleList::new();
-                    // SAFETY: the title list and the instance buffer are live.
-                    unsafe {
-                        assert!(Builder.build(list.this(), &tlas_desc(tlas, &world._inputs[2])))
-                    };
-                    list.run();
-                    generation()
-                })
-                .collect::<Option<Vec<u64>>>()?;
-            let traced = rays.then(|| {
-                let slot = Descriptor::new(tlas);
-                let list = TitleList::new();
-                let out = unwritten();
-                trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
-                list.run();
-                out.words()
-            });
-            (releases_over(tlas) == releases).then_some((first, rebuilt, traced))
-        })
-        .expect("five tries, each cut into by a release of all title memory");
-    assert_ne!(rebuilt[0], first, "the first generation is still published");
-    assert_eq!(rebuilt, [rebuilt[0], first, rebuilt[0], first]);
-    if let Some(traced) = traced {
-        assert_eq!(traced, hit());
+    let world = World::new();
+    let tlas = world.tlas.address();
+    // A new allocation can get the same GPU address. A weak reference
+    // identifies the result without keeping it in use.
+    let generation = || Arc::downgrade(&registry().structures[&tlas].result);
+    let rebuild = || {
+        let list = TitleList::new();
+        // SAFETY: the title list and the instance buffer are live.
+        unsafe { assert!(Builder.build(list.this(), &tlas_desc(tlas, &world._inputs[2]))) };
+        list.run();
+        generation()
+    };
+    let first = generation();
+    let second = rebuild();
+    assert!(
+        !first.ptr_eq(&second),
+        "the first generation is still published"
+    );
+
+    // A watch test can reset its guards while the first result is a spare.
+    drop(crate::watch::tests::serial());
+    for expected in [&first, &second, &first] {
+        assert!(rebuild().ptr_eq(expected), "reuse the retired result");
+    }
+    if rays {
+        let slot = Descriptor::new(tlas);
+        let list = TitleList::new();
+        let out = unwritten();
+        trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
+        list.run();
+        assert_eq!(out.words(), hit());
     }
 }
 
