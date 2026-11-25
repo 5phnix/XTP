@@ -759,7 +759,7 @@ impl<'a> Lower<'a> {
             let delta = self.s.m.i32(4 * k);
             let within = self.raw_add(address.within, delta);
             let (byte, valid) = self.raw_coordinate(view, BufferAddress { within, ..address }, 4);
-            let xs = self.guarded_load(Some(valid), |l| {
+            let xs = self.guarded_values(Some(valid), |l| {
                 let h = match view {
                     RawView::Table(e) => {
                         l.s.heap_handle(l.cur, e.raw, false, e.nonuniform, (props, 0))
@@ -947,7 +947,7 @@ impl<'a> Lower<'a> {
         };
         let (byte, valid) = self.raw_coordinate(RawView::Table(e), address, width);
         self.note_run_time(src, props);
-        self.guarded_load(Some(valid), |l| {
+        self.guarded_values(Some(valid), |l| {
             let h =
                 l.s.heap_handle(l.cur, e.raw, false, e.nonuniform, (props, 0));
             access(l, h, byte)
@@ -967,6 +967,15 @@ impl<'a> Lower<'a> {
         if guard.is_some() {
             GUARDED_LOADS.with(|n| n.set(n.get() + 1));
         }
+        self.guarded_values(guard, load)
+    }
+
+    /// Return zero for each value in lanes where the operation was skipped.
+    fn guarded_values(
+        &mut self,
+        guard: Option<V>,
+        load: impl FnOnce(&mut Self) -> Result<Vec<V>, Why>,
+    ) -> Result<Vec<V>, Why> {
         let at = self.begin_guarded(guard);
         match load(self) {
             Ok(xs) => {
@@ -1075,7 +1084,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 thread_local! {
-    /// Loads [`Lower::guarded_load`] put under a guard on this thread.
+    /// Loads [`Lower::guarded_load`] put under an EXEC guard on this thread.
     static GUARDED_LOADS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
