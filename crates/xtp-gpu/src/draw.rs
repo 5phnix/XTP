@@ -1737,6 +1737,9 @@ impl State {
         let mut last = None;
         let mut seen = std::collections::HashSet::new();
         let mut hashing = 0;
+        // The staging buffers made again for served textures that changed:
+        // a share of the budget the first uploads above did not spend.
+        let mut refreshes = crate::texture::Refreshes::of(budget);
         for &index in &pass.served {
             if checking.elapsed() > PASS_CHECKING {
                 break;
@@ -1840,7 +1843,20 @@ impl State {
             }
             // One never staged (none could be made then, or it took another's
             // place) gets its staging buffer here, within the room left.
-            match stage_for_pass(resource, texture, budget, &mut spent, &mut counts) {
+            // One whose staging buffer was released gets it again from the
+            // refreshes' share (`texture::Refreshes`): before, the first
+            // uploads left it no room while the world loaded, and shaders
+            // read its old texels (Codex's review of c44a716, 2).
+            let staged = match refreshes.stage(resource) {
+                // Past the share: the first the next pass looks at.
+                Some(Staged::NoRoom(_)) => {
+                    last = before;
+                    break;
+                }
+                Some(staged) => staged,
+                None => stage_for_pass(resource, texture, budget, &mut spent, &mut counts),
+            };
+            match staged {
                 Staged::Ready(_) => {}
                 Staged::NoRoom(_) | Staged::NotNow => continue,
                 Staged::Never | Staged::Host => {
@@ -1865,7 +1881,7 @@ impl State {
         if let Some(last) = last {
             host.textures_checked(last);
         }
-        counts.bytes = spent;
+        counts.bytes = spent + refreshes.made();
         counts.us = started.elapsed().as_micros() as u64;
         host.texture_pass_done(&pass, counts);
         Some(counts)
@@ -4811,6 +4827,72 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(counts.hashed, 1, "{counts:?}");
         assert_eq!(texels_4x4(host, small), vec![0x6666_6666; 16]);
         assert_eq!(host.log_messages(), None);
+        drop(heap);
+        release(big);
+        release(small);
+    }
+
+    /// A served texture whose staging buffer was released, then changed by
+    /// the title, is uploaded again at the pass's check even when the
+    /// pass's first uploads spent its whole budget: its buffer is made
+    /// again from the refreshes' share (`texture::Refreshes`). Before, the
+    /// check found no room left and went on, and shaders read its old
+    /// texels as long as first uploads took the budget (Codex's review of
+    /// c44a716, 2). In a child process whose passes stage 1 MiB
+    /// (`XTP_HEAP_TEXTURES`, read once), which a 4 MiB texture spends.
+    #[test]
+    fn a_released_served_texture_is_refreshed_when_first_uploads_spent_the_budget() {
+        use crate::testgpu::TitleList;
+        const CHILD: &str = "XTP_TEST_SMALL_PASS";
+        let test = "draw::tests::a_released_served_texture_is_refreshed_when_first_uploads_spent_the_budget";
+        if std::env::var_os(CHILD).is_none() {
+            let Some(_gpu) = crate::testgpu::device(test) else {
+                return;
+            };
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("XTP_HEAP_TEXTURES", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "the child: {stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        assert_eq!(
+            crate::descriptor::host::heap_textures_budget(),
+            Some(1 << 20)
+        );
+        let heap = crate::descriptor::TestHeap::views(4);
+        let views = crate::descriptor::heap(heap.0).host().expect("a host heap");
+        let small = filled_texture(heap.0, 1, 4, 4, 0x11);
+        let list = TitleList::new();
+        assert_eq!(pass_in(heap.0, &list).uploaded, 1);
+        list.run();
+        // The list held its staging buffer until it went.
+        drop(list);
+        assert_eq!(views.texture_queue().served_slots(), [1]);
+        assert_eq!(texels_4x4(host, small), vec![0x1111_1111; 16]);
+        assert!(crate::texture::release_staging_now(small));
+        fill_texture(small, 0x22);
+        // 4 MiB of RGBA8, uploaded first: more than the pass's budget.
+        let big = filled_texture(heap.0, 2, 64, 16384, 0x33);
+        let list = TitleList::new();
+        let counts = pass_in(heap.0, &list);
+        list.run();
+        assert_eq!((counts.uploaded, counts.hashed), (1, 1), "{counts:?}");
+        assert!(counts.bytes > 4 << 20, "{counts:?}");
+        assert_eq!(texels_4x4(host, small), vec![0x2222_2222; 16]);
+        assert_eq!(host.log_messages(), None);
+        drop(list);
         drop(heap);
         release(big);
         release(small);
