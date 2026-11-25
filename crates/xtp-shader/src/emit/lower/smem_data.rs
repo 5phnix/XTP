@@ -38,9 +38,16 @@ impl Lower<'_> {
     pub(super) fn reused_after_access(&self, site: Site, dwords: &[Option<Value>]) -> bool {
         let ours: HashSet<Value> = dwords.iter().flatten().copied().collect();
         let mut direct = HashSet::new();
+        // Every scalar load a descriptor comes from (`descriptor_dword`'s).
+        let mut loads = HashSet::new();
         for d in &self.x.res.descriptors {
             let this = |s: &Source| matches!(*s, Source::Loaded { load, .. } if load == site);
-            if !d.source.leaves().into_iter().any(this) {
+            let leaves = d.source.leaves();
+            loads.extend(leaves.iter().filter_map(|l| match **l {
+                Source::Loaded { load, .. } => Some(load),
+                _ => None,
+            }));
+            if !leaves.into_iter().any(this) {
                 continue;
             }
             if !this(&d.source) {
@@ -75,12 +82,25 @@ impl Lower<'_> {
                 return false;
             }
         }
-        joins.into_iter().all(|j| self.takes_data(j))
+        joins.into_iter().all(|j| self.takes_data(j, &loads))
     }
 
     /// Whether the join whose value is `join` takes, directly or through
-    /// other joins, a value no descriptor load wrote: a number.
-    fn takes_data(&self, join: Value) -> bool {
+    /// other joins, a value none of the descriptor loads `loads` wrote: a
+    /// number.
+    fn takes_data(&self, join: Value, loads: &HashSet<Site>) -> bool {
+        let descriptor = |v: Value| {
+            let Some(&b) = self.def_block.get(&v) else {
+                return false;
+            };
+            let insts = &self.x.p.blocks[b].insts;
+            insts
+                .iter()
+                .position(|i| i.writes.iter().any(|w| w.1 == v))
+                .is_some_and(|i| {
+                    insts[i].name().starts_with("s_load_dword") && loads.contains(&(b, i))
+                })
+        };
         let mut seen = HashSet::from([join]);
         let mut work = vec![join];
         while let Some(v) = work.pop() {
@@ -88,7 +108,7 @@ impl Lower<'_> {
                 continue;
             };
             for &a in &self.x.p.blocks[b].phis[i].args {
-                if self.descriptor_dword(a) {
+                if descriptor(a) {
                     continue;
                 }
                 if !self.phi_at.contains_key(&a) {
