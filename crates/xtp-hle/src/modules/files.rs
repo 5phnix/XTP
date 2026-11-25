@@ -1827,7 +1827,14 @@ pub extern "C" fn fwrite(buffer: *const u8, size: usize, count: usize, stream: F
 
 #[cfg(test)]
 pub(super) fn check_fwrite_from(buffer: *const u8, len: usize, expected: u8) {
-    let file = host!("ucrtbase.dll", "tmpfile": extern "C" fn() -> File)();
+    let dir = tempfile::tempdir().unwrap();
+    let mut path = wide_of(&dir.path().join("pending.bin"));
+    path.push(0);
+    let mode: Vec<_> = "w+b\0".encode_utf16().collect();
+    let file = host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
+        path.as_ptr(),
+        mode.as_ptr(),
+    );
     assert!(!file.is_null());
     assert_eq!(fwrite(buffer, 1, len, file), len);
     host!("ucrtbase.dll", "rewind": extern "C" fn(File))(file);
