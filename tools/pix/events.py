@@ -10,6 +10,8 @@ of that name instead). Reads only the table; no capture, no replay.
 """
 
 import csv
+
+csv.field_size_limit(1 << 30)
 import re
 import sys
 from collections import Counter, defaultdict
@@ -28,9 +30,15 @@ def compact(name, xml):
     return f"{name}({', '.join(args)})"
 
 
+# PIX names a SetMarker of metadata 0 (XTP's, UTF-16) "<deprecated - use
+# pix3.h instead> <text>".
+DEPRECATED = re.compile(r"^<deprecated[^>]*>\s*")
+
+
 def marker_text(row):
-    if MARKER.match(row["name"]):
-        return row["name"]
+    name = DEPRECATED.sub("", row["name"])
+    if MARKER.match(name):
+        return name
     if "Marker" in row["name"]:
         for _, text in leaves(row["call"]):
             text = text.replace("&#60;", "<").replace("&#62;", ">").replace("&amp;", "&")

@@ -635,6 +635,10 @@ static int walk(int argc, wchar_t** argv) {
             if (FAILED(q.info->GetEvent(i, &e))) continue;
             std::string name = e.Name ? e.Name : "";
             std::string call = e.ApiCallData ? e.ApiCallData : "";
+            // PIX names a SetMarker of metadata 0 (XTP's, UTF-16)
+            // "<deprecated - use pix3.h instead> <text>".
+            if (name.rfind("<deprecated", 0) == 0 && name.find("> ") != std::string::npos)
+                name = name.substr(name.find("> ") + 2);
             if (xtp_marker(name)) { marker = name; continue; }
             if (name.find("SetMarker") != std::string::npos || name.find("Marker") != std::string::npos) {
                 for (auto& [tag, text] : leaves(call))
@@ -713,4 +717,103 @@ static int walk(int argc, wchar_t** argv) {
     }
     logf("walk done");
     return 0;
+}
+
+// xtp-pix pso: the shaders of chosen pipeline state objects, from the
+// capture's normalized pipeline state streams.
+static int pso(int argc, wchar_t** argv) {
+    if (argc < 3) {
+        logf("pso <file.wpix> <out dir> <object id>...");
+        return 2;
+    }
+    std::set<unsigned long long> wanted;
+    for (int i = 2; i < argc; i++) wanted.insert(_wcstoui64(argv[i], nullptr, 10));
+    Com<IPixFactory> factory;
+    Com<IPixGpuCaptureDocument> doc;
+    if (open_capture(argv[0], factory, doc)) return 1;
+    fs::path out = argv[1];
+    std::error_code ec;
+    fs::create_directories(out, ec);
+    // Pipeline state objects are not in the API object collection: they are
+    // reached through the program state of a draw or dispatch that uses them.
+    std::vector<Queue> qs;
+    if (queues(doc.p, qs)) return 1;
+    int found = 0;
+    std::set<unsigned long long> done;
+    for (auto& q : qs)
+    for (UINT32 ev = 0; ev < q.count && done.size() < wanted.size(); ev++) {
+        PIX_EVENT_INFO e{};
+        if (FAILED(q.info->GetEvent(ev, &e)) || !e.Name || !is_work(e.Name)) continue;
+        Com<IPixProgramState> ps;
+        if (FAILED(doc->GetProgramState(&e, __uuidof(IPixProgramState), ps.put_void())) || !ps) continue;
+        Com<IPixGenericPipeline> gp;
+        if (FAILED(ps->GetGpuProgram(__uuidof(IPixGenericPipeline), gp.put_void())) || !gp) continue;
+        Com<IPixPipelineState> p;
+        if (FAILED(gp->GetPipelineState(__uuidof(IPixPipelineState), p.put_void())) || !p) continue;
+        unsigned long long id = (unsigned long long)p->GetApiObjectId();
+        if (!wanted.count(id) || !done.insert(id).second) continue;
+        logf("pso %llu first used at event %u (%s)", id, e.Index, e.Name);
+        const PIX_PIPELINE_STATE_STREAM_DESC* d = p->GetDesc();
+        if (!d || !d->SubobjectStream) continue;
+        const uint8_t* start = static_cast<const uint8_t*>(d->SubobjectStream);
+        const uint8_t* at = start;
+        const uint8_t* end = start + d->SizeInBytes;
+        auto align = [](size_t x, size_t a) { return (x + a - 1) / a * a; };
+        while (at + 4 <= end) {
+            auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*>(at);
+            const char* stage = nullptr;
+            switch (type) {
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: stage = "vs"; break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: stage = "ps"; break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: stage = "gs"; break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: stage = "cs"; break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: stage = "ms"; break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: stage = "as"; break;
+            default: break;
+            }
+            size_t inner_align = 4, inner = 0;
+            switch (type) {
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: inner_align = 8; inner = 8; break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+                inner_align = 8; inner = sizeof(D3D12_SHADER_BYTECODE); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: inner_align = 8; inner = sizeof(D3D12_STREAM_OUTPUT_DESC); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: inner = sizeof(D3D12_BLEND_DESC); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: inner = sizeof(D3D12_RASTERIZER_DESC); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1: inner = sizeof(D3D12_RASTERIZER_DESC1); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2: inner = sizeof(D3D12_RASTERIZER_DESC2); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: inner = sizeof(D3D12_DEPTH_STENCIL_DESC); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: inner = sizeof(D3D12_DEPTH_STENCIL_DESC1); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: inner = sizeof(D3D12_DEPTH_STENCIL_DESC2); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: inner_align = 8; inner = sizeof(D3D12_INPUT_LAYOUT_DESC); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: inner = sizeof(D3D12_RT_FORMAT_ARRAY); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: inner = sizeof(DXGI_SAMPLE_DESC); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: inner_align = 8; inner = sizeof(D3D12_CACHED_PIPELINE_STATE); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: inner_align = 8; inner = sizeof(D3D12_VIEW_INSTANCING_DESC); break;
+            default: inner = 4; break;
+            }
+            const uint8_t* body = at + align(4, inner_align);
+            if (body + inner > end) break;
+            if (stage) {
+                auto* bc = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(body);
+                if (bc->pShaderBytecode && bc->BytecodeLength) {
+                    fs::path f = out / (std::to_wstring(id) + L"-" + widen(stage) + L".dxil");
+                    FILE* o = nullptr;
+                    if (!_wfopen_s(&o, f.c_str(), L"wb") && o) {
+                        fwrite(bc->pShaderBytecode, 1, bc->BytecodeLength, o);
+                        fclose(o);
+                        logf("pso %llu: %s, %zu bytes -> %s", id, stage, (size_t)bc->BytecodeLength, narrow(f.c_str()).c_str());
+                        found++;
+                    }
+                }
+            }
+            at = start + align((size_t)(body + inner - start), sizeof(void*));
+        }
+    }
+    for (auto id : wanted)
+        if (!done.count(id)) logf("pso %llu: no direct draw or dispatch uses it", id);
+    logf("%d shaders written", found);
+    return found ? 0 : 1;
 }

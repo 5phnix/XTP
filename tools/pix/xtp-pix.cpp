@@ -16,6 +16,10 @@
 //   xtp-pix events <file.wpix> <out.tsv>
 //       Every event of every queue: queue, index, parent, command list,
 //       name and API call data. No replay.
+//   xtp-pix pso <file.wpix> <out dir> <object id>...
+//       Writes the shader bytecode of those pipeline state objects (ids as
+//       the event list prints them, obj#<id>) as <id>-<stage>.dxil, for
+//       dxc -dumpbin. No replay.
 //   xtp-pix walk <file.wpix> <out.tsv> [--from N] [--to N] [--queue Q]
 //                [--every-draw] [--resources <out.tsv>]
 //       Replays the capture and, after each draw and dispatch in range
@@ -422,6 +426,7 @@ static int capture(int argc, wchar_t** argv) {
 
 static int events(int argc, wchar_t** argv);
 static int walk(int argc, wchar_t** argv);
+static int pso(int argc, wchar_t** argv);
 
 int wmain(int argc, wchar_t** argv) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -434,6 +439,7 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == L"capture") rc = capture(argc - 2, argv + 2);
     else if (cmd == L"events") rc = events(argc - 2, argv + 2);
     else if (cmd == L"walk") rc = walk(argc - 2, argv + 2);
+    else if (cmd == L"pso") rc = pso(argc - 2, argv + 2);
     else fprintf(stderr, "unknown command\n");
     if (g_log) fclose(g_log);
     // pixapi's worker threads may still hold the process: leave at once.

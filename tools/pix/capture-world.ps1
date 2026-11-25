@@ -114,7 +114,7 @@ New-Item -ItemType Directory -Force $run | Out-Null
 Note "waiting for the game slot"
 $taken = $false
 while (-not $taken) {
-    while ((Test-LockHeld) -or (Get-Games).Count) { Start-Sleep -Seconds 5 }
+    while ((Test-LockHeld) -or @(Get-Games).Count) { Start-Sleep -Seconds 5 }
     try {
         $fs = [System.IO.File]::Open($lock, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
         $w = New-Object System.IO.StreamWriter($fs)
@@ -126,7 +126,7 @@ while (-not $taken) {
 Note "slot taken (pid $PID)"
 $muter = $null
 try {
-    if (Get-Games) { throw 'a game xtp.exe started meanwhile' }
+    if (@(Get-Games).Count) { throw 'a game xtp.exe started meanwhile' }
     $data = Join-Path $run 'data'
     Remove-Item $data, "$run\frames", $capture, "$run\world.png" -Recurse -Force -ErrorAction SilentlyContinue
     Copy-Item $golden $data -Recurse

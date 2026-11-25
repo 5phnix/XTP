@@ -12,6 +12,8 @@ black. Reads only the table xtp-pix wrote; no capture, no replay.
 """
 
 import csv
+
+csv.field_size_limit(1 << 30)
 import sys
 from collections import defaultdict
 
