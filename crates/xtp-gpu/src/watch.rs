@@ -756,6 +756,16 @@ pub fn pin_copy_back(at: usize, len: usize) -> CopyBackPin {
     CopyBackPin(Some(r))
 }
 
+/// Garde toutes les vues de la source lisibles jusqu’à la fin de la lecture du titre.
+pub fn pin_title_read(at: usize, len: usize) -> Option<CopyBackPin> {
+    if !crate::readmap::enabled() || len == 0 {
+        return None;
+    }
+    let range = blocks(at, len);
+    guards().owners.pin(range.clone(), true);
+    Some(CopyBackPin(Some(range)))
+}
+
 pub(super) fn pin_read(at: usize, len: usize) -> Option<CopyBackPin> {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();

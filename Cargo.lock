@@ -846,6 +846,7 @@ dependencies = [
  "tracing",
  "windows-sys",
  "xtp-core",
+ "xtp-gpu",
  "xtp-pe",
 ]
 

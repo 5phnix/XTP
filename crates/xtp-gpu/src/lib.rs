@@ -49,7 +49,19 @@ mod readmap;
 #[cfg(windows)]
 pub use readmap::{configure_copy_back, save_copy_back_map};
 #[cfg(windows)]
-pub use watch::{CopyBackPin, pin_copy_back, set_copy_back_lookup};
+pub use watch::{CopyBackPin, pin_copy_back, pin_title_read, set_copy_back_lookup};
+#[cfg(all(windows, feature = "readmap-test"))]
+#[doc(hidden)]
+pub fn publish_copy_back_for_test(at: usize, bytes: &mut [u8], writer: u64) -> Option<usize> {
+    assert!(bytes.len() <= watch::PAGE - at % watch::PAGE);
+    let key = readmap::Key {
+        size: watch::PAGE as u64,
+        alignment: 16,
+        writer,
+        offset: 0,
+    };
+    watch::publish(at, key, bytes, None).map(|(copied, _)| copied)
+}
 pub mod queue;
 #[cfg(windows)]
 mod rectangles;
