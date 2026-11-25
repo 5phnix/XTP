@@ -691,6 +691,7 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+pub mod effects;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
