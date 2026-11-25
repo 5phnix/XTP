@@ -241,7 +241,7 @@ fn number_on_its_edge_only(cs: &HostShader) {
         eprintln!("no WARP device; skipped");
         return;
     };
-    let (root, pso) = host.compute_pipeline(&cs).expect("a pipeline");
+    let (root, pso) = host.compute_pipeline(cs).expect("a pipeline");
     for (flag, want) in [(1, 77), (0, 7)] {
         // A whole constant buffer (256 bytes): the flag, then the number.
         let mut cb = vec![0u32; 64];
