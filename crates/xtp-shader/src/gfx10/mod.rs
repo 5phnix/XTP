@@ -541,9 +541,15 @@ mod tests {
         ];
         for (name, w0, nsa, regs) in cases {
             let sequential = [w0, 0x0040_0000];
-            for (words, dim, addr) in [
+            // The coarse offset pairs in gfx10_asm_mimg.s add four to the
+            // opcode and put an offset dword first. Build the packed offset
+            // encodings from the sequential LLVM cases using that layout.
+            let offset = [w0 + (4 << 18), sequential[1]];
+            let offset_name = format!("{}_o_g16", name.strip_suffix("_g16").unwrap());
+            for (words, name, dim, addr) in [
                 (
                     &sequential[..],
+                    name,
                     0,
                     vec![Operand::Vector {
                         reg: 0,
@@ -552,10 +558,20 @@ mod tests {
                 ),
                 (
                     nsa,
+                    name,
                     1,
                     regs.iter()
                         .map(|&reg| Operand::Vector { reg, dwords: 1 })
                         .collect(),
+                ),
+                (
+                    &offset[..],
+                    offset_name.as_str(),
+                    0,
+                    vec![Operand::Vector {
+                        reg: 0,
+                        dwords: regs.len() as u8,
+                    }],
                 ),
             ] {
                 let inst = instruction(&bytes(words), 0).unwrap();
@@ -623,6 +639,10 @@ mod tests {
             (0xE9, true, 4),     // image_sample_cd_cl_g16, a16
             (0xEA, true, 4),     // image_sample_c_cd_g16, a16
             (0xEB, true, 5),     // image_sample_c_cd_cl_g16, a16
+            (0xEC, true, 4),     // image_sample_cd_o_g16, a16
+            (0xED, true, 5),     // image_sample_cd_cl_o_g16, a16
+            (0xEE, true, 5),     // image_sample_c_cd_o_g16, a16
+            (0xEF, true, 6),     // image_sample_c_cd_cl_o_g16, a16
         ] {
             let w0 = 0xF000_0000 | (op & 0x7F) << 18 | op >> 7 | 1 << 3 | 1 << 8;
             let d = decode(&bytes(&[w0, u32::from(a16) << 30, S_ENDPGM])).unwrap();

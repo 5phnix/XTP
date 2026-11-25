@@ -1,4 +1,8 @@
-// GFX10 opcode names, generated from Mesa's src/amd/compiler/aco_opcodes.py
+// LLVM MC encodings (llvm-project llvmorg-19.1.7, Apache-2.0 WITH
+// LLVM-exception) supply VOP3P 0x018 and MIMG 0x061 and 0x0e8..=0x0eb.
+// MIMG 0x0ec..=0x0ef are the offset forms identified in review, following
+// the same opcode pattern as the coarse offset pairs in LLVM MC.
+// The remaining rows come from Mesa's src/amd/compiler/aco_opcodes.py
 // (tag mesa-22.3.0, GFX10 column), which carries this notice:
 //
 // Copyright (c) 2018 Valve Corporation
@@ -1176,6 +1180,10 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x0e9, "image_sample_cd_cl_g16"),
     (0x0ea, "image_sample_c_cd_g16"),
     (0x0eb, "image_sample_c_cd_cl_g16"),
+    (0x0ec, "image_sample_cd_o_g16"),
+    (0x0ed, "image_sample_cd_cl_o_g16"),
+    (0x0ee, "image_sample_c_cd_o_g16"),
+    (0x0ef, "image_sample_c_cd_cl_o_g16"),
 ];
 
 pub(super) const FLAT: &[(u16, &str)] = &[

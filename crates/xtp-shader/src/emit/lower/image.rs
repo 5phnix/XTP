@@ -373,14 +373,8 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
-        match name {
-            "image_gather4h" => return Err(name),
-            "image_sample_cd_g16" | "image_sample_cd_cl_g16" => {
-                // SampleGrad selects a level per lane. The coarse form
-                // selects one level per quad.
-                return Err("a sample with coarse packed derivatives");
-            }
-            _ => {}
+        if name == "image_gather4h" {
+            return Err(name);
         }
         if *tfe || *lwe {
             return Err("an image access with tfe or lwe");
@@ -976,9 +970,9 @@ impl<'a> Lower<'a> {
                     sampler.sample(self, "sampleBias.f32", 61, &mut args)
                 }
                 63 => {
-                    // shortcut: the coarse forms (`_cd`) compute one level
-                    // per quad; the host's per pixel is the same when the
-                    // gradients agree across the quad.
+                    // The coarse forms (`_cd`, including `_g16`) compute one
+                    // level per quad. SampleGrad selects a level per lane,
+                    // which agrees when the gradients match across the quad.
                     let mut g = vec![fu; 6];
                     if let Some(face) = cube_face {
                         // The face coordinates' derivatives, as the

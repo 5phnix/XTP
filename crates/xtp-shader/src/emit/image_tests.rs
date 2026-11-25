@@ -1345,6 +1345,30 @@ fn sample_and_gather_forms_lower_to_valid_dxil() {
 }
 
 #[test]
+fn coarse_g16_samples_lower_to_sample_grad() {
+    for suffix in ["_g16", "_cl_g16", "_o_g16", "_cl_o_g16"] {
+        let coarse = format!("image_sample_cd{suffix}");
+        let fine = format!("image_sample_d{suffix}");
+        let lits = literals(&coarse, false, false);
+        for a16 in [false, true] {
+            let emit_sample = |name| {
+                let mut inst = mimg(name, 0xF);
+                inst.a16 = a16;
+                translate(inst, &lits).unwrap_or_else(|e| panic!("{name}, a16={a16}: {e}"))
+            };
+            let coarse_dxil = emit_sample(&coarse).dxil;
+            let summary = super::last_module_summary();
+            assert!(summary.contains("sampleGrad"), "{coarse}: {summary}");
+            assert!(summary.contains("legacyF16ToF32"), "{coarse}: {summary}");
+            assert!(
+                coarse_dxil == emit_sample(&fine).dxil,
+                "{coarse}, a16={a16}"
+            );
+        }
+    }
+}
+
+#[test]
 fn forms_without_an_sm_6_6_equivalent_name_why() {
     let cases: &[(&str, bool, bool, &str)] = &[
         // (name, bias 0, level 0, reason)
@@ -1446,16 +1470,16 @@ fn forms_without_an_sm_6_6_equivalent_name_why() {
         ),
         ("image_gather4h", false, false, "image_gather4h"),
         (
-            "image_sample_cd_g16",
+            "image_sample_c_cd_o_g16",
             false,
             false,
-            "a sample with coarse packed derivatives",
+            "a comparison sample with explicit derivatives",
         ),
         (
-            "image_sample_cd_cl_g16",
+            "image_sample_c_cd_cl_o_g16",
             false,
             false,
-            "a sample with coarse packed derivatives",
+            "a comparison sample with explicit derivatives",
         ),
     ];
     for &(name, zero_bias, zero_level, why) in cases {
