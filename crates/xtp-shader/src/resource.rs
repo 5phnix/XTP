@@ -1783,8 +1783,9 @@ impl<'a> Tracer<'a> {
     fn lane_copies(&self, lanes: &[Value], known: &Known) -> Option<Source> {
         let mut loads: Vec<Site> = Vec::new();
         let mut first = None;
+        let start = self.lane_path(known);
         for (k, &v) in lanes.iter().enumerate() {
-            let copies = self.scalar_copies(v, known)?;
+            let copies = self.scalar_copies(v, &start, known)?;
             if copies.is_empty() {
                 return None;
             }
@@ -1834,15 +1835,14 @@ impl<'a> Tracer<'a> {
     /// The SGPR dwords (as origins) that `v_mov_b32` and `v_cndmask_b32`
     /// copy into VGPR value `v`, through joins and VGPR moves, on each path
     /// that lanes in `known` (those that access the descriptor) can have
-    /// come by ([`LanePath`]); with the old value of any VGPR write such a
-    /// lane may reach with its EXEC bit clear, since it keeps that value.
-    /// None where any other definition reaches `v` on such a path (a
-    /// number the code computed, an entry value, a constant, a load), or
-    /// past [`MAX_COPIES`] steps.
-    fn scalar_copies(&self, v: Value, known: &Known) -> Option<Vec<Term>> {
-        let start = self.lane_path(known);
+    /// come by ([`LanePath`], from `start`: [`Self::lane_path`]); with the
+    /// old value of any VGPR write such a lane may reach with its EXEC bit
+    /// clear, since it keeps that value. None where any other definition
+    /// reaches `v` on such a path (a number the code computed, an entry
+    /// value, a constant, a load), or past [`MAX_COPIES`] steps.
+    fn scalar_copies(&self, v: Value, start: &LanePath, known: &Known) -> Option<Vec<Term>> {
         let mut seen = std::collections::HashSet::new();
-        let (mut work, mut out) = (vec![(v, start)], Vec::new());
+        let (mut work, mut out) = (vec![(v, start.clone())], Vec::new());
         while let Some((v, path)) = work.pop() {
             if seen.len() > MAX_COPIES {
                 return None;
