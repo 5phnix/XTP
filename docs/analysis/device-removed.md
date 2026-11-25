@@ -242,8 +242,8 @@ In `rt/tests.rs` (GPU tests, through `testgpu`):
   `rt_a_tlas_without_its_stand_in_is_refused` (P1-1, P1-3; the stand-in's
   failure is simulated per thread).
 - `rt_builds_off_keeps_the_empty_tlas_and_traces_miss`.
-- `rt_blas_of_known_bounds_from_title_memory` (watch item 497, Leonida
-  #1816's fixture, reimplemented): a triangle with bounds (−5, 0, 1) to
+- `rt_blas_of_known_bounds_from_title_memory` (watch item 497, an upstream
+  fork's fixture #1816, reimplemented): a triangle with bounds (−5, 0, 1) to
   (4, 8, 9), its vertices and indices in title buffers, then in title
   memory outside any buffer object across a 4 MiB window boundary (XTP's
   loose window copies), built twice with the title's CPU moving it by 1
