@@ -667,7 +667,9 @@ fn a_mask_joined_with_a_number_exports_the_arms_number() {
     // Not the lane number below 32: the drawn body starts after it.
     execz.drain(..2);
     execz.pop();
-    let cases: [(&str, &[u32], u32, fn(u32) -> u32); 3] = [
+    // The shape, its body, s8, and what vertex v exports.
+    type Case<'a> = (&'a str, &'a [u32], u32, fn(u32) -> u32);
+    let cases: [Case; 3] = [
         ("execz", &execz, 41, |v| if v < 5 { 42 } else { 0 }),
         ("andn2", &ANDN2_JOIN, 41, |_| 42),
         ("andn2", &ANDN2_JOIN, 0, |_| 0),
