@@ -170,13 +170,51 @@ corners come from the vertex id. Since drops-fix (`d80e707`) those draw
 each record as the title wrote it: 3 vertices a rectangle, from the
 record's start vertex, on the indirect path and on the direct one. They
 drew 6 a rectangle from vertex 0 before, twice the title's vertices. Their
-vertex ids count from 0 in each record, as on the console (§5.1.1).
-shortcut: the fourth corner, which the console makes from the vertex
-shader's outputs, is not made; a vertex shader that reads its id past 2
-draws whatever it computes for it. The pipelines are logged once each
-("indirect rectangles without vertex inputs"). Making the fourth corner is
-left to do: VIctory #255's remap (the vertex shader run for the three
-corners), or a geometry stage as VIctory #1020 adds.
+vertex ids count from 0 in each record, as on the console (§5.1.1). The
+pipelines are logged once each ("indirect rectangles without vertex
+inputs").
+
+Their fourth corner, which the console makes from the vertex shader's
+outputs, is made since rects (task 7fead5db): a pipeline of the console's
+rectangle type whose vertex shader has no per-vertex input gets a geometry
+stage behind its translated vertex shader (`xtp_shader::emit::rect_gs`,
+added at the pipeline's creation in `pipeline/host.rs`, chosen in
+`rectangles/geometry.rs`). Reimplemented from the design in fxceless's
+study of their fork, no code of theirs. The corner is the vertex whose
+position shares x with one other vertex and y with the third; the fourth
+vertex is `a + b − corner` for the position and every float output, `v0`'s
+for the others (flat values are the first vertex's); three vertices with no
+such corner, or whose w differ, stay one triangle. The tiled lighting's
+rectangles come as top left, bottom left, top right: their corner is v0,
+which the input path's `v3 = v0 + v2 - v1` (corner v1) would get wrong; they
+have no vertex input, so they take the stage. WARP tests
+(`rectangles::geometry::tests`) draw the three vertex orders, three vertices
+with no corner and a corner whose w differ, directly and through the
+indirect rewrite, and check the coverage, the interpolated output and v0's
+flat value (culling back faces, then front faces: both triangles turn the
+same way); without the stage the same draw lights each first triangle only.
+A pipeline the driver refuses with the stage is made without it (a
+warning), and a pixel shader that reads `SV_PrimitiveID` gets none.
+
+In the world (session rects-1, 2026-11-25 01:39, PC, Series S, build
+`6125363`, `XTP_RAW_STRUCTURED=1`, `XTP_SKIP_PIPELINES=577248728544d74b`,
+`XTP_TEXTURE_POOL=1`, `XTP_GPU_PIPESTATS=1`): no pipeline was refused with
+the stage nor went without it. The tiled lighting's draw
+(`[vertex 167501e87c356551, pixel 9727fc3c51b2f11c]`, one a frame) runs
+2,759 vertex invocations (920 tiles of 32 × 32, 40 × 23 over 1280 × 720),
+1,839 primitives into the clipper (two a tile; one before) and 921,127 pixel
+invocations, the 921,600 pixels of 1280 × 720: its tiles cover the target.
+Over four 5 s reports its primitives are 2/3 of its vertex invocations
+(0.666 to 0.667). The other indirect rectangle draws, 238 to 275 a frame,
+send 183 to 320 primitives a frame for 528 to 831 vertex invocations, most
+of them clipped away (14 to 114 out of the clipper, 3,500 to 74,000 pixel
+invocations): the counts do not tell their corner-less triangles from
+their rectangles. All indirect rectangle draws take 3.2 to 3.7 ms of GPU a
+frame. Rectangles dropped: only the indexed ones (0.5 to 1.5 a frame),
+which nothing here changes. The pass view's sampled "lit" share of the
+tiled lighting's outputs says nothing about this: without the stage
+(present-1, frames 677 to 703) the same pass's depth output is 8.3 % to
+29.8 % lit from frame to frame, with it (frame 641) 15.8 %.
 
 #### 5.1.1 Where the start vertex and start instance arrive
 
@@ -296,7 +334,7 @@ programs, as OCE does: the maintainers' watch notes; not done).
 | Wave64 mesh programs on 32-lane hosts | 1,700 / 3,451 | mesh64 (0a31f0cb) |
 | Slow translator refusals holding the workers (lane masks) | most of "being made", 432 / 336 indirect | masks-fix; a slow lane in `make.rs` if it stays |
 | Shaders that do not translate | 691 / 992 | translator tasks (VIctory #193 + #704 need `descriptor/` too) |
-| Rectangles whose corners come from the vertex id (drawn, fourth corner not made; their vertex ids are the console's, §5.1.1) | 0 dropped | the fourth corner: VIctory #255's remap or #1020's geometry stage, not taken yet |
+| Rectangles whose corners come from the vertex id (drawn, the fourth corner made by a geometry stage since rects; their vertex ids are the console's, §5.1.1) | 0 dropped | rects (7fead5db): the world session's look at the tiled lighting |
 | Indexed rectangle lists | 1 | GPU layer, not done |
 | FidelityFX programs without DXIL | — | FidelityFX task |
 
