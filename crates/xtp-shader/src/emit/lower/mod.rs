@@ -342,6 +342,8 @@ struct Lower<'a> {
     lane_slots: Option<V>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh: le dernier export d'indices de chaque lane, dans un dword privé.
+    mesh_primitive: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Mesh: which values are the same in every lane (`mesh_prologue`).
@@ -845,6 +847,7 @@ impl<'a> Lower<'a> {
             group_reads,
             lane_slots: None,
             flat: None,
+            mesh_primitive: None,
             no_barrier,
             uniform: None,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -1016,6 +1019,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if let Some(slot) = self.mesh_primitive {
+            self.finish_mesh_indices(slot);
+        }
         #[cfg(debug_assertions)]
         self.s.m.assert_paired_branches();
         let mut user_data: Vec<_> = self.user_reads.values().copied().collect();

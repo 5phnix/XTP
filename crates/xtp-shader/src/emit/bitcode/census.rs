@@ -19,7 +19,7 @@ use std::sync::{Mutex, OnceLock};
 use super::{Cast, Module, Op};
 
 /// The kinds, in the order of [`Census::counts`].
-pub const KINDS: [&str; 23] = [
+pub const KINDS: [&str; 24] = [
     "total",
     "arith",
     "math_call",
@@ -43,6 +43,7 @@ pub const KINDS: [&str; 23] = [
     "io_other",
     "gep",
     "blocks",
+    "private_local",
 ];
 
 /// Instruction counts of one module, by [`KINDS`].
@@ -101,6 +102,7 @@ impl Module {
         let call_kind: Vec<usize> = self.funcs.iter().map(|f| kind(&f.name)).collect();
         let live = self.live();
         let reached = self.reached();
+        let private = |p: &super::V| matches!(*p, super::V::Inst(i) if matches!(self.insts[i as usize].op, Op::LocalI32(_)));
         let mut c = Census::default();
         for (_, blk) in self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
             c.counts[at("blocks")] += 1;
@@ -115,6 +117,8 @@ impl Module {
                     Op::Extract(..) => at("extract"),
                     Op::Phi(_) => at("phi"),
                     Op::Gep(..) => at("gep"),
+                    Op::LocalI32(_) => at("private_local"),
+                    Op::Load(p) | Op::Store(p, _) if private(p) => at("private_local"),
                     Op::Load(_) => at("lds_load"),
                     Op::Store(..) => at("lds_store"),
                     Op::AtomicRmw(..) | Op::CmpXchg(..) => at("atomic"),

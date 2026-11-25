@@ -105,6 +105,8 @@ mod loop_limit_tests;
 mod mask_tests;
 #[cfg(all(test, windows))]
 mod mesh_tests;
+#[cfg(all(test, windows))]
+mod meshidx_tests;
 // IR to DXIL, one file per encoding or concern: which backlog item of
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
 pub(crate) mod lower;
