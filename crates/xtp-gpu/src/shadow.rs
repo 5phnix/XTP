@@ -2373,7 +2373,8 @@ impl Shadow {
     /// than title memory while the write tracking says it holds them as
     /// they are ([`Shadow::stale`] false): writes it missed. The first ones
     /// are logged with what memory they are in (a view of physical pages,
-    /// which the title may show at other addresses too, or other memory).
+    /// and at how many other addresses the title shows that page, or other
+    /// memory).
     /// Pieces that cannot all be read are left out.
     fn missed(&self, from: usize, to: usize) -> usize {
         /// Pieces logged at most, over the run.
@@ -2413,6 +2414,7 @@ impl Shadow {
                             differ,
                             copy = format_args!("{start:#x}+{:#x}", self.len),
                             view = info.Type == MEM_MAPPED,
+                            other_views = crate::watch::views_of(at),
                             protect = format_args!("{:#x}", info.Protect),
                             region = format_args!("{:#x}", info.AllocationBase as usize),
                             watched = self.watched.load(Ordering::Relaxed),

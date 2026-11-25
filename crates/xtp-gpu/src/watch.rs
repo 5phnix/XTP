@@ -716,6 +716,23 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     KernelWrite { id, pages }
 }
 
+/// For diagnostics (`XTP_FULL_REFRESH`): at how many other addresses the
+/// title shows the physical page of the 64 KiB block holding `at`, by the
+/// runtime's index of its views ([`set_alias_lookup`]); 0 without it. Read
+/// only; no guard lock is taken.
+pub(crate) fn views_of(at: usize) -> usize {
+    let Some(lookup) = ALIAS_LOOKUP.get() else {
+        return 0;
+    };
+    let block = at / BLOCK * BLOCK;
+    let mut pairs = Vec::new();
+    lookup(block..block + BLOCK, &mut pairs);
+    pairs
+        .iter()
+        .filter(|&&(a, other)| a == block && other != block)
+        .count()
+}
+
 /// Whether some block of view memory is guarded now, without the guards'
 /// lock (see `GUARDED`): if not, a write needs no [`writing`], and the
 /// runtime need not look up where the physical pages it wrote show.
