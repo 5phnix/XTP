@@ -67,7 +67,15 @@ const IN_HALF: &[u32] = &[
 ];
 
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
-    let target = host.target();
+    run_for(host, native, groups, host.target())
+}
+
+fn run_for(
+    host: &Host,
+    native: &crate::NativeProgram,
+    groups: u32,
+    target: super::Target,
+) -> Result<Vec<u32>, String> {
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
     // The validator, where one is installed: drivers take some modules it
     // refuses.
@@ -313,6 +321,43 @@ fn masks_read_whole_count_both_halves() {
     console_flow_case("s_bcnt1 of lanes below 40", &body, 32, |_| 32);
 }
 
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn masked_double_sum_counts_both_halves() {
+    // Chaque lane fournit 0.0 ou 1.0 en double précision. Lire les lanes
+    // une par une donne un ordre de sommation indépendant des permutations.
+    let mut body = vec![
+        0x7d88_00a9, // vcc = (41 > v0)
+        0x7e02_0280,
+        0x7e04_02ff,
+        0x3ff0_0000, // v[1:2] = 1.0
+        0xbe8e_25c1, // s[14:15] = EXEC, EXEC = -1
+        0x8790_0e6a, // s[16:17] = vcc & s[14:15]
+        0xd501_0003,
+        0x0042_0280, // v3 = masque ? v1 : 0
+        0xd501_0004,
+        0x0042_0480, // v4 = masque ? v2 : 0
+    ];
+    for lane in 0..64 {
+        let index = (128 + lane) << 9;
+        body.extend([0xd760_000a, index | 259, 0xd760_000b, index | 260]);
+        if lane == 0 {
+            body.extend([0x7e0a_020a, 0x7e0c_020b]); // v[5:6] = s[10:11]
+        } else {
+            body.extend([0xd564_0005, (261 << 9) | 10]); // v[5:6] += s[10:11]
+        }
+    }
+    body.extend([
+        0xd760_000a,
+        0x0001_0105,
+        0xd760_000b,
+        0x0001_0106, // lecture de la somme
+        0xbefe_040e,
+        0x7e04_1e0a, // restauration d’EXEC et conversion dans v2
+    ]);
+    console_flow_case("masked double sum", &body, 64, |_| 41f32.to_bits());
+}
+
 /// A lane of the other half: lane 40 is the upper half's lane 8.
 #[test]
 #[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
@@ -455,16 +500,8 @@ fn a_select_on_a_mask_held_as_a_number_translates_for_every_host() {
             Some(if target.runs(64) { 64 } else { 32 })
         );
     }
-    // Two console waves per group: the console flow's halves meet at
-    // group barriers, so it runs one console wave per group only, and the
-    // program stops with the split form's reason.
-    match emit_for(&program(HELD_SELECT, 128), HOSTS[0]) {
-        Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(
-            what,
-            "a lane mask held as a number in a wave64 program split in halves"
-        ),
-        r => panic!("{r:?}"),
-    }
+    emit_for(&program(HELD_SELECT, 128), HOSTS[0]).unwrap();
+    assert!(super::last_module_summary().ends_with("; console flow with paired lanes"));
 }
 
 #[test]
@@ -476,12 +513,15 @@ fn a_select_on_a_mask_held_as_a_number_runs_as_the_console() {
         64,
         held_select,
     );
+    console_flow_case("numeric mask in independent waves", HELD_SELECT, 128, |t| {
+        if t < 64 { held_select(t) } else { 1 }
+    });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Constant lane reads retain the existing small exchange. A computed
+/// read in multiple complete waves uses paired lanes.
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
+fn several_console_waves_choose_the_exchange_their_lane_reads_need() {
     let body = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
@@ -497,13 +537,15 @@ fn console_flow_is_for_one_console_wave_per_group() {
     // path with the lane read through group-shared memory
     // (`lane_reads_cross_halves_in_groups_of_several_console_waves`).
     assert!(emit_for(&program(&body, 128), nvidia).is_ok());
-    // At a lane the code computes (s1, the group id), neither.
+    // A computed lane (s1, the group id).
     let computed = [
         0xD760_0009,
         0x0000_0300, // v_readlane_b32 s9, v0, s1
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
-    assert!(emit_for(&program(&computed, 128), nvidia).is_err());
+    emit_for(&program(&computed, 128), nvidia).unwrap();
+    assert!(super::last_module_summary().ends_with("; console flow with paired lanes"));
+    assert!(emit_for(&program(&computed, 96), nvidia).is_err());
 }
 
 /// Lane reads of the other half in groups of several console waves, as
@@ -632,6 +674,7 @@ fn first_lane_reads_are_the_console_waves() {
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
     console_flow_case("DPP and v_readfirstlane", &body, 64, |_| 0);
+    console_flow_case("first active lane of four waves", &body, 256, |t| t & !63);
 }
 
 /// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
@@ -681,6 +724,10 @@ fn loops_with_an_exit_mask_grown_from_zero() {
         0x4A04_040C, // v_add_nc_u32 v2, s12, v2
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
+    // The second wave takes 64 more iterations than the first.
+    console_flow_case("independent wave loops", &body, 128, |t| {
+        (t & !63) + 40 + 64
+    });
 }
 
 /// [`program`] with 512 bytes of LDS.
@@ -831,6 +878,10 @@ fn wave64_inclusive_prefix_joins_both_host_waves() {
         0x7E04_0301, // v_mov_b32 v2, v1
     ];
     console_flow_case("whole-wave inclusive sum", &body, 64, |n| n * (n + 1) / 2);
+    console_flow_case("prefix in several console waves", &body, 128, |t| {
+        let lane = t & 63;
+        (lane + 1) * (t & !63) + lane * (lane + 1) / 2
+    });
 }
 
 /// A scan of the lane ids with `opcode` (a VOP2 operation) as its step and
@@ -1455,6 +1506,7 @@ fn every_hardware_case_translates_and_validates_without_a_device() {
     in_half_lane_reads_match_the_console_on_every_adapter();
     three_dimensional_groups_keep_the_consoles_lanes();
     masks_read_whole_count_both_halves();
+    masked_double_sum_counts_both_halves();
     lane_reads_cross_halves();
     lane_reads_cross_halves_in_groups_of_several_console_waves();
     exchanges_inside_a_branch_one_half_skips();
@@ -1480,6 +1532,8 @@ fn every_hardware_case_translates_and_validates_without_a_device() {
     numeric_selects_beside_in_half_reads();
     lane_reads_in_branches_beside_a_whole_wave_section();
     a_lane_read_past_the_wave_reads_its_low_bits();
+    paired_lanes_share_lds_and_count_their_own_mask_bits();
+    paired_lanes_execute_a_half_precision_whole_wave_section();
     lds_in_a_group_of_48_threads_reads_both_halves();
     a_loop_exit_mask_read_inside_the_loop_counts_the_lanes_that_left();
     DRY.with(|d| d.set(false));
@@ -1616,4 +1670,79 @@ fn a_loop_exit_mask_read_inside_the_loop_counts_the_lanes_that_left() {
     let p = program_wave32(LOOP_EXIT_COUNT_32, 32);
     assert_flows("wave32", &p, whole);
     program_case("wave32 loop exit mask counted inside", &p, |_| 32, true);
+}
+
+/// Lanes from different console waves exchange LDS across s_barrier.
+/// The read after the predicated atomic uses the original lane mask and
+/// its return value. Each active lane updates a distinct dword.
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn paired_lanes_share_lds_and_count_their_own_mask_bits() {
+    let body = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xD834_0000,
+        0x0000_0104, // ds_write_b32 v4, v1
+        0xBF8A_0000, // s_barrier
+        0x3A0A_00C0, // v_xor_b32 v5, 64, v0
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D88_02A8, // v_cmp_gt_u32 vcc, 40, v1
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xD880_0000,
+        0x0200_0005, // ds_add_rtn_u32 v2, v5, v0
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0000,
+        0x0600_0004, // ds_read_b32 v6, v4
+        0x4A04_0D02, // v_add_nc_u32 v2, v2, v6
+    ];
+    program_case(
+        "masked LDS add and mbcnt",
+        &program_lds(&body, 128),
+        |t| {
+            let lane = t & 63;
+            if lane < 40 { 2 * lane + (t ^ 64) } else { lane }
+        },
+        true,
+    );
+}
+
+/// A whole-wave section with a half-precision addition, which the symbolic
+/// reduction pass cannot express. Each lane doubles the FP16 value from
+/// lane 0 of its opposite 16-lane row. Both rows then read console lane 32.
+#[test]
+#[ignore = "hardware: 32-lane waves (see hardware())"]
+fn paired_lanes_execute_a_half_precision_whole_wave_section() {
+    let body = [
+        0x4A02_00FF,
+        0x3C00,      // v_add_nc_u32 v1, 0x3c00, v0
+        0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+        0xD778_0002,
+        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x6404_0502, // v_add_f16 v2, v2, v2
+        0xD760_0009,
+        0x0001_4102, // v_readlane_b32 s9, v2, 32
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    let p = program(&body, 128);
+    let mut cs = emit_for(&p, HOSTS[0]).unwrap();
+    if let Ok(mut validator) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        validator.validate(&mut cs.dxil).unwrap();
+    }
+    for (name, host) in hardware() {
+        if host.target().runs(32) {
+            let out = run_for(&host, &p, 1, HOSTS[0]).unwrap();
+            let expected: Vec<u32> = (0..128)
+                .map(|t| 0x8000 + ((t & !15) ^ 16) + (t & !63) + 48)
+                .collect();
+            assert_eq!(out, expected, "{name}: paired FP16 rows");
+        }
+    }
 }

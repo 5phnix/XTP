@@ -90,6 +90,7 @@ fn translate(parts: &[&[u32]], wave64: bool, lanes: (u32, u32)) -> (Option<u32>,
     let native = crate::NativeProgram {
         stage: crate::HwStage::Cs,
         wave64,
+        float_mode: 0,
         vgprs: 8,
         layout: vec![],
         used: vec![],

@@ -194,6 +194,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
+                Reg::FloatMode => Val::I32(self.s.m.i32(self.x.native.float_mode.into())),
                 Reg::V(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
@@ -486,9 +487,18 @@ impl<'a> Lower<'a> {
             RootType::Constants | RootType::Table => {}
             _ => return Val::Missing("a root descriptor"),
         }
-        let index = u32::from(rp.user_data) + dword;
+        // A spilled signature starts at table byte zero. Bind only the
+        // reads the program needs, without reserving its absent user SGPRs.
+        let logical = u32::from(rp.user_data) + dword;
+        let index = if self.x.res.spill_loads.is_empty() {
+            logical
+        } else {
+            self.user_reads
+                .get(&logical)
+                .map_or(self.user_reads.len() as u32, |u| u.index)
+        };
         self.user_reads.insert(
-            index,
+            logical,
             UserData {
                 index,
                 slot: rp.slot,
@@ -1049,6 +1059,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
+            float_mode: 0,
             vgprs: 4,
             layout: vec![],
             used: vec![],

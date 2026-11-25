@@ -30,7 +30,7 @@ Nothing from any game is in the repository ([asset policy](../asset-policy.md)).
 | `crates/xtp-game` | BTP 6 only: its formats, build identities, hooks | `lib.rs` |
 | `crates/xtp-testkit` | dev-dependency only: visible, countable test skips (`xtp_testkit::skip`, `XTP_REQUIRE`) | `lib.rs` |
 | `apps/xtp` | the `xtp` command: `inspect`, `census`, `shader-info`, `translate`, `run`, `config` | `main.rs`, `run.rs` |
-| `xtask` | repository tooling: `policy`, `conventions`, `pr-check`, `install-hooks` | `main.rs` |
+| `xtask` | repository tooling: `policy`, `conventions`, `pr-check`, `install-hooks`, `frames` | `main.rs` |
 | `tests/fixtures/hle-probe` | a stand-in title we wrote, built by the loader's tests | `src/` |
 
 Areas in commit headers and `area/...` labels follow this table
@@ -131,6 +131,16 @@ crashes.log   : the last entry of crashes.log in the data folder, or "none"
 
 Leave out anything the title itself printed and every file it uses or
 produces. Replace your user name in paths if you prefer.
+
+### Timing summary
+
+`cargo xtask frames <run.log>` (add `--json` for scripts) summarizes a run
+log's frame-rate lines: median, p10, p90 and worst of the frame, stage and
+submission figures. Drops without a host pipeline are listed twice: totals
+by cause, then the details those totals include, each with the number of
+lines it was seen on. It also counts the lines it skipped, split into other
+lines and frame or drop lines it could not read in full. Invalid UTF-8 in
+the log is replaced, not fatal.
 
 ## Good first issues
 

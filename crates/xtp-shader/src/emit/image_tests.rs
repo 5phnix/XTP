@@ -213,6 +213,7 @@ fn native_in(words: &[u32], group: [u32; 3]) -> NativeProgram {
     NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 32,
         layout: vec![table(0, 1), table(1, 2), table(2, 3)],
         used: vec![
@@ -1519,6 +1520,7 @@ mod atomic64 {
         NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
+            float_mode: 0,
             vgprs: 32,
             layout: vec![table(0, 1), table(1, 2)],
             used: vec![used(0, 1, 8), used(1, 2, 4)],

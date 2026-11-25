@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod conventions;
+mod frames;
 mod play;
 mod policy;
 mod pr_check;
@@ -63,6 +64,15 @@ enum Cmd {
         #[arg(long)]
         fail_fast: bool,
     },
+    /// Summarize a run log's frame times, stage costs and drop counters.
+    Frames {
+        /// A log captured from a run (no game data is copied into the repository).
+        #[arg(value_name = "RUN.LOG")]
+        log: PathBuf,
+        /// Print the same summary as JSON for scripts.
+        #[arg(long)]
+        json: bool,
+    },
     /// Point git at .githooks/: commits run the policy and message checks.
     InstallHooks,
     /// Run the title from a copy of the golden data folder to gameplay with
@@ -113,6 +123,7 @@ fn main() -> Result<()> {
                 fail_fast,
             },
         ),
+        Cmd::Frames { log, json } => frames::run(&log, json),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

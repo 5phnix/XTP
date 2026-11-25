@@ -64,6 +64,7 @@ mod compare;
 mod descriptor;
 mod export;
 mod flow;
+pub(super) mod geometry;
 mod image;
 mod input;
 mod integer;
@@ -256,6 +257,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Une somme f64 de lanes masquées lit les votes de la vague console.
+    emitted_double_count: bool,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -285,8 +288,8 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
-    /// A console wave64 compute program run as two 32-lane host waves
-    /// (each lane's reads stay in its half; see `Lower::new`).
+    /// A wave64 program lowered in 32-lane halves. In paired mode both
+    /// register sets belong to the same host wave.
     split: bool,
     /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
     console_cf: bool,
@@ -604,13 +607,12 @@ impl<'a> Lower<'a> {
             split |= group_reads;
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half) or to share LDS in
-            // the console's instruction order: the console flow, for a group
-            // of one console wave. What keeps a program out of it is the
-            // reason it stops with.
+            // the console's instruction order. A single console wave can
+            // exchange through LDS; multiple complete waves use paired lanes.
             let needs_wave64 =
                 (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
             if needs_wave64 && !x.target.runs(64) {
-                no_console_flow = if cs.threads.iter().product::<u32>() > 64 {
+                no_console_flow = if threads > 64 && !threads.is_multiple_of(64) {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
@@ -618,7 +620,7 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
-                } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
+                } else if threads < 64
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 {
                     Some("a whole-wave section of a wave64 on a host without 64-lane waves")
@@ -659,6 +661,14 @@ impl<'a> Lower<'a> {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
                 split = x.native.wave64 && !x.target.runs(64);
+            }
+            if x.console_cf && split && threads > 64 {
+                // Each physical lane carries console lanes i and i+32. One
+                // physical wave therefore follows one console program counter.
+                group_reads = false;
+                s.m.pair_lanes();
+                flat_group = Some(cs.threads);
+                s.threads = Some([threads / 2, 1, 1]);
             }
             if split {
                 s.wave_size = Some(32);
@@ -727,6 +737,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            emitted_double_count: false,
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -869,7 +880,11 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
-        self.find_sections();
+        // All 64 logical lanes are present in a paired wave. Execute the
+        // original steps, including FP16 operations and their rounding.
+        if !self.s.m.paired_lanes() {
+            self.find_sections();
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -933,6 +948,7 @@ impl<'a> Lower<'a> {
                 }
                 (false, true) => "per lane in halves",
                 (true, false) => "console flow",
+                (true, true) if self.s.m.paired_lanes() => "console flow with paired lanes",
                 (true, true) => "console flow in halves",
             },
             cmp_samplers,
@@ -983,6 +999,7 @@ impl<'a> Lower<'a> {
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
         let r = match &inst.fields {
+            _ if inst.write(Reg::FloatMode).is_some() => self.set_float_mode(inst),
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
@@ -1020,6 +1037,16 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+        }?;
+        if !self.bad.is_empty() {
+            for &(_, w) in &inst.writes {
+                if self.bad.get(&w) == Some(&mask::LANE_MASK)
+                    && let Ok(word) = self.mask_dword(w)
+                {
+                    self.vals.insert(w, Val::I32(word));
+                }
+            }
         }
+        Ok(())
     }
 }

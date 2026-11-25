@@ -847,7 +847,7 @@ impl<'a> Lower<'a> {
         }
         let on = self.s.threads.is_some()
             && !self.s.pixel
-            && !(self.console_cf && self.split)
+            && (!(self.console_cf && self.split) || self.s.m.paired_lanes())
             && !self.mesh_halves()
             && self.s.lds_dwords + 2
                 <= if self.s.mesh.is_some() {
@@ -1023,7 +1023,12 @@ impl<'a> Lower<'a> {
         let at = self.s.m.element(wait, ended, own);
         let after = self.s.m.load(wait, at);
         let sum = self.s.m.bin(wait, Bin::Add, before, after);
-        let all = self.s.m.i32(threads);
+        // Each physical lane counts both of its logical lanes when paired.
+        let all = self.s.m.i32(if self.s.m.paired_lanes() {
+            2 * threads
+        } else {
+            threads
+        });
         let all_ended = self.s.m.cmp(wait, pred::EQ, sum, all);
         self.s
             .m
@@ -1085,6 +1090,21 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // A join of computed numbers (`dead_at_join`): an SGPR, not a
+            // mask itself, some of whose incoming values are numbers and
+            // none a constant.
+            let st = self.x.st;
+            let numbers = !bit
+                && !st.masks.contains_key(&phi.value)
+                && !st.highs.contains_key(&phi.value)
+                && phi
+                    .args
+                    .iter()
+                    .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))))
+                && !phi
+                    .args
+                    .iter()
+                    .any(|a| matches!(self.vals.get(a), Some(Val::I32(V::Const(_)))));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -1118,6 +1138,23 @@ impl<'a> Lower<'a> {
                         if self.unused_pixel_sgpr(phi.reg, q, b) =>
                     {
                         self.s.m.i32(0)
+                    }
+                    (Some(Val::Missing(_)), false)
+                        if numbers && self.dead_at_join(arg, &mut Vec::new()) =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
+                    }
+                    (Some(Val::Missing(super::mask::LANE_MASK)), false)
+                        if self.x.console_cf
+                            && self.emitted_double_count
+                            && self.read_phis.contains(&phi.value)
+                            && !self.bad.contains_key(&arg)
+                            && (self.x.st.masks.contains_key(&arg)
+                                || self.x.st.highs.contains_key(&arg)) =>
+                    {
+                        // Le vote doit être émis à la définition du masque,
+                        // avant de résoudre les jonctions dont il dépend.
+                        return Err(Stop::Retry(arg, super::mask::LANE_MASK));
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
@@ -1156,6 +1193,49 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         Ok(())
+    }
+
+    /// Whether `v`, an incoming value of a join of computed numbers, is a
+    /// register the program reads as no number there: a descriptor's dword
+    /// with no host value ([`super::smem::DESCRIPTOR_WORD`]), a lane mask's
+    /// dword outside compute (where no ballot gives it as data), or a join
+    /// of only such values. Compiled code joins numbers with numbers: a
+    /// physical register that holds a mask on one path and a number on the
+    /// other holds two variables, and the program reads the joined value
+    /// only where the number's path set it (behind a flag kept in a VGPR:
+    /// the skinned and shadow mesh programs 235e56869c1ea883 at 0x1980,
+    /// c3ba22ec6fc5dd4a at 0x1b48). That edge brings an undefined value.
+    // shortcut: wrong where a mask meets a computed number and the program
+    // reads the mask's side as data after the join (in compute, where
+    // ballots are exact, such a join stays refused, as does one with a
+    // constant: `cond ? ballot : 5`).
+    // Ported from fxceless's VIctory fork (commit 578d459) by fxceless
+    // (`dead` and its arm in the joins). Here: undefined rather than 0, as
+    // the descriptor-word rule above; not in compute; not where a number of
+    // the join is a constant.
+    fn dead_at_join(&self, v: Value, seen: &mut Vec<Value>) -> bool {
+        if matches!(self.vals.get(&v), Some(Val::Missing(w)) if *w == super::smem::DESCRIPTOR_WORD)
+            && self.descriptor_dword(v)
+        {
+            return true;
+        }
+        let st = self.x.st;
+        if self.mask_data != super::mask::MaskData::Console
+            && (st.masks.contains_key(&v) || st.highs.contains_key(&v))
+        {
+            return true;
+        }
+        let Some(&(b, i)) = self.phi_at.get(&v) else {
+            return false;
+        };
+        if seen.contains(&v) {
+            return true;
+        }
+        seen.push(v);
+        self.x.p.blocks[b].phis[i]
+            .args
+            .iter()
+            .all(|&a| self.dead_at_join(a, seen))
     }
 }
 

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use super::mask::MaskData;
 use super::{Lower, Val, Why};
-use crate::emit::bitcode::{Attr, Bin, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Dpp, Fields, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
@@ -186,6 +186,46 @@ impl<'a> Lower<'a> {
     pub(super) fn shape(&mut self, shape: crate::emit::wave::Shape) -> Result<V, Why> {
         use crate::emit::wave::{Op, Shape};
         let (op, src, mask, ident, prefix) = match shape {
+            Shape::CountHi(mask) => {
+                if self.mask_data != MaskData::Console || self.split && !self.console_cf {
+                    return Err("a count without the console wave's lanes");
+                }
+                let &mask = self
+                    .x
+                    .st
+                    .masks
+                    .get(&mask)
+                    .ok_or("a wave reduction's untracked mask")?;
+                let c = self.cur;
+                let on = self.boolean(mask, c)?;
+                self.s.flags |= flags::WAVE_OPS;
+                let bit = self.s.m.cast(c, Cast::ZExt, on, self.s.t.i32);
+                let sum = self.s.m.i8(0);
+                let unsigned = self.s.m.i8(1);
+                let mut count = self.s.op(
+                    c,
+                    "waveActiveOp.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    119,
+                    &[bit, sum, unsigned],
+                );
+                if self.split {
+                    let (lo, hi) = self.exchange(c, count);
+                    count = self.s.m.bin(c, Bin::Add, lo, hi);
+                }
+                // Pour 1 à 64, la fraction du f32 tient dans le mot haut du f64.
+                let f = self.s.m.cast(c, Cast::UiToFp, count, self.s.t.f32);
+                let bits = self.as_int(f);
+                let three = self.s.m.i32(3);
+                let upper = self.s.m.bin(c, Bin::LShr, bits, three);
+                let bias = self.s.m.i32((1023 - 127) << 20);
+                let upper = self.s.m.bin(c, Bin::Add, upper, bias);
+                let z = self.s.m.i32(0);
+                let empty = self.s.m.cmp(c, pred::EQ, count, z);
+                self.emitted_double_count = true;
+                return Ok(self.s.m.select(c, empty, z, upper));
+            }
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
@@ -692,7 +732,11 @@ impl<'a> Lower<'a> {
             111,
             &[],
         );
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let f = if self.s.m.paired_lanes() {
+            self.s.m.paired_flat(e, base, lane)
+        } else {
+            self.s.m.bin(e, Bin::Add, base, lane)
+        };
         self.s.flags |= flags::WAVE_OPS;
         self.console_flat = Some(f);
         f
@@ -710,11 +754,9 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the console flow can run this compute program on the host:
-    /// what `Lower::new` requires before it asks for it. In two 32-lane
-    /// halves, one console wave per group (the halves meet at group
-    /// barriers), no `ds_permute` across the halves, and whole-wave
-    /// sections only in a group of exactly 64 threads; on a host that runs
-    /// the console's waves, no `ds_permute`.
+    /// used when a per-lane mask read needs all 64 console lanes.
+    /// Complete waves can run paired. A partial single wave can use the
+    /// original group exchange when it has no whole-wave section.
     pub(super) fn console_flow_runs(&self) -> bool {
         if self.mask_data != MaskData::Console {
             return false;
@@ -732,7 +774,9 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 && !self.x.target.runs(64) {
             let sections =
                 (0..p.blocks.len()).any(|b| !crate::emit::wave::sections(p, b).is_empty());
-            self.x.target.runs(32) && threads <= 64 && !permute && (threads == 64 || !sections)
+            self.x.target.runs(32)
+                && !permute
+                && (threads.is_multiple_of(64) || threads < 64 && !sections)
         } else {
             self.x.target.runs(self.wave()) && !permute
         }
@@ -744,7 +788,12 @@ impl<'a> Lower<'a> {
     /// of 32 threads or fewer exchanges nothing.)
     pub(super) fn exchange_fits(&self) -> Result<(), Why> {
         let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
-        if self.console_cf && self.split && threads > 32 && self.s.lds_dwords + 2 > 8192 {
+        if self.console_cf
+            && self.split
+            && !self.s.m.paired_lanes()
+            && threads > 32
+            && self.s.lds_dwords + 2 > 8192
+        {
             return Err("a wave64 program whose LDS leaves no room for its halves' exchange");
         }
         if self.group_reads && self.s.lds_dwords + threads > 8192 {
@@ -814,6 +863,9 @@ impl<'a> Lower<'a> {
     /// fewer has no upper half: its lanes count as inactive there (0).
     pub(super) fn exchange(&mut self, at: usize, x: V) -> (V, V) {
         let threads: u32 = self.s.threads.expect("compute").iter().product();
+        if self.s.m.paired_lanes() {
+            return self.s.m.paired_words(at, x);
+        }
         let z = self.s.m.i32(0);
         if threads <= 32 {
             return (x, z);

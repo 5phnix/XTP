@@ -80,7 +80,11 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod desc_data_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod geometry_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
@@ -96,17 +100,29 @@ mod mesh_tests;
 // IR to DXIL, one file per encoding or concern: which backlog item of
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
 pub(crate) mod lower;
+#[cfg(all(test, windows))]
+mod raw_tests;
 pub mod rect_gs;
 mod sampler;
+#[cfg(test)]
+mod sampler_tests;
+#[cfg(all(test, windows))]
+mod scalar_gap_tests;
 mod shader;
+#[cfg(all(test, windows))]
+mod smem_data_tests;
 #[cfg(all(test, windows))]
 mod smem_tests;
 #[cfg(all(test, windows))]
 mod split_tests;
 #[cfg(all(test, windows))]
 mod stride_tests;
+#[cfg(test)]
+mod userdata_tests;
 #[cfg(windows)]
 pub mod validator;
+#[cfg(all(test, windows))]
+mod validator_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
@@ -268,7 +284,9 @@ pub struct HostShader {
 
 /// Whether buffers read by element with a stride known at translation are
 /// read through raw handles (`index * stride + offset`) instead of
-/// structured ones: `XTP_RAW_STRUCTURED=1`, read once. `xtp-gpu` then makes
+/// structured ones: on by default since 2026-11-25 (every image session ran
+/// with it; without it the world draws black), `XTP_RAW_STRUCTURED=0` turns
+/// it off, read once. `xtp-gpu` then makes
 /// the title's structured views raw views of the same bytes where it can
 /// (Marvisak/VIctory#1762, after fxceless's VIctory fork's `raw_window`):
 /// on NVIDIA a raw read through a structured view returns other dwords or
@@ -283,7 +301,7 @@ pub fn raw_structured() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "0"))
 }
 
 #[cfg(test)]
@@ -327,7 +345,7 @@ impl HostShader {
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
-    /// Dword in the user-data buffer (the console's user-data index).
+    /// Dword in the host user-data buffer. Spilled root arguments are packed.
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
@@ -486,8 +504,8 @@ pub fn translate_program_for(
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())
-        .map_err(|e| (Step::Resources, e))?;
+    let res =
+        resource::track_native(&p, native, st.as_ref().ok()).map_err(|e| (Step::Resources, e))?;
     let io = io::raise(&p, native).map_err(|e| (Step::Io, e))?;
     let st = st.map_err(|e| (Step::Structure, e))?;
     emit_for(c, native, &p, &st, &io, &res, target).map_err(|e| (Step::Emit, e))
@@ -636,7 +654,8 @@ pub fn emit_for(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    // D3D12 encode comparaison, minimum et maximum dans le même champ.
+                    s.filter = (s.filter & !(3 << 7)) | 0x80;
                 }
                 s
             })
@@ -803,6 +822,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
+            float_mode: 0,
             vgprs: 2,
             layout: vec![],
             used: vec![],
@@ -864,6 +884,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: true,
+            float_mode: 0,
             vgprs: 2,
             layout: vec![],
             used: vec![],
@@ -1000,6 +1021,7 @@ mod tests {
             let native = super::NativeProgram {
                 stage: super::HwStage::Ps,
                 wave64: false,
+                float_mode: 0,
                 vgprs: 4,
                 layout: vec![],
                 used: vec![],
@@ -1072,6 +1094,7 @@ mod tests {
         let native = super::NativeProgram {
             stage: super::HwStage::Ps,
             wave64: false,
+            float_mode: 0,
             vgprs: 4,
             layout: vec![],
             used: vec![],
@@ -1126,6 +1149,7 @@ mod tests {
         crate::NativeProgram {
             stage: crate::HwStage::Cs,
             wave64,
+            float_mode: 0,
             vgprs: 8,
             layout: vec![],
             used: vec![],
@@ -1178,14 +1202,12 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the console flow cannot run it (its waves need not
-        // branch alike), so each lane takes its own path in two 32-lane
-        // halves and the lane read at lane 5 goes through group-shared
-        // memory (`lower::lanes::group_reads_meet`).
+        // A constant lane in this group can use its existing LDS exchange.
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
         assert_eq!(emit_for(&two, NVIDIA).unwrap().wave_size(), Some(32));
-        // At a lane the code computes (s1), still not.
+        // A computed lane needs both register sets. Keep a partial last
+        // wave as a negative control.
         let computed = [
             0xD760_0000,
             0x0000_0300, // v_readlane_b32 s0, v0, s1
@@ -1193,12 +1215,13 @@ mod tests {
             0xBF81_0000, // s_endpgm
         ];
         assert_eq!(
-            emit_for(&compute_of(&computed, true, 128), NVIDIA),
+            emit_for(&compute_of(&computed, true, 96), NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
                 what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
             })
         );
+        assert!(emit_for(&compute_of(&computed, true, 128), NVIDIA).is_ok());
         // The same code in waves of 32 runs on either.
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());
@@ -1254,11 +1277,7 @@ mod tests {
         }
     }
 
-    /// On every hardware adapter with a supported wave path: a wave64 program
-    /// that reads other lanes translates in groups of one console wave (natively
-    /// or in the console flow) and the adapter takes it; in groups of two it
-    /// translates exactly when the adapter runs 64-lane waves. An adapter with
-    /// neither 64- nor 32-lane waves correctly refuses the one-wave program.
+    /// Groups of one or two waves can read a console lane on either host.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -1283,14 +1302,9 @@ mod tests {
             };
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            match emit_for(&compute_of(&words, true, 128), target) {
-                Ok(cs) => {
-                    assert!(target.runs(64), "{name}");
-                    host.compute_pipeline(&cs)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                }
-                Err(_) => assert!(!target.runs(64), "{name}"),
-            }
+            let two = emit_for(&compute_of(&words, true, 128), target).unwrap();
+            host.compute_pipeline(&two)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 

@@ -53,6 +53,14 @@ pub(crate) struct HostHeap {
     strides: Option<Strides>,
     /// The last [`HostHeap::picked_spans`]: its frame, and what it found.
     picked: Mutex<Option<(u64, Arc<Picked>)>>,
+    /// View heaps: the title slots holding a view of a texture the title
+    /// may fill, for shaders that pick textures by index
+    /// ([`TextureQueue`], [`HostHeap::texture_pass`]).
+    textures: Mutex<TextureQueue>,
+    /// View heaps: per title slot, the frame (plus one; 0: never) in which
+    /// a draw last read it through a table
+    /// ([`HostHeap::texture_slot_tabled`]).
+    tabled: Vec<std::sync::atomic::AtomicU32>,
 }
 
 /// Slots past the dynamic ones in a view heap with a runtime stride table,
@@ -583,6 +591,10 @@ impl HostHeap {
             null_raw: OnceLock::new(),
             strides,
             picked: Mutex::new(None),
+            textures: Mutex::default(),
+            tabled: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1068,6 +1080,11 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        if !for_draw {
+            // The title wrote the slot: what shaders that pick textures by
+            // index may find there.
+            self.queue_texture(index, view.as_ref().map(|v| (key, v)));
+        }
         // A texture the title placed itself is viewed through the resource
         // made for its memory, which another replaces when a texture the
         // GPU writes comes there (#643): the record stays the same, so the
@@ -1622,6 +1639,707 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn alias_base(&self) -> u32 {
         self.strides.as_ref().expect("a stride table").alias_base
+    }
+}
+
+/// Frames for which a slot a draw read through a table counts as a table's
+/// ([`HostHeap::texture_slot_tabled`]).
+const TABLED_FRAMES: u64 = 240;
+
+/// Frames a texture view the title writes into a table's slot waits in the
+/// [`TextureQueue`] for the draw that reads it, before a pass takes it for
+/// one a shader picks by index. A title that builds a table per draw
+/// writes thousands of texture views a frame into slots only tables read
+/// (fxceless's VIctory fork counted some 2,500 a frame in BTP 6's opening
+/// cutscene, a few hundred textures over and over), each of which would
+/// stand in the queue with the slots shaders do pick by index. In frames
+/// as `crate::frame::current` counts them (two or three begun per frame
+/// presented in that cutscene, by the fork's count).
+const TABLED_GRACE: u64 = 8;
+
+/// Since the start: texture views the title wrote into a table's slot
+/// (due after [`TABLED_GRACE`]), and slots that stopped waiting for a pass
+/// because a draw read them through a table.
+static TABLED_WRITES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Slots of each kind a pass is handed at most: due for their first
+/// upload, served to check for changes.
+const PASS_SLOTS: usize = 4096;
+
+/// Where frames do not advance (a title that does not wait for them), a
+/// pass this long after the last one.
+const PASS_AGAIN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a pass makes and uploads textures for the first time: making
+/// one can wait in the kernel (a host texture, its staging buffer), and
+/// the world's loading leaves thousands waiting; the rest wait for the
+/// next frames' passes. (The fork's 250 ms a pass came after "1.6-2.2 s of
+/// each of the world's first twenty frames" without a limit.)
+pub(crate) const PASS_MAKING: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// How long a pass checks served textures for changes, in turns from
+/// where the last one stopped.
+pub(crate) const PASS_CHECKING: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The bytes of served textures whose memory only a hash tells (neither
+/// write-watched nor guarded: `texture::Change::Unknown`) a pass uploads
+/// for the check at submission to hash: some 1.3 ms of hashing at the
+/// safety net's measured 3 GB/s (`texture.rs` `net_costs`). The others
+/// wait for their next turn.
+pub(crate) const PASS_HASHING: u64 = 4 << 20;
+
+/// The bytes of staging buffers past which a pass uploads no texture for
+/// the first time (tables' textures counted): each one is upload memory
+/// of its texture's size, held for as long as the texture lives, and the
+/// world's heap holds views of some 32,000 textures. Those past it wait
+/// (logged once). It was 3 GiB: reached in the first world session
+/// (heaptex-A, PC, 2026-11-25), beside the title's own memory, it left the
+/// PC's memory nearly full.
+pub(crate) const PASS_STAGING: u64 = 1 << 30;
+
+/// The share of its local video memory budget (percent) past which a pass
+/// makes no host texture for a first upload: in heaptex-A the passes made
+/// one for each of 17,500 slots, the process's local memory went from the
+/// 10.5 GB of the same world without them to 13.3 GB resident, past what
+/// a 16 GB card shared with the desktop's programs has, and the video
+/// memory manager's evictions at each submission's preparation took the
+/// frame to 1-11 s on the GPU. Those past it wait for room (the title's
+/// own textures and targets come first).
+pub(crate) const PASS_VIDEO_SHARE: u64 = 85;
+
+/// Whether a pass may make host textures, by the process's local video
+/// memory `(budget, usage)` (`crate::dxgi::video_memory`; `None`, unknown:
+/// yes).
+pub(crate) fn room_for_textures(memory: Option<(u64, u64)>) -> bool {
+    memory.is_none_or(|(budget, usage)| usage < budget / 100 * PASS_VIDEO_SHARE)
+}
+
+/// The bytes a frame's pass stages for first uploads of textures shaders
+/// pick by index (`XTP_HEAP_TEXTURES`, MiB, 64 by default: the detiling at
+/// submission is about a millisecond per MiB); `None` when it is 0, `off`
+/// or `false`: no pass, as before (such textures stay as they were made,
+/// and placed ones null). Read once.
+pub(crate) fn heap_textures_budget() -> Option<u64> {
+    static BUDGET: OnceLock<Option<u64>> = OnceLock::new();
+    *BUDGET
+        .get_or_init(|| heap_textures_budget_of(std::env::var("XTP_HEAP_TEXTURES").ok().as_deref()))
+}
+
+/// [`heap_textures_budget`] for the switch's value.
+fn heap_textures_budget_of(value: Option<&str>) -> Option<u64> {
+    const DEFAULT_MIB: u64 = 64;
+    let mib = match value.map(str::trim) {
+        None => DEFAULT_MIB,
+        Some(v) if matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "false") => {
+            tracing::warn!(
+                "XTP_HEAP_TEXTURES={v}: textures shaders pick by index are not uploaded"
+            );
+            return None;
+        }
+        Some(v) => v.parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = v,
+                "XTP_HEAP_TEXTURES is not a number of MiB: {DEFAULT_MIB} MiB"
+            );
+            DEFAULT_MIB
+        }),
+    };
+    Some(mib.min(1 << 20) << 20)
+}
+
+/// What the queue of textures picked by index knows of a title slot that
+/// waits for its first upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Waiting {
+    /// The frame from which it is due.
+    due: u64,
+    /// The frame it was written in.
+    written: u64,
+    /// Which write of the queue put it here, counted over the run: newer
+    /// writes are served first, and the pass hands it back with what it
+    /// did, so that a slot written again meanwhile stays as written.
+    write: u64,
+    /// The record it holds (view index and generation).
+    key: u64,
+    /// Looks in a row that found nothing to upload (none of its memory
+    /// mapped, its host copy not resident yet).
+    looks: u8,
+}
+
+/// The title slots of a view heap holding a view of a texture the title
+/// may fill itself (a texture object it does not render to, a texture
+/// placed in its memory), for shaders that pick textures by an index they
+/// compute: no used-resource entry names such a slot, so no draw's table
+/// makes it (a placed texture's slot stays null) nor uploads its texture
+/// (the host copy keeps what it was made with). A pass once a frame
+/// (`draw.rs` `heap_textures`) serves the slots waiting for their first
+/// upload, then checks the served ones for changes in turns. A slot a draw
+/// reads through a table is that draw's to bring up to date. No host heap
+/// is needed, so it is tested without one.
+///
+/// Ported from fxceless's VIctory fork (commit 578d459), `TextureQueue`:
+/// its order (the slots looked at before, then the newest write and the
+/// oldest in turns), its looks again at a slot with nothing to upload yet,
+/// and its grace for the slots of tables. The fork uploads a texture once,
+/// and again only when the title rewrites its slot or the runtime maps
+/// its memory; here an uploaded slot stays served and is checked against
+/// the write watch or its guards (`texture::memory_change`: a texture
+/// streaming in is written after its view), which takes the place of the
+/// fork's mapping hooks, spans of placed memory and part uploads. Slots
+/// are kept by write as well as by slot: the fork sorted every due slot
+/// at every pass (tens of thousands while the world loads).
+#[derive(Default)]
+pub(crate) struct TextureQueue {
+    /// Slots waiting for their first upload.
+    waiting: BTreeMap<u32, Waiting>,
+    /// The same by write: never looked at, and looked at before.
+    fresh: BTreeMap<u64, u32>,
+    again: BTreeMap<u64, u32>,
+    /// Writes so far.
+    writes: u64,
+    /// Slots uploaded, with the record they held then.
+    served: BTreeMap<u32, u64>,
+    /// The served slot the last checks stopped at.
+    cursor: u32,
+    /// The last pass handed out: its frame and when.
+    pass: Option<(u64, std::time::Instant)>,
+}
+
+impl TextureQueue {
+    /// Slot `index` was written with record `key`'s view of a texture the
+    /// title may fill (`placed` in its memory) in `frame`, due from frame
+    /// `due`: it waits for its first upload. Not if it holds the record it
+    /// waits with, or that of a texture object it was served with (a title
+    /// copying the same descriptors again): the host slot of a placed
+    /// texture is made null by the write (`HostHeap::mirror`), so such a
+    /// slot waits again. Whether it now waits anew.
+    fn written(&mut self, index: u32, key: u64, placed: bool, frame: u64, due: u64) -> bool {
+        let same = self.waiting.get(&index).is_some_and(|w| w.key == key)
+            || (!placed && self.served.get(&index) == Some(&key));
+        if same {
+            return false;
+        }
+        self.remove(index);
+        self.writes += 1;
+        let write = self.writes;
+        self.waiting.insert(
+            index,
+            Waiting {
+                due,
+                written: frame,
+                write,
+                key,
+                looks: 0,
+            },
+        );
+        self.fresh.insert(write, index);
+        true
+    }
+
+    /// Slot `index` holds no view of a texture the title may fill: out.
+    fn remove(&mut self, index: u32) {
+        if let Some(w) = self.waiting.remove(&index) {
+            self.fresh.remove(&w.write);
+            self.again.remove(&w.write);
+        }
+        self.served.remove(&index);
+    }
+
+    /// Slot `index`'s texture was brought up to date (by a pass, or by a
+    /// draw that read it through a table): served, if it waited. Whether
+    /// it did.
+    fn serve(&mut self, index: u32) -> bool {
+        let Some(w) = self.waiting.remove(&index) else {
+            return false;
+        };
+        self.fresh.remove(&w.write);
+        self.again.remove(&w.write);
+        self.served.insert(index, w.key);
+        true
+    }
+
+    /// Up to `max` slots due at `frame`, each with its write number, in the
+    /// order to serve them: first those looked at before, the newest first
+    /// (the look is a query, and what arrived since is what the title
+    /// streamed last); then the newest write and the oldest in turns. Slot
+    /// order served the low slots of a backlog of 25,000-40,000 while the
+    /// textures of the shot on screen waited (the fork's run 52: "98 % of
+    /// the drawn pixels had no colour texture in the first 3D frames");
+    /// the newest alone would leave the oldest waiting for good.
+    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let is_due =
+            |&(_, &index): &(&u64, &u32)| self.waiting.get(&index).is_some_and(|w| w.due <= frame);
+        let mut order: Vec<(u32, u64)> = self
+            .again
+            .iter()
+            .rev()
+            .filter(&is_due)
+            .take(max)
+            .map(|(&write, &index)| (index, write))
+            .collect();
+        let mut fresh = self.fresh.iter().filter(&is_due);
+        let mut newest = true;
+        while order.len() < max {
+            let next = if newest {
+                fresh.next_back()
+            } else {
+                fresh.next()
+            };
+            let Some((&write, &index)) = next else {
+                break;
+            };
+            order.push((index, write));
+            newest = !newest;
+        }
+        order
+    }
+
+    /// The waiting entry of `index`, if it is still the write the pass was
+    /// handed.
+    fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        self.waiting.get_mut(&index).filter(|w| w.write == write)
+    }
+
+    /// Slot `index` (handed out with `write`) was uploaded: served.
+    fn done(&mut self, index: u32, write: u64) {
+        if self.same(index, write).is_some() {
+            self.serve(index);
+        }
+    }
+
+    /// Nothing to upload at slot `index` (handed out with `write`) now:
+    /// looked at again after 1, 2, 4, ... frames, at most `most`, before
+    /// the slots never looked at.
+    fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
+        let Some(w) = self.same(index, write) else {
+            return;
+        };
+        w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
+        w.looks = w.looks.saturating_add(1);
+        if self.fresh.remove(&write).is_some() {
+            self.again.insert(write, index);
+        }
+    }
+
+    /// Slot `index` holds nothing the title fills (its view went, or views
+    /// a texture the host renders to or copied into): out until written
+    /// again. `write`: as the pass was handed it; `None`, a served slot.
+    fn dropped(&mut self, index: u32, write: Option<u64>) {
+        match write {
+            Some(write) => {
+                if self.same(index, write).is_some() {
+                    self.remove(index);
+                }
+            }
+            None => {
+                self.served.remove(&index);
+            }
+        }
+    }
+
+    /// Up to `max` served slots after the one the last checks stopped at,
+    /// going round once at most, those `skip` says to leave out.
+    fn next_served(&self, max: usize, skip: impl Fn(u32) -> bool) -> Vec<u32> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let after = self.served.range((Excluded(self.cursor), Unbounded));
+        let before = self.served.range(..=self.cursor);
+        after
+            .chain(before)
+            .map(|(&index, _)| index)
+            .filter(|&index| !skip(index))
+            .take(max)
+            .collect()
+    }
+
+    /// Whether a pass is due at `frame` and `now`: once a frame, or
+    /// [`PASS_AGAIN`] after the last one where frames do not advance. If
+    /// it is, it is taken: the time since the last one (the longest there
+    /// is for the first).
+    fn pass_due(&mut self, frame: u64, now: std::time::Instant) -> Option<std::time::Duration> {
+        let since = match self.pass {
+            None => std::time::Duration::MAX,
+            Some((last, at)) => {
+                let since = now.saturating_duration_since(at);
+                if last == frame && since < PASS_AGAIN {
+                    return None;
+                }
+                since
+            }
+        };
+        self.pass = Some((frame, now));
+        Some(since)
+    }
+
+    /// For the log: slots waiting; of them due at `frame`; looked at
+    /// before; slots served; and the frames the oldest due one has waited
+    /// since its write.
+    fn census(&self, frame: u64) -> [u64; 5] {
+        let mut c = [
+            self.waiting.len() as u64,
+            0,
+            self.again.len() as u64,
+            self.served.len() as u64,
+            0,
+        ];
+        for w in self.waiting.values().filter(|w| w.due <= frame) {
+            c[1] += 1;
+            c[4] = c[4].max(frame.saturating_sub(w.written));
+        }
+        c
+    }
+}
+
+/// Whether `view`, as the title wrote it, views a texture the title may
+/// fill itself: one it placed in its memory (made when something reads
+/// it), or a texture object it does not render to nor write through
+/// unordered access (as its host copy says, once resident).
+fn fills_texture(view: &View) -> bool {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Placed(false, resource, _) => resource[0] != BUFFER,
+        View::Shader(resource, _) => {
+            let resource = *resource as crate::object::This;
+            crate::resource::buffer_bytes(resource).is_none()
+                && crate::resource::host_resource(resource)
+                    .is_none_or(crate::texture::title_written)
+        }
+        _ => false,
+    }
+}
+
+/// [`HostHeap::tabled`]'s stamp for `frame`.
+fn stamp_of(frame: u64) -> u32 {
+    (frame as u32).wrapping_add(1)
+}
+
+/// The frame passes and stamps count by: the title's, and in tests what
+/// a test adds ([`PASS_LATER`]).
+fn pass_frame() -> u64 {
+    let frame = crate::frame::current();
+    #[cfg(test)]
+    let frame = frame + PASS_LATER.load(Ordering::Relaxed);
+    frame
+}
+
+/// Frames tests add for passes: the title's frame counter is not theirs
+/// to advance.
+#[cfg(test)]
+pub(crate) static PASS_LATER: AtomicU64 = AtomicU64::new(0);
+
+/// What a pass over the textures shaders pick by index works on (`draw.rs`
+/// `heap_textures`), from [`HostHeap::texture_pass`].
+pub(crate) struct TexturePass {
+    pub(crate) frame: u64,
+    /// Slots due for their first upload, with their write numbers, in the
+    /// order to serve them.
+    pub(crate) due: Vec<(u32, u64)>,
+    /// Served slots to check for changes, in turn; those tables read
+    /// lately are left out (their draws check them).
+    pub(crate) served: Vec<u32>,
+    /// Frames at most between two looks at a slot with nothing to upload:
+    /// those in about four seconds, between 16 and 256 (a title streams by
+    /// the clock; at the opening cutscene's half a frame a second, the
+    /// fork's 120 frames were four minutes).
+    pub(crate) most: u64,
+}
+
+/// What one pass over the textures shaders pick by index did, for the log
+/// ([`HostHeap::texture_pass_done`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PassCounts {
+    /// Due slots looked at; of them uploaded for the first time, and the
+    /// bytes of their staging buffers; and those with nothing to upload
+    /// yet (none of the memory mapped, the host copy not resident).
+    pub(crate) looked: u64,
+    pub(crate) uploaded: u64,
+    pub(crate) bytes: u64,
+    pub(crate) away: u64,
+    /// Served slots checked; of them found changed (uploaded again), and
+    /// those whose memory only a hash tells, uploaded for the check at
+    /// submission to hash ([`PASS_HASHING`]).
+    pub(crate) checked: u64,
+    pub(crate) changed: u64,
+    pub(crate) hashed: u64,
+    /// Due slots left for later passes by the budgets (bytes, time,
+    /// staging memory, video memory).
+    pub(crate) left: u64,
+    /// 1 if the pass made no first upload for want of room: staging memory
+    /// past [`PASS_STAGING`], or video memory past [`PASS_VIDEO_SHARE`].
+    pub(crate) full: u64,
+    /// Microseconds the pass took.
+    pub(crate) us: u64,
+}
+
+/// Passes since the last log line: when the window began, how many, their
+/// counts summed, and the longest's microseconds.
+#[derive(Default)]
+struct PassWindow {
+    began: Option<std::time::Instant>,
+    passes: u64,
+    sum: PassCounts,
+    longest: u64,
+}
+
+static PASS_WINDOW: Mutex<PassWindow> = Mutex::new(PassWindow {
+    began: None,
+    passes: 0,
+    sum: PassCounts {
+        looked: 0,
+        uploaded: 0,
+        bytes: 0,
+        away: 0,
+        checked: 0,
+        changed: 0,
+        hashed: 0,
+        left: 0,
+        full: 0,
+        us: 0,
+    },
+    longest: 0,
+});
+
+/// How often the passes are summed up in the log.
+const PASS_LOG: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl HostHeap {
+    /// The queue's part of the title's write of slot `index` (`view`: the
+    /// record written and its view, if it is one of ours).
+    fn queue_texture(&self, index: u32, view: Option<(u64, &View)>) {
+        if self.sampler || self.tabled.is_empty() {
+            return;
+        }
+        let held = view
+            .filter(|(_, v)| fills_texture(v))
+            .map(|(key, v)| (key, matches!(v, View::Placed(..))));
+        self.queue_slot(index, held, pass_frame());
+    }
+
+    /// [`HostHeap::queue_texture`] in `frame`, for a slot that now holds
+    /// `held` (the record, and whether it is placed) or no texture the
+    /// title fills. A slot tables read lately waits [`TABLED_GRACE`]
+    /// frames for their draw.
+    fn queue_slot(&self, index: u32, held: Option<(u64, bool)>, frame: u64) {
+        let lately = self.tabled_lately(index, frame);
+        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        match held {
+            Some((key, placed)) => {
+                let due = if lately { frame + TABLED_GRACE } else { frame };
+                if q.written(index, key, placed, frame, due) && lately {
+                    TABLED_WRITES[0].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            None => q.remove(index),
+        }
+    }
+
+    /// A draw read title slot `index` through a table, and brings what it
+    /// views up to date (`draw.rs` `readable`): for [`TABLED_FRAMES`]
+    /// frames the title's writes of the slot wait [`TABLED_GRACE`] frames
+    /// for such a draw, and passes leave it to them. A slot that waited for
+    /// a pass is served from now on: a shader may pick it by index all the
+    /// same once tables no longer read it.
+    pub(crate) fn texture_slot_tabled(&self, index: u32) {
+        self.tabled_in(index, pass_frame());
+    }
+
+    /// [`HostHeap::texture_slot_tabled`] in `frame`.
+    fn tabled_in(&self, index: u32, frame: u64) {
+        let Some(stamp) = self.tabled.get(index as usize) else {
+            return;
+        };
+        let now = stamp_of(frame);
+        // Once per slot and frame: tables are read by every draw.
+        if stamp.load(Ordering::Relaxed) == now {
+            return;
+        }
+        stamp.store(now, Ordering::Relaxed);
+        let served = self
+            .textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .serve(index);
+        if served {
+            TABLED_WRITES[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a draw read title slot `index` through a table within the
+    /// last [`TABLED_FRAMES`] frames before `frame`.
+    fn tabled_lately(&self, index: u32, frame: u64) -> bool {
+        let stamp = self
+            .tabled
+            .get(index as usize)
+            .map_or(0, |s| s.load(Ordering::Relaxed));
+        stamp != 0 && u64::from(stamp_of(frame).wrapping_sub(stamp)) <= TABLED_FRAMES
+    }
+
+    /// The work of a pass over the textures shaders pick from this heap by
+    /// index, once a frame by the first list that asks (`draw.rs`
+    /// `heap_textures`); `None` for the others, and in sampler heaps.
+    pub(crate) fn texture_pass(&self) -> Option<TexturePass> {
+        self.texture_pass_at(pass_frame(), std::time::Instant::now())
+    }
+
+    /// [`HostHeap::texture_pass`] at `frame` and `now`.
+    fn texture_pass_at(&self, frame: u64, now: std::time::Instant) -> Option<TexturePass> {
+        if self.sampler || self.tabled.is_empty() {
+            return None;
+        }
+        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let since = q.pass_due(frame, now)?;
+        let due = q.due(frame, PASS_SLOTS);
+        let served = q.next_served(PASS_SLOTS, |index| self.tabled_lately(index, frame));
+        let most = (4000 / since.as_millis().max(1)).clamp(16, 256) as u64;
+        Some(TexturePass {
+            frame,
+            due,
+            served,
+            most,
+        })
+    }
+
+    /// Title slot `index`, as `pass` handed it out with `write`, was
+    /// uploaded: served from now on.
+    pub(crate) fn texture_slot_done(&self, index: u32, write: u64) {
+        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        q.done(index, write);
+    }
+
+    /// Nothing to upload at title slot `index` (as `pass` handed it out
+    /// with `write`) yet: looked at again later ([`TextureQueue::later`]).
+    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, pass: &TexturePass) {
+        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        q.later(index, write, pass.frame, pass.most);
+    }
+
+    /// Title slot `index` holds no texture the title fills: out of the
+    /// queue until written again. `write`: as the pass was handed it;
+    /// `None` for a served slot.
+    pub(crate) fn texture_slot_dropped(&self, index: u32, write: Option<u64>) {
+        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        q.dropped(index, write);
+    }
+
+    /// A pass checked served slots up to `last`: the next goes on after it.
+    pub(crate) fn textures_checked(&self, last: u32) {
+        self.textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cursor = last;
+    }
+
+    /// Counts what `pass` did; every [`PASS_LOG`], logs the passes since
+    /// the last line per pass (a pass a frame), and the queue.
+    pub(crate) fn texture_pass_done(&self, pass: &TexturePass, counts: PassCounts) {
+        let now = std::time::Instant::now();
+        let mut w = PASS_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        let began = *w.began.get_or_insert(now);
+        w.passes += 1;
+        let s = &mut w.sum;
+        s.looked += counts.looked;
+        s.uploaded += counts.uploaded;
+        s.bytes += counts.bytes;
+        s.away += counts.away;
+        s.checked += counts.checked;
+        s.changed += counts.changed;
+        s.hashed += counts.hashed;
+        s.left += counts.left;
+        s.full += counts.full;
+        s.us += counts.us;
+        w.longest = w.longest.max(counts.us);
+        // The first pass, then a line a window.
+        let first = !LOGGED.swap(true, Ordering::Relaxed);
+        if !first && now.saturating_duration_since(began) < PASS_LOG {
+            return;
+        }
+        let census = self
+            .textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .census(pass.frame);
+        let window = std::mem::take(&mut *w);
+        drop(w);
+        let n = window.passes.max(1) as f64;
+        let per = |v: u64| (v as f64 / n * 10.0).round() / 10.0;
+        let s = window.sum;
+        let (budget, usage) = host()
+            .and_then(|h| crate::dxgi::video_memory(&h.device))
+            .unwrap_or_default();
+        tracing::info!(
+            passes = window.passes,
+            seconds = now.saturating_duration_since(began).as_secs(),
+            uploaded = per(s.uploaded),
+            mib = per(s.bytes >> 20),
+            away = per(s.away),
+            left = per(s.left),
+            full_passes = s.full,
+            checked = per(s.checked),
+            changed = per(s.changed),
+            hashed = per(s.hashed),
+            ms = per(s.us) / 1000.0,
+            longest_ms = window.longest / 1000,
+            waiting = census[0],
+            due = census[1],
+            looked_before = census[2],
+            served = census[3],
+            oldest_frames = census[4],
+            tabled_writes = TABLED_WRITES[0].load(Ordering::Relaxed),
+            tabled_out = TABLED_WRITES[1].load(Ordering::Relaxed),
+            staging_mib = crate::texture::staged_total() >> 20,
+            video_mib = usage >> 20,
+            video_budget_mib = budget >> 20,
+            "textures shaders pick by index, per pass (a frame)"
+        );
+    }
+
+    /// The queue of textures picked by index (tests).
+    #[cfg(test)]
+    pub(crate) fn texture_queue(&self) -> std::sync::MutexGuard<'_, TextureQueue> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// A texture a pass over the textures shaders pick by index uploads
+/// (`what`: for the first time, or again after a change), at debug level
+/// under its own target, `xtp_gpu::heap_textures`
+/// (`XTP_LOG=info,xtp_gpu::heap_textures=debug`): its title slot, the
+/// address the title placed it at (none: a texture object), its host size
+/// and format. To tell whether a given texture the title fills (by its
+/// address) is taken.
+pub(crate) fn note_heap_texture(index: u32, handle: u64, texture: &ID3D12Resource, what: &str) {
+    if !tracing::enabled!(target: "xtp_gpu::heap_textures", tracing::Level::DEBUG) {
+        return;
+    }
+    let placed = match super::view(handle) {
+        Some(View::Placed(_, _, desc)) => Some(u64::from(desc[10]) | u64::from(desc[11]) << 32),
+        _ => None,
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    tracing::debug!(
+        target: "xtp_gpu::heap_textures",
+        slot = index,
+        placed = ?placed.map(|a| format!("{a:#x}")),
+        width = d.Width,
+        height = d.Height,
+        format = d.Format.0,
+        "a texture shaders pick by index: {what}"
+    );
+}
+
+/// Whether the passes have logged their first line.
+static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+impl TextureQueue {
+    /// Slots waiting for their first upload (tests).
+    pub(crate) fn waiting_slots(&self) -> Vec<u32> {
+        self.waiting.keys().copied().collect()
+    }
+
+    /// Slots served (tests).
+    pub(crate) fn served_slots(&self) -> Vec<u32> {
+        self.served.keys().copied().collect()
     }
 }
 
@@ -2504,6 +3222,186 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// The queue of textures picked by index serves the slots looked at
+    /// before first, then the newest write and the oldest in turns; a slot
+    /// with nothing to upload is looked at again after 1, 2, 4 frames up to
+    /// the limit; what the pass reports of a slot written again meanwhile
+    /// is dropped; a slot written with the record it holds stays as it is,
+    /// unless a placed texture's (whose host slot the write made null); the
+    /// served slots are handed out in turns; and passes come once a frame,
+    /// or a while after the last where frames do not advance. After the
+    /// test of fxceless's VIctory fork (578d459) of the same name.
+    #[test]
+    fn the_texture_queue_serves_the_newest_writes_first() {
+        use std::time::{Duration, Instant};
+        let mut q = TextureQueue::default();
+        // Slots 10..18 written in frames 1..9, slot 5 last.
+        for i in 0..8u32 {
+            assert!(q.written(10 + i, 100 + u64::from(i), false, u64::from(i) + 1, 0));
+        }
+        assert!(q.written(5, 5, false, 9, 0));
+        let order = |q: &TextureQueue, frame| -> Vec<u32> {
+            q.due(frame, 100).into_iter().map(|d| d.0).collect()
+        };
+        // newest, oldest, newest, oldest, and so on
+        assert_eq!(order(&q, 9), [5, 10, 17, 11, 16, 12, 15, 13, 14]);
+        assert_eq!(q.due(9, 2).len(), 2);
+        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
+        let write = |q: &TextureQueue, index: u32| {
+            q.due(u64::MAX, 100)
+                .iter()
+                .find(|d| d.0 == index)
+                .expect("waiting")
+                .1
+        };
+        // Slot 17 has nothing to upload: again next frame, then in 2, 4, 4.
+        let w17 = write(&q, 17);
+        let mut frame = 9;
+        for wait in [1, 2, 4, 4] {
+            q.later(17, w17, frame, 4);
+            assert!(!order(&q, frame + wait - 1).contains(&17));
+            frame += wait;
+            // Due again, and ahead of every slot never looked at.
+            assert_eq!(order(&q, frame)[0], 17);
+        }
+        assert_eq!(q.census(9)[2], 1);
+        q.done(17, w17);
+        assert!(!order(&q, u64::MAX).contains(&17));
+        assert_eq!(q.served_slots(), [17]);
+        // The title writes slot 16 again while a pass works on it: what the
+        // pass then says about the old write changes nothing.
+        let w16 = write(&q, 16);
+        assert!(q.written(16, 116, false, 13, 0));
+        q.done(16, w16);
+        q.later(16, w16, 13, 4);
+        q.dropped(16, Some(w16));
+        assert!(order(&q, 13).contains(&16));
+        assert_eq!(q.served_slots(), [17]);
+        // Written with the record it waits with: as it was.
+        let w15 = write(&q, 15);
+        assert!(!q.written(15, 105, false, 14, 0));
+        assert_eq!(write(&q, 15), w15);
+        // A served texture object's slot written with its record stays
+        // served (a title copying the same descriptors again); a placed
+        // texture's waits again.
+        assert!(!q.written(17, 107, false, 15, 0));
+        assert_eq!(q.served_slots(), [17]);
+        assert!(q.written(17, 107, true, 15, 0));
+        assert!(q.served_slots().is_empty());
+        // A write due later (a table's slot) is not handed out before.
+        assert!(q.written(98, 1, false, 14, 16));
+        assert!(!order(&q, 15).contains(&98));
+        assert!(order(&q, 16).contains(&98));
+        // A slot with no texture any more: out.
+        q.remove(98);
+        assert!(!order(&q, u64::MAX).contains(&98));
+
+        // Served slots in turns from where the checks stopped, a lap at
+        // most, those to skip left out; a slot gone is dropped.
+        let mut q = TextureQueue::default();
+        for i in 1..=5u32 {
+            q.written(i, u64::from(i), false, 1, 0);
+            assert!(q.serve(i));
+        }
+        assert_eq!(q.next_served(3, |_| false), [1, 2, 3]);
+        q.cursor = 3;
+        assert_eq!(q.next_served(10, |i| i == 5), [4, 1, 2, 3]);
+        q.dropped(4, None);
+        assert_eq!(q.next_served(10, |_| false), [5, 1, 2, 3]);
+        assert_eq!(q.census(1), [0, 0, 0, 4, 0]);
+
+        // Once a frame, or a while on where frames do not advance.
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        assert_eq!(q.pass_due(1, t), Some(Duration::MAX));
+        assert_eq!(q.pass_due(1, t + ms(50)), None);
+        assert_eq!(q.pass_due(2, t + ms(60)), Some(ms(60)));
+        assert_eq!(q.pass_due(2, t + ms(60) + PASS_AGAIN), Some(PASS_AGAIN));
+    }
+
+    /// A slot a draw read through a table stops waiting for a pass and is
+    /// served, though passes leave it to such draws while they read it; the
+    /// title's next write of it waits for such a draw, and is due after the
+    /// grace frames if none reads it; long after the last table, a write is
+    /// due at once. After the test of fxceless's VIctory fork (578d459) of
+    /// the same name.
+    #[test]
+    fn slots_read_through_tables_leave_the_texture_queue() {
+        use std::time::Instant;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let frame = 100;
+        let due = |at: u64| -> Vec<u32> {
+            heap.texture_queue()
+                .due(at, 8)
+                .into_iter()
+                .map(|d| d.0)
+                .collect()
+        };
+        heap.queue_slot(2, Some((2, false)), frame);
+        heap.queue_slot(3, Some((3, false)), frame);
+        assert_eq!(due(frame), [3, 2]);
+        heap.tabled_in(3, frame);
+        assert_eq!(due(frame), [2]);
+        assert_eq!(heap.texture_queue().served_slots(), [3]);
+        // Read through a table lately: no pass checks it.
+        let pass = heap.texture_pass_at(frame, Instant::now()).expect("a pass");
+        assert!(pass.served.is_empty());
+        assert_eq!(pass.due.iter().map(|d| d.0).collect::<Vec<_>>(), [2]);
+        assert!(
+            heap.texture_pass_at(frame, Instant::now()).is_none(),
+            "one a frame"
+        );
+        // Written again in the next frame: due once the grace frames have
+        // passed without a draw that reads it.
+        heap.queue_slot(3, Some((30, false)), frame + 1);
+        assert_eq!(due(frame + TABLED_GRACE), [2]);
+        assert_eq!(due(frame + 1 + TABLED_GRACE), [3, 2]);
+        // The draw comes after all: served again.
+        heap.tabled_in(3, frame + 2);
+        assert_eq!(due(u64::MAX), [2]);
+        // No texture there any more: out.
+        heap.queue_slot(2, None, frame + 2);
+        assert!(due(u64::MAX).is_empty());
+        // Long after the last table, a write is due at once, and once
+        // served it is checked.
+        let later = frame + 3 + TABLED_FRAMES;
+        heap.queue_slot(3, Some((31, false)), later);
+        assert_eq!(due(later), [3]);
+        assert!(heap.texture_queue().serve(3));
+        let pass = heap.texture_pass_at(later, Instant::now()).expect("a pass");
+        assert_eq!(pass.served, [3]);
+    }
+
+    /// `XTP_HEAP_TEXTURES`: MiB a pass stages, 64 by default; 0, `off` or
+    /// `false`, no pass.
+    #[test]
+    fn heap_texture_budgets_read_as_mib() {
+        assert_eq!(heap_textures_budget_of(None), Some(64 << 20));
+        assert_eq!(heap_textures_budget_of(Some(" 16 ")), Some(16 << 20));
+        assert_eq!(heap_textures_budget_of(Some("much")), Some(64 << 20));
+        for off in ["0", "off", "False"] {
+            assert_eq!(heap_textures_budget_of(Some(off)), None, "{off}");
+        }
+    }
+
+    /// Passes make host textures below 85 % of the local video memory
+    /// budget only (heaptex-A: 13.3 GB resident on a 16 GB card shared with
+    /// the desktop, 1-11 s a frame on the GPU); unknown, they may.
+    #[test]
+    fn passes_make_textures_below_a_share_of_the_video_budget() {
+        const GB: u64 = 1 << 30;
+        assert!(room_for_textures(None));
+        assert!(room_for_textures(Some((14 * GB, 10 * GB))));
+        assert!(
+            !room_for_textures(Some((14 * GB, 12 * GB))),
+            "85 %: 11.9 GB"
+        );
+        assert!(!room_for_textures(Some((14 * GB, 15 * GB))));
+        assert!(!room_for_textures(Some((0, 0))), "no budget at all");
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
@@ -2944,6 +3842,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
+            float_mode: 0,
             vgprs: 4,
             layout: vec![
                 param(RootType::Constants, 4, 0, 0),

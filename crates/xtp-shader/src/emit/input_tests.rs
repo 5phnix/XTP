@@ -53,6 +53,7 @@ fn native_pixel(words: &[u32], input_addr: u32, rsrc2: u32) -> NativeProgram {
     NativeProgram {
         stage: HwStage::Ps,
         wave64: false,
+        float_mode: 0,
         vgprs: 8,
         layout: vec![],
         used: vec![],

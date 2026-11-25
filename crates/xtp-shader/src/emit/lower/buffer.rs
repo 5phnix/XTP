@@ -5,7 +5,7 @@
 
 use super::descriptor::UNKNOWN_STRIDE;
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, Cast, V};
+use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Reg};
@@ -340,19 +340,26 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            // (handle, coordinates); none: through the runtime stride table.
-            let static_view = match index {
-                _ if self.through_table(index, used, src)? => None,
+            /// How the atomic reaches the buffer.
+            enum Route {
+                /// A handle and its coordinates.
+                View(V, [V; 3]),
+                /// A raw handle and an element of a known stride.
+                Element(V, V),
+                /// The runtime stride table.
+                Table,
+            }
+            let route = match index {
+                _ if self.through_table(index, used, src)? => Route::Table,
                 Some(index) if crate::emit::raw_structured() => {
-                    let byte = self.element_byte(index, off, used);
-                    Some((self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu]))
+                    Route::Element(self.handle(site, src, false, (11 | u, 0))?, index)
                 }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    Some((h, [index, off, iu]))
+                    Route::View(h, [index, off, iu])
                 }
-                None => Some((self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu])),
+                None => Route::View(self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -385,20 +392,23 @@ impl<'a> Lower<'a> {
                 }
             };
             let at = self.begin_guarded(guard);
-            let r = match static_view {
-                Some((h, coords)) => atomic_op(self, h, coords),
-                None => {
-                    // Out of range the console returns 0.
-                    let done = self.runtime_access(src, index, off, 4, 11 | u, |l, h, byte| {
+            // Out of range the console returns 0.
+            let done = match route {
+                Route::View(h, coords) => Ok(vec![atomic_op(self, h, coords)]),
+                Route::Element(h, index) => {
+                    self.element_access(h, index, off, 4, used, |l, h, byte| {
                         Ok(vec![atomic_op(l, h, [byte, iu, iu])])
-                    });
-                    match done {
-                        Ok(r) => r[0],
-                        Err(why) => {
-                            self.end_guarded(at, &[]);
-                            return Err(why);
-                        }
-                    }
+                    })
+                }
+                Route::Table => self.runtime_access(src, index, off, 4, 11 | u, |l, h, byte| {
+                    Ok(vec![atomic_op(l, h, [byte, iu, iu])])
+                }),
+            };
+            let r = match done {
+                Ok(r) => r[0],
+                Err(why) => {
+                    self.end_guarded(at, &[]);
+                    return Err(why);
                 }
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
@@ -456,20 +466,7 @@ impl<'a> Lower<'a> {
                             4 * count,
                             11 | u,
                             |l, h, byte| {
-                                let mut args = vec![h, byte, iu];
-                                args.extend(&vals);
-                                args.resize(3 + 4, iu);
-                                args.push(l.s.m.i8(mask));
-                                args.push(l.s.m.i32(4));
-                                let void = l.s.t.void;
-                                l.s.op(
-                                    l.cur,
-                                    "rawBufferStore.i32",
-                                    Attr::NoUnwind,
-                                    void,
-                                    140,
-                                    &args,
-                                );
+                                l.raw_store(h, byte, &vals, mask);
                                 Ok(Vec::new())
                             },
                         );
@@ -477,9 +474,18 @@ impl<'a> Lower<'a> {
                         return done.map(|_| ());
                     }
                     Some(index) if crate::emit::raw_structured() => {
-                        let byte = self.element_byte(index, off, used);
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([byte, iu]);
+                        // The same, made only where the element's range
+                        // checks pass.
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        let mask = (1u8 << count) - 1;
+                        let at = self.begin_guarded(guard);
+                        let done =
+                            self.element_access(h, index, off, 4 * count, used, |l, h, byte| {
+                                l.raw_store(h, byte, &vals, mask);
+                                Ok(Vec::new())
+                            });
+                        self.end_guarded(at, &[]);
+                        return done.map(|_| ());
                     }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
@@ -562,28 +568,15 @@ impl<'a> Lower<'a> {
                             off,
                             4 * count,
                             11 | u,
-                            |l, h, byte| {
-                                let c = l.cur;
-                                let r = l.s.op(
-                                    c,
-                                    "rawBufferLoad.f32",
-                                    Attr::ReadOnly,
-                                    l.s.t.res_ret,
-                                    139,
-                                    &[h, byte, iu, mask, align],
-                                );
-                                Ok((0..count)
-                                    .map(|k| {
-                                        let x = l.s.m.extract(c, r, k);
-                                        l.as_int(x)
-                                    })
-                                    .collect())
-                            },
+                            |l, h, byte| Ok(l.raw_dwords(h, byte, count)),
                         );
                     }
                     Some(index) if crate::emit::raw_structured() => {
-                        let byte = l.element_byte(index, off, used);
-                        (l.handle(site, src, false, (11 | u, 0))?, [byte, iu])
+                        // Loads where the element's range checks fail read 0.
+                        let h = l.handle(site, src, false, (11 | u, 0))?;
+                        return l.element_access(h, index, off, 4 * count, used, |l, h, byte| {
+                            Ok(l.raw_dwords(h, byte, count))
+                        });
                     }
                     Some(index) => (l.handle(site, src, false, (12 | u, stride))?, [index, off]),
                     None => (l.handle(site, src, false, (11 | u, 0))?, [off, iu]),
@@ -653,15 +646,112 @@ impl<'a> Lower<'a> {
     }
 
     /// The byte of `off` in element `index` of a buffer of the known stride
-    /// of `used`, for a raw handle ([`crate::emit::raw_structured`]).
-    /// shortcut: a structured handle checks the element against the view's
-    /// count; a raw one only the byte against its size, so an `index *
-    /// stride` that wraps reads a byte inside the view.
-    fn element_byte(&mut self, index: V, off: V, used: Option<&UsedResource>) -> V {
+    /// of `used`, for a raw handle ([`crate::emit::raw_structured`]), and
+    /// whether an access of `width` bytes there passes the console's range
+    /// checks of a structured view, as the stride table's do
+    /// ([`Self::runtime_view`]): inside the element (`off + width <=
+    /// stride`), and at an element whose bytes lie below 2^32, so `index *
+    /// stride` cannot wrap to a byte inside the view. An element past the
+    /// view's count is past the raw view's bytes (the host's raw view holds
+    /// the structured one's elements and no more), where the raw handle's
+    /// bounds check reads 0 and drops writes, as the console does.
+    fn element_byte(
+        &mut self,
+        index: V,
+        off: V,
+        width: u32,
+        used: Option<&UsedResource>,
+    ) -> (V, V) {
         let c = self.cur;
-        let stride = self.s.m.i32(used.map_or(0, |u| u.stride));
+        let s = used.map_or(0, |u| u.stride);
+        debug_assert!(s >= 4 && s.is_multiple_of(4), "a known stride");
+        let stride = self.s.m.i32(s);
         let at = self.s.m.bin(c, Bin::Mul, index, stride);
-        self.s.m.bin(c, Bin::Add, at, off)
+        let byte = self.s.m.bin(c, Bin::Add, at, off);
+        // Elements below 2^32 / stride end at or below 2^32.
+        let elements = self.s.m.i32(((1u64 << 32) / u64::from(s.max(1))) as u32);
+        let in_range = self.s.m.cmp(c, pred::IULT, index, elements);
+        // `off` below the stride first, so `off + width` cannot wrap.
+        let width = self.s.m.i32(width);
+        let end = self.s.m.bin(c, Bin::Add, off, width);
+        let starts = self.s.m.cmp(c, pred::IULT, off, stride);
+        let ends = self.s.m.cmp(c, pred::IULE, end, stride);
+        let inside = self.s.m.bin(c, Bin::And, starts, ends);
+        let valid = self.s.m.bin(c, Bin::And, in_range, inside);
+        (byte, valid)
+    }
+
+    /// Runs `access` (with the raw handle `h` and the byte in its view) for
+    /// an access of `width` bytes at byte `off` of element `index` of a
+    /// buffer of the known stride of `used`, in the lanes where it passes
+    /// the range checks of [`Self::element_byte`]; what it gives is 0 in the
+    /// others, which access nothing (a load reads 0, a store or an atomic
+    /// is dropped, as on the console).
+    fn element_access(
+        &mut self,
+        h: V,
+        index: V,
+        off: V,
+        width: u32,
+        used: Option<&UsedResource>,
+        access: impl FnOnce(&mut Self, V, V) -> Result<Vec<V>, Why>,
+    ) -> Result<Vec<V>, Why> {
+        let (byte, valid) = self.element_byte(index, off, width, used);
+        let at = self.begin_guarded(Some(valid));
+        let xs = match access(self, h, byte) {
+            Ok(xs) => xs,
+            Err(why) => {
+                self.end_guarded(at, &[]);
+                return Err(why);
+            }
+        };
+        let zero = self.s.m.i32(0);
+        let pairs: Vec<(V, V)> = xs.iter().map(|&x| (x, zero)).collect();
+        Ok(self.end_guarded(at, &pairs))
+    }
+
+    /// Stores `vals` (up to four dwords, those of `mask`) in raw buffer `h`
+    /// from byte `byte`.
+    fn raw_store(&mut self, h: V, byte: V, vals: &[V], mask: u8) {
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mut args = vec![h, byte, iu];
+        args.extend(vals);
+        args.resize(3 + 4, iu);
+        args.push(self.s.m.i8(mask));
+        args.push(self.s.m.i32(4));
+        let void = self.s.t.void;
+        self.s.op(
+            self.cur,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &args,
+        );
+    }
+
+    /// `count` dwords of raw buffer `h` from byte `byte` (one load).
+    fn raw_dwords(&mut self, h: V, byte: V, count: u32) -> Vec<V> {
+        let c = self.cur;
+        let (iu, mask, align) = (
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8((1u8 << count) - 1),
+            self.s.m.i32(4),
+        );
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        (0..count)
+            .map(|k| {
+                let x = self.s.m.extract(c, r, k);
+                self.as_int(x)
+            })
+            .collect()
     }
 
     /// Whether a raw access of `src`'s buffer (an untyped load, store or
@@ -868,6 +958,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
+            float_mode: 0,
             vgprs: 32,
             layout: vec![RootParam {
                 root: RootType::Table,
