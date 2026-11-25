@@ -209,6 +209,55 @@ fn the_rows_of_one_register_keep_element_order() {
     validates("pixel inputs", &ps);
 }
 
+#[test]
+fn clip_distances_sharing_a_sort_key_validate_in_large_signatures() {
+    // Le cas signalé a 35 sorties. Avec 43 et 99 sorties, le tri de MSVC
+    // choisit le pivot sur neuf lignes et peut partitionner plusieurs fois.
+    for (count, width) in [(32, 2), (40, 2), (96, 4)] {
+        let mut outputs = vec![position()];
+        for i in 0..count {
+            outputs.push(el(
+                "TEXCOORD",
+                i,
+                0,
+                9,
+                2,
+                Some(1 + i / width),
+                (i % width) as u8,
+                1,
+            ));
+        }
+        for i in 0..2 {
+            outputs.push(el(
+                "SV_ClipDistance",
+                i,
+                6,
+                9,
+                2,
+                Some(1 + count / width),
+                i as u8,
+                1,
+            ));
+        }
+        for rotation in 0..outputs.len() {
+            let vs = vertex(outputs.clone());
+            if count == 32 && matches!(rotation, 15 | 16) {
+                let clips: Vec<_> = rows_of(&vs, FourCC::OSG1)
+                    .into_iter()
+                    .filter(|(name, ..)| name == "SV_ClipDistance")
+                    .map(|(_, index, ..)| index)
+                    .collect();
+                assert_eq!(clips, if rotation == 15 { [0, 1] } else { [1, 0] });
+            }
+            validates(
+                &format!("OSG1, {} sorties, rotation {rotation}", outputs.len()),
+                &vs,
+            );
+            outputs.rotate_left(1);
+        }
+    }
+}
+
 /// Rows still sort by register first, unallocated elements last; within a
 /// register, by name (one per element, system values sharing theirs).
 #[test]
