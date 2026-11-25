@@ -2165,6 +2165,60 @@ mod tests {
         crate::object::slot::<extern "system" fn(This) -> u32>(r, 0x10)(r);
     }
 
+    #[test]
+    fn volume_rows_and_texels_belong_to_their_depth_slice() {
+        let Some(host) = crate::testgpu::device("passdump::tests::volume_rows_and_texels") else {
+            return;
+        };
+        // A 3 x 2 x 2 R8_UNORM target in the title's resource ABI.
+        let words = [4u32, 0, 0, 0, 3, 0, 2, (1 << 16) | 2, 61, 1, 0, 0, 1, 0];
+        // SAFETY: all fourteen words of the 56-byte description are initialized.
+        let desc = unsafe {
+            words
+                .as_ptr()
+                .cast::<crate::resource::ResourceDesc>()
+                .read_unaligned()
+        };
+        let resource = crate::resource::tests_support::committed(&desc);
+        let texture = crate::resource::host_resource(resource).unwrap();
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        for (z, value) in [0.0, 1.0].into_iter().enumerate() {
+            let view = D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_R8_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE3D,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture3D: D3D12_TEX3D_RTV {
+                        MipSlice: 0,
+                        FirstWSlice: z as u32,
+                        WSize: 1,
+                    },
+                },
+            };
+            let rtv = host.rtv(texture, Some(&view));
+            // SAFETY: the RTV covers one slice of this target on the open list.
+            unsafe { list.list.ClearRenderTargetView(rtv, &[value; 4], None) };
+        }
+        let mut dump = Dump::new(4096, 0);
+        dump.written(&list, resource as usize);
+        dump.op(&host.device, &list, "dispatch 1x1x1");
+        dump.closed(&host.device, &list);
+        list.close();
+        host.execute(&[&list]);
+        dump.submitted(&[&list]);
+        host.drain();
+        let text = dump.report(1).unwrap();
+        for expected in [
+            "slice 0: lit 0.0%",
+            "slice 1: lit 100.0%",
+            "texel (2,1,0): [0.0] bytes [00]",
+            "texel (2,1,1): [1.0] bytes [ff]",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        release(resource);
+    }
+
     /// A target shown: stretched over the image, values times the scale,
     /// integers over 255, one channel as grey.
     #[test]
