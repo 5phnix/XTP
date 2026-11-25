@@ -60,6 +60,8 @@
 //! measures before and after it (`apps/xtp/src/survey.rs`).
 
 mod buffer;
+#[cfg(test)]
+pub(crate) use buffer::{INTEGER_LOAD_PROGRAM_TEST, code_fingerprint};
 mod compare;
 mod descriptor;
 mod export;
@@ -132,6 +134,10 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Typed buffer loads that move 16-bit integers (`bufferLoad.i32`):
+    /// d16 ones, and plain ones of `buffer::INTEGER_LOAD_PROGRAMS`.
+    #[cfg(test)]
+    pub integer_loads: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -300,6 +306,9 @@ struct Lower<'a> {
     entries: HashMap<(usize, Site, u8), descriptor::Entry>,
     /// [`Lowered::run_time_buffers`] so far.
     run_time_buffers: u8,
+    /// [`Lowered::integer_loads`] so far.
+    #[cfg(test)]
+    integer_loads: u32,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -890,6 +899,8 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             entries: HashMap::new(),
             run_time_buffers: 0,
+            #[cfg(test)]
+            integer_loads: 0,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1130,6 +1141,8 @@ impl<'a> Lower<'a> {
             run_time_buffers: self.run_time_buffers,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            integer_loads: self.integer_loads,
             #[cfg(test)]
             wave_ops: self.s.flags & super::shader::flags::WAVE_OPS != 0,
             #[cfg(test)]
