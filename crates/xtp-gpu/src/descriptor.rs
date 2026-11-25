@@ -939,10 +939,13 @@ pub(crate) fn give_back(held: &mut Held) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
-        // First, before any of the heap goes: work holding it ends, and
-        // work after finds it gone ([`HeapHold`]).
-        *self.life.heap.write().unwrap_or_else(|e| e.into_inner()) = 0;
         let at = std::ptr::from_ref::<Heap>(self) as usize;
+        // First, before any of the heap goes: work holding it ends, and
+        // work after finds it gone ([`HeapHold`]). Done already when the
+        // title's last release drops it ([`release`]).
+        if RELEASING.get() != at {
+            *self.life.heap.write().unwrap_or_else(|e| e.into_inner()) = 0;
+        }
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
@@ -1478,8 +1481,48 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     let found = object::is(iid, &HEAP_IIDS).then_some(this);
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
 }
+/// The title's release of a heap. Work holding the heap ([`HeapHold`])
+/// ends, and the heap is marked gone for work after, before the last
+/// release rebuilds its box: before, the heap's drop did that, once the box
+/// was rebuilt, so the box and that work's `&Heap` were alive together
+/// (stride4c, Codex review of stride4b, P1). A release that is not the last
+/// leaves the heap as it was; work waiting meanwhile finds it there.
 extern "system" fn release(this: This) -> u32 {
+    #[cfg(windows)]
+    {
+        let life = heap(this).life.clone();
+        let mut at = life.heap.write().unwrap_or_else(|e| e.into_inner());
+        let address = std::mem::replace(&mut *at, 0);
+        #[cfg(test)]
+        if let Some(between) = RELEASE_BETWEEN.with(|b| b.borrow_mut().take()) {
+            between();
+        }
+        let before = RELEASING.replace(this as usize);
+        let left = object::release_boxed::<Heap>(this);
+        RELEASING.set(before);
+        if left != 0 {
+            *at = address;
+        }
+        left
+    }
+    #[cfg(not(windows))]
     object::release_boxed::<Heap>(this)
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// The heap whose release this thread runs ([`release`]), which holds
+    /// the lock of its life for writing: the heap's drop leaves it alone.
+    static RELEASING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    /// Run once by the next [`release`] on this thread, once the heap is
+    /// marked gone and before the box may be rebuilt (tests: work asking
+    /// for the heap then).
+    static RELEASE_BETWEEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 extern "system" fn desc(this: This, out: *mut HeapDesc) {
     if !out.is_null() {
@@ -1763,6 +1806,51 @@ mod tests {
             .join()
             .expect("released");
         assert!(released.load(Ordering::SeqCst));
+        assert!(hold.with(|_| ()).is_none());
+    }
+
+    /// stride4c, Codex review of stride4b, P1: the last release rebuilt the
+    /// heap's box before its drop marked it gone, while work holding the
+    /// heap still had it. Work asking for the heap once a release has begun
+    /// waits until the release knows whether it was the last: then it finds
+    /// the heap gone (the box is rebuilt only after), or, for a release
+    /// that was not the last, there as before.
+    #[cfg(windows)]
+    #[test]
+    fn work_asking_during_a_release_finds_the_heap_gone_only_after_the_last() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let made = TestHeap::views(8);
+        let this = made.0;
+        // The last release below is the test's own.
+        std::mem::forget(made);
+        let start = heap(this).start;
+        let hold = heap(this).hold();
+        // Releases `this` while another thread asks for the heap: what it
+        // found, and the release's count.
+        let release_asked = |hold: HeapHold| {
+            let asker = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            let (spawned, finished) = (asker.clone(), done.clone());
+            RELEASE_BETWEEN.with(|b| {
+                *b.borrow_mut() = Some(Box::new(move || {
+                    let waited = finished.clone();
+                    let thread = std::thread::spawn(move || {
+                        let found = hold.with(|h| h.start);
+                        waited.store(true, Ordering::SeqCst);
+                        found
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    assert!(!finished.load(Ordering::SeqCst), "the work waits");
+                    *spawned.lock().unwrap() = Some(thread);
+                }));
+            });
+            let left = release(this);
+            let thread = asker.lock().unwrap().take().expect("asked meanwhile");
+            (thread.join().expect("the asking thread"), left)
+        };
+        object::add_ref(this);
+        assert_eq!(release_asked(hold.clone()), (Some(start), 1), "not the last");
+        assert_eq!(release_asked(hold.clone()), (None, 0), "the last");
         assert!(hold.with(|_| ()).is_none());
     }
 
