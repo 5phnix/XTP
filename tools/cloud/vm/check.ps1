@@ -61,7 +61,7 @@ try {
         $arguments = "-NoProfile -ExecutionPolicy Bypass -File C:\xtp\tools\vm\cargo-steps.ps1 -Mode $Mode"
         if ($CargoArgs) { $arguments += " -CargoArgs `"$CargoArgs`"" }
     }
-    $code = Invoke-XtpSessionJob -Exe "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Arguments $arguments -Log $log -Environment $envs -User $SessionUser
+    $code = Invoke-XtpSessionJob -Exe "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Arguments $arguments -Log $log -Environment $envs -User $SessionUser -NoWait:$NoWait
     Write-Output ("{0} {1} in {2:N0} s (log {3})" -f $Mode, $(if ($code -eq 0) { 'PASSED' } else { "FAILED ($code)" }), ((Get-Date) - $t0).TotalSeconds, $log)
     exit $code
 } finally {

@@ -137,8 +137,8 @@ function Get-XtpSshArgList($Cfg, [string]$Zone) {
 
 # Runs a PowerShell script block's text on the VM, over SSH through IAP.
 # Windows' sshd starts cmd.exe; the script travels as -EncodedCommand, so it
-# must stay short (cmd.exe limits a line to 8191 characters): larger work goes
-# in a script under C:\xtp\tools (see Send-XtpVmToolFolder). Returns the output
+# must fit a command line (compressed if needed). Larger tools are copied
+# under C:\xtp\tools (see Send-XtpVmToolFolder). Returns the output
 # lines; throws when the remote script fails, unless -AllowFail.
 function Invoke-XtpVm {
     param(
@@ -151,6 +151,26 @@ function Invoke-XtpVm {
     $wrapped = "`$ProgressPreference='SilentlyContinue'; `$ErrorActionPreference='Stop'; try {`n$Script`n} catch { [Console]::Out.WriteLine('REMOTE ERROR: ' + `$_.Exception.Message + ' ' + `$_.InvocationInfo.PositionMessage); exit 1 }; exit `$LASTEXITCODE"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapped))
     $command = "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    if ($command.Length -gt 8000) {
+        # Keep read-only queries such as -Status in memory on the VM. Base64
+        # fits in a cmd environment variable without shell quoting.
+        $bytes = [Text.Encoding]::UTF8.GetBytes($wrapped)
+        $buffer = [IO.MemoryStream]::new()
+        try {
+            $gzip = [IO.Compression.GZipStream]::new($buffer, [IO.Compression.CompressionMode]::Compress, $true)
+            try { $gzip.Write($bytes, 0, $bytes.Length) } finally { $gzip.Dispose() }
+            $payload = [Convert]::ToBase64String($buffer.ToArray())
+        } finally { $buffer.Dispose() }
+        $unpack = {
+            $ErrorActionPreference = 'Stop'
+            $m = [IO.MemoryStream]::new([Convert]::FromBase64String($env:XtpRemotePayload))
+            $z = [IO.Compression.GZipStream]::new($m, [IO.Compression.CompressionMode]::Decompress)
+            & ([scriptblock]::Create([IO.StreamReader]::new($z).ReadToEnd()))
+            exit $LASTEXITCODE
+        }.ToString()
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($unpack))
+        $command = "set XtpRemotePayload=$payload&& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    }
     if ($command.Length -gt 8000) { throw "Remote script too long ($($command.Length) characters); put it in a file under tools\cloud\vm." }
     $sshArgs = @('compute', 'ssh', "$($Cfg.sshUser)@$($Cfg.vm)") + (Get-XtpSshArgList $Cfg $Zone) + @("--command=$command", '--', '-batch')
     if ($PassThru) {

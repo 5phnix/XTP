@@ -637,8 +637,8 @@ pub(crate) struct HostPipeline {
     /// With `XTP_SHADER_LOOP_COUNT`, where a shader of it counts the lanes
     /// stopped at a loop's limit or budget: the root parameter of the
     /// counter (a root UAV, `u0` in [`LOOP_COUNTER_SPACE`], for every
-    /// stage) and the pipeline's slot, whose dword draws and dispatches
-    /// bind there (`crate::loopstat`).
+    /// stage) and the pipeline's slot, whose counter (16-byte aligned)
+    /// draws and dispatches bind there (`crate::loopstat`).
     pub(crate) loop_counter: Option<(u32, u32)>,
 }
 
@@ -1133,8 +1133,8 @@ impl HostPipeline {
             bound.push(stage);
         }
         // XTP_SHADER_LOOP_COUNT: a shader that counts the lanes it stops at a
-        // limit writes the pipeline's dword of the counters, a root UAV all
-        // stages see (`crate::loopstat`).
+        // limit writes the pipeline's counter, a root UAV all stages see
+        // (`crate::loopstat`).
         let mut loop_counter = None;
         if translations.iter().any(|t| t.host.loop_counter()) {
             let Some(slot) = crate::loopstat::slot(&format!("{shaders:?}")) else {
@@ -2755,8 +2755,16 @@ mod tests {
     /// `XTP_SHADER_LOOP_COUNT` end to end (S12): a compute program whose
     /// lanes 0 to 4 loop past the loop limit, translated with the counter,
     /// gets the counter's root UAV and a slot, and each group it runs adds
-    /// the 5 lanes the limit stops to that slot's dword. Translated without
-    /// the counter, its pipeline has neither.
+    /// the 5 lanes the limit stops to that slot's counter. Translated
+    /// without the counter, its pipeline has neither.
+    ///
+    /// Four pipelines of it take four slots, each residue modulo 4 for
+    /// consecutive ones: each binds its counter at a 16-byte aligned
+    /// address, which the debug layer checks of a raw view's
+    /// (`XTP_D3D12_DEBUG=1`), and counts its own groups alone. A snapshot
+    /// recorded between two lists, as the present's list records one
+    /// (`loopstat::record`), holds what the lists before it counted, not
+    /// what the list after it adds to the live counters.
     #[test]
     fn a_loop_counter_counts_the_lanes_a_limit_stops() {
         use crate::testgpu::TitleList;
@@ -2823,34 +2831,85 @@ mod tests {
         }
         let counting = xtp_shader::emit::with_loop_count(translate);
         assert!(counting.loop_counter());
-        let p = pipeline(counting, "loop-count-on");
-        let (param, slot) = p.loop_counter.expect("the counter's root parameter");
-        let before = crate::loopstat::counted(slot).expect("the counters");
-        let groups = 3;
+        let pipelines: Vec<HostPipeline> = (0..4)
+            .map(|n| pipeline(counting.clone(), &format!("loop-count-on-{n}")))
+            .collect();
+        let slots: Vec<u32> = pipelines
+            .iter()
+            .map(|p| p.loop_counter.expect("the counter's root parameter").1)
+            .collect();
+        let distinct: std::collections::HashSet<u32> = slots.iter().copied().collect();
+        assert_eq!(distinct.len(), 4, "one slot per pipeline: {slots:?}");
+        let counted = || -> Vec<u32> {
+            slots
+                .iter()
+                .map(|&slot| crate::loopstat::counted(slot).expect("the counters"))
+                .collect()
+        };
+        // Runs `groups` groups of `p` in `l`, its counter bound as the draw
+        // state binds it.
+        let dispatch = |l: &crate::host::HostList, p: &HostPipeline, groups: u32| {
+            let (param, slot) = p.loop_counter.expect("the counter's root parameter");
+            let at = crate::loopstat::address(slot).expect("the slot's address");
+            assert_eq!(at % 16, 0, "slot {slot}: a raw view's address");
+            l.keep(&p.root);
+            l.keep(&p.pso);
+            let user = p.stages[0].user_data;
+            let zeros = vec![0u32; user.map_or(0, |(_, n)| n as usize)];
+            // SAFETY: an open list; live objects kept until it is reset;
+            // the counters live for good.
+            unsafe {
+                l.list.SetComputeRootSignature(&p.root);
+                l.list.SetPipelineState(&p.pso);
+                if let Some((param, n)) = user {
+                    l.list
+                        .SetComputeRoot32BitConstants(param, n, zeros.as_ptr().cast(), 0);
+                }
+                l.list.SetComputeRootUnorderedAccessView(param, at);
+                l.list.Dispatch(groups, 1, 1);
+            }
+        };
+        let before = counted();
         let list = TitleList::new();
         let l = list.host();
-        l.keep(&p.root);
-        l.keep(&p.pso);
-        let user = p.stages[0].user_data;
-        let zeros = vec![0u32; user.map_or(0, |(_, n)| n as usize)];
-        let at = crate::loopstat::address(slot).expect("the slot's address");
-        // SAFETY: an open list; live objects kept until it is reset; the
-        // counters live for good.
-        unsafe {
-            l.list.SetComputeRootSignature(&p.root);
-            l.list.SetPipelineState(&p.pso);
-            if let Some((param, n)) = user {
-                l.list
-                    .SetComputeRoot32BitConstants(param, n, zeros.as_ptr().cast(), 0);
-            }
-            l.list.SetComputeRootUnorderedAccessView(param, at);
-            l.list.Dispatch(groups, 1, 1);
+        // The root signatures index both heaps directly: both are bound
+        // before one is set.
+        crate::testgpu::bind_indexed_heaps(device, l);
+        for (n, p) in pipelines.iter().enumerate() {
+            dispatch(l, p, n as u32 + 1);
         }
         list.run();
         // SAFETY: a plain device query.
         assert!(unsafe { device.device.GetDeviceRemovedReason() }.is_ok());
-        let after = crate::loopstat::counted(slot).expect("the counters");
-        assert_eq!(after.wrapping_sub(before), 5 * groups, "slot {slot}");
+        let after = counted();
+        for n in 0..4 {
+            assert_eq!(
+                after[n].wrapping_sub(before[n]),
+                5 * (n as u32 + 1),
+                "slot {}, of slots {slots:?}",
+                slots[n]
+            );
+        }
+        // The snapshot, then more lanes stopped after it.
+        let list = TitleList::new();
+        let snapshot = crate::loopstat::snapshot_in(device, &list.host().list)
+            .expect("a snapshot of the counters");
+        list.run();
+        let list = TitleList::new();
+        let l = list.host();
+        crate::testgpu::bind_indexed_heaps(device, l);
+        dispatch(l, &pipelines[0], 2);
+        list.run();
+        // SAFETY: a plain device query.
+        assert!(unsafe { device.device.GetDeviceRemovedReason() }.is_ok());
+        let copied: Vec<u32> = slots
+            .iter()
+            .map(|&slot| snapshot.counted(slot).expect("copied"))
+            .collect();
+        assert_eq!(copied, after, "the snapshot: slots {slots:?}");
+        let live = counted();
+        assert_eq!(live[0].wrapping_sub(after[0]), 10, "slot {}", slots[0]);
+        assert_eq!(live[1..], after[1..], "slots {slots:?}");
     }
 }
 
