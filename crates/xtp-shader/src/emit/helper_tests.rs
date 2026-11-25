@@ -112,7 +112,7 @@ fn swizzle_quad(dst: u32, src: u32, perm: u32) -> [u32; 2] {
 
 /// `v_readlane_b32 s<dst>, v<src>, s<lane>`.
 fn read_lane(dst: u32, src: u32, lane: u32) -> [u32; 2] {
-    [0xD760_0000 | dst, V + src | lane << 9]
+    [0xD760_0000 | dst, (V + src) | lane << 9]
 }
 
 /// `exp mrt0 v<a>, v<b>, v<c>, v<d> done vm`.
