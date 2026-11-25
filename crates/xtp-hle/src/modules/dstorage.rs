@@ -558,6 +558,11 @@ impl Lanes {
                 waiting,
                 "dstorage: last {seconds:.1} s"
             );
+            if mesh_stats() {
+                let mut d = destinations();
+                tracing::info!("{}", d.line(seconds));
+                *d = Destinations::default();
+            }
             self.done = Default::default();
             self.bcpack = 0;
             self.since = None;
@@ -1174,14 +1179,6 @@ impl Destination<'_> {
         fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
     ) -> Result<(), HRESULT> {
         let request = self.request;
-        // Where each request writes (with this module at debug), to follow a
-        // destination to the host copies that read it (`XTP_FULL_REFRESH`).
-        tracing::debug!(
-            destination = format_args!("{:#x}", request.destination as usize),
-            len,
-            pages = ?&self.pages[..self.pages.len().min(4)],
-            "dstorage: destination written"
-        );
         if request.options & PAGE_DESTINATION == 0 {
             // Raw reads land through the kernel, which does not fault into
             // the GPU side's guard on title buffers: open them, and hold
@@ -1193,7 +1190,9 @@ impl Destination<'_> {
             // completion.
             let out =
                 unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-            return fill(out).map(drop);
+            let n = fill(out)?;
+            self.written(Form::Address, n);
+            return Ok(());
         }
         let offset = (request.page_offset & 0xffff) as usize;
         // xmem's view of the pages does not fault into the guards on the
@@ -1202,15 +1201,191 @@ impl Destination<'_> {
         // Consecutive pages of one allocation (the usual case): written in
         // place in xmem's view of it.
         if let Some(mut window) = xmem::page_window(self.pages, offset, len) {
-            return fill(window.bytes()).map(drop);
+            let n = fill(window.bytes())?;
+            drop(window);
+            self.written(Form::InPlace, n);
+            return Ok(());
         }
         let data = room(self.scatter, len);
         let n = fill(data)?;
         if xmem::write_physical(self.pages, offset, &data[..n]) {
+            self.written(Form::Scattered, n);
             Ok(())
         } else {
             Err(E_INVALIDARG)
         }
+    }
+
+    /// After `n` bytes were written into the destination: where (with this
+    /// module at debug), to follow a destination to the host copies that
+    /// read it (`XTP_FULL_REFRESH`), and the destinations' statistics
+    /// (`XTP_MESH_STATS=1`). Logged once written, with what was produced:
+    /// a short zlib stream leaves the end of the destination as it was.
+    fn written(&self, form: Form, n: usize) {
+        let request = self.request;
+        let offset = (request.page_offset & 0xffff) as usize;
+        match form {
+            Form::Address => tracing::debug!(
+                destination = format_args!("{:#x}", request.destination as usize),
+                len = n,
+                "dstorage: destination written"
+            ),
+            Form::InPlace | Form::Scattered => tracing::debug!(
+                form = form.name(),
+                offset,
+                len = n,
+                pages = ?&self.pages[..self.pages.len().min(4)],
+                "dstorage: destination written"
+            ),
+        }
+        if !mesh_stats() {
+            return;
+        }
+        // Looked up before the statistics' lock: xmem's index has its own.
+        match form {
+            Form::Address => {
+                #[cfg(feature = "diagnostics")]
+                let (pages, views) =
+                    xtp_gpu::meshstat::other_views(request.destination as usize, n);
+                #[cfg(not(feature = "diagnostics"))]
+                let (pages, views) = (0, 0);
+                let mut d = destinations();
+                d.note(form, n);
+                d.address_aliased += pages as u64;
+                d.address_views += views as u64;
+            }
+            Form::InPlace | Form::Scattered => {
+                let views = xmem::title_views(self.pages, offset, n);
+                let guarding = xtp_gpu::guarding();
+                let mut d = destinations();
+                d.note(form, n);
+                d.pages(views, guarding);
+            }
+        }
+    }
+}
+
+/// How a request's destination is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Form {
+    /// At a title address (a raw read through the kernel, or in place).
+    Address,
+    /// Into physical pages, consecutive pages of one allocation, in place
+    /// in xmem's view of it.
+    InPlace,
+    /// Into physical pages through the worker's buffer.
+    Scattered,
+}
+
+impl Form {
+    fn name(self) -> &'static str {
+        match self {
+            Form::Address => "address",
+            Form::InPlace => "pages in place",
+            Form::Scattered => "scattered pages",
+        }
+    }
+}
+
+/// Whether DirectStorage counts its destinations (`XTP_MESH_STATS=1`, off by
+/// default), for the line [`Destinations::line`] makes every 5 s: whether
+/// the title shows the physical pages it writes at more than one address,
+/// and at how many xmem opened the GPU side's guards (fxceless's VIctory fork
+/// #571 found a write signalled at one view of a page only).
+fn mesh_stats() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XTP_MESH_STATS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// What DirectStorage's destinations were since the last line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Destinations {
+    /// Requests and bytes written, by [`Form`].
+    requests: [u64; 3],
+    bytes: [u64; 3],
+    /// Physical pages written; of them those the title shows, and those it
+    /// shows at more than one address, in how many requests.
+    pages: u64,
+    shown: u64,
+    aliased: u64,
+    aliased_requests: u64,
+    /// The title addresses showing those pages shown more than once, and
+    /// of them those whose guards xmem opened after the write: all while
+    /// the GPU side guards anything, none otherwise (then every view
+    /// counts as written at the next asking anyway).
+    aliased_views: u64,
+    signalled: u64,
+    /// Destinations at title addresses: their 64 KiB pages that the title
+    /// shows at other addresses too, and those other addresses
+    /// (diagnostics builds).
+    address_aliased: u64,
+    address_views: u64,
+}
+
+fn destinations() -> MutexGuard<'static, Destinations> {
+    static DESTINATIONS: Mutex<Destinations> = Mutex::new(Destinations {
+        requests: [0; 3],
+        bytes: [0; 3],
+        pages: 0,
+        shown: 0,
+        aliased: 0,
+        aliased_requests: 0,
+        aliased_views: 0,
+        signalled: 0,
+        address_aliased: 0,
+        address_views: 0,
+    });
+    DESTINATIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Destinations {
+    fn note(&mut self, form: Form, n: usize) {
+        self.requests[form as usize] += 1;
+        self.bytes[form as usize] += n as u64;
+    }
+
+    /// A page destination's pages, as `xmem::title_views` counts them, and
+    /// whether the GPU side guarded anything when xmem opened their views.
+    fn pages(
+        &mut self,
+        (pages, shown, aliased, views): (usize, usize, usize, usize),
+        guarding: bool,
+    ) {
+        self.pages += pages as u64;
+        self.shown += shown as u64;
+        self.aliased += aliased as u64;
+        self.aliased_requests += u64::from(aliased > 0);
+        self.aliased_views += views as u64;
+        if guarding {
+            self.signalled += views as u64;
+        }
+    }
+
+    /// The line, over `seconds`.
+    fn line(&self, seconds: f64) -> String {
+        let mb = |form: Form| self.bytes[form as usize] as f64 / 1e6;
+        let n = |form: Form| self.requests[form as usize];
+        format!(
+            "dstorage: destinations in the last {seconds:.1} s: {} at title addresses ({:.1} MB; \
+             {} of their pages shown at other addresses too, at {} other addresses), {} into \
+             pages in place ({:.1} MB), {} into scattered pages ({:.1} MB); pages written {}, \
+             shown by the title {}, at more than one address {} (in {} requests, at {} \
+             addresses), of those addresses opened after the writes {}",
+            n(Form::Address),
+            mb(Form::Address),
+            self.address_aliased,
+            self.address_views,
+            n(Form::InPlace),
+            mb(Form::InPlace),
+            n(Form::Scattered),
+            mb(Form::Scattered),
+            self.pages,
+            self.shown,
+            self.aliased,
+            self.aliased_requests,
+            self.aliased_views,
+            self.signalled,
+        )
     }
 }
 
@@ -1894,6 +2069,48 @@ mod tests {
 
     fn free(pages: &[usize]) {
         assert_eq!(xmem::XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    /// The statistics of `XTP_MESH_STATS` see a page the title shows at two
+    /// addresses (the aliases of the fork's #571) as such, from wherever in
+    /// its pages a destination starts, and pages it shows nowhere yet.
+    #[test]
+    fn destinations_count_the_title_views_of_their_pages() {
+        let pages = allocate(3);
+        let (a, b) = (reserve(2), reserve(1));
+        // Pages 0 and 1 at `a`, page 0 at `b` too; page 2 nowhere.
+        assert_eq!(xmem::XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert_eq!(xmem::XMemMapPhysicalPages(b, 1, pages.as_ptr()), b);
+        assert_eq!(xmem::title_views(&pages, 0, 3 * PAGE), (3, 2, 1, 2));
+        assert_eq!(xmem::title_views(&pages, PAGE - 10, 20), (2, 2, 1, 2));
+        assert_eq!(xmem::title_views(&pages[1..], 0, 100), (1, 1, 0, 0));
+        assert_eq!(xmem::title_views(&pages[2..], 0, 100), (1, 0, 0, 0));
+        // An unknown page: nothing counted.
+        assert_eq!(xmem::title_views(&[7], 0, 100), (0, 0, 0, 0));
+
+        let mut d = Destinations::default();
+        d.note(Form::InPlace, 3 * PAGE);
+        d.pages(xmem::title_views(&pages, 0, 3 * PAGE), true);
+        d.note(Form::Scattered, 100);
+        d.pages(xmem::title_views(&pages, 0, 100), false);
+        assert_eq!(d.requests, [0, 1, 1]);
+        assert_eq!(
+            (d.pages, d.shown, d.aliased, d.aliased_requests),
+            (4, 3, 2, 2)
+        );
+        // Opened after the writes only while something was guarded.
+        assert_eq!((d.aliased_views, d.signalled), (4, 2));
+        let line = d.line(5.0);
+        assert!(
+            line.contains("at more than one address 2 (in 2 requests, at 4 addresses)"),
+            "{line}"
+        );
+
+        // Unmapped, the page shows once more.
+        assert_eq!(xmem::XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(xmem::title_views(&pages, 0, PAGE), (1, 1, 0, 0));
+        assert_eq!(xmem::XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        free(&pages);
     }
 
     fn spent() -> Spent {

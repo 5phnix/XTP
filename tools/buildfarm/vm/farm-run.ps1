@@ -96,6 +96,7 @@ try {
             Start-Sleep -Seconds 2
         }
     }
+    Set-FarmSlotUsed $Root $req.slot
 
     # 4. Commits into the mirror, the slot at the target commit.
     $git = Get-FarmGit
@@ -139,21 +140,15 @@ try {
     }
     $sync = ((Get-Date) - $t0).TotalSeconds
 
-    # 4b. Disk room. Six slots' incremental caches fill the 110 GB disk in a
-    # few hours of busy deliveries (2026-11-24: "os error 112" on every
-    # build). Under 20 GB free, the incremental caches of the other slots
-    # that have been idle for 10 minutes go; the deps they built stay.
+    # 4b. Disk room. Six slots' incremental caches filled the 110 GB disk in
+    # a few hours of busy deliveries (2026-11-24: "os error 112" on every
+    # build). Builds now run without incremental compilation: the caches
+    # left go, in this slot and in the slots no job holds (their lock taken
+    # meanwhile), never under a running build. Under 20 GB free after that,
+    # the target folders of free slots without a job for 30 minutes go too.
     try {
-        if ((Get-PSDrive -Name $Root.Substring(0, 1)).Free -lt 20GB) {
-            foreach ($other in Get-ChildItem (Join-Path $Root 'w') -Directory -ErrorAction SilentlyContinue) {
-                if ($other.FullName -ieq $slotDir) { continue }
-                foreach ($profile in Get-ChildItem (Join-Path $other.FullName 'target') -Directory -ErrorAction SilentlyContinue) {
-                    $inc = Join-Path $profile.FullName 'incremental'
-                    if ((Test-Path $inc) -and (Get-Item $inc).LastWriteTime -lt (Get-Date).AddMinutes(-10)) {
-                        Remove-Item $inc -Recurse -Force -ErrorAction SilentlyContinue
-                    }
-                }
-            }
+        foreach ($gone in @(Clear-FarmSlotCaches -Root $Root -Current $req.slot | Where-Object { $_ -notmatch '\\incremental$' })) {
+            Write-FarmErr "under 20 GB free: removed $gone (no job there for 30 minutes)"
         }
     } catch { Write-FarmErr "disk room: $($_.Exception.Message)" }
 
@@ -204,7 +199,10 @@ try {
     Write-FarmErr "error: $($_.Exception.Message)"
     $code = 98
 } finally {
-    if ($lock) { $lock.Dispose() }
+    if ($lock) {
+        Set-FarmSlotUsed $Root $req.slot
+        $lock.Dispose()
+    }
     Remove-Item -Force $runFile -ErrorAction SilentlyContinue
     if ($bundle) { Remove-Item -Force $bundle -ErrorAction SilentlyContinue }
 }

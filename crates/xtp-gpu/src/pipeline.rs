@@ -198,6 +198,13 @@ fn native(container: &[u8]) -> Result<Native, String> {
             }),
         None => None,
     };
+    #[cfg(feature = "diagnostics")]
+    if matches!(native.as_ref().map(|p| &p.io),
+        Some(xtp_shader::native::StageIo::Ps { db_shader_control, .. }) if db_shader_control & (1 << 16) != 0)
+    {
+        // GFX10 DB_SHADER_CONTROL.PRIMITIVE_ORDERED_PIXEL_SHADER.
+        crate::list::cuts::POPS_SHADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(match native {
         Some(p) => Native {
             wave64: p.wave64,
@@ -227,6 +234,8 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    #[cfg(windows)]
+    missing_targets: OnceLock<Box<[OnceLock<Arc<make::Pending>>]>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -277,6 +286,47 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+#[cfg(windows)]
+pub(crate) fn graphics_pipeline<'a>(this: This, missing: u8) -> Option<&'a host::HostPipeline> {
+    if missing == 0 || this.is_null() {
+        return host_pipeline(this);
+    }
+    make::ready(graphics_pending(pipeline(this), missing)?)
+}
+
+#[cfg(windows)]
+fn graphics_pending(p: &Pipeline, missing: u8) -> Option<&Arc<make::Pending>> {
+    let g = p.host.graphics.as_deref()?;
+    let mask = missing & g.typed_slots();
+    if mask == 0 {
+        return Some(&p.host);
+    }
+    // Le tas de variantes n’existe que si le titre laisse un trou dans
+    // des sorties typées. Chaque combinaison garde sa clé et sa compilation.
+    let variants = p
+        .missing_targets
+        .get_or_init(|| (0..256).map(|_| OnceLock::new()).collect());
+    let variant = variants[usize::from(mask)].get_or_init(|| {
+        Arc::new(make::Pending::new(
+            p.shaders.clone(),
+            Some(Box::new(g.without_targets(mask))),
+            None,
+        ))
+    });
+    Some(variant)
+}
+
+#[cfg(windows)]
+pub(crate) fn null_target_view(
+    this: This,
+    slot: usize,
+) -> Option<(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, bool)> {
+    if this.is_null() {
+        return None;
+    }
+    pipeline(this).host.graphics.as_ref()?.null_view(slot)
 }
 
 /// The compute program of a title pipeline, made or not (`None` for a null
@@ -466,6 +516,8 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        missing_targets: OnceLock::new(),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -639,7 +691,6 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-pub mod effects;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
@@ -662,6 +713,43 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_graphics_pipeline(
+    shaders: Vec<Arc<Shader>>,
+    graphics: host::GraphicsState,
+    masks: &[u8],
+) -> This {
+    let mut title = std::ptr::null();
+    assert_eq!(
+        hand_out(
+            shaders,
+            Some((Box::new(graphics), None)),
+            &PIPELINE_IIDS[0],
+            &mut title
+        ),
+        object::S_OK
+    );
+    for &mask in masks {
+        graphics_pending(pipeline(title), mask).unwrap().make(|| {});
+    }
+    title
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_shader(stage: &'static str, host: xtp_shader::emit::HostShader) -> Arc<Shader> {
+    Arc::new(Shader {
+        stage,
+        hash: blake3::hash(&host.dxil).to_hex()[..16].to_owned(),
+        container: Vec::new(),
+        native: OnceLock::new(),
+        translated: OnceLock::from(Some(Translated {
+            host,
+            used: vec![],
+            wave64: false,
+        })),
+    })
 }
 
 #[cfg(test)]

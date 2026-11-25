@@ -845,6 +845,7 @@ dependencies = [
  "miniz_oxide",
  "tracing",
  "windows-sys",
+ "xtp-core",
  "xtp-pe",
 ]
 

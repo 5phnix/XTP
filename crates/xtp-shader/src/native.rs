@@ -59,10 +59,17 @@
 //!             u16 maximum primitives, u8 user SGPRs, u8 output topology
 //!             (2 triangles); code follows at E+0x45c
 //! record +0x4c u32 LDS bytes (`lds_byte_size`; mesh programs read it here)
+//! ES  as VS (inputs, their VGPRs v9 up where the VS has v4 up; outputs,
+//!     entry n the ESGS ring item's row n); E+0x1ac u32 the item in dwords
+//! GS  E+0x148 32 outputs of 6 B as the VS's, E+0x208 u32 count;
+//!     E+0x27c u32 the GSVS item in dwords (one lane's vertices),
+//!     E+0x280 u32 1 in every program seen (an instance or stream count),
+//!     E+0x284 u32 most vertices, E+0x28c u32 one vertex in dwords
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//! The ES and GS layouts are the title's (`docs/analysis/es-gs.md`, section
+//! 3.4); LS and HS keep their stage data in a layout not read.
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -122,6 +129,13 @@ const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
+const ES_ITEM_DWORDS: usize = 0x1ac;
+const GS_OUTPUTS: usize = 0x148;
+const GS_OUTPUT_COUNT: usize = 0x208;
+const GS_ITEM_DWORDS: usize = 0x27c;
+const GS_COUNT: usize = 0x280;
+const GS_MAX_VERTICES: usize = 0x284;
+const GS_VERTEX_DWORDS: usize = 0x28c;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -360,6 +374,36 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    /// An export shader: the vertex shader compiled for use with a
+    /// geometry shader, whose outputs go to the ESGS ring.
+    Es(ExportIo),
+    /// A geometry shader of a merged ES + GS stage.
+    Gs(GeometryIo),
+}
+
+/// An export shader's inputs (as a vertex shader's) and ring item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportIo {
+    pub inputs: Vec<VsInput>,
+    /// Entry n is the ring item's row n (`OSG1` row `row`).
+    pub outputs: Vec<VsOutput>,
+    /// One vertex's ring item, in dwords (8 for the title's 32-byte items).
+    pub item_dwords: u32,
+}
+
+/// A geometry shader's outputs and its GSVS ring layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryIo {
+    /// Stream 0's vertex outputs, as a vertex shader's.
+    pub outputs: Vec<VsOutput>,
+    /// One lane's GSVS item (its vertices), in dwords.
+    pub item_dwords: u32,
+    /// 1 in every program of the title: the instance or the stream count
+    /// (no program says which).
+    pub count: u32,
+    pub max_vertices: u32,
+    /// One vertex in the GSVS ring, in dwords.
+    pub vertex_dwords: u32,
 }
 
 impl StageIo {
@@ -647,6 +691,12 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            // Their stage data is the title's layout, read from its programs
+            // only: one that does not read keeps no I/O (the translation
+            // refuses the program) rather than failing the container, whose
+            // plain vertex shader beside an ES still translates.
+            HwStage::Es => es_io(stage_data).unwrap_or_default(),
+            HwStage::Gs => gs_io(stage_data).unwrap_or_default(),
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -734,7 +784,13 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             vgpr: e[3],
         })
         .collect();
-    let outputs = semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+    let outputs = vs_outputs(data, VS_OUTPUTS, VS_OUTPUT_COUNT)?;
+    Ok(StageIo::Vs { inputs, outputs })
+}
+
+/// Output entries of 6 bytes at `at`, as a vertex shader's.
+fn vs_outputs(data: &[u8], at: usize, count_at: usize) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, at, 6, count_at)?
         .as_chunks::<6>()
         .0
         .iter()
@@ -745,8 +801,28 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             fp16: e[5] & 1 != 0,
             pack2: e[5] & 2 != 0,
         })
-        .collect();
-    Ok(StageIo::Vs { inputs, outputs })
+        .collect())
+}
+
+fn es_io(data: &[u8]) -> Result<StageIo, ShaderError> {
+    let StageIo::Vs { inputs, outputs } = vs_io(data)? else {
+        unreachable!()
+    };
+    Ok(StageIo::Es(ExportIo {
+        inputs,
+        outputs,
+        item_dwords: u32_at(data, ES_ITEM_DWORDS)?,
+    }))
+}
+
+fn gs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
+    Ok(StageIo::Gs(GeometryIo {
+        outputs: vs_outputs(data, GS_OUTPUTS, GS_OUTPUT_COUNT)?,
+        item_dwords: u32_at(data, GS_ITEM_DWORDS)?,
+        count: u32_at(data, GS_COUNT)?,
+        max_vertices: u32_at(data, GS_MAX_VERTICES)?,
+        vertex_dwords: u32_at(data, GS_VERTEX_DWORDS)?,
+    }))
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
@@ -1105,6 +1181,89 @@ mod tests {
             .map(|p| p.stage)
             .collect();
         assert_eq!(stages, [HwStage::Es, HwStage::Vs]);
+    }
+
+    /// The stage data of a merged ES + GS pair, in the title's layout
+    /// (es-gs.md section 3.4): the ES's inputs and ring item rows as a
+    /// vertex shader's, its item size; the GS's outputs and GSVS layout.
+    #[test]
+    fn reads_export_and_geometry_stage_data() {
+        let out = |usage, row, param| VsOutput {
+            usage,
+            row,
+            param,
+            fp16: false,
+            pack2: false,
+        };
+        let mut blob = fssm(&[(HwStage::Es, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Es);
+        // TEXCOORD row 1 (xy) fetched into v9-v10.
+        blob[e + VS_INPUTS..][..5].copy_from_slice(&[6, 1, 3, 9, 1]);
+        blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        // Item rows: the position (usage 0), then the texcoord.
+        blob[e + VS_OUTPUTS..][..12].copy_from_slice(&[0, 0, 0, 0, 0, 0, 6, 1, 0, 1, 0, 0]);
+        blob[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+        blob[e + ES_ITEM_DWORDS..][..4].copy_from_slice(&8u32.to_le_bytes());
+        let es = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert_eq!(
+            es.io,
+            StageIo::Es(ExportIo {
+                inputs: vec![VsInput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    mask: 3,
+                    vgpr: 9
+                }],
+                outputs: vec![out(Usage::Other(0), 0, 0), out(Usage::Generic, 1, 0)],
+                item_dwords: 8,
+            })
+        );
+
+        let mut blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Gs);
+        blob[e + GS_OUTPUTS..][..12].copy_from_slice(&[0, 0, 0, 0, 0, 0, 6, 1, 0, 1, 0, 0]);
+        blob[e + GS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+        for (at, v) in [
+            (GS_ITEM_DWORDS, 60u32),
+            (GS_COUNT, 1),
+            (GS_MAX_VERTICES, 3),
+            (GS_VERTEX_DWORDS, 20),
+        ] {
+            blob[e + at..][..4].copy_from_slice(&v.to_le_bytes());
+        }
+        let gs = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert_eq!(
+            gs.io,
+            StageIo::Gs(GeometryIo {
+                outputs: vec![out(Usage::Other(0), 0, 0), out(Usage::Generic, 1, 0)],
+                item_dwords: 60,
+                count: 1,
+                max_vertices: 3,
+                vertex_dwords: 20,
+            })
+        );
+
+        // An ES whose stage data does not read keeps no I/O; the plain
+        // vertex shader beside it still reads.
+        let mut bad = fssm(&[(HwStage::Es, &VS_CODE)]);
+        let e = stage_data_at(&bad, HwStage::Es);
+        bad[e + VS_INPUT_COUNT..][..4].copy_from_slice(&33u32.to_le_bytes());
+        let vs = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let found = native_programs(&part(&[(KIND_NATIVE, &xbch(&bad)), (KIND_NATIVE, &vs)]))
+            .expect("the container reads");
+        assert_eq!(
+            found.iter().map(|p| (p.stage, &p.io)).collect::<Vec<_>>(),
+            [
+                (HwStage::Es, &StageIo::None),
+                (
+                    HwStage::Vs,
+                    &StageIo::Vs {
+                        inputs: vec![],
+                        outputs: vec![]
+                    }
+                )
+            ]
+        );
     }
 
     #[test]

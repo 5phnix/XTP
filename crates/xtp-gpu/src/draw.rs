@@ -23,6 +23,7 @@ use windows::core::Interface;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+use crate::rectangles::Records;
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -65,9 +66,79 @@ pub(crate) struct VertexView {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
-    address: u64,
-    size: u32,
-    format: u32,
+    pub(crate) address: u64,
+    pub(crate) size: u32,
+    pub(crate) format: u32,
+}
+
+/// Copies des vues liées quand une sortie manque. Le titre peut écraser ses
+/// descripteurs ou changer de pipeline entre OMSetRenderTargets et le dessin.
+#[derive(Default)]
+struct IncompleteTargets {
+    colors: Vec<SavedTarget>,
+    depth: Option<(ID3D12Resource, Option<D3D12_DEPTH_STENCIL_VIEW_DESC>)>,
+    pipeline: usize,
+}
+
+enum SavedTarget {
+    Real(ID3D12Resource, Option<D3D12_RENDER_TARGET_VIEW_DESC>),
+    Missing(D3D12_RENDER_TARGET_VIEW_DESC),
+}
+
+fn null_view(
+    mut desc: D3D12_RENDER_TARGET_VIEW_DESC,
+    pipeline: usize,
+    slot: usize,
+) -> D3D12_RENDER_TARGET_VIEW_DESC {
+    if let Some((format, multisampled)) = crate::pipeline::null_target_view(pipeline as This, slot)
+    {
+        if format.0 != 0 {
+            desc.Format = format;
+        }
+        desc.ViewDimension = if multisampled {
+            D3D12_RTV_DIMENSION_TEXTURE2DMS
+        } else {
+            D3D12_RTV_DIMENSION_TEXTURE2D
+        };
+    }
+    desc
+}
+
+impl IncompleteTargets {
+    fn rebind(&mut self, list: &HostList, pipeline: usize) {
+        if self.pipeline == pipeline {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let rtvs: Vec<_> = self
+            .colors
+            .iter()
+            .enumerate()
+            .map(|(slot, view)| match view {
+                SavedTarget::Real(texture, desc) => host.rtv(texture, desc.as_ref()),
+                SavedTarget::Missing(desc) => host.rtv(
+                    None::<&ID3D12Resource>,
+                    Some(&null_view(*desc, pipeline, slot)),
+                ),
+            })
+            .collect();
+        let dsv = self
+            .depth
+            .as_ref()
+            .map(|(texture, desc)| host.dsv(texture, desc.as_ref()));
+        // SAFETY: ces vues viennent d’être recréées dans les tas CPU de l’hôte.
+        unsafe {
+            list.list.OMSetRenderTargets(
+                rtvs.len() as u32,
+                Some(rtvs.as_ptr()),
+                false,
+                dsv.as_ref().map(std::ptr::from_ref),
+            )
+        };
+        self.pipeline = pipeline;
+    }
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -82,6 +153,8 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    missing_targets: u8,
+    incomplete_targets: Option<Box<IncompleteTargets>>,
     depth: usize,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
@@ -621,6 +694,8 @@ impl State {
         let host = match topology {
             RECTANGLES => 4,
             TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
+                #[cfg(feature = "diagnostics")]
+                crate::list::cuts::TOPOLOGIES.fetch_add(1, Ordering::Relaxed);
                 once!(topology, "console topology drawn as a triangle list");
                 4
             }
@@ -716,23 +791,75 @@ impl State {
             return;
         };
         self.targets.clear();
+        self.missing_targets = 0;
         let mut rtvs = Vec::new();
-        for &h in handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
-                once!(
-                    handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
+        #[cfg(feature = "diagnostics")]
+        let mut hole = false;
+        // AgneyaK identified this slot shift in Marvisak/VIctory#1613 (736fa790).
+        // Each shader output keeps its slot; only real resources need transitions.
+        let views: [_; 8] = std::array::from_fn(|slot| {
+            let record = handles
+                .get(slot)
+                .and_then(|&h| crate::descriptor::rtv_record(h));
+            let texture = record.and_then(|r| crate::resource::host_resource(r.resource));
+            (record, texture)
+        });
+        let views = &views[..handles.len().min(8)];
+        self.incomplete_targets = views.iter().any(|(_, t)| t.is_none()).then(Box::default);
+        for (slot, &(record, texture)) in views.iter().enumerate() {
+            if let (Some(record), Some(texture)) = (record, texture) {
+                #[cfg(feature = "diagnostics")]
+                if hole {
+                    crate::list::cuts::SHIFTED_TARGET.fetch_add(1, Ordering::Relaxed);
+                }
+                self.targets.push(record.resource as usize);
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(record.resource);
+                crate::resource::note_target_view(
+                    texture,
+                    record.desc().map(|d| d.Format.0 as u32),
                 );
-                continue;
-            };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
-                continue;
-            };
-            self.targets.push(record.resource as usize);
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            crate::resource::note_target_view(texture, record.desc().map(|d| d.Format.0 as u32));
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+                let desc = record.desc();
+                rtvs.push(host.rtv(texture, desc.as_ref()));
+                if let Some(saved) = &mut self.incomplete_targets {
+                    saved.colors.push(SavedTarget::Real(texture.clone(), desc));
+                }
+            } else {
+                use crate::resource::format::{Caps, HostCaps, uses};
+                #[cfg(feature = "diagnostics")]
+                {
+                    hole = true;
+                    crate::list::cuts::MISSING_TARGET.fetch_add(1, Ordering::Relaxed);
+                }
+                self.missing_targets |= 1 << slot;
+                let fallback = record
+                    .and_then(|r| {
+                        r.desc().map(|d| d.Format).or_else(|| {
+                            crate::resource::texture_memory(r.resource).map(|(_, d)| {
+                                DXGI_FORMAT(crate::resource::pc_format(d.format()) as i32)
+                            })
+                        })
+                    })
+                    .filter(|f| HostCaps.support1(f.0 as u32) & uses::RENDER_TARGET != 0)
+                    .unwrap_or(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM);
+                let null = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: fallback,
+                    ViewDimension: match record.and_then(|r| r.desc()).map(|d| d.ViewDimension) {
+                        Some(
+                            D3D12_RTV_DIMENSION_TEXTURE2DMS | D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY,
+                        ) => D3D12_RTV_DIMENSION_TEXTURE2DMS,
+                        _ => D3D12_RTV_DIMENSION_TEXTURE2D,
+                    },
+                    ..Default::default()
+                };
+                rtvs.push(host.rtv(
+                    None::<&ID3D12Resource>,
+                    Some(&null_view(null, self.pipeline, slot)),
+                ));
+                if let Some(saved) = &mut self.incomplete_targets {
+                    saved.colors.push(SavedTarget::Missing(null));
+                }
+            }
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -740,8 +867,15 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            let desc = record.depth_desc();
+            if let Some(saved) = &mut self.incomplete_targets {
+                saved.depth = Some((texture.clone(), desc));
+            }
+            Some(host.dsv(texture, desc.as_ref()))
         });
+        if let Some(saved) = &mut self.incomplete_targets {
+            saved.pipeline = self.pipeline;
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -804,7 +938,9 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return Err(Unready::NoPipeline);
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) =
+            crate::pipeline::graphics_pipeline(self.pipeline as This, self.missing_targets)
+        else {
             return Err(Unready::NoPipeline);
         };
         if p.compute || p.mesh != mesh {
@@ -818,6 +954,9 @@ impl State {
                 (false, false) => "a vertex pipeline bound",
             }
             .into());
+        }
+        if let Some(saved) = &mut self.incomplete_targets {
+            saved.rebind(list, self.pipeline);
         }
         self.bind(list, p, false)?;
         let l = &list.list;
@@ -836,6 +975,13 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            #[cfg(feature = "diagnostics")]
+            crate::meshstat::read(
+                crate::meshstat::What::Vertex { stride: v.stride },
+                &shadow,
+                v.address,
+                u64::from(v.size),
+            );
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -854,6 +1000,13 @@ impl State {
                 return Err("index buffer outside title buffers".into());
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            #[cfg(feature = "diagnostics")]
+            crate::meshstat::read(
+                crate::meshstat::What::Index { format: v.format },
+                &shadow,
+                v.address,
+                u64::from(v.size),
+            );
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1010,6 +1163,8 @@ impl State {
                         }
                         continue;
                     };
+                    #[cfg(feature = "diagnostics")]
+                    crate::meshstat::root_view(address);
                     if tabled {
                         self.root_srv_table(list, Some(address), param, compute)?;
                         continue;
@@ -1616,6 +1771,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::indirect::note_direct(list, self.pipeline, [x, y, z]);
         #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(list, self.pipeline, crate::meshstat::Op::Dispatch);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             self.dispatch_dropped(Unready::NoPipeline);
             return;
@@ -1625,7 +1782,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            self.rt_dropped(list);
+            self.rt_dropped(list, crate::rt_standin::Work::Groups([x, y, z]));
             self.dispatch_dropped(Unready::NoPipeline);
             return;
         };
@@ -1652,6 +1809,8 @@ impl State {
             });
         };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        meshes.ran();
     }
 
     /// Counts a dispatch that does not run; the next one of the list that
@@ -1672,29 +1831,35 @@ impl State {
         dropped("dispatch", self.pipeline, why);
     }
 
-    /// A dispatch, direct or indirect, dropped for want of a host pipeline:
-    /// if it runs one of the title's trace programs ([`crate::rt_standin`]),
-    /// what its program writes through unordered access is handed over as
-    /// the title's compute tables and root views hold it now, to be counted
-    /// and (its switch on) cleared to "every ray missed". A clear binds
-    /// XTP's own view heap: the next draw or dispatch binds the title's.
-    fn rt_dropped(&mut self, list: &HostList) {
+    /// A dispatch, direct or indirect, dropped for want of a host pipeline,
+    /// which would have run `work`: if it runs one of the title's trace
+    /// programs ([`crate::rt_standin`]), it is counted, and with the
+    /// stand-in on, what its program writes through unordered access is
+    /// handed over as the title's compute tables (in the bound heaps only)
+    /// and root views hold it now, to be cleared to "every ray missed". A
+    /// clear binds XTP's own view heap: the next draw or dispatch binds the
+    /// title's.
+    fn rt_dropped(&mut self, list: &HostList, work: crate::rt_standin::Work) {
         let Some(program) = crate::rt_standin::program(self.pipeline as This) else {
             return;
         };
         use crate::rt_standin::Bound;
-        let bound: Vec<Bound> = program
-            .writes()
-            .map(|u| match (u.root, self.compute.get(usize::from(u.slot))) {
-                (RootType::Table, Some(Root::Table(table))) => {
-                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
-                        .map_or(Bound::Unset, Bound::View)
-                }
-                (RootType::Descriptor, Some(Root::View(address))) => Bound::Root(*address),
-                _ => Bound::Unset,
-            })
-            .collect();
-        if crate::rt_standin::dropped(list, &program, &bound) {
+        let bound = || {
+            program
+                .writes()
+                .map(|u| match (u.root, self.compute.get(usize::from(u.slot))) {
+                    (RootType::Table, Some(Root::Table(table))) => {
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        self.heap_of(handle)
+                            .and_then(|_| crate::descriptor::view(handle))
+                            .map_or(Bound::Unset, Bound::View)
+                    }
+                    (RootType::Descriptor, Some(Root::View(address))) => Bound::Root(*address),
+                    _ => Bound::Unset,
+                })
+                .collect()
+        };
+        if crate::rt_standin::dropped(list, &program, work, bound) {
             self.forget_host();
         }
     }
@@ -1744,6 +1909,16 @@ impl State {
             self.trace("mesh", groups[0], 0);
             crate::indirect::note_direct(list, self.pipeline, groups);
         }
+        #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(
+            list,
+            self.pipeline,
+            crate::meshstat::Op::Mesh {
+                groups: groups[0]
+                    .saturating_mul(groups[1])
+                    .saturating_mul(groups[2]),
+            },
+        );
         let ran = self.prepare_for(list, false, true).and_then(|()| {
             let l6 = list
                 .list
@@ -1765,6 +1940,10 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
             Ok(())
         });
+        #[cfg(feature = "diagnostics")]
+        if ran.is_ok() {
+            meshes.ran();
+        }
         if let Err(why) = ran {
             dropped("mesh dispatch", self.pipeline, why);
         }
@@ -2011,6 +2190,12 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(
+            list,
+            self.pipeline,
+            crate::meshstat::Op::Draw { vertices, first },
+        );
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false).and_then(|()| {
             if rects {
@@ -2038,6 +2223,8 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            meshes.ran();
         }
         if let Err(why) = ran {
             dropped("draw", self.pipeline, why);
@@ -2113,12 +2300,40 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        let ran = if self.topology == RECTANGLES {
-            once!("indexed rectangles not drawn");
-            Err(INDEXED_RECTANGLES.into())
-        } else {
-            self.prepare(list, true)
-        };
+        #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(
+            list,
+            self.pipeline,
+            crate::meshstat::Op::Indexed { indices, first },
+        );
+        if self.topology == RECTANGLES {
+            #[cfg(feature = "diagnostics")]
+            crate::list::cuts::INDEXED_RECT.fetch_add(1, Ordering::Relaxed);
+            if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+                && p.inputs.iter().any(|e| !e.per_instance)
+            {
+                let record =
+                    Records::Direct([indices, instances, first, base as u32, first_instance]);
+                match self.rectangles_indirect(
+                    list,
+                    &p.inputs,
+                    (20, 1),
+                    (record, None, Some(self.index)),
+                    |s, l| s.prepare(l, false),
+                ) {
+                    Ok(()) => {
+                        DRAWN.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        meshes.ran();
+                    }
+                    Err(why) => dropped("indexed draw", self.pipeline, why),
+                }
+                return;
+            }
+            // Vertex-ID pipelines consume the original indexed triangles.
+            // Their geometry stage emits the second half of each rectangle.
+        }
+        let ran = self.prepare(list, true);
         match ran {
             Ok(()) => {
                 #[cfg(feature = "diagnostics")]
@@ -2134,6 +2349,8 @@ impl State {
                         .DrawIndexedInstanced(indices, instances, first, base, first_instance)
                 };
                 DRAWN.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                meshes.ran();
             }
             Err(why) => dropped("indexed draw", self.pipeline, why),
         }
@@ -2156,10 +2373,6 @@ fn rectangle_vertices(vertices: u32, first: u32, expanded: bool) -> (u32, u32) {
         (rects * 3, first)
     }
 }
-
-/// Why indexed rectangle lists are dropped.
-/// shortcut: they are not expanded, neither direct nor indirect ones.
-const INDEXED_RECTANGLES: &str = "indexed rectangles";
 
 impl State {
     /// Indirect execution of a one-argument signature of `kind` (PC
@@ -2190,6 +2403,12 @@ impl State {
         if max == 0 {
             return true;
         }
+        #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(
+            list,
+            self.pipeline,
+            crate::meshstat::Op::Indirect { kind, stride, max },
+        );
         let pipeline = self.pipeline;
         // Counted in `list` (its indirect drops); here only why.
         let fail = |why: Unready| {
@@ -2204,9 +2423,17 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return fail(Unready::NoPipeline);
         }
-        if kind == INDEXED && self.topology == RECTANGLES {
-            return fail(INDEXED_RECTANGLES.into());
-        }
+        let indexed_rect = kind == INDEXED && self.topology == RECTANGLES;
+        let indexed_expansion = if indexed_rect {
+            #[cfg(feature = "diagnostics")]
+            crate::list::cuts::INDIRECT_RECT.fetch_add(1, Ordering::Relaxed);
+            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+                return fail(Unready::NoPipeline);
+            };
+            p.inputs.iter().any(|e| !e.per_instance)
+        } else {
+            false
+        };
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             return fail("arguments outside title buffers".into());
@@ -2218,11 +2445,31 @@ impl State {
             },
             None => None,
         };
-        if kind == DRAW && self.topology == RECTANGLES {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::meshstat::{What, read};
+            read(What::Args, &args, arguments, len);
+            if let Some((s, at)) = &counter {
+                read(What::Count, s, *at, 4);
+            }
+        }
+        if self.topology == RECTANGLES && (kind == DRAW || indexed_expansion) {
             let rects = (&args, arguments);
-            return match self.indirect_rectangles(list, (stride, max), rects, &counter) {
+            return match self.indirect_rectangles(
+                list,
+                (stride, max),
+                rects,
+                &counter,
+                indexed_expansion,
+            ) {
                 Ok(()) => {
+                    #[cfg(feature = "diagnostics")]
+                    if indexed_rect {
+                        crate::list::cuts::INDIRECT_RECT_RECORDED.fetch_add(1, Ordering::Relaxed);
+                    }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    meshes.ran();
                     true
                 }
                 Err(why) => fail(why),
@@ -2274,7 +2521,10 @@ impl State {
         };
         if let Err(why) = ran {
             if kind == DISPATCH && why == Unready::NoPipeline {
-                self.rt_dropped(list);
+                // The rewrite above left the count of its commands that run
+                // a group at the start of the expanded arguments.
+                let count = expanded.as_ref().map(|(buffer, _)| (buffer.clone(), 0));
+                self.rt_dropped(list, crate::rt_standin::Work::Commands(count));
             }
             return fail(why);
         }
@@ -2343,11 +2593,17 @@ impl State {
         if let Some(c) = separate_count {
             crate::indirect::done(list, c);
         }
+        #[cfg(feature = "diagnostics")]
+        if indexed_rect {
+            crate::list::cuts::INDIRECT_RECT_RECORDED.fetch_add(1, Ordering::Relaxed);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        meshes.ran();
         true
     }
 }
@@ -2355,8 +2611,9 @@ impl State {
 /// The records of an indirect rectangle draw, and its count if the title
 /// gives one: a host copy and a title address each.
 type RectangleArguments<'a> = (
-    (&'a Arc<crate::shadow::Shadow>, u64),
+    Records<'a>,
     Option<(&'a Arc<crate::shadow::Shadow>, u64)>,
+    Option<IndexView>,
 );
 
 impl State {
@@ -2370,6 +2627,7 @@ impl State {
         (stride, max): (u32, u32),
         (args, arguments): (&Arc<crate::shadow::Shadow>, u64),
         counter: &Option<(Arc<crate::shadow::Shadow>, u64)>,
+        indexed: bool,
     ) -> Result<(), Unready> {
         let p = crate::pipeline::host_pipeline(self.pipeline as This).ok_or(Unready::NoPipeline)?;
         if p.compute || p.mesh {
@@ -2388,7 +2646,11 @@ impl State {
             list,
             &p.inputs,
             (stride, max),
-            ((args, arguments), counter),
+            (
+                Records::Title(args, arguments),
+                counter,
+                indexed.then_some(self.index),
+            ),
             |s, l| s.prepare(l, false),
         )
     }
@@ -2403,15 +2665,14 @@ impl State {
         list: &HostList,
         inputs: &[crate::pipeline::host::Input],
         (stride, max): (u32, u32),
-        ((args, arguments), counter): RectangleArguments,
+        arguments: RectangleArguments,
         bind: impl FnOnce(&mut State, &HostList) -> Result<(), Unready>,
     ) -> Result<(), Unready> {
         // The rewritten records: draw arguments, 16 bytes apart.
         let signature = host_signature(0, 16).ok_or("no host signature")?;
         let expanding =
             crate::timestamps::command(list, crate::timestamps::What::RectangleExpansion, None);
-        let prepared =
-            self.expand_rectangles(list, inputs, (stride, max), (args, arguments), counter)?;
+        let prepared = self.expand_rectangles(list, inputs, (stride, max), arguments)?;
         drop(expanding);
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -2419,10 +2680,13 @@ impl State {
         prepared.bind_vertices(list);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(
-                format!("indirect rectangles max {max} at {arguments:#x}"),
-                false,
-            )
+            let text = match arguments.0 {
+                Records::Title(_, at) => format!("indirect rectangles max {max} at {at:#x}"),
+                Records::Direct([indices, instances, ..]) => {
+                    format!("indexed rectangles {indices}x{instances}")
+                }
+            };
+            self.op_text(text, false)
         });
         let _timed = crate::timestamps::command(
             list,
@@ -2453,8 +2717,7 @@ impl State {
         list: &HostList,
         inputs: &[crate::pipeline::host::Input],
         (stride, max): (u32, u32),
-        (args, arguments): (&Arc<crate::shadow::Shadow>, u64),
-        counter: Option<(&Arc<crate::shadow::Shadow>, u64)>,
+        (records, counter, index): RectangleArguments,
     ) -> Result<crate::rectangles::Prepared, Unready> {
         let vertices = self.vertex.map(|v| (v.address, v.size, v.stride));
         self.recording.lease(list);
@@ -2463,9 +2726,14 @@ impl State {
             &mut self.own.rects,
             inputs,
             &vertices,
-            (args, arguments, stride, max),
+            (records, stride, max),
+            index,
             counter,
-            self.own.indirect_samples.next(list, self.pipeline),
+            if matches!(records, Records::Title(..)) {
+                self.own.indirect_samples.next(list, self.pipeline)
+            } else {
+                None
+            },
         )?)
     }
 }
@@ -2555,6 +2823,12 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+        }
+        #[cfg(feature = "diagnostics")]
+        if u.kind == ResourceType::Uav {
+            crate::meshstat::wrote(&shadow, address, len);
+        } else {
+            crate::meshstat::read(crate::meshstat::What::View, &shadow, address, len);
         }
     }
     match (view, u.kind) {
@@ -4482,6 +4756,114 @@ float4 ps(V v) : SV_Target { return v.color; }
         (p, c, views)
     }
 
+    #[test]
+    fn missing_first_target_preserves_the_second_slot() {
+        use crate::resource::tests_support::{committed, read_back, target};
+        let test = "draw::tests::missing_first_target_preserves_the_second_slot";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let null = std::ptr::null();
+
+        use xtp_shader::{
+            HwStage,
+            emit::{HostShader, rect_gs::probe},
+        };
+        let shader = |name, stage, dxil| {
+            crate::pipeline::test_shader(
+                name,
+                HostShader {
+                    stage,
+                    dxil,
+                    group_base: None,
+                    user_data: vec![],
+                    samplers: vec![],
+                    static_samplers: vec![],
+                    root_cbvs: vec![],
+                    root_srvs: vec![],
+                    stride_table: false,
+                    run_time_buffers: 0,
+                },
+            )
+        };
+        let vs = probe::vertex(
+            &[[-1., -1., 0., 1.], [-1., 3., 0., 1.], [3., -1., 0., 1.]],
+            &[[1.; 4]; 3],
+            &[1; 3],
+        );
+        let mut graphics = crate::pipeline::host::GraphicsState::default();
+        graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        graphics.targets.NumRenderTargets = 2;
+        graphics.targets.RTFormats[0] = DXGI_FORMAT(10);
+        graphics.targets.RTFormats[1] = DXGI_FORMAT(28);
+        // Désactive le test de profondeur de cette sonde couleur.
+        #[repr(C)]
+        struct Depth(u32, D3D12_DEPTH_STENCIL_DESC);
+        let depth = Depth(
+            11,
+            D3D12_DEPTH_STENCIL_DESC {
+                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                ..Default::default()
+            },
+        );
+        // SAFETY: sous-objet complet dans le format du flux.
+        unsafe { graphics.read(11, (&raw const depth).cast()) };
+        let pipeline = crate::pipeline::test_graphics_pipeline(
+            vec![
+                shader("vertex", HwStage::Vs, vs),
+                shader("pixel", HwStage::Ps, probe::pixel()),
+            ],
+            graphics,
+            &[0, 1],
+        );
+        let painter = Painter::new(host, false);
+        for typed in [false, true] {
+            let title = committed(&target(u64::from(SIDE), SIDE, 28));
+            let tex = crate::resource::host_resource(title).unwrap();
+            let list = TitleList::new();
+            let mut records = [[0u64; 16]; 2];
+            let handles = records.each_mut().map(|slot| slot.as_mut_ptr() as u64);
+            crate::descriptor::create_rtv(null, title, null.cast(), handles[1]);
+            if typed {
+                crate::descriptor::create_rtv(null, null, &[28, 4, 0, 0, 0, 0], handles[0]);
+            }
+            crate::list::ensure_state(list.host(), title, 4);
+            // SAFETY: an open list and live RGBA8 target.
+            unsafe {
+                list.host()
+                    .list
+                    .ClearRenderTargetView(host.rtv(tex, None), &[0.; 4], None);
+            }
+            painter.bind(list.host());
+            crate::testgpu::bind_indexed_heaps(host, list.host());
+            let mut state = State::default();
+            // Les deux ordres de liaison doivent sélectionner la même variante.
+            if typed {
+                state.set_pipeline(pipeline);
+            }
+            state.set_targets(list.host(), &handles, 0);
+            state.set_pipeline(pipeline);
+            state
+                .prepare(list.host(), false)
+                .expect("le dessin est prêt");
+            // SAFETY: le pipeline et les vues sont ceux sélectionnés par la préparation réelle.
+            unsafe { list.host().list.DrawInstanced(3, 1, 0, 0) };
+            list.run();
+            let image = read_back(host, tex, 4);
+            crate::object::slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
+            assert!(
+                image
+                    .as_chunks::<256>()
+                    .0
+                    .iter()
+                    .all(|row| row[..SIDE as usize * 4].iter().all(|&v| v == 0)),
+                "slot 1 overwritten (typed null: {typed})"
+            );
+        }
+        crate::object::slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
+    }
+
     /// An indirect rectangle draw end to end, as `indirect_rectangles`
     /// records it: the expansion, the draw's own state bound again after
     /// the passes (here the test pipeline), the expanded vertices of two
@@ -4517,8 +4899,9 @@ float4 ps(V v) : SV_Target { return v.color; }
                 &painter_inputs(),
                 (16, 3),
                 (
-                    (&args_copy, args.address()),
+                    Records::Title(&args_copy, args.address()),
                     Some((&count_copy, count.address())),
+                    None,
                 ),
                 |s, l| {
                     assert_eq!(
@@ -4582,7 +4965,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                 list.host(),
                 &[],
                 (16, 2),
-                ((&args_copy, args.address()), None),
+                (Records::Title(&args_copy, args.address()), None, None),
                 |_, l| {
                     painter.bind(l);
                     Ok(())
@@ -4630,8 +5013,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                 list.host(),
                 &painter_inputs(),
                 (16, 1),
-                (&args_copy, args.address()),
-                None,
+                (Records::Title(&args_copy, args.address()), None, None),
             )
             .expect("expanded");
         let scratch = prepared.args.clone();

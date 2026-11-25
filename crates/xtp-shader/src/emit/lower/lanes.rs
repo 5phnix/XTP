@@ -13,110 +13,54 @@ use crate::gfx10::{Dpp, Fields, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
 use crate::structure::Bool;
 
-/// A `v_readlane_b32` of a lane fixed in the code (an inline constant or a
-/// literal).
-pub(super) fn constant_lane_read(i: &Inst) -> bool {
-    i.name() == "v_readlane_b32"
-        && matches!(&i.fields, Fields::Valu(v) if matches!(
-            v.src.get(1),
-            Some(Operand::Literal(_)) | Some(Operand::Const(_))
-        ))
+/// Le sélecteur utilise ses six bits bas. Toutes les waves du groupe
+/// doivent contenir cette lane, y compris la dernière.
+pub(super) fn present_lane_read(i: &Inst, threads: u32) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    let lane = match v.src.get(1) {
+        Some(Operand::Literal(x)) => Some(*x),
+        Some(Operand::Const(c)) => crate::resource::inline(*c),
+        _ => None,
+    };
+    i.name() == "v_readlane_b32" && lane.is_some_and(|x| (x & 63) < threads % 64)
 }
 
-/// Whether the halves of several console waves can run `p` each lane on its
-/// own path, with its lane reads through group-shared memory
-/// ([`Lower::group_read_lane`]): what lets every thread of the group meet at
-/// each group barrier, and the program's own LDS keep its order.
-///
-/// - No loop: a lane that leaves one early would miss the barriers inside.
-/// - The blocks that hold a barrier (`s_barrier`, or a lane read, which
-///   meets twice) follow one another by dominance: the barriers a lane
-///   passes are then a prefix of the same sequence in every lane, and a
-///   lane that skips a block of them passes no barrier after it, so it can
-///   only end. (The program's own `s_barrier` is lowered the same way
-///   wherever it stands.)
-/// - Every LDS write and every later LDS read, and every read and later
-///   write, have an `s_barrier` between them on every path: the console runs
-///   a wave's 64 lanes in step, so its compiler may leave out the barrier
-///   between lanes of one wave, which are two host waves here. (Two writes
-///   are not ordered: lanes writing one dword without a barrier between
-///   them race in the source program too, whose group-shared memory D3D12
-///   and the console's compiler order only at barriers.)
+/// On ne publie que dans un bloc linéaire, avec EXEC intact : tous les
+/// threads atteignent chaque barrière et fournissent leur VGPR. Entre
+/// deux barrières, plusieurs lectures LDS sont permises. Une écriture ou
+/// une atomique doit être le seul accès, car les demi-waves sont indépendantes.
 pub(super) fn group_reads_meet(p: &Program) -> bool {
-    let n = p.blocks.len();
-    let order = crate::ir::reverse_postorder(&p.blocks);
-    let mut index = vec![usize::MAX; n];
-    for (k, &b) in order.iter().enumerate() {
-        index[b] = k;
-    }
-    let reachable = |b: usize| index[b] != usize::MAX;
-    let back = (0..n).filter(|&b| reachable(b)).any(|b| {
-        p.blocks[b]
-            .exit
-            .successors()
-            .iter()
-            .any(|&s| index[s] <= index[b])
-    });
-    if back {
+    let [block] = p.blocks.as_slice() else {
+        return false;
+    };
+    if !matches!(block.exit, crate::ir::Exit::End) {
         return false;
     }
-    // The blocks with barriers, in reverse postorder: each dominates the next.
-    let idom = crate::ir::idoms(&p.blocks, &order, &index);
-    let dominates = |d: usize, mut b: usize| loop {
-        if b == d {
-            return true;
-        }
-        if idom[b] == b || idom[b] == usize::MAX {
+    let mut accessed = false;
+    let mut wrote = false;
+    for i in &block.insts {
+        if [crate::ir::EXEC, crate::ir::EXEC + 1]
+            .iter()
+            .any(|&r| i.write(Reg::S(r)).is_some())
+        {
             return false;
         }
-        b = idom[b];
-    };
-    let meets: Vec<usize> = order
-        .iter()
-        .copied()
-        .filter(|&b| {
-            p.blocks[b]
-                .insts
-                .iter()
-                .any(|i| i.name() == "s_barrier" || i.name() == "v_readlane_b32")
-        })
-        .collect();
-    if meets.windows(2).any(|w| !dominates(w[0], w[1])) {
-        return false;
-    }
-    // LDS: from each access, the paths until an `s_barrier`.
-    let lds = |i: &Inst| -> Option<bool> {
         let name = i.name();
-        (matches!(i.fields, Fields::Ds { .. })
+        if name == "s_barrier" {
+            accessed = false;
+            wrote = false;
+        } else if matches!(i.fields, Fields::Ds { .. })
             && !name.starts_with("ds_swizzle")
-            && !name.contains("permute"))
-        .then(|| !name.starts_with("ds_read"))
-    };
-    for (b, block) in p.blocks.iter().enumerate().filter(|&(b, _)| reachable(b)) {
-        for (i, inst) in block.insts.iter().enumerate() {
-            let Some(writes) = lds(inst) else { continue };
-            let mut seen = vec![false; n];
-            let mut work = vec![(b, i + 1)];
-            while let Some((x, from)) = work.pop() {
-                let mut stopped = false;
-                for later in &p.blocks[x].insts[from..] {
-                    if later.name() == "s_barrier" {
-                        stopped = true;
-                        break;
-                    }
-                    if lds(later).is_some_and(|w| w != writes) {
-                        return false;
-                    }
-                }
-                if stopped {
-                    continue;
-                }
-                for s in p.blocks[x].exit.successors() {
-                    if !std::mem::replace(&mut seen[s], true) {
-                        work.push((s, 0));
-                    }
-                }
+            && !name.contains("permute")
+        {
+            let writes = !name.starts_with("ds_read");
+            if wrote || writes && accessed {
+                return false;
             }
+            accessed = true;
+            wrote = writes;
         }
     }
     true
@@ -703,6 +647,16 @@ impl<'a> Lower<'a> {
         if let Some(f) = self.console_flat {
             return f;
         }
+        let shape = self.s.threads.expect("compute");
+        if shape[1..] != [1, 1] {
+            // Sur NVIDIA, deux waves d'une tuile 2D peuvent avoir le même
+            // premier indice arrondi (0xkn0wh3r3, VIctory #2126). Déclarer
+            // le groupe sur une ligne donne à chaque wave sa plage alignée.
+            // Les coordonnées console se déduisent de la forme d'origine,
+            // comme pour les dérivées implicites et les lanes appariées.
+            self.flat_group = Some(shape);
+            self.s.threads = Some([shape.iter().product(), 1, 1]);
+        }
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         let flat = self.s.op(
@@ -816,10 +770,8 @@ impl<'a> Lower<'a> {
     /// of this thread's console wave. Every thread that is here writes its
     /// `x` at its console thread's place in group-shared memory, the group
     /// meets, each thread reads its wave's lane, and the group meets again
-    /// before the next read writes. Every thread that has not ended is here
-    /// ([`group_reads_meet`]). A lane that ended earlier wrote nothing: what
-    /// is read for it is what the place held (on the console, what its
-    /// registers held).
+    /// before the next read writes. L’admission garantit que la lane
+    /// existe dans la dernière wave et que chaque thread publie sa valeur.
     pub(super) fn group_read_lane(&mut self, x: V, lane: V) -> Result<V, Why> {
         let k = self
             .s
@@ -918,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn lane_reads_and_barriers_every_thread_that_has_not_ended_reaches_meet() {
+    fn a_lane_read_after_a_partial_early_exit_does_not_meet() {
         let mut words = vec![
             0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
             0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
@@ -929,7 +881,7 @@ mod tests {
         words.extend(DS_READ);
         words.extend(READ_LANE_40);
         words.push(S_ENDPGM);
-        assert!(meet(&words));
+        assert!(!meet(&words));
     }
 
     #[test]
@@ -973,12 +925,14 @@ mod tests {
         words.extend(READ_LANE_40);
         words.push(S_ENDPGM);
         assert!(!meet(&words));
-        // Two writes, then a barrier, then the read: ordered.
+        // La barrière doit aussi séparer les deux écritures.
         let mut words = DS_WRITE.to_vec();
         words.extend(DS_WRITE);
         words.push(S_BARRIER);
         words.extend(DS_READ);
         words.push(S_ENDPGM);
+        assert!(!meet(&words));
+        words.insert(2, S_BARRIER);
         assert!(meet(&words));
         // A read, then a write without a barrier.
         let mut words = DS_READ.to_vec();
