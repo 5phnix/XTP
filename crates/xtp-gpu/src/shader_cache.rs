@@ -848,13 +848,15 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second from the cache");
     }
 
+    /// The cache's entry files: those in its shard folders (its root holds
+    /// its index file beside them).
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
-        for e in std::fs::read_dir(dir).unwrap().flatten() {
-            if e.path().is_dir() {
-                files.extend(walk(&e.path()));
-            } else {
-                files.push(e.path());
+        for shard in std::fs::read_dir(dir).unwrap().flatten() {
+            if shard.path().is_dir() {
+                for e in std::fs::read_dir(shard.path()).unwrap().flatten() {
+                    files.push(e.path());
+                }
             }
         }
         files
