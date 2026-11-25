@@ -456,11 +456,11 @@ shaders compute without a table.
 example 64 bytes at `0x3e15bac0` (a page shown at no other address) or 768
 bytes at `0x735fa5a40` (a pool whose pages show at two other addresses).
 XTP reads it from the host copy of the title buffer holding that address.
-In `imgsrc-2` every probed draw ran and was read back: for all 59 draws of
-frames 660 to 663, the GPU's bytes before the draw equal title memory at
-submission, which equals title memory at recording. The CPU fills these
-buffers (they change from frame to frame), and the host copy is up to
-date.
+In `imgsrc-2` every probed draw ran and was read back: for all 60 draws of
+frames 660 to 663, the GPU's bytes of `s1+32` and `s1+64` just before the
+draw equal title memory at submission, which equals title memory at
+recording: the host copy is up to date, and the GPU reads what the title
+holds there.
 
 **The bytes.** Each 64-byte element is an instance record: a 3×4 matrix,
 1.0, the word `COLOR2` decodes (offset 52), 1.0, a packed word. The word
