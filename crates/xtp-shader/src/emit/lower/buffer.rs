@@ -161,6 +161,58 @@ pub(super) fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// Programs whose plain typed buffer loads (`buffer_load_format_*`, not
+/// d16) move 16-bit integers, as d16 ones do: each loaded register holds
+/// the element's 16 bits zero-extended, read through an unsigned handle.
+/// Each is named by [`code_fingerprint`] of its native code.
+///
+/// shortcut (this title only): the head's blend-shape extraction
+/// (container `970c4fbb3b017c0e`, 2,112 bytes of native code). It reads
+/// the face network's output with three `buffer_load_format_x` through a
+/// view at dword 16 of its table, and takes the low half of each result
+/// as a half (`v_fma_mix_f32` with that half selected). The title views
+/// that output as `R16_UINT` (1,064,960 bytes; fxceless/victory-fork#927,
+/// measured on an RTX 5080 by tippythetaidum and by iGoldenNinja), so on
+/// the console each register gets the 16 bits zero-extended. Read through
+/// a float handle, which D3D12 leaves undefined over an integer view, the
+/// output put rainbow-coloured squares on faces once the network computed
+/// (tippythetaidum on #927). A rule for every such load is left out: XTP
+/// cannot prove from the code alone that a load is read only as halves
+/// (this program reads them inside partial EXEC masks), and in 658 other
+/// programs the code reads plain typed loads only as halves, through
+/// views whose formats are known only when they are bound: unsigned ones
+/// would want the same integers, 32-bit float ones the float path
+/// (docs/analysis/face-animation.md).
+const INTEGER_LOAD_PROGRAMS: [u64; 1] = [0x4a22_9537_a865_7146];
+
+/// FNV-1a on 64 bits of `code`, a program's native code as stored: what
+/// [`INTEGER_LOAD_PROGRAMS`] names programs by.
+pub(crate) fn code_fingerprint(code: &[u8]) -> u64 {
+    code.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One more program for [`INTEGER_LOAD_PROGRAMS`], by its fingerprint,
+    /// in this thread's tests.
+    pub(crate) static INTEGER_LOAD_PROGRAM_TEST: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+impl<'a> Lower<'a> {
+    /// Whether this program is one of [`INTEGER_LOAD_PROGRAMS`].
+    fn integer_load_program(&self) -> bool {
+        let fingerprint = code_fingerprint(&self.x.native.code);
+        #[cfg(test)]
+        if INTEGER_LOAD_PROGRAM_TEST.get() == Some(fingerprint) {
+            return true;
+        }
+        INTEGER_LOAD_PROGRAMS.contains(&fingerprint)
+    }
+}
+
 impl<'a> Lower<'a> {
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
@@ -631,8 +683,8 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
+                // Each channel's 16 bits as they are, as an unsigned integer
+                // (see the typed load below), not by way of a float.
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
@@ -640,27 +692,34 @@ impl<'a> Lower<'a> {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
                     }
-                    let f32t = self.s.t.f32;
-                    let f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                    wide.push(self.as_int(f));
+                    let low = self.s.m.i32(0xFFFF);
+                    wide.push(self.s.m.bin(c, Bin::And, x, low));
                 }
                 vals = wide;
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
-                // of a float format.
+                // of a float format (sixteen bits a channel: of a 16-bit
+                // unsigned one).
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
+                // Four unsigned integers for halves, four floats otherwise.
+                let component = if d16 { 0x405 } else { 0x409 };
+                args.push(self.handle(site, src, false, (10 | u, component))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    args.push(if d16 { x } else { self.as_float(x) });
                 }
-                (69, "bufferStore.f32")
+                (
+                    69,
+                    if d16 {
+                        "bufferStore.i32"
+                    } else {
+                        "bufferStore.f32"
+                    },
+                )
             } else {
                 match index {
                     _ if raw => {
@@ -701,6 +760,13 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
+        // A typed load that moves 16-bit integers: a d16 one, or a plain one
+        // in a program of [`INTEGER_LOAD_PROGRAMS`].
+        let integers = typed && format.is_none() && (d16 || self.integer_load_program());
+        #[cfg(test)]
+        {
+            self.integer_loads += u32::from(integers);
+        }
         // (What can stop the load is checked before its guarded block.)
         let stride = used.map_or(0, |u| u.stride);
         match *format {
@@ -742,7 +808,35 @@ impl<'a> Lower<'a> {
                 return l.format_load(h, off, f, count, 4);
             }
             let c = l.cur;
-            let r = if typed {
+            let r = if integers {
+                // Sixteen bits a channel: on the console each channel's 16
+                // bits go as they are, half floats and plain 16-bit integers
+                // alike (the face network keeps both in buffers it views as
+                // R16G16B16A16_UINT and R16_UINT). They are read as unsigned
+                // integers, which a 16-bit unsigned view carries unchanged;
+                // read as floats through such a view (outside what D3D12
+                // defines) every value was 0 on an RTX 5080. Ported from
+                // fxceless/victory-fork#927 (5dc9e63f04) by tippythetaidum.
+                // shortcut: the view is taken to be in a 16-bit unsigned
+                // format, as the title's are; a 16-bit float or signed view
+                // is read through the unsigned handle all the same, and a
+                // wider, normalised or 8-bit one, whose values the console
+                // converts to halves, is read as its integers. (A plain load
+                // of [`INTEGER_LOAD_PROGRAMS`] gives each channel's integer
+                // whole, zero-extended from the view's 16 bits.)
+                let h = l.handle(site, src, false, (10 | u, 0x405))?;
+                let index = index.unwrap_or(l.s.m.i32(0));
+                let i32t = l.s.t.i32;
+                let ret = l.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                l.s.op(
+                    c,
+                    "bufferLoad.i32",
+                    Attr::ReadOnly,
+                    ret,
+                    68,
+                    &[h, index, iu],
+                )
+            } else if typed {
                 let h = l.handle(site, src, false, (10 | u, 0x409))?;
                 let index = index.unwrap_or(l.s.m.i32(0));
                 l.s.op(
@@ -775,14 +869,16 @@ impl<'a> Lower<'a> {
             };
             let mut xs = Vec::new();
             if d16 {
-                // Two f16 channels per VGPR (an odd last high half 0).
+                // Two 16-bit channels per VGPR (an odd last high half 0),
+                // each the low 16 bits of the unsigned integer the typed
+                // load gave (d16 accesses are all typed).
                 let k16 = l.s.m.i32(16);
-                let i32t = l.s.t.i32;
                 for k in 0..count.div_ceil(2) {
                     let mut x = None;
                     for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                        let f = l.s.m.extract(c, r, ch);
-                        let h = l.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                        let word = l.s.m.extract(c, r, ch);
+                        let low = l.s.m.i32(0xFFFF);
+                        let h = l.s.m.bin(c, Bin::And, word, low);
                         x = Some(match x {
                             Some(hi) => {
                                 let hi = l.s.m.bin(c, Bin::Shl, hi, k16);
@@ -797,7 +893,7 @@ impl<'a> Lower<'a> {
             }
             for k in 0..count {
                 let x = l.s.m.extract(c, r, k);
-                xs.push(l.as_int(x));
+                xs.push(if integers { x } else { l.as_int(x) });
             }
             Ok(xs)
         })?;

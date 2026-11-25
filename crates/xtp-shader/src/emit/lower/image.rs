@@ -185,7 +185,7 @@ fn sample_form(name: &str) -> Option<SampleForm> {
         gather,
         ..SampleForm::default()
     };
-    for token in rest.split('_').skip(1) {
+    for token in rest.strip_prefix('_').unwrap_or(rest).split_terminator('_') {
         let flag = match token {
             "c" => &mut f.c,
             "d" | "cd" => &mut f.d,
@@ -372,10 +372,13 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
+        let name = inst.name();
+        if name == "image_gather4h" {
+            return Err(name);
+        }
         if *tfe || *lwe {
             return Err("an image access with tfe or lwe");
         }
-        let name = inst.name();
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -967,9 +970,10 @@ impl<'a> Lower<'a> {
                     sampler.sample(self, "sampleBias.f32", 61, &mut args)
                 }
                 63 => {
-                    // shortcut: the coarse forms (`_cd`) compute one level
-                    // per quad; the host's per pixel is the same when the
-                    // gradients agree across the quad.
+                    // shortcut: the coarse forms (`_cd`, including `_g16`)
+                    // compute one level per quad; SampleGrad selects a level
+                    // per lane, which agrees when the gradients match across
+                    // the quad.
                     let mut g = vec![fu; 6];
                     if let Some(face) = cube_face {
                         // The face coordinates' derivatives, as the

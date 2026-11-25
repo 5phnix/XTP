@@ -84,6 +84,8 @@
 //!   console never exports them).
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod buffer16_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod desc_data_tests;
@@ -93,6 +95,8 @@ mod diff_tests;
 mod geometry_tests;
 #[cfg(all(test, windows))]
 mod group_id_tests;
+#[cfg(all(test, windows))]
+mod helper_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
