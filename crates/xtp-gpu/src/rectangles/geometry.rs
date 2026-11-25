@@ -632,6 +632,214 @@ mod tests {
         );
     }
 
+    fn depth_bounds_state(
+        topology: i32,
+        with_depth: bool,
+        depth_test: bool,
+    ) -> crate::pipeline::host::GraphicsState {
+        use crate::pipeline::host::GraphicsState;
+        #[repr(C)]
+        struct Sub<T>(u32, T);
+        let mut state = GraphicsState::default();
+        state.targets.NumRenderTargets = 1;
+        state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(topology);
+        state.targets.RTFormats[0] = FORMAT;
+        let bounds = Sub(
+            21,
+            D3D12_DEPTH_STENCIL_DESC1 {
+                DepthEnable: depth_test.into(),
+                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                DepthBoundsTestEnable: true.into(),
+                ..Default::default()
+            },
+        );
+        let raster = Sub(
+            10,
+            D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+        );
+        // SAFETY: each scalar subobject has its D3D12 type followed by its descriptor.
+        unsafe {
+            state.read(21, (&raw const bounds).cast());
+            state.read(10, (&raw const raster).cast());
+            if with_depth {
+                let format = Sub(16, DXGI_FORMAT_D32_FLOAT);
+                state.read(16, (&raw const format).cast());
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn rectangle_geometry_obeys_depth_bounds() {
+        check_rectangle_bounds("rectangle_geometry_obeys_depth_bounds", true);
+    }
+
+    #[test]
+    #[ignore = "WARP ignores depth bounds with a bound DSV and DepthEnable=FALSE (Hangar 5baa47be)"]
+    fn rectangle_geometry_obeys_bounds_with_depth_testing_off() {
+        check_rectangle_bounds(
+            "rectangle_geometry_obeys_bounds_with_depth_testing_off",
+            false,
+        );
+    }
+
+    fn check_rectangle_bounds(test: &str, depth_test: bool) {
+        use crate::object::{This, slot};
+        use crate::pipeline::{host::HostPipeline, test_shader};
+        use crate::resource::tests_support::{committed, depth_unordered};
+        use xtp_shader::{HwStage, emit::HostShader};
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        if !host.depth_bounds {
+            crate::testgpu::skip(test, "depth bounds unsupported");
+            return;
+        }
+        let cases = rectangles();
+        let stage = |stage, dxil| HostShader {
+            stage,
+            dxil,
+            group_base: None,
+            user_data: vec![],
+            samplers: vec![],
+            static_samplers: vec![],
+            root_cbvs: vec![],
+            root_srvs: vec![],
+            stride_table: false,
+            run_time_buffers: 0,
+        };
+        let shaders = [
+            test_shader("vertex", stage(HwStage::Vs, vertex_shader(&cases, None))),
+            test_shader("pixel", stage(HwStage::Ps, probe::pixel())),
+        ];
+        for stored in [None, Some(0.125), Some(0.5)] {
+            let state = depth_bounds_state(19, stored.is_some(), stored.is_some() && depth_test);
+            let pso = HostPipeline::new(&shaders, Some(&state))
+                .expect("rectangle pipeline with depth bounds");
+            let list = TitleList::new();
+            let target = Target::new(&host.device, 1);
+            target.bind(list.host(), &pso.root, &pso.pso);
+            let depth = stored.map(|z| {
+                let title = committed(&depth_unordered(W.into(), H, 40));
+                let tex = crate::resource::host_resource(title).expect("depth target");
+                let dsv = host.dsv(
+                    tex,
+                    Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                        Format: DXGI_FORMAT_D32_FLOAT,
+                        ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                        ..Default::default()
+                    }),
+                );
+                crate::list::ensure_state(
+                    list.host(),
+                    title,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32,
+                );
+                // SAFETY: both descriptors and textures live through the draw.
+                unsafe {
+                    list.host()
+                        .list
+                        .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, z, 0, None);
+                    list.host().list.OMSetRenderTargets(
+                        1,
+                        Some(&target.views.GetCPUDescriptorHandleForHeapStart()),
+                        false,
+                        Some(&dsv),
+                    );
+                }
+                title
+            });
+            let offset = if crate::device::newer() { 0x368 } else { 0x358 };
+            slot::<extern "system" fn(This, f32, f32)>(list.this(), offset)(
+                list.this(),
+                0.25,
+                0.75,
+            );
+            // SAFETY: an open list with the test pipeline and its targets.
+            unsafe {
+                list.host()
+                    .list
+                    .DrawInstanced(cases.len() as u32 * 3, 1, 0, 0)
+            };
+            let pixels = target.read(host, &list);
+            if let Some(title) = depth {
+                slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
+            }
+            if stored == Some(0.125) {
+                assert!(pixels.iter().all(|p| *p == [0.; 4]));
+            } else {
+                whole(&check(&pixels, &cases, "bounds passed", 0.0), &cases);
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_pipeline_accepts_bounds_with_depth_testing_off() {
+        use crate::pipeline::{host::HostPipeline, test_shader};
+        use xtp_shader::{
+            HwStage, NativeProgram,
+            native::{MeshIo, StageIo},
+        };
+        let test =
+            "rectangles::geometry::tests::mesh_pipeline_accepts_bounds_with_depth_testing_off";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        if !host.depth_bounds || !host.mesh_shaders() {
+            crate::testgpu::skip(test, "mesh shaders and depth bounds required");
+            return;
+        }
+        // One wave exports position (0,0,0,1) and a degenerate primitive.
+        let words: [u32; 7] = [
+            0x7e00_0280,
+            0x7e02_02f2,
+            0xf800_08cf,
+            0x0100_0000,
+            0xf800_0941,
+            0,
+            0xbf81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            float_mode: 0,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let vs = vertex_shader(&rectangles(), None);
+        let mut container = xtp_shader::Container::parse(&vs).expect("output signature");
+        container
+            .parts
+            .retain(|p| p.fourcc == xtp_shader::FourCC::OSG1);
+        let mesh = xtp_shader::emit::translate_program(&container, &native).expect("mesh fixture");
+        let mut state = depth_bounds_state(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0, true, false);
+        state.targets.NumRenderTargets = 0;
+        state.targets.RTFormats[0] = DXGI_FORMAT_UNKNOWN;
+        assert!(
+            HostPipeline::new(&[test_shader("mesh", mesh)], Some(&state)).is_some(),
+            "{:?}",
+            crate::pipeline::host::refusals()
+        );
+    }
+
     /// A rectangle list without vertex inputs, drawn as the direct path
     /// draws it (three vertices a rectangle): each rectangle is whole, with
     /// the fourth corner whichever vertex is the corner (the float output

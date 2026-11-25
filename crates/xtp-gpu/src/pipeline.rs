@@ -670,6 +670,21 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_shader(stage: &'static str, host: xtp_shader::emit::HostShader) -> Arc<Shader> {
+    Arc::new(Shader {
+        stage,
+        hash: blake3::hash(&host.dxil).to_hex()[..16].to_owned(),
+        container: Vec::new(),
+        native: OnceLock::new(),
+        translated: OnceLock::from(Some(Translated {
+            host,
+            used: vec![],
+            wave64: false,
+        })),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]

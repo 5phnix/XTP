@@ -722,7 +722,7 @@ impl State {
         let mut rtvs = Vec::new();
         #[cfg(feature = "diagnostics")]
         let mut hole = false;
-        // VIctory #1613 identified the slot shift when an RTV has no host texture.
+        // AgneyaK identified this slot shift in Marvisak/VIctory#1613 (736fa790).
         // Each shader output keeps its slot; only real resources need transitions.
         for &handle in handles {
             let record = crate::descriptor::rtv_record(handle);
