@@ -904,6 +904,15 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Byte-budget tests disable deadlines on their thread (`tests::Untimed`).
+fn pass_time_spent(started: std::time::Instant, limit: std::time::Duration) -> bool {
+    #[cfg(test)]
+    if tests::UNTIMED.get() {
+        return false;
+    }
+    started.elapsed() > limit
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         // The old state gives back what it held as it goes: slots, and its
@@ -1937,7 +1946,7 @@ impl State {
         let mut video_left = video_room(video);
         let mut spent = 0;
         for &(index, write) in &pass.due {
-            if spent >= budget || started.elapsed() > PASS_MAKING {
+            if spent >= budget || pass_time_spent(started, PASS_MAKING) {
                 break;
             }
             counts.looked += 1;
@@ -2031,7 +2040,7 @@ impl State {
         // a share of the budget the first uploads above did not spend.
         let mut refreshes = crate::texture::Refreshes::of(budget);
         for &index in &pass.served {
-            if checking.elapsed() > PASS_CHECKING {
+            if pass_time_spent(checking, PASS_CHECKING) {
                 break;
             }
             let before = last;
@@ -5219,6 +5228,45 @@ void main(uint3 id : SV_DispatchThreadID) {
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
+    thread_local! {
+        pub(super) static UNTIMED: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Disables pass deadlines on this thread, restoring the previous setting.
+    struct Untimed(bool);
+
+    impl Untimed {
+        fn new() -> Untimed {
+            Untimed(UNTIMED.replace(true))
+        }
+    }
+
+    impl Drop for Untimed {
+        fn drop(&mut self) {
+            UNTIMED.set(self.0);
+        }
+    }
+
+    #[test]
+    fn passes_are_timed_again_after_the_guard_drops() {
+        let started = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        let limit = std::time::Duration::ZERO;
+        assert!(pass_time_spent(started, limit));
+        {
+            let _outer = Untimed::new();
+            assert!(!pass_time_spent(started, limit));
+            {
+                let _inner = Untimed::new();
+                assert!(!pass_time_spent(started, limit));
+            }
+            assert!(!pass_time_spent(started, limit));
+        }
+        assert!(pass_time_spent(started, limit));
+    }
+
     /// A `width` x `height` RGBA8 texture object the title fills with
     /// `byte`, once its host copy is resident, and a shader view of it in
     /// slot `slot` of the title heap `heap`.
@@ -5422,7 +5470,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// pass's hashing budget: the one it left out is the first the next
     /// pass looks at. Before, the checks went on past it, and a texture
     /// after one as big as the budget was never uploaded again (Codex's
-    /// review of heaptex).
+    /// review of heaptex). Disable deadlines: staging the 4 MiB texture can
+    /// spend the 8 ms upload limit before the small one is reached (#54).
     #[test]
     fn textures_the_hashing_budget_left_out_come_first_next() {
         use crate::testgpu::TitleList;
@@ -5434,13 +5483,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         if crate::descriptor::host::heap_textures_budget().is_none() {
             return;
         }
+        let _untimed = Untimed::new();
         let heap = crate::descriptor::TestHeap::views(4);
         let views = crate::descriptor::heap(heap.0).host().expect("a host heap");
         // 4 MiB of RGBA8: the whole budget.
         let big = filled_texture(heap.0, 1, 64, 16384, 0x44);
         let small = filled_texture(heap.0, 2, 4, 4, 0x55);
         let list = TitleList::new();
-        assert_eq!(pass_in(heap.0, &list).uploaded, 2);
+        let counts = pass_in(heap.0, &list);
+        assert_eq!(counts.uploaded, 2, "{counts:?}");
         list.run();
         assert_eq!(views.texture_queue().served_slots(), [1, 2]);
         fill_texture(small, 0x66);
