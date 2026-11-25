@@ -658,6 +658,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
             crate::native::HwStage::Vs
         },
         dxil: s.finish(),
+        group_base: None,
         user_data: Vec::new(),
         samplers: Vec::new(),
         static_samplers: Vec::new(),

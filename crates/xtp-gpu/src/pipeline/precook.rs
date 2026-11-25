@@ -347,6 +347,7 @@ pub(in crate::pipeline) mod tests {
                 host: xtp_shader::emit::HostShader {
                     stage: kind,
                     dxil,
+                    group_base: None,
                     user_data: vec![],
                     samplers: vec![],
                     static_samplers: vec![],
