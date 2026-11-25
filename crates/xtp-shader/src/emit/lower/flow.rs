@@ -1135,10 +1135,23 @@ impl<'a> Lower<'a> {
                     // other reason the descriptor load stopped with (a cube
                     // or MSAA image, a constant buffer's descriptor read as
                     // data) stops the program as it would without the join.
+                    // shortcut: in the console flow (branches taken
+                    // wave-wide) the proof follows every path, as no
+                    // condition says which way the wave goes, so a dword
+                    // that the program reads only behind a flag still fails
+                    // it there; such a join keeps the undefined value
+                    // unproven, as before the proof, and counts in
+                    // `emit::UNPROVEN_DESCRIPTOR_JOINS`. The 12 ray-tracing
+                    // resolve compute programs of the characters
+                    // (`CS_RaytracingResolve` f21e9178, 842de0c32bc8dcc5 and
+                    // its family) run so. Wrong if the program reads the
+                    // descriptor's dwords as data on that edge.
                     (Some(Val::Missing(why)), false)
                         if why == super::smem::DESCRIPTOR_WORD
                             && self.descriptor_dword(arg)
-                            && (!read || self.unread_on_edge(phi.reg, q, b)) =>
+                            && (!read
+                                || self.unread_on_edge(phi.reg, q, b)
+                                || self.console_cf && unproven_join()) =>
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
@@ -1362,7 +1375,15 @@ impl<'a> Lower<'a> {
                 let guard = if per_lane { st.guards[at][i] } else { None };
                 let (runs, skips) = guard.map_or((true, false), |g| self.outcomes(g, &path));
                 let scalar = matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. });
-                if runs
+                // A vector instruction writes its SGPRs (a lane read, a
+                // compare's mask) in every lane, whatever its guard
+                // (`write_placed`): they hold its result afterwards. A lane
+                // read's value reaches them even where the guard fails (a
+                // compare's bit is 0 there).
+                let to_sgpr = matches!(inst.fields, Fields::Valu(_))
+                    && inst.writes.iter().any(|w| matches!(w.0, Reg::S(_)));
+                let lane_read = to_sgpr && !inst.name().starts_with("v_cmp");
+                if (runs || per_lane && lane_read)
                     && inst
                         .reads
                         .iter()
@@ -1391,6 +1412,10 @@ impl<'a> Lower<'a> {
                     } else {
                         return false;
                     }
+                }
+                if per_lane && to_sgpr {
+                    t.regs
+                        .retain(|r| !matches!(r, Reg::S(_)) || inst.write(*r).is_none());
                 }
                 if !skips && (per_lane || scalar) {
                     t.regs.retain(|r| inst.write(*r).is_none());
@@ -1673,6 +1698,13 @@ impl<'a> Lower<'a> {
             _ => None,
         }
     }
+}
+
+/// Counts a console-flow join that takes a descriptor's dword as undefined
+/// without proof (see the descriptor-word rule of [`Lower::fill_phis`]).
+fn unproven_join() -> bool {
+    crate::emit::UNPROVEN_DESCRIPTOR_JOINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Blocks [`Lower::unread_on_edge`] searches at most (each a visit of a
@@ -2218,6 +2250,43 @@ mod tests {
                 "{r:?}"
             );
         }
+    }
+
+    /// The console flow's shortcut of the descriptor-word rule: the join of
+    /// [`a_descriptor_dword_read_on_its_edge_after_a_join_stops`] (s8 read
+    /// on both edges) after a loop whose lane read makes the program run in
+    /// the console flow (`lane_read_loop_tests`). There the join keeps the
+    /// undefined value without proof and is counted; the same join in the
+    /// per-lane form stops (the test above).
+    #[test]
+    fn the_console_flow_keeps_a_descriptor_join_unproven_and_counts_it() {
+        use std::sync::atomic::Ordering;
+        const S_NOP: u32 = 0xBF80_0000;
+        let mut words = vec![
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+            0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+            0xBF88_0006, // s_cbranch_execz -> end
+            0xD760_0009,
+            0x0001_0300, // loop: v_readlane_b32 s9, v0, 1
+            0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+            0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFFA, // s_cbranch_execnz -> loop
+            0x887E_0A7E, // end: s_or_b32 exec_lo, exec_lo, s10
+        ];
+        let mut join = DESCRIPTOR_JOIN;
+        join[17] = S_NOP;
+        join[18] = S_NOP;
+        words.extend(join);
+        let mut p = descriptor_join(ResourceType::Srv);
+        p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let before = crate::emit::UNPROVEN_DESCRIPTOR_JOINS.load(Ordering::Relaxed);
+        emit_for(&p, crate::emit::Target::ANY).expect("translated in the console flow");
+        let flow = crate::emit::last_module_summary();
+        assert!(flow.contains("console flow"), "{flow}");
+        assert!(crate::emit::UNPROVEN_DESCRIPTOR_JOINS.load(Ordering::Relaxed) > before);
     }
 
     /// [`DESCRIPTOR_JOIN`] in the form of the material and character pixel
