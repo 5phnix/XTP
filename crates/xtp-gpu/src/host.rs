@@ -823,6 +823,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin (`twins`).
     twins: Mutex<twins::TwinUses>,
+    /// Whether `twins` may have something for the next draw or dispatch
+    /// (`HostList::planes_now`, `HostList::twins_written`): read without
+    /// its lock, so that a list with nothing due takes none per bind.
+    twins_due: std::sync::atomic::AtomicBool,
     /// The pipelines the list binds, for reports of slow submissions:
     /// shared with its submissions ([`Recorded`]), a reset starts a new set.
     pipelines: Mutex<std::sync::Arc<std::collections::BTreeSet<String>>>,
@@ -1319,6 +1323,7 @@ impl Host {
                 states: Mutex::default(),
                 prelude: Mutex::new((prelude_allocator, prelude)),
                 twins: Mutex::default(),
+                twins_due: Default::default(),
                 pipelines: Mutex::default(),
                 writer: AtomicU64::new(0),
                 buffer_writes: AtomicU64::new(0),
@@ -1544,6 +1549,11 @@ impl Host {
             list.last.store(*submitted, Ordering::Release);
             list.ours.store(!title, Ordering::Release);
         }
+        // `XTP_PLANE_PROBE`: the probes of the lists' depth plane passes
+        // are read once this submission has run.
+        #[cfg(feature = "diagnostics")]
+        runs.iter()
+            .for_each(|list| list.twins_submitted(*submitted));
         self.timeline.push(*submitted, touches, pending);
         crate::timestamps::submitted(&self.queue, runs, *submitted, title);
         // `XTP_SYNC_SUBMIT`, and timed lists: finished before returning,
