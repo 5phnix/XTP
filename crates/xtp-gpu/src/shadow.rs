@@ -3263,6 +3263,7 @@ pub(crate) fn refresh_everything(submission: u64) -> usize {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let mut copies: Vec<Arc<Shadow>> = buffers()
+        .entries
         .values()
         .filter_map(|e| e.shadow.clone())
         .collect();
@@ -4437,27 +4438,67 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
 }
 
-/// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// Index intervals by their length's highest bit. In each class an owner
+/// can only start within one class width of the queried address.
+#[derive(Default)]
+struct BufferTable {
+    entries: BTreeMap<(u64, usize), Entry>,
+    classes: BTreeMap<u32, BTreeMap<(u64, usize), u64>>,
+}
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+impl BufferTable {
+    fn remove(&mut self, key: (u64, usize)) -> Option<Entry> {
+        let entry = self.entries.remove(&key)?;
+        if let Some(class) = (entry.end - key.0).checked_ilog2()
+            && let Some(group) = self.classes.get_mut(&class)
+        {
+            group.remove(&key);
+            if group.is_empty() {
+                self.classes.remove(&class);
+            }
+        }
+        Some(entry)
+    }
+
+    fn insert(&mut self, key: (u64, usize), len: u64) {
+        self.remove(key);
+        let end = key.0.saturating_add(len);
+        if let Some(class) = (end - key.0).checked_ilog2() {
+            self.classes.entry(class).or_default().insert(key, end);
+        }
+        self.entries.insert(key, Entry { end, shadow: None });
+    }
+
+    fn owner(&self, address: u64) -> Option<(usize, u64)> {
+        self.classes
+            .iter()
+            .filter_map(|(&class, group)| {
+                let max_len = u64::MAX >> (63 - class);
+                let first = address.saturating_sub(max_len - 1);
+                group
+                    .range((first, 0)..=(address, usize::MAX))
+                    .rev()
+                    .find(|(_, end)| **end > address)
+            })
+            .max_by_key(|(key, _)| *key)
+            .map(|(key, &end)| (key.1, end))
+    }
+}
+
+fn buffers() -> std::sync::MutexGuard<'static, BufferTable> {
+    static BUFFERS: std::sync::LazyLock<Mutex<BufferTable>> =
+        std::sync::LazyLock::new(Default::default);
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    buffers().insert((start, resource), len);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let removed = buffers().remove(&(start, resource));
+    let removed = buffers().remove((start, resource));
     if let Some(entry) = removed {
         crate::rt::release_buffer(Some(resource), start, entry.end);
     }
@@ -4470,6 +4511,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let (key, entry_end) = {
         let map = buffers();
         let found = map
+            .entries
             .range(..=(address, usize::MAX))
             .rev()
             .take(64)
@@ -4510,7 +4552,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let made = Arc::new(Shadow::new(buffer, data, gpu, key.0, len, card));
     let mut map = buffers();
-    match map.get_mut(&key) {
+    match map.entries.get_mut(&key) {
         // Another thread made one meanwhile: that one (ours goes).
         Some(Entry {
             shadow: Some(s), ..
@@ -4543,13 +4585,8 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 /// The innermost title resource containing this address.
-pub(crate) fn buffer_owner(address: u64) -> Option<usize> {
-    buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, entry)| entry.end > address)
-        .map(|(key, _)| key.1)
+pub(crate) fn buffer_owner(address: u64) -> Option<(usize, u64)> {
+    buffers().owner(address)
 }
 
 /// The title buffers holding `address`, innermost first (the one [`find`]
@@ -4557,6 +4594,7 @@ pub(crate) fn buffer_owner(address: u64) -> Option<usize> {
 /// which [`find`] copies in windows. For logs: it makes no copy.
 pub(crate) fn holders(address: u64) -> Vec<(u64, u64)> {
     buffers()
+        .entries
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -4571,6 +4609,7 @@ pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let map = buffers();
     match map
+        .entries
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -4773,6 +4812,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers()
+        .entries
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();

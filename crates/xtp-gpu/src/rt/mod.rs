@@ -205,7 +205,6 @@ impl<'a> Recorder<'a> {
             result,
             instances: None,
             compacted_size: postbuild.map(|(_, size)| size),
-            owner: None,
         })
     }
 
@@ -286,7 +285,6 @@ struct Structure {
     result: Arc<ID3D12Resource>,
     // Only TLAS generations refer to a snapshot of the BLAS address space.
     instances: Option<Arc<BlasMap>>,
-    owner: Option<usize>,
     compacted_size: Option<Arc<AtomicU64>>,
 }
 
@@ -299,36 +297,98 @@ impl Structure {
     }
 }
 
+struct Destination {
+    end: u64,
+    owner: Option<usize>,
+    generation: u64,
+}
+
 #[derive(Default)]
 struct Registry {
     structures: BTreeMap<u64, Structure>,
+    // Includes builds still recording, so removal also cancels their publication.
+    ranges: BTreeMap<u64, Destination>,
+    generation: u64,
     snapshot: Option<Arc<BlasMap>>,
 }
 
-static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
-    structures: BTreeMap::new(),
-    snapshot: None,
-});
-
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
+    static TABLE: std::sync::LazyLock<Mutex<Registry>> = std::sync::LazyLock::new(Default::default);
+    TABLE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Registry {
-    fn replace(&mut self, dst: u64, built: Option<Structure>) -> bool {
-        let old = self.structures.remove(&dst);
-        if old.is_some_and(|s| s.instances.is_none())
-            || built.as_ref().is_some_and(|s| s.instances.is_none())
+    fn retire(&mut self, start: u64, end: u64, owner: Option<Option<usize>>) -> Option<Structure> {
+        if end <= start {
+            return None;
+        }
+        let first = self
+            .ranges
+            .range(..start)
+            .next_back()
+            .filter(|(_, r)| r.end > start)
+            .map_or(start, |(&key, _)| key);
+        let keys: Vec<_> = self
+            .ranges
+            .range(first..end)
+            .filter(|(_, r)| owner.is_none_or(|o| o == r.owner))
+            .map(|(&key, _)| key)
+            .collect();
+        let mut previous = None;
+        for key in keys {
+            self.ranges.remove(&key);
+            let old = self.structures.remove(&key);
+            if old.as_ref().is_some_and(|s| s.instances.is_none()) {
+                self.snapshot = None;
+            }
+            if key == start {
+                previous = old;
+            }
+        }
+        previous
+    }
+
+    fn begin(&mut self, start: u64, bytes: Option<u64>) -> (u64, Option<Arc<ID3D12Resource>>) {
+        let owner = crate::shadow::buffer_owner(start);
+        let end = match (bytes.filter(|&n| n > 0), owner) {
+            (Some(n), Some((_, end))) => start.saturating_add(n).min(end),
+            (Some(n), None) => start.saturating_add(n),
+            (None, Some((_, end))) => end,
+            (None, None) => start.saturating_add(1),
+        };
+        let old = self.retire(start, end, None);
+        self.generation += 1;
+        self.ranges.insert(
+            start,
+            Destination {
+                end,
+                owner: owner.map(|o| o.0),
+                generation: self.generation,
+            },
+        );
+        (
+            self.generation,
+            old.map(|s| s.result).filter(|r| Arc::strong_count(r) == 1),
+        )
+    }
+
+    fn finish(&mut self, start: u64, generation: u64, built: Option<Structure>) -> bool {
+        if self
+            .ranges
+            .get(&start)
+            .is_none_or(|r| r.generation != generation)
         {
+            return false;
+        }
+        let Some(built) = built else {
+            self.ranges.remove(&start);
+            return false;
+        };
+        if built.instances.is_none() {
             self.snapshot = None;
         }
-        if let Some(mut structure) = built {
-            structure.owner = crate::shadow::buffer_owner(dst);
-            self.structures.insert(dst, structure);
-            true
-        } else {
-            false
-        }
+        self.structures.insert(start, built);
+        true
     }
 
     fn blas_map(&mut self) -> Option<Arc<BlasMap>> {
@@ -340,33 +400,14 @@ impl Registry {
 }
 
 pub(crate) fn release_buffer(owner: Option<usize>, start: u64, end: u64) {
-    let mut table = registry();
-    let released: Vec<_> = table
-        .structures
-        .range(start..end)
-        .filter(|(_, s)| s.owner == owner)
-        .map(|(&address, _)| address)
-        .collect();
-    for address in released {
-        table.replace(address, None);
-    }
-}
-
-/// Resolves one descriptor's title TLAS address at the time of lookup.
-/// Use `host_tlas_for_list` when recording a GPU command to retain that generation.
-pub fn host_tlas(title_tlas: u64) -> Option<u64> {
-    let table = registry();
-    let entry = table.structures.get(&title_tlas)?;
-    entry.instances.as_ref()?;
-    // SAFETY: the registry holds the TLAS resource throughout the lookup.
-    Some(unsafe { entry.result.GetGPUVirtualAddress() })
+    registry().retire(start, end, Some(owner));
 }
 
 /// Resolves and pins the TLAS and its possible BLAS references for this recording.
 ///
 /// # Safety
 /// `list` is a live title command list.
-pub unsafe fn host_tlas_for_list(list: *const Object, title_tlas: u64) -> Option<u64> {
+pub unsafe fn host_tlas(list: *const Object, title_tlas: u64) -> Option<u64> {
     let list = crate::list::host_list(list)?;
     let table = registry();
     let entry = table.structures.get(&title_tlas)?;
@@ -378,6 +419,9 @@ pub unsafe fn host_tlas_for_list(list: *const Object, title_tlas: u64) -> Option
     // SAFETY: the list owns this resource until the GPU has finished the recording.
     Some(unsafe { entry.result.GetGPUVirtualAddress() })
 }
+
+/// Compatibility name for the recording-scoped lookup.
+pub use host_tlas as host_tlas_for_list;
 
 /// Resolves one title descriptor slot and retains the TLAS for this dispatch.
 /// Call separately for every slot, including distinct offsets in one descriptor table.
@@ -407,21 +451,14 @@ pub unsafe fn descriptor_tlas(list: *const Object, handle: u64) -> Option<u64> {
 ///
 /// # Safety
 /// `title_list` is a live title list and the active CPU arrays follow the builder ABI.
-unsafe fn build_one(title_list: *const Object, desc: &Build, ordered: bool) -> bool {
+unsafe fn build_one(
+    title_list: *const Object,
+    desc: &Build,
+    ordered: bool,
+    title_bytes: Option<u64>,
+) -> bool {
     let dst = desc.DestAccelerationStructureData;
-    let reuse = {
-        let mut table = registry();
-        let previous = table.structures.remove(&dst);
-        if previous
-            .as_ref()
-            .is_some_and(|entry| entry.instances.is_none())
-        {
-            table.snapshot = None;
-        }
-        previous
-            .map(|s| s.result)
-            .filter(|r| Arc::strong_count(r) == 1)
-    };
+    let (generation, reuse) = registry().begin(dst, title_bytes);
     let built = (|| {
         if dst == 0 {
             return None;
@@ -462,7 +499,7 @@ unsafe fn build_one(title_list: *const Object, desc: &Build, ordered: bool) -> b
             _ => None,
         }
     })();
-    registry().replace(dst, built)
+    registry().finish(dst, generation, built)
 }
 
 /// Rebuilds a rehydrated title entry and optionally samples its inputs on the GPU.
@@ -470,8 +507,17 @@ unsafe fn build_one(title_list: *const Object, desc: &Build, ordered: bool) -> b
 /// # Safety
 /// The title list and CPU arrays obey the same contract as `build`.
 pub unsafe fn rehydrate(list: *const Object, desc: &Build) -> bool {
+    // SAFETY: the caller supplies a live list and descriptions.
+    unsafe { rehydrate_sized(list, desc, None) }
+}
+
+/// Rehydrates a structure with the result size supplied by the title builder.
+///
+/// # Safety
+/// The list and CPU arrays obey the same contract as `rehydrate`.
+pub unsafe fn rehydrate_sized(list: *const Object, desc: &Build, title_bytes: Option<u64>) -> bool {
     // SAFETY: the caller supplies the same live inputs required by build.
-    let recorded = unsafe { Builder.build(list, desc) };
+    let recorded = unsafe { build_one(list, desc, false, title_bytes) };
     #[cfg(feature = "diagnostics")]
     if probe::enabled() {
         let sampled = recorded
@@ -495,7 +541,7 @@ impl Builder {
     /// `list` is a live title command list and the CPU geometry arrays are valid for the call.
     pub unsafe fn build(&self, list: *const Object, desc: &Build) -> bool {
         // SAFETY: the caller supplies the list and geometry arrays.
-        unsafe { build_one(list, desc, false) }
+        unsafe { build_one(list, desc, false, None) }
     }
 
     /// Records a contiguous batch. The preceding build's final UAV barrier also
@@ -509,10 +555,23 @@ impl Builder {
         list: *const Object,
         descs: impl Iterator<Item = &'a Build>,
     ) {
+        // SAFETY: the caller supplies a contiguous recording with live descriptors.
+        unsafe { self.build_batch_sized(list, descs.map(|d| (d, None))) }
+    }
+
+    /// Records a batch using the title builder's destination sizes.
+    ///
+    /// # Safety
+    /// The list and descriptors obey the same contract as `build_batch`.
+    pub unsafe fn build_batch_sized<'a>(
+        &self,
+        list: *const Object,
+        descs: impl Iterator<Item = (&'a Build, Option<u64>)>,
+    ) {
         let mut ordered = false;
-        for desc in descs {
+        for (desc, title_bytes) in descs {
             // SAFETY: the batch supplies live inputs. Only a completed build leaves a trailing barrier.
-            ordered = unsafe { build_one(list, desc, ordered) };
+            ordered = unsafe { build_one(list, desc, ordered, title_bytes) };
         }
     }
 
@@ -521,11 +580,18 @@ impl Builder {
     /// # Safety
     /// `list` is a live title list.
     pub unsafe fn copy(&self, list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
+        let (source, generation) = {
+            let mut table = registry();
+            let source = table.structures.get(&src).cloned();
+            let bytes = table.ranges.get(&src).map(|range| range.end - src);
+            let (generation, _) = table.begin(dst, bytes);
+            (source, generation)
+        };
         let copied = (|| {
             if dst == 0 {
                 return None;
             }
-            let source = registry().structures.get(&src)?.clone();
+            let source = source?;
             let recorder = Recorder::new(crate::list::host_list(list)?)?;
             if !source.producer.available(&recorder.list.rt_recording()) {
                 return None;
@@ -536,7 +602,7 @@ impl Builder {
                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode),
             )
         })();
-        registry().replace(dst, copied)
+        registry().finish(dst, generation, copied)
     }
 }
 

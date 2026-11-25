@@ -220,7 +220,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             compacted.address(),
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0
         ));
-        assert!(host_tlas(cloned.address()).is_none());
+        assert!(host_tlas(list.this(), cloned.address()).is_none());
         assert!(Builder.build(list.this(), &tlas_desc(first.address())));
         let mut updated = blas_input(&changed);
         updated.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE
@@ -235,11 +235,12 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             }
         ));
         assert!(Builder.build(list.this(), &tlas_desc(second.address())));
+        assert!(host_tlas(cloning.this(), first.address()).is_none());
         let a = host_tlas_for_list(list.this(), first.address()).unwrap();
         let b = host_tlas_for_list(list.this(), second.address()).unwrap();
         assert_ne!(a, b);
-        assert_eq!(host_tlas(first.address()), Some(a));
-        assert_eq!(host_tlas(second.address()), Some(b));
+        assert_eq!(host_tlas(list.this(), first.address()), Some(a));
+        assert_eq!(host_tlas(list.this(), second.address()), Some(b));
         let mut table = [0u64; 20];
         for (offset, address, expected) in [(0x60, first.address(), a), (0x80, second.address(), b)]
         {
@@ -257,7 +258,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         );
         let released = first.address();
         drop((blas, cloned, first, second));
-        assert_eq!(host_tlas(released), None);
+        assert_eq!(host_tlas(list.this(), released), None);
         trace(host, list.host(), a, &output);
         trace(host, list.host(), b, &after_refit);
     }
@@ -266,4 +267,46 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
     list.run();
     assert_eq!(output.words(), [1, 2.0f32.to_bits(), 0, 0]);
     assert_eq!(after_refit.words(), [0, 0, 0, 0]);
+}
+
+#[test]
+fn rt_retirement_cancels_overlapping_publications_and_keeps_adjacent_ranges() {
+    let mut table = Registry::default();
+    let base = 0x4000;
+    for offset in [0, 256, 512, 768] {
+        table.begin(base + offset, Some(256));
+    }
+    let old = table.ranges[&(base + 256)].generation;
+    let (new, _) = table.begin(base + 128, Some(384));
+    assert!(!table.finish(base + 256, old, None));
+    assert_eq!(
+        table.ranges.keys().copied().collect::<Vec<_>>(),
+        [base + 128, base + 512, base + 768]
+    );
+    table.retire(base + 180, base + 181, Some(None));
+    assert!(!table.finish(base + 128, new, None));
+    assert_eq!(table.ranges.len(), 2);
+}
+
+#[test]
+fn rt_owner_survives_more_than_64_intervening_buffers() {
+    let base = 0x9876_0000_0000;
+    crate::shadow::register(1, base, 1024);
+    for i in 1..=100 {
+        crate::shadow::register(i + 1, base + 2 * i as u64, 1);
+    }
+    assert_eq!(
+        crate::shadow::buffer_owner(base + 255),
+        Some((1, base + 1024))
+    );
+    assert_eq!(
+        crate::shadow::buffer_owner(base + 200),
+        Some((101, base + 201))
+    );
+    registry().begin(base + 255, Some(128));
+    crate::shadow::unregister(1, base);
+    assert!(!registry().ranges.contains_key(&(base + 255)));
+    for i in 1..=100 {
+        crate::shadow::unregister(i + 1, base + 2 * i as u64);
+    }
 }

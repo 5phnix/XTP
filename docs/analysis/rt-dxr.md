@@ -666,9 +666,8 @@ Per title structure address, as VIctory #702 keys them (section 11):
   per list. Consecutive builds in a batch share their intervening UAV
   barrier. Releasing a title buffer or remapping loose title memory retires
   its address mappings.
-- **Lookup at dispatch.** `xtp_gpu::rt::host_tlas(title_tlas)` returns the
-  current mapped GPU address. Use `host_tlas_for_list` to pin a generation
-  while recording a command, or `descriptor_tlas` with the live title
+- **Lookup at dispatch.** `xtp_gpu::rt::host_tlas(list, title_tlas)` checks the
+  producer and retains the TLAS and its BLAS for that recording. Use it directly, or `descriptor_tlas` with the live title
   descriptor handle. Resolve each descriptor independently, including
   table 5 at byte offsets +0x60 and +0x80. A cross-list copy or direct
   binding whose producer has yet to be submitted is unavailable.

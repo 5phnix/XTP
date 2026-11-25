@@ -247,6 +247,19 @@ impl Call {
     }
 }
 
+/// Title and host prebuild sizes describe different BVH formats. Ask the
+/// title builder with the active inputs while their CPU arrays are live.
+fn title_bytes(this: Object, desc: &Desc) -> Option<u64> {
+    if prebuild::ORIGINAL.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut inputs = desc.Inputs;
+    inputs.Flags &= !D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+    let mut sizes = Sizes::default();
+    prebuild::original()(this, &inputs, std::ptr::null(), &mut sizes);
+    Some(sizes.ResultDataMaxSizeInBytes).filter(|&bytes| bytes != 0)
+}
+
 extern "system" fn build(this: Object, list: Object, count: u32, entries: *const BatchEntry) {
     if enabled!(Level::DEBUG) {
         let call = Call::new();
@@ -285,7 +298,12 @@ extern "system" fn build(this: Object, list: Object, count: u32, entries: *const
         // SAFETY: the title supplies count live entries and records no intervening list commands.
         unsafe {
             let entries = std::slice::from_raw_parts(entries, count as usize);
-            xtp_gpu::rt::Builder.build_batch(list.cast(), entries.iter().map(|entry| &entry.build));
+            xtp_gpu::rt::Builder.build_batch_sized(
+                list.cast(),
+                entries
+                    .iter()
+                    .map(|entry| (&entry.build, title_bytes(this, &entry.build))),
+            );
         }
     }
 }
@@ -349,8 +367,11 @@ extern "system" fn rehydrate(
         let mut recorded = 0;
         for i in 0..count {
             // SAFETY: the original call accepted this list and array of count descriptions.
-            recorded +=
-                u32::from(unsafe { xtp_gpu::rt::rehydrate(list.cast(), &*descs.add(i as usize)) });
+            let desc = unsafe { &*descs.add(i as usize) };
+            // SAFETY: the title list and the active CPU inputs are live for this call.
+            recorded += u32::from(unsafe {
+                xtp_gpu::rt::rehydrate_sized(list.cast(), desc, title_bytes(this, desc))
+            });
         }
         debug!(
             count,
