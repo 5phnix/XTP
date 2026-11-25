@@ -151,14 +151,26 @@ impl Library {
         }
     }
 
-    /// Stores `pso` under the first of `slots` the library is not known to
-    /// hold. A name StorePipeline refuses as held (an entry this process did
-    /// not know of, one that does not load for this description) is noted
-    /// and the next one tried.
-    fn store(&self, slots: &[(String, HSTRING)], pso: &ID3D12PipelineState) {
-        for (name, wide) in slots {
+    /// Stores `pso` under the first of `slots` (its names, [`slot`]) that
+    /// does not hold an entry this pipeline's description fails to load
+    /// from: `failed` says the slots whose load failed here. A slot the
+    /// library holds that was not tried holds this pipeline already (stored
+    /// meanwhile by another thread: a name is its description's hash), and
+    /// nothing more is stored; one that was tried and failed holds another
+    /// entry, and the next slot is tried. A name StorePipeline refuses is
+    /// held, by the same rules.
+    fn store(
+        &self,
+        slots: &[(String, HSTRING)],
+        failed: &[bool; SLOTS],
+        pso: &ID3D12PipelineState,
+    ) {
+        for ((name, wide), &failed) in slots.iter().zip(failed) {
             if self.names().held.contains(name) {
-                continue;
+                if failed {
+                    continue;
+                }
+                return;
             }
             // SAFETY: a live pipeline; a name already stored is refused,
             // which leaves the library as it was.
@@ -168,7 +180,12 @@ impl Library {
                     self.hold(name);
                     return;
                 }
-                Err(e) if e.code() == windows::Win32::Foundation::E_INVALIDARG => self.hold(name),
+                Err(e) if e.code() == windows::Win32::Foundation::E_INVALIDARG => {
+                    self.hold(name);
+                    if !failed {
+                        return;
+                    }
+                }
                 Err(e) => {
                     tracing::debug!(name, error = %e, "host pipeline not stored");
                     return;
@@ -561,27 +578,31 @@ fn found_in(
         LOCK_US.fetch_add(since(asked), Ordering::Relaxed);
         (held, l)
     };
-    // The names of `slots` worth a load in a library of `names`: those it
-    // holds, and its own name if `names` may miss it.
+    // The slots worth a load in a library of `names`: those it holds, or
+    // all of them when `names` may miss some (a library read without its
+    // names file: a load that finds no entry costs little).
     let tried = |names: Option<&Names>| -> Vec<usize> {
         (0..SLOTS)
-            .filter(|&k| match names {
-                Some(n) => n.held.contains(&slots[k].0) || (k == 0 && !n.complete),
-                None => k == 0,
-            })
+            .filter(|&k| names.is_none_or(|n| !n.complete || n.held.contains(&slots[k].0)))
             .collect()
     };
+    // The slots of this library whose load failed: their entries are other
+    // descriptions', and a store goes past them ([`Library::store`]).
+    let mut failed = [false; SLOTS];
     let loaded = {
         let (_name, l) = take();
         let started = std::time::Instant::now();
         let mut loaded = None;
         let ours = tried(Some(&l.names()));
         for k in ours {
-            if let Ok(pso) = load(&l.library, PCWSTR(slots[k].1.as_ptr())) {
-                // Learned, when the names were not all known.
-                l.hold(&slots[k].0);
-                loaded = Some((pso, Source::Library));
-                break;
+            match load(&l.library, PCWSTR(slots[k].1.as_ptr())) {
+                Ok(pso) => {
+                    // Learned, when the names were not all known.
+                    l.hold(&slots[k].0);
+                    loaded = Some((pso, Source::Library));
+                    break;
+                }
+                Err(_) => failed[k] = true,
             }
         }
         if loaded.is_none()
@@ -589,7 +610,7 @@ fn found_in(
         {
             for k in tried(previous.names.as_ref()) {
                 if let Ok(pso) = load(&previous.library, PCWSTR(slots[k].1.as_ptr())) {
-                    l.store(&slots, &pso);
+                    l.store(&slots, &failed, &pso);
                     loaded = Some((pso, Source::Previous));
                     break;
                 }
@@ -607,7 +628,7 @@ fn found_in(
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let (_name, l) = take();
-    l.store(&slots, &pso);
+    l.store(&slots, &failed, &pso);
     keep_stand_in(&pso);
     Ok((pso, Source::Made))
 }
