@@ -235,7 +235,7 @@ dispatches on that path.
 | `3fe821a8916a4564` | Compute | Updates the small exposure record read by later passes. | [World black §4.3][black43] | high |
 | `2bfdc19dc1f25b3a` | Compute | Writes the lens parameter buffer from the autofocus result and CPU constants. | [CPU image §4.1][cpu41] | high |
 | `c89f7bd38af4f529` | Compute | Resolves half-resolution colour over time using lens parameters and depth. Its output's next reader is open. | [CPU image §4.1][cpu41] | medium |
-| `b2b1ea29bc3987db` | Compute | Appears to be a temporal resolve variant. It was not dispatched in the later PSO sessions and its consumer is open. | [PSO refusals §4.1][pso41], [CPU image §4.1][cpu41], code | medium |
+| `b2b1ea29bc3987db` | Compute | Appears to be a temporal resolve variant. It was not dispatched in the later PSO sessions and its consumer is open. | [PSO refusals §4.1][pso41], code | low |
 | `30ee260ef303ac7b` | Vertex | Places the full-screen draw that prepares the half-resolution depth-of-field layer. | [World black §9.6][black96], code | high |
 | `f987c56098b9faff` | Pixel | Writes the depth-of-field colour layer with the circle of confusion in alpha. | [World black §9.6][black96] | high |
 | `44fdeb707f882b7d` | Compute | Applies the first blur step to the depth-of-field layer. | [World black §9.6][black96] | high |
@@ -413,44 +413,50 @@ the shared role at pass level. It leaves individual material variants open.
 
 ## Refused and dropped programs
 
-The [refusal census][ref2] and [PSO logs][pso2] cover different builds.
-The PSO study reproduced all 116 early wave-size refusals on a 32-lane
-host. A refusal or an incomplete submission can identify a program
-without showing what its output would have fed.
+These programs are named by the [refusal census][ref2], whose rows date
+from `1c61fa1`, and by the [PSO logs][pso2] and run reports of other
+builds. Most of them translate on `main` now: the 19 wave64 shadow
+programs since `f992374` ([world-session refusals][waveworld]) and the
+merged geometry halves since [ES/GS §7.2][es72]. None of the rows below
+is still documented as refused; of the programs this group added, only
+`0ddab4b63b1394e0` in the [BVH table][bvh-roles] is. A refusal or an
+incomplete submission can identify a program without showing what its
+output would have fed.
 
 ### Shadow compute on the wave64 path
 
 The [refusals study][ref7] identifies 16 cascade programs and three tile
-classifiers from their code. The world-session logs recorded refusals for
-these programs and did not show completed dispatches for any of the 19.
+classifiers from their code. The world-session logs of that time recorded
+refusals for these programs and showed no completed dispatch for any of
+the 19. All 19 translate on `main` since `f992374`.
 
 | Hash | Stage | Role | Evidence | Confidence |
 |---|---|---|---|---|
-| `0c028454b58543f0` | Compute | Classifies tiles for shadow rendering. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `191ecaed66eea3b1` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `1d44a723bdebbf27` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `240cb516c1af0bc3` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `31d703207b51549a` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `466ec41d3f9d24c0` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `56f3bf2d9388e5a7` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `65de113e23fa4fdd` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `804b342cb4b9d1e9` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `922e1d0ee1e19a85` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `ab5455fc6abb804f` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `abd7a22106898c66` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `b4b0427232707598` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `b8f3f7979d6bbc50` | Compute | Classifies tiles for shadow rendering. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `be6ce5d849d51127` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `ce79e9eba7ae0348` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld] | medium |
-| `d7db57731ada919b` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `eae3498e6553afa8` | Compute | Classifies tiles for shadow rendering. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
-| `fa0bd10a35bfef3c` | Compute | Computes cascaded shadows. No dispatch was observed in the surveyed world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld] | medium |
+| `0c028454b58543f0` | Compute | Classifies tiles for shadow rendering. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `191ecaed66eea3b1` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `1d44a723bdebbf27` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `240cb516c1af0bc3` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `31d703207b51549a` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `466ec41d3f9d24c0` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `56f3bf2d9388e5a7` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `65de113e23fa4fdd` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `804b342cb4b9d1e9` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `922e1d0ee1e19a85` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `ab5455fc6abb804f` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `abd7a22106898c66` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `b4b0427232707598` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `b8f3f7979d6bbc50` | Compute | Classifies tiles for shadow rendering. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `be6ce5d849d51127` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `ce79e9eba7ae0348` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld] | medium |
+| `d7db57731ada919b` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `eae3498e6553afa8` | Compute | Classifies tiles for shadow rendering. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld], [PSO refusals §4.2][pso42] | medium |
+| `fa0bd10a35bfef3c` | Compute | Computes cascaded shadows. Translates on `main`; no dispatch was observed in the earlier world sessions. | [Refusals §7][ref7], [Wave64 compute][waveworld] | medium |
 
 ### Voxelisation geometry
 
 The [refusal census][ref2] counted the export and geometry halves
-separately. The [merged geometry study][es72] translated both halves
-offline. The export half sits in the vertex container and feeds the
+separately. Both halves translate on `main` since the [merged geometry
+study's phase 2][es72]. The export half sits in the vertex container and feeds the
 geometry stage.
 
 | Hash | Stage | Role | Evidence | Confidence |
