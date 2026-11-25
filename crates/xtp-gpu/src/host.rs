@@ -24,6 +24,9 @@ mod frames;
 pub(crate) mod submissions;
 mod timeline;
 mod twins;
+/// For tests elsewhere that hold submissions in flight.
+#[cfg(test)]
+pub(crate) use submissions::Gate;
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -66,6 +69,9 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// The value the last submission handed to the queue signals, stored
+    /// before it is handed over ([`Host::executing`]).
+    executing: AtomicU64,
     /// The value the last present's copy signals: the frame a flip wait
     /// and the next present wait for (0: none yet).
     presented: AtomicU64,
@@ -472,6 +478,7 @@ fn create(software: bool) -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            executing: AtomicU64::new(0),
             presented: AtomicU64::new(0),
             timeline: Timeline::new(),
             finisher: std::sync::Once::new(),
@@ -1367,6 +1374,8 @@ impl Host {
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            // Before the GPU may start on it (`Host::executing`).
+            self.executing.store(*submitted, Ordering::SeqCst);
             let started = std::time::Instant::now();
             // SAFETY: closed lists, not running (waited for above); our fence.
             let signalled = unsafe {
@@ -1419,6 +1428,22 @@ impl Host {
         if sync {
             self.settle(*submitted);
         }
+    }
+
+    /// The host fence value of the last submission handed to the queue,
+    /// stored before the GPU may start on it: once [`Host::completed`]
+    /// reaches what this returned, the GPU has run every submission that
+    /// could have read host memory (descriptors, the stride table) before
+    /// the call, and later ones read it as it is after the call. 0: none.
+    pub(crate) fn executing(&self) -> u64 {
+        self.executing.load(Ordering::SeqCst)
+    }
+
+    /// The host fence value the GPU has reached (all ones once the device
+    /// is removed).
+    pub(crate) fn completed(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.fence.GetCompletedValue() }
     }
 
     /// Finishes, in order, the submissions the GPU has run (no waiting).
