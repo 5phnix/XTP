@@ -181,6 +181,11 @@ enum Scene {
 
 /// `ray_test.hlsl` compiled by the Windows SDK's DXC, with `defines`.
 fn ray_program(defines: &[&str]) -> Vec<u8> {
+    compiled("ray_test.hlsl", defines)
+}
+
+/// `file` of this folder compiled by the Windows SDK's DXC, with `defines`.
+fn compiled(file: &str, defines: &[&str]) -> Vec<u8> {
     let dxc = std::env::var_os("XTP_PC_DXC")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -194,7 +199,7 @@ fn ray_program(defines: &[&str]) -> Vec<u8> {
         .args(["-T", "cs_6_5", "-E", "main", "-Fo"])
         .arg(&binary)
         .args(defines.iter().flat_map(|d| ["-D", d]))
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rt/ray_test.hlsl"))
+        .arg(format!("{}/src/rt/{file}", env!("CARGO_MANIFEST_DIR")))
         .output()
         .unwrap();
     assert!(
@@ -242,9 +247,23 @@ fn spliced_root(host: &Host) -> (u32, ID3D12RootSignature) {
 }
 
 fn trace(host: &Host, title_list: &TitleList, tlas: Scene, output: &TitleBuffer) {
-    let list = title_list.host();
     let spliced = matches!(tlas, Scene::Spliced(_));
     let code = ray_program(if spliced { &["SPLICED"] } else { &[] });
+    trace_program(host, title_list, tlas, output, &code);
+}
+
+/// [`trace`] with the compiled ray program `code`, whose output is all of
+/// `output`.
+fn trace_program(
+    host: &Host,
+    title_list: &TitleList,
+    tlas: Scene,
+    output: &TitleBuffer,
+    code: &[u8],
+) {
+    let list = title_list.host();
+    let spliced = matches!(tlas, Scene::Spliced(_));
+    let bytes = 4 * output.words().len() as u64;
     // The commands of an indirect trace come before its PSO and root views.
     let prepared = match tlas {
         // SAFETY: the test's live list and descriptor slot.
@@ -255,8 +274,8 @@ fn trace(host: &Host, title_list: &TitleList, tlas: Scene, output: &TitleBuffer)
         _ => None,
     };
     let shadow = output.shadow();
-    shadow.refresh(list, output.address(), 16);
-    shadow.gpu_writes(list, output.address(), 16);
+    shadow.refresh(list, output.address(), bytes);
+    shadow.gpu_writes(list, output.address(), bytes);
     // SAFETY: the root signature is embedded by DXC or made here. The list keeps
     // both objects and the output shadow, and the caller retains the TLAS through
     // completion.
@@ -265,7 +284,7 @@ fn trace(host: &Host, title_list: &TitleList, tlas: Scene, output: &TitleBuffer)
             crate::testgpu::bind_indexed_heaps(list);
             spliced_root(host)
         } else {
-            (0, host.device.CreateRootSignature(0, &code).unwrap())
+            (0, host.device.CreateRootSignature(0, code).unwrap())
         };
         let pso: ID3D12PipelineState = host
             .device
@@ -1134,4 +1153,153 @@ fn rt_builds_off_keeps_the_empty_tlas_and_traces_miss() {
     trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
     list.run();
     assert_eq!(out.words(), MISSES, "the trace ran on the empty TLAS");
+}
+
+/// The known-bounds triangle (−5, 0, 1), (4, 0, 1), (4, 8, 9), moved `dz`
+/// along z: its bounds are those corners.
+fn bounds_vertices(dz: f32) -> [f32; 9] {
+    [-5., 0., 1. + dz, 4., 0., 1. + dz, 4., 8., 9. + dz]
+}
+
+/// What `ray_bounds.hlsl` reads of that triangle: four hits at
+/// t = 11 + y + dz (it lies in the plane z = 1 + y + dz), then four
+/// misses just past its edges.
+fn bounds_expected(dz: f32) -> [Option<f32>; 8] {
+    let at = |y: f32| Some(11. + y + dz);
+    [at(1.), at(7.), at(0.5), at(0.05), None, None, None, None]
+}
+
+/// Memory the runtime maps outside any title buffer object, as it maps the
+/// title's physical pages: its host copies are loose 4 MiB windows
+/// (`shadow::loose`). Never unmapped: copies made of it outlive the test.
+fn plain_memory(len: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+    };
+    // SAFETY: a fresh section, mapped whole; the view keeps it.
+    unsafe {
+        let section = CreateFileMappingW(
+            -1isize as _,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            len as u32,
+            std::ptr::null(),
+        );
+        assert!(!section.is_null(), "a section");
+        let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+        windows_sys::Win32::Foundation::CloseHandle(section);
+        assert_ne!(view, 0, "a view");
+        view
+    }
+}
+
+/// Leonida #1816's fixture, reimplemented (watch item 497): a BLAS of known
+/// bounds, (−5, 0, 1) to (4, 8, 9), whose vertices and indices are title
+/// memory, read back by rays near each edge. Once in title buffers, once
+/// in plain title memory, the vertices across a 4 MiB window boundary
+/// (XTP's loose window copies); each built twice, the title's CPU moving
+/// the vertices by 1 along z between the builds. A wrong address
+/// translation gives misses or other distances; a stale copy gives the
+/// first build's distances after the second.
+#[test]
+fn rt_blas_of_known_bounds_from_title_memory() {
+    let test = "rt_blas_of_known_bounds_from_title_memory";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let program = compiled("ray_bounds.hlsl", &[]);
+    let (vertex_buffer, index_buffer) = (TitleBuffer::new(36), TitleBuffer::new(8));
+    const WINDOW: usize = 4 << 20;
+    let plain = plain_memory(2 * WINDOW);
+    let boundary = (plain + WINDOW) & !(WINDOW - 1);
+    let cases = [
+        (
+            "title buffers",
+            vertex_buffer.address(),
+            index_buffer.address(),
+        ),
+        (
+            "plain title memory, across a window boundary",
+            (boundary - 20) as u64,
+            (boundary + 64) as u64,
+        ),
+    ];
+    for (case, vertices, indices) in cases {
+        // SAFETY: 8 bytes of the case's title memory, 2-byte aligned.
+        unsafe { (indices as *mut [u16; 4]).write_unaligned([0, 1, 2, 0]) };
+        let (blas, tlas) = (TitleBuffer::new(1024), TitleBuffer::new(1024));
+        let instances = instances_of(&[blas.address()]);
+        let slot = Descriptor::new(tlas.address());
+        for dz in [0., 1.] {
+            for (i, v) in bounds_vertices(dz).iter().enumerate() {
+                // SAFETY: 36 bytes of the case's title memory, as its CPU writes them.
+                unsafe { (vertices as *mut u32).add(i).write_unaligned(v.to_bits()) };
+            }
+            let geometry = Geometry {
+                Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                    Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                        Transform3x4: 0,
+                        IndexFormat: DXGI_FORMAT_R16_UINT,
+                        VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                        IndexCount: 3,
+                        VertexCount: 3,
+                        IndexBuffer: indices,
+                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                            StartAddress: vertices,
+                            StrideInBytes: 12,
+                        },
+                    },
+                },
+            };
+            let producer = TitleList::new();
+            // SAFETY: the title list and every range the descriptions name are live.
+            unsafe {
+                assert!(
+                    Builder.build(
+                        producer.this(),
+                        &Build {
+                            DestAccelerationStructureData: blas.address(),
+                            Inputs: blas_input(&geometry),
+                            ..Default::default()
+                        }
+                    ),
+                    "{case}: the BLAS build"
+                );
+                assert!(
+                    Builder.build(producer.this(), &tlas_desc(tlas.address(), &instances)),
+                    "{case}: the TLAS build"
+                );
+            }
+            producer.run();
+            let output = TitleBuffer::new(64);
+            output.set_words(|_| 77);
+            let list = TitleList::new();
+            trace_program(
+                gpu.host(),
+                &list,
+                Scene::Descriptor(slot.handle()),
+                &output,
+                &program,
+            );
+            list.run();
+            let words = output.words();
+            for (ray, want) in bounds_expected(dz).into_iter().enumerate() {
+                let got = (words[2 * ray] == 1).then(|| f32::from_bits(words[2 * ray + 1]));
+                match (got, want) {
+                    (Some(got), Some(want)) => assert!(
+                        (got - want).abs() < 1e-3,
+                        "{case}, dz {dz}: ray {ray} hit at {got}, not {want}"
+                    ),
+                    (None, None) => {}
+                    _ => panic!("{case}, dz {dz}: ray {ray} read {got:?}, not {want:?}"),
+                }
+            }
+        }
+    }
 }
