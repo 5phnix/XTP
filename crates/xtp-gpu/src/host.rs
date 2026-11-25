@@ -831,8 +831,6 @@ pub(crate) struct HostList {
     /// shared with its submissions ([`Recorded`]), a reset starts a new set.
     pipelines: Mutex<std::sync::Arc<std::collections::BTreeSet<String>>>,
     writer: AtomicU64,
-    /// Recorded buffer writes, including transfers and clears outside draw binding.
-    buffer_writes: AtomicU64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
@@ -1060,6 +1058,64 @@ type Closing = Box<dyn FnOnce(&HostList) + Send>;
 /// Work a list runs at each of its submissions ([`HostList::at_submit`]).
 type Submitting = std::sync::Arc<dyn Fn(&HostList) + Send + Sync>;
 
+/// Latest write at each address, represented by the starts of runs with the
+/// same serial. A zero serial is a gap. An overwrite preserves both tails.
+#[derive(Default)]
+struct WriteRanges(std::collections::BTreeMap<usize, u64>);
+
+impl WriteRanges {
+    fn at(&self, address: usize) -> u64 {
+        self.0.range(..=address).next_back().map_or(0, |(_, &v)| v)
+    }
+
+    fn record(&mut self, from: usize, to: usize, serial: u64) {
+        let tail = self.at(to);
+        while let Some((&at, _)) = self.0.range(from..to).next() {
+            self.0.remove(&at);
+        }
+        self.0.insert(from, serial);
+        self.0.insert(to, tail);
+    }
+
+    fn latest(&self, from: usize, to: usize) -> u64 {
+        self.0
+            .range(from..to)
+            .map(|(_, &v)| v)
+            .max()
+            .unwrap_or(0)
+            .max(self.at(from))
+    }
+}
+
+/// Per recording. Key zero covers submission-time writes to title memory.
+/// GPU writes name the shadow they actually target.
+#[derive(Default)]
+struct BufferWrites {
+    serial: u64,
+    ranges: std::collections::HashMap<usize, WriteRanges>,
+    unknown: u64,
+    binding: bool,
+    indexed_output: bool,
+    shader_outputs: Vec<(usize, usize, usize)>,
+}
+
+impl BufferWrites {
+    fn record(&mut self, copy: usize, address: usize, len: usize) {
+        if len != 0 {
+            self.serial += 1;
+            self.ranges.entry(copy).or_default().record(
+                address,
+                address.saturating_add(len),
+                self.serial,
+            );
+        }
+    }
+
+    fn latest(&self, copy: usize, address: usize, end: usize) -> u64 {
+        self.ranges.get(&copy).map_or(0, |r| r.latest(address, end))
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1105,6 +1161,9 @@ struct Deferred {
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     indirect_writers: crate::indirect::Writers,
+    buffer_writes: BufferWrites,
+    /// Shadow and title range read by a recorded GPU copy into CBV memory.
+    cbv_reads: std::collections::HashSet<(usize, usize, usize)>,
 }
 
 /// A list a submission in flight names.
@@ -1156,6 +1215,9 @@ impl Pending {
         // One list's lock at a time: a submission may name a list twice.
         for list in runs {
             let deferred = list.deferred();
+            for &(copy, from, to) in &deferred.cbv_reads {
+                touches.cbv_reads.entry(copy).or_default().push((from, to));
+            }
             for step in &deferred.copies {
                 match step {
                     Step::GpuWrite(shadow, address, len, _) => {
@@ -1326,7 +1388,6 @@ impl Host {
                 twins_due: Default::default(),
                 pipelines: Mutex::default(),
                 writer: AtomicU64::new(0),
-                buffer_writes: AtomicU64::new(0),
                 budget: Mutex::default(),
                 decode_uses: Mutex::default(),
                 decode_pipeline: Default::default(),
@@ -2513,8 +2574,8 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
+        deferred.buffer_writes.record(0, dst as usize, len);
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
@@ -2610,8 +2671,14 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
+        let writes = &mut deferred.buffer_writes;
+        let copy = std::sync::Arc::as_ptr(shadow) as usize;
+        if writes.binding {
+            writes.shader_outputs.push((copy, address, len));
+        } else {
+            writes.record(copy, address, len);
+        }
         deferred.indirect_writers.record(&shadow.buffer, true);
         deferred.copies.push(Step::GpuWrite(
             shadow.clone(),
@@ -2630,8 +2697,10 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
+        deferred
+            .buffer_writes
+            .record(std::sync::Arc::as_ptr(shadow) as usize, address, len);
         deferred.indirect_writers.record(&shadow.buffer, false);
         deferred
             .copies
@@ -2646,8 +2715,10 @@ impl HostList {
         address: usize,
         bytes: usize,
     ) {
-        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
+        deferred
+            .buffer_writes
+            .record(std::sync::Arc::as_ptr(shadow) as usize, address, bytes);
         deferred.indirect_writers.record(&shadow.buffer, false);
         deferred
             .copies
@@ -2655,12 +2726,57 @@ impl HostList {
     }
 
     pub(crate) fn unknown_buffer_write(&self) {
-        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
-        self.deferred().indirect_writers.unknown();
+        let mut deferred = self.deferred();
+        deferred.indirect_writers.unknown();
+        deferred.buffer_writes.indexed_output = true;
     }
 
-    pub(crate) fn buffer_writes(&self) -> u64 {
-        self.buffer_writes.load(Ordering::Relaxed)
+    /// Shader UAVs are declared while binding, but they write after all the
+    /// input copies of that command, even when both views alias.
+    pub(crate) fn begin_shader_outputs(&self) {
+        self.deferred().buffer_writes.binding = true;
+    }
+
+    pub(crate) fn end_shader_outputs(&self, bound: bool) {
+        let mut deferred = self.deferred();
+        let writes = &mut deferred.buffer_writes;
+        writes.binding = false;
+        while let Some((copy, address, len)) = writes.shader_outputs.pop() {
+            if bound {
+                writes.record(copy, address, len);
+            }
+        }
+        if std::mem::take(&mut writes.indexed_output) && bound {
+            // A shader indexing writable descriptors at run time can select
+            // a descriptor installed after recording.
+            writes.serial += 1;
+            writes.unknown = writes.serial;
+        }
+    }
+
+    pub(crate) fn cbv_read(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: u64,
+        len: u64,
+    ) {
+        self.deferred().cbv_reads.insert((
+            std::sync::Arc::as_ptr(shadow) as usize,
+            address as usize,
+            (address + len) as usize,
+        ));
+    }
+
+    /// Latest submission-time title write and GPU write to this input.
+    pub(crate) fn input_writes(&self, copy: Option<usize>, address: u64, len: u64) -> (u64, u64) {
+        let deferred = self.deferred();
+        let writes = &deferred.buffer_writes;
+        let end = address.saturating_add(len) as usize;
+        let from = address as usize;
+        (
+            writes.latest(0, from, end),
+            copy.map_or(0, |c| writes.latest(c, from, end).max(writes.unknown)),
+        )
     }
 
     pub(crate) fn indirect_writes(
@@ -2821,6 +2937,7 @@ impl HostList {
         work: impl Fn() + Send + 'static,
     ) {
         let mut deferred = self.deferred();
+        deferred.buffer_writes.record(0, writes.0, writes.1);
         deferred
             .copies
             .push(Step::Run(Box::new(work), writes, reads));
