@@ -3254,9 +3254,8 @@ pub(crate) mod tests_support {
         out
     }
 
-    /// The 8-bit RGBA texels of subresource 0 of `texture` (at most 64
-    /// texels wide), which is in `state` and stays in it: rows 256 bytes
-    /// apart.
+    /// The bytes of subresource 0 of a 2D colour texture with rows at most
+    /// 256 bytes wide. Rows are returned 256 bytes apart, in its own format.
     pub(crate) fn read_back(
         host: &crate::host::Host,
         texture: &ID3D12Resource,
@@ -3264,7 +3263,13 @@ pub(crate) mod tests_support {
     ) -> Vec<u8> {
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        assert!(d.Width <= 64);
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        // SAFETY: room for the one footprint requested.
+        unsafe {
+            host.device
+                .GetCopyableFootprints(&d, 0, 1, 0, Some(&mut footprint), None, None, None);
+        }
+        assert_eq!(footprint.Footprint.RowPitch, 256);
         let size = 256 * u64::from(d.Height);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
@@ -3304,16 +3309,7 @@ pub(crate) mod tests_support {
             pResource: unsafe { std::mem::transmute_copy(&readback) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: 0,
-                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
-                        Width: d.Width as u32,
-                        Height: d.Height,
-                        Depth: 1,
-                        RowPitch: 256,
-                    },
-                },
+                PlacedFootprint: footprint,
             },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
