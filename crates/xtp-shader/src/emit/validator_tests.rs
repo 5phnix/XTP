@@ -1,9 +1,34 @@
-//! What dxil.dll refuses in the containers the emitter writes (W6).
+//! What dxil.dll refuses in the containers the emitter writes (W6): the
+//! order of the rows of `ISG1`/`OSG1`, which it compares byte for byte with
+//! the parts it writes from the module, and the one interpolation mode it
+//! allows per signature row. Small modules built with [`Shader`] (their
+//! signatures as given), and one console pixel program translated whole.
+//! Each container is checked by the system's dxil.dll where there is one
+//! (a skip is said on standard error).
 
 use super::bitcode::{Attr, Cast, Term};
-use super::container::SigElement;
-use super::shader::Shader;
+use super::container::{self, SigElement};
+use super::shader::{Shader, one_mode_per_row};
 use super::validator::Validator;
+use crate::dxbc::{Container, FourCC};
+
+/// dxil.dll's verdict on `container`; `None` without a dxil.dll.
+fn verdict(what: &str, container: &[u8]) -> Option<Result<(), String>> {
+    match Validator::load(Validator::default_path().as_deref()) {
+        Ok(mut v) => Some(v.validate(&mut container.to_vec())),
+        Err(e) => {
+            eprintln!("SKIPPED validation of {what}: {e}");
+            None
+        }
+    }
+}
+
+/// Panics if dxil.dll refuses `container`.
+fn validates(what: &str, container: &[u8]) {
+    if let Some(Err(e)) = verdict(what, container) {
+        panic!("{what}: validation: {e}");
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn el(
@@ -30,21 +55,34 @@ fn el(
     }
 }
 
-fn target() -> SigElement {
-    let mut t = el("SV_Target", 0, 16, 9, 0, Some(0), 0, 4);
-    t.usage = 0xf;
-    t
+/// `SV_Position` in row 0, as an output (noperspective, as DXC declares it).
+fn position() -> SigElement {
+    el("SV_Position", 0, 3, 9, 4, Some(0), 0, 4)
 }
 
-/// A pixel shader reading channels `reads` ((element, column)) of `inputs`
-/// into SV_Target0's channels in turn.
-fn pixel(mut inputs: Vec<SigElement>, reads: &[(usize, u8)]) -> Vec<u8> {
+/// A 32-bit uint `TEXCOORD<index>` at `(1, col)`, one channel.
+fn uint(index: u32, interp: u8, col: u8) -> SigElement {
+    el("TEXCOORD", index, 0, 5, interp, Some(1), col, 1)
+}
+
+/// A float `TEXCOORD<index>` at `(1, col)`, one channel.
+fn float(index: u32, interp: u8, col: u8) -> SigElement {
+    el("TEXCOORD", index, 0, 9, interp, Some(1), col, 1)
+}
+
+fn front_face(interp: u8, col: u8) -> SigElement {
+    el("SV_IsFrontFace", 0, 13, 5, interp, Some(1), col, 1)
+}
+
+/// A pixel shader reading the first channel of each element of `inputs`
+/// named in `reads` into SV_Target0's channels in turn.
+fn pixel(mut inputs: Vec<SigElement>, reads: &[usize]) -> Vec<u8> {
     let mut s = Shader::new(true);
     let b = s.entry;
     let mut vals = Vec::new();
-    for &(id, col) in reads {
+    for &id in reads {
         let e = &mut inputs[id];
-        e.usage |= 1 << col;
+        e.usage |= 1;
         let int = e.comp != 9;
         let (ty, suffix) = if int {
             (s.t.i32, ".i32")
@@ -52,7 +90,7 @@ fn pixel(mut inputs: Vec<SigElement>, reads: &[(usize, u8)]) -> Vec<u8> {
             (s.t.f32, ".f32")
         };
         let undef = s.m.undef(s.t.i32);
-        let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), undef];
+        let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(0), undef];
         let v = s.op(b, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args);
         let f32t = s.t.f32;
         vals.push(if int {
@@ -71,7 +109,9 @@ fn pixel(mut inputs: Vec<SigElement>, reads: &[(usize, u8)]) -> Vec<u8> {
         let void = s.t.void;
         s.op(b, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
     }
-    s.outputs = vec![target()];
+    let mut target = el("SV_Target", 0, 16, 9, 0, Some(0), 0, 4);
+    target.usage = 0xf;
+    s.outputs = vec![target];
     s.m.terminate(b, Term::Ret);
     s.finish()
 }
@@ -89,14 +129,8 @@ fn vertex(outputs: Vec<SigElement>) -> Vec<u8> {
             };
             let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), zero];
             let void = s.t.void;
-            s.op(
-                b,
-                &format!("storeOutput{suffix}"),
-                Attr::NoUnwind,
-                void,
-                5,
-                &args,
-            );
+            let name = format!("storeOutput{suffix}");
+            s.op(b, &name, Attr::NoUnwind, void, 5, &args);
         }
     }
     s.outputs = outputs
@@ -110,62 +144,237 @@ fn vertex(outputs: Vec<SigElement>) -> Vec<u8> {
     s.finish()
 }
 
-fn position() -> SigElement {
-    el("SV_Position", 0, 3, 9, 4, Some(0), 0, 4)
+/// The elements of part `fourcc` of `container`, in the part's row order.
+fn rows_of(container: &[u8], fourcc: FourCC) -> Vec<(String, u32, Option<u32>, u8)> {
+    let c = Container::parse(container).expect("a container");
+    let part = c.part(fourcc).expect("the part").data;
+    super::signature(part)
+        .expect("a signature")
+        .into_iter()
+        .map(|e| (e.name, e.index, e.row, e.col))
+        .collect()
 }
 
-/// Prints what dxil.dll says of each variant (exploration, not a check).
+/// Two elements packed into one register, the one at column 3 first in
+/// element order (as the console's signatures have them: rows are theirs).
+/// dxil.dll writes the rows of a register in the order of their names,
+/// which is element order: by column, ISG1 and OSG1 differed from its own
+/// ("Container part 'Program Input/Output Signature' does not match
+/// expected for module").
 #[test]
-#[ignore = "exploration: run with --ignored --nocapture"]
-fn explore_validator_rules() {
-    let path = Validator::default_path();
-    eprintln!("dxil.dll: {path:?}");
-    let mut v = Validator::load(path.as_deref()).expect("dxil.dll");
-    let mut say = |what: &str, mut c: Vec<u8>| {
-        let r = v.validate(&mut c);
-        eprintln!(
-            "{what}: {}",
-            match r {
-                Ok(()) => "ok".to_owned(),
-                Err(e) => e.replace('\n', " | "),
-            }
-        );
+fn the_rows_of_one_register_keep_element_order() {
+    let elements = || {
+        vec![
+            position(),
+            float(0, 2, 3),
+            el("TEXCOORD", 1, 0, 9, 2, Some(1), 0, 3),
+        ]
     };
-    let pos = || el("SV_Position", 0, 3, 9, 4, Some(0), 0, 4);
-    let u = |index, interp, col| el("TEXCOORD", index, 0, 5, interp, Some(1), col, 1);
-    let f = |index, interp, col| el("TEXCOORD", index, 0, 9, interp, Some(1), col, 1);
-    say("V1 ps [u32 c unread, f32 lin unread]", pixel(vec![pos(), u(0, 1, 0), f(1, 2, 1)], &[]));
-    say("V2 ps [u32 c read, f32 c unread]", pixel(vec![pos(), u(0, 1, 0), f(1, 1, 1)], &[(1, 0)]));
-    say("V3 ps [f32 lin read, u32 lin unread]", pixel(vec![pos(), f(0, 2, 0), u(1, 2, 1)], &[(1, 0)]));
-    say("V4 ps [f32 lin read, u32 undef unread]", pixel(vec![pos(), f(0, 2, 0), u(1, 0, 1)], &[(1, 0)]));
-    say("V5 ps [u32 undef unread, f32 lin read]", pixel(vec![pos(), u(0, 0, 0), f(1, 2, 1)], &[(2, 0)]));
-    say("V6 ps u32 lin read alone", pixel(vec![pos(), u(0, 2, 0)], &[(1, 0)]));
-    say("V6b ps u32 lin unread alone", pixel(vec![pos(), u(0, 2, 0)], &[]));
-    say("V7 ps f32 undef read alone", pixel(vec![pos(), f(0, 0, 0)], &[(1, 0)]));
-    say("V7b ps f32 undef unread alone", pixel(vec![pos(), f(0, 0, 0)], &[]));
-    say("V7c ps u32 undef unread alone", pixel(vec![pos(), u(0, 0, 0)], &[]));
-    say("V8 vs [u32 lin, f32 lin]", vertex(vec![pos(), u(0, 2, 0), f(1, 2, 1)]));
-    say("V9 vs [u32 undef, f32 undef]", vertex(vec![pos(), u(0, 0, 0), f(1, 0, 1)]));
-    say("V9b vs [u32 c, f32 undef]", vertex(vec![pos(), u(0, 1, 0), f(1, 0, 1)]));
-    say("V9c vs [f32 lin, u32 undef]", vertex(vec![pos(), f(0, 2, 0), u(1, 0, 1)]));
-    say("V10 vs [u32 c, f32 c]", vertex(vec![pos(), u(0, 1, 0), f(1, 1, 1)]));
-    say("V10b vs [u32 c, f32 lin]", vertex(vec![pos(), u(0, 1, 0), f(1, 2, 1)]));
-    say("V10c vs pos undef", vertex(vec![el("SV_Position", 0, 3, 9, 0, Some(0), 0, 4)]));
-    say("V10d vs pos lin", vertex(vec![el("SV_Position", 0, 3, 9, 2, Some(0), 0, 4)]));
-    // Row order: an element at column 3 listed before one at column 0.
-    say("V11 vs order [(1,3) then (1,0)]", vertex(vec![pos(), f(0, 2, 3), el("TEXCOORD", 1, 0, 9, 2, Some(1), 0, 3)]));
-    say("V11b ps order [(1,3) then (1,0)]", pixel(vec![pos(), f(0, 2, 3), el("TEXCOORD", 1, 0, 9, 2, Some(1), 0, 3)], &[(1, 0), (2, 0)]));
-    // Front face beside an unread float.
-    say("V12 ps [f32 lin unread, front face c]", pixel(vec![pos(), f(0, 2, 0), el("SV_IsFrontFace", 0, 13, 5, 1, Some(1), 1, 1)], &[]));
-    say("V12b ps [f32 c unread, front face c]", pixel(vec![pos(), f(0, 1, 0), el("SV_IsFrontFace", 0, 13, 5, 1, Some(1), 1, 1)], &[]));
-    // Centroid and sample beside linear.
-    say("V13 ps [f32 lin read, f32 centroid unread]", pixel(vec![pos(), f(0, 2, 0), f(1, 3, 1)], &[(1, 0)]));
-    say("V14 ps [f32 noperspective read, f32 lin unread]", pixel(vec![pos(), f(0, 4, 0), f(1, 2, 1)], &[(1, 0)]));
+    let expected = vec![
+        ("SV_Position".to_owned(), 0, Some(0), 0),
+        ("TEXCOORD".to_owned(), 0, Some(1), 3),
+        ("TEXCOORD".to_owned(), 1, Some(1), 0),
+    ];
+    let vs = vertex(elements());
+    assert_eq!(rows_of(&vs, FourCC::OSG1), expected);
+    validates("vertex outputs", &vs);
+    let ps = pixel(elements(), &[1, 2]);
+    assert_eq!(rows_of(&ps, FourCC::ISG1), expected);
+    validates("pixel inputs", &ps);
 }
 
+/// Rows still sort by register first, unallocated elements last; within a
+/// register, by name (one per element, system values sharing theirs).
 #[test]
-fn signature_writers_see_position() {
-    // Placeholder so the module has a check until the real ones land.
-    let c = vertex(vec![position()]);
-    assert_eq!(&c[..4], b"DXBC");
+fn rows_sort_by_register_then_name() {
+    let depth = el("SV_Depth", 0, 17, 9, 0, None, 0, 1);
+    let elements = [
+        el("SV_Target", 1, 16, 9, 0, Some(1), 0, 4),
+        depth,
+        el("SV_Target", 0, 16, 9, 0, Some(0), 0, 4),
+    ];
+    let part = container::signature(&elements, false);
+    let rows: Vec<(u32, Option<u32>)> = super::signature(&part)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.index, e.row))
+        .collect();
+    assert_eq!(rows, [(0, Some(0)), (1, Some(1)), (0, None)]);
+}
+
+/// The modes [`one_mode_per_row`] gives each row's elements.
+fn modes(mut elements: Vec<SigElement>, read: &[usize], pixel_inputs: bool) -> Vec<u8> {
+    for &i in read {
+        elements[i].usage = 1;
+    }
+    one_mode_per_row(&mut elements, pixel_inputs);
+    elements.iter().map(|e| e.interp).collect()
+}
+
+/// The console packs a flat channel beside interpolated ones in one
+/// attribute row; DXIL allows one interpolation mode per row ("signature
+/// element ... has interpolation mode that differs from another element
+/// packed into the same row"). Elements whose mode changes nothing take
+/// the row's: inputs no read chose a mode for, and outputs.
+#[test]
+fn a_row_gets_one_interpolation_mode() {
+    // Pixel inputs nothing reads: constant where the row holds an integer
+    // (DXIL wants integers constant or undefined), else the first's mode.
+    assert_eq!(
+        modes(vec![position(), uint(0, 1, 0), float(1, 2, 1)], &[], true),
+        [4, 1, 1]
+    );
+    assert_eq!(
+        modes(vec![position(), float(0, 2, 0), front_face(1, 1)], &[], true),
+        [4, 1, 1]
+    );
+    assert_eq!(
+        modes(vec![position(), float(0, 3, 0), float(1, 2, 1)], &[], true),
+        [4, 3, 3]
+    );
+    // A read input keeps the mode its reads chose; the others take it.
+    assert_eq!(
+        modes(vec![position(), float(0, 2, 0), float(1, 3, 1)], &[1], true),
+        [4, 2, 2]
+    );
+    assert_eq!(
+        modes(vec![position(), float(0, 4, 0), float(1, 2, 1)], &[1], true),
+        [4, 4, 4]
+    );
+    assert_eq!(
+        modes(vec![position(), float(0, 2, 0), uint(1, 1, 1)], &[2], true),
+        [4, 1, 1]
+    );
+    // An integer beside a read float of another mode: undefined, which
+    // dxil.dll takes before the row's other elements.
+    assert_eq!(
+        modes(vec![position(), uint(0, 1, 0), float(1, 2, 1)], &[2], true),
+        [4, 0, 2]
+    );
+    // Outputs: their mode is the next stage's to say.
+    assert_eq!(
+        modes(vec![position(), uint(0, 1, 0), float(1, 2, 1)], &[1, 2], false),
+        [4, 1, 1]
+    );
+    assert_eq!(
+        modes(vec![position(), float(0, 2, 0), float(1, 4, 1)], &[1, 2], false),
+        [4, 2, 2]
+    );
+    // Rows dxil.dll takes are left as they are: an undefined element
+    // before a defined one, and one mode.
+    assert_eq!(
+        modes(vec![position(), uint(0, 0, 0), float(1, 2, 1)], &[], true),
+        [4, 0, 2]
+    );
+    assert_eq!(
+        modes(vec![position(), float(0, 2, 0), float(1, 2, 1)], &[], false),
+        [4, 2, 2]
+    );
+    // Two modes read in one row: left to dxil.dll, which refuses them.
+    assert_eq!(
+        modes(vec![position(), float(0, 2, 0), float(1, 3, 1)], &[1, 2], true),
+        [4, 2, 3]
+    );
+}
+
+/// The rows of [`a_row_gets_one_interpolation_mode`] in finished
+/// containers: dxil.dll takes each.
+#[test]
+fn rows_of_one_mode_validate() {
+    let ps = [
+        ("uint and float unread", vec![position(), uint(0, 1, 0), float(1, 2, 1)], vec![]),
+        ("float unread beside the front face", vec![position(), float(0, 2, 0), front_face(1, 1)], vec![]),
+        ("linear read, centroid unread", vec![position(), float(0, 2, 0), float(1, 3, 1)], vec![1]),
+        ("noperspective read, linear unread", vec![position(), float(0, 4, 0), float(1, 2, 1)], vec![1]),
+        ("linear unread, uint read", vec![position(), float(0, 2, 0), uint(1, 1, 1)], vec![2]),
+        ("uint unread, then linear read", vec![position(), uint(0, 1, 0), float(1, 2, 1)], vec![2]),
+    ];
+    for (what, inputs, reads) in ps {
+        validates(&format!("pixel inputs: {what}"), &pixel(inputs, &reads));
+    }
+    let vs = [
+        ("uint and float", vec![position(), uint(0, 1, 0), float(1, 2, 1)]),
+        ("float and uint", vec![position(), float(0, 2, 0), uint(1, 1, 1)]),
+        ("linear and noperspective", vec![position(), float(0, 2, 0), float(1, 4, 1)]),
+    ];
+    for (what, outputs) in vs {
+        validates(&format!("vertex outputs: {what}"), &vertex(outputs));
+    }
+}
+
+/// What stays refused, and why: an integer after a read element of another
+/// mode in its row can be neither that mode (integers are constant or
+/// undefined) nor undefined (the row has a mode by then); its row needs
+/// the read lowered otherwise (as a constant input and barycentric
+/// weights). The test keeps dxil.dll's rules the row pass relies on in
+/// sight: if a later dxil.dll takes this, the pass can do more.
+#[test]
+fn an_integer_after_a_read_float_of_another_mode_stays_refused() {
+    let ps = pixel(vec![position(), float(0, 2, 0), uint(1, 1, 1)], &[1]);
+    if let Some(r) = verdict("an integer after a linear float", &ps) {
+        let e = r.expect_err("dxil.dll took an integer after a linear float in one row");
+        assert!(e.contains("interpolation mode that differs"), "{e}");
+    }
+}
+
+/// A console pixel program whose attribute rows hold a flat channel the
+/// program reads (`v_interp_mov` P0) beside one it does not read, and an
+/// uint beside a float, neither read: translated whole, each row has one
+/// mode and dxil.dll takes the container.
+#[test]
+fn a_console_row_of_a_flat_channel_and_others_validates() {
+    use crate::native::{NativeProgram, PsInput, StageIo, Usage};
+    let words = [
+        0xC80E_0002u32, // v_interp_mov_f32 v3, p0, attr0.x
+        0xF800_180F,
+        0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+        0xBF81_0000,
+    ];
+    let input = |row: u8| PsInput {
+        usage: Usage::Generic,
+        row,
+        mask: 0b0011,
+        attr: row,
+        flat: false,
+        fp16: false,
+        pack2: false,
+        row2: 0,
+    };
+    let native = NativeProgram {
+        stage: crate::HwStage::Ps,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![input(0), input(1)],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let at = |e: SigElement, row: u32| SigElement {
+        row: Some(row),
+        interp: 0,
+        ..e
+    };
+    let isg1 = container::signature(
+        &[
+            at(float(0, 0, 0), 0),
+            at(float(1, 0, 1), 0),
+            at(uint(2, 0, 0), 1),
+            at(float(3, 0, 1), 1),
+        ],
+        true,
+    );
+    let mut target = el("SV_Target", 0, 16, 9, 0, Some(0), 0, 4);
+    target.usage = 0xf;
+    let osg1 = container::signature(&[target], false);
+    let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+    let c = Container::parse(&bytes).unwrap();
+    let out = super::translate_program(&c, &native).unwrap_or_else(|(step, e)| {
+        panic!("{}: {e}", step.name());
+    });
+    validates("the console pixel program", &out.dxil);
 }

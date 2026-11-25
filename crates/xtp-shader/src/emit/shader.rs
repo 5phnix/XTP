@@ -502,6 +502,9 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        one_mode_per_row(&mut self.inputs, self.pixel);
+        one_mode_per_row(&mut self.outputs, false);
+        one_mode_per_row(&mut self.prims, false);
         let threads = self
             .threads
             .map_or(String::new(), |[x, y, z]| format!("threads {x}x{y}x{z}, "));
@@ -885,5 +888,75 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Whether dxil.dll refuses the interpolation modes of row `row`: DXIL
+/// packs one mode per row, that of the row's first element (in element
+/// order), and refuses a later element of another mode, undefined (0)
+/// included, once the row has a defined one ("interpolation mode that
+/// differs from another element packed into the same row").
+fn row_conflict(elements: &[SigElement], row: u32) -> bool {
+    let mut mode = 0;
+    for e in elements.iter().filter(|e| e.row == Some(row)) {
+        if mode != 0 && e.interp != mode {
+            return true;
+        }
+        mode = e.interp;
+    }
+    false
+}
+
+/// Gives the elements packed into one row interpolation modes dxil.dll
+/// takes together, in the rows where it would refuse theirs
+/// ([`row_conflict`]).
+///
+/// Rows are the console's, packed by its own rules: an attribute row holds
+/// a flat channel beside interpolated ones (`v_interp_mov` reads P0 of any
+/// channel). The modes are DXC's defaults by type (`emit_for`), except for
+/// the pixel inputs a program reads, whose reads chose theirs. Those are
+/// kept (`reads`: the inputs of a pixel shader). The others do not change
+/// what a program computes (an output: the next stage's inputs say how it
+/// is interpolated; an input nothing reads), so they take the mode of the
+/// row's read elements; else constant where the row holds an integer (DXIL
+/// wants integers constant or undefined), else the mode of the row's first
+/// element. An integer beside a read element of another mode is made
+/// undefined, which dxil.dll takes only before the row's other elements;
+/// a row read with two modes is left as it is (dxil.dll refuses it: its
+/// reads would have to be lowered otherwise).
+pub(crate) fn one_mode_per_row(elements: &mut [SigElement], reads: bool) {
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let int = |e: &SigElement| e.comp != 9;
+    let kept = |e: &SigElement| reads && e.usage != 0 && e.interp != 0;
+    for row in rows {
+        if !row_conflict(elements, row) {
+            continue;
+        }
+        let in_row: Vec<usize> = (0..elements.len())
+            .filter(|&i| elements[i].row == Some(row))
+            .collect();
+        let mut read = in_row
+            .iter()
+            .map(|&i| &elements[i])
+            .filter(|e| kept(e))
+            .map(|e| e.interp);
+        let mode = match read.next() {
+            Some(m) if read.all(|r| r == m) => m,
+            Some(_) => continue,
+            None if in_row.iter().any(|&i| int(&elements[i])) => 1,
+            None => in_row
+                .iter()
+                .map(|&i| elements[i].interp)
+                .find(|&m| m != 0)
+                .unwrap_or(1),
+        };
+        for &i in &in_row {
+            let e = &mut elements[i];
+            if !kept(e) {
+                e.interp = if int(e) && mode != 1 { 0 } else { mode };
+            }
+        }
     }
 }
