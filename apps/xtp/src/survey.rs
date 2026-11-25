@@ -341,6 +341,10 @@ pub(crate) struct Program {
     /// reaches its 16- or 64-bit float instructions: the host rounds to
     /// nearest even (`xtp_shader::ir::float_modes`, a shortcut).
     pub half_rounding: bool,
+    /// A translated mesh shader whose outputs pass D3D12's 32 KiB
+    /// ([`MESH_OUTPUT_BYTES`]; `emit/lower/mesh.rs`, a shortcut): the host's
+    /// driver takes it, the validator refuses it.
+    pub mesh_over: bool,
 }
 
 /// One record of the pack and its programs.
@@ -504,6 +508,7 @@ fn record(source: &Source, validator: Option<&mut Validator>, target: emit::Targ
     };
     let mut validator = validator;
     for p in &programs {
+        let mut mesh_over = false;
         let outcome = match p.stage {
             HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms => {
                 // A panic is a translator bug: it is counted, not fatal.
@@ -511,14 +516,19 @@ fn record(source: &Source, validator: Option<&mut Validator>, target: emit::Targ
                     emit::translate_program_for(&container, p, target)
                 }));
                 match translated {
-                    Ok(Ok(shader)) => Outcome::Translated {
-                        output: output_hash(&shader),
-                        wave: shader.wave_size(),
-                        check: validator.as_deref_mut().map(|v| {
-                            v.validate(&mut shader.dxil.clone())
-                                .map_err(|text| first_error(&text))
-                        }),
-                    },
+                    Ok(Ok(shader)) => {
+                        mesh_over = p.stage == HwStage::Ms
+                            && mesh_output_bytes(&shader.dxil)
+                                .is_some_and(|n| n > MESH_OUTPUT_BYTES);
+                        Outcome::Translated {
+                            output: output_hash(&shader),
+                            wave: shader.wave_size(),
+                            check: validator.as_deref_mut().map(|v| {
+                                v.validate(&mut shader.dxil.clone())
+                                    .map_err(|text| first_error(&text))
+                            }),
+                        }
+                    }
                     Ok(Err((step, e))) => Outcome::Failed {
                         step: step.name(),
                         what: what(&e),
@@ -552,9 +562,42 @@ fn record(source: &Source, validator: Option<&mut Validator>, target: emit::Targ
             wave64: p.wave64,
             outcome,
             half_rounding,
+            mesh_over,
         });
     }
     out
+}
+
+/// D3D12's limit on a mesh shader's outputs: vertex plus primitive output
+/// scalars times the maxima, 4 bytes each (`dxil.dll`'s "vertex plus
+/// primitive output size is greater than 32768").
+const MESH_OUTPUT_BYTES: u32 = 32 * 1024;
+
+/// The output bytes a translated mesh shader declares, as the validator
+/// counts them: the components of its `OSG1` elements times its maximum
+/// vertices, plus those of `PSG1` times its maximum primitives (`PSV0`).
+fn mesh_output_bytes(dxil: &[u8]) -> Option<u32> {
+    let c = Container::parse(dxil).ok()?;
+    let u32_at =
+        |d: &[u8], at: usize| Some(u32::from_le_bytes(d.get(at..at + 4)?.try_into().ok()?));
+    let scalars = |fourcc| -> Option<u32> {
+        let Some(part) = c.part(fourcc) else {
+            return Some(0);
+        };
+        let d = part.data;
+        let (n, base) = (u32_at(d, 0)? as usize, u32_at(d, 4)? as usize);
+        (0..n)
+            .map(|i| d.get(base + 32 * i + 24).map(|m| m.count_ones()))
+            .sum()
+    };
+    let psv = c.part(FourCC::PSV0)?.data;
+    // Runtime info after its size: maximum vertices and primitives at 12.
+    let max = |at: usize| {
+        Some(u32::from(u16::from_le_bytes(
+            psv.get(4 + at..6 + at)?.try_into().ok()?,
+        )))
+    };
+    Some(4 * (scalars(FourCC::OSG1)? * max(12)? + scalars(FourCC::PSG1)? * max(14)?))
 }
 
 /// A blocker's text without the code offset, so programs group by it.
@@ -621,6 +664,8 @@ pub(crate) struct Totals {
     /// Translations under a 16- or 64-bit rounding the host does not apply
     /// ([`Program::half_rounding`]).
     pub half_rounding: PerStage,
+    /// Mesh translations past D3D12's output limit ([`Program::mesh_over`]).
+    pub mesh_over: usize,
     /// The hash of every translation's hash, in pack order.
     pub digest: Option<blake3::Hash>,
 }
@@ -648,6 +693,7 @@ impl Totals {
                         if p.half_rounding {
                             *t.half_rounding.entry(p.stage).or_default() += 1;
                         }
+                        t.mesh_over += usize::from(p.mesh_over);
                         digest.update(&(i as u64).to_le_bytes());
                         digest.update(&(k as u64).to_le_bytes());
                         digest.update(output.as_bytes());
@@ -857,6 +903,11 @@ pub(crate) fn report(s: &Survey, path: &str) -> String {
     );
     let _ = writeln!(
         o,
+        "mesh outputs {} mesh translations declare more than 32 KiB of outputs (the driver takes them, the validator does not)",
+        t.mesh_over
+    );
+    let _ = writeln!(
+        o,
         "\noutputs      blake3 {} ({translated} translations)",
         t.digest.map(|d| d.to_string()).unwrap_or_default()
     );
@@ -998,6 +1049,7 @@ pub(crate) fn to_json(s: &Survey) -> String {
         }
     }
     let _ = writeln!(o, "  \"half_rounding\": {},", per_stage(&t.half_rounding));
+    let _ = writeln!(o, "  \"mesh_outputs_over_32k\": {},", t.mesh_over);
     let _ = writeln!(
         o,
         "  \"outputs\": \"{}\",",
