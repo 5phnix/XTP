@@ -261,7 +261,7 @@ name (d687ecdb).
 
 | Pass | Role (program) | Reads | Writes |
 |---|---|---|---|
-| P334 | tiled depth processing (`deferred_tiled`) | main depth | 80×45 RG32F per 16×16 tile: min/max linear depth; max 9 986 m, mean 7 394/9 076 m |
+| P334 | the tiled deferred lighting's depth processing | main depth | 80×45 RG32F per 16×16 tile: min/max linear depth; max 9 986 m, mean 7 394/9 076 m |
 | P650 | autofocus scan, first reduction | the 80×45 tiles | 5×3 |
 | P651 | autofocus scan, final reduction | 5×3 | 1×1: [7 496, 9 984, 1 024, 0] |
 | P652 | lens parameters (`2bfdc19dc1f25b3a`, 1×1×1) | 1×1, CPU constants (224 bytes) | a 48-byte lens buffer, ping-ponged (`0x95e0ff960`, `0x9191fcf30`), and 16 bytes |
