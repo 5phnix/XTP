@@ -1069,6 +1069,7 @@ impl State {
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
+            crate::resource::decode::wrote(list, t as This);
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
@@ -1223,12 +1224,17 @@ impl State {
         // set after them.
         let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
         let root_uavs = p.stages.iter().any(|s| !s.root_uavs.is_empty());
-        use xtp_shader::emit::{PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV};
+        use xtp_shader::emit::{
+            INDEXED_ADDRESS_SRV, PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV,
+        };
         let constant_reads = p.stages.iter().any(|s| {
             s.translated().host.user_data.iter().any(|u| {
                 matches!(
                     u.root,
-                    PACKED_ADDRESS_SRV | SCALAR_ADDRESS_SRV | VECTOR_ADDRESS_SRV
+                    INDEXED_ADDRESS_SRV
+                        | PACKED_ADDRESS_SRV
+                        | SCALAR_ADDRESS_SRV
+                        | VECTOR_ADDRESS_SRV
                 )
             })
         });
@@ -1236,6 +1242,10 @@ impl State {
             constant_reads || root_uavs || root_srvs && crate::pipeline::host::bounded_root_srvs(),
         );
         self.set_host_heaps(list, wanted);
+        list.decode_uses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin_bind();
         self.bind_pipeline(list, p, compute);
         let picked = p
             .stages
@@ -1257,6 +1267,13 @@ impl State {
             crate::frameprobe::begin(&stage.shader.hash);
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
+            // Decoding binds a compute PSO and root signature. Restore the descriptor
+            // tables before setting the compute stage's root arguments.
+            if list.decode_pipeline.swap(false, Ordering::Relaxed) {
+                self.host_roots[1] = 0;
+                self.host_pipeline = 0;
+                self.bind_pipeline(list, p, compute);
+            }
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1314,7 +1331,10 @@ impl State {
                     }
                     if matches!(
                         u.root,
-                        PACKED_ADDRESS_SRV | SCALAR_ADDRESS_SRV | VECTOR_ADDRESS_SRV
+                        INDEXED_ADDRESS_SRV
+                            | PACKED_ADDRESS_SRV
+                            | SCALAR_ADDRESS_SRV
+                            | VECTOR_ADDRESS_SRV
                     ) {
                         let words = match self.roots_ref(compute).get(usize::from(u.slot)) {
                             Some(Root::Constants(words)) => words.as_slice(),
@@ -1332,8 +1352,11 @@ impl State {
                                     })
                             }),
                         });
-                        values[u.index as usize] =
-                            self.root_srv_slot(list, address.filter(|&a| a != 0))?.1;
+                        values[u.index as usize] = if u.root == INDEXED_ADDRESS_SRV {
+                            self.indexed_address_srv(list, address)?
+                        } else {
+                            self.root_srv_slot(list, address.filter(|&a| a != 0))?.1
+                        };
                         continue;
                     }
                     values[u.index as usize] = match fresh {
@@ -1411,6 +1434,7 @@ impl State {
         {
             self.writes += 1;
         }
+        crate::resource::decode::bound_writes(list);
         list.twins_written();
         Ok(())
     }
@@ -1910,6 +1934,34 @@ impl State {
         Ok((host.gpu_handle(slot), window.bias))
     }
 
+    /// Lie la copie qui contient la base. Le shader conserve l'index GPU et
+    /// l'identité du tampon, même pour une base décalée dans la copie.
+    fn indexed_address_srv(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+    ) -> Result<u32, &'static str> {
+        let (a, copy) = address
+            .filter(|&a| a != 0)
+            .and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)))
+            .ok_or("an indexed BVH buffer without a host copy")?;
+        let heap = self.host_heaps[0];
+        let host = host_heap(heap).ok_or("an indexed BVH buffer without a view heap")?;
+        let offset = copy.offset(a);
+        let bias = offset % 16;
+        let len = copy.left(a);
+        let span = len
+            .checked_add(bias)
+            .filter(|&n| n <= u64::from(xtp_shader::emit::RawWindow::MAX_DWORDS) * 4)
+            .ok_or("an indexed BVH buffer too large for a raw view")?;
+        let slot = host
+            .shared_raw(&copy, offset - bias, span)
+            .ok_or("no shared slot for an indexed BVH buffer")?;
+        self.recording.shared(list, heap, slot);
+        copy.refresh(list, a, len);
+        Ok((slot << 4) | bias as u32)
+    }
+
     /// The slot, in the view heap set on the host list (the title's, or
     /// XTP's own: [`State::wanted_heaps`]), of a root SRV's one-view table:
     /// a raw view from `address` to the end of its buffer's host copy, the
@@ -2046,6 +2098,9 @@ impl State {
         let len = s.left(address).min(CBV_SPAN);
         let gpu = s.gpu(address);
         if !gpu.is_multiple_of(256) {
+            if let Some(gpu) = self.gpu_cbv_fill(list, address, len) {
+                return Some(gpu);
+            }
             // The memory goes with the recording.
             self.recording.lease(list);
             return self.own.upload_fill(list, address, len);
@@ -2078,6 +2133,17 @@ impl State {
         Some(copied)
     }
 
+    fn gpu_cbv_fill(&mut self, list: &HostList, address: u64, len: u64) -> Option<u64> {
+        let shadow = crate::host::host()?.fill_source(address, len)?;
+        let (buffer, at) = self
+            .own
+            .gpu_copy(list, &shadow.buffer, shadow.offset(address), len)?;
+        self.recording.lease(list);
+        shadow.refresh(list, address, len);
+        // SAFETY: the recording holds the aligned chunk until its lists finish.
+        Some(unsafe { buffer.GetGPUVirtualAddress() } + at)
+    }
+
     /// Runs a dispatch on the host; the first that runs after dropped ones
     /// starts with a barrier ([`State::dispatch_dropped`]).
     pub(crate) fn dispatch(&mut self, list: &HostList, [x, y, z]: [u32; 3], limits: [u32; 3]) {
@@ -2099,6 +2165,9 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            // XTP_FRAME_PROBE: what it would read (`frameprobe::dropped`).
+            #[cfg(feature = "diagnostics")]
+            self.probe_dropped(list, None);
             self.rt_dropped(list, crate::rt_standin::Work::Groups([x, y, z]));
             self.dispatch_dropped(Unready::NoPipeline);
             return;
@@ -2406,6 +2475,10 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(gpu) = self.gpu_cbv_fill(list, address, u64::from(size)) {
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some(gpu) = list.scratch_fill(address, u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -2550,6 +2623,28 @@ impl State {
                 })
             })
             .collect()
+    }
+
+    /// `XTP_FRAME_PROBE` for a dispatch dropped without a host pipeline
+    /// (diagnostics): the tables its compute program says it uses, from its
+    /// console program (`pipeline::Shader::native`), resolved from the
+    /// roots the title bound, and for an indirect one its `arguments`.
+    #[cfg(feature = "diagnostics")]
+    fn probe_dropped(&self, list: &HostList, arguments: Option<(u64, u64)>) {
+        let Some(shader) = crate::pipeline::compute_shader(self.pipeline as This) else {
+            return;
+        };
+        if !crate::frameprobe::wanted(&shader.hash) {
+            return;
+        }
+        let Ok(native) = shader.native() else {
+            return;
+        };
+        let tables = self.probe_tables(&native.used, &[], true);
+        crate::frameprobe::dropped(list, &shader.hash, tables);
+        if let Some((address, len)) = arguments {
+            crate::frameprobe::arguments(list, address, len);
+        }
     }
 
     pub(crate) fn draw(
@@ -2861,6 +2956,11 @@ impl State {
             return fail("no host signature".into());
         }
         let Some(p) = crate::pipeline::host_pipeline(pipeline as This) else {
+            // XTP_FRAME_PROBE: what it would read, and its arguments.
+            #[cfg(feature = "diagnostics")]
+            if kind == DISPATCH {
+                self.probe_dropped(list, Some((arguments, len)));
+            }
             if kind == DISPATCH {
                 // Le substitut de ray tracing utilise le nombre réel de commandes
                 // comme prédicat GPU. Lui seul a besoin du bridage en cas de rejet.
@@ -2943,6 +3043,9 @@ impl State {
         if let Err(why) = ready {
             return fail(why);
         }
+        // XTP_FRAME_PROBE: the argument records of a probed op.
+        #[cfg(feature = "diagnostics")]
+        crate::frameprobe::arguments(list, arguments, len);
         let stats = self.own.indirect_samples.next(list, pipeline);
         let Some(out) = crate::indirect::bound(
             list,
@@ -3303,6 +3406,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             crate::capture::note_target(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::passdump::written(list, *resource as This);
+            crate::resource::decode::bound_uav(list, *resource as This);
             list.twin_use(*resource as This, true, true);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
@@ -4832,6 +4936,54 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut c = state(heap.0);
         heaps(&mut c, la.host());
         assert_eq!(slot(&mut c, &la, Some(16)), first);
+    }
+
+    #[test]
+    fn a_cbv_fill_reads_an_in_flight_shaders_output_on_the_gpu() {
+        use crate::host::submissions::{Gate, serial, watched};
+        let _serial = serial();
+        let Some(gpu) =
+            crate::testgpu::device("a_cbv_fill_reads_an_in_flight_shaders_output_on_the_gpu")
+        else {
+            return;
+        };
+        let host = gpu.host();
+        let reader = Reader::new(host, true);
+        let kernel = Kernel::new(host);
+        let first = host.new_list().unwrap();
+        let second = host.new_list().unwrap();
+        let base = watched(4 << 20) as u64;
+        let address = base + 16; // A valid title CBV, misaligned on the host.
+        let shadow = crate::shadow::find(base, CBV_SPAN + 16).unwrap();
+        shadow.refresh(&first, base, crate::watch::PAGE as u64);
+        kernel.dispatch(&first, Pass::Fill, base + 2 * CBV_SPAN, address);
+        first.close();
+        let (out, data) = host.shared_buffer(WORDS as u64 * 4).unwrap();
+        let mut state = state(std::ptr::null());
+        let mut gate = Gate::close(host);
+        host.execute(&[&first]);
+        heaps(&mut state, &second);
+        let cbv = state.root_cbv(&second, address).unwrap();
+        assert_eq!(state.own.copied, CBV_SPAN);
+        // SAFETY: live pipeline and buffers until both lists have finished.
+        unsafe {
+            second.list.SetComputeRootSignature(&reader.root);
+            second.list.SetPipelineState(&reader.pso);
+            second.list.SetComputeRootConstantBufferView(0, cbv);
+            second
+                .list
+                .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            second.list.Dispatch(1, 1, 1);
+        }
+        second.close();
+        host.execute(&[&second]);
+        assert!(first.running() && second.running());
+        gate.open();
+        host.drain();
+        // SAFETY: the GPU is done writing the mapped result.
+        let got = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), WORDS) };
+        assert_eq!(&got[..64], (0..64).map(pattern).collect::<Vec<_>>());
+        assert_eq!(&got[64..], [0; WORDS - 64]);
     }
 
     /// A root CBV reads its 64 KiB inside memory the list holds: in place

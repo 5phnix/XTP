@@ -1192,7 +1192,7 @@ static PREDICATE_WORDS: OnceLock<Option<Predicates>> = OnceLock::new();
 /// One copy's predicate word: the copy runs unless it is 0. It goes back
 /// when its holder goes (the list's submission step, dropped once the list
 /// is reset and nothing running uses its recording).
-struct Predicate {
+pub(crate) struct Predicate {
     of: &'static Predicates,
     at: u32,
     /// The submission being prepared (`timestamps::submissions`, plus one)
@@ -1203,7 +1203,7 @@ struct Predicate {
 impl Predicate {
     /// A free word, set to run (so a copy whose step never ran would run);
     /// `None` without predication or once they are all taken (logged once).
-    fn take() -> Option<Predicate> {
+    pub(crate) fn take() -> Option<Predicate> {
         let of = PREDICATE_WORDS
             .get_or_init(|| {
                 if !predication() {
@@ -1231,6 +1231,25 @@ impl Predicate {
         Some(p)
     }
 
+    pub(crate) fn bind(&self, list: &HostList) {
+        // SAFETY: the predicate word stays allocated until this list finishes.
+        unsafe {
+            list.list.SetPredication(
+                &self.of.buffer,
+                self.offset(),
+                D3D12_PREDICATION_OP_EQUAL_ZERO,
+            )
+        };
+    }
+
+    pub(crate) fn unbind(list: &HostList) {
+        // SAFETY: the command list is open.
+        unsafe {
+            list.list
+                .SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)
+        };
+    }
+
     fn offset(&self) -> u64 {
         u64::from(self.at) * 8
     }
@@ -1241,7 +1260,7 @@ impl Predicate {
     /// one word, so the second decision must not take the copy from the
     /// first (VIctory #1500, by A6thGraderFr, handles that case too).
     /// Returns whether the copy runs.
-    fn decide(&self, due: bool, submission: u64) -> bool {
+    pub(crate) fn decide(&self, due: bool, submission: u64) -> bool {
         let this = submission + 1;
         let runs = due || self.ran_in.load(Ordering::Relaxed) == this;
         if runs {

@@ -10,7 +10,7 @@ use crate::testgpu::{Kernel, Pass, TitleBuffer, device, pattern};
 /// ([`Gate`]) would stop one that waits inside a submission (which holds
 /// the submission lock) until the gate's timer opens it. Tests elsewhere
 /// wait for the GPU only after submitting, so they are only delayed.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -111,7 +111,7 @@ fn submissions_finish_in_order_after_their_gpu_work() {
 /// Title memory as the runtime reserves it, write-watched: `len` bytes at
 /// the start of a 4 MiB window of their own (a window of loose memory gets
 /// one host copy, `shadow::find`). Never freed: the copy outlives the test.
-fn watched(len: usize) -> usize {
+pub(crate) fn watched(len: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
     };

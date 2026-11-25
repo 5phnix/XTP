@@ -1169,6 +1169,44 @@ impl<'a> Lower<'a> {
         );
     }
 
+    fn indexed_constant_dword(
+        &mut self,
+        read: crate::resource::ConstantRead,
+        index: crate::ir::Value,
+    ) -> Result<V, Why> {
+        let binding = self.host_word(crate::emit::INDEXED_ADDRESS_SRV, read.slot, read.dword);
+        let c = self.cur;
+        let (four, fifteen) = (self.s.m.i32(4), self.s.m.i32(15));
+        let slot = self.s.m.bin(c, Bin::LShr, binding, four);
+        let bias = self.s.m.bin(c, Bin::And, binding, fifteen);
+        let handle = self.s.heap_handle(c, slot, false, false, (11, 0));
+        let index = self.i32_of(index)?;
+        // Une vue brute tient dans 512 Mio. Un grand index doit rester hors
+        // de la vue, même si lui ajouter le biais ou 4 ferait déborder le u32.
+        let limit = self.s.m.i32(crate::emit::RawWindow::MAX_DWORDS * 4);
+        let fits = self.s.m.cmp(c, pred::IULT, index, limit);
+        let byte = self.s.m.bin(c, Bin::Add, index, bias);
+        let byte = self.s.m.select(c, fits, byte, limit);
+        let mask = self.s.m.i32(!3);
+        let aligned = self.s.m.bin(c, Bin::And, byte, mask);
+        let next = self.s.m.bin(c, Bin::Add, aligned, four);
+        let low = self.raw_words(handle, aligned, 1)[0];
+        let high = self.raw_words(handle, next, 1)[0];
+        // Deux lectures alignées couvrent aussi un dword à cheval sur deux mots.
+        let three = self.s.m.i32(3);
+        let lane = self.s.m.bin(c, Bin::And, byte, three);
+        let shift = self.s.m.bin(c, Bin::Shl, lane, three);
+        let low = self.s.m.bin(c, Bin::LShr, low, shift);
+        let zero = self.s.m.i32(0);
+        let inv = self.s.m.bin(c, Bin::Sub, zero, shift);
+        let bits = self.s.m.i32(31);
+        let inv = self.s.m.bin(c, Bin::And, inv, bits);
+        let hi = self.s.m.bin(c, Bin::Shl, high, inv);
+        let partial = self.s.m.cmp(c, pred::NE, shift, zero);
+        let hi = self.s.m.select(c, partial, hi, zero);
+        Ok(self.s.m.bin(c, Bin::Or, low, hi))
+    }
+
     pub(super) fn constant_read_handle(
         &mut self,
         read: crate::resource::ConstantRead,
@@ -1318,6 +1356,11 @@ impl<'a> Lower<'a> {
             return Err("a global load result");
         };
         if let Some(&read) = self.x.res.constant_reads.get(&(b, i)) {
+            if let Some(index) = read.index {
+                let x = self.indexed_constant_dword(read, index)?;
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
+            }
             let h = self.constant_read_handle(read, false);
             for k in 0..n {
                 let at = self.s.m.i32(read.offset + 4 * k);

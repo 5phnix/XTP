@@ -33,8 +33,7 @@
 //!   fails is made again by the next one.
 //! - Generations: a library cannot drop an entry, and every translator
 //!   change adds a name for each pipeline whose code changed, beside the
-//!   old one. `xtp precook` therefore makes a new generation when the
-//!   translator changed or the file grew past a bound ([`rebuild`]): the
+//!   old one. `xtp precook` compacts oversized files ([`rebuild`]): the
 //!   library starts empty, what it asks for is taken from the generation
 //!   before when that has it (loaded there, stored here) and made
 //!   otherwise, and the save replaces the file with the new generation
@@ -74,7 +73,7 @@ struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
     _blob: Vec<u8>,
-    /// Pipelines stored since the last save.
+    /// Changes since the last save, including replacing a generation.
     added: AtomicU64,
     /// While a new generation is made ([`rebuild`]): the one before, read
     /// only.
@@ -156,13 +155,6 @@ pub(crate) fn file_bytes() -> Option<u64> {
         .map(|m| m.len())
 }
 
-/// For tests: whether the host keeps pipelines in a library (it may have
-/// none).
-#[cfg(test)]
-pub(crate) fn available() -> bool {
-    library().is_some()
-}
-
 /// The host's library of `bytes`, which must outlive it.
 fn make(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
     // SAFETY: the callers keep the bytes beside the library.
@@ -228,7 +220,8 @@ fn new_generation(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     Some(Library {
         library,
         _blob: Vec::new(),
-        added: AtomicU64::new(0),
+        // Even a generation with no surviving pipelines replaces its file.
+        added: AtomicU64::new(1),
         previous,
     })
 }
@@ -346,8 +339,15 @@ pub(crate) enum Saved {
 pub(crate) fn save(now: bool) -> Saved {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else {
+    let Some(dir) = DIR.get() else {
         return Saved::Nothing;
+    };
+    let Some(library) = library() else {
+        return if REBUILD.load(Ordering::SeqCst) {
+            Saved::Failed("the host could not create the replacement pipeline library".into())
+        } else {
+            Saved::Nothing
+        };
     };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -425,30 +425,33 @@ fn write_library(
             Err(std::sync::TryLockError::WouldBlock) => return Saved::Nothing,
         }
     };
-    let serialised = {
-        // Alone: no store between the size and the bytes.
-        let l = library.write().unwrap_or_else(|e| e.into_inner());
-        let added = l.added.load(Ordering::Relaxed);
-        if added == 0 {
-            None
-        } else {
-            // SAFETY: a buffer of the size the library asks for.
-            let bytes = unsafe {
-                let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-                l.library.Serialize(&mut bytes).map(|()| bytes)
-            };
-            match bytes {
-                Ok(bytes) => Some((bytes, added)),
-                Err(e) => return Saved::Failed(format!("not serialised: {e}")),
+    let path = dir.join(LIBRARY_FILE);
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let serialised = (|| -> std::io::Result<_> {
+        std::fs::create_dir_all(dir)?;
+        let (mapped, added) = {
+            // Alone: no store between the size and the bytes.
+            let l = library.write().unwrap_or_else(|e| e.into_inner());
+            let added = l.added.load(Ordering::Relaxed);
+            if added == 0 {
+                return Ok(None);
             }
+            (LibraryFile::serialize(&tmp, &l.library)?, added)
+        };
+        let size = mapped.size;
+        mapped.flush()?;
+        drop(mapped);
+        std::fs::rename(&tmp, &path)?;
+        Ok(Some((size, added)))
+    })();
+    let serialised = match serialised {
+        Ok(result) => result,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Saved::Failed(e.to_string());
         }
     };
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| match &serialised {
-            Some((bytes, _)) => write_atomically(&dir.join(LIBRARY_FILE), bytes),
-            None => Ok(()),
-        })
-        .and_then(|()| then(serialised.as_ref().map(|(b, _)| b.len())));
+    let written = then(serialised.map(|(size, _)| size));
     match (written, serialised) {
         (Err(e), _) => Saved::Failed(e.to_string()),
         (Ok(_), Some((_, added))) => {
@@ -459,6 +462,90 @@ fn write_library(
         }
         (Ok(true), None) => Saved::Written,
         (Ok(false), None) => Saved::Nothing,
+    }
+}
+
+/// D3D12 needs one contiguous output buffer. A writable view of the
+/// temporary file avoids a second library-sized allocation in the heap.
+struct LibraryFile {
+    file: std::fs::File,
+    view: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+    size: usize,
+}
+
+impl LibraryFile {
+    fn serialize(
+        path: &std::path::Path,
+        library: &ID3D12PipelineLibrary1,
+    ) -> std::io::Result<Self> {
+        use std::os::windows::{
+            fs::OpenOptionsExt,
+            io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        };
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+        };
+
+        // SAFETY: a live library under its exclusive lock.
+        let size = unsafe { library.GetSerializedSize() };
+        if size > isize::MAX as usize {
+            return Err(std::io::Error::other(
+                "pipeline library is too large to map",
+            ));
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(path)?;
+        file.set_len(size as u64)?;
+        // SAFETY: an unnamed mapping of this file, extended to exactly size.
+        let section = unsafe {
+            CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if section.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the newly created handle is ours; the view retains its
+        // section independently once this handle closes.
+        let section = unsafe { OwnedHandle::from_raw_handle(section) };
+        // SAFETY: the section covers the entire file and permits writes.
+        let view = unsafe { MapViewOfFile(section.as_raw_handle(), FILE_MAP_WRITE, 0, 0, size) };
+        if view.Value.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mapped = Self { file, view, size };
+        // SAFETY: the exclusively opened file has one writable view of size bytes.
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(view.Value.cast(), size);
+            library.Serialize(bytes).map_err(std::io::Error::other)?;
+        }
+        Ok(mapped)
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        use windows_sys::Win32::System::Memory::FlushViewOfFile;
+        // SAFETY: this view and its file stay open through the flush.
+        if unsafe { FlushViewOfFile(self.view.Value, self.size) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.file.sync_all()
+    }
+}
+
+impl Drop for LibraryFile {
+    fn drop(&mut self) {
+        // SAFETY: this object owns the sole view and unmaps it exactly once.
+        unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.view) };
     }
 }
 
@@ -762,6 +849,11 @@ mod tests {
         let old = RwLock::new(open(&device, Vec::new()).unwrap());
         assert_eq!(ask(&old, &host.device, &a, "a"), Source::Made);
         assert_eq!(ask(&old, &host.device, &b, "b"), Source::Made);
+        // Even a matching name must not return a pipeline whose
+        // description has different bytecode.
+        let mismatch = crate::testgpu::expect_layer_errors(|| ask(&old, &host.device, &b, "a"));
+        assert_eq!(mismatch, Source::Made);
+        assert_eq!(ask(&old, &host.device, &a, "a"), Source::Library);
         let new = RwLock::new(new_generation(&device, saved(&old)).unwrap());
         assert_eq!(ask(&new, &host.device, &a, "a"), Source::Previous);
         assert_eq!(ask(&new, &host.device, &a, "a"), Source::Library);
@@ -771,6 +863,13 @@ mod tests {
             ask(&next, &host.device, &b, "b"),
             Source::Made,
             "not asked for"
+        );
+        let empty = RwLock::new(new_generation(&device, saved(&next)).unwrap());
+        let reopened = RwLock::new(open(&device, saved(&empty)).unwrap());
+        assert_eq!(
+            ask(&reopened, &host.device, &a, "a"),
+            Source::Made,
+            "nothing survived"
         );
     }
 }

@@ -8,10 +8,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A console compute program of 64 threads, in 32-lane waves, that only
+/// A console compute program in 32-lane waves that only
 /// ends (`s_endpgm`), as the console compiler stores it: FSSM record, XBCH
 /// zlib blob, XDAT index in the `DXIL` part (`xtp_shader::native`).
-fn compute_container() -> Vec<u8> {
+fn compute_container(threads: u32) -> Vec<u8> {
     const RECORD: usize = 0x54;
     const STAGE_DATA: usize = 0x40;
     let code = 0xBF81_0000u32.to_le_bytes(); // s_endpgm
@@ -32,7 +32,7 @@ fn compute_container() -> Vec<u8> {
     r[0x14..0x18].copy_from_slice(&(1u32 << 5).to_le_bytes()); // wave32
     r[0x50..0x54].copy_from_slice(&(4u32 | 8 << 20).to_le_bytes()); // VGPRs, SGPRs
     let stage = RECORD;
-    r[stage + 0x28..stage + 0x34].copy_from_slice(&[64u32, 1, 1].map(u32::to_le_bytes).concat()); // threads
+    r[stage + 0x28..stage + 0x34].copy_from_slice(&[threads, 1, 1].map(u32::to_le_bytes).concat());
     payload.extend_from_slice(&r);
     payload.extend_from_slice(&code);
 
@@ -126,6 +126,16 @@ struct Run {
 /// Runs `exe precook <pack> --no-wait <args>` with a cache of its own in
 /// `dir`, on the test adapter; `None` (the test skipped) without a device.
 fn precook(exe: &Path, dir: &Path, pack: &Path, args: &[&str]) -> Option<Run> {
+    precook_with_settings(exe, dir, pack, args, &[])
+}
+
+fn precook_with_settings(
+    exe: &Path,
+    dir: &Path,
+    pack: &Path,
+    args: &[&str],
+    settings: &[(&str, &str)],
+) -> Option<Run> {
     let adapter = match std::env::var("XTP_TEST_ADAPTER").as_deref() {
         Ok("none") => {
             xtp_testkit::skip(xtp_testkit::reason::NO_GPU);
@@ -149,6 +159,7 @@ fn precook(exe: &Path, dir: &Path, pack: &Path, args: &[&str]) -> Option<Run> {
         .env_remove("XTP_HOST_LANES")
         .env_remove("XTP_LOG")
         .env_remove("RUST_LOG")
+        .envs(settings.iter().copied())
         .output()
         .expect("running xtp precook");
     let run = Run {
@@ -177,7 +188,7 @@ fn precook(exe: &Path, dir: &Path, pack: &Path, args: &[&str]) -> Option<Run> {
 #[test]
 fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     let dir = tempfile::tempdir().unwrap();
-    let compute = compute_container();
+    let compute = compute_container(64);
     let refused = container(&[]);
     let mut pack = b"SGD5".to_vec();
     pack.extend(record("CS_Synthetic_0011aabb_Wrapped", &compute));
@@ -232,7 +243,7 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
         listed.contains("refused: malformed shader: no DXIL part"),
         "{listed}"
     );
-    let library = pipelines.join("host-pipelines.bin").is_file();
+    assert!(pipelines.join("host-pipelines.bin").is_file(), "{out}");
     let kept = std::fs::read_to_string(pipelines.join("early-pipelines.txt")).unwrap();
     let mut kept: Vec<&str> = kept.lines().collect();
     kept.sort();
@@ -251,12 +262,10 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     assert_eq!(figure(out, "translated"), Some(0), "{out}");
     assert_eq!(figure(out, "from cache"), Some(1), "{out}");
     assert_eq!(figure(out, "refused"), Some(1), "the refusal, kept: {out}");
-    if library {
-        assert!(
-            out.contains("1 programs: 0 host pipelines made, 1 from the library"),
-            "{out}"
-        );
-    }
+    assert!(
+        out.contains("1 programs: 0 host pipelines made, 1 from the library"),
+        "{out}"
+    );
 
     // Another build of the same translator.
     let other = dir.path().join("xtp-other.exe");
@@ -272,4 +281,73 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     let shared = precook(&other, dir.path(), &pack_path, &["--force"]).unwrap();
     assert_eq!(figure(&shared.out, "translated"), Some(0), "{}", shared.out);
     assert_eq!(figure(&shared.out, "from cache"), Some(1), "{}", shared.out);
+}
+
+/// A new translation key with one changed DXIL. A loop-limit change gives
+/// the two loop-free programs a new key while preserving their DXIL. Changing
+/// the group size in one record then changes just that program's DXIL.
+#[test]
+fn precook_keeps_pipelines_across_translation_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shaders.rpf");
+    let xtp = Path::new(env!("CARGO_BIN_EXE_xtp"));
+    let write_pack = |threads| {
+        let mut pack = b"SGD5".to_vec();
+        pack.extend(record("CS_First_Wrapped", &compute_container(32)));
+        pack.extend(record("CS_Second_Wrapped", &compute_container(threads)));
+        std::fs::write(&path, pack).unwrap();
+    };
+    let run = |limit| {
+        precook_with_settings(
+            xtp,
+            dir.path(),
+            &path,
+            &[],
+            &[("XTP_SHADER_LOOP_LIMIT", limit)],
+        )
+    };
+    write_pack(64);
+    let Some(first) = run("128") else { return };
+    assert_eq!(figure(&first.out, "translated"), Some(2), "{}", first.out);
+    let library = dir.path().join("cache/pipelines/host-pipelines.bin");
+    assert!(library.is_file(), "{}", first.out);
+
+    write_pack(128);
+    let changed = run("256").unwrap().out;
+    assert_eq!(figure(&changed, "translated"), Some(2), "{changed}");
+    assert!(!changed.contains("a new generation"), "{changed}");
+    assert!(
+        changed.contains("1 host pipelines made, 1 from the library"),
+        "{changed}"
+    );
+
+    // The replaced pipeline is still available to a session using the old build.
+    write_pack(64);
+    let original = run("128").unwrap().out;
+    assert_eq!(figure(&original, "from cache"), Some(2), "{original}");
+    assert!(
+        original.contains("0 host pipelines made, 2 from the library"),
+        "{original}"
+    );
+
+    // A driver-rejected file is replaced with a usable library.
+    std::fs::write(library, b"invalid pipeline library").unwrap();
+    let repaired = run("128").unwrap().out;
+    assert!(
+        repaired.contains("2 host pipelines made, 0 from the library"),
+        "{repaired}"
+    );
+    let forced = precook_with_settings(
+        xtp,
+        dir.path(),
+        &path,
+        &["--force"],
+        &[("XTP_SHADER_LOOP_LIMIT", "128")],
+    )
+    .unwrap()
+    .out;
+    assert!(
+        forced.contains("0 host pipelines made, 2 from the library"),
+        "{forced}"
+    );
 }

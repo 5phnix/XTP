@@ -21,24 +21,29 @@
 //! - the range's bytes three times: title memory when the op is recorded,
 //!   title memory when its list is submitted (what the submission's
 //!   refresh takes), and the host copy on the GPU just before the op
-//!   (copied in the list where the op stands). [`BYTES`] at most each,
-//!   counted (non-zero bytes) and shown as words up to [`SHOWN`] bytes.
+//!   (copied in the list where the op stands). 64 KiB at most each
+//!   (`XTP_FRAME_PROBE_KIB`, up to 16 MiB; [`bytes`]), counted (non-zero
+//!   bytes, the first and the last of them) and shown as words up to
+//!   [`SHOWN`] bytes, and from the first non-zero byte when that lies
+//!   further. A frame's read-back holds 48 MiB (`XTP_FRAME_PROBE_MIB`, up
+//!   to 512; [`budget`]).
+//! - for a texture view: the host texture's size (depth or layers too) and
+//!   the title address of its memory, which tells two views of one texture.
+//!
+//! An indirect op of a listed program also gets its argument records, read
+//! the same three ways ([`arguments`]). A dispatch of a listed program
+//! that is dropped for want of a host pipeline (its program does not
+//! translate) is probed too, as "dropped": the tables its console program
+//! says it uses, resolved from the roots the title bound ([`dropped`]), so
+//! what it would have read and written shows though it never runs.
 //!
 //! Every listed frame also gets the R9G9B9E5 timeline (upstream watch item
 //! 360): each texture an op reads through a table in title format 67 (an
-//! R9G9B9E5 view, which the host keeps as an RGBA16F stand-in that
-//! `resource::decode_now` fills on the GPU, in a list of XTP's own run
-//! at the start of the next title submission), each texture an op writes
-//! through unordered access at the same title address, and the title
-//! submissions with their lists in order. The report names, per R9G9B9E5
-//! texture, the submission whose start runs its decoding (the first after
-//! the frame's first read of it) and the submissions of its writers.
-//!
-//! shortcut: the decoding is inferred from where the first read stands
-//! (`resource::decode_now` is not told about), so a texture whose
-//! decoding could not be made is reported as decoded too.
+//! R9G9B9E5 view), and each UAV write at the same address.
+//! Each decode command counts the submissions in which its predicate
+//! allowed the conversion to run.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,17 +58,52 @@ use crate::object::This;
 
 /// Ops probed a frame, at most.
 const OPS: usize = 96;
-/// Bytes of a range snapshot (title memory) or copied back (host copy).
-const BYTES: u64 = 64 << 10;
 /// Bytes of a snapshot shown as words.
 const SHOWN: usize = 512;
-/// Read-back memory a frame.
-const BUDGET: u64 = 48 << 20;
+/// Bytes shown from a snapshot's first non-zero byte, when it lies past
+/// the first [`SHOWN`].
+const SHOWN_AT_FIRST: usize = 128;
 /// The title format of R9G9B9E5.
 const R9G9B9E5: u32 = 67;
 /// Presents after a listed frame at which it is reported even if some
 /// probed op's list was never submitted.
 const LATE: u64 = 4;
+
+/// A size switch in `unit` bytes: `default` when unset or not a number,
+/// else clamped to `1..=max`.
+fn sized(text: Option<&str>, default: u64, max: u64, unit: u64) -> u64 {
+    text.and_then(|t| t.trim().parse::<u64>().ok())
+        .map_or(default, |n| n.clamp(1, max))
+        * unit
+}
+
+/// Bytes of a range snapshot (title memory) or copied back (host copy):
+/// `XTP_FRAME_PROBE_KIB`, 64 KiB by default, 16 MiB at most.
+fn bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        sized(
+            std::env::var("XTP_FRAME_PROBE_KIB").ok().as_deref(),
+            64,
+            16 << 10,
+            1 << 10,
+        )
+    })
+}
+
+/// Read-back memory a frame: `XTP_FRAME_PROBE_MIB`, 48 MiB by default, 512
+/// at most.
+fn budget() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        sized(
+            std::env::var("XTP_FRAME_PROBE_MIB").ok().as_deref(),
+            48,
+            512,
+            1 << 20,
+        )
+    })
+}
 
 /// A descriptor a stage reads through a table, as `draw::State` resolves
 /// it for the op.
@@ -90,26 +130,44 @@ struct Snapshot {
     bytes: Vec<u8>,
 }
 
+/// `bytes` as little-endian words in hex.
+fn words(bytes: &[u8]) -> String {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&w| format!("{:08x}", u32::from_le_bytes(w)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl Snapshot {
     fn text(&self, len: u64) -> String {
-        let nz = self.bytes.iter().filter(|&&b| b != 0).count();
-        let words: Vec<String> = self.bytes[..self.bytes.len().min(SHOWN)]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&w| format!("{:08x}", u32::from_le_bytes(w)))
-            .collect();
-        let more = if self.bytes.len() > SHOWN { " …" } else { "" };
-        format!(
-            "non-zero {nz} of {} bytes{} [{}{more}]",
-            self.bytes.len(),
-            if (self.bytes.len() as u64) < len {
-                format!(" (first {} of {len})", self.bytes.len())
+        let b = &self.bytes;
+        let nz = b.iter().filter(|&&x| x != 0).count();
+        let more = if b.len() > SHOWN { " …" } else { "" };
+        let mut out = format!(
+            "non-zero {nz} of {} bytes{}",
+            b.len(),
+            if (b.len() as u64) < len {
+                format!(" (first {} of {len})", b.len())
             } else {
                 String::new()
             },
-            words.join(" ")
-        )
+        );
+        let first = b.iter().position(|&x| x != 0);
+        let last = b.iter().rposition(|&x| x != 0);
+        if let (Some(first), Some(last)) = (first, last) {
+            let _ = write!(out, ", from +{first:#x} to +{last:#x}");
+        }
+        let _ = write!(out, " [{}{more}]", words(&b[..b.len().min(SHOWN)]));
+        // The first non-zero bytes, where the words above do not reach.
+        if let Some(first) = first.filter(|&f| f >= SHOWN) {
+            let at = first & !15;
+            let end = (at + SHOWN_AT_FIRST).min(b.len());
+            let _ = write!(out, "; at +{at:#x}: [{}]", words(&b[at..end]));
+        }
+        out
     }
 }
 
@@ -130,6 +188,9 @@ struct Op {
     /// The title submission that ran its list, once one has.
     submission: Option<u64>,
     program: String,
+    /// Dropped for want of a host pipeline: its reads are what it would
+    /// have read ([`dropped`]).
+    dropped: bool,
     reads: Vec<Read>,
 }
 
@@ -150,6 +211,7 @@ struct Frame {
     matched: usize,
     ops: Vec<Op>,
     textures: Vec<TextureUse>,
+    decodings: Vec<(u64, usize, u64, std::sync::Arc<AtomicU64>)>,
     readback: Option<ID3D12Resource>,
     used: u64,
     /// Title submissions made while it was recorded or ran: number, lists.
@@ -163,6 +225,10 @@ static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     /// The program whose stage this thread prepares (`begin`).
     static PROGRAM: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The op this thread probed last, until the next stage is prepared:
+    /// its frame, list and index, for its indirect arguments
+    /// ([`arguments`]).
+    static LAST: Cell<Option<(u64, usize, usize)>> = const { Cell::new(None) };
 }
 
 fn frames() -> MutexGuard<'static, Vec<Frame>> {
@@ -204,6 +270,7 @@ fn frame_mut(frames: &mut Vec<Frame>, frame: u64) -> &mut Frame {
         matched: 0,
         ops: Vec::new(),
         textures: Vec::new(),
+        decodings: Vec::new(),
         readback: None,
         used: 0,
         submissions: Vec::new(),
@@ -216,6 +283,7 @@ fn frame_mut(frames: &mut Vec<Frame>, frame: u64) -> &mut Frame {
 pub(crate) fn begin(program: &str) {
     if recording().is_some() {
         PROGRAM.with(|p| program.clone_into(&mut p.borrow_mut()));
+        LAST.set(None);
     }
 }
 
@@ -227,6 +295,19 @@ pub(crate) fn wanted(program: &str) -> bool {
 /// `draw::State::bind`, once a stage of a probed program has its tables
 /// (`tables`) for the op about to be recorded in `list`.
 pub(crate) fn stage(list: &HostList, program: &str, tables: Vec<Table>) {
+    push(list, program, &tables, false);
+}
+
+/// `draw::State`, for a dispatch of a probed program dropped for want of a
+/// host pipeline: the tables its console program says it uses (`tables`,
+/// resolved from the roots the title bound), probed as for an op that runs.
+/// The copies of its host copies stand where it would have run.
+pub(crate) fn dropped(list: &HostList, program: &str, tables: Vec<Table>) {
+    push(list, program, &tables, true);
+}
+
+fn push(list: &HostList, program: &str, tables: &[Table], dropped: bool) {
+    LAST.set(None);
     let Some(frame) = recording() else {
         return;
     };
@@ -252,16 +333,86 @@ pub(crate) fn stage(list: &HostList, program: &str, tables: Vec<Table>) {
             r
         })
         .collect();
+    LAST.set(Some((frame, key(list), f.ops.len())));
     f.ops.push(Op {
         list: key(list),
         submission: None,
         program: program.to_owned(),
+        dropped,
         reads,
     });
 }
 
+/// `draw::State::execute_indirect`, once the op's stage was probed (it ran,
+/// or [`dropped`]): its `len` bytes of argument records at title `address`,
+/// read as a buffer view is, added to the op this thread probed last.
+pub(crate) fn arguments(list: &HostList, address: u64, len: u64) {
+    let Some((frame, at, index)) = LAST.take() else {
+        return;
+    };
+    if at != key(list) || recording() != Some(frame) {
+        return;
+    }
+    let mut text = "indirect arguments:".to_owned();
+    let (at_record, from, gpu) = range(&mut text, address, len);
+    let mut frames = frames();
+    let f = frame_mut(&mut frames, frame);
+    let gpu = match from {
+        Some((s, address, n)) => copy(f, list, &s, address, n),
+        None => gpu,
+    };
+    if let Some(op) = f.ops.get_mut(index) {
+        op.reads.push(Read {
+            text,
+            range: Some((address, len)),
+            at_record,
+            at_submit: None,
+            gpu,
+        });
+    }
+}
+
 /// A host copy, and the title range of it to copy back.
 type CopyFrom = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+
+/// A range's bytes now, the host copy to read on the GPU, and where the
+/// GPU's bytes are (or why there are none).
+type Found = (
+    Option<Snapshot>,
+    Option<CopyFrom>,
+    Result<(u64, u64), &'static str>,
+);
+
+/// The title range `address`+`len` described into `text`: its memory and
+/// host copy, its bytes now, and the host copy to read on the GPU (or why
+/// there is none).
+fn range(text: &mut String, address: u64, len: u64) -> Found {
+    let _ = write!(
+        text,
+        "\n      memory {address:#x}+{len:#x}: {}, its 64 KiB page shown at {} other addresses",
+        memory_text(address),
+        crate::watch::views_of(address as usize)
+    );
+    let take = len.min(bytes());
+    let (from, gpu) = match crate::shadow::find(address, take) {
+        Some(s) => {
+            let _ = write!(
+                text,
+                "; host copy at +{:#x} ({} bytes to its end{})",
+                s.offset(address),
+                s.left(address),
+                if s.carded() { ", card" } else { "" }
+            );
+            let n = take.min(s.left(address));
+            (Some((s, address, n)), Err("not copied"))
+        }
+        None => {
+            text.push_str("; no host copy");
+            (None, Err("no host copy"))
+        }
+    };
+    (snapshot(address, take), from, gpu)
+}
 
 /// What `t` reads, its title bytes taken now, and the host copy whose
 /// bytes the GPU reads.
@@ -308,43 +459,17 @@ fn read(t: &Table) -> (Read, Option<CopyFrom>) {
             snapshot(address, 64).map_or_else(|| "not readable".to_owned(), |s| s.text(64))
         );
     }
-    let range = view
+    let span = view
         .as_ref()
         .and_then(crate::descriptor::host::buffer_range)
         .filter(|&(_, len)| len > 0);
-    let mut gpu = Err("not a buffer view");
-    let mut at_record = None;
-    let mut from = None;
-    if let Some((address, len)) = range {
-        let _ = write!(
-            text,
-            "\n      memory {address:#x}+{len:#x}: {}, its 64 KiB page shown at {} other addresses",
-            memory_text(address),
-            crate::watch::views_of(address as usize)
-        );
-        let take = len.min(BYTES);
-        match crate::shadow::find(address, take) {
-            Some(s) => {
-                let _ = write!(
-                    text,
-                    "; host copy at +{:#x} ({} bytes to its end{})",
-                    s.offset(address),
-                    s.left(address),
-                    if s.carded() { ", card" } else { "" }
-                );
-                let n = take.min(s.left(address));
-                from = Some((s, address, n));
-            }
-            None => {
-                text.push_str("; no host copy");
-                gpu = Err("no host copy");
-            }
-        }
-        at_record = snapshot(address, take);
-    }
+    let (at_record, from, gpu) = match span {
+        Some((address, len)) => range(&mut text, address, len),
+        None => (None, None, Err("not a buffer view")),
+    };
     let r = Read {
         text,
-        range,
+        range: span,
         at_record,
         at_submit: None,
         gpu,
@@ -388,8 +513,17 @@ fn host_text(resource: This) -> String {
         Some(t) => {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
+            let depth = if d.DepthOrArraySize > 1 {
+                format!("x{}", d.DepthOrArraySize)
+            } else {
+                String::new()
+            };
+            let at = crate::resource::texture_memory(resource)
+                .map_or_else(String::new, |(data, _)| {
+                    format!(", title memory {:#x}", data as usize)
+                });
             format!(
-                "host {}x{} f{} flags {:#x}",
+                "host {}x{}{depth} f{} flags {:#x}{at}",
                 d.Width, d.Height, d.Format.0, d.Flags.0
             )
         }
@@ -478,7 +612,7 @@ fn copy(
         f.readback = Some(readback_buffer(&host.device).map_err(|_| "no read-back buffer")?);
     }
     let at = f.used.next_multiple_of(16);
-    if at + len > BUDGET {
+    if at + len > budget() {
         return Err("read-back budget spent");
     }
     f.used = at + len;
@@ -512,7 +646,7 @@ fn readback_buffer(device: &ID3D12Device) -> windows::core::Result<ID3D12Resourc
     };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: BUDGET,
+        Width: budget(),
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -565,6 +699,21 @@ pub(crate) fn texture(list: &HostList, resource: This, write: bool) {
     frame_mut(&mut frames(), frame).textures.push(use_);
 }
 
+/// Counts submissions that enable this command's predicate. The list can be
+/// discarded or submitted again.
+pub(crate) fn decoding(list: &HostList, resource: This) -> Option<std::sync::Arc<AtomicU64>> {
+    let frame = recording()?;
+    let (address, _) = crate::resource::texture_memory(resource)?;
+    let count = std::sync::Arc::new(AtomicU64::new(0));
+    frame_mut(&mut frames(), frame).decodings.push((
+        address as u64,
+        key(list),
+        SUBMISSIONS.load(Ordering::Relaxed),
+        count.clone(),
+    ));
+    Some(count)
+}
+
 /// `Host::submit`: a title submission of `runs`, in order, before its
 /// refreshes. Takes the probed ranges' title memory for the ops of these
 /// lists, and reports the frames presented since, once what was submitted
@@ -598,7 +747,7 @@ pub(crate) fn submitted(runs: &[&HostList]) {
                 op.submission = Some(number);
                 for r in &mut op.reads {
                     if let Some((address, len)) = r.range {
-                        r.at_submit = snapshot(address, len.min(BYTES));
+                        r.at_submit = snapshot(address, len.min(bytes()));
                     }
                 }
             }
@@ -687,13 +836,18 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
     for (i, op) in f.ops.iter().enumerate() {
         let _ = writeln!(
             out,
-            "op {} {} {}",
+            "op {} {} {}{}",
             i + 1,
             match (op.submission, numbers.get(&op.list)) {
                 (Some(s), Some(n)) => format!("L{n} (submission {s})"),
                 _ => format!("list {:#x} (not submitted)", op.list),
             },
-            op.program
+            op.program,
+            if op.dropped {
+                " DROPPED (no host pipeline): what it would read and write"
+            } else {
+                ""
+            }
         );
         for r in &op.reads {
             let _ = writeln!(out, "    {}", r.text);
@@ -758,51 +912,39 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
             "texture {:#x} (title format {}, {}):",
             t.address, t.title_format, t.host
         );
-        let decoded = t.after + 1;
         let _ = writeln!(
             out,
-            "  first read by {} in {}: its decoding runs at the start of submission {decoded}",
+            "  first read by {} in {}",
             t.program,
             list_name(t.list, t.after),
         );
         // Each program and list once, with how many uses.
         let mut uses: Vec<(bool, &str, usize, u64, u32, usize)> = Vec::new();
         for u in f.textures.iter().filter(|u| u.address == t.address) {
-            let sub = submission_of(f, u.list, u.after).unwrap_or(0);
             match uses
                 .iter_mut()
-                .find(|x| x.0 == u.write && x.1 == u.program && x.2 == u.list)
+                .find(|x| x.0 == u.write && x.1 == u.program && x.2 == u.list && x.3 == u.after)
             {
                 Some(x) => x.5 += 1,
-                None => uses.push((u.write, &u.program, u.list, sub, u.title_format, 1)),
+                None => uses.push((u.write, &u.program, u.list, u.after, u.title_format, 1)),
             }
         }
-        for &(write, program, list, _, format, n) in &uses {
+        for &(write, program, list, after, format, n) in &uses {
             let _ = writeln!(
                 out,
                 "  {} by {program} in {} ({n} uses, title format {format})",
                 if write { "written" } else { "read" },
-                list_name(list, 0)
+                list_name(list, after)
             );
         }
-        let late: Vec<u64> = uses
-            .iter()
-            .filter(|x| x.0 && x.3 >= decoded)
-            .map(|x| x.3)
-            .collect();
-        let _ = writeln!(
-            out,
-            "  => {}",
-            if !uses.iter().any(|x| x.0) {
-                "no unordered-access writer at this address in the frame's tables".to_owned()
-            } else if late.is_empty() {
-                "every writer's list ran before the decoding".to_owned()
-            } else {
-                format!(
-                    "the decoding runs before writers in submissions {late:?}: their texels show a frame later"
-                )
-            }
-        );
+        for (_, list, after, count) in f.decodings.iter().filter(|d| d.0 == t.address) {
+            let _ = writeln!(
+                out,
+                "  decode in {}: {} executions",
+                list_name(*list, *after),
+                count.load(Ordering::Relaxed)
+            );
+        }
     }
     let _ = writeln!(out, "\n== Title submissions");
     for (n, lists) in &f.submissions {
@@ -839,12 +981,44 @@ mod tests {
         };
         assert_eq!(
             s.text(12),
-            "non-zero 4 of 12 bytes [00000001 00000000 010080ff]"
+            "non-zero 4 of 12 bytes, from +0x0 to +0xb [00000001 00000000 010080ff]"
         );
         assert_eq!(
             s.text(64),
-            "non-zero 4 of 12 bytes (first 12 of 64) [00000001 00000000 010080ff]"
+            "non-zero 4 of 12 bytes (first 12 of 64), from +0x0 to +0xb [00000001 00000000 010080ff]"
         );
+        let zero = Snapshot { bytes: vec![0; 8] };
+        assert_eq!(zero.text(8), "non-zero 0 of 8 bytes [00000000 00000000]");
+    }
+
+    /// Non-zero bytes past the words shown are shown from the first of
+    /// them, 16-byte aligned.
+    #[test]
+    fn snapshots_show_their_first_non_zero_bytes() {
+        let mut bytes = vec![0u8; 1024];
+        bytes[0x2bc] = 7;
+        bytes[0x2bf] = 1;
+        let text = Snapshot { bytes }.text(1024);
+        assert!(
+            text.starts_with("non-zero 2 of 1024 bytes, from +0x2bc to +0x2bf [00000000"),
+            "{text}"
+        );
+        let tail = text.split_once("; at +0x2b0: [").unwrap().1;
+        let shown: Vec<&str> = tail.trim_end_matches(']').split(' ').collect();
+        assert_eq!(shown.len(), SHOWN_AT_FIRST / 4);
+        assert_eq!(
+            &shown[..4],
+            ["00000000", "00000000", "00000000", "01000007"]
+        );
+    }
+
+    #[test]
+    fn size_switches_parse_and_clamp() {
+        assert_eq!(sized(None, 64, 16 << 10, 1 << 10), 64 << 10);
+        assert_eq!(sized(Some(" 2048 "), 64, 16 << 10, 1 << 10), 2 << 20);
+        assert_eq!(sized(Some("0"), 64, 16 << 10, 1 << 10), 1 << 10);
+        assert_eq!(sized(Some("99999999"), 64, 16 << 10, 1 << 10), 16 << 20);
+        assert_eq!(sized(Some("2M"), 48, 512, 1 << 20), 48 << 20);
     }
 
     #[test]

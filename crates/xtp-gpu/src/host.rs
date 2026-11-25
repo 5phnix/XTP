@@ -800,6 +800,7 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    pub(crate) rt_scratch: Mutex<Option<ID3D12Resource>>,
     pub(crate) query_resolves: crate::query::Resolves,
     /// Swapped for a fresh one when the list is reset while it runs.
     allocator: Mutex<ID3D12CommandAllocator>,
@@ -829,6 +830,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
+    pub(crate) decode_uses: Mutex<crate::resource::decode::Uses>,
+    pub(crate) decode_pipeline: std::sync::atomic::AtomicBool,
     pub(crate) clamps: Mutex<crate::indirect::Runs>,
     /// The host fence value of its last submission (0: none): it is not
     /// dropped before that one has finished.
@@ -1279,6 +1282,7 @@ impl Host {
                 format!("xtp host prelude {:#x}", prelude.as_raw() as usize)
             });
             Ok(HostList {
+                rt_scratch: Mutex::default(),
                 allocator: Mutex::new(allocator),
                 bounds_list: if self.depth_bounds {
                     Some(list.cast()?)
@@ -1295,6 +1299,8 @@ impl Host {
                 pipelines: Mutex::default(),
                 writer: AtomicU64::new(0),
                 budget: Mutex::default(),
+                decode_uses: Mutex::default(),
+                decode_pipeline: Default::default(),
                 clamps: Mutex::default(),
                 last: AtomicU64::new(0),
                 fresh_after: AtomicU64::new(0),
@@ -1412,6 +1418,7 @@ impl Host {
         // sweep, and this submission must take its snapshots afterwards.
         if crate::shadow::refresh_due(batch.submission) {
             self.drain();
+            let _copy = Phase::Copies.enter();
             crate::shadow::refresh_everything(batch.submission);
         }
         if batch.submission.is_multiple_of(32) {
@@ -1433,7 +1440,10 @@ impl Host {
         // (`shadow::cards_around`): what their CPU side took goes up first,
         // and what the shaders wrote is found on the card after the lists,
         // in the same submission.
-        let (cards_first, cards_last) = crate::shadow::cards_around(batch.submission);
+        let (cards_first, cards_last) = {
+            let _copy = crate::shadow::cards().then(|| Phase::Copies.enter());
+            crate::shadow::cards_around(batch.submission)
+        };
         if let Some(first) = cards_first {
             lists.insert(0, Some(first));
             firsts.iter_mut().skip(1).for_each(|at| *at += 1);
@@ -1611,6 +1621,20 @@ impl Host {
         {
             self.settle(value);
         }
+    }
+
+    /// The live host copy covering a fill when an earlier submission is
+    /// writing part of it. A label or an alias alone cannot supply it.
+    pub(crate) fn fill_source(
+        &self,
+        address: u64,
+        len: u64,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        let writer = self
+            .timeline
+            .fill_writer(address as usize, address.checked_add(len)? as usize)?;
+        let shadow = crate::shadow::existing(address, len)?;
+        (std::sync::Arc::as_ptr(&shadow) as usize == writer).then_some(shadow)
     }
 
     /// Runs `signal` once every submission made so far has finished: at
@@ -2229,6 +2253,11 @@ impl HostList {
             }
             allocator.clone()
         };
+        self.decode_uses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.decode_pipeline.store(false, Ordering::Relaxed);
         *self.clamps.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // New ones: a submission in flight keeps its own (`Recorded`).

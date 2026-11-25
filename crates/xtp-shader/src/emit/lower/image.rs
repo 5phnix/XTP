@@ -6,12 +6,72 @@
 use std::collections::HashSet;
 
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
-use crate::emit::shader::flags;
+use crate::emit::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use crate::emit::shader::{Shader, flags};
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Reg, Value};
 use crate::native::ResourceType;
 use crate::resource::{Site, Source};
+
+/// Résultat MIMG : DXIL impose de joindre séparément les composantes scalaires.
+enum Texels {
+    Resource(V),
+    Channels([V; 4]),
+}
+
+impl Texels {
+    fn channel(&self, s: &mut Shader, block: usize, ch: u32) -> V {
+        match self {
+            Self::Resource(r) => s.m.extract(block, *r, ch),
+            Self::Channels(xs) => xs[ch as usize],
+        }
+    }
+}
+
+struct SamplerChoice {
+    first: V,
+    /// Condition vraie sur le chemin qui a fourni le second sampler.
+    second: Option<(V, V)>,
+}
+
+impl SamplerChoice {
+    // Adapté de fxceless/victory-fork#25 (cb80bf0, MartinIndra02, GPL-3.0).
+    // Chaque branche utilise un registre statique et ne lit la texture qu'une fois.
+    fn dispatch<const N: usize>(
+        &self,
+        l: &mut Lower<'_>,
+        mut call: impl FnMut(&mut Shader, usize, V) -> [V; N],
+    ) -> [V; N] {
+        let Some((cond, second)) = self.second else {
+            return call(&mut l.s, l.cur, self.first);
+        };
+        let a = l.s.m.new_block();
+        let b = l.s.m.new_block();
+        let join = l.s.m.new_block();
+        l.s.m.terminate(l.cur, Term::CondBr(cond, b, a));
+        let left = call(&mut l.s, a, self.first);
+        let right = call(&mut l.s, b, second);
+        l.s.m.terminate(a, Term::Br(join));
+        l.s.m.terminate(b, Term::Br(join));
+        l.cur = join;
+        std::array::from_fn(|i| {
+            let phi = l.s.m.phi(join, l.s.t.f32);
+            l.s.m.set_phi(phi, vec![(left[i], a), (right[i], b)]);
+            phi
+        })
+    }
+
+    fn sample(&self, l: &mut Lower<'_>, name: &str, op: u32, args: &mut [V]) -> Texels {
+        if self.second.is_none() {
+            return Texels::Resource(l.s.op(l.cur, name, Attr::ReadOnly, l.s.t.res_ret, op, args));
+        }
+        Texels::Channels(self.dispatch(l, |s, block, handle| {
+            args[1] = handle;
+            let r = s.op(block, name, Attr::ReadOnly, s.t.res_ret, op, args);
+            std::array::from_fn(|i| s.m.extract(block, r, i as u32))
+        }))
+    }
+}
 
 /// A 64-bit image atomic, as [`Lower::image`] decoded it.
 struct Atomic64<'s> {
@@ -164,6 +224,57 @@ impl<'a> Lower<'a> {
             Some([x, 1, 1]) if x.is_multiple_of(4) => Ok(()),
             _ => Err(NO_CONSOLE_QUADS),
         }
+    }
+
+    /// Les deux entrées constantes d'une jonction scalaire utilisent les arêtes
+    /// du CFG émis, y compris les blocs intercalés pour compter les tours de boucle.
+    fn image_sampler(
+        &mut self,
+        site: Site,
+        src: &Source,
+        comparison: bool,
+    ) -> Result<SamplerChoice, Why> {
+        let props = (14 | if comparison { 0x8000 } else { 0 }, 0);
+        if let Source::Phi { block, args } = src {
+            let mut live = self.x.p.blocks[*block]
+                .preds
+                .iter()
+                .copied()
+                .zip(args)
+                .filter(|(p, _)| self.block[*p].is_some());
+            if let (
+                Some((a, left @ Source::Constant(_))),
+                Some((b, right @ Source::Constant(_))),
+                None,
+            ) = (live.next(), live.next(), live.next())
+            {
+                let edge = |p| {
+                    self.edges
+                        .get(&(p, *block))
+                        .copied()
+                        .or(self.tail[p])
+                        .ok_or("a descriptor chosen by control flow")
+                };
+                let (a, b) = (edge(a)?, edge(b)?);
+                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                let first = self.handle(site, left, true, props)?;
+                let second = if left == right {
+                    None
+                } else {
+                    let second = self.handle(site, right, true, props)?;
+                    let cond = self.s.m.phi(join, self.s.t.i1);
+                    let no = self.s.m.bool(false);
+                    let yes = self.s.m.bool(true);
+                    self.s.m.set_phi(cond, vec![(no, a), (yes, b)]);
+                    Some((cond, second))
+                };
+                return Ok(SamplerChoice { first, second });
+            }
+        }
+        Ok(SamplerChoice {
+            first: self.handle(site, src, true, props)?,
+            second: None,
+        })
     }
 
     /// A 64-bit image atomic: DXIL's i64 `atomicBinOp` or
@@ -524,8 +635,6 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
-        // The four texels of a gather made of samples (`GATHER_AT_LEVEL`).
-        let mut gathered: Option<[V; 4]> = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -537,7 +646,7 @@ impl<'a> Lower<'a> {
                 return Err("a comparison sample of several channels");
             }
             // Comparison: the sampler is a comparison sampler.
-            let sh = self.handle(site, ss, true, (14 | if f.c { 0x8000 } else { 0 }, 0))?;
+            let sampler = self.image_sampler(site, ss, f.c)?;
             // Coordinates the size divides (not the array slice).
             let spatial = coords - usize::from(kind == 6 || kind == 7);
             // Address dwords in order (LLVM ImageDimIntrinsics.td, Mesa
@@ -728,14 +837,16 @@ impl<'a> Lower<'a> {
                 at[..spatial].copy_from_slice(&cs[..spatial]);
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
-                    let lod = self.s.op(
-                        c,
-                        "calculateLOD.f32",
-                        Attr::ReadOnly,
-                        f32t,
-                        81,
-                        &[h, sh, at[0], at[1], at[2], clamped],
-                    );
+                    let [lod] = sampler.dispatch(self, |s, block, sh| {
+                        [s.op(
+                            block,
+                            "calculateLOD.f32",
+                            Attr::ReadOnly,
+                            f32t,
+                            81,
+                            &[h, sh, at[0], at[1], at[2], clamped],
+                        )]
+                    });
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
@@ -810,7 +921,7 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
-            let mut args = vec![h, sh];
+            let mut args = vec![h, sampler.first];
             args.extend(&cs);
             match op {
                 60 | 61 if !self.s.pixel => {
@@ -842,33 +953,18 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     args.push(clamp);
-                    self.s.op(
-                        c,
-                        "sampleGrad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        63,
-                        &args,
-                    )
+                    sampler.sample(self, "sampleGrad.f32", 63, &mut args)
                 }
                 60 => {
                     args.extend(&os);
                     args.push(clamp);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    sampler.sample(self, "sample.f32", 60, &mut args)
                 }
                 61 => {
                     let bias = float(self, bias_at)?;
                     args.extend(&os);
                     args.extend([bias, clamp]);
-                    self.s.op(
-                        c,
-                        "sampleBias.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        61,
-                        &args,
-                    )
+                    sampler.sample(self, "sampleBias.f32", 61, &mut args)
                 }
                 63 => {
                     // shortcut: the coarse forms (`_cd`) compute one level
@@ -893,14 +989,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     args.push(clamp);
-                    self.s.op(
-                        c,
-                        "sampleGrad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        63,
-                        &args,
-                    )
+                    sampler.sample(self, "sampleGrad.f32", 63, &mut args)
                 }
                 64 | 65 => {
                     let at = usize::from(f.o) + usize::from(f.b);
@@ -913,8 +1002,7 @@ impl<'a> Lower<'a> {
                     } else {
                         "sampleCmpLevelZero.f32"
                     };
-                    self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    sampler.sample(self, name, op, &mut args)
                 }
                 GATHER_AT_LEVEL => {
                     // A gather at a level the code computes. DXIL's gathers
@@ -966,36 +1054,27 @@ impl<'a> Lower<'a> {
                         *o = zero;
                     }
                     let channel = dmask.trailing_zeros();
-                    let mut last_r = None;
                     let mut texels = [fu; 4];
                     // The console's (and DXIL's) gather order.
                     for (n, by) in [(0.0f32, 1.0f32), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
                         .into_iter()
                         .enumerate()
                     {
+                        let c = self.cur;
                         let mut at = cs.clone();
                         for (k, step) in [by.0, by.1].into_iter().enumerate() {
                             let centre = self.s.m.f32((step + 0.5).to_bits());
                             let x = self.s.m.bin(c, Bin::Add, low[k], centre);
                             at[k] = self.s.m.bin(c, Bin::SDiv, x, size[k]);
                         }
-                        let mut a = vec![h, sh];
+                        let mut a = vec![h, sampler.first];
                         a.extend(&at);
                         a.extend(&none);
                         a.push(level);
-                        let r = self.s.op(
-                            c,
-                            "sampleLevel.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            62,
-                            &a,
-                        );
-                        texels[n] = self.s.m.extract(c, r, channel);
-                        last_r = Some(r);
+                        let r = sampler.sample(self, "sampleLevel.f32", 62, &mut a);
+                        texels[n] = r.channel(&mut self.s, self.cur, channel);
                     }
-                    gathered = Some(texels);
-                    last_r.expect("four samples")
+                    Texels::Channels(texels)
                 }
                 62 => {
                     let lod = if f.l {
@@ -1005,14 +1084,7 @@ impl<'a> Lower<'a> {
                     };
                     args.extend(&os);
                     args.push(lod);
-                    self.s.op(
-                        c,
-                        "sampleLevel.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        62,
-                        &args,
-                    )
+                    sampler.sample(self, "sampleLevel.f32", 62, &mut args)
                 }
                 _ => {
                     args.extend(&os[..2]);
@@ -1024,8 +1096,7 @@ impl<'a> Lower<'a> {
                     } else {
                         "textureGather.f32"
                     };
-                    self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    sampler.sample(self, name, op, &mut args)
                 }
             }
         } else {
@@ -1045,18 +1116,19 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            self.s.op(
+            Texels::Resource(self.s.op(
                 c,
                 "textureLoad.f32",
                 Attr::ReadOnly,
                 self.s.t.res_ret,
                 66,
                 &args,
-            )
+            ))
         };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
+        let c = self.cur;
         let channels: Vec<u32> = if gather {
             vec![0, 1, 2, 3]
         } else {
@@ -1064,10 +1136,7 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = match gathered {
-                Some(texels) => texels[ch as usize],
-                None => self.s.m.extract(c, r, ch),
-            };
+            let x = r.channel(&mut self.s, c, ch);
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.

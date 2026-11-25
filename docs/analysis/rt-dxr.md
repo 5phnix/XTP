@@ -1,7 +1,8 @@
 # Ray tracing on DXR: host acceleration structures and inline ray queries in place of the title's traversal loops
 
 Task rtdxr (7ae2c553), 2026-11-25, phase 1 (the design). The title is
-BTP 6, build 1.0.2.1, Series S mode. Static analysis only:
+BTP 6, build 1.0.2.1, Series S mode. Static analysis with a subsequent
+builder capture in sections 3.2 and 3.4:
 RVAs (image base 0x140000000) and behaviour in our own words, no code. Trace
 programs are named by their 16-digit hash, as the logs print it; roles come
 from rt-standin.md and refusals.md. Disassemblies, scans and notes stay
@@ -68,8 +69,8 @@ Their own AnyPS5 already runs RDNA2 traversal loops on host ray queries
   instance records. A program whose results need a guest node pointer
   for later passes is the only case that needs the title's builder; none
   is known yet.
-- **DXIL side** (section 7): DXR 1.1 inline ray queries (opcodes 178 to
-  215, checked against DXC 10.0.26100), the shader flag for ray-tracing
+- **DXIL side** (section 7): DXR 1.1 inline ray queries (opcodes 178–212
+  and 214–215), the shader flag for ray-tracing
   tier 1.1 (bit 25, `SFI0` 0x100000), and the TLAS as an SRV of kind
   16. It is bound as a root SRV at a reserved register, through the
   existing `root_srvs` path, with the host TLAS address set at dispatch.
@@ -142,7 +143,8 @@ because the local clone is shallow:
 | Files | First version | Later authors | In XTP |
 |---|---|---|---|
 | `RayQueryTraversal.cpp/.h`, `ir/RayQuery.h`, `spirvEmitterRayQuery.cpp`, `spirvEmitterBvh.cpp`, `spirvEmitterTrinityBvh.cpp`, `rayTracing.h/.cpp`, `rayTracingSlots.cpp`, `rt_blas_walk.comp`, `rt_tlas_walk.comp`, `rt_common.inc` | the KytyPS5 import `e6570df9` (2026-11-17). Already substantial then: `RayQueryTraversal.cpp` 232 KB, `rayTracingSlots.cpp` 90 KB. Upstream: KytyPS5/KytyPS5 (Nmzik, Senaxx) and the fork simnJS/KytyPS5-GTA (TheCruZ) | simnJS: about 30 commits on `RayQueryTraversal.cpp` (18–19 Nov). mjnhbg3: one commit on `rayTracingSlots.cpp` (`a6e89640`) | **Ideas only** (GPL-2.0-only, third parties). Only the person's own lines in their commits are portable (anyps5.md) |
-| `RayQueryResults.cpp/.h`, `RayQuerySource.cpp/.h`, `RayQueryOracle.cpp/.h`, `spirvEmitterRayQueryShared.h` | added after the import by simnJS | simnJS only | **The person's**: portable with "Ported from simnJS/AnyPS5 (commit) by simnJS" |
+| `RayQueryResults.cpp/.h`, `RayQuerySource.cpp/.h`, `RayQueryOracle.cpp/.h` | added after the import by simnJS | simnJS only | **The person's**: portable with "Ported from simnJS/AnyPS5 (commit) by simnJS" |
+| `spirvEmitterRayQueryShared.h` | lines 263–310 originate in the KytyPS5 import `e6570df9` | later work by simnJS | Lines 263–310 are **ideas only**. Check provenance per line before porting any other part of this header. |
 | `rayTracingCheck.cpp/.h`, `rayTracingReplay.h` | added by simnJS | simnJS, plus one commit by mjnhbg3 | the person's lines portable, mjnhbg3's ideas only |
 
 XTP is Rust and DXIL, so nothing is copied verbatim anyway. What XTP
@@ -222,9 +224,10 @@ has not been measured.
 
   The fourth argument is the array of CPU addresses of the same data,
   after the title's own GPU-to-CPU window. An entry is passed only if a
-  bit in the dehydrated header is set. The geometry inputs are complete,
-  so a host build from them gives the same structure that rehydration
-  gives.
+  bit in the dehydrated header is set. Rebuilding the BLAS on the host
+  also requires its original vertex and index ranges to remain readable
+  by the GPU at build execution. The descriptions alone cannot establish
+  residency. Count a missing range as an unavailable BLAS.
 - **TLAS prebuild** (`0x56ac100`): type `TOP_LEVEL`, the instance count
   from the low 26 bits of a word of the title. Two bits of the same word
   choose the flags:
@@ -249,10 +252,27 @@ has not been measured.
   - vertex buffer: an address plus a byte offset, both in the record;
   - stride: a 16-bit field of the record.
 
-**Not measured yet:** which vertex and index formats actually occur,
-geometry and instance counts, and how many builds and refits a frame
-makes. They are runtime data. The first step of phase 2 logs them from
-the intercept (section 10).
+**PC capture, 2026-11-25** (`cache/play/20261125-090924/run.log`,
+Series S mode, RTX 4080 SUPER, 40 seconds after control returned).
+The 581 build calls contained 3,490 BLAS entries (1,536 new and 1,954
+refits) and 1,255 TLAS entries (all new). A built BLAS had 1–54
+geometries and a built TLAS had 1–2,843 instances. Across 4,196 prebuild
+queries the maximum requested instance count was 6,144. The title DLL
+returned 1,024–26,504,192 result bytes, 16,836–11,352,240 scratch bytes
+and 0–1,559,296 update-scratch bytes.
+
+| Triangle descriptors observed at the entry point | Vertex format | Index format | Count |
+|---|---|---|---:|
+| Build or refit | R32G32B32_FLOAT | R16_TYPELESS | 11,472 |
+| Build or refit | R32G32B32_FLOAT | R16_UINT | 3,552 |
+| Build or refit | R32G32_FLOAT | R16_TYPELESS | 2,057 |
+| Rehydrate | R32G32_FLOAT | R16_TYPELESS | 2,749 |
+
+All 8,828 prebuild triangle descriptors used R16_UINT. The host path
+must account for the raw format in the actual build entries. The 160
+rehydration calls described 1,070 BLAS with 1–79 geometries each. This
+capture counted descriptors at CPU call time. GPU-readable vertex/index
+coverage for those 1,070 entries remains unmeasured.
 
 ### 3.3 Instances, masks, flags
 
@@ -288,6 +308,14 @@ The builder's compute dispatches dropped today ("BVH builder held",
 85 to 350 a frame in the run log of 20261125-081233) are the console
 library carrying this out.
 
+In the PC capture above, presented-frame numbers 602–849 cover the 248
+interior frames between the first and last observed build frames.
+Counting entries per frame, including zeroes, new builds (BLAS and TLAS)
+ranged from 0 to 66 with a median of 8. Refits ranged from 0 to 15
+with a median of 8. Rehydrations ranged from 0 to 65 with a median of 0.
+Across the full capture 1,534 postbuild requests asked for compacted
+size. There were zero calls to the copy method, including compact copies.
+
 ### 3.5 Where XTP intercepts, and whether the title's builder still runs
 
 - **Intercept the 7 methods** with an HLE module for
@@ -299,16 +327,12 @@ library carrying this out.
   library asks, by forwarding to the real DLL (a CPU function). The
   title then allocates what it expects. Host sizes are kept apart, in
   host buffers.
-- **The title's builder is not run.** Once the traces are served by host
-  ray queries, nothing reads the console BVH except code after the loops
-  that reads guest records. That case is handled in section 6.
-  - Today the builder is held anyway.
-  - Not running it saves its 85 to 350 dispatches a frame.
-  - It also spares cxr4 the last 22 refusals of its 52 programs.
-
-  The exception is a program whose results need guest node pointers
-  (section 6). None is known; one would bring back the console builder
-  and AnyPS5's walk-based mapping.
+- **Phase 2a keeps the title's builder.** All seven hooks call the original
+  DLL. The host records triangle BLAS builds and clones on the same list.
+  A successful rehydration can record a fresh host build from the original
+  geometry. The title still receives its DLL's prebuild and postbuild sizes.
+  Skipping the original builder would require checking the remaining guest
+  record consumers described in section 6.
 
 ## 4. The trace programs
 
@@ -564,6 +588,10 @@ the repository):
     - `CommittedInstanceIndex` 207, `CommittedInstanceID` 208;
     - `CommittedGeometryIndex` 209, `CommittedPrimitiveIndex` 210;
     - candidate twins 201 to 204;
+    - `CandidateInstanceContributionToHitGroupIndex` 214 and
+      `CommittedInstanceContributionToHitGroupIndex` 215.
+      Opcode 213 is the `GeometryIndex` system value in a ray-tracing shader.
+      [DXC opcode definitions](https://github.com/microsoft/DirectXShaderCompiler/blob/main/include/dxc/DXIL/DxilConstants.h)
   - `rayQuery_StateVector.f32` with a component:
     - `CommittedTriangleBarycentrics` 194, candidate 193;
     - object ray origin and direction 205/206 and 211/212;
@@ -600,9 +628,13 @@ Per title structure address, as VIctory #702 keys them (section 11):
     (`shadow::find`, `refresh`, `gpu`);
   - formats checked against DXR's list.
 
-  A refit is `PERFORM_UPDATE` with source = destination when the title's
-  flags allowed updates. A compaction copy becomes a host compaction
-  copy. A rehydration becomes a full host build from the same inputs.
+  For a refit, retain the original build parameters and check update
+  eligibility, including `ALLOW_UPDATE`, unchanged topology and primitive
+  counts. For compaction, give the title its own postbuild size. Query the
+  host compacted size separately, map the title destination to the new
+  host buffer and retain the old resource through its last GPU use.
+  Rehydration can use a full host build when its geometry is available
+  (section 3.2).
 - **TLAS**: built each time the title builds it, from its instance
   array. Each instance's BLAS address is rewritten to the host BLAS
   address.
@@ -645,9 +677,10 @@ Per title structure address, as VIctory #702 keys them (section 11):
   - 8-bit: `R8G8B8A8_UNORM`, `R8G8_UNORM`, `R8G8B8A8_SNORM`,
     `R8G8_SNORM`.
 
-  A format outside it needs a conversion pass into a float buffer.
-  `R16_TYPELESS` indices are already turned into `R16_UINT` by the
-  title.
+  A vertex format outside it needs a conversion pass into a float
+  buffer. Section 3.2 records `R16_UINT` in prebuild queries and
+  `R16_TYPELESS` in actual build entries. The host DXR descriptor needs
+  the typed 16-bit index format for that data.
 - **Culling.** The host applies DXR's instance-flag semantics
   (`TRIANGLE_CULL_DISABLE`, `FRONT_COUNTERCLOCKWISE`) to the title's
   flags. The ray's own cull flag, and the console's sign convention for
@@ -674,7 +707,9 @@ Steps:
 2. **Host structures** (`crates/xtp-gpu/src/rt/`):
    - the address table, builds, refits, copies, the instance rewrite and
      the TLAS lookup;
-   - WARP tests: one triangle, one instance; a refit; a compaction.
+   - WARP tests: build a one-triangle BLAS, clone it, reference the clone
+     from a one-instance TLAS, then check the ray's hit and distance.
+     Check refit and compaction separately.
 3. **The splice** (`emit/lower/rayquery.rs`): recognition for family A
    shadows, the proof by play for hit and t, and the DXIL ops above.
    Tests in `emit/rayquery_tests.rs`, on a synthetic program written for
@@ -754,7 +789,7 @@ container once the splice exists.
 - **AnyPS5.** Read in the read-only clone, its history through GitHub's
   API. Never built or run.
 - **Not done:**
-  - runtime measurement of the builder calls;
+  - GPU residency of the rehydrated geometry at host build time;
   - the instance array's writer;
   - each gather's exit values: the proof of section 5.3 gives them;
   - the cull sign convention.
