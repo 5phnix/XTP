@@ -1831,7 +1831,13 @@ fn rayquery_family_a_end_to_end_on_warp() {
     plant.insert(Play::buffer(0, 0x60), u32::MAX);
     let played = prover
         .play(11, 0, Root::Box, &plant, &mut |rays, rng| {
-            world::around(rays, Root::Box, u32::from(site.mask), rng)
+            // A world of a few instances at least.
+            loop {
+                let w = world::around(rays, Root::Box, u32::from(site.mask), rng);
+                if w.instances.len() >= 5 {
+                    break w;
+                }
+            }
         })
         .unwrap_or_else(|f| panic!("{f:?}"));
     prover
@@ -1891,5 +1897,5 @@ fn rayquery_family_a_end_to_end_on_warp() {
         w.instances.len()
     );
     assert!(wrong.is_empty(), "{wrong:#?}");
-    assert!(hits > 4, "{hits} hits");
+    assert!(hits >= 6, "{hits} hits");
 }
