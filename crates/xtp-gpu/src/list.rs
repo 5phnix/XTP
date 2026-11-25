@@ -988,6 +988,17 @@ fn clear_uav(
             warn_once!("a UAV clear of a slot without a view of ours: not done");
             return;
         };
+        // Résoudre la texture une seule fois pour les deux descripteurs,
+        // la transition d'état et le suivi de son écriture.
+        let view = match view {
+            View::Placed(true, ref resource, _) if resource[0] != 1 => {
+                let Some(texture) = crate::descriptor::host::placed_texture(&view) else {
+                    return;
+                };
+                texture
+            }
+            view => view,
+        };
         let words: Option<&[u32]> = match &view {
             View::Unordered(_, _, desc) => desc.as_ref().map(|d| &d[..]),
             View::Placed(true, _, desc) => Some(&desc[..10]),
@@ -2773,6 +2784,43 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn a_placed_texture_clear_updates_the_same_host_copy_as_its_view() {
+            let Some(gpu) = device("list::tests::gpu::placed_texture_clear") else {
+                return;
+            };
+            let memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+            let address = memory.address();
+            let desc = crate::resource::tests_support::target(4, 4, 28);
+            // SAFETY: ResourceDesc contient les quatorze mots du descripteur console.
+            let mut resource: [u32; 14] = unsafe { std::mem::transmute_copy(&desc) };
+            resource[12] = 4;
+            let mut view = [0; 16];
+            view[..2].copy_from_slice(&[28, 4]);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            let heap = crate::descriptor::TestHeap::views(4);
+            let handle = crate::descriptor::heap(heap.0).start;
+            crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &view, handle);
+            let list = TitleList::new();
+            clear_uav_uint(
+                list.this(),
+                handle,
+                handle,
+                std::ptr::null(),
+                &[1, 2, 3, 4],
+                0,
+                std::ptr::null(),
+            );
+            list.run();
+            let object = crate::resource::texture_at(address, &resource).unwrap();
+            let texture = crate::resource::host_resource(object).unwrap();
+            let texels =
+                crate::resource::tests_support::read_back(gpu.host(), texture, UNORDERED_ACCESS);
+            assert_eq!(&texels[..4], &[1, 2, 3, 4]);
+            drop(heap);
+            crate::resource::memory_remapped(address as usize, 65536);
         }
 
         /// A buffer view's integer clear writes its range of the host copy,
