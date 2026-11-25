@@ -122,7 +122,8 @@ struct List {
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
     /// The pipeline the title set last (`SetPipelineState`, or the one its
-    /// reset passed): the program whose thread group `DispatchX` reads.
+    /// creation or reset passed): the program whose thread group
+    /// `DispatchX` reads.
     #[cfg(windows)]
     pipeline: std::sync::atomic::AtomicUsize,
 }
@@ -187,11 +188,11 @@ pub(crate) extern "system" fn create_list(
     _nodes: u32,
     kind: u32,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    new_list(kind, allocator, iid, out)
+    new_list(kind, allocator, pipeline, iid, out)
 }
 
 /// The console's list creation: type, flags, node mask and barrier batch
@@ -209,7 +210,7 @@ pub(crate) extern "system" fn create_list_x(
     _: This,
     desc: *const ListDesc,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -218,10 +219,19 @@ pub(crate) extern "system" fn create_list_x(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "console command list");
-    new_list(desc.kind, allocator, iid, out)
+    new_list(desc.kind, allocator, pipeline, iid, out)
 }
 
-fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// A list of `kind`, open, with `pipeline` (null: none) set as
+/// `SetPipelineState` sets one: D3D12's initial pipeline state, which
+/// draws and dispatches recorded before the title sets another use.
+fn new_list(
+    kind: u32,
+    allocator: This,
+    pipeline: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -251,11 +261,19 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
             }
         }),
         #[cfg(windows)]
-        state: Default::default(),
+        state: {
+            let mut state = crate::draw::State::default();
+            state.set_pipeline(pipeline);
+            std::sync::Mutex::new(state)
+        },
         #[cfg(windows)]
-        pipeline: Default::default(),
+        pipeline: std::sync::atomic::AtomicUsize::new(pipeline as usize),
     });
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    let made = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    if made == S_OK {
+        crate::pipeline::bound(pipeline);
+    }
+    made
 }
 
 /// Keeps `pipeline` as the one the title set last on `this` (see
@@ -343,8 +361,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = this;
     S_OK
 }
 
@@ -567,8 +586,8 @@ pub(crate) struct CopyLocation {
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer (a read-back) on the GPU
+/// into the buffer's host copy ([`read_back`]).
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -592,8 +611,7 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            read_back(list, dst, [x, y, z], src, source_box);
             return;
         };
         // A destination whose host format stands in for the title's.
@@ -691,6 +709,141 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Texture to buffer (a read-back) into footprint `dst` of a title buffer:
+/// copied on the GPU, in list order, into the buffer's host copy as the
+/// footprint lays the texels out (rows at the title's pitch; the texture's
+/// console tiling is its host copy's business, as for the other copies),
+/// then into title memory once the list has run, as buffer copies go
+/// ([`crate::shadow::copy`]). The footprint's range is brought up to date
+/// from title memory first, so the bytes the copy leaves (between rows,
+/// outside its box) go back as the title had them.
+/// shortcut: the host places a footprint 512 bytes apart in its buffer,
+/// with rows a multiple of 256 bytes apart; BTP 6's read-back in VIctory
+/// #1583's run (5x1 texels of format 2, rows 256 bytes apart) fits. Another
+/// placement, a texture whose host format stands in for the title's (the
+/// bytes would need converting back) and a source that is no texture are
+/// logged once and not copied.
+#[cfg(windows)]
+fn read_back(
+    list: &crate::host::HostList,
+    dst: CopyLocation,
+    at: [u32; 3],
+    src: CopyLocation,
+    source_box: *const [u32; 6],
+) {
+    use std::sync::Once;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BOX, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+    };
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    let footprint = dst.footprint;
+    // Also a texture destination whose host copy is not ready.
+    if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                dst = dst.kind,
+                src = src.kind,
+                "a texture copy to a destination without a host copy that is no read-back: not done"
+            )
+        });
+        return;
+    }
+    let Some(texture) = crate::resource::host_resource(src.resource) else {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| tracing::warn!("a read-back of a texture without a host copy: not done"));
+        return;
+    };
+    // SAFETY: a live texture.
+    let host_format = unsafe { texture.GetDesc() }.Format.0 as u32;
+    let format = crate::resource::texture_memory(src.resource)
+        .map_or(footprint.format(), |(_, desc)| desc.format());
+    if crate::resource::format::conversion(format, host_format).is_some() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format,
+                host_format,
+                "a read-back of a texture whose host format stands in for the title's: not done"
+            )
+        });
+        return;
+    }
+    let Some(bytes) = footprint.bytes() else {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format = footprint.format(),
+                "a read-back in a format of unknown size: not done"
+            )
+        });
+        return;
+    };
+    let Some(target) = buffer_range(dst.resource, footprint.offset, bytes) else {
+        return;
+    };
+    let target = target as u64;
+    let Some(copy) = crate::shadow::find(target, bytes) else {
+        return;
+    };
+    let offset = copy.offset(target);
+    let (_, _, _, pitch) = footprint.shape();
+    if !offset.is_multiple_of(512) || !pitch.is_multiple_of(256) {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                offset,
+                pitch,
+                "a read-back the host cannot place (footprints 512 bytes apart, rows 256): not done"
+            )
+        });
+        return;
+    }
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    list.twin_use(src.resource, false, false);
+    ensure_state(list, src.resource, COPY_SOURCE);
+    // What the copy leaves keeps the title's bytes; the whole range goes
+    // back.
+    copy.refresh(list, target, bytes);
+    copy.gpu_copies(list, target, bytes);
+    let mut to = dst;
+    to.resource = copy.buffer.as_raw().cast_const().cast();
+    to.footprint.offset = offset;
+    let mut from = src;
+    from.resource = texture.as_raw().cast_const().cast();
+    let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!(
+            "read back {:?} into {:?} {footprint:?} at {at:?}",
+            src.resource, dst.resource
+        )
+    });
+    let (common, dest) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    // SAFETY: an open list; both locations in the host's layout, naming a
+    // live texture and the host copy the list keeps (`refresh`), the
+    // footprint inside it; the box is the title's (same layout).
+    unsafe {
+        list.list.ResourceBarrier(&[
+            crate::host::uav_barrier(),
+            crate::host::transition(&copy.buffer, common, dest),
+        ]);
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(),
+            at[0],
+            at[1],
+            at[2],
+            (&raw const from).cast(),
+            host_box,
+        );
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&copy.buffer, dest, common)]);
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -1797,7 +1950,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     at
 }
 
-/// Root signatures come from the translated pipelines.
+/// A call that sets nothing XTP uses (newer lists' 0x470, and without a
+/// host GPU every draw state call). The host's root signatures come from
+/// the translated pipelines; the title's only tell when its root arguments
+/// go (`draw::State::set_root_signature`).
 extern "system" fn ignored_state(_: This) {}
 
 extern "system" fn depth_order(_: This) {
@@ -1879,6 +2035,12 @@ mod state {
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
+    }
+    pub(super) extern "system" fn compute_signature(this: This, signature: This) {
+        with_state(this, |_, s| s.set_root_signature(true, signature));
+    }
+    pub(super) extern "system" fn graphics_signature(this: This, signature: This) {
+        with_state(this, |_, s| s.set_root_signature(false, signature));
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(true, slot, handle));
@@ -2030,10 +2192,12 @@ mod state {
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as compute_constant;
     pub(super) use super::ignored_state as compute_constants;
+    pub(super) use super::ignored_state as compute_signature;
     pub(super) use super::ignored_state as compute_table;
     pub(super) use super::ignored_state as compute_view;
     pub(super) use super::ignored_state as graphics_constant;
     pub(super) use super::ignored_state as graphics_constants;
+    pub(super) use super::ignored_state as graphics_signature;
     pub(super) use super::ignored_state as graphics_table;
     pub(super) use super::ignored_state as graphics_view;
     pub(super) use super::ignored_state as heaps;
@@ -2283,8 +2447,8 @@ const METHODS: [(usize, *const ()); 54] = [
     (25, set_pipeline as *const ()),              // 0xc8
     (26, barrier as *const ()),                   // 0xd0
     (32, state::heaps as *const ()),              // 0x100
-    (33, ignored_state as *const ()),             // 0x108 compute root signature
-    (34, ignored_state as *const ()),             // 0x110 graphics root signature
+    (33, state::compute_signature as *const ()),  // 0x108
+    (34, state::graphics_signature as *const ()), // 0x110
     (35, state::compute_table as *const ()),      // 0x118
     (36, state::graphics_table as *const ()),     // 0x120
     (37, state::compute_constant as *const ()),   // 0x128
@@ -2551,6 +2715,211 @@ mod tests {
             assert_eq!(got[..3], written, "the dispatch reads the written words");
             assert_eq!(got[3..], [0x1111_1111; 61]);
             assert_eq!(w.words()[..3], written);
+        }
+
+        /// A list created with a pipeline has it set, as `SetPipelineState`
+        /// sets one, whichever creation method the title calls: its draw
+        /// state and `DispatchX` use it until the title sets another, and
+        /// its first bind is logged. A list created without one has none.
+        /// Before, the creation's pipeline was dropped.
+        #[test]
+        fn lists_bind_the_initial_pipeline_on_creation() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use tracing::{Event, Metadata, Subscriber, span};
+
+            /// Counts the pipelines' "first bind" lines.
+            struct FirstBinds(Arc<AtomicUsize>);
+            impl Subscriber for FirstBinds {
+                fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                    let fields = metadata.fields();
+                    metadata.is_event()
+                        && metadata.target() == "xtp_gpu::pipeline"
+                        && ["pipeline", "frame", "hash"]
+                            .iter()
+                            .all(|f| fields.field(f).is_some())
+                }
+                fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                    span::Id::from_u64(1)
+                }
+                fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+                fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+                fn event(&self, event: &Event<'_>) {
+                    if self.enabled(event.metadata()) {
+                        self.0.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                fn enter(&self, _: &span::Id) {}
+                fn exit(&self, _: &span::Id) {}
+            }
+
+            /// A compute pipeline description as the title passes one.
+            #[repr(C)]
+            struct ComputeDesc {
+                root: This,
+                code: *const u8,
+                size: usize,
+            }
+
+            let test = "list::tests::gpu::lists_bind_the_initial_pipeline_on_creation";
+            let Some(_gpu) = device(test) else { return };
+            let null = std::ptr::null();
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let desc = ListDesc {
+                kind: 0,
+                flags: 0,
+                nodes: 0,
+                barrier_batch: 0,
+            };
+            // Bytes of this test's own (shaders are shared by their bytes),
+            // which nothing translates: the list only names the pipeline.
+            let bytes = [0xa5, 0xb6, 0xc7, 0x46];
+            let compute = ComputeDesc {
+                root: null,
+                code: bytes.as_ptr(),
+                size: bytes.len(),
+            };
+            let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            // What the list's draw state holds (an address no pipeline has
+            // until it has been read).
+            let drawn = |list: This| {
+                let mut pipeline = std::ptr::without_provenance(1);
+                with_state(list, |_, s| pipeline = s.pipeline());
+                pipeline
+            };
+            let binds = Arc::new(AtomicUsize::new(0));
+            let counting = tracing::Dispatch::new(FirstBinds(binds.clone()));
+            tracing::dispatcher::with_default(&counting, || {
+                for console in [false, true] {
+                    let create = |pipeline, out| {
+                        if console {
+                            create_list_x(null, &desc, allocator, pipeline, &LIST_IIDS[1], out)
+                        } else {
+                            create_list(null, 0, 0, allocator, pipeline, &LIST_IIDS[1], out)
+                        }
+                    };
+                    let mut pipeline = null;
+                    assert_eq!(
+                        crate::pipeline::create_compute(
+                            null,
+                            (&raw const compute).cast(),
+                            &PAGEABLE_IIDS[0],
+                            &mut pipeline,
+                        ),
+                        S_OK
+                    );
+                    let before = binds.load(Ordering::Relaxed);
+                    let mut list = null;
+                    assert_eq!(create(null, &mut list), S_OK);
+                    assert_eq!((drawn(list), kept_pipeline(list)), (null, null));
+                    assert_eq!(binds.load(Ordering::Relaxed), before);
+                    assert_eq!(release(list), 0);
+
+                    assert_eq!(create(pipeline, &mut list), S_OK);
+                    assert_eq!(
+                        drawn(list),
+                        pipeline,
+                        "the draw state's (console {console})"
+                    );
+                    assert_eq!(kept_pipeline(list), pipeline, "DispatchX's");
+                    assert_eq!(binds.load(Ordering::Relaxed), before + 1, "its first bind");
+                    assert_eq!(release(list), 0);
+                    assert_eq!(release(pipeline), 0);
+                }
+            });
+            assert_eq!(release(allocator), 0);
+        }
+
+        /// A copy location as the title passes one: a resource, the kind (0
+        /// a subresource index, 1 a placed footprint), then the index or the
+        /// footprint (offset, format, width, height, depth, row pitch).
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            offset: u64,
+            format: u32,
+            width: u32,
+            height: u32,
+            depth: u32,
+            row_pitch: u32,
+        }
+
+        /// Texture copies into title buffers (read-backs) run on the GPU in
+        /// list order, after the draws that wrote the texture, and reach
+        /// title memory once the list has run, as the title's footprints
+        /// lay them out: at their offset, rows at their pitch, a box at its
+        /// place. The bytes the copies leave keep what the title wrote.
+        /// Before, these copies were skipped ("texture to buffer copies not
+        /// implemented").
+        #[test]
+        fn texture_read_backs_reach_title_buffers_as_their_footprints_lay_them_out() {
+            let test = "list::tests::gpu::texture_read_backs_reach_title_buffers_as_their_footprints_lay_them_out";
+            let Some(_gpu) = device(test) else { return };
+            const TITLE: u32 = 0xdead_beef;
+            let (outer, inner) = ([1, 2, 3, 4], [9, 8, 7, 6]);
+            let t = texture(4, 4);
+            let list = TitleList::new();
+            fill(list.this(), t, (0, 0, 4, 4), outer);
+            fill(list.this(), t, (1, 1, 3, 3), inner);
+            let dst = TitleBuffer::new(4096);
+            dst.set_words(|_| TITLE);
+            let footprint = |offset| Location {
+                resource: dst.resource(),
+                kind: 1,
+                offset,
+                format: RGBA8,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 256,
+            };
+            let source = Location {
+                resource: t,
+                kind: 0,
+                offset: 0,
+                format: 0,
+                width: 0,
+                height: 0,
+                depth: 0,
+                row_pitch: 0,
+            };
+            let copy = |to: &Location, [x, y, z]: [u32; 3], area: Option<&[u32; 6]>| {
+                copy_texture_region(
+                    list.this(),
+                    std::ptr::from_ref(to).cast(),
+                    x,
+                    y,
+                    z,
+                    (&raw const source).cast(),
+                    area.map_or(std::ptr::null(), std::ptr::from_ref),
+                )
+            };
+            // All of it 512 bytes in; its middle 2x2 to (2, 1) of a
+            // footprint 2048 bytes in (a box: left, top, front, right,
+            // bottom, back).
+            copy(&footprint(512), [0, 0, 0], None);
+            copy(&footprint(2048), [2, 1, 0], Some(&[1, 1, 0, 3, 3, 1]));
+            list.run();
+            release(t);
+            let mut want = vec![TITLE; 1024];
+            for y in 0..4 {
+                for x in 0..4 {
+                    let middle = (1..3).contains(&x) && (1..3).contains(&y);
+                    want[(512 + y * 256) / 4 + x] =
+                        u32::from_le_bytes(if middle { inner } else { outer });
+                }
+            }
+            for y in 1..3 {
+                for x in 2..4 {
+                    want[(2048 + y * 256) / 4 + x] = u32::from_le_bytes(inner);
+                }
+            }
+            assert_eq!(dst.words(), want);
         }
 
         /// A title resource description (`D3D12_RESOURCE_DESC`), as the

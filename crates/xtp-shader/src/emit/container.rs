@@ -64,6 +64,122 @@ impl SigElement {
     }
 }
 
+/// Lors du partitionnement, le std::sort de DXC (MSVC) peut permuter des
+/// lignes de même clé. dxil.dll reconstruit la signature et la compare
+/// octet par octet. Seuls les indices bougent, les noms gardent l'ordre DXIL.
+fn sort_signature_rows(
+    rows: &mut [usize],
+    key: impl Fn(usize) -> (u32, u32) + Copy,
+    budget: usize,
+) {
+    if rows.len() <= 32 {
+        rows.sort_by_key(|&i| key(i)); // Le tri par insertion de MSVC est stable.
+        return;
+    }
+    if budget == 0 {
+        // Après trop de partitions, MSVC trie par tas. Il descend jusqu'à
+        // une feuille (à droite en cas d'égalité), puis remonte la valeur.
+        let sift = |heap: &mut [usize], root: usize| {
+            let value = heap[root];
+            let mut hole = root;
+            while hole < heap.len() / 2 {
+                let left = 2 * hole + 1;
+                let right = left + 1;
+                let child = if right < heap.len() && key(heap[right]) >= key(heap[left]) {
+                    right
+                } else {
+                    left
+                };
+                heap[hole] = heap[child];
+                hole = child;
+            }
+            while hole > root && key(heap[(hole - 1) / 2]) < key(value) {
+                heap[hole] = heap[(hole - 1) / 2];
+                hole = (hole - 1) / 2;
+            }
+            heap[hole] = value;
+        };
+        for root in (0..rows.len() / 2).rev() {
+            sift(rows, root);
+        }
+        for end in (1..rows.len()).rev() {
+            rows.swap(0, end);
+            sift(&mut rows[..end], 0);
+        }
+        return;
+    }
+
+    let len = rows.len();
+    let mid = len / 2;
+    let last = len - 1;
+    let mut median = |a: usize, b: usize, c: usize| {
+        if key(rows[b]) < key(rows[a]) {
+            rows.swap(a, b);
+        }
+        if key(rows[c]) < key(rows[b]) {
+            rows.swap(b, c);
+            if key(rows[b]) < key(rows[a]) {
+                rows.swap(a, b);
+            }
+        }
+    };
+    if last > 40 {
+        let step = len / 8;
+        median(0, step, 2 * step);
+        median(mid - step, mid, mid + step);
+        median(last - 2 * step, last - step, last);
+        median(step, mid, last - step);
+    } else {
+        median(0, mid, last);
+    }
+    // Les lignes de même clé occupent [lo, hi). Les deux curseurs partent
+    // du pivot. Quand un côté est épuisé, on décale le groupe du pivot.
+    let pivot = key(rows[mid]);
+    let (mut lo, mut hi) = (mid, mid + 1);
+    let (mut left, mut right) = (lo, hi);
+    loop {
+        while right < len && key(rows[right]) >= pivot {
+            if key(rows[right]) == pivot {
+                rows.swap(hi, right);
+                hi += 1;
+            }
+            right += 1;
+        }
+        while left > 0 && key(rows[left - 1]) <= pivot {
+            left -= 1;
+            if key(rows[left]) == pivot {
+                lo -= 1;
+                rows.swap(lo, left);
+            }
+        }
+        if left == 0 && right == len {
+            break;
+        }
+        if left == 0 {
+            if hi != right {
+                rows.swap(lo, hi);
+            }
+            rows.swap(lo, right);
+            lo += 1;
+            hi += 1;
+            right += 1;
+        } else if right == len {
+            left -= 1;
+            lo -= 1;
+            hi -= 1;
+            rows.swap(left, lo);
+            rows.swap(lo, hi);
+        } else {
+            left -= 1;
+            rows.swap(left, right);
+            right += 1;
+        }
+    }
+    let budget = budget / 2 + budget / 4;
+    sort_signature_rows(&mut rows[..lo], key, budget);
+    sort_signature_rows(&mut rows[hi..], key, budget);
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -76,9 +192,6 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // their name, not by column: elements packed into one register keep the
     // order of their names (dxil.dll compares the part byte for byte, and
     // refuses "Program Input/Output Signature does not match" otherwise).
-    // DXC's sort is not stable, but MSVC sorts up to 32 rows by insertion
-    // (stable), and two rows tie only when one register holds two elements
-    // of the same system value.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -96,7 +209,12 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
+    let key = |i: usize| (elements[i].row.unwrap_or(u32::MAX), offsets[i]);
+    if elements.len() > 32 && names.len() < elements.len() {
+        sort_signature_rows(&mut order, key, elements.len());
+    } else {
+        order.sort_by_key(|&i| key(i));
+    }
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;

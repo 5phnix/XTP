@@ -106,6 +106,32 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+impl Journal {
+    /// Interroge Windows sur des pages entières et garde sa réponse dans `found`.
+    fn poll(&mut self, pages: Range<usize>) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const WRITE_WATCH_FLAG_RESET: u32 = 1;
+        let size = pages.len() * PAGE;
+        let mut count = size / KERNEL_PAGE;
+        self.found.resize(count.max(self.found.len()), 0);
+        let mut granularity = 0;
+        #[cfg(test)]
+        tests::WATCH_QUERIES.set(tests::WATCH_QUERIES.get() + 1);
+        // SAFETY: the answer buffer holds `count` entries.
+        let status = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (pages.start * PAGE) as *const _,
+                size,
+                self.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        (status == 0).then_some(count)
+    }
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -113,32 +139,17 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let _watch = crate::host::preparation::Phase::Watch.enter();
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // Une vue de section ne peut pas avoir MEM_WRITE_WATCH.
+    let known_view = KNOWN_VIEWS.contains(first);
+    if known_view && !guarded {
+        return None;
+    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
-        }
+    let ask_guard = || {
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
         let written = guard(first * PAGE, last * PAGE);
@@ -147,9 +158,18 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             crate::copystat::C::GuardUs,
             guarding.elapsed().as_micros() as u64,
         );
-        written?
+        written
+    };
+    // Si un remappage efface le bit avant que guard prenne GUARDS, guard
+    // vérifie la nouvelle allocation et on revient à Windows si elle est privée.
+    let (count, dirty) = if let Some(dirty) = known_view.then(ask_guard).flatten() {
+        (0, dirty)
+    } else if let Some(count) = j.poll(first..last) {
+        (count, Vec::new())
+    } else if guarded {
+        (0, ask_guard()?)
     } else {
-        Vec::new()
+        return None;
     };
     #[cfg(feature = "diagnostics")]
     {
@@ -159,8 +179,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(dirty);
+    for page in pages {
         j.written.insert(page, now);
     }
     Some((
@@ -189,12 +209,6 @@ struct Guards {
     /// them page by page through the kernel's failing reads, hundreds of
     /// MB per world frame.
     absent: BTreeSet<usize>,
-    /// Blocks found to be in a view when an asking began there, until the
-    /// runtime remaps them. Asking the system each time (`VirtualQuery`,
-    /// which walks a view's page tables to the region's end) cost 100-230
-    /// ms per world frame in VIctory #490's runs, and 300-400 ms for a
-    /// frame's 1 050 askings of one 174 MB view here (`guard_costs`).
-    views: BTreeSet<usize>,
     /// Blocks that could not be made read-only and are no placeholders
     /// (free address space, a reservation or a view not committed yet) when
     /// a copy took them, until the runtime reports a change there: reported
@@ -217,7 +231,6 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
-    views: BTreeSet::new(),
     unguardable: BTreeSet::new(),
     aliased: BTreeSet::new(),
 });
@@ -288,6 +301,10 @@ impl FaultPages {
             let Some(region) = self.0.get(page >> 16) else {
                 break;
             };
+            if !on && region.get().is_none() {
+                pages.start = ((page >> 16) + 1) << 16;
+                continue;
+            }
             let count = pages.len().min(64 - page % 64);
             let mask = (u64::MAX >> (64 - count)) << (page % 64);
             let word = (page >> 6) & 1023;
@@ -305,6 +322,9 @@ impl FaultPages {
 static WRITE_FAULTS: FaultPages = FaultPages::new();
 static READ_FAULTS: FaultPages = FaultPages::new();
 static KNOWN_READS: FaultPages = FaultPages::new();
+/// Blocs de départ déjà identifiés comme vues de section par `guard`.
+/// GUARDS sérialise leur identification et leur invalidation au remappage.
+static KNOWN_VIEWS: FaultPages = FaultPages::new();
 
 /// The runtime's answer to where else the title shows the physical pages of
 /// a range of title memory ([`set_alias_lookup`]).
@@ -358,11 +378,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // forgets it all. An asking in between that finds the view gone notes
     // its blocks absent (the report before opened them, 5553e29), which the
     // report after forgets too.
-    if !g.views.contains(&first) {
+    if !KNOWN_VIEWS.contains(first) {
         if !view(start) {
             return None;
         }
-        g.views.insert(first);
+        KNOWN_VIEWS.set(first..first + 1, true);
     }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
@@ -1080,12 +1100,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let g = &mut *g;
     let range = blocks(at, len);
     g.owners.forget(range.clone());
-    for known in [
-        &mut g.absent,
-        &mut g.views,
-        &mut g.unguardable,
-        &mut g.aliased,
-    ] {
+    KNOWN_VIEWS.set(range.clone(), false);
+    for known in [&mut g.absent, &mut g.unguardable, &mut g.aliased] {
         let gone: Vec<usize> = known.range(range.clone()).copied().collect();
         for block in gone {
             known.remove(&block);
@@ -1225,6 +1241,7 @@ pub(crate) mod tests {
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     thread_local! {
+        pub(super) static WATCH_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The address-space queries `guard` made on this thread (`view`,
         /// `placeholder`; each test runs on its own).
         pub(super) static QUERIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1514,16 +1531,16 @@ pub(crate) mod tests {
     /// Whether the guards note anything of blocks `[at, at + len)`.
     fn noted(at: usize, len: usize) -> bool {
         let g = guards();
-        [
-            &g.protected,
-            &g.clean,
-            &g.absent,
-            &g.views,
-            &g.unguardable,
-            &g.aliased,
-        ]
-        .into_iter()
-        .any(|known| known.range(blocks(at, len)).next().is_some())
+        blocks(at, len).any(|block| KNOWN_VIEWS.contains(block))
+            || [
+                &g.protected,
+                &g.clean,
+                &g.absent,
+                &g.unguardable,
+                &g.aliased,
+            ]
+            .into_iter()
+            .any(|known| known.range(blocks(at, len)).next().is_some())
     }
 
     /// One page in two views (a pagefile section mapped twice), as xmem
@@ -1908,6 +1925,33 @@ pub(crate) mod tests {
         assert!(guard(p, p + 16).is_none());
         assert!(guard(p, p + 16).is_none());
         assert_eq!(queried(), at + 5);
+        unmapped(view, 2);
+    }
+
+    #[test]
+    fn known_views_skip_write_watch_until_their_block_is_remapped() {
+        let _serial = serial();
+        let view = mapped(2);
+        let next = view + PAGE;
+        let end = next + PAGE;
+        let queries = WATCH_QUERIES.get();
+        writes(view, next, true).expect("first view probe");
+        writes(next, end, true).expect("second view probe");
+        assert_eq!(WATCH_QUERIES.get(), queries + 2);
+
+        assert!(writes(view, end, false).is_none());
+        // SAFETY: writing our mapped view goes through the guard handler.
+        unsafe { (view as *mut u8).write_volatile(1) };
+        let (now, pages) = writes(view, end, true).expect("known view");
+        assert!(pages.contains(&(view / PAGE, now)));
+        assert!(!pages.contains(&(next / PAGE, now)));
+        assert_eq!(WATCH_QUERIES.get(), queries + 2);
+
+        title_memory_remapped(view, PAGE);
+        assert!(writes(next, end, false).is_none());
+        assert_eq!(WATCH_QUERIES.get(), queries + 2);
+        writes(view, next, true).expect("probe after remap");
+        assert_eq!(WATCH_QUERIES.get(), queries + 3);
         unmapped(view, 2);
     }
 
