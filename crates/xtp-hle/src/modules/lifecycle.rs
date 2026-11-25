@@ -31,6 +31,8 @@ fn routines() -> MutexGuard<'static, Vec<(usize, Routine, usize)>> {
 /// How long the console lets suspend routines run before it ends the title.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
+static ENDING: AtomicBool = AtomicBool::new(false);
+
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
 pub extern "system" fn RegisterAppStateChangeNotification(
@@ -203,10 +205,13 @@ extern "system" fn window_proc(
 /// Suspends the title as the console does when it ends it, runs `then`
 /// (once), then ends the process. Returns at once; later calls do nothing.
 pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
-    static ENDING: AtomicBool = AtomicBool::new(false);
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
     }
+    RESTART_ON_CRASH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     let suspend = routines().clone();
     tracing::info!(routines = suspend.len(), "{why}: suspending the title");
     // Whoever comes first (the routines or the deadline) runs `then`; the
@@ -255,7 +260,10 @@ static RESTART_ON_CRASH: Mutex<Option<Vec<std::ffi::OsString>>> = Mutex::new(Non
 /// Records the arguments to relaunch with if the process hits an unhandled
 /// crash (`XLaunchRestartOnCrash`).
 pub(crate) fn set_restart_on_crash(args: Vec<std::ffi::OsString>) {
-    *RESTART_ON_CRASH.lock().unwrap_or_else(|e| e.into_inner()) = Some(args);
+    let mut restart = RESTART_ON_CRASH.lock().unwrap_or_else(|e| e.into_inner());
+    if !ENDING.load(Ordering::SeqCst) {
+        *restart = Some(args);
+    }
 }
 
 /// Installs the hook for fatal unhandled exceptions. Autopilot logs a skip
@@ -276,6 +284,9 @@ fn relaunch_on_crash(autopilot: bool) {
     else {
         return;
     };
+    if ENDING.load(Ordering::SeqCst) {
+        return;
+    }
     if autopilot {
         tracing::info!("skipping crash restart: autopilot is enabled");
         return;

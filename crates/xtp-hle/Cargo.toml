@@ -52,6 +52,9 @@ xtp-core.workspace = true
 tempfile.workspace = true
 xtp-testkit.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_JobObjects"] }
+
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = [
@@ -69,7 +72,3 @@ diagnostics = [
 
 [lints]
 workspace = true
-
-[[test]]
-name = "restart_on_crash"
-harness = false

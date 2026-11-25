@@ -249,6 +249,27 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_without_title_args_keeps_the_executable_and_drops_old_args() {
+        let ours = ["run", "G:/game.exe", "--", "-old"].map(std::ffi::OsString::from);
+        let current = std::ffi::OsStr::new("G:/game.exe");
+        for args in [std::ptr::null(), c"".as_ptr(), c" \t".as_ptr()] {
+            let args = text(args).unwrap_or_default();
+            assert_eq!(relaunch_args(ours.to_vec(), current, "", &args), ours[..2]);
+        }
+    }
+
+    #[test]
+    fn a_restart_uses_the_shared_whitespace_split_for_quoted_args() {
+        let ours = ["run", "G:/game.exe", "--", "-old"].map(std::ffi::OsString::from);
+        let current = std::ffi::OsStr::new("G:/game.exe");
+        let command = relaunch_args(ours.to_vec(), current, "", "-save \"slot 1\"");
+        assert_eq!(
+            command,
+            ["run", "G:/game.exe", "--", "-save", "\"slot", "1\""].map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
     fn served_areas_are_available_others_not() {
         type Check = extern "system" fn(This, u32) -> bool;
         let check = method::<Check>(&FEATURES_OBJECT, 0x18);
