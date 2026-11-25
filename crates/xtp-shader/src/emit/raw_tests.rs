@@ -786,7 +786,7 @@ fn rebuilt_program(
 #[test]
 fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
     let (_one, hosts) = hosts();
-    // The used-resource stride is deliberately absent: word 1 supplies it.
+    // Le stride vient du mot 1 du descripteur reconstruit.
     for (oob, stride, records, index, within, scalar, want) in [
         (0, 12, 2, 0, 0, 0, Some(3)),
         (0, 12, 2, 0, 0, 12, Some(6)),
@@ -797,18 +797,34 @@ fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
         (1, 12, 2, 2, 0, 0, None),
         (2, 12, 1, 2, 12, 0, Some(12)),
         (2, 12, 0, 0, 0, 0, None),
-        // LLVM, IntrinsicsAMDGPU.td : SOFFSET déplace la base après le contrôle.
         (3, 12, 16, 0, 0, 12, Some(6)),
-        (3, 12, 16, 0, 4, 12, Some(7)),
-        (3, 12, 14, 0, 0, 12, Some(6)),
+        (3, 12, 16, 0, 4, 12, None),
+        (3, 12, 14, 0, 0, 12, None),
         (3, 12, 14, 0, 12, 0, None),
+        (3, 0, 20, 0, 8, 8, Some(7)), // Le dernier octet tient exactement.
+        // Vecteurs de docs/buffer_bounds.md, projet de @ubiquitarianism
+        // (GPL-3.0, mesures SHADER-116 et SHADER-341 sur gfx1036/gfx1011).
+        // Source également citée par rminzao : https://github.com/Marvisak/VIctory/pull/2084
+        (3, 0, 18, 0, 8, 8, None),
+        (3, 16, 18, 0, 8, 8, None),
+        (3, 18, 18, 0, 8, 8, None),
+        (3, 16, 18, 4, 0, 0, Some(19)), // Index × stride déplace seulement l'adresse.
+        (0, 16, 18, 0, 13, 0, None),
+        (0, 16, 18, 0, 12, 0, Some(6)),
     ] {
+        // OFFEN fournit l'offset en octets, comme dans la sonde matérielle.
+        let (op, addr) = if index == 0 {
+            (0xe030_1000, 0x1402_0204) // v4 (offset)
+        } else {
+            (0xe030_3000, 0x1402_0203) // v[3:4] (index, offset)
+        };
         let mut access = vec![
             0x7e02_0280, // v1 = 0
             0x7e06_0280 + index,
+            0x7e08_0280 + within,
             0xbe94_0380 + scalar,
-            0xe030_2000 + within,
-            0x1402_0203,
+            op,
+            addr,
         ];
         access.extend(EPILOGUE);
         let p = rebuilt_program(stride << 16, records, 0x0101_4fac | (oob << 28), 1, &access);

@@ -105,6 +105,8 @@ mod mesh_tests;
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
 pub(crate) mod lower;
 #[cfg(all(test, windows))]
+mod r1_tests;
+#[cfg(all(test, windows))]
 mod raw_tests;
 pub mod rect_gs;
 mod sampler;
@@ -138,6 +140,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::opt::dxil_opt;
+pub(crate) use lower::geometry::GsShape;
 pub use sampler::StaticSampler;
 pub use shader::{
     ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
@@ -445,6 +448,13 @@ pub fn last_module_summary() -> String {
     }
 }
 
+/// Joins where a descriptor's dword took an undefined value in the console
+/// flow without the proof that no lane reads it there (the `shortcut:` of
+/// `lower/flow.rs`'s descriptor-word rule), over every translation of the
+/// process: what a survey or a session reports of that shortcut.
+pub static UNPROVEN_DESCRIPTOR_JOINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 thread_local! {
     /// The form of the program [`emit_for`] translated last on this thread
     /// (see [`last_module_summary`]); empty after a failure.
@@ -468,12 +478,30 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
+        })?;
+    translate_program_for(&c, &native, target).map_err(|(_, e)| e)
+}
+
+/// [`translate_for`] of the export shader (ES) of a vertex shader container
+/// instead of its vertex shader: the vertex shader of a pipeline that has a
+/// geometry shader (`docs/analysis/es-gs.md`).
+pub fn translate_es_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Es)
+        .ok_or(ShaderError::Unsupported {
+            offset: 0,
+            what: "a container without an export shader",
         })?;
     translate_program_for(&c, &native, target).map_err(|(_, e)| e)
 }
@@ -526,11 +554,13 @@ pub fn translate_program_for(
 ) -> Result<HostShader, (Step, ShaderError)> {
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)
         .map_err(|e| (Step::Decode, e))?;
+    let p = lower::geometry::prepared(p, native.stage).map_err(|e| (Step::Decode, e))?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res =
-        resource::track_native(&p, native, st.as_ref().ok()).map_err(|e| (Step::Resources, e))?;
+    let tracked = lower::geometry::tracked(c, &p, native).map_err(|e| (Step::Resources, e))?;
+    let res = resource::track_native(&tracked, native, st.as_ref().ok())
+        .map_err(|e| (Step::Resources, e))?;
     let io = io::raise(&p, native).map_err(|e| (Step::Io, e))?;
     let st = st.map_err(|e| (Step::Structure, e))?;
     emit_for(c, native, &p, &st, &io, &res, target).map_err(|e| (Step::Emit, e))
@@ -560,6 +590,7 @@ pub fn emit_for(
     target: Target,
 ) -> Result<HostShader, ShaderError> {
     LAST_FLOW.set("");
+    let io = &*lower::geometry::with_shape(c, native, io)?;
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),

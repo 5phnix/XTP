@@ -485,6 +485,11 @@ pub(crate) fn bounded_root_srvs() -> bool {
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
+    /// A stage of a pipeline with a geometry shader, a merged ES + GS
+    /// half ([`merged_half`]): the vertex stage's translation of its
+    /// container's export shader (ES), which runs there instead of its
+    /// vertex shader, and the geometry stage's own.
+    pub(crate) merged: Option<Arc<Translated>>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
@@ -498,10 +503,88 @@ pub(crate) struct Stage {
 
 impl Stage {
     pub(crate) fn translated(&self) -> &Translated {
-        self.shader
-            .translated()
-            .expect("host pipelines are made from translated shaders")
+        match &self.merged {
+            Some(t) => t,
+            None => self
+                .shader
+                .translated()
+                .expect("host pipelines are made from translated shaders"),
+        }
     }
+}
+
+/// Merged halves' translations ([`merged_half`]), by container hash and
+/// half (true: the export shader).
+type MergedHalves =
+    std::collections::HashMap<(String, bool), Arc<std::sync::OnceLock<Option<Arc<Translated>>>>>;
+static MERGED_HALVES: std::sync::Mutex<Option<MergedHalves>> = std::sync::Mutex::new(None);
+
+/// A half of the console's merged ES + GS stage, translated for the host
+/// (`docs/analysis/es-gs.md`): of a vertex shader container its export
+/// shader (`es`), which a pipeline with a geometry shader runs as its
+/// vertex shader, the console's ES writing the ring its GS reads; of a
+/// geometry shader container its GS. Each with what its own console
+/// program says of itself (the resources its tables hold): the container's
+/// [`Shader::native`] reads its vertex shader, and nothing of a GS
+/// container. Made once per container and half; `None` (logged once) when
+/// it does not translate.
+fn merged_half(shader: &Shader, es: bool) -> Option<Arc<Translated>> {
+    let once = {
+        let mut made = MERGED_HALVES.lock().unwrap_or_else(|e| e.into_inner());
+        made.get_or_insert_with(Default::default)
+            .entry((shader.hash.clone(), es))
+            .or_default()
+            .clone()
+    };
+    once.get_or_init(|| {
+        let half = if es { "export" } else { "geometry" };
+        let started = std::time::Instant::now();
+        let done = merged_translation(&shader.container, es);
+        let ms = started.elapsed().as_millis() as u64;
+        match &done {
+            Ok(_) => tracing::info!(hash = %shader.hash, half, ms, "merged half translated"),
+            Err(e) => tracing::warn!(
+                hash = %shader.hash,
+                half,
+                error = %e,
+                ms,
+                "merged half does not translate; its pipelines with a geometry shader are dropped"
+            ),
+        }
+        done.ok().map(Arc::new)
+    })
+    .clone()
+}
+
+/// [`merged_half`]'s translation of `container`.
+fn merged_translation(container: &[u8], es: bool) -> Result<Translated, String> {
+    use xtp_shader::HwStage;
+    let target = crate::device::host_target();
+    let (host, stage) = if es {
+        let host = crate::shader_cache::host_es_shader(container, target)?;
+        (host, HwStage::Es)
+    } else {
+        let host = crate::shader_cache::host_shader(container, target)?;
+        (host, HwStage::Gs)
+    };
+    if host.stage != stage {
+        return Err(format!(
+            "the container's {:?} program translated",
+            host.stage
+        ));
+    }
+    let c = xtp_shader::Container::parse(container).map_err(|e| e.to_string())?;
+    let dxil = c.part(xtp_shader::FourCC::DXIL).ok_or("no DXIL part")?.data;
+    let native = xtp_shader::native_programs(dxil)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|p| p.stage == stage)
+        .ok_or("no program of its half")?;
+    Ok(Translated {
+        host,
+        used: native.used,
+        wave64: native.wave64,
+    })
 }
 
 pub(crate) struct HostPipeline {
@@ -512,7 +595,8 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
-    /// Vertex, then pixel stage, or the compute stage.
+    /// Vertex (or mesh) stage, then pixel and geometry stages, or the
+    /// compute stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
@@ -808,14 +892,20 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh" | "geometry"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, mesh, geometry, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        // A geometry shader: the vertex stage runs its container's export
+        // shader (ES), which writes the ring the GS reads on the console.
+        let geometry = find("geometry");
+        if geometry.is_some() && mesh.is_some() {
+            return refuse("a geometry shader beside a mesh shader", shaders);
+        }
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -826,6 +916,7 @@ impl HostPipeline {
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(geometry.map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -844,8 +935,28 @@ impl HostPipeline {
                 return refuse(format!("{} shader {why}", s.stage), shaders);
             }
         }
-        for (s, _) in &stages {
-            if let Some(why) = shader_refusal(s.stage, s.translated()?) {
+        // With a geometry shader, the vertex and geometry stages are a
+        // merged ES + GS pair's halves: their own translations.
+        let mut merged: Vec<Option<Arc<Translated>>> = vec![None; stages.len()];
+        if geometry.is_some() {
+            for ((s, _), m) in stages.iter().zip(&mut merged) {
+                if matches!(s.stage, "vertex" | "geometry") {
+                    *m = merged_half(s, s.stage == "vertex");
+                    if m.is_none() {
+                        let why =
+                            format!("its {} shader's merged half does not translate", s.stage);
+                        return refuse(why, shaders);
+                    }
+                }
+            }
+        }
+        let translations: Vec<&Translated> = stages
+            .iter()
+            .zip(&merged)
+            .map(|((s, _), m)| m.as_deref().or_else(|| s.translated()))
+            .collect::<Option<_>>()?;
+        for ((s, _), t) in stages.iter().zip(&translations) {
+            if let Some(why) = shader_refusal(s.stage, t) {
                 return refuse(format!("{} shader {why}", s.stage), shaders);
             }
         }
@@ -858,10 +969,11 @@ impl HostPipeline {
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
-        for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+        for (k, &(shader, visibility)) in stages.iter().enumerate() {
+            let t = &translations[k].host;
             let mut stage = Stage {
                 shader: shader.clone(),
+                merged: merged[k].clone(),
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
@@ -984,13 +1096,14 @@ impl HostPipeline {
                 }
             };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+            translations
+                .get(i)
+                .map_or(D3D12_SHADER_BYTECODE::default(), |t| {
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: t.host.dxil.as_ptr().cast(),
+                        BytecodeLength: t.host.dxil.len(),
+                    }
+                })
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -1076,28 +1189,40 @@ impl HostPipeline {
             });
         }
 
+        // The stages after the vertex stage, by name: a pipeline may have no
+        // pixel stage, and the geometry stage comes after it.
+        let at = |name: &str| stages.iter().position(|(s, _)| s.stage == name);
+        let ps_at = at("pixel");
+        let pixel = ps_at.map_or_else(D3D12_SHADER_BYTECODE::default, code);
         // The console's rectangles whose vertex shader has no per-vertex
         // input: a geometry stage makes each one's fourth corner.
         let gs = if g.topology.0 == RECTANGLES {
-            let dxil = |i: usize| {
-                let t = stages.get(i).and_then(|(s, _)| s.translated());
+            if geometry.is_some() {
+                return refuse("rectangles drawn through a geometry shader", shaders);
+            }
+            let dxil = |i: Option<usize>| {
+                let t = i.and_then(|i| translations.get(i));
                 t.map(|t| t.host.dxil.as_slice())
             };
-            dxil(0).and_then(|vs| crate::rectangles::geometry_stage(&g.elements(), vs, dxil(1)))
+            dxil(Some(0))
+                .and_then(|vs| crate::rectangles::geometry_stage(&g.elements(), vs, dxil(ps_at)))
         } else {
             None
         };
+        // The title's geometry shader, else the rectangles'.
+        let title_gs = at("geometry").map(code);
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
-            GS: gs
-                .as_deref()
-                .map_or_else(D3D12_SHADER_BYTECODE::default, |b| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: b.as_ptr().cast(),
-                    BytecodeLength: b.len(),
-                }),
-            PS: code(1),
+            GS: title_gs.unwrap_or_else(|| {
+                gs.as_deref()
+                    .map_or_else(D3D12_SHADER_BYTECODE::default, |b| D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: b.as_ptr().cast(),
+                        BytecodeLength: b.len(),
+                    })
+            }),
+            PS: pixel,
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -1119,11 +1244,13 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        let (vs_code, ps_code) = (code_bytes(&code(0)), code_bytes(&code(1)));
+        let (vs_code, ps_code) = (code_bytes(&code(0)), code_bytes(&pixel));
+        let gs_code = title_gs.as_ref().map(code_bytes);
         // The stage's bytes are in the name only when there is one: the other
         // pipelines keep their names in the pipeline library.
         let mut codes = vec![vs_code.as_slice(), ps_code.as_slice()];
         codes.extend(gs.as_deref());
+        codes.extend(gs_code.as_deref());
         let name = super::library::name("graphics", &root_blob, &codes, &state);
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
             if g.depth_bounds && host.depth_bounds {
@@ -1903,6 +2030,84 @@ mod tests {
         );
     }
 
+    /// A pipeline with a geometry shader runs its vertex shader
+    /// container's export shader (ES) as its vertex shader, and its
+    /// geometry shader's own translation (`merged_half`'s, given here as
+    /// FXC's programs): the ES writes the value the GS passes on and the
+    /// pixel shader writes. The container's plain vertex shader (its own
+    /// translation here) writes no such value, and the geometry shader's
+    /// container has no translation of its own: both stages must take the
+    /// merged halves.
+    #[test]
+    fn a_pipeline_with_a_geometry_shader_runs_the_export_shader() {
+        let Some(gpu) =
+            crate::testgpu::device("a_pipeline_with_a_geometry_shader_runs_the_export_shader")
+        else {
+            return;
+        };
+        let host = gpu.host();
+        crate::testgpu::known_layer_errors(&[1419], "#45");
+        use windows::core::s;
+        use xtp_shader::HwStage;
+        const ITEM: &str = "struct V {
+            float4 pos : SV_Position;
+            nointerpolation uint value : TEXCOORD0;
+        };";
+        let es = format!(
+            "{ITEM} V main(uint id : SV_VertexID) {{
+                V v;
+                v.pos = float4(id == 1 ? 3 : -1, id == 2 ? 3 : -1, 0, 1);
+                v.value = 73;
+                return v;
+            }}"
+        );
+        let gs = format!(
+            "{ITEM} [maxvertexcount(3)]
+            void main(triangle V input[3], inout TriangleStream<V> s) {{
+                for (uint i = 0; i < 3; i++) {{
+                    s.Append(input[i]);
+                }}
+            }}"
+        );
+        let plain = "float4 main(uint id : SV_VertexID) : SV_Position {
+            return float4(id == 1 ? 3 : -1, id == 2 ? 3 : -1, 0, 1);
+        }";
+        let ps = format!("{ITEM} uint main(V v) : SV_Target {{ return v.value; }}");
+        let (vs_hash, gs_hash) = ("merged-es-test-vertex", "merged-es-test-geometry");
+        {
+            let mut made = MERGED_HALVES.lock().unwrap_or_else(|e| e.into_inner());
+            let made = made.get_or_insert_with(Default::default);
+            for (hash, half, t) in [
+                (vs_hash, true, compiled(HwStage::Es, &es, s!("vs_5_1"))),
+                (gs_hash, false, compiled(HwStage::Gs, &gs, s!("gs_5_1"))),
+            ] {
+                let once = std::sync::OnceLock::from(Some(Arc::new(t)));
+                made.insert((hash.to_owned(), half), Arc::new(once));
+            }
+        }
+        let shaders = [
+            title_shader(
+                "vertex",
+                vs_hash,
+                Some(compiled(HwStage::Vs, plain, s!("vs_5_1"))),
+            ),
+            title_shader(
+                "pixel",
+                "merged-es-test-pixel",
+                Some(compiled(HwStage::Ps, &ps, s!("ps_5_1"))),
+            ),
+            title_shader("geometry", gs_hash, None),
+        ];
+        let mut g = blend_stream(&[62], GraphicsState::default().blend, false);
+        g.depth.DepthEnable = false.into();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        let p = HostPipeline::new(&shaders, Some(&g)).expect("a pipeline with a geometry shader");
+        let stages: Vec<_> = p.stages.iter().map(|s| s.translated().host.stage).collect();
+        assert_eq!(stages, [HwStage::Es, HwStage::Ps, HwStage::Gs]);
+        assert_eq!(draw_r8_uint(host, &p, 2, |_, _| {})[..2], [73, 73]);
+    }
+
     #[test]
     fn depth_bounds_distinguish_pipeline_keys() {
         let mut g = GraphicsState::default();
@@ -2002,6 +2207,66 @@ mod tests {
         assert_eq!(&bytes[..4], &[11, 73, 73, 11]);
     }
 
+    /// `source` compiled by FXC for `profile`, as the translation of a
+    /// `kind` console program.
+    fn compiled(kind: xtp_shader::HwStage, source: &str, profile: PCSTR) -> Translated {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        let mut blob = None;
+        // SAFETY: the source lives through compilation and the blob owns its bytes.
+        let dxil = unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                PCSTR::null(),
+                None,
+                None,
+                s!("main"),
+                profile,
+                0,
+                0,
+                &mut blob,
+                None,
+            )
+            .unwrap();
+            let blob = blob.unwrap();
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec()
+        };
+        Translated {
+            host: xtp_shader::emit::HostShader {
+                stage: kind,
+                dxil,
+                group_base: None,
+                user_data: vec![],
+                samplers: vec![],
+                static_samplers: vec![],
+                root_cbvs: vec![],
+                root_srvs: vec![],
+                stride_table: false,
+                run_time_buffers: 0,
+            },
+            used: vec![],
+            wave64: false,
+        }
+    }
+
+    /// A title's `stage` shader named `hash`, already translated (or not:
+    /// `None`), without a container.
+    fn title_shader(
+        stage: &'static str,
+        hash: &str,
+        translated: Option<Translated>,
+    ) -> Arc<Shader> {
+        Arc::new(Shader {
+            stage,
+            hash: hash.to_owned(),
+            container: Vec::new(),
+            native: Default::default(),
+            translated: std::sync::OnceLock::from(translated),
+        })
+    }
+
     fn render_r8_uint(
         host: &crate::host::Host,
         mut g: GraphicsState,
@@ -2009,78 +2274,45 @@ mod tests {
         before_draw: impl FnOnce(&crate::testgpu::TitleList, D3D12_CPU_DESCRIPTOR_HANDLE),
     ) -> Vec<u8> {
         crate::testgpu::known_layer_errors(&[1419], "#45");
-        use crate::object::{This, slot};
-        use crate::resource::tests_support::{committed, read_back, target};
-        use windows::Win32::Foundation::RECT;
-        use windows::Win32::Graphics::Direct3D::{
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, Fxc::D3DCompile,
-        };
         use windows::core::s;
-        let shader = |stage, kind, source: &str, profile| {
-            let mut blob = None;
-            // SAFETY: the source lives through compilation and the blob owns its bytes.
-            let dxil = unsafe {
-                D3DCompile(
-                    source.as_ptr().cast(),
-                    source.len(),
-                    PCSTR::null(),
-                    None,
-                    None,
-                    s!("main"),
-                    profile,
-                    0,
-                    0,
-                    &mut blob,
-                    None,
-                )
-                .unwrap();
-                let blob = blob.unwrap();
-                std::slice::from_raw_parts(
-                    blob.GetBufferPointer().cast::<u8>(),
-                    blob.GetBufferSize(),
-                )
-                .to_vec()
-            };
-            Arc::new(Shader {
-                stage,
-                hash: format!("r8-uint-{stage}"),
-                container: Vec::new(),
-                native: Default::default(),
-                translated: std::sync::OnceLock::from(Some(Translated {
-                    host: xtp_shader::emit::HostShader {
-                        stage: kind,
-                        dxil,
-                        group_base: None,
-                        user_data: vec![],
-                        samplers: vec![],
-                        static_samplers: vec![],
-                        root_cbvs: vec![],
-                        root_srvs: vec![],
-                        stride_table: false,
-                        run_time_buffers: 0,
-                    },
-                    used: vec![],
-                    wave64: false,
-                })),
-            })
-        };
-        let vs = shader(
+        let vs = title_shader(
             "vertex",
-            xtp_shader::HwStage::Vs,
-            "float4 main(uint id : SV_VertexID) : SV_Position {
+            "r8-uint-vertex",
+            Some(compiled(
+                xtp_shader::HwStage::Vs,
+                "float4 main(uint id : SV_VertexID) : SV_Position {
                 return float4(id == 1 ? 3 : -1, id == 2 ? 3 : -1, 0, 1);
             }",
-            s!("vs_5_1"),
+                s!("vs_5_1"),
+            )),
         );
-        let ps = shader(
+        let ps = title_shader(
             "pixel",
-            xtp_shader::HwStage::Ps,
-            "uint main() : SV_Target { return 73u; }",
-            s!("ps_5_1"),
+            "r8-uint-pixel",
+            Some(compiled(
+                xtp_shader::HwStage::Ps,
+                "uint main() : SV_Target { return 73u; }",
+                s!("ps_5_1"),
+            )),
         );
         g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
         let p = HostPipeline::new(&[vs, ps], Some(&g)).expect("R8_UINT pipeline");
+        draw_r8_uint(host, &p, width, before_draw)
+    }
+
+    /// One triangle drawn with `p` over an R8_UINT target `width` pixels
+    /// wide and one high, cleared to 11; the target's bytes.
+    fn draw_r8_uint(
+        host: &crate::host::Host,
+        p: &HostPipeline,
+        width: u32,
+        before_draw: impl FnOnce(&crate::testgpu::TitleList, D3D12_CPU_DESCRIPTOR_HANDLE),
+    ) -> Vec<u8> {
+        use crate::object::{This, slot};
+        use crate::resource::tests_support::{committed, read_back, target};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
         let image = committed(&target(width.into(), 1, 62));
         let texture = crate::resource::host_resource(image).expect("R8_UINT texture");

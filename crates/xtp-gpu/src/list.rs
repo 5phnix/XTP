@@ -1617,17 +1617,50 @@ fn note_dispatch_x(
     );
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let (Some(list), Some(heap)) = (
+        host_list(this),
+        crate::query::host_heap(heap, kind, index, 1),
+    ) {
+        list.keep(heap);
+        // SAFETY: a matching heap and in-range slot retained by this list.
+        unsafe {
+            list.list.BeginQuery(
+                heap,
+                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
+                index,
+            )
+        };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let (Some(list), Some(heap)) = (
+        host_list(this),
+        crate::query::host_heap(heap, kind, index, 1),
+    ) {
+        list.keep(heap);
+        // SAFETY: as in begin_query.
+        unsafe {
+            list.list.EndQuery(
+                heap,
+                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
+                index,
+            )
+        };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// host occlusion and pipeline-statistics results at this point in the list.
+/// Without a usable host heap, retain the conservative visible/zero results.
+/// Timestamps use the submission clock.
 extern "system" fn resolve_queries(
     this: This,
     _heap: This,
@@ -1651,7 +1684,53 @@ extern "system" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    if offset
+        .checked_add(u64::from(count) * bytes)
+        .is_none_or(|end| end > size)
+    {
+        return;
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    match kind {
+        OCCLUSION | BINARY => {
+            cuts::OCCLUSION.fetch_add(count.into(), cuts::Order);
+        }
+        PIPELINE_STATISTICS => {
+            cuts::STATS.fetch_add(count.into(), cuts::Order);
+        }
+        _ => {}
+    }
+    #[cfg(windows)]
+    if let (Some(list), Some(heap)) = (
+        host_list(this),
+        crate::query::host_heap(_heap, kind, _first, count),
+    ) && offset.is_multiple_of(8)
+        && let Some(at) = (data as u64).checked_add(offset)
+        && let Some(dst) = crate::shadow::find(at, u64::from(count) * bytes)
+        && dst.offset(at).is_multiple_of(8)
+    {
+        use windows::Win32::Graphics::Direct3D12::*;
+        list.keep(heap);
+        dst.gpu_copies(list, at, u64::from(count) * bytes);
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        let copy = D3D12_RESOURCE_STATE_COPY_DEST;
+        // SAFETY: the list keeps both resources and the whole range was checked.
+        unsafe {
+            list.list.ResourceBarrier(&[
+                crate::host::uav_barrier(),
+                crate::host::transition(&dst.buffer, common, copy),
+            ]);
+            list.list.ResolveQueryData(
+                heap,
+                D3D12_QUERY_TYPE(kind as i32),
+                _first,
+                count,
+                &dst.buffer,
+                dst.offset(at),
+            );
+            list.list
+                .ResourceBarrier(&[crate::host::transition(&dst.buffer, copy, common)]);
+        }
         return;
     }
     for i in 0..u64::from(count) {
@@ -1728,9 +1807,17 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     at
 }
 
-/// Ignore les signatures racines (fournies par nos pipelines) et les
-/// indications d'ordre de profondeur et de fréquence d'ombrage.
+/// Root signatures come from the translated pipelines.
 extern "system" fn ignored_state(_: This) {}
+
+extern "system" fn depth_order(_: This) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    cuts::DEPTH_ORDER.fetch_add(1, cuts::Order);
+}
+extern "system" fn shading_rate(_: This) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    cuts::SHADING_RATE.fetch_add(1, cuts::Order);
+}
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) static BOUNDED_LISTS: std::sync::atomic::AtomicU64 =
@@ -1740,14 +1827,14 @@ extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use std::sync::atomic::Ordering::Relaxed;
-        // SAFETY: une liste du titre. Chaque enregistrement compte une seule fois.
+        // SAFETY: a title list. Count each recording once.
         if !unsafe { &(*this.cast::<List>()).bounds_set }.swap(true, Relaxed) {
             BOUNDED_LISTS.fetch_add(1, Relaxed);
         }
     }
     #[cfg(windows)]
     if let Some(list) = host_list(this).and_then(|l| l.bounds_list.as_ref()) {
-        // SAFETY: liste ouverte sur un périphérique qui accepte les bornes.
+        // SAFETY: an open list on a device that supports depth bounds.
         unsafe { list.OMSetDepthBounds(min, max) };
     }
     #[cfg(not(windows))]
@@ -2003,6 +2090,10 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if args.len() > 1 {
+        cuts::MULTI.fetch_add(1, cuts::Order);
+    }
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
@@ -2043,6 +2134,45 @@ extern "system" fn execute_indirect(
             address = ?address.map(|a| format!("{a:#x}")),
             counted = !count.is_null(),
             "indirect execution dropped (first time for this signature)"
+        );
+    }
+}
+
+/// Cumulative call counts so the interval between log lines loses no samples.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod cuts {
+    pub(super) use std::sync::atomic::Ordering::Relaxed as Order;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub(crate) static MULTI: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static INDEXED_RECT: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static INDIRECT_RECT_RECORDED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static INDIRECT_RECT: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TOPOLOGIES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static POPS_SHADERS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static GROWTH: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static MISSING_TARGET: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SHIFTED_TARGET: AtomicU64 = AtomicU64::new(0);
+    pub(super) static OCCLUSION: AtomicU64 = AtomicU64::new(0);
+    pub(super) static STATS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static DEPTH_ORDER: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SHADING_RATE: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn log() {
+        tracing::info!(
+            multi = MULTI.load(Relaxed),
+            indexed_rect = INDEXED_RECT.load(Relaxed),
+            indirect_indexed_rect = INDIRECT_RECT.load(Relaxed),
+            indirect_indexed_rect_recorded = INDIRECT_RECT_RECORDED.load(Relaxed),
+            topology_sets = TOPOLOGIES.load(Relaxed),
+            scratch_growth = GROWTH.load(Relaxed),
+            missing_rtv = MISSING_TARGET.load(Relaxed),
+            rtv_after_hole = SHIFTED_TARGET.load(Relaxed),
+            occlusion_results = OCCLUSION.load(Relaxed),
+            statistics_results = STATS.load(Relaxed),
+            depth_order = DEPTH_ORDER.load(Relaxed),
+            shading_rate = SHADING_RATE.load(Relaxed),
+            pops_shaders = POPS_SHADERS.load(Relaxed),
+            "fixed-function totals"
         );
     }
 }
@@ -2180,25 +2310,26 @@ const METHODS: [(usize, *const ()); 54] = [
     (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, depth_bounds as *const ()),              // 0x220 DB_DEPTH_BOUNDS_MIN/MAX
+    (68, depth_bounds as *const ()),              // 0x220 OMSetDepthBoundsX
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
     (72, wait_value as *const ()),                // 0x240, 64 bits
-    (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
+    (73, depth_order as *const ()),               // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
-    (124, ignored_state as *const ()),            // 0x3e0 shading rate
+    (124, shading_rate as *const ()),             // 0x3e0 shading rate
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+const MORE_METHODS: [(usize, *const ()); 10] = [
+    (28, begin_query as *const ()),            // 0xe0 BeginQuery
+    (29, end_query as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
     (99, driver_hint as *const ()),            // 0x318
+    (107, depth_bounds as *const ()),          // 0x358 OMSetDepthBounds
     // Pipeline syncs at the top and bottom of the pipe, 0x408 and 0x410.
     (129, sync as *const ()),
     (130, sync as *const ()),
@@ -2257,6 +2388,14 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn both_depth_bounds_methods_in_both_list_layouts() {
+        for (table, x, standard) in [(&LIST_FUNCTIONS, 68, 107), (&NEWER_LIST_FUNCTIONS, 70, 109)] {
+            assert_eq!(table.0[x], depth_bounds as *const ());
+            assert_eq!(table.0[standard], table.0[x]);
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

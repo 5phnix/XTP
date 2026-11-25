@@ -7,9 +7,8 @@
 //! barycentrics; `v_interp_mov` reads one vertex's value. After the 32-bit
 //! export patch ([`NativeProgram::patched_code`]) exports carry plain
 //! 32-bit values: `mrt<n>` is render target n, `mrtz` depth, stencil and
-//! sample mask, `null` nothing. A lane whose EXEC bit is clear at the
-//! export that ends the program (`done`) is discarded: that export's guard
-//! after structurisation.
+//! sample mask, `null` nothing. Le dernier export avec VM transmet EXEC
+//! comme masque de validité des pixels.
 //!
 //! Vertex shaders that run as the hardware VS get the vertex id in v0, the
 //! primitive id in v2 and the instance id in v3; the fetch shader loads
@@ -70,7 +69,21 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Merged ES + GS: VGPR n (0 to 4) on entry, the GS half's system
+    /// values, which the ES keeps: the ESGS ring offsets of the input
+    /// vertices in 16-bit halves of v0, v1 (and v4), then the primitive and
+    /// invocation ids in the GFX9 layout. Only ring addresses read the
+    /// offsets, and `emit/lower/geometry.rs` resolves those before the
+    /// lowering; no other read has a host value.
+    GsSystem(u8),
 }
+
+/// The VGPR an export shader's vertex id arrives in, after the GS half's
+/// system VGPRs ([`Input::GsSystem`]): what the title's ES programs index
+/// their vertex streams with.
+pub(crate) const ES_VERTEX_ID: u8 = 5;
+/// The GS half's system VGPRs: v0 up to this.
+const GS_SYSTEM_VGPRS: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Barycentric {
@@ -176,8 +189,10 @@ pub struct Export {
     pub values: [Option<Value>; 4],
     /// Two f16 values per dword.
     pub compressed: bool,
-    /// The program's last export (for pixels: kills the lanes not in EXEC).
+    /// Dernier export du programme.
     pub done: bool,
+    /// L’export transmet EXEC comme masque de validité des pixels.
+    pub vm: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -189,20 +204,15 @@ pub struct Io {
     pub exports: Vec<Export>,
     /// Number of defined entry SGPRs when the stage layout is known.
     pub initialized_sgprs: Option<u8>,
+    /// A geometry shader's shape, from its container's `PSV0`
+    /// (`emit::emit_for` sets it; [`raise`] cannot, having no container).
+    pub(crate) geometry: Option<crate::emit::GsShape>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
-    match raise_inputs(p, native, false) {
-        Err(ShaderError::Unsupported {
-            what:
-                "an interpolation without its first half"
-                | "interpolation halves of different attributes",
-            ..
-        }) => raise_inputs(p, native, true),
-        result => result,
-    }
+    raise_inputs(p, native, false)
 }
 
 /// On a live read of a folded first half, evaluate the two instructions
@@ -210,7 +220,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
 pub(crate) fn raise_inputs(
     p: &Program,
     native: &NativeProgram,
-    separate: bool,
+    read_first: bool,
 ) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
@@ -280,6 +290,34 @@ pub(crate) fn raise_inputs(
             ];
             (loaded, &[][..], &ms.outputs[..])
         }
+        // Merged ES + GS (`docs/analysis/es-gs.md`): the GS half's system
+        // VGPRs, then for the ES its vertex id and the attributes the fetch
+        // shader loads (v9 up in the title, where its VS has v4 up). s3, the
+        // merged wave info, is left out: the lane counts' EXEC set-up is
+        // removed before (`drop_lane_prologue`) and only ring addresses read
+        // the wave index. Neither half exports.
+        (StageIo::Es(es), HwStage::Es) => {
+            let mut loaded: Vec<(Reg, Input)> = (0..GS_SYSTEM_VGPRS)
+                .map(|r| (Reg::V(r), Input::GsSystem(r)))
+                .collect();
+            loaded.push((Reg::V(ES_VERTEX_ID), Input::VertexId));
+            for i in &es.inputs {
+                for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
+                    let input = Input::Attribute {
+                        row: i.row,
+                        channel,
+                    };
+                    loaded.push((Reg::V(i.vgpr + channel), input));
+                }
+            }
+            (loaded, &[][..], &[][..])
+        }
+        (StageIo::Gs(_), HwStage::Gs) => {
+            let loaded = (0..GS_SYSTEM_VGPRS)
+                .map(|r| (Reg::V(r), Input::GsSystem(r)))
+                .collect();
+            (loaded, &[][..], &[][..])
+        }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
     let inputs: Vec<(Value, Input)> = p
@@ -347,6 +385,7 @@ pub(crate) fn raise_inputs(
         defs: &defs,
         phis: &phis,
     };
+    let mut first_halves = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -360,43 +399,40 @@ pub(crate) fn raise_inputs(
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32" | "v_interp_p2_f32", _) if separate => {
-                            io.interps.push((site, Interp::Weighted { attribute }));
+                        ("v_interp_p1_f32", _) => {
+                            if read_first {
+                                first_halves.push((site, attribute));
+                            }
                         }
-                        ("v_interp_p1_f32", _) => {}
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
                             };
                             // The first half's result is this one's old dst.
-                            let interp = halves
-                                .pair(
-                                    attr,
-                                    inst.read(Reg::V(d)),
-                                    inst.read(Reg::V(reg)),
-                                    &barycentric,
-                                )
-                                .map_err(|what| unsupported(at, what))?;
+                            let interp = halves.pair(
+                                attr,
+                                inst.read(Reg::V(d)),
+                                inst.read(Reg::V(reg)),
+                                &barycentric,
+                            );
                             push_pair(&mut io, site, interp, attribute);
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" | "v_interp_p2_f16" if separate => {
-                        let attribute = attribute(inst, &v.src[0])?;
-                        io.interps.push((site, Interp::Weighted { attribute }));
+                    "v_interp_p1ll_f16" => {
+                        if read_first {
+                            first_halves.push((site, attribute(inst, &v.src[0])?));
+                        }
                     }
-                    "v_interp_p1ll_f16" => {}
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
                             Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
                             _ => None,
                         };
-                        let interp = halves
-                            .pair(&v.src[0], read(2), read(1), &barycentric)
-                            .map_err(|what| unsupported(at, what))?;
+                        let interp = halves.pair(&v.src[0], read(2), read(1), &barycentric);
                         push_pair(&mut io, site, interp, attribute);
                     }
                     _ => return Err(unsupported(at, "an interpolation form")),
@@ -406,8 +442,13 @@ pub(crate) fn raise_inputs(
                     src,
                     compr,
                     done,
+                    vm,
                     ..
                 } => {
+                    // A merged half's outputs are its ring writes.
+                    if matches!(native.stage, HwStage::Es | HwStage::Gs) {
+                        return Err(unsupported(at, "an export in a merged ES + GS program"));
+                    }
                     let target = match *target {
                         t @ 0..=7 => Target::Color(t),
                         8 => Target::Depth,
@@ -439,9 +480,47 @@ pub(crate) fn raise_inputs(
                         values,
                         compressed: *compr,
                         done: *done,
+                        vm: *vm,
                     });
                 }
                 _ => {}
+            }
+        }
+    }
+    if !first_halves.is_empty() {
+        // Une paire évaluée par le rasteriseur ne lit pas son accumulateur.
+        // Suivre les autres lectures à travers les phi pour ne matérialiser
+        // que les premières moitiés dont la valeur peut être observée.
+        use std::collections::HashSet;
+        let folded: HashSet<_> = io
+            .interps
+            .iter()
+            .filter_map(|(s, interp)| matches!(interp, Interp::Interpolated { .. }).then_some(*s))
+            .collect();
+        let mut reads = Vec::new();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                if !folded.contains(&(b, i)) {
+                    reads.extend(inst.reads.iter().map(|r| r.1));
+                }
+            }
+        }
+        let mut used = HashSet::new();
+        while let Some(v) = reads.pop() {
+            if used.insert(v)
+                && let Some(&(b, i)) = phis.get(&v)
+            {
+                reads.extend_from_slice(&p.blocks[b].phis[i].args);
+            }
+        }
+        for (site, attribute) in first_halves {
+            if p.blocks[site.0].insts[site.1]
+                .writes
+                .iter()
+                .any(|w| used.contains(&w.1))
+                && !io.interps.iter().any(|(s, _)| *s == site)
+            {
+                io.interps.push((site, Interp::Weighted { attribute }));
             }
         }
     }
@@ -490,7 +569,11 @@ impl Pair {
 
 /// Records interpolation `pair` at `site`, and its first halves too when
 /// they evaluate on their own (computed barycentrics).
-fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute) {
+fn push_pair(io: &mut Io, site: Site, pair: Option<Pair>, attribute: Attribute) {
+    let Some(pair) = pair else {
+        io.interps.push((site, Interp::Weighted { attribute }));
+        return;
+    };
     if pair.barycentric.is_none() {
         for &f in &pair.first {
             if !io.interps.iter().any(|(s, _)| *s == f) {
@@ -520,13 +603,9 @@ impl Halves<'_> {
         acc: Option<Value>,
         j: Option<Value>,
         barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
-    ) -> Result<Pair, &'static str> {
+    ) -> Option<Pair> {
         let mut first = Vec::new();
-        self.sites(
-            acc.ok_or("an interpolation without its first half")?,
-            &mut Vec::new(),
-            &mut first,
-        )?;
+        self.sites(acc?, &mut Vec::new(), &mut first)?;
         let mut kind = match barycentric(j) {
             Some((kind, 1)) => Some(kind),
             _ => None,
@@ -541,18 +620,18 @@ impl Halves<'_> {
                 } if inst.name() == "v_interp_p1_f32" => (*attr, inst.read(Reg::V(*reg))),
                 Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => match v.src.get(1) {
                     Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
-                    _ => return Err("an interpolation without its first half"),
+                    _ => return None,
                 },
-                _ => return Err("an interpolation without its first half"),
+                _ => return None,
             };
             if a != *attr {
-                return Err("interpolation halves of different attributes");
+                return None;
             }
             if kind.is_some_and(|k| barycentric(i) != Some((k, 0))) {
                 kind = None;
             }
         }
-        Ok(Pair {
+        Some(Pair {
             barycentric: kind,
             first,
         })
@@ -560,29 +639,21 @@ impl Halves<'_> {
 
     /// The instructions `v` comes from, through phis (`seen`: phis on the
     /// way; a loop back to one adds nothing).
-    fn sites(
-        &self,
-        v: Value,
-        seen: &mut Vec<Value>,
-        out: &mut Vec<Site>,
-    ) -> Result<(), &'static str> {
+    fn sites(&self, v: Value, seen: &mut Vec<Value>, out: &mut Vec<Site>) -> Option<()> {
         if let Some(&site) = self.defs.get(&v) {
             if !out.contains(&site) {
                 out.push(site);
             }
-            return Ok(());
+            return Some(());
         }
-        let &(b, i) = self
-            .phis
-            .get(&v)
-            .ok_or("an interpolation without its first half")?;
+        let &(b, i) = self.phis.get(&v)?;
         if !seen.contains(&v) {
             seen.push(v);
             for &a in &self.p.blocks[b].phis[i].args {
                 self.sites(a, seen, out)?;
             }
         }
-        Ok(())
+        Some(())
     }
 }
 
@@ -752,6 +823,70 @@ mod tests {
         assert_eq!(io.exports[0].target, Target::Primitive);
         // The group input is uniform only as the first lane reads it.
         assert!(mesh(&[0x7E02_0305, S_ENDPGM]).is_err()); // v_mov_b32 v1, v5
+    }
+
+    /// A merged ES + GS pair's halves: the GS half's system VGPRs in both,
+    /// the ES's vertex id in v5 and its attributes at the stage data's
+    /// VGPRs; neither half exports.
+    #[test]
+    fn merged_es_and_gs_inputs() {
+        let merged = |stage: HwStage, words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 256).unwrap();
+            let io = match stage {
+                HwStage::Es => StageIo::Es(crate::native::ExportIo {
+                    inputs: vec![crate::native::VsInput {
+                        usage: Usage::Generic,
+                        row: 1,
+                        mask: 3,
+                        vgpr: 9,
+                    }],
+                    outputs: vec![],
+                    item_dwords: 8,
+                }),
+                _ => StageIo::Gs(crate::native::GeometryIo {
+                    outputs: vec![],
+                    item_dwords: 60,
+                    count: 1,
+                    max_vertices: 3,
+                    vertex_dwords: 20,
+                }),
+            };
+            let native = NativeProgram {
+                stage,
+                wave64: true,
+                float_mode: 0,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io,
+                code,
+            };
+            (raise(&p, &native), p)
+        };
+        let (io, p) = merged(
+            HwStage::Es,
+            &[
+                0x7E28_0305, // v_mov_b32 v20, v5
+                0x7E2A_030A, // v_mov_b32 v21, v10
+                0x7E2C_0300, // v_mov_b32 v22, v0
+                S_ENDPGM,
+            ],
+        );
+        let input = |reg| p.inputs.iter().find(|i| i.0 == Reg::V(reg)).unwrap().1;
+        let io = io.unwrap();
+        assert!(io.inputs.contains(&(input(5), Input::VertexId)));
+        let y = Input::Attribute { row: 1, channel: 1 };
+        assert!(io.inputs.contains(&(input(10), y)));
+        assert!(io.inputs.contains(&(input(0), Input::GsSystem(0))));
+        let (io, p) = merged(HwStage::Gs, &[0x7E28_0301, S_ENDPGM]); // v_mov_b32 v20, v1
+        let v1 = p.inputs.iter().find(|i| i.0 == Reg::V(1)).unwrap().1;
+        assert_eq!(io.unwrap().inputs, [(v1, Input::GsSystem(1))]);
+        for stage in [HwStage::Es, HwStage::Gs] {
+            // exp prim, v9, off, off, off done
+            let (io, _) = merged(stage, &[0xF800_0941, 0x0000_0009, S_ENDPGM]);
+            assert!(io.is_err(), "{stage:?} exports");
+        }
     }
 
     #[test]

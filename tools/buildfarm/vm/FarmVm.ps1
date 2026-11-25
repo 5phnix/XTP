@@ -136,7 +136,9 @@ function Invoke-FarmWatched {
 }
 
 # The environment of a build: the toolchain under C:\farm, the variables the
-# client forwards; never the client's target directory or job count.
+# client forwards; never the client's target directory or job count, and
+# never incremental compilation, whatever the client says: farm builds gain
+# little from it, and its caches filled the disks (Clear-FarmSlotCaches).
 function Get-FarmBuildEnv($Forward) {
     $fe = Get-Content -Raw (Join-Path $script:Root 'farm-env.json') | ConvertFrom-Json
     $h = @{}
@@ -155,7 +157,86 @@ function Get-FarmBuildEnv($Forward) {
     if ($Forward) {
         foreach ($p in $Forward.PSObject.Properties) { $h[$p.Name] = [string] $p.Value }
     }
+    $h['CARGO_INCREMENTAL'] = '0'
     $h
+}
+
+# Takes a slot's lock (C:\farm\locks\<slot>.lock, which farm-run.ps1 holds
+# for the whole job) when no job holds it: the open handle, to dispose of to
+# let it go, or $null while a job holds it.
+function Open-FarmSlotLock([string] $Root, [string] $Slot) {
+    try {
+        [IO.File]::Open((Join-Path $Root "locks\$Slot.lock"), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch {
+        $null
+    }
+}
+
+# When a slot last had a job (C:\farm\state\<slot>.used, written by
+# farm-run.ps1 under the slot's lock at the start and the end of each job).
+function Set-FarmSlotUsed([string] $Root, [string] $Slot) {
+    try { [IO.File]::WriteAllText((Join-Path $Root "state\$Slot.used"), (Get-Date).ToUniversalTime().ToString('o')) } catch { }
+}
+
+# Disk room, before a job's build (farm-run.ps1, step 4b). Returns what it
+# removed. Builds run without incremental compilation (Get-FarmBuildEnv), so
+# the slots' incremental folders are dead weight: they go in the job's own
+# slot ($Current, whose lock the caller holds) and in every slot no job
+# holds, its lock taken meanwhile so that no job starts there. A slot a job
+# holds is never touched: judging a slot idle by its incremental folder's
+# date (that date does not change while files deep inside it do) deleted
+# caches under running builds, which then failed (2026-11-25). Under
+# $MinFreeGb free after that, the whole target folders of free slots that
+# had no job for $UnusedMinutes go too, least recently used first; never
+# this job's slot, nor a slot with no use recorded.
+function Clear-FarmSlotCaches {
+    param([Parameter(Mandatory)] [string] $Root, [Parameter(Mandatory)] [string] $Current, [double] $MinFreeGb = 20, [int] $UnusedMinutes = 30)
+    $removed = @()
+    $slots = @(Get-ChildItem -LiteralPath (Join-Path $Root 'w') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^s\d{1,3}$' })
+    foreach ($s in $slots) {
+        $lock = $null
+        if ($s.Name -ine $Current) {
+            $lock = Open-FarmSlotLock $Root $s.Name
+            if (-not $lock) { continue }
+        }
+        try {
+            foreach ($prof in @(Get-ChildItem -LiteralPath (Join-Path $s.FullName 'target') -Directory -ErrorAction SilentlyContinue)) {
+                $inc = Join-Path $prof.FullName 'incremental'
+                if (Test-Path -LiteralPath $inc) {
+                    Remove-Item -LiteralPath $inc -Recurse -Force -ErrorAction SilentlyContinue
+                    $removed += $inc
+                }
+            }
+        } finally {
+            if ($lock) { $lock.Dispose() }
+        }
+    }
+    $drive = $Root.Substring(0, 1)
+    $freeGb = { [double] (Get-PSDrive -Name $drive).Free / 1GB }
+    if ((& $freeGb) -ge $MinFreeGb) { return $removed }
+    $before = (Get-Date).AddMinutes(-$UnusedMinutes)
+    $old = foreach ($s in $slots) {
+        $stamp = Join-Path $Root "state\$($s.Name).used"
+        if ($s.Name -ieq $Current -or -not (Test-Path -LiteralPath $stamp) -or -not (Test-Path -LiteralPath (Join-Path $s.FullName 'target'))) { continue }
+        $used = (Get-Item -LiteralPath $stamp).LastWriteTime
+        if ($used -lt $before) { [pscustomobject]@{ slot = $s; stamp = $stamp; used = $used } }
+    }
+    foreach ($o in @($old | Sort-Object used)) {
+        if ((& $freeGb) -ge $MinFreeGb) { break }
+        $lock = Open-FarmSlotLock $Root $o.slot.Name
+        if (-not $lock) { continue }
+        try {
+            # The stamp changes only under the lock: still unused.
+            if ((Get-Item -LiteralPath $o.stamp).LastWriteTime -lt $before) {
+                $target = Join-Path $o.slot.FullName 'target'
+                Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+                $removed += $target
+            }
+        } finally {
+            $lock.Dispose()
+        }
+    }
+    $removed
 }
 
 function Get-FarmGit {

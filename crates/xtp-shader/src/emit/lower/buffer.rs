@@ -91,7 +91,7 @@ struct BufferAddress {
 }
 
 /// Plage commune aux composantes du transfert. `remaining` compte les octets
-/// logiques avant la fin de l'élément ou du tampon, avant ajout de SOFFSET.
+/// logiques avant la fin de l'élément ou du tampon.
 #[derive(Clone, Copy)]
 struct RawRange {
     byte: V,
@@ -933,9 +933,14 @@ impl<'a> Lower<'a> {
         let max = self.s.m.i32(u32::MAX);
         let index = a.index.unwrap_or(zero);
         let mut valid = a.valid;
+        let mut checked_offset = a.within;
         let (mut byte, limit) = match view {
             RawView::Table(e) => {
                 let raw = self.s.m.cmp(c, pred::EQ, e.stride, zero);
+                if let Some(so) = a.scalar {
+                    let so = self.s.m.select(c, raw, so, zero);
+                    checked_offset = self.raw_add(a.within, so, &mut valid);
+                }
                 let four = self.s.m.i32(4);
                 let (at, limit) = if a.index.is_some() {
                     let in_count = self.s.m.cmp(c, pred::IULT, index, e.count);
@@ -982,16 +987,21 @@ impl<'a> Lower<'a> {
                     BufferOob::Index => None,
                     BufferOob::Nonempty if records == 0 => Some(zero),
                     BufferOob::Nonempty => None,
-                    BufferOob::Raw => Some(count),
+                    BufferOob::Raw => {
+                        // Mesures sur gfx1036 et gfx1011 (VIctory #2084) : la borne
+                        // inclut SOFFSET. Index × stride déplace l'adresse.
+                        if let Some(so) = a.scalar {
+                            checked_offset = self.raw_add(a.within, so, &mut valid);
+                        }
+                        Some(count)
+                    }
                 };
                 (byte, limit)
             }
         };
-        // IntrinsicsAMDGPU.td (raw_buffer_load) exclut SOFFSET du contrôle
-        // de bornes et du swizzle. Il déplace seulement la base physique.
         let remaining = limit.map_or(max, |size| {
-            let inside = self.s.m.cmp(c, pred::IULE, a.within, size);
-            let left = self.s.m.bin(c, Bin::Sub, size, a.within);
+            let inside = self.s.m.cmp(c, pred::IULE, checked_offset, size);
+            let left = self.s.m.bin(c, Bin::Sub, size, checked_offset);
             self.s.m.select(c, inside, left, zero)
         });
         let base = self.s.m.i32(a.base);
