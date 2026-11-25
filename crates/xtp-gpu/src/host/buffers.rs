@@ -1124,14 +1124,14 @@ mod tests {
     /// What shaders write to a copy in the card's memory goes back to title
     /// memory after the GPU ran, and only that: no snapshot is taken, the
     /// title's bytes around stay. A later pass reads the first's output on
-    /// the card, and a GPU copy's destination goes back too.
+    /// the card, and a GPU copy's destination goes back too (a copy within
+    /// the buffer, staged in the card's memory, which the debug layer
+    /// passes when on).
     #[test]
     fn a_shader_write_to_a_copy_on_the_card_goes_back() {
         use crate::testgpu::{Kernel, Pass, TitleBuffer, pattern};
         let test = "host::buffers::tests::a_shader_write_to_a_copy_on_the_card_goes_back";
         with_cards(test, |host| {
-            // The GPU copy within one buffer (`shadow::copy`).
-            crate::testgpu::known_layer_errors(&[538], "#45");
             let kernel = Kernel::new(host);
             let big = TitleBuffer::new(2 << 20);
             big.set_words(|i| 0x7e00_0000 + i as u32);
@@ -1142,8 +1142,12 @@ mod tests {
             kernel.dispatch(&first, Pass::Fill, at + SCRATCH, at + OUT);
             first.close();
             kernel.dispatch(&second, Pass::Copy, at + OUT, at + COPY);
-            // A GPU copy of 256 bytes of the first's output, page 5.
+            // A GPU copy of 256 bytes of the first's output, page 5: within
+            // the buffer, so staged, in the card's memory too.
+            let staged = || crate::shadow::CARD_STAGED.load(Ordering::Relaxed);
+            let before = staged();
             assert!(crate::shadow::copy(&second, at + (5 << 16), at + OUT, 256));
+            assert_eq!(staged(), before + 1, "staged on the card");
             second.close();
             host.execute(&[&first]);
             assert_eq!(shadow.snapshots(), 0, "no snapshot of a copy on the card");
