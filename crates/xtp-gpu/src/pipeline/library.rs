@@ -363,12 +363,15 @@ mod tests {
 
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
-        else {
-            return; // no host GPU here
+        let test = "pipeline::library::tests::a_rejected_blob_gives_an_empty_library";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
         };
-        let library =
-            open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let device = gpu.device.cast::<ID3D12Device1>().expect("ID3D12Device1");
+        // The layer reports the blob it cannot read; the library falls back.
+        let library = crate::testgpu::expect_layer_errors(|| {
+            open(&device, b"not a pipeline library".repeat(16)).expect("an empty library")
+        });
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());

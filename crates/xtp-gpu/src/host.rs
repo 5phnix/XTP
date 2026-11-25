@@ -1768,6 +1768,13 @@ impl Host {
         text
     }
 
+    /// The debug layer's message queue (`XTP_D3D12_DEBUG=1` in a
+    /// diagnostics build), for tests to fail on its errors.
+    #[cfg(test)]
+    pub(crate) fn message_queue(&self) -> Option<&ID3D12InfoQueue> {
+        self.messages.as_ref()
+    }
+
     /// Moves the debug layer's messages into our log; returns the first
     /// error among them.
     pub(crate) fn log_messages(&self) -> Option<String> {

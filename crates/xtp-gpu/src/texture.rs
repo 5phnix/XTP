@@ -1508,9 +1508,10 @@ mod tests {
     #[test]
     fn a_texture_is_copied_once_until_its_memory_changes() {
         let test = "texture::tests::a_texture_is_copied_once_until_its_memory_changes";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !predication() {
             return;
         }
@@ -1572,9 +1573,9 @@ mod tests {
     #[test]
     fn another_host_copy_is_copied_into() {
         let test = "texture::tests::another_host_copy_is_copied_into";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let [first, second] = [0, 1].map(|_| committed(&sampled(16, 16, 28)));
         let started = std::time::Instant::now();
         while [first, second]
@@ -1625,9 +1626,10 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
         };
         let test = "texture::tests::a_texture_in_a_view_is_hashed_only_after_a_write";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || !predication() {
             return;
         }
@@ -1721,10 +1723,12 @@ mod tests {
     /// submissions are counted with timestamps off too (the default here).
     #[test]
     fn a_list_named_twice_in_a_submission_copies() {
+        crate::testgpu::known_layer_errors(&[553], "#45");
         let test = "texture::tests::a_list_named_twice_in_a_submission_copies";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !predication() {
             return;
         }
@@ -1950,9 +1954,10 @@ mod tests {
     #[test]
     fn a_texture_is_hashed_as_it_is_detiled() {
         let test = "texture::tests::a_texture_is_hashed_as_it_is_detiled";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || !predication() {
             return;
         }
@@ -1997,9 +2002,10 @@ mod tests {
     #[test]
     fn a_write_no_guard_saw_is_found_by_the_safety_net() {
         let test = "texture::tests::a_write_no_guard_saw_is_found_by_the_safety_net";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || !predication() || net_budget() == 0 {
             return;
         }

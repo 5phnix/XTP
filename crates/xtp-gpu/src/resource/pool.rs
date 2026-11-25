@@ -970,12 +970,10 @@ mod tests {
     }
 
     /// A pool on the test device with small heaps (1 MiB a 64 KiB heap).
-    fn pool(test: &str, budget: Budget) -> Option<(&'static crate::host::Host, Pool)> {
-        let host = crate::testgpu::device(test)?;
-        Some((
-            host,
-            Pool::new(host.device.clone(), Config::sized(MIB, MIB), budget),
-        ))
+    fn pool(test: &str, budget: Budget) -> Option<(crate::testgpu::Gpu, Pool)> {
+        let gpu = crate::testgpu::device(test)?;
+        let pool = Pool::new(gpu.device.clone(), Config::sized(MIB, MIB), budget);
+        Some((gpu, pool))
     }
 
     fn unlimited() -> Budget {
@@ -988,7 +986,7 @@ mod tests {
     #[test]
     fn textures_are_placed_by_class_and_ranges_reused() {
         let test = "resource::pool::tests::textures_are_placed_by_class_and_ranges_reused";
-        let Some((_, pool)) = pool(test, unlimited()) else {
+        let Some((_gpu, pool)) = pool(test, unlimited()) else {
             return;
         };
         assert!(
@@ -1050,9 +1048,10 @@ mod tests {
     #[test]
     fn a_placed_texture_holds_what_is_copied_into_it() {
         let test = "resource::pool::tests::a_placed_texture_holds_what_is_copied_into_it";
-        let Some((host, pool)) = pool(test, unlimited()) else {
+        let Some((gpu, pool)) = pool(test, unlimited()) else {
             return;
         };
+        let host = gpu.host();
         let d = texture(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
         let placed = pool.place(&d, D3D12_RESOURCE_STATE_COPY_DEST).unwrap();
         assert!(placed.residency.wait(Duration::from_secs(5)));
@@ -1108,7 +1107,7 @@ mod tests {
     #[test]
     fn past_the_budget_no_heap_is_made() {
         let test = "resource::pool::tests::past_the_budget_no_heap_is_made";
-        let Some((_, pool)) = pool(test, Box::new(|_| Some((MIB, MIB)))) else {
+        let Some((_gpu, pool)) = pool(test, Box::new(|_| Some((MIB, MIB)))) else {
             return;
         };
         let d = texture(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
@@ -1199,9 +1198,10 @@ mod tests {
     #[ignore = "a benchmark: several GB of video memory"]
     fn bench_5000_bc7_textures() {
         let test = "resource::pool::tests::bench_5000_bc7_textures";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let n: usize = std::env::var("XTP_POOL_BENCH")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1294,7 +1294,7 @@ mod tests {
     #[test]
     fn what_the_pool_does_not_take() {
         let test = "resource::pool::tests::what_the_pool_does_not_take";
-        let Some((_, pool)) = pool(test, unlimited()) else {
+        let Some((_gpu, pool)) = pool(test, unlimited()) else {
             return;
         };
         let big = texture(1024, 1024, DXGI_FORMAT_R8G8B8A8_UNORM, 1);

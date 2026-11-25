@@ -488,9 +488,10 @@ fn release_waits_for_the_gpu() {
 /// besides unless the host's is WARP. None (the skip reported) without a
 /// host device.
 fn devices(test: &str) -> Vec<(&'static str, ID3D12Device)> {
-    let Some(host) = crate::testgpu::device(test) else {
+    let Some(gpu) = crate::testgpu::device(test) else {
         return Vec::new();
     };
+    let host = gpu.host();
     let mut all = vec![("host device", host.device.clone())];
     if crate::testgpu::software() != Some(Ok(true)) {
         match warp() {

@@ -859,9 +859,10 @@ mod tests {
     #[test]
     fn a_depth_texture_reads_what_its_twin_was_written() {
         let test = "host::twins::tests::a_depth_texture_reads_what_its_twin_was_written";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         const D16_UNORM: u32 = 55;
         let depth = depth(4, 4, D16_UNORM);
         // Made with the first unordered access view of the texture.
@@ -915,9 +916,10 @@ mod tests {
     #[test]
     fn a_depth_stencil_textures_twins_reach_its_planes() {
         let test = "host::twins::tests::a_depth_stencil_textures_twins_reach_its_planes";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         const D32_FLOAT_S8X24_UINT: u32 = 20;
         let depth = depth(4, 4, D32_FLOAT_S8X24_UINT);
         assert!(crate::resource::twin_view(depth, None).is_some());

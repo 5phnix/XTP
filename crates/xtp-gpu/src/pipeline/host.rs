@@ -1486,9 +1486,10 @@ mod tests {
     #[test]
     fn wave64_mesh_pipelines_are_refused_before_translation() {
         let test = "pipeline::host::tests::wave64_mesh_pipelines_are_refused_before_translation";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let lanes = crate::device::host_wave_lanes().expect("the device's lanes");
         if !host.mesh_shaders() || lanes.1 >= 64 {
             // Nothing is refused for its waves on this host: not a missing
@@ -1995,6 +1996,7 @@ mod tests {
         width: u32,
         before_draw: impl FnOnce(&crate::testgpu::TitleList, D3D12_CPU_DESCRIPTOR_HANDLE),
     ) -> Vec<u8> {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::object::{This, slot};
         use crate::resource::tests_support::{committed, read_back, target};
         use windows::Win32::Foundation::RECT;
@@ -2214,12 +2216,14 @@ mod tests {
     ///   on every device, which also checks the dispatch read back here.
     #[test]
     fn wave64_compute_for_a_forced_32_lane_target() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
         use std::sync::atomic::{AtomicU64, Ordering};
         use xtp_shader::emit::{HostShader, Target};
         let test = "pipeline::host::tests::wave64_compute_for_a_forced_32_lane_target";
-        let Some(device) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let device = gpu.host();
         let lanes = crate::device::host_wave_lanes().expect("the device's lanes");
         let target = crate::device::target_of(Some(lanes), Some("32-32")).unwrap();
         assert_eq!(
@@ -2405,9 +2409,11 @@ mod tests {
             },
             ..Default::default()
         };
-        // SAFETY: the description points at live data.
-        let made: windows::core::Result<ID3D12PipelineState> =
-            unsafe { host.device.CreateComputePipelineState(&desc) };
+        // A probe: the layer reports a description the driver refuses.
+        let made: windows::core::Result<ID3D12PipelineState> = crate::testgpu::expect_layer_errors(
+            // SAFETY: the description points at live data.
+            || unsafe { host.device.CreateComputePipelineState(&desc) },
+        );
         made.is_err()
     }
 }

@@ -4177,9 +4177,9 @@ mod tests {
     #[test]
     fn snapshot_mirrors_are_kept_for_the_next_submissions() {
         let test = "shadow::tests::snapshot_mirrors_are_kept_for_the_next_submissions";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(2 * PAGE);
         let shadow = find(window as u64, (2 * PAGE) as u64).expect("a host copy");
         shadow.update(window, 2 * PAGE);
@@ -4219,9 +4219,9 @@ mod tests {
     #[test]
     fn a_refresh_leaves_what_a_gpu_copy_in_flight_writes() {
         let test = "shadow::tests::a_refresh_leaves_what_a_gpu_copy_in_flight_writes";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(PAGE);
         let shadow = find(window as u64, PAGE as u64).expect("a host copy");
         shadow.update(window, PAGE);
@@ -4255,9 +4255,9 @@ mod tests {
     #[test]
     fn a_copy_back_keeps_title_writes_made_while_it_runs() {
         let test = "shadow::tests::a_copy_back_keeps_title_writes_made_while_it_runs";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(2 * PAGE);
         let shadow = find(window as u64, PAGE as u64).expect("a host copy");
         let page = window + PAGE;
@@ -4313,9 +4313,9 @@ mod tests {
     #[test]
     fn a_range_is_copied_once_until_the_title_writes_it() {
         let test = "shadow::tests::a_range_is_copied_once_until_the_title_writes_it";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(3 * PAGE);
         let shadow = find(window as u64, (3 * PAGE) as u64).expect("a host copy");
         // From inside the first page to inside the third, as views are.
@@ -4364,9 +4364,9 @@ mod tests {
     #[test]
     fn a_refresh_leaves_what_shaders_in_flight_write() {
         let test = "shadow::tests::a_refresh_leaves_what_shaders_in_flight_write";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(3 * PAGE);
         let shadow = find(window as u64, (3 * PAGE) as u64).expect("a host copy");
         shadow.update(window, 3 * PAGE);
@@ -4490,9 +4490,9 @@ mod tests {
     #[test]
     fn a_copy_back_keeps_the_readable_pieces_of_a_run() {
         let test = "shadow::tests::a_copy_back_keeps_the_readable_pieces_of_a_run";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(4 * PAGE);
         let shadow = find(window as u64, (4 * PAGE) as u64).expect("a host copy");
         shadow.update(window, 4 * PAGE);
@@ -4530,9 +4530,9 @@ mod tests {
     #[test]
     fn a_copy_back_run_keeps_title_writes_made_after_its_read() {
         let test = "shadow::tests::a_copy_back_run_keeps_title_writes_made_after_its_read";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(2 * PAGE);
         let shadow = find(window as u64, (2 * PAGE) as u64).expect("a host copy");
         let second = window + PAGE;
@@ -4578,9 +4578,9 @@ mod tests {
     #[test]
     fn where_the_gpu_and_the_title_both_wrote_the_titles_stay() {
         let test = "shadow::tests::where_the_gpu_and_the_title_both_wrote_the_titles_stay";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(PAGE);
         let shadow = find(window as u64, PAGE as u64).expect("a host copy");
         shadow.update(window, PAGE);
@@ -4621,9 +4621,9 @@ mod tests {
     #[test]
     fn overlapping_ranges_of_a_submission_go_back_once() {
         let test = "shadow::tests::overlapping_ranges_of_a_submission_go_back_once";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(2 * PAGE);
         let shadow = find(window as u64, (2 * PAGE) as u64).expect("a host copy");
         shadow.update(window, 2 * PAGE);
@@ -4670,9 +4670,9 @@ mod tests {
     #[test]
     fn a_title_write_under_a_busy_range_reaches_the_copy_later() {
         let test = "shadow::tests::a_title_write_under_a_busy_range_reaches_the_copy_later";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(3 * PAGE);
         let shadow = find(window as u64, (3 * PAGE) as u64).expect("a host copy");
         let page = window + PAGE;
@@ -4803,9 +4803,9 @@ mod tests {
     fn w1_on_guarded_memory() {
         let test = "shadow::tests::w1_on_guarded_memory";
         alone(test, || {
-            if crate::testgpu::device(test).is_none() {
+            let Some(_gpu) = crate::testgpu::device(test) else {
                 return;
-            }
+            };
             // A window of a view's own: one loose host copy.
             let mapped = view(2 * WINDOW as usize);
             let window = mapped.next_multiple_of(WINDOW as usize);
@@ -4884,9 +4884,9 @@ mod tests {
         use census::K;
         let test = "shadow::tests::the_census_counts_the_first_touch_of_what_came_back";
         alone(test, || {
-            if crate::testgpu::device(test).is_none() {
+            let Some(_gpu) = crate::testgpu::device(test) else {
                 return;
-            }
+            };
             let mapped = view(2 * WINDOW as usize);
             let window = mapped.next_multiple_of(WINDOW as usize);
             let shadow = find(window as u64, (3 * PAGE) as u64).expect("a host copy");
@@ -4972,9 +4972,9 @@ mod tests {
         use census::K;
         let test = "shadow::tests::the_census_guards_write_watched_memory_with_all_only";
         alone(test, || {
-            if crate::testgpu::device(test).is_none() {
+            let Some(_gpu) = crate::testgpu::device(test) else {
                 return;
-            }
+            };
             let len = 2 * PAGE;
             let window = watched(len);
             let shadow = find(window as u64, len as u64).expect("a host copy");
@@ -5062,9 +5062,9 @@ mod tests {
             MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         let test = "shadow::tests::world_frame_copies_cost";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         const LEN: usize = 64 << 20;
         const SUBMISSIONS: usize = 39;
         const MEM_WRITE_WATCH: u32 = 0x0020_0000;
@@ -5150,9 +5150,9 @@ mod tests {
     #[test]
     fn a_copy_is_made_without_the_buffer_lock_held() {
         let test = "shadow::tests::a_copy_is_made_without_the_buffer_lock_held";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let window = watched(2 << 20);
         // Two title buffers (the resources are only keys here), the first
         // of a size no other test asks for.

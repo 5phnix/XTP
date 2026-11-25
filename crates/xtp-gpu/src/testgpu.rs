@@ -43,15 +43,222 @@ fn adapter(value: Option<&str>) -> Option<Result<bool, String>> {
 }
 
 /// The host device for the test named `test`, or `None` once the skip is
-/// reported (see the module).
-pub(crate) fn device(test: &str) -> Option<&'static Host> {
+/// reported (see the module). Keep it until the test ends: then the test
+/// fails on the debug layer's errors (see [`Gpu`]).
+pub(crate) fn device(test: &str) -> Option<Gpu> {
     match crate::host::created() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            watch(host);
+            Some(Gpu { host })
+        }
         Err(reason) => {
             skip(test, reason);
             None
         }
     }
+}
+
+/// A test's host device. With the D3D12 debug layer on
+/// (`XTP_D3D12_DEBUG=1` in a diagnostics build, as CI runs the GPU tests),
+/// dropping it fails the test with the errors the layer raised on the
+/// test's thread (named after the test), and with any it raised on other
+/// threads of ours meanwhile (exact when tests run one at a time,
+/// `--test-threads=1`).
+pub(crate) struct Gpu {
+    host: &'static Host,
+}
+
+impl Gpu {
+    /// The device itself, as a plain reference (the guard stays with the
+    /// test).
+    pub(crate) fn host(&self) -> &'static Host {
+        self.host
+    }
+}
+
+thread_local! {
+    /// Set while this thread hands the device invalid input on purpose.
+    static EXPECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Message ids of known errors this thread's test raises, and the issue
+    /// that tracks them.
+    static KNOWN: std::cell::RefCell<(Vec<i32>, &'static str)> =
+        const { std::cell::RefCell::new((Vec::new(), "")) };
+}
+
+/// For a test that raises known errors (tracked by `issue`) with these
+/// message ids: they are reported on standard error instead of failing it,
+/// so the rest of what it checks still runs under the layer.
+pub(crate) fn known_layer_errors(ids: &[i32], issue: &'static str) {
+    KNOWN.with(|k| *k.borrow_mut() = (ids.to_vec(), issue));
+}
+
+/// Runs `f`, which hands the device invalid input on purpose: the errors
+/// the debug layer raises on this thread meanwhile are expected, and not
+/// counted against the test.
+pub(crate) fn expect_layer_errors<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXPECTING.with(|e| e.set(self.0));
+        }
+    }
+    let _reset = Reset(EXPECTING.with(|e| e.replace(true)));
+    f()
+}
+
+impl std::ops::Deref for Gpu {
+    type Target = Host;
+    fn deref(&self) -> &Host {
+        self.host
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let errors = layer_errors();
+        if !errors.is_empty() {
+            panic!(
+                "the D3D12 debug layer reported {} error(s):\n{}",
+                errors.len(),
+                errors.join("\n")
+            );
+        }
+    }
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn thread_name() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_owned()
+}
+
+/// An error the debug layer raised: the thread whose call reported it, the
+/// message id and its text.
+struct LayerError {
+    thread: String,
+    id: i32,
+    text: String,
+}
+
+/// The debug layer's errors (`XTP_D3D12_DEBUG=1` in a diagnostics build).
+static LAYER_ERRORS: std::sync::Mutex<Vec<LayerError>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `thread` runs a test: the harness names a test's thread after
+/// its path (`module::tests::name`); ours are named `xtp-…` or not at all.
+fn is_test_thread(thread: &str) -> bool {
+    thread.contains("::")
+}
+
+/// Takes the errors this thread raised, and those raised on threads that
+/// are no test's; known ones (see [`known_layer_errors`]) are reported on
+/// standard error instead.
+fn layer_errors() -> Vec<String> {
+    let me = thread_name();
+    let (known, issue) = KNOWN.with(|k| k.borrow().clone());
+    let mut errors = lock(&LAYER_ERRORS);
+    let (mut taken, mut tolerated) = (Vec::new(), 0);
+    errors.retain(|e| {
+        if e.thread == me && known.contains(&e.id) {
+            tolerated += 1;
+            false
+        } else if e.thread == me {
+            taken.push(format!("{} (message id {})", e.text, e.id));
+            false
+        } else if !is_test_thread(&e.thread) {
+            taken.push(format!(
+                "{} (message id {}, on thread {})",
+                e.text, e.id, e.thread
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    if tolerated > 0 {
+        let _ = writeln!(
+            std::io::stderr(),
+            "KNOWN {me}: {tolerated} D3D12 debug layer error(s) with ids {known:?} ({issue})"
+        );
+    }
+    taken
+}
+
+/// Has the debug layer report its errors to [`LAYER_ERRORS`] as they are
+/// raised, on the thread that made the call, before the host moves them
+/// into its log.
+/// Whether it does: not when the layer was not asked for; an error when it
+/// was but cannot report to us (reported once, and a failure in strict
+/// mode, so a CI run cannot pass without the layer).
+fn watch(host: &Host) -> bool {
+    static WATCHING: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
+    let watching = WATCHING.get_or_init(|| {
+        let asked = cfg!(feature = "diagnostics") && std::env::var_os("XTP_D3D12_DEBUG").is_some();
+        if !asked {
+            return Ok(false);
+        }
+        let Some(queue) = host.message_queue() else {
+            return Err(
+                "XTP_D3D12_DEBUG is set but the D3D12 debug layer is missing (install \
+                        Graphics Tools)"
+                    .into(),
+            );
+        };
+        let queue = windows::core::Interface::cast::<ID3D12InfoQueue1>(queue).map_err(|e| {
+            format!("the D3D12 debug layer has no message callback (ID3D12InfoQueue1): {e}")
+        })?;
+        let mut cookie = 0;
+        // SAFETY: a static callback, registered once for the device's life.
+        unsafe {
+            queue.RegisterMessageCallback(
+                Some(on_message),
+                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                std::ptr::null_mut(),
+                &mut cookie,
+            )
+        }
+        .map_err(|e| format!("no D3D12 message callback: {e}"))?;
+        Ok(true)
+    });
+    match watching {
+        Ok(on) => *on,
+        Err(why) => {
+            let strict =
+                std::env::var_os("XTP_REQUIRE_GPU").is_some_and(|v| !v.is_empty() && v != "0");
+            assert!(!strict, "{why} (XTP_REQUIRE_GPU is set)");
+            static TOLD: std::sync::Once = std::sync::Once::new();
+            TOLD.call_once(|| {
+                let _ = writeln!(std::io::stderr(), "{why}: its errors cannot fail the tests");
+            });
+            false
+        }
+    }
+}
+
+unsafe extern "system" fn on_message(
+    _category: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    id: D3D12_MESSAGE_ID,
+    description: windows::core::PCSTR,
+    _context: *mut std::ffi::c_void,
+) {
+    if severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0 || EXPECTING.with(|e| e.get()) {
+        return;
+    }
+    // SAFETY: the layer passes a NUL-terminated description.
+    let text = unsafe { description.to_string() }.unwrap_or_default();
+    lock(&LAYER_ERRORS).push(LayerError {
+        thread: thread_name(),
+        id: id.0,
+        text,
+    });
 }
 
 /// Reports that `test` did not run, for `reason`: on standard error, or as
@@ -429,13 +636,57 @@ mod tests {
         }
     }
 
+    /// With the debug layer on (CI's debug-layer step), a test that records
+    /// a wrong barrier (the same state on both sides) fails when its device
+    /// goes, with the layer's message.
+    #[test]
+    fn a_wrong_barrier_fails_the_test_with_the_layers_message() {
+        let test = "testgpu::tests::a_wrong_barrier_fails_the_test_with_the_layers_message";
+        let outcome = std::panic::catch_unwind(|| {
+            let gpu = device(test)?;
+            if !watch(gpu.host()) {
+                return None;
+            }
+            let list = gpu.new_list().unwrap();
+            let (buffer, _) = gpu.upload_buffer(256).unwrap();
+            let state = D3D12_RESOURCE_STATE_COPY_DEST;
+            let barrier = crate::host::transition(&buffer, state, state);
+            // SAFETY: an open list and a live buffer; the barrier is wrong on
+            // purpose, which the layer reports as it is recorded. The list is
+            // never closed (that fails the run) nor submitted.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            Some(())
+        });
+        match outcome {
+            Ok(None) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "SKIPPED {test}: needs the debug layer (XTP_D3D12_DEBUG=1, diagnostics build)"
+                );
+            }
+            Ok(Some(())) => panic!("the wrong barrier did not fail the test"),
+            Err(failure) => {
+                let text = failure
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(
+                    text.contains("the D3D12 debug layer reported")
+                        && text.contains("ResourceBarrier"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
     /// The helper end to end: a kernel dispatched in a title list fills a
     /// title buffer through its host copy (copied back after the run).
     #[test]
     fn a_kernel_fills_a_title_buffer() {
-        let Some(host) = device("testgpu::tests::a_kernel_fills_a_title_buffer") else {
+        let Some(gpu) = device("testgpu::tests::a_kernel_fills_a_title_buffer") else {
             return;
         };
+        let host = gpu.host();
         let kernel = Kernel::new(host);
         let (scratch, out) = (TitleBuffer::new(256), TitleBuffer::new(256));
         let list = TitleList::new();

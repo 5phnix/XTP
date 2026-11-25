@@ -89,6 +89,26 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # No game files here: tests that need them skip (CONTRIBUTING.md, Tests).
       - run: cargo test --workspace --locked
+      # The GPU tests again, on WARP under the D3D12 debug layer: a test fails
+      # on the errors the layer raises on its thread (crates/xtp-gpu/src/
+      # testgpu.rs). One test at a time, so errors of our own threads go to
+      # the test that caused them. The layer comes with Graphics Tools.
+      - name: Install Graphics Tools (the D3D12 debug layer)
+        shell: pwsh
+        run: |
+          if (Test-Path "$env:WINDIR\System32\d3d12SDKLayers.dll") {
+            "the D3D12 debug layer is installed"
+          } else {
+            Measure-Command {
+              Add-WindowsCapability -Online -Name Tools.Graphics.DirectX~~~~0.0.1.0 | Out-Host
+            } | ForEach-Object { "installed in $([int]$_.TotalSeconds) s" }
+          }
+      - name: GPU tests under the D3D12 debug layer
+        env:
+          XTP_TEST_ADAPTER: warp
+          XTP_D3D12_DEBUG: "1"
+          XTP_REQUIRE_GPU: "1"
+        run: cargo test -p xtp-gpu --features diagnostics --locked -- --test-threads=1
 
   policy:
     runs-on: ubuntu-latest

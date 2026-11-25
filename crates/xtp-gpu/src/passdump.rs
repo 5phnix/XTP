@@ -2054,9 +2054,10 @@ mod tests {
     #[test]
     fn targets_are_shown_scaled_over_the_image() {
         let test = "passdump::tests::targets_are_shown_scaled_over_the_image";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let hdr = cleared(4, 2, 10, [2.0, 0.5, 0.25, 1.0]);
         let ids = cleared(2, 2, 62, [200.0, 0.0, 0.0, 0.0]);
         let mut show = Show::new(host, 8, 4).unwrap();
@@ -2087,9 +2088,10 @@ mod tests {
     #[test]
     fn passes_are_sampled_after_their_ops() {
         let test = "passdump::tests::passes_are_sampled_after_their_ops";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let target = cleared(8, 4, 10, [0.5, 0.25, 0.0, 1.0]);
         // A 16-byte buffer the draw reads, its host copy up to date.
         let exposure = crate::testgpu::TitleBuffer::new(256);

@@ -557,9 +557,10 @@ mod tests {
     #[test]
     fn two_planes_are_composed() {
         let test = "dxgi::planes::tests::two_planes_are_composed";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         use crate::object::slot;
         let null = std::ptr::null();
         let make = |w: u64, h: u32| {
