@@ -1522,6 +1522,19 @@ fn family_a() -> (NativeProgram, Site) {
     family_a_with(|t| t)
 }
 
+/// `native` without its LDS. Spliced, the family A program uses none (its
+/// walk did); with an allocation, a one-wave group asks for 32-lane waves
+/// (`WaveSize`, as `32ed072b9f845048` does), which the farm's WARP makes no
+/// pipeline for. The WARP runs translate this copy; the proof and the
+/// validation take the program as it is.
+fn without_lds(native: &NativeProgram) -> NativeProgram {
+    let mut n = native.clone();
+    if let StageIo::Cs(io) = &mut n.io {
+        io.rsrc2 &= !(0x1FF << 15);
+    }
+    n
+}
+
 #[test]
 fn rayquery_family_a_program_builds_and_splices() {
     let (native, site) = family_a();
@@ -1768,8 +1781,9 @@ fn rayquery_edge_cases_differ_as_documented() {
 #[test]
 fn rayquery_family_a_translates_validates_and_binds_alone() {
     let (native, site) = family_a();
-    let cs = translate_with(&native, &site, true).unwrap();
-    check_dxil(&cs);
+    check_dxil(&translate_with(&native, &site, true).unwrap());
+    let cs = translate_with(&without_lds(&native), &site, false).unwrap();
+    assert_eq!(cs.wave_size(), None);
     let Ok(host) = super::host::Host::new(true) else {
         eprintln!("no WARP device; skipped");
         return;
@@ -1823,7 +1837,7 @@ fn rayquery_family_a_end_to_end_on_warp() {
     prover
         .compare(11, &played, &mut proof::Report::default())
         .unwrap_or_else(|f| panic!("{f:?}"));
-    let cs = translate_with(&native, &site, true).unwrap();
+    let cs = translate_with(&without_lds(&native), &site, false).unwrap();
     let Ok(host) = super::host::Host::new(true) else {
         eprintln!("no WARP device; skipped");
         return;
