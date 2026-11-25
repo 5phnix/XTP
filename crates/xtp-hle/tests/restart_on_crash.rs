@@ -41,20 +41,41 @@ fn run_parent() {
         "initial child should terminate with a fault"
     );
 
-    // Wait for the restarted grandchild to start, record its line, and fault.
+    // Wait for the restarted grandchild to start and log its PID.
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut grandchild_pid = None;
     while Instant::now() < deadline {
-        if let Ok(text) = std::fs::read_to_string(&log_path)
-            && text.lines().count() >= 2
-        {
-            break;
+        if let Ok(text) = std::fs::read_to_string(&log_path) {
+            let lines: Vec<&str> = text.lines().collect();
+            if lines.len() >= 2 {
+                grandchild_pid = lines[1]
+                    .strip_prefix("pid=")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|s| s.parse::<u32>().ok());
+                break;
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Give a brief settle window to verify a second crash does NOT trigger a
-    // third launch.
-    std::thread::sleep(Duration::from_millis(400));
+    // Deterministically wait for the restarted grandchild to fault and exit so
+    // it is never left running and we know no third launch occurred.
+    if let Some(pid) = grandchild_pid {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+        // SAFETY: opening the grandchild PID for SYNCHRONIZE only.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if !handle.is_null() {
+            // SAFETY: valid process handle returned by `OpenProcess`.
+            unsafe {
+                WaitForSingleObject(handle, 10_000);
+                CloseHandle(handle);
+            }
+        }
+    }
+
     let final_text = std::fs::read_to_string(&log_path).expect("read probe log");
     let final_lines: Vec<&str> = final_text.lines().collect();
 

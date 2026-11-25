@@ -177,7 +177,7 @@ Legend: ✔ implemented and tested, ◐ partial, ✘ missing, — not needed.
 | Speech synthesis | ✔ Windows voices, text and SSML to 48 kHz PCM | → PC runtime | 4 / — | Done (R6) |
 | Closed captions, high contrast | ✔ Windows settings and title override | ✔ `accessibility.rs` | 5 / 3 | Done (R7) |
 | XError callback and options | ✘ class absent | ✔ | — / — | After xcl, if the title asks (R9) |
-| Relaunch (`XLaunchNewGame`), restart on crash | ◐ relaunch untested live | ✔ both | 4 (lifecycle) / — | Verify (R10) |
+| Relaunch (`XLaunchNewGame`), restart on crash | ✔ `XLaunchRestartOnCrash` tested; `XLaunchNewGame` untested live | ✔ both | 5 (lifecycle + `restart_on_crash`) / — | Partial (R10) |
 | HDR, URIs, deferrals, screenshots | ✔ | ◐ | 1 / — | Keep XTP |
 
 ### 4.3 Audio
@@ -372,7 +372,7 @@ shows the title calls them.
   completes as cancelled.
 - **Depends on:** R1, optional.
 
-### R10. Relaunch and restart on crash, live — S
+### R10. Relaunch and restart on crash, live — S (restart-on-crash done; live relaunch untested)
 - **Goal:** confirm `XLaunchNewGame` (wait for the old process, start again
   with the arguments) on the real title, and add `XLaunchRestartOnCrash`
   (record the arguments; the crash reporter relaunches once).

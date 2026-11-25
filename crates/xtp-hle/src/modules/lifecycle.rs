@@ -240,8 +240,14 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
 const RELAUNCHED_FROM: &str = "XTP_RELAUNCHED_FROM";
 
 /// Set in the environment of a process restarted after a crash so a second
-/// crash does not loop indefinitely.
+/// crash does not loop indefinitely. Cleared from the environment at startup
+/// (into [`ALREADY_CRASH_RESTARTED`]) so a later `XLaunchNewGame` relaunch
+/// does not inherit it.
 const CRASH_RESTARTED: &str = "XTP_CRASH_RESTARTED";
+
+/// Remembered in-process after [`wait_for_previous`] removes [`CRASH_RESTARTED`]
+/// from the environment.
+static ALREADY_CRASH_RESTARTED: AtomicBool = AtomicBool::new(false);
 
 /// Command-line arguments recorded by `XLaunchRestartOnCrash`.
 static RESTART_ON_CRASH: Mutex<Option<Vec<std::ffi::OsString>>> = Mutex::new(None);
@@ -254,9 +260,12 @@ pub(crate) fn set_restart_on_crash(args: Vec<std::ffi::OsString>) {
 
 /// Crash-reporter hook (`xtp_loader::on_crash`): if `XLaunchRestartOnCrash`
 /// recorded arguments and this process was not already restarted from a crash,
-/// spawns a replacement process once with [`CRASH_RESTARTED`] set.
+/// spawns a replacement process once with [`CRASH_RESTARTED`] set and ends
+/// this process immediately so the two instances never overlap.
 pub fn relaunch_on_crash() {
-    if std::env::var_os(CRASH_RESTARTED).is_some() {
+    if ALREADY_CRASH_RESTARTED.load(Ordering::Relaxed)
+        || std::env::var_os(CRASH_RESTARTED).is_some()
+    {
         tracing::info!("skipping crash restart: already restarted once");
         return;
     }
@@ -266,16 +275,18 @@ pub fn relaunch_on_crash() {
     let Some(args) = guard.take() else {
         return;
     };
-    relaunch_with_env(args, Some((CRASH_RESTARTED, "1")));
+    if relaunch_with_env(args, Some((CRASH_RESTARTED, "1"))) {
+        end_with(1);
+    }
 }
 
 /// Starts `xtp` again with `args` (after the title has suspended); the
 /// new process waits until this one has ended.
 pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
-    relaunch_with_env(args, None);
+    let _ = relaunch_with_env(args, None);
 }
 
-fn relaunch_with_env(args: Vec<std::ffi::OsString>, extra_env: Option<(&str, &str)>) {
+fn relaunch_with_env(args: Vec<std::ffi::OsString>, extra_env: Option<(&str, &str)>) -> bool {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
     let mut me: HANDLE = std::ptr::null_mut();
     // SAFETY: an inheritable duplicate of our own process handle.
@@ -302,16 +313,28 @@ fn relaunch_with_env(args: Vec<std::ffi::OsString>, extra_env: Option<(&str, &st
         command.spawn()
     });
     match spawned {
-        Ok(child) => tracing::info!(pid = child.id(), ?args, "relaunched"),
-        Err(e) => tracing::warn!(%e, "relaunch failed; the title just ends"),
+        Ok(child) => {
+            tracing::info!(pid = child.id(), ?args, "relaunched");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(%e, "relaunch failed; the title just ends");
+            false
+        }
     }
 }
 
-/// In a relaunched `xtp`: waits (30 s at most) for the process it
-/// replaces to be gone, so the two never share the title's files.
+/// In a relaunched `xtp`: consumes `XTP_CRASH_RESTARTED` (so a later
+/// `XLaunchNewGame` does not inherit it) and waits (30 s at most) for the
+/// process it replaces to be gone, so the two never share the title's files.
 pub fn wait_for_previous() {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    if std::env::var_os(CRASH_RESTARTED).is_some() {
+        ALREADY_CRASH_RESTARTED.store(true, Ordering::Relaxed);
+        // SAFETY: removing our own variable at startup before title threads run.
+        unsafe { std::env::remove_var(CRASH_RESTARTED) };
+    }
     let Some(handle) = std::env::var(RELAUNCHED_FROM)
         .ok()
         .and_then(|h| h.parse::<usize>().ok())
@@ -329,13 +352,17 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    end_with(0);
+}
+
+fn end_with(code: u32) {
     // A held cursor would outlive us.
     super::gameinput::release_mouse();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     xtp_gpu::pipeline::save_pipeline_cache();
     // SAFETY: ends this process, as the console ends a suspended title.
-    unsafe { TerminateProcess(GetCurrentProcess(), 0) };
+    unsafe { TerminateProcess(GetCurrentProcess(), code) };
 }
 
 pub(crate) fn module() -> HleModule {
