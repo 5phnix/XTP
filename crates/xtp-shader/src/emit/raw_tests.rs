@@ -358,17 +358,20 @@ struct Case {
     raw_access: bool,
     /// Dword 1 of the output: the value loaded, or the one stored.
     value: u32,
-    /// The buffer's dword 3 after the access, for unordered views.
-    stored: Option<u32>,
+    /// For unordered views, the buffer after the access: `(k, v)`, `v` at
+    /// dword `k` and 0 everywhere else.
+    stored: Option<(usize, u32)>,
+    /// The views it runs with.
+    modes: &'static [Mode],
 }
 
-/// Runs every case in every [`MODES`] on every host; the failures.
+/// Runs every case in each of its modes on every host; the failures.
 fn check(cases: &[Case]) -> Vec<String> {
     let (_one, hosts) = hosts();
     let mut failures = Vec::new();
     for case in cases {
         let native = program(case.access, case.kind, case.uav);
-        for mode in MODES {
+        for &mode in case.modes {
             let what = format!("{} ({mode:?} views)", case.name);
             let cs = match translate(&native, mode) {
                 Ok(cs) => cs,
@@ -396,13 +399,21 @@ fn check(cases: &[Case]) -> Vec<String> {
                         got[1], case.value
                     ));
                 }
-                if let Some(want) = case.stored.filter(|_| values)
-                    && out[0][3] != want
-                {
-                    failures.push(format!(
-                        "{what} on {host_name}: dword 3 {}, not {want}",
-                        out[0][3]
-                    ));
+                if let Some((k, v)) = case.stored.filter(|_| values) {
+                    let mut want = vec![0; (BYTES / 4) as usize];
+                    want[k] = v;
+                    if out[0] != want {
+                        let set: Vec<(usize, u32)> = out[0]
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|&(_, x)| x != 0)
+                            .collect();
+                        failures.push(format!(
+                            "{what} on {host_name}: the buffer's non-zero dwords {set:?}, not \
+                             [({k}, {v})]"
+                        ));
+                    }
                 }
             }
         }
@@ -410,17 +421,28 @@ fn check(cases: &[Case]) -> Vec<String> {
     failures
 }
 
-/// A [`Case`] as a row: name, access, kind, unordered view, raw access,
-/// value, dword 3 after.
-type Row = (
-    &'static str,
-    &'static [u32],
-    Kind,
-    bool,
-    bool,
-    u32,
-    Option<u32>,
-);
+/// A case of `access` over a buffer of `kind` (an unordered view where
+/// `uav`), run in every mode.
+fn case(
+    name: &str,
+    access: &'static [u32],
+    kind: Kind,
+    uav: bool,
+    raw_access: bool,
+    value: u32,
+    stored: Option<(usize, u32)>,
+) -> Case {
+    Case {
+        name: name.to_owned(),
+        access,
+        kind,
+        uav,
+        raw_access,
+        value,
+        stored,
+        modes: &MODES,
+    }
+}
 
 /// A buffer's record count read as data is the console's whatever the host
 /// views and however the program accesses the buffer: 16 for 192 bytes of
@@ -435,34 +457,23 @@ type Row = (
 fn record_counts_read_as_data_are_the_consoles() {
     let data = data();
     let s12 = Kind::Structured(12);
+    let raw = Kind::Raw;
+    // Stores and atomics write 42 at dword 3 (byte 12), nothing else.
+    let at3 = Some((3, 42));
     #[rustfmt::skip]
-    let rows: [Row; 11] = [
-        ("indexed load", INDEXED_LOAD, s12, false, false, data[3], None),
-        ("offset load", OFFSET_LOAD, s12, false, true, data[3], None),
-        ("scalar load", SCALAR_LOAD, s12, false, true, data[3], None),
-        ("raw offset load", OFFSET_LOAD, Kind::Raw, false, true, data[3], None),
-        ("raw scalar load", SCALAR_LOAD, Kind::Raw, false, true, data[3], None),
-        ("typed load", TYPED_LOAD, Kind::Typed, false, false, data[4], None),
-        ("indexed store", INDEXED_STORE, s12, true, false, 42, Some(42)),
-        ("offset store", OFFSET_STORE, s12, true, true, 42, Some(42)),
-        ("indexed atomic", INDEXED_ATOMIC, s12, true, false, 42, Some(42)),
-        ("scalar load of an unordered view", SCALAR_LOAD, s12, true, true, 0, None),
-        ("raw offset store", OFFSET_STORE, Kind::Raw, true, true, 42, Some(42)),
+    let cases = [
+        case("indexed load", INDEXED_LOAD, s12, false, false, data[3], None),
+        case("offset load", OFFSET_LOAD, s12, false, true, data[3], None),
+        case("scalar load", SCALAR_LOAD, s12, false, true, data[3], None),
+        case("raw offset load", OFFSET_LOAD, raw, false, true, data[3], None),
+        case("raw scalar load", SCALAR_LOAD, raw, false, true, data[3], None),
+        case("typed load", TYPED_LOAD, Kind::Typed, false, false, data[4], None),
+        case("indexed store", INDEXED_STORE, s12, true, false, 42, at3),
+        case("offset store", OFFSET_STORE, s12, true, true, 42, at3),
+        case("indexed atomic", INDEXED_ATOMIC, s12, true, false, 42, at3),
+        case("scalar load of an unordered view", SCALAR_LOAD, s12, true, true, 0, None),
+        case("raw offset store", OFFSET_STORE, raw, true, true, 42, at3),
     ];
-    let cases: Vec<Case> = rows
-        .into_iter()
-        .map(
-            |(name, access, kind, uav, raw_access, value, stored)| Case {
-                name: name.to_owned(),
-                access,
-                kind,
-                uav,
-                raw_access,
-                value,
-                stored,
-            },
-        )
-        .collect();
     let failures = check(&cases);
     assert!(failures.is_empty(), "{failures:#?}");
 }
@@ -479,29 +490,100 @@ fn loads_by_element_read_index_times_stride_at_every_stride() {
     let mut cases = Vec::new();
     for s in [4, 8, 12, 16, 24] {
         let at = (s / 4) as usize;
-        let load = |name: String, access, value| Case {
-            name,
-            access,
-            kind: Kind::Structured(s),
-            uav: false,
-            raw_access: false,
-            value,
-            stored: None,
-        };
-        cases.push(load(
-            format!("element 1, stride {s}"),
+        let kind = Kind::Structured(s);
+        cases.push(case(
+            &format!("element 1, stride {s}"),
             INDEXED_LOAD,
+            kind,
+            false,
+            false,
             data[at],
+            None,
         ));
         // Byte 4 of the element (inside it from stride 8 on).
         if s >= 8 {
-            cases.push(load(
-                format!("byte 4 of element 1, stride {s}"),
+            cases.push(case(
+                &format!("byte 4 of element 1, stride {s}"),
                 INDEXED_LOAD_AT_4,
+                kind,
+                false,
+                false,
                 data[at + 1],
+                None,
             ));
         }
     }
+    let failures = check(&cases);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Loads byte 12 of element 1 into `v2`: past a 12-byte element.
+const LOAD_PAST_THE_ELEMENT: &[u32] = &[
+    0x7E06_0281, // v_mov_b32 v3, 1
+    0x7E08_028C, // v_mov_b32 v4, 12
+    0xE030_3000,
+    0x8002_0203, // buffer_load_dword v2, v[3:4], s[8:11], 0 idxen offen
+];
+
+/// Stores 42 (`v2`) at byte 12 of element 1.
+const STORE_PAST_THE_ELEMENT: &[u32] = &[
+    0x7E04_02AA, // v_mov_b32 v2, 42
+    0x7E06_0281, // v_mov_b32 v3, 1
+    0x7E08_028C, // v_mov_b32 v4, 12
+    0xE070_3000,
+    0x8002_0203, // buffer_store_dword v2, v[3:4], s[8:11], 0 idxen offen
+];
+
+/// Adds 42 (`v2`) at byte 12 of element 1.
+const ATOMIC_PAST_THE_ELEMENT: &[u32] = &[
+    0x7E04_02AA, // v_mov_b32 v2, 42
+    0x7E06_0281, // v_mov_b32 v3, 1
+    0x7E08_028C, // v_mov_b32 v4, 12
+    0xE0C8_3000,
+    0x8002_0203, // buffer_atomic_add v2, v[3:4], s[8:11], 0 idxen offen
+];
+
+/// Loads element 2^30 + 1 into `v2`: at a stride of 4, `index * stride` is
+/// 2^32 + 4, byte 4 once it wraps.
+const LOAD_WRAPPING: &[u32] = &[
+    0x7E06_02FF,
+    0x4000_0001, // v_mov_b32 v3, 0x40000001
+    0xE030_2000,
+    0x8002_0203, // buffer_load_dword v2, v3, s[8:11], 0 idxen
+];
+
+/// Stores 42 (`v2`) at element 2^30 + 1.
+const STORE_WRAPPING: &[u32] = &[
+    0x7E04_02AA, // v_mov_b32 v2, 42
+    0x7E06_02FF,
+    0x4000_0001, // v_mov_b32 v3, 0x40000001
+    0xE070_2000,
+    0x8002_0203, // buffer_store_dword v2, v3, s[8:11], 0 idxen
+];
+
+/// With `XTP_RAW_STRUCTURED=1` an access by element through a raw handle
+/// makes the console's range checks of a structured view, as the stride
+/// table's raw views do: at an element's end (byte 12 of a 12-byte
+/// element, the next one's first dword) or at an element whose bytes pass
+/// 2^32 (`index * stride` wrapping to a byte inside the view), a load reads
+/// 0 and a store or an atomic leaves the buffer as it was (Codex's review
+/// of the stride table's landing, board task 01dada4d). Not run with
+/// structured views, whose checks are the host's own.
+#[test]
+fn accesses_past_their_element_or_wrapping_reach_nothing() {
+    const RAW: &[Mode] = &[Mode::Raw, Mode::Table];
+    let (s12, s4) = (Kind::Structured(12), Kind::Structured(4));
+    // Nothing written: dword 6 (the next element's first, at stride 12) and
+    // dword 1 (where the wrapped store lands) stay 0, as all the others.
+    #[rustfmt::skip]
+    let cases = [
+        case("a load past the element", LOAD_PAST_THE_ELEMENT, s12, false, false, 0, None),
+        case("a store past the element", STORE_PAST_THE_ELEMENT, s12, true, false, 42, Some((6, 0))),
+        case("an atomic past the element", ATOMIC_PAST_THE_ELEMENT, s12, true, false, 42, Some((6, 0))),
+        case("a load at a wrapping index", LOAD_WRAPPING, s4, false, false, 0, None),
+        case("a store at a wrapping index", STORE_WRAPPING, s4, true, false, 42, Some((1, 0))),
+    ]
+    .map(|c| Case { modes: RAW, ..c });
     let failures = check(&cases);
     assert!(failures.is_empty(), "{failures:#?}");
 }
