@@ -48,7 +48,7 @@ use super::super::container::Binding;
 use super::super::shader::{ROOT_CBV_SPACE, flags};
 use super::{Lower, Stop, Val, Why};
 use crate::ShaderError;
-use crate::gfx10::{Encoding, Fields, Instruction, Valu};
+use crate::gfx10::{Encoding, Fields, Instruction, Operand, Valu};
 use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{NativeProgram, RootType};
 
@@ -61,6 +61,12 @@ pub const TLAS_REGISTER: u8 = 240;
 pub(crate) mod ray_flags {
     pub const FORCE_OPAQUE: u32 = 0x01;
     pub const CULL_BACK_FACING_TRIANGLES: u32 = 0x10;
+    /// The flags the host's answer in the proof models (`World::query`),
+    /// the only ones a site may have. FORCE_OPAQUE is required besides: the
+    /// lowering's `Proceed` loop commits no candidate, so a query that left
+    /// a triangle non-opaque would miss it (Codex review of eb7d7d8, point
+    /// 1).
+    pub const MODELLED: u32 = FORCE_OPAQUE | CULL_BACK_FACING_TRIANGLES;
 }
 
 /// The VOP3 opcode of the spliced instruction: past the last one GFX10
@@ -69,6 +75,9 @@ pub(crate) const RAY_QUERY: u16 = 0x3ff;
 
 /// The first word of the spliced instruction ("RAYQ").
 const MAGIC: u32 = 0x5241_5951;
+
+/// The operand code of `src_lds_direct`: a VALU source that reads LDS.
+const LDS_DIRECT: u8 = 254;
 
 /// What the code after a walk reads of one of its registers (section 5.3;
 /// AnyPS5's `RayQueryResultKind`, the kinds the prototype needs).
@@ -332,6 +341,15 @@ pub(crate) fn splice(mut p: Program, site: &Site) -> Result<Program, Why> {
     if p.wave64 {
         return Err("a ray-tracing walk in a wave64 program");
     }
+    if site.flags & ray_flags::FORCE_OPAQUE == 0 || site.flags & !ray_flags::MODELLED != 0 {
+        return Err("a ray query with ray flags the proof has no model of");
+    }
+    // The play captures EXEC and the results where the walk is left: a
+    // register kept otherwise would go unchecked (Codex review of eb7d7d8,
+    // point 6).
+    if site.kept.iter().any(|&r| r != Reg::S(EXEC)) {
+        return Err("a ray-tracing walk that keeps a register other than EXEC");
+    }
     let one = |offset: usize| -> Result<usize, Why> {
         let mut at = p
             .blocks
@@ -364,10 +382,17 @@ pub(crate) fn splice(mut p: Program, site: &Site) -> Result<Program, Why> {
         return Err("a ray-tracing walk with a path that ends the program");
     }
     // What the walk does besides its registers must be what the query
-    // leaves out: reads, and LDS the code outside it never touches.
+    // leaves out: reads, and LDS the code outside it never touches, through
+    // DS instructions, loads to LDS, or a VALU operand that reads it
+    // (`src_lds_direct`, an interpolation attribute: Codex review of
+    // eb7d7d8, point 4).
     let lds = |i: &Inst| match &i.fields {
         Fields::Ds { .. } => true,
         Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => *lds,
+        Fields::Valu(v) => v
+            .src
+            .iter()
+            .any(|s| matches!(s, Operand::Const(LDS_DIRECT) | Operand::Attr { .. })),
         _ => false,
     };
     let lds_outside = p

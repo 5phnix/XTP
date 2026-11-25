@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 
 use super::HostShader;
+use super::lower::rayquery::play::QueryRay;
 use super::lower::rayquery::proof::{self, Play, Prover};
 use super::lower::rayquery::world::{self, Blas, Instance, Rng, Root, Tri, World};
 use super::lower::rayquery::{
@@ -421,6 +422,86 @@ fn rayquery_refuses_walks_with_effects_the_query_lacks() {
     // ... which the code after the walk reads (0xd8: ds_read_b32 v1, v0).
     let read = patched(&stack, 0xd8, &[0xD8D8_0000, 0x0100_0000]);
     assert_eq!(splice(ir(&read), &SITE).err(), effect);
+    // ... or reads through a VALU operand (Codex review of eb7d7d8, point
+    // 4; 0xd8: v_mov_b32 v1, src_lds_direct, then s_nop 0).
+    let direct = patched(&stack, 0xd8, &[0x7E02_02FE, 0xBF80_0000]);
+    assert_eq!(splice(ir(&direct), &SITE).err(), effect);
+}
+
+/// What the proof cannot check is refused before it plays (Codex review of
+/// eb7d7d8): ray flags the host's answer does not model, FORCE_OPAQUE
+/// missing among them (point 1: the lowering commits no candidate, so a
+/// non-opaque triangle would be missed), and a kept register other than
+/// EXEC, which the play does not compare (point 6).
+#[test]
+fn rayquery_refuses_sites_the_proof_cannot_check() {
+    let p = ir(&native());
+    let flags = Some("a ray query with ray flags the proof has no model of");
+    let without_opaque = Site {
+        flags: ray_flags::CULL_BACK_FACING_TRIANGLES,
+        ..SITE
+    };
+    assert_eq!(splice(p.clone(), &without_opaque).err(), flags);
+    // RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH.
+    let first_hit = Site {
+        flags: ray_flags::FORCE_OPAQUE | 0x04,
+        ..SITE
+    };
+    assert_eq!(splice(p.clone(), &first_hit).err(), flags);
+    let kept = Site {
+        kept: &[Reg::V(1)],
+        ..SITE
+    };
+    assert_eq!(
+        splice(p, &kept).err(),
+        Some("a ray-tracing walk that keeps a register other than EXEC")
+    );
+    // The review's counterexample: family A's site without FORCE_OPAQUE.
+    let (native, site) = family_a();
+    let site = Site {
+        flags: ray_flags::CULL_BACK_FACING_TRIANGLES,
+        ..site
+    };
+    assert_eq!(
+        proof::prove(&ir(&native), &native, &site)
+            .map(|_| ())
+            .map_err(|f| f.why),
+        Err("a ray query with ray flags the proof has no model of")
+    );
+}
+
+/// The host's answer sets a lane aside (an edge, or fragile) only where the
+/// ambiguity can change it (Codex review of eb7d7d8, point 3): a triangle
+/// at t-max behind a clear hit, or a grazed one past it, changes nothing;
+/// alone at t-max, or grazed before the hit, it does.
+#[test]
+fn rayquery_host_answer_sets_aside_only_lanes_it_may_change() {
+    let ray = |t_max: f32| QueryRay {
+        origin: [1.0, 1.0, 0.0],
+        direction: [0.0, 0.0, 1.0],
+        t_min: 0.0,
+        t_max,
+        mask: 0xd5,
+        flags: ray_flags::FORCE_OPAQUE | ray_flags::CULL_BACK_FACING_TRIANGLES,
+    };
+    let world = |tris: Vec<Tri>| {
+        one_instance(Blas {
+            leaves: tris.into_iter().map(|t| vec![t]).collect(),
+            cycle: None,
+        })
+    };
+    let answer = world(vec![a_at(3.0), a_at(5.0)]).query(&ray(5.0));
+    assert!(answer.hit && !answer.edge && !answer.fragile, "{answer:?}");
+    assert_eq!(answer.t, 3.0);
+    let answer = world(vec![a_at(5.0)]).query(&ray(5.0));
+    assert!(!answer.hit && answer.edge, "{answer:?}");
+    // A's shape moved to x = 1: the ray runs on its edge from (1, 0).
+    let grazed = |z: f32| -> Tri { [[1.0, 0.0, z], [1.0, 4.0, z], [5.0, 0.0, z]] };
+    let answer = world(vec![a_at(3.0), grazed(7.0)]).query(&ray(100.0));
+    assert!(answer.hit && !answer.fragile, "{answer:?}");
+    assert_eq!(answer.t, 3.0);
+    let answer = world(vec![a_at(3.0), grazed(2.0)]).query(&ray(100.0));
+    assert!(answer.fragile, "{answer:?}");
 }
 
 /// Without a site the program is not spliced: the walk stays, and the
@@ -1725,9 +1806,28 @@ fn rayquery_proves_a_title_container_by_play() {
         proven += 1;
     }
     assert!(proven > 0, "no site in this container");
-    // As `xtp translate --validate` does: translated, spliced, valid.
+    // As the runtime translates it: spliced and valid.
     let cs = super::translate(&data).unwrap_or_else(|e| panic!("{e}"));
     check_dxil(&cs);
+    // With `XTP_TEST_ADAPTER=hardware` (or unset), its compute pipeline on
+    // the default hardware adapter, translated for that adapter's waves: a
+    // driver's compiler that fails on it fails this process only (VIctory
+    // #2309 saw one recurse until its stack overflowed).
+    match super::host::Host::new(false) {
+        Ok(host) => {
+            let adapters = super::host::adapters().unwrap_or_default();
+            let cs = super::translate_for(&data, host.target()).unwrap_or_else(|e| panic!("{e}"));
+            let started = std::time::Instant::now();
+            host.compute_pipeline(&cs)
+                .unwrap_or_else(|e| panic!("{adapters:?}: {e}"));
+            eprintln!(
+                "compute pipeline made on {:?} in {:?}",
+                adapters.first(),
+                started.elapsed()
+            );
+        }
+        Err(e) => eprintln!("no device for its pipeline: {e}"),
+    }
 }
 
 /// Lane 0's ray, planted for group 0 with only lane 0 in the tile mask.
