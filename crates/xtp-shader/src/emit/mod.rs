@@ -100,10 +100,10 @@ pub(crate) mod lower;
 mod raw_tests;
 pub mod rect_gs;
 mod sampler;
-#[cfg(all(test, windows))]
-mod scalar_gap_tests;
 #[cfg(test)]
 mod sampler_tests;
+#[cfg(all(test, windows))]
+mod scalar_gap_tests;
 mod shader;
 #[cfg(all(test, windows))]
 mod smem_data_tests;
