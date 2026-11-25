@@ -1,8 +1,10 @@
 //! Observation des imports du constructeur BVH, après résolution dans la DLL du titre.
 //! Activer la cible `xtp_hle::modules::bvhbuilder=debug` pour relever une session.
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tracing::{Level, debug, enabled};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -96,13 +98,34 @@ fn frame() -> u64 {
     xtp_gpu::queue::presented()
 }
 
+static BUILDERS: Mutex<BTreeMap<usize, Arc<xtp_gpu::rt::Builder>>> = Mutex::new(BTreeMap::new());
+
+fn host_builder(this: Object) -> Option<Arc<xtp_gpu::rt::Builder>> {
+    BUILDERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&this.addr())
+        .cloned()
+}
+
 extern "system" fn ctor(this: Object, device: Object, flag: u8) -> Object {
     debug!(frame = frame(), ?this, ?device, flag, "ctor");
-    ctor::original()(this, device, flag)
+    let object = ctor::original()(this, device, flag);
+    if !object.is_null() {
+        BUILDERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(object.addr(), Arc::default());
+    }
+    object
 }
 
 extern "system" fn dtor(this: Object) {
     debug!(frame = frame(), ?this, "dtor");
+    BUILDERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&this.addr());
     dtor::original()(this)
 }
 
@@ -122,7 +145,11 @@ extern "system" fn copy(this: Object, list: Object, dst: u64, src: u64, mode: i3
         compact = mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT.0,
         "copy"
     );
-    copy::original()(this, list, dst, src, mode)
+    copy::original()(this, list, dst, src, mode);
+    if let Some(builder) = host_builder(this) {
+        // SAFETY: the DLL receives this same live title list.
+        unsafe { builder.copy(list.cast(), dst, src, mode) };
+    }
 }
 
 // Une frame est échantillonnée à l'entrée. L'identifiant relie les lignes même si
@@ -276,7 +303,15 @@ extern "system" fn build(this: Object, list: Object, count: u32, entries: *const
             }
         }
     }
-    build::original()(this, list, count, entries)
+    build::original()(this, list, count, entries);
+    if !entries.is_null()
+        && let Some(builder) = host_builder(this)
+    {
+        for i in 0..count {
+            // SAFETY: these CPU descriptors and the list belong to the current call.
+            unsafe { builder.build(list.cast(), &(*entries.add(i as usize)).build) };
+        }
+    }
 }
 
 extern "system" fn prebuild(
@@ -333,7 +368,24 @@ extern "system" fn rehydrate(
             }
         }
     }
-    rehydrate::original()(this, list, count, descs, cpu)
+    let hr = rehydrate::original()(this, list, count, descs, cpu);
+    if hr >= 0
+        && !descs.is_null()
+        && let Some(builder) = host_builder(this)
+    {
+        let mut recorded = 0;
+        for i in 0..count {
+            // SAFETY: the original call accepted this list and array of count descriptions.
+            recorded += u32::from(unsafe { builder.build(list.cast(), &*descs.add(i as usize)) });
+        }
+        debug!(
+            count,
+            recorded,
+            unavailable = count - recorded,
+            "rehydrated host BLAS recordings"
+        );
+    }
+    hr
 }
 
 #[cfg(test)]
