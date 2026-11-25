@@ -30,6 +30,15 @@
 //! - The precook reuses the pipeline library across translator changes.
 //!   It can compact a library past [`LIBRARY_REBUILD_BYTES`] into a new
 //!   generation ([`rebuild_library`]) containing the pipelines used again.
+//! - A pipeline the library holds is not loaded here ([`super::library`]'s
+//!   `without_loading`): it is made through the same function, which names
+//!   it from its translated shaders, root signature and state, and its name
+//!   found in the library's names is the answer ([`Counts::known`]). After
+//!   a translator change, the pipelines whose translations did not change
+//!   cost their name alone; a session loads each when it needs it.
+//! - After a translator change, each translation is compared with the one
+//!   the translator before kept ([`compare_with`], [`compared`]): what the
+//!   change altered, counted. The answer is always this build's.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -105,9 +114,13 @@ pub fn container(container: &[u8], stage: Option<HwStage>, pipelines: bool) -> O
 pub struct Compute(Arc<Shader>);
 
 impl Compute {
-    /// Loads or creates the pipeline using the same description as a dispatch.
+    /// Makes the pipeline from the same description as a dispatch, unless
+    /// the library holds it (then it is not loaded either).
     pub fn pipeline(&self) -> Outcome {
-        if HostPipeline::new(std::slice::from_ref(&self.0), None).is_some() {
+        let made = super::library::without_loading(|| {
+            HostPipeline::new(std::slice::from_ref(&self.0), None).is_some()
+        });
+        if made {
             Outcome::Ready
         } else {
             Outcome::NoPipeline
@@ -148,6 +161,8 @@ pub struct Counts {
     /// Host pipelines compiled, and loaded from the library.
     pub made: u64,
     pub loaded: u64,
+    /// Host pipelines the library holds by their names, not loaded.
+    pub known: u64,
 }
 
 /// The counts so far.
@@ -158,7 +173,32 @@ pub fn counts() -> Counts {
         cached,
         made: super::library::MADE.load(Ordering::Relaxed),
         loaded: super::library::LOADED.load(Ordering::Relaxed),
+        known: super::library::KNOWN.load(Ordering::Relaxed),
     }
+}
+
+/// From now on, compares each translation made with the entry the
+/// translator of `key` (another build's key, as [`Ready::key`] gives it in
+/// hexadecimal) kept for its container. False if `key` is not one, or a
+/// comparison is set already.
+pub fn compare_with(key: &str) -> bool {
+    if key.len() != 64 || !key.is_ascii() {
+        return false;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        match u8::from_str_radix(&key[2 * i..2 * i + 2], 16) {
+            Ok(v) => *b = v,
+            Err(_) => return false,
+        }
+    }
+    crate::shader_cache::compare_with(bytes)
+}
+
+/// How the translations made compare with the translator before's
+/// ([`compare_with`]).
+pub fn compared() -> crate::shader_cache::Compared {
+    crate::shader_cache::compared_counts()
 }
 
 /// The host pipelines refused so far, by reason, most first.
@@ -642,10 +682,10 @@ pub enum Replayed {
 
 /// Makes the host pipeline of `recorded`'s pipeline `i` into the library,
 /// as the session's first draw with it would: the same function, shaders
-/// and state.
+/// and state. One the library holds is not loaded.
 pub fn replay(recorded: &Recorded, i: usize) -> Replayed {
     let d = &recorded.pipelines[i];
-    if HostPipeline::new(&d.shaders, Some(&d.state)).is_some() {
+    if super::library::without_loading(|| HostPipeline::new(&d.shaders, Some(&d.state)).is_some()) {
         return Replayed::Ready;
     }
     if d.shaders
@@ -990,7 +1030,8 @@ pub(in crate::pipeline) mod tests {
 
     /// A graphics pipeline a session kept is made again into the library
     /// by the same function, with the state read again from its stream:
-    /// compiled the first time, found in the library the next. Two
+    /// compiled the first time, the next time held by the library's names
+    /// and not loaded (a session loads it). Two
     /// descriptions this build reads as one pipeline are made once; one
     /// whose shader no longer translates is refused at once.
     #[test]
@@ -1064,9 +1105,12 @@ pub(in crate::pipeline) mod tests {
         let made = counts().made;
         assert_eq!(replay(&recorded, 0), Replayed::Ready);
         assert!(counts().made > made, "compiled");
-        let loaded = counts().loaded;
+        // Made again by the precook: its name is held, so it is not loaded.
+        // (Other tests of this process load and make pipelines meanwhile:
+        // the counts only say that this one was answered by its name.)
+        let known = counts().known;
         assert_eq!(replay(&recorded, 0), Replayed::Ready);
-        assert!(counts().loaded > loaded, "found in the library");
+        assert!(counts().known > known, "held by the library");
         assert_eq!(replay(&recorded, 1), Replayed::Untranslated);
 
         // Keep the same translated shaders and change only the topology.

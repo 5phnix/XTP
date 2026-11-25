@@ -421,6 +421,9 @@ pub(crate) fn raise_inputs(
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
+                    "v_interp_p1_f32" | "v_interp_p2_f32" | "v_interp_mov_f32" => {
+                        return Err(unsupported(at, "an e64 f32 interpolation"));
+                    }
                     "v_interp_p1ll_f16" => {
                         if read_first {
                             first_halves.push((site, attribute(inst, &v.src[0])?));

@@ -9,7 +9,7 @@
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -87,6 +87,153 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+const PLACEHOLDER_RESERVE: u32 = MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
+static LOW_VA_RESERVE: Mutex<Option<LowVaReserve>> = Mutex::new(None);
+
+struct LowVaReserve {
+    base: usize,
+    len: usize,
+    exact_size: bool,
+}
+
+impl LowVaReserve {
+    fn new(len: usize, exact_size: bool) -> std::io::Result<Self> {
+        let (_, highest) = address_range(ADDRESS_32BIT);
+        let mut range = MEM_ADDRESS_REQUIREMENTS {
+            HighestEndingAddress: highest as *mut c_void,
+            ..Default::default()
+        };
+        let base = allocate_virtual(
+            std::ptr::null_mut(),
+            len,
+            PLACEHOLDER_RESERVE,
+            PAGE_NOACCESS,
+            Some(&mut range),
+        );
+        if base.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            base: base as usize,
+            len,
+            exact_size,
+        })
+    }
+
+    /// Hands out a placeholder that the caller can split, map and release.
+    fn take(&mut self, len: usize) -> Option<*mut c_void> {
+        if len == 0
+            || !len.is_multiple_of(PAGE)
+            || len > self.len
+            || (self.exact_size && len != self.len)
+        {
+            return None;
+        }
+        let base = self.base as *mut c_void;
+        if len < self.len {
+            // SAFETY: the reserve still owns this placeholder. Splitting its
+            // prefix keeps both parts reserved throughout the handoff.
+            if unsafe { VirtualFree(base, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+                return None;
+            }
+        }
+        self.base += len;
+        self.len -= len;
+        Some(base)
+    }
+}
+
+/// Holds a placeholder before the host graphics device and title start.
+/// The default covers one measured startup request from a known build.
+/// It takes that much low address space until the matching request uses it,
+/// without committing pages. Reserving exactly that size leaves the rest of
+/// the low range available and prevents smaller requests from using it up.
+/// An explicit MiB count instead supplies pieces on allocation failure.
+/// Zero disables the reserve.
+pub fn reserve_low_va_from_env(default_mib: usize) {
+    const VARIABLE: &str = "XTP_LOW_VA_RESERVE_MIB";
+    let value = std::env::var_os(VARIABLE);
+    let override_mib = value.as_deref().and_then(|value| {
+        let mib = low_va_override_mib(value);
+        if mib.is_none() {
+            tracing::warn!(?value, "{VARIABLE} must be a MiB count from 0 to 4095");
+        }
+        mib
+    });
+    let mib = override_mib.unwrap_or(default_mib);
+    if mib == 0 {
+        return;
+    }
+    let mut reserve = LOW_VA_RESERVE.lock().unwrap_or_else(|e| e.into_inner());
+    if reserve.is_some() {
+        return;
+    }
+    let automatic = override_mib.is_none();
+    match LowVaReserve::new(mib * MIB, automatic) {
+        Ok(saved) => {
+            tracing::info!(
+                mib,
+                automatic,
+                base = format_args!("{:#x}", saved.base),
+                "held a low VA placeholder"
+            );
+            *reserve = Some(saved);
+        }
+        Err(error) => tracing::warn!(mib, %error, "could not hold a low VA placeholder"),
+    }
+}
+
+fn low_va_override_mib(value: &OsStr) -> Option<usize> {
+    value.to_str()?.parse().ok().filter(|&mib| mib < 4096)
+}
+
+fn take_low_va_reserve(size: usize, exact_size: bool) -> Option<*mut c_void> {
+    let at = LOW_VA_RESERVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .filter(|reserve| reserve.exact_size == exact_size)?
+        .take(size)?;
+    tracing::info!(
+        size,
+        at = format_args!("{at:p}"),
+        "used the low VA placeholder reserve"
+    );
+    Some(at)
+}
+
+fn allocate_virtual(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+    range: Option<&mut MEM_ADDRESS_REQUIREMENTS>,
+) -> *mut c_void {
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    let count = u32::from(range.is_some());
+    if let Some(range) = range {
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = std::ptr::from_mut(range).cast();
+    }
+    // SAFETY: the caller's address and size, with host flags. When passed,
+    // the address requirements and their parameter live through the call.
+    unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            base,
+            size,
+            kind,
+            protect,
+            if count == 0 {
+                std::ptr::null_mut()
+            } else {
+                &mut parameter
+            },
+            count,
+        )
+    }
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -123,11 +270,8 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     let mut kind = kind & !(PAGES_2M | PAGES_64K_BIT);
     if placeholder {
-        kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
+        kind |= PLACEHOLDER_RESERVE;
     }
-    let mut parameter = MEM_EXTENDED_PARAMETER::default();
-    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
-    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
     // Address requirements apply to reservations at an address of our choice.
     let constrained = base.is_null();
     if constrained {
@@ -139,23 +283,36 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
-    // SAFETY: the title's own arguments, cleaned of console bits; the
-    // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
+    let low_placeholder = constrained
+        && flags & ADDRESS_32BIT != 0
+        && kind == PLACEHOLDER_RESERVE
+        && requirements.Alignment == 0
+        && protect == PAGE_NOACCESS;
+    let saved = if low_placeholder {
+        take_low_va_reserve(size, true)
+    } else {
+        None
+    };
+    let mut at = saved.unwrap_or_else(|| {
+        allocate_virtual(
             base,
             size,
             kind,
             protect,
-            if constrained {
-                &mut parameter
-            } else {
-                std::ptr::null_mut()
-            },
-            constrained.into(),
+            constrained.then_some(&mut requirements),
         )
-    };
+    });
+    // SAFETY: capture this thread's allocation error before any reporting.
+    let error = at.is_null().then(|| unsafe { GetLastError() });
+    if let Some(error) = error
+        && low_placeholder
+    {
+        if let Some(saved) = take_low_va_reserve(size, false) {
+            at = saved;
+        } else {
+            tracing::warn!(size, error, "32-bit placeholder allocation failed");
+        }
+    }
     note_virtual(kind, size, !at.is_null());
     if !at.is_null() {
         // Heaps over title memory (`xtp_gpu::uma`, with `XTP_UMA=1`) follow
@@ -180,6 +337,12 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    if at.is_null()
+        && let Some(error) = error
+    {
+        // SAFETY: the caller can read the original Windows error.
+        unsafe { SetLastError(error) };
     }
     at
 }
@@ -1795,6 +1958,75 @@ mod tests {
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn the_low_va_reserve_hands_out_independent_mappable_placeholders() {
+        let mut saved = LowVaReserve::new(3 * PAGE, false).unwrap();
+        let base = saved.base;
+        assert!(base + 3 * PAGE <= 1 << 32);
+        let mut range = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: base as *mut c_void,
+            HighestEndingAddress: (base + 3 * PAGE - 1) as *mut c_void,
+            Alignment: PAGE,
+        };
+        assert!(
+            allocate_virtual(
+                std::ptr::null_mut(),
+                PAGE,
+                PLACEHOLDER_RESERVE,
+                PAGE_NOACCESS,
+                Some(&mut range),
+            )
+            .is_null()
+        );
+        assert!(saved.take(0).is_none());
+        assert!(saved.take(PAGE + 1).is_none());
+        assert!(saved.take(4 * PAGE).is_none());
+
+        let first = saved.take(2 * PAGE).unwrap();
+        assert_eq!(first as usize, base);
+        assert_eq!(query(first).host.RegionSize, 2 * PAGE);
+        let rest = saved.take(PAGE).unwrap();
+        assert_eq!(rest as usize, base + 2 * PAGE);
+        assert_eq!(query(rest).host.RegionSize, PAGE);
+        assert!(saved.take(PAGE).is_none());
+
+        let pages = allocate(2);
+        assert_eq!(XMemMapPhysicalPages(first, 2, pages.as_ptr()), first);
+        assert_eq!(query(first).host.State, MEM_COMMIT);
+        assert_eq!(query(rest).host.State, MEM_RESERVE);
+        assert_eq!(XMemMapPhysicalPages(first, 2, std::ptr::null()), first);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert_eq!(title_virtual_free(first, 0, MEM_RELEASE), 1);
+        assert_eq!(title_virtual_free(rest, 0, MEM_RELEASE), 1);
+    }
+
+    #[test]
+    fn automatic_low_va_reserve_waits_for_an_exact_size() {
+        let mut saved = LowVaReserve::new(3 * PAGE, true).unwrap();
+        assert!(saved.take(PAGE).is_none());
+        assert!(saved.take(4 * PAGE).is_none());
+        let at = saved.take(3 * PAGE).unwrap();
+        let info = query(at).host;
+        assert_eq!(info.State, MEM_RESERVE);
+        assert_eq!(info.RegionSize, 3 * PAGE);
+        assert!(saved.take(3 * PAGE).is_none());
+        assert_eq!(title_virtual_free(at, 0, MEM_RELEASE), 1);
+    }
+
+    #[test]
+    fn low_va_override_accepts_zero_and_rejects_out_of_range_values() {
+        for (value, expected) in [
+            ("0", Some(0)),
+            ("185", Some(185)),
+            ("4095", Some(4095)),
+            ("4096", None),
+            ("-1", None),
+            ("", None),
+        ] {
+            assert_eq!(low_va_override_mib(OsStr::new(value)), expected);
+        }
     }
 
     #[test]

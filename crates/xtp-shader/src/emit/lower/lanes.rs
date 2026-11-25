@@ -390,6 +390,114 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of a lane of this lane's quad (DPP `quad_perm`, a
+    /// quad-mode `ds_swizzle`) goes through quad reads: in a pixel program,
+    /// always, for its helper lanes.
+    ///
+    /// A pixel's quad holds a helper lane where the primitive does not
+    /// cover a pixel (at a triangle's edge) and where a pixel was
+    /// discarded. On the console, whole-quad mode keeps helper lanes in
+    /// EXEC, so a lane read reaches them. D3D12 leaves them out of wave
+    /// operations (without SM 6.7's `WaveOpsIncludeHelperLanes`):
+    /// `WaveReadLaneAt` from or in a helper lane is undefined (the fork
+    /// that found this read 0 from one on AMD; WARP happens to read its
+    /// value). A derivative taken by hand (`quad_perm` [1,1,3,3] minus
+    /// [0,0,2,2]) was then the whole value at an edge, and a texture read
+    /// that took its level from it read the smallest one: lines along
+    /// triangle edges on car paint, glass and skin. Quad reads read helper
+    /// lanes and return in them as in any lane, on every vendor, and keep
+    /// helper lanes running until the last of them (D3D12 does not keep
+    /// them past the last quad or derivative operation).
+    // Ported from Belobug/VIctory-Belobug-AMD (03629f3f0d) by Belobug
+    pub(super) fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel program:
+    /// a helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes that hold
+    /// it, take them out of EXEC) serves helper lanes too. On the host,
+    /// `WaveReadLaneFirst` reads the first lane that is not a helper lane,
+    /// and its result in a helper lane is undefined (D3D12, without SM
+    /// 6.7's `WaveOpsIncludeHelperLanes`). Once only helper lanes are left
+    /// in such a loop it reads no lane, none of them matches, and the loop
+    /// runs to its limit in each: in a title's world, draws of 0.3 to 1.3 s
+    /// each until a submission passed the host's 2 s limit. With its own
+    /// value a helper lane matches in the first pass and leaves. Where the
+    /// value is the same in every lane, its own is the first lane's anyway;
+    /// what a helper lane computes only feeds derivatives and quad reads,
+    /// and its stores are dropped.
+    // Ported from Marvisak/VIctory (0601955, PR #1733) by Vaximous
+    pub(super) fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        // Read where the first-lane read is: a discarded lane becomes one.
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
+    /// `x` of the lane of this lane's quad that `perm` names (DPP
+    /// `quad_perm`: lane n reads lane `perm >> 2n & 3`), through quad
+    /// reads (see [`Self::helpers_read`]): the three swaps are one quad
+    /// operation each, any other permutation one quad read per lane it
+    /// names.
+    fn quad_perm_read(&mut self, x: V, perm: u32) -> V {
+        let from = |n: u32| perm >> (2 * n) & 3;
+        if (0..4).all(|n| from(n) == n) {
+            return x;
+        }
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        // QuadReadAcrossX, QuadReadAcrossY, QuadReadAcrossDiagonal.
+        let across = match perm {
+            0xB1 => Some(0),
+            0x4E => Some(1),
+            0x1B => Some(2),
+            _ => None,
+        };
+        if let Some(kind) = across {
+            let kind = self.s.m.i8(kind);
+            return self
+                .s
+                .op(c, "quadOp.i32", Attr::NoUnwind, i32t, 123, &[x, kind]);
+        }
+        let mut reads = [None; 4];
+        for n in 0..4 {
+            let at = from(n);
+            if reads[at as usize].is_none() {
+                let k = self.s.m.i32(at);
+                let r = self
+                    .s
+                    .op(c, "quadReadLaneAt.i32", Attr::NoUnwind, i32t, 122, &[x, k]);
+                reads[at as usize] = Some(r);
+            }
+        }
+        let read = |n: u32| reads[from(n) as usize].expect("read above");
+        let mut r = read(3);
+        if (0..3).all(|n| from(n) == from(3)) {
+            return r;
+        }
+        // This lane's place in its quad, as `dpp` takes it.
+        let lane = self.lane_index();
+        let three = self.s.m.i32(3);
+        let place = self.s.m.bin(c, Bin::And, lane, three);
+        for n in 0..3 {
+            if from(n) != from(3) {
+                let k = self.s.m.i32(n);
+                let is = self.s.m.cmp(c, pred::EQ, place, k);
+                r = self.s.m.select(c, is, read(n), r);
+            }
+        }
+        r
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     pub(super) fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -486,6 +594,12 @@ impl<'a> Lower<'a> {
         if !mesh_quad {
             self.cross_lane(quad)?;
         }
+        // A pixel's quad permutation: quad reads, which name their source
+        // lanes themselves (`helpers_read`).
+        let pixel_perm = match dpp {
+            Dpp::Row { ctrl, .. } if self.helpers_read(quad) => Some(u32::from(ctrl)),
+            _ => None,
+        };
         let c = self.cur;
         let lane = self.lane_index();
         let k = |l: &mut Self, n: u32| l.s.m.i32(n);
@@ -513,6 +627,8 @@ impl<'a> Lower<'a> {
             } => {
                 let n = u32::from(ctrl & 15);
                 let (src, inside) = match ctrl {
+                    // Read below by `quad_perm_read`.
+                    0..=0xFF if pixel_perm.is_some() => (lane, None),
                     0..=0xFF => {
                         let (three, one, not3) = (k(self, 3), k(self, 1), k(self, !3));
                         let p = self.s.m.bin(c, Bin::And, lane, three);
@@ -561,10 +677,10 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
-        } else {
-            self.read_lane_in_wave(x, src)
+        let mut r = match pixel_perm {
+            Some(perm) => self.quad_perm_read(x, perm),
+            None if mesh_quad => self.quad_pick(x, src),
+            None => self.read_lane_in_wave(x, src),
         };
         let mut enable = None;
         if let Some(inside) = inside {

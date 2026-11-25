@@ -1521,7 +1521,17 @@ function Invoke-FarmJob {
                 if ($code -eq 98 -or $code -eq 99) {
                     # The VM could not prepare the job (its message says why).
                     $lost = $true
-                    Set-FarmHealth $Config $sel.vm 5 "could not prepare a job (exit $code)"
+                    # A 98 a minute or more after sending a bundle is the VM
+                    # giving up on a bundle that never came (farm-run.ps1:
+                    # nothing for 60 s): the IAP tunnel stopped passing this
+                    # connection's upload, the VM is fine. This job moves on,
+                    # other jobs keep the VM: marking it unhealthy turned one
+                    # job's three stalled uploads into 5 minutes without any
+                    # VM, every build on the PC (2026-11-25).
+                    $stalled = $code -eq 98 -and $bundle.Size -gt 0 -and ((Get-Date) - $tRun).TotalSeconds -ge 60
+                    Write-FarmLog $Config ('{0} could not prepare a job of {1} (exit {2}{3})' -f $sel.vm, $wt.Name, $code,
+                        $(if ($stalled) { ", the $($bundle.Size) B upload stalled: the VM stays available" } else { '' }))
+                    if (-not $stalled) { Set-FarmHealth $Config $sel.vm 5 "could not prepare a job (exit $code)" }
                     break
                 }
                 if ($code -ne 0 -and $code -ne 124 -and -not (Test-FarmVmStaying $Config $sel.vm)) {

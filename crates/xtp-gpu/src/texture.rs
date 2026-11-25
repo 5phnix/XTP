@@ -59,12 +59,18 @@
 //! buffer lived as long as its texture, and the world's thousands filled
 //! the staging limit of the textures picked by index for good. An upload
 //! of a texture whose host copy holds what was detiled last, its memory
-//! unchanged by what the write watch or the guards tell, makes nothing
-//! again. No copy reads a buffer made again before something is detiled
-//! into it: under a predicate, its decision at submission says so; without
-//! one, the buffer is filled when the copy is recorded, or no copy is
-//! recorded. The memory is read for a detiling into one room shared by the
-//! checks, not into a copy of its own kept per texture.
+//! not written by what the write watch or the guards tell (or only a hash
+//! tells), makes nothing again and records nothing in its list: the check
+//! at the list's submission tells whether the title wrote the memory
+//! since, until then, and if it did the buffer is made again, detiled, and
+//! copied by a list of late copies that runs just before the list
+//! ([`late_copies`]). No copy reads a buffer made again before something
+//! is detiled into it: under a predicate, its decision at submission says
+//! so; without one, the buffer is filled when the copy is recorded, or no
+//! copy is recorded. Nothing is detiled from memory that is not mapped
+//! (but the units of a reserved host copy whose memory is): the host copy
+//! keeps its texels. The memory is read for a detiling into one room
+//! shared by the checks, not into a copy of its own kept per texture.
 //!
 //! Textures read through descriptor tables are brought up to date by the
 //! draws that read them. Directly indexed views are not known per draw:
@@ -486,14 +492,19 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     // The host copy `texture` is: what the copy writes (the list holds it
     // through its state below).
-    let target = crate::resource::host_copy(resource)
-        .filter(|c| c.texture.as_raw() == texture.as_raw())
-        .map(|c| Arc::downgrade(&c));
-    // Released, and its host copy has what is in the memory: nothing to
-    // make again, nor to copy. Before, a table read made the buffer again
-    // whatever the room, only for the check at submission to find nothing
-    // to detile (Codex's review of c44a716, 3).
-    if state_of(resource).is_some_and(|s| s.current(target.as_ref())) {
+    let copy =
+        crate::resource::host_copy(resource).filter(|c| c.texture.as_raw() == texture.as_raw());
+    let target = copy.as_ref().map(Arc::downgrade);
+    // Released, and its host copy has what is in the memory as far as can
+    // be told now: nothing made again, nor recorded here; the check at
+    // submission copies what the title writes until then. Before, a table
+    // read made the buffer again whatever the room, only for the check at
+    // submission to find nothing to detile (Codex's review of c44a716, 3;
+    // of db37732, 1, for memory only a hash tells).
+    if let Some(copy) = copy
+        && let Some(state) = state_of(resource).filter(|s| s.late(target.as_ref()))
+    {
+        upload_late(list, resource, state, copy);
         return false;
     }
     // Made again if it was released: this list holds it from now on.
@@ -584,24 +595,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                 (gpu + footprint.Offset, len),
             );
         }
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
-            },
-        };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        copy_subresource(&list.list, texture, &buffer, i, footprint);
     }
     if predicate.is_some() {
         // SAFETY: an open list.
@@ -623,7 +617,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             && !staging.blank.load(Ordering::Acquire)
             && target.as_ref().is_none_or(|t| staging.copy_due(t));
         let runs = match &predicate {
-            Some(p) => p.decide(due, crate::timestamps::submissions()),
+            Some(p) => p.decide(due),
             None => true,
         };
         COPIES[usize::from(runs)].fetch_add(1, Ordering::Relaxed);
@@ -635,6 +629,246 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             .push((staging.id, runs));
     });
     true
+}
+
+/// Records in `list` the copy of subresource `i` of a staging buffer
+/// `buffer`, laid out at `footprint`, into `texture`.
+fn copy_subresource(
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    buffer: &ID3D12Resource,
+    i: usize,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
+    let to = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: i as u32,
+        },
+    };
+    let from = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *footprint,
+        },
+    };
+    // SAFETY: an open list; both locations name live resources (the
+    // caller's list holds them until it is reset).
+    unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+}
+
+/// [`upload`] of `resource`, whose staging buffer was released and whose
+/// host copy `copy` has what was detiled last, the memory unchanged since
+/// as far as can be told at record time ([`Staging::late`]): nothing is
+/// made, nor recorded in `list`. The check at its submission tells whether
+/// the title wrote the memory since, after the list was recorded too (and
+/// hashes memory only a hash tells): if it did, the staging buffer is made
+/// again and detiled, and copied into the host copy by the late copies
+/// that run just before the list ([`late_copies`]). A second read in the
+/// list is covered by this one. Before, the check was skipped, and a write
+/// between the recording and the submission left the list's shaders the
+/// old texels (Codex's review of db37732, 1).
+fn upload_late(
+    list: &HostList,
+    resource: This,
+    staging: Arc<Staging>,
+    copy: Arc<crate::resource::HostTexture>,
+) {
+    // Read lately: its buffer, if made again, stays while it is.
+    staging
+        .recorded
+        .store(SWEEPS.load(Ordering::Relaxed), Ordering::Relaxed);
+    // The check at submission; the list holds the state, and the host copy
+    // below, until it is reset.
+    list.defer_texture(staging.clone());
+    let (key, before) = (resource as usize, std::ptr::from_ref(list) as usize);
+    list.defer_host((0, 0), move || {
+        // Not over what a GPU write submitted before put there; not from a
+        // buffer that holds no detiling (none made: nothing written); not
+        // if the host copy has these bytes (copied by a list before).
+        let target = Arc::downgrade(&copy);
+        if gpu_written(key)
+            || staging.buffer().is_none()
+            || staging.blank.load(Ordering::Acquire)
+            || !staging.copy_due(&target)
+        {
+            return;
+        }
+        if !record_late(before, &staging, &copy) {
+            // Not copied after all: its next upload copies.
+            *staging.copied.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return;
+        }
+        COPIES[1].fetch_add(1, Ordering::Relaxed);
+        COPIED[1].fetch_add(staging.size, Ordering::Relaxed);
+        #[cfg(test)]
+        DECIDED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((staging.id, true));
+    });
+}
+
+/// The late copies ([`upload_late`]): recorded at a submission into a list
+/// of their own that runs just before the host list whose check found them
+/// due, and before its prelude (`host.rs`), so that they move the texture
+/// from the state the lists submitted before leave it in, and back. The
+/// one being recorded, with the host list it runs before and the
+/// submission it is recorded in (`timestamps::submissions` then); and those
+/// handed to submissions, free once the GPU has run them.
+struct LateLists {
+    open: Option<(usize, u64, LateList)>,
+    handed: Vec<LateList>,
+}
+
+/// A list of late copies and its allocator.
+struct LateList {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    /// The host fence value of the submission it was recorded for: free
+    /// once the GPU has reached it.
+    until: u64,
+}
+
+static LATE: Mutex<LateLists> = Mutex::new(LateLists {
+    open: None,
+    handed: Vec::new(),
+});
+
+impl LateList {
+    /// A new one, open.
+    fn new(host: &crate::host::Host) -> Option<LateList> {
+        // SAFETY: plain object creation; the list starts open.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .ok()?;
+            let list: ID3D12GraphicsCommandList = host
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .ok()?;
+            crate::host::name(&list, || "texture late copies".into());
+            Some(LateList {
+                allocator,
+                list,
+                until: 0,
+            })
+        }
+    }
+}
+
+impl LateLists {
+    /// The list the late copies for host list `before` are recorded into
+    /// in the submission being prepared: the one open for it, or one
+    /// opened (a free one, or a new one). `None` if none can be had.
+    fn open_for(
+        &mut self,
+        host: &crate::host::Host,
+        before: usize,
+    ) -> Option<&ID3D12GraphicsCommandList> {
+        let submission = crate::timestamps::submissions();
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|(list, at, _)| *list != before || *at != submission)
+            && let Some((_, _, stale)) = self.open.take()
+        {
+            // Open for a list whose submission did not take it: it never
+            // ran, and is free.
+            // SAFETY: an open list of ours.
+            if unsafe { stale.list.Close() }.is_ok() {
+                self.handed.push(LateList { until: 0, ..stale });
+            }
+        }
+        if self.open.is_none() {
+            let reached = host.completed();
+            let late = match self.handed.iter().position(|l| l.until <= reached) {
+                Some(at) => {
+                    let late = self.handed.swap_remove(at);
+                    // SAFETY: closed, and the GPU ran what it recorded.
+                    unsafe {
+                        late.allocator.Reset().ok()?;
+                        late.list.Reset(&late.allocator, None).ok()?;
+                    }
+                    late
+                }
+                None => LateList::new(host)?,
+            };
+            // The value this submission signals (the one handed to the
+            // queue last, plus one); a submission whose lists run one at
+            // a time (diagnostics) finishes before the next is prepared.
+            let until = host.executing() + 1;
+            self.open = Some((before, submission, LateList { until, ..late }));
+        }
+        self.open.as_ref().map(|(_, _, late)| &late.list)
+    }
+}
+
+/// Records, at the submission of host list `before`, the copy of
+/// `staging`'s buffer into host copy `copy` among the late copies run just
+/// before it ([`LateLists`]): from the state the texture is in then into
+/// the copy destination state, and back. Whether it was recorded.
+fn record_late(before: usize, staging: &Staging, copy: &crate::resource::HostTexture) -> bool {
+    const COPY_DEST: u32 = 0x400;
+    let (Some(host), Some(buffer)) = (host(), staging.buffer()) else {
+        return false;
+    };
+    let mut late = LATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(list) = late.open_for(host, before) else {
+        once!("no list for a texture's late copy: its next upload copies it");
+        return false;
+    };
+    // The state the lists before leave it in (their preludes ran).
+    let state = copy.state.load(Ordering::Relaxed);
+    let [into, back] = [(state, COPY_DEST), (COPY_DEST, state)].map(|(from, to)| {
+        crate::host::transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(from as i32),
+            D3D12_RESOURCE_STATES(to as i32),
+        )
+    });
+    // SAFETY: an open list of ours; the texture and the buffer are held by
+    // the host list's steps until it is reset, after its submission ran.
+    unsafe {
+        if state != COPY_DEST {
+            list.ResourceBarrier(&[into]);
+        }
+        for (i, footprint) in staging.footprints.iter().enumerate() {
+            copy_subresource(list, &copy.texture, &buffer, i, footprint);
+        }
+        if state != COPY_DEST {
+            list.ResourceBarrier(&[back]);
+        }
+    }
+    true
+}
+
+/// The late copies the steps of host list `list` recorded in this
+/// submission ([`upload_late`]), closed: a list to run just before it and
+/// its prelude. `None` if there are none. Called once the list's steps
+/// ran.
+pub(crate) fn late_copies(list: &HostList) -> Option<ID3D12CommandList> {
+    let before = std::ptr::from_ref(list) as usize;
+    let mut late = LATE.lock().unwrap_or_else(|e| e.into_inner());
+    if late.open.as_ref().is_none_or(|(l, _, _)| *l != before) {
+        return None;
+    }
+    let (_, _, made) = late.open.take()?;
+    // SAFETY: the open list of late copies.
+    let run = match unsafe { made.list.Close() } {
+        Ok(()) => made.list.cast().ok(),
+        Err(e) => {
+            tracing::warn!(error = %e, "a list of late texture copies did not close: not run");
+            None
+        }
+    };
+    late.handed.push(made);
+    run
 }
 
 /// What a look at a texture's memory before its upload is recorded tells
@@ -722,7 +956,9 @@ pub(crate) enum Staged {
     Ready(u64),
     /// It would take these many bytes, more than the room given: none made.
     NoRoom(u64),
-    /// None now (no host, or no upload memory for it): asked again later.
+    /// None now (no host, no upload memory for it, or for a pass's refresh
+    /// more room than a pass could give it now: [`Refreshes::stage`]):
+    /// asked again later.
     NotNow,
     /// None ever: its contents cannot be uploaded (no console layout, an
     /// XOR mode, a stand-in format without a conversion).
@@ -784,23 +1020,24 @@ impl Refreshes {
     /// Makes the staging buffer of served texture `resource` again if it
     /// was released, within the share left: what came of it (as [`stage`]
     /// tells). `None` if it was never staged: a first upload, which the
-    /// pass stages within its own budget.
+    /// pass stages within its own budget. Past the share left,
+    /// [`Staged::NoRoom`]: the next pass's share takes it first. Past what
+    /// a pass of its own could make with the staging buffers that live,
+    /// [`Staged::NotNow`]: looked at again at its next turn, and the pass
+    /// goes on with the textures after it ([`refused`]).
     pub(crate) fn stage(&mut self, resource: This) -> Option<Staged> {
         if gpu_written(resource as usize) {
             return Some(Staged::Host);
         }
         let staging = state_of(resource)?;
-        let room = refresh_room(
-            self.share,
-            self.made,
-            crate::descriptor::host::pass_staging(),
-            staged_total(),
-        );
+        let (limit, staged) = (crate::descriptor::host::pass_staging(), staged_total());
+        let room = refresh_room(self.share, self.made, limit, staged);
         Some(match staging.make_upload(room) {
             Ok(made) => {
                 self.made += made;
                 Staged::Ready(made)
             }
+            Err(Staged::NoRoom(bytes)) => refused(bytes, self.share, self.made, limit, staged),
             Err(why) => why,
         })
     }
@@ -816,6 +1053,22 @@ fn refresh_room(share: u64, made: u64, limit: u64, staged: u64) -> u64 {
         share.saturating_sub(made)
     };
     pass.min(limit.saturating_add(share).saturating_sub(staged))
+}
+
+/// What [`Refreshes`] tells of a staging buffer of `bytes` past the room it
+/// had (`made` of its `share` made, `staged` bytes living under the limit
+/// `limit`): [`Staged::NoRoom`] if the first of a pass would take it (the
+/// share spent: the next pass starts with it); [`Staged::NotNow`] if not
+/// even that one would. Before, both stopped the pass's checks and the next
+/// pass started with it again: one texture past the staging limit and the
+/// share (96 MiB, 64 and 16) left every changed texture after it stale,
+/// one whose buffer lived included (Codex's review of db37732, 3).
+fn refused(bytes: u64, share: u64, made: u64, limit: u64, staged: u64) -> Staged {
+    if made > 0 && bytes <= refresh_room(share, 0, limit, staged) {
+        Staged::NoRoom(bytes)
+    } else {
+        Staged::NotNow
+    }
 }
 
 /// Releases `resource`'s staging buffer at once if no list holds it,
@@ -1391,9 +1644,6 @@ static PREDICATE_WORDS: OnceLock<Option<Predicates>> = OnceLock::new();
 pub(crate) struct Predicate {
     of: &'static Predicates,
     at: u32,
-    /// The submission being prepared (`timestamps::submissions`, plus one)
-    /// when the word was last set to run; 0: never.
-    ran_in: AtomicU64,
 }
 
 impl Predicate {
@@ -1418,11 +1668,7 @@ impl Predicate {
             once!("texture copy predicates ran out: copies run every time");
             return None;
         };
-        let p = Predicate {
-            of,
-            at,
-            ran_in: AtomicU64::new(0),
-        };
+        let p = Predicate { of, at };
         p.set(true);
         Some(p)
     }
@@ -1450,20 +1696,13 @@ impl Predicate {
         u64::from(self.at) * 8
     }
 
-    /// At the list's submission (`submission`: the submissions made
-    /// before it): its copy runs if `due`, or if it was let run earlier in
-    /// the same submission, which names the list twice. Both runs read the
-    /// one word, so the second decision must not take the copy from the
-    /// first (VIctory #1500, by A6thGraderFr, handles that case too).
-    /// Returns whether the copy runs.
-    pub(crate) fn decide(&self, due: bool, submission: u64) -> bool {
-        let this = submission + 1;
-        let runs = due || self.ran_in.load(Ordering::Relaxed) == this;
-        if runs {
-            self.ran_in.store(this, Ordering::Relaxed);
-        }
-        self.set(runs);
-        runs
+    /// At the list's submission: its copy runs if `due`. A submission that
+    /// names the list again runs it again only once this run has finished
+    /// (`Host::run_as`), so no other run reads the word meanwhile. Returns
+    /// whether the copy runs.
+    pub(crate) fn decide(&self, due: bool) -> bool {
+        self.set(due);
+        due
     }
 
     /// Before the list runs: whether its copy runs.
@@ -1796,10 +2035,11 @@ impl Staging {
     }
 
     /// Whether its staging buffer was released and an upload into host copy
-    /// `target` needs none: the host copy has what was detiled last, and the
-    /// memory is unchanged since, as the write watch or the guards tell
-    /// (memory only a hash tells gets one, for the check at submission).
-    fn current(&self, target: Option<&Weak<crate::resource::HostTexture>>) -> bool {
+    /// `target` is left to the check at submission ([`upload_late`]): the
+    /// host copy has what was detiled last, and the memory is not written
+    /// since as the write watch or the guards tell, or only a hash tells
+    /// (taken at submission, before anything is made again).
+    fn late(&self, target: Option<&Weak<crate::resource::HostTexture>>) -> bool {
         let released = self
             .upload
             .lock()
@@ -1808,7 +2048,7 @@ impl Staging {
         released
             && !self.host_owned.load(Ordering::Relaxed)
             && self.holds(target)
-            && self.change() == Change::No
+            && self.change() != Change::Yes
     }
 
     /// Makes its staging buffer again if it was released, within `room`
@@ -1861,11 +2101,8 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         // A blank buffer a copy is due from (`upload`): detiled whatever the
         // memory's checks say, as at its first check.
-        if self.force.swap(false, Ordering::AcqRel) {
-            last.asked = 0;
-            last.hash = None;
-        }
-        self.check(&mut last, before_write)
+        let forced = self.force.swap(false, Ordering::AcqRel);
+        self.check(&mut last, forced, before_write)
     }
 
     /// When a copy no predicate decides is recorded ([`upload`]): detiles
@@ -1884,14 +2121,17 @@ impl Staging {
         if self.host_owned.load(Ordering::Relaxed) {
             return false;
         }
-        last.asked = 0;
-        last.hash = None;
-        self.check(&mut last, || ());
+        self.check(&mut last, true, || ());
         !self.blank.load(Ordering::Acquire)
     }
 
-    /// [`Staging::refresh_now`] under the lock of `last`.
-    fn check(&self, last: &mut Last, before_write: impl FnOnce()) -> usize {
+    /// [`Staging::refresh_now`] under the lock of `last`; `forced`: the
+    /// memory is detiled whatever the write watch, the guards or the hash
+    /// say, if it can be read. What tells a change is left as it was when
+    /// nothing is detiled: the memory not mapped, or no staging buffer to be
+    /// had. Before, a forced check forgot it, and the next one read the
+    /// memory whatever it said.
+    fn check(&self, last: &mut Last, forced: bool, before_write: impl FnOnce()) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         #[cfg(feature = "diagnostics")]
@@ -1903,15 +2143,28 @@ impl Staging {
             }
         }
         if let Some(now) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && !crate::watch::changed_since(start, start + size, last.asked) {
+            if !forced
+                && last.asked != 0
+                && !crate::watch::changed_since(start, start + size, last.asked)
+            {
+                return 0;
+            }
+            let Some(read) = self.snapshot(size) else {
+                // Not mapped (streamed out): nothing to detile, the host
+                // copy keeps its texels until a write tells new bytes.
+                // Before, the write watch, which answers for a reservation
+                // all decommitted (no page written), let it be read as
+                // zeros, detiled and copied over valid texels (Codex's
+                // review of db37732, 2).
+                last.asked = now;
+                return 0;
+            };
+            if !self.stage_again() {
+                give_room(read);
                 return 0;
             }
             last.asked = now;
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            let mut read = take_room(size);
-            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-            before_write();
+            self.before_write(before_write);
             self.detile(&read);
             #[cfg(feature = "diagnostics")]
             census::detiled(&mut last.detiled, blake3::hash(&read));
@@ -1933,8 +2186,9 @@ impl Staging {
         if guards()
             && let Some(now) = crate::watch::writes(start, start + size, true)
         {
-            let clean =
-                last.asked != 0 && !crate::watch::changed_since(start, start + size, last.asked);
+            let clean = !forced
+                && last.asked != 0
+                && !crate::watch::changed_since(start, start + size, last.asked);
             last.asked = now;
             // A write they report is hashed below anyway.
             let suspect = self.suspect.swap(false, Ordering::Relaxed);
@@ -1970,7 +2224,7 @@ impl Staging {
         // Memory the guards report written most likely changed: its
         // snapshot is taken at once. Otherwise it is hashed in place first
         // (all of it committed), and copied only if that tells a change.
-        if !reported && whole {
+        if !forced && !reported && whole {
             // SAFETY: committed memory of the texture's layout size.
             let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
             if last.hash == Some(self.hash(tiled)) {
@@ -1978,17 +2232,18 @@ impl Staging {
             }
         }
         // Hashed and detiled from one snapshot (module doc), taken through
-        // the copy, which stands pages unmapped since the check above. The
+        // the kernel, which tells pages unmapped since the check above. The
         // room is shared, and not held during the wait.
-        let mut snapshot = take_room(size);
-        crate::host::copy_mapped(snapshot.as_mut_ptr(), self.memory, size, false);
+        let Some(snapshot) = self.snapshot(size) else {
+            return 0;
+        };
         let hash = self.hash(&snapshot);
-        if last.hash != Some(hash) {
+        if (forced || last.hash != Some(hash)) && self.stage_again() {
             last.hash = Some(hash);
             if unseen {
                 self.missed(size);
             }
-            before_write();
+            self.before_write(before_write);
             self.detile(&snapshot);
             self.written.fetch_add(1, Ordering::Release);
             #[cfg(feature = "diagnostics")]
@@ -2000,6 +2255,45 @@ impl Staging {
         }
         give_room(snapshot);
         size
+    }
+
+    /// The texture's memory, `size` bytes of it, read into the room the
+    /// checks share ([`take_room`]) through the kernel, which tells pages
+    /// that are not mapped: all of them mapped, or, for a reserved host
+    /// copy, some (`map_units` maps the units whose memory is, the copy
+    /// leaves the others; what is not mapped reads as zeros). `None`
+    /// otherwise: nothing is detiled from it.
+    /// shortcut: a host copy that is not reserved waits for all of its
+    /// memory, as it did in memory that is not write-watched.
+    fn snapshot(&self, size: usize) -> Option<Vec<u8>> {
+        let mut room = take_room(size);
+        if crate::host::read_into(self.memory, &mut room) {
+            return Some(room);
+        }
+        if self.tiles.is_some() && any_committed(self.memory, size) {
+            crate::host::copy_mapped(room.as_mut_ptr(), self.memory, size, false);
+            return Some(room);
+        }
+        give_room(room);
+        None
+    }
+
+    /// Before a detiling: its staging buffer, made again if it was released
+    /// (the check at submission of an upload left to it found the memory
+    /// written: [`upload_late`]). False if none can be had now: the change
+    /// waits for a later check.
+    fn stage_again(&self) -> bool {
+        self.make_upload(u64::MAX).is_ok()
+    }
+
+    /// Runs `before_write` (the wait for an earlier submission whose copy
+    /// may read the staging buffer) unless the buffer is blank: no copy
+    /// read it nor reads it (each needs a detiling first), and a buffer made
+    /// again does not wait for the submissions that read the one before.
+    fn before_write(&self, before_write: impl FnOnce()) {
+        if !self.blank.load(Ordering::Acquire) {
+            before_write();
+        }
     }
 
     /// The hash of `bytes`, this texture's memory or its snapshot.
@@ -2945,14 +3239,14 @@ mod tests {
         let _ = other;
     }
 
-    /// A list named twice in one submission runs its copy in both runs if
-    /// the first needs it: both read its one predicate word. Submitted
-    /// again in a later submission, nothing changed, it does not: the
-    /// submissions are counted with timestamps off too (the default here).
+    /// A list named twice in one submission runs twice, the second run
+    /// once the first has finished (D3D12 message 553 otherwise, #45): the
+    /// first copies, the second finds the texture current and does not.
+    /// Submitted again in a later submission, nothing changed, it does not
+    /// either. The layer raises nothing.
     #[test]
-    fn a_list_named_twice_in_a_submission_copies() {
-        crate::testgpu::known_layer_errors(&[553], "#45");
-        let test = "texture::tests::a_list_named_twice_in_a_submission_copies";
+    fn a_list_named_twice_in_a_submission_copies_once() {
+        let test = "texture::tests::a_list_named_twice_in_a_submission_copies_once";
         let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
@@ -2983,17 +3277,17 @@ mod tests {
         list.close();
         host.execute(&[&list, &list]);
         host.drain();
-        assert_eq!(decided(&staging), [true, true, true]);
+        assert_eq!(decided(&staging), [true, true, false]);
         let read = read_back(host, texture, COPY_DEST);
         let texels: Vec<u8> = (0..16)
             .flat_map(|y| read[y * 256..y * 256 + 64].to_vec())
             .collect();
         assert!(texels.iter().all(|&b| b == 0x77), "{:x?}", &texels[..16]);
-        // The same recording in a submission of its own, the memory as it
-        // was: told from a second run of the last one by the count.
+        // The same recording in a submission of its own: nothing changed
+        // since the last run, so it does not copy either.
         host.execute(&[&list]);
         host.drain();
-        assert_eq!(decided(&staging), [true, true, true, false]);
+        assert_eq!(decided(&staging), [true, true, false, false]);
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
     }
@@ -3150,8 +3444,15 @@ mod tests {
     /// A title texture over the title's view `view`, once its host copy is
     /// resident.
     fn texture_in(view: usize) -> (This, &'static ID3D12Resource) {
-        let resource =
-            crate::resource::tests_support::at_address(view as u64, &sampled(16, 16, 28));
+        square_texture_in(view, 16)
+    }
+
+    /// As [`texture_in`], `width` texels square.
+    fn square_texture_in(view: usize, width: u64) -> (This, &'static ID3D12Resource) {
+        let resource = crate::resource::tests_support::at_address(
+            view as u64,
+            &sampled(width, width as u32, 28),
+        );
         let started = std::time::Instant::now();
         loop {
             if let Some(texture) = crate::resource::host_resource(resource) {
@@ -3754,10 +4055,14 @@ mod tests {
     /// A staging buffer goes once no list holds its texture's state (the
     /// lists that copied from it ran and were reset: the fence passed) and
     /// no upload of it was recorded for `idle` sweeps, not before; its
-    /// bytes are counted released. Its next upload makes it again, blank:
-    /// unchanged memory is neither detiled nor copied (the host copy has
-    /// its bytes), a change is detiled and copied as before, and a host
-    /// copy not known to hold the bytes gets them detiled and copied.
+    /// bytes are counted released. Its next upload, its memory only a hash
+    /// tells, is left to the check at submission: unchanged memory makes
+    /// nothing again, and is neither detiled nor copied (the host copy has
+    /// its bytes); a change makes it again there, detiled and copied as
+    /// before. A host copy not known to hold the bytes gets the buffer made
+    /// again when the upload is recorded, and the bytes detiled and copied.
+    /// Before, the upload made it again whatever the memory held (Codex's
+    /// review of db37732, 1).
     #[test]
     fn staging_buffers_go_once_their_last_copy_ran() {
         let test = "texture::tests::staging_buffers_go_once_their_last_copy_ran";
@@ -3811,20 +4116,20 @@ mod tests {
         assert_eq!(sweep_out(), (1, bytes), "released");
         assert_eq!(staged_bytes(resource), None);
 
-        // Unchanged: made again, neither detiled nor copied.
+        // Unchanged: nothing made again, neither detiled nor copied.
         let written = state().written.load(Ordering::Acquire);
         sample_in(host, resource, 1);
-        assert_eq!(staged_bytes(resource), Some(bytes), "made again");
-        assert_eq!(decided_id(id), [true, false, false]);
+        assert_eq!(staged_bytes(resource), None, "not made again");
+        assert_eq!(decided_id(id), [true, false]);
         assert_eq!(state().written.load(Ordering::Acquire), written);
-        assert!(state().blank.load(Ordering::Acquire));
         assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x1111_1111));
 
-        // Changed: detiled and copied.
+        // Changed: made again at submission, detiled and copied.
         // SAFETY: the texture's own title memory, `size` bytes.
         unsafe { memory.cast_mut().write_bytes(0x33, size) };
         sample_in(host, resource, 1);
-        assert_eq!(decided_id(id), [true, false, false, true]);
+        assert_eq!(staged_bytes(resource), Some(bytes), "made again");
+        assert_eq!(decided_id(id), [true, false, true]);
         assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x3333_3333));
 
         // Released again; a host copy not known to hold the last detiling
@@ -3832,7 +4137,7 @@ mod tests {
         assert_eq!(sweep_out(), (1, bytes), "released again");
         *state().copied.lock().unwrap() = None;
         sample_in(host, resource, 1);
-        assert_eq!(decided_id(id), [true, false, false, true, true]);
+        assert_eq!(decided_id(id), [true, false, true, true]);
         assert!(!state().blank.load(Ordering::Acquire));
         assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x3333_3333));
         type Release = extern "system" fn(This) -> u32;
@@ -3930,7 +4235,10 @@ mod tests {
     /// check then detiles nothing) finds it filled: the copy brings the
     /// title's bytes, as without predicates before buffers were released.
     /// Before, both copies read the blank buffer made again (Codex's review
-    /// of c44a716, 1).
+    /// of c44a716, 1). Each upload after a release here is into a host
+    /// copy not known to hold the bytes: one that holds them leaves the
+    /// read to the check at submission, which records no copy in the list
+    /// (`a_write_after_a_list_closed_is_copied_before_it_runs`).
     #[test]
     fn copies_without_a_predicate_never_read_a_blank_buffer() {
         use windows_sys::Win32::System::Memory::{
@@ -3954,6 +4262,8 @@ mod tests {
         // SAFETY: the texture's memory, ours, `size` bytes of it.
         let fill = |byte: u8| unsafe { (at as *mut u8).write_bytes(byte, size) };
         let all = |byte: u8| texels_of(host, texture).iter().all(|&b| b == byte);
+        // Its host copy not known to hold what was detiled last.
+        let unknown = || *state_of(resource).unwrap().copied.lock().unwrap() = None;
 
         // The first upload: filled when recorded, then copied.
         fill(0x11);
@@ -3966,6 +4276,7 @@ mod tests {
         // and no copy is recorded.
         // SAFETY: pages of our allocation; nothing reads them meanwhile.
         assert_ne!(unsafe { VirtualFree(at as *mut _, LEN, MEM_DECOMMIT) }, 0);
+        unknown();
         let list = host.new_list().unwrap();
         assert!(
             !upload(&list, resource, texture),
@@ -3991,6 +4302,7 @@ mod tests {
         // into the texture is submitted: the copy brings what was filled.
         released(resource);
         fill(0x33);
+        unknown();
         let reader = host.new_list().unwrap();
         assert!(upload(&reader, resource, texture));
         reader.close();
@@ -4059,12 +4371,232 @@ mod tests {
         free_memory(at, LEN);
     }
 
+    /// A texture whose staging buffer was released, its host copy holding
+    /// what was detiled last and its memory not written since: a list that
+    /// reads it (twice) records nothing for it; the title writes other bytes
+    /// once the list is closed, then submits it: the check at submission
+    /// finds the write, makes the buffer again, and copies the bytes before
+    /// the list runs, from the state the lists before left the texture in
+    /// and back to it; not over a GPU write into the texture submitted
+    /// before the list. Not written, nothing is made again. In write-watched
+    /// memory and in memory only a hash tells, with a predicate and
+    /// without. Before, nothing was checked at submission, and the list's
+    /// shaders read the old texels (Codex's review of db37732, 1).
+    #[test]
+    fn a_write_after_a_list_closed_is_copied_before_it_runs() {
+        let test = "texture::tests::a_write_after_a_list_closed_is_copied_before_it_runs";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        const LEN: usize = 64 << 10;
+        // Both shader-read states, as a draw's table leaves a texture.
+        const READ: u32 = 0x40 | 0x80;
+        for (watched, predicates) in [(true, true), (false, true), (true, false)] {
+            let _none = (!predicates).then(WithoutPredicates::new);
+            let at = private_memory(LEN, watched);
+            let (resource, texture) = texture_in(at);
+            let _alone = SweptAlone::new(resource);
+            let (id, size) = {
+                let state = staging(resource, texture).unwrap();
+                (state.id, state.layout.size as usize)
+            };
+            // SAFETY: the texture's memory, ours, `size` bytes of it.
+            let fill = |byte: u8| unsafe { (at as *mut u8).write_bytes(byte, size) };
+            // Its first rows, read from the state the lists left it in.
+            let texels = || {
+                let copy = crate::resource::host_copy(resource).unwrap();
+                let read = read_back(host, &copy.texture, copy.state.load(Ordering::Relaxed));
+                (0..16)
+                    .flat_map(|y| read[y * 256..y * 256 + 64].to_vec())
+                    .collect::<Vec<u8>>()
+            };
+            let case = format!("write-watched {watched}, predicates {predicates}");
+
+            fill(0x11);
+            sample_in(host, resource, 1);
+            // A draw leaves it in the shader-read states.
+            let draw = host.new_list().unwrap();
+            crate::list::ensure_state(&draw, resource, READ);
+            draw.close();
+            host.execute(&[&draw]);
+            host.drain();
+            drop(draw);
+            assert!(texels().iter().all(|&b| b == 0x11), "{case}");
+            released(resource);
+
+            // Not written: nothing made again, nor copied.
+            let decided = decided_id(id).len();
+            sample_in(host, resource, 1);
+            assert_eq!(staged_bytes(resource), None, "{case}: not made again");
+            assert_eq!(decided_id(id).len(), decided, "{case}: nothing copied");
+
+            // Written once the list closed: copied before it runs.
+            let list = host.new_list().unwrap();
+            assert!(
+                !upload(&list, resource, texture),
+                "{case}: nothing recorded"
+            );
+            assert!(!upload(&list, resource, texture), "{case}: read again");
+            crate::list::ensure_state(&list, resource, READ);
+            list.close();
+            fill(0x22);
+            host.execute(&[&list]);
+            host.drain();
+            drop(list);
+            assert!(
+                texels().iter().all(|&b| b == 0x22),
+                "{case}: {:x?}",
+                &texels()[..16]
+            );
+            assert_eq!(decided_id(id)[decided..], [true], "{case}: one copy");
+            assert!(staged_bytes(resource).is_some(), "{case}: made again");
+            assert_eq!(
+                crate::resource::host_copy(resource)
+                    .unwrap()
+                    .state
+                    .load(Ordering::Relaxed),
+                READ,
+                "{case}: left as the list leaves it"
+            );
+
+            // Released again, read, written once the list closed, but a GPU
+            // write into the texture is submitted before the list: the
+            // host's contents stay, nothing is copied over them.
+            released(resource);
+            let decided = decided_id(id).len();
+            let reader = host.new_list().unwrap();
+            assert!(!upload(&reader, resource, texture), "{case}");
+            reader.close();
+            fill(0x33);
+            let writer = host.new_list().unwrap();
+            gpu_write(&writer, resource, true);
+            writer.close();
+            host.execute(&[&writer]);
+            host.execute(&[&reader]);
+            host.drain();
+            drop((reader, writer));
+            assert_eq!(decided_id(id).len(), decided, "{case}: copied over");
+            assert!(
+                texels().iter().all(|&b| b == 0x22),
+                "{case}: {:x?}",
+                &texels()[..16]
+            );
+            release(resource);
+            free_memory(at, LEN);
+        }
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// A texture in write-watched memory whose host copy holds its bytes,
+    /// its staging buffer released, then its memory decommitted (the write
+    /// watch still answers for the reservation, and finds no page written):
+    /// a read left to the check at submission; a buffer made again by a
+    /// pass's first upload (of another slot) and filled for a copy without
+    /// a predicate; a copy forced at submission (its host copy not known to
+    /// hold the bytes); part of the memory committed again and written:
+    /// none takes anything from memory that is not mapped, and the host
+    /// copy keeps its texels. All of it committed again and written, it is
+    /// copied. Before, the second read the memory as zeros, detiled and
+    /// copied them over the texels (Codex's review of db37732, 2).
+    #[test]
+    fn decommitted_write_watched_memory_never_reaches_the_host_copy() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let test = "texture::tests::decommitted_write_watched_memory_never_reaches_the_host_copy";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        const LEN: usize = 64 << 10;
+        const PAGE: usize = 4 << 10;
+        let at = private_memory(LEN, true);
+        // 16 KiB of texels: more than its first page.
+        let (resource, texture) = square_texture_in(at, 64);
+        let _alone = SweptAlone::new(resource);
+        let (id, size) = {
+            let state = staging(resource, texture).unwrap();
+            (state.id, state.layout.size as usize)
+        };
+        assert!(size > PAGE && size <= LEN, "{size}");
+        // SAFETY: the texture's memory, ours, `size` bytes of it, committed.
+        let fill = |byte: u8, len: usize| unsafe { (at as *mut u8).write_bytes(byte, len) };
+        let all = |byte: u8| texels_of(host, texture).iter().all(|&b| b == byte);
+        let commit = |len: usize| {
+            // SAFETY: pages of our reservation, committed again.
+            let again = unsafe { VirtualAlloc(at as *const _, len, MEM_COMMIT, PAGE_READWRITE) };
+            assert!(!again.is_null());
+        };
+
+        fill(0x11, size);
+        sample_in(host, resource, 1);
+        assert!(all(0x11));
+        released(resource);
+        // SAFETY: pages of our allocation; nothing reads them meanwhile.
+        assert_ne!(unsafe { VirtualFree(at as *mut _, LEN, MEM_DECOMMIT) }, 0);
+        let decided = decided_id(id).len();
+
+        // Read by a list: left to the check at submission, which finds
+        // nothing written.
+        sample_in(host, resource, 1);
+        assert!(all(0x11), "{:x?}", &texels_of(host, texture)[..16]);
+        assert_eq!(staged_bytes(resource), None);
+
+        // A pass's first upload of another slot of it: its buffer made
+        // again within the room, then a copy without a predicate.
+        let Staged::Ready(made) = stage(resource, texture, u64::MAX) else {
+            panic!("{:?}", stage(resource, texture, u64::MAX));
+        };
+        assert!(made > 0, "made again");
+        {
+            let _none = WithoutPredicates::new();
+            let list = host.new_list().unwrap();
+            assert!(
+                !upload(&list, resource, texture),
+                "a copy from memory not mapped"
+            );
+            list.close();
+            host.execute(&[&list]);
+            host.drain();
+        }
+        assert!(all(0x11), "{:x?}", &texels_of(host, texture)[..16]);
+
+        // A copy forced at submission, under a predicate: it does not run.
+        *state_of(resource).unwrap().copied.lock().unwrap() = None;
+        sample_in(host, resource, 1);
+        assert!(all(0x11), "{:x?}", &texels_of(host, texture)[..16]);
+        assert_eq!(decided_id(id)[decided..], [false]);
+
+        // Its first page committed again and written, the rest not: a host
+        // copy that is not reserved waits for all of it.
+        commit(PAGE);
+        fill(0x22, PAGE);
+        assert_eq!(memory_change(resource), Change::Yes);
+        sample_in(host, resource, 1);
+        assert!(all(0x11), "{:x?}", &texels_of(host, texture)[..16]);
+        assert_eq!(decided_id(id)[decided..], [false, false]);
+
+        // All of it committed again and written: copied.
+        commit(LEN);
+        fill(0x33, size);
+        sample_in(host, resource, 1);
+        assert!(all(0x33), "{:x?}", &texels_of(host, texture)[..16]);
+        assert_eq!(decided_id(id)[decided..], [false, false, true]);
+
+        release(resource);
+        free_memory(at, LEN);
+        assert_eq!(host.log_messages(), None);
+    }
+
     /// A pass's checks make the released staging buffers of served textures
     /// again from a share of the pass's budget of their own: the first
     /// whatever its bytes, the next ones within what is left of the share;
     /// one whose buffer lives costs nothing, one never staged is not theirs
     /// (a first upload), one a GPU write was submitted into needs none. The
-    /// share may pass the staging limit by itself, not more.
+    /// share may pass the staging limit by itself, not more. One past the
+    /// share waits for the next pass's; one no pass could make now is left
+    /// for its next turn, the textures after it going on.
     #[test]
     fn released_served_textures_are_made_again_from_a_share_of_their_own() {
         let test =
@@ -4105,6 +4637,22 @@ mod tests {
         assert_eq!(refresh_room(16 * MIB, 20 * MIB, 1024 * MIB, 0), 0);
         assert_eq!(refresh_room(16 * MIB, 0, 1024 * MIB, 1030 * MIB), 10 * MIB);
         assert_eq!(refresh_room(16 * MIB, 0, 1024 * MIB, 2048 * MIB), 0);
+        // Past it: the share spent, the first of the next pass; past what a
+        // pass of its own could make, its next turn (the pass goes on).
+        assert_eq!(
+            refused(10 * MIB, 16 * MIB, 8 * MIB, 1024 * MIB, 0),
+            Staged::NoRoom(10 * MIB)
+        );
+        assert_eq!(refused(96 * MIB, 16 * MIB, 0, 64 * MIB, 0), Staged::NotNow);
+        assert_eq!(
+            refused(96 * MIB, 16 * MIB, 8 * MIB, 64 * MIB, 0),
+            Staged::NotNow
+        );
+        assert_eq!(
+            refused(40 * MIB, 16 * MIB, 0, 1024 * MIB, 1000 * MIB),
+            Staged::NotNow,
+            "the staging buffers that live leave it no room"
+        );
 
         type Release = extern "system" fn(This) -> u32;
         for r in [a, b, never] {

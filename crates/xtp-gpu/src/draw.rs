@@ -187,7 +187,7 @@ pub(crate) struct State {
     heap_objects: Vec<(usize, usize)>,
     /// Tables made afresh in this list, by title table and descriptor words.
     /// GPU-filled tables also depend on the writes preceding their copies.
-    fresh_tables: std::collections::HashMap<(u64, u64), (u32, Option<u64>)>,
+    fresh_tables: std::collections::HashMap<(u64, u64), FreshTable>,
     /// What the recording holds in host view heaps (its fresh tables' and
     /// own copies' dynamic slots, the shared root SRV views it binds), and
     /// with it [`State::own`]: given back in one batch once the list is
@@ -195,8 +195,6 @@ pub(crate) struct State {
     /// if the list is reset while it runs).
     recording: crate::descriptor::Recording,
     new_descriptors: Vec<NewDescriptor>,
-    /// A fresh table of the stage being bound could not be made.
-    table_failed: bool,
     /// View heaps whose buffer views of slots picked at run time this
     /// recording brought up to date ([`State::picked_buffers`]).
     picked: Vec<usize>,
@@ -211,17 +209,13 @@ pub(crate) struct State {
     /// pick by index ([`State::heap_textures`]).
     heap_textured: Vec<usize>,
     /// Root SRVs bound as one-view tables in this list: (view heap, title
-    /// address, host copy, 0 for a view in place or [`State::writes`] + 1
+    /// address, host copy, 0 for a view in place or the source write serial + 1
     /// for a copy of the list's own) → slot.
     root_srv_slots: std::collections::HashMap<(usize, u64, usize, u64), u32>,
     /// Une vue brute par segment de tampon et par tas pour cet enregistrement.
     root_uav_slots: std::collections::HashMap<(usize, usize, u64, u64), u32>,
-    /// Latest GPU copy for each source buffer and title address.
+    /// Latest CBV fill for each source buffer and title address.
     cbv_copies: std::collections::HashMap<(usize, u64), CbvCopy>,
-    /// The draws and dispatches recorded so far that may write GPU memory
-    /// (compute, unordered access): a copy of the list's own made before
-    /// one is not reused after it.
-    writes: u64,
     /// A dispatch was dropped since the list's last one that ran: the next
     /// that runs starts with a UAV barrier ([`State::dispatch_dropped`]).
     dropped_dispatch: bool,
@@ -267,9 +261,43 @@ impl Drop for State {
 /// translator declares 64 KiB).
 const CBV_SPAN: u64 = 1 << 16;
 
-struct CbvCopy {
-    /// Only binds with the same preceding writes can reuse these bytes.
+/// Bytes of each root CBV [`State::dump_at_submission`] logs.
+#[cfg(feature = "diagnostics")]
+const DUMPED_CBV_BYTES: u64 = 384;
+
+/// The way this CBV is filled and the last list write affecting its bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CbvInput {
+    gpu_source: Option<usize>,
     writes: u64,
+}
+
+impl CbvInput {
+    fn at(
+        list: &HostList,
+        address: u64,
+        len: u64,
+        shadow: Option<&std::sync::Arc<crate::shadow::Shadow>>,
+    ) -> Self {
+        let copy = shadow.map(|s| std::sync::Arc::as_ptr(s) as usize);
+        let (title, gpu) = list.input_writes(copy, address, len);
+        let gpu_source = copy.filter(|&c| {
+            gpu != 0 || crate::host::host().and_then(|h| h.fill_writer(address, len)) == Some(c)
+        });
+        Self {
+            gpu_source,
+            writes: title.max(gpu),
+        }
+    }
+}
+
+struct FreshTable {
+    first: u32,
+    constants: Vec<(u64, u64, CbvInput)>,
+}
+
+struct CbvCopy {
+    input: CbvInput,
     gpu: u64,
     bytes: u64,
 }
@@ -285,8 +313,7 @@ const MISALIGNED_SPAN: u64 = xtp_shader::resource::MISALIGNED_SRV_BYTES as u64;
 const OWN_CHUNK: u64 = 1 << 20;
 
 /// Bytes one list copies on the GPU for its root views at most: past it,
-/// root SRVs not on 16 bytes read zeros and root CBVs near their copy's end
-/// are read in place (both logged).
+/// a bind requiring a new GPU copy is rejected and logged.
 const LIST_COPIES: u64 = 128 << 20;
 
 /// GPU memory the lists' own chunks take at most, together.
@@ -325,6 +352,8 @@ struct Own {
     /// The holds on the raw views of the runtime stride tables the list's
     /// shaders read, by view heap ([`State::stride_table`]).
     strides: Vec<(usize, crate::descriptor::host::StrideHold)>,
+    /// Where [`Own::zeros`] put its zeros: upload chunk and offset.
+    zeros: Option<(usize, u64)>,
 }
 
 struct Chunk {
@@ -409,16 +438,24 @@ impl Own {
     /// Copies `len` bytes of host copy `from` from byte `offset` into GPU
     /// memory of the list's own, at this place in the list (after what
     /// earlier commands wrote there, before later ones read it): the buffer
-    /// and the offset in it. `None` past [`LIST_COPIES`] or
-    /// [`ALL_COPIES`] (logged).
+    /// and the offset in it. The `pad` bytes after them are zeroed (at
+    /// most 255: a constant view's [`padding`]). `None` past
+    /// [`LIST_COPIES`] or [`ALL_COPIES`] (logged).
     fn gpu_copy(
         &mut self,
         list: &HostList,
         from: &ID3D12Resource,
         offset: u64,
         len: u64,
+        pad: u64,
     ) -> Option<(ID3D12Resource, u64)> {
         use crate::host::{transition, uav_barrier};
+        debug_assert!(pad < 256);
+        let zeros = if pad > 0 {
+            Some(self.zeros(list)?)
+        } else {
+            None
+        };
         if self.copied + len > LIST_COPIES {
             counted!(
                 warn,
@@ -461,6 +498,11 @@ impl Own {
                 transition(&c.buffer, c.state, dest),
             ]);
             list.list.CopyBufferRegion(&c.buffer, at, from, offset, len);
+            if let Some((zeros, zeros_at)) = &zeros {
+                // Within the 256-byte steps `place` gives.
+                list.list
+                    .CopyBufferRegion(&c.buffer, at + len, zeros, *zeros_at, pad);
+            }
             list.list.ResourceBarrier(&[
                 transition(from, source, common),
                 transition(&c.buffer, dest, read),
@@ -472,12 +514,61 @@ impl Own {
 
     /// Upload memory of the list's own holding `len` bytes of title memory
     /// at `address` once the list is submitted: its host address.
+    /// The [`padding`] after them reads zeros.
     fn upload_fill(&mut self, list: &HostList, address: u64, len: u64) -> Option<u64> {
         let (i, at) = self.place(false, list, len)?;
         let c = &self.upload[i];
+        // SAFETY: the padding lies in the place just taken in this mapped
+        // chunk, which no GPU work reads before the list's submission; the
+        // fill writes only the first `len` bytes.
+        unsafe {
+            ((c.data + (at + len) as usize) as *mut u8).write_bytes(0, padding(len) as usize)
+        };
         list.defer_fill_at(c.data, at as usize, address as usize, len as usize);
         Some(c.gpu + at)
     }
+
+    /// 256 bytes of zeros in the list's upload memory, to copy from on the
+    /// GPU: the buffer and the offset in it. Made once per recording.
+    fn zeros(&mut self, list: &HostList) -> Option<(ID3D12Resource, u64)> {
+        let (i, at) = match self.zeros {
+            Some(place) => place,
+            None => {
+                let (i, at) = self.place(false, list, 256)?;
+                let c = &self.upload[i];
+                // SAFETY: the place just taken in this mapped chunk; the
+                // GPU reads it only after the list's submission.
+                unsafe { ((c.data + at as usize) as *mut u8).write_bytes(0, 256) };
+                self.zeros = Some((i, at));
+                (i, at)
+            }
+        };
+        Some((self.upload[i].buffer.clone(), at))
+    }
+}
+
+/// The bytes past `len` up to the next 256 of a constant view of the list's
+/// own memory: the host view takes whole 256s, and there the console reads
+/// zeros (past the view's size), not what earlier lists left.
+fn padding(len: u64) -> u64 {
+    len.next_multiple_of(256) - len
+}
+
+/// Scratch memory of the list's holding `len` bytes of title memory at
+/// `address` once it is submitted, for a table's constant view: its host
+/// address. The [`padding`] after them reads zeros.
+fn scratch_constant(list: &HostList, address: u64, len: u64) -> Option<u64> {
+    let pad = padding(len);
+    if pad == 0 {
+        return list.scratch_fill(address, len);
+    }
+    let (gpu, to) = list.scratch(len + pad)?;
+    // SAFETY: `len + pad` bytes of the list's mapped scratch memory, which
+    // no GPU work reads before the list's submission (a list reset while it
+    // runs records into fresh chunks); the fill writes only the first `len`.
+    unsafe { to.add(len as usize).write_bytes(0, pad as usize) };
+    list.defer_fill(to, address as *const u8, len as usize);
+    Some(gpu)
 }
 
 /// A chunk of `size` bytes and [`CBV_SPAN`] more: in GPU memory (`gpu`,
@@ -591,11 +682,12 @@ fn picked_refresh(
 }
 
 /// The host heap behind a key of [`State::host_heaps`]: a title heap, or
-/// XTP's own view heap.
+/// XTP's own view or sampler heap.
 fn host_heap(key: usize) -> Option<&'static crate::descriptor::host::HostHeap> {
     match key {
         0 => None,
         crate::descriptor::OWN_VIEW_HEAP => crate::descriptor::own_view_heap(),
+        crate::descriptor::OWN_SAMPLER_HEAP => crate::descriptor::own_sampler_heap(),
         h => crate::descriptor::heap(h as This).host(),
     }
 }
@@ -665,6 +757,45 @@ fn note_root_srv(address: u64, copy: &crate::shadow::Shadow) {
             left,
             buffer = format_args!("{start:#x}+{len:#x}"),
             "a root SRV near its buffer's end: reads past it return zeros"
+        );
+    }
+}
+
+/// Logs a root SRV's one-view table (Watch 443, VIctory #1671): the bytes
+/// it views from `address` against those its host copy holds from there,
+/// to the end of the title buffer or of the 4 MiB window copy of memory
+/// outside every buffer. A table that stops before its copy's end is cut
+/// (counted at info): a shader reading past the cut reads zeros where the
+/// console reads the buffer. Past a window's end the title's memory goes
+/// on as well. Each table at debug level.
+fn note_root_srv_extent(address: u64, copy: &crate::shadow::Shadow, viewed: u64) {
+    let left = copy.left(address);
+    let start = address - copy.offset(address);
+    let len = copy.offset(address) + left;
+    if viewed < left {
+        counted!(
+            info,
+            address = format_args!("{address:#x}"),
+            viewed,
+            left,
+            copy = format_args!("{start:#x}+{len:#x}"),
+            "a root SRV's one-view table stops before its host copy's end: reads past it \
+             return zeros"
+        );
+    }
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let window = crate::shadow::holders(address).is_empty();
+        tracing::debug!(
+            address = format_args!("{address:#x}"),
+            viewed,
+            left,
+            copy = format_args!("{start:#x}+{len:#x}"),
+            holds = if window {
+                "a 4 MiB window"
+            } else {
+                "a title buffer"
+            },
+            "a root SRV's one-view table"
         );
     }
 }
@@ -1217,18 +1348,19 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
-    /// The heaps the host list is to have: the title's, with XTP's own view
-    /// heap in place of a view heap where the title binds none (or one
-    /// without a host heap) and the pipeline reads root SRVs (`root_srvs`),
-    /// which are bound as tables in a view heap; the console needs no heap
-    /// for root views. Once the list has XTP's heap, it keeps it until the
-    /// title binds a view heap.
-    fn wanted_heaps(&self, tabled: bool) -> [usize; 2] {
+    /// The heaps the host list is to have: the title's, with XTP's own in
+    /// place of each the title binds none of (or one without a host heap).
+    /// Pipelines' root signatures index both heaps directly, and D3D12 lets
+    /// such a root signature be set only once both are bound (debug layer
+    /// message 1419); root SRVs, bound as tables, also need a view heap.
+    fn wanted_heaps(&self) -> [usize; 2] {
         let mut wanted = self.heaps;
-        let title_views =
-            wanted[0] != 0 && crate::descriptor::heap(wanted[0] as This).host().is_some();
-        if !title_views && (tabled || self.host_heaps[0] == crate::descriptor::OWN_VIEW_HEAP) {
+        let hosted = |h: usize| h != 0 && crate::descriptor::heap(h as This).host().is_some();
+        if !hosted(wanted[0]) {
             wanted[0] = crate::descriptor::OWN_VIEW_HEAP;
+        }
+        if !hosted(wanted[1]) {
+            wanted[1] = crate::descriptor::OWN_SAMPLER_HEAP;
         }
         wanted
     }
@@ -1273,9 +1405,17 @@ impl State {
         if self.host_heaps == wanted && !replaced {
             return;
         }
-        let heaps: Vec<Option<ID3D12DescriptorHeap>> = heaps
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = wanted
             .into_iter()
-            .flatten()
+            .zip(heaps)
+            .filter_map(|(key, heap)| {
+                if key != 0 && heap.is_none() {
+                    // A root signature that indexes the heaps directly then
+                    // meets message 1419 again.
+                    once!(key, "no host descriptor heap to bind in a heap slot");
+                }
+                heap
+            })
             .map(|h| Some(h.clone()))
             .collect();
         heaps.iter().flatten().for_each(|h| list.keep(h));
@@ -1321,6 +1461,10 @@ impl State {
 
     fn bind_pipeline(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let l = &list.list;
+        // Heaps first: a root signature with directly indexed heaps must be
+        // set after them.
+        let wanted = self.wanted_heaps();
+        self.set_host_heaps(list, wanted);
         let root = p.root.as_raw() as usize;
         if (!compute || self.pending_compute.is_none())
             && self.host_roots[usize::from(compute)] != root
@@ -1368,7 +1512,11 @@ impl State {
         if list.planes_now() {
             self.after_our_pass(list);
         }
-        self.with_bind_descriptors(|state| state.bind_stages(list, p, compute, limits))
+        list.begin_shader_outputs();
+        let result =
+            self.with_bind_descriptors(|state| state.bind_stages(list, p, compute, limits));
+        list.end_shader_outputs(result.is_ok());
+        result
     }
 
     fn with_bind_descriptors(
@@ -1405,32 +1553,25 @@ impl State {
         limits: [u32; 3],
     ) -> Result<(), &'static str> {
         let l = &list.list;
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
-        let root_uavs = p.stages.iter().any(|s| !s.root_uavs.is_empty());
         use xtp_shader::emit::{
             INDEXED_ADDRESS_SRV, PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV,
         };
-        let constant_reads = p.stages.iter().any(|s| {
-            s.translated().host.user_data.iter().any(|u| {
-                matches!(
-                    u.root,
-                    INDEXED_ADDRESS_SRV
-                        | PACKED_ADDRESS_SRV
-                        | SCALAR_ADDRESS_SRV
-                        | VECTOR_ADDRESS_SRV
-                )
-            })
-        });
-        let wanted = self.wanted_heaps(
-            constant_reads || root_uavs || root_srvs && crate::pipeline::host::bounded_root_srvs(),
-        );
-        self.set_host_heaps(list, wanted);
         list.decode_uses
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .begin_bind();
+        // A trace's empty TLAS, its fallback where no title root view sets
+        // it: built (when it must be) before the pipeline's state is bound.
+        let empty_tlas = p
+            .stages
+            .iter()
+            .any(|s| {
+                s.root_srvs
+                    .iter()
+                    .any(|r| r.0 == xtp_shader::emit::TLAS_REGISTER)
+            })
+            .then(|| crate::rt::empty_tlas_in(list))
+            .flatten();
         self.bind_pipeline(list, p, compute);
         let picked = p
             .stages
@@ -1450,25 +1591,13 @@ impl State {
             let t = stage.translated();
             #[cfg(feature = "diagnostics")]
             crate::frameprobe::begin(&stage.shader.hash);
-            self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, compute)?;
             // Decoding binds a compute PSO and root signature. Restore the descriptor
             // tables before setting the compute stage's root arguments.
             if list.decode_pipeline.swap(false, Ordering::Relaxed) {
                 self.host_roots[1] = 0;
                 self.host_pipeline = 0;
                 self.bind_pipeline(list, p, compute);
-            }
-            if self.table_failed {
-                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
-                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::warn!(
-                        dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
-                    );
-                }
-                return Err("no dynamic slots for its tables");
             }
             let mut biases = Vec::new();
             for &(slot, param) in &stage.root_uavs {
@@ -1569,13 +1698,26 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let tabled = srv && crate::pipeline::host::root_srv_in_table(slot);
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // An unset table is undefined: a null view instead.
                         if tabled {
                             self.root_srv_table(list, None, param, compute)?;
+                        }
+                        // The RayQuery TLAS, a root SRV no title root view
+                        // sets: an empty TLAS, where every ray misses, unless
+                        // the trace binds the host's (a null root SRV removed
+                        // the WARP device).
+                        if srv && slot == xtp_shader::emit::TLAS_REGISTER {
+                            let gpu = empty_tlas.ok_or("no empty TLAS for a trace")?;
+                            if compute {
+                                self.compute_root(list, param, ComputeRoot::Srv(gpu));
+                            } else {
+                                // SAFETY: an open list; the list keeps the TLAS.
+                                unsafe { l.SetGraphicsRootShaderResourceView(param, gpu) };
+                            }
                         }
                         continue;
                     };
@@ -1588,7 +1730,7 @@ impl State {
                     let gpu = if srv {
                         root_srv_direct(list, address)
                     } else {
-                        self.root_cbv(list, address)
+                        Some(self.root_cbv(list, address)?)
                     };
                     let Some(gpu) = gpu else {
                         continue;
@@ -1629,17 +1771,6 @@ impl State {
                     l.SetGraphicsRootUnorderedAccessView(param, gpu);
                 }
             }
-        }
-        // Copies of the list's own made so far may now be stale.
-        if compute
-            || p.stages.iter().any(|s| {
-                s.translated()
-                    .used
-                    .iter()
-                    .any(|u| u.kind == ResourceType::Uav)
-            })
-        {
-            self.writes += 1;
         }
         crate::resource::decode::bound_writes(list);
         list.twins_written();
@@ -2029,6 +2160,9 @@ impl State {
                     last = before;
                     break;
                 }
+                // Past what a pass of its own could make now: `NotNow`, left
+                // for its next turn, the textures after it go on
+                // (`texture::Refreshes::stage`).
                 Some(staged) => staged,
                 None => stage_for_pass(resource, texture, budget, &mut spent, &mut counts),
             };
@@ -2198,11 +2332,19 @@ impl State {
         };
         let bytes = s.left(a).min(limit);
         s.refresh(list, a, bytes);
-        let key = (heap, a, copy, if in_place { 0 } else { self.writes + 1 });
+        let serial = if in_place {
+            0
+        } else {
+            let (title, gpu) =
+                list.input_writes(Some(std::sync::Arc::as_ptr(&s) as usize), a, bytes);
+            title.max(gpu) + 1
+        };
+        let key = (heap, a, copy, serial);
         if let Some(&slot) = self.root_srv_slots.get(&key) {
             return Ok((host, slot));
         }
         note_root_srv(a, &s);
+        note_root_srv_extent(a, &s, bytes);
         let slot = if in_place {
             let slot = host.shared_raw(&s, offset, bytes);
             if let Some(slot) = slot {
@@ -2210,7 +2352,7 @@ impl State {
             }
             slot
         } else {
-            self.misaligned_srv(list, host, heap, &s, a)
+            Some(self.misaligned_srv(list, host, heap, &s, a)?)
         };
         let Some(slot) = slot else {
             counted!(
@@ -2226,8 +2368,8 @@ impl State {
 
     /// A slot the list holds with a raw view of a copy of the list's own of
     /// the root SRV at `a` (not on 16 bytes of host copy `s`): its first
-    /// [`MISALIGNED_SPAN`] bytes, copied on the GPU here. `None` if no slot
-    /// is free.
+    /// [`MISALIGNED_SPAN`] bytes, copied on the GPU here. The bind fails
+    /// if the copy or descriptor cannot be allocated.
     fn misaligned_srv(
         &mut self,
         list: &HostList,
@@ -2235,7 +2377,7 @@ impl State {
         heap: usize,
         s: &crate::shadow::Shadow,
         a: u64,
-    ) -> Option<u32> {
+    ) -> Result<u32, &'static str> {
         let left = s.left(a);
         let len = left.min(MISALIGNED_SPAN);
         counted!(
@@ -2254,125 +2396,114 @@ impl State {
                 "a root SRV not on 16 bytes copied in part: reads past the copy return zeros"
             );
         }
-        let slot = host.dynamic(1)?;
+        let slot = host
+            .dynamic(1)
+            .ok_or("no dynamic slot for a copied root SRV")?;
         self.recording.range(list, heap, slot, 1);
         // Whole dwords, the last one too: the copy is rounded up to 64 KiB.
         // SAFETY: a live buffer.
         let width = unsafe { s.buffer.GetDesc() }.Width;
         let offset = s.offset(a);
         let bytes = len.next_multiple_of(4).min(width - offset);
-        match self.own.gpu_copy(list, &s.buffer, offset, bytes) {
-            Some((buffer, at)) => host.raw_at(slot, &buffer, at, len),
-            None => {
-                counted!(
-                    warn,
-                    address = format_args!("{a:#x}"),
-                    "a root SRV not on 16 bytes could not be copied: it reads zeros"
-                );
-                host.null_raw_at(slot);
-            }
-        }
-        Some(slot)
+        let Some((buffer, at)) = self.own.gpu_copy(list, &s.buffer, offset, bytes, 0) else {
+            counted!(
+                warn,
+                address = a,
+                bytes,
+                "bind dropped: could not copy a misaligned root SRV"
+            );
+            return Err("could not copy a misaligned root SRV");
+        };
+        host.raw_at(slot, &buffer, at, len);
+        Ok(slot)
     }
 
-    /// The host address of a root CBV at title `address`. In place, its
-    /// buffer's host copy, when it is 256-byte aligned there (the console
-    /// needs 16) and the 64 KiB a root CBV reads lie in the copy (past the
-    /// title buffer's end, in the copy's zeroed rounding). Else a copy of
-    /// the list's own, followed by at least 64 KiB more of it: made on the
-    /// GPU from the host copy when aligned or when that copy has a GPU
-    /// writer in flight. Once this recording copies a CBV on the GPU it can
-    /// keep using that source after the writer finishes. Other misaligned
-    /// CBVs use upload memory filled from title memory at submission.
-    /// A shader reading past the title buffer reads memory the list holds
-    /// (zeros, or other data of the list's), not whatever the host placed
-    /// after the copy. If a GPU copy cannot be allocated, aligned CBVs are
-    /// read in place and misaligned CBVs use the submission-time upload.
-    /// shortcut: a root descriptor has no size, so reads past the buffer
-    /// return zeros only in place; a one-CBV table would bound them as root
-    /// SRVs are, at the cost of a root signature change (`pipeline::host`).
-    fn root_cbv(&mut self, list: &HostList, address: u64) -> Option<u64> {
-        let s = crate::shadow::find(address, 1)?;
+    /// A root CBV must be aligned and backed by 64 KiB of list-owned or
+    /// shadow memory. Misaligned inputs without a GPU writer can be filled
+    /// from title memory at submission.
+    fn root_cbv(&mut self, list: &HostList, address: u64) -> Result<u64, &'static str> {
+        let s = crate::shadow::find(address, 1).ok_or("a root CBV without a host copy")?;
         let len = s.left(address).min(CBV_SPAN);
         let gpu = s.gpu(address);
-        if !gpu.is_multiple_of(256) {
-            if let Some(gpu) = self.gpu_cbv_fill(list, address, len) {
-                return Some(gpu);
-            }
-            // The memory goes with the recording.
-            self.recording.lease(list);
-            return self.own.upload_fill(list, address, len);
-        }
-        let offset = s.offset(address);
+        let aligned = gpu.is_multiple_of(256);
         // SAFETY: a live buffer.
-        let width = unsafe { s.buffer.GetDesc() }.Width;
-        if offset + CBV_SPAN <= width {
+        if aligned && s.offset(address) + CBV_SPAN <= unsafe { s.buffer.GetDesc() }.Width {
             s.refresh(list, address, len);
-            return Some(gpu);
+            return Ok(gpu);
         }
-        self.copy_cbv(list, &s, address, len).or_else(|| {
-            // Past the copy budget, read the refreshed host copy in place.
-            s.refresh(list, address, len);
-            Some(gpu)
-        })
+        let mut input = CbvInput::at(list, address, len, Some(&s));
+        if aligned {
+            // A short aligned shadow also needs padding for unbounded reads.
+            input.gpu_source = Some(std::sync::Arc::as_ptr(&s) as usize);
+        }
+        self.fill_cbv(list, &s, address, len, input)
     }
 
-    fn gpu_cbv_fill(&mut self, list: &HostList, address: u64, len: u64) -> Option<u64> {
-        let writer = crate::host::host()?.fill_writer(address, len);
-        if writer.is_none() && self.cbv_copies.is_empty() {
-            return None;
-        }
-        let shadow = crate::shadow::existing(address, len)?;
-        let source = (shadow.buffer.as_raw() as usize, address);
-        let eligible = match writer {
-            Some(copy) => copy == std::sync::Arc::as_ptr(&shadow) as usize,
-            None => self.cbv_copies.contains_key(&source),
-        };
-        if !eligible {
-            return None;
-        }
-        self.copy_cbv(list, &shadow, address, len)
-    }
-
-    fn copy_cbv(
+    fn fill_cbv(
         &mut self,
         list: &HostList,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: u64,
         len: u64,
-    ) -> Option<u64> {
+        input: CbvInput,
+    ) -> Result<u64, &'static str> {
         let key = (shadow.buffer.as_raw() as usize, address);
-        let writes = self.writes + list.buffer_writes();
         if let Some(copy) = self.cbv_copies.get(&key)
-            && copy.writes == writes
-            && len <= copy.bytes
+            && copy.input.gpu_source == input.gpu_source
+            // A view of whole 256s reads no padding; one with padding must
+            // find zeros there, not the longer copy's next bytes.
+            && (len == copy.bytes || padding(len) == 0 && len <= copy.bytes)
+            // A larger snapshot may also cover a newer write outside the
+            // requested prefix. Every write after that snapshot is newer.
+            && input.writes <= copy.input.writes
         {
-            CBV_COPY_HITS.fetch_add(1, Ordering::Relaxed);
-            return Some(copy.gpu);
+            if input.gpu_source.is_some() {
+                CBV_COPY_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(copy.gpu);
         }
-        let (buffer, at) = self
-            .own
-            .gpu_copy(list, &shadow.buffer, shadow.offset(address), len)?;
+        let gpu = if input.gpu_source.is_some() {
+            let Some((buffer, at)) = self.own.gpu_copy(
+                list,
+                &shadow.buffer,
+                shadow.offset(address),
+                len,
+                padding(len),
+            ) else {
+                counted!(
+                    warn,
+                    address,
+                    bytes = len,
+                    "bind dropped: could not copy a CBV on the GPU"
+                );
+                return Err("could not copy a CBV on the GPU");
+            };
+            shadow.refresh(list, address, len);
+            list.cbv_read(shadow, address, len);
+            CBV_COPIES.fetch_add(1, Ordering::Relaxed);
+            counted!(
+                debug,
+                address,
+                bytes = len,
+                "a CBV copied on the GPU into list memory"
+            );
+            // SAFETY: the recording holds the aligned chunk until its lists finish.
+            unsafe { buffer.GetGPUVirtualAddress() + at }
+        } else {
+            self.own
+                .upload_fill(list, address, len)
+                .ok_or("could not upload a root CBV")?
+        };
         self.recording.lease(list);
-        shadow.refresh(list, address, len);
-        // SAFETY: the recording holds the aligned chunk until its lists finish.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
         self.cbv_copies.insert(
             key,
             CbvCopy {
-                writes,
+                input,
                 gpu,
                 bytes: len,
             },
         );
-        CBV_COPIES.fetch_add(1, Ordering::Relaxed);
-        counted!(
-            debug,
-            address = format_args!("{address:#x}"),
-            bytes = len,
-            "a CBV copied on the GPU into list memory"
-        );
-        Some(gpu)
+        Ok(gpu)
     }
 
     /// Runs a dispatch on the host; the first that runs after dropped ones
@@ -2422,6 +2553,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.dump_at_submission(list, None);
         let _timed = crate::timestamps::command(list, crate::timestamps::What::Dispatch, Some(p));
         // SAFETY: an open list with everything set; the barrier names no
         // resource.
@@ -2526,6 +2659,108 @@ impl State {
         text
     }
 
+    /// Diagnostics (`XTP_DUMP_DISPATCH_INPUTS=<program hash>,...`, each
+    /// the start of a program's hash): for each dispatch of a matching
+    /// program, logs at its list's submission what title memory holds
+    /// then: the first [`DUMPED_CBV_BYTES`] bytes of each root CBV, and the
+    /// 12 bytes of group counts an indirect one reads at `arguments` (what
+    /// the CPU left there: a GPU writer runs after the submission). With
+    /// `XTP_D3D12_DRED`, the device-removed report names the dispatches in
+    /// flight by the same program and root addresses ([`State::op_text`]).
+    #[cfg(feature = "diagnostics")]
+    fn dump_at_submission(&self, list: &HostList, arguments: Option<u64>) {
+        static PROGRAMS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let programs = PROGRAMS.get_or_init(|| {
+            std::env::var("XTP_DUMP_DISPATCH_INPUTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        });
+        if programs.is_empty() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        for stage in &p.stages {
+            let program = stage.shader.hash.to_string();
+            if !programs.iter().any(|w| program.starts_with(w.as_str())) {
+                continue;
+            }
+            let mut reads: Vec<(String, u64, u64)> = Vec::new();
+            for &(slot, _) in &stage.root_cbvs {
+                if let Some(&Root::View(address)) = self.roots_ref(true).get(usize::from(slot)) {
+                    reads.push((format!("root CBV s{slot}"), address, DUMPED_CBV_BYTES));
+                }
+            }
+            // CBVs in descriptor tables: the bytes their views name.
+            let t = stage.translated();
+            for u in t.used.iter().filter(|u| u.kind == ResourceType::Cbv) {
+                if u.root != RootType::Table {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot))
+                else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(View::Constant(address, size)) = crate::descriptor::view(handle) {
+                    let what = format!("table CBV s{}+{}", u.slot, u.table_offset_dwords);
+                    let bytes = u64::from(size).clamp(4, DUMPED_CBV_BYTES);
+                    reads.push((what, address, bytes));
+                }
+            }
+            if let Some(at) = arguments {
+                reads.push(("indirect group counts".into(), at, 12));
+            }
+            // Inline constants: the user data the program reads, as set now.
+            let user_data: Vec<String> = t
+                .host
+                .user_data
+                .iter()
+                .map(|u| {
+                    let v = self.user_value(true, u.slot, u.root, u.dword);
+                    format!("u{}={v:#x}", u.index)
+                })
+                .collect();
+            tracing::info!(
+                program,
+                list = format_args!("{:#x}", list.list.as_raw() as usize),
+                user_data = user_data.join(" "),
+                "a dispatch's user data at its recording"
+            );
+            let host_list = list.list.as_raw() as usize;
+            list.defer_host((0, 0), move || {
+                for (what, address, len) in &reads {
+                    // Read through the kernel: unmapped pages read as zeros.
+                    let mut bytes = vec![0u8; *len as usize];
+                    crate::host::copy_mapped(
+                        bytes.as_mut_ptr(),
+                        *address as *const u8,
+                        bytes.len(),
+                        false,
+                    );
+                    let (words, _) = bytes.as_chunks::<4>();
+                    let words = words
+                        .iter()
+                        .map(|&w| format!("{:08x}", u32::from_le_bytes(w)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tracing::info!(
+                        program,
+                        list = format_args!("{host_list:#x}"),
+                        what,
+                        address = format_args!("{address:#x}"),
+                        words,
+                        "a dispatch's input at its submission"
+                    );
+                }
+            });
+        }
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, groups: [u32; 3]) {
@@ -2614,7 +2849,12 @@ impl State {
     /// Within a list, the same table holding the same descriptors is made
     /// once unless intervening writes can change its GPU-filled constants.
     /// The world's large tables would otherwise take hundreds of slots per draw.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+    ) -> Result<Vec<(u8, u32)>, &'static str> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -2681,10 +2921,13 @@ impl State {
                 }
                 (table, h.finish())
             };
-            let writes = self.writes + list.buffer_writes();
-            if let Some(&(first, copied_at)) = self.fresh_tables.get(&key)
-                && copied_at.is_none_or(|w| w == writes)
+            if let Some(cached) = self.fresh_tables.get(&key)
+                && cached.constants.iter().all(|&(address, len, was)| {
+                    let shadow = crate::shadow::existing(address, len);
+                    was == CbvInput::at(list, address, len, shadow.as_ref())
+                })
             {
+                let first = cached.first;
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2700,10 +2943,14 @@ impl State {
                 // view: a texture or null descriptor read as a buffer gives
                 // a wild address on AMD and the device is removed (#59).
                 // The draw or dispatch is dropped instead.
-                self.table_failed = true;
-                break;
+                counted!(
+                    warn,
+                    slots = n,
+                    "bind dropped: no dynamic slots for its table"
+                );
+                return Err("no dynamic slots for its tables");
             };
-            let mut copied_at = None;
+            let mut constants = Vec::new();
             // Held until the recording goes (after its submission, if the
             // list is reset while it runs).
             self.recording
@@ -2714,16 +2961,24 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    // No address or no bytes: a null constant view (zeros),
+                    // not a view of 0 bytes or of title address 0.
+                    Some(View::Constant(address, size)) if address == 0 || size == 0 => {
+                        host.null_constant(index);
+                    }
                     Some(View::Constant(address, size)) => {
-                        if let Some(gpu) = self.gpu_cbv_fill(list, address, u64::from(size)) {
-                            copied_at = Some(writes);
-                            host.constant_at(index, gpu, size);
-                            continue;
-                        }
-                        let Some(gpu) = list.scratch_fill(address, u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
+                        // At most what a shader can index: the rest is not
+                        // copied, and the host takes no larger view.
+                        let size = crate::descriptor::host::capped_constant(address, size);
+                        let len = u64::from(size);
+                        let shadow = crate::shadow::existing(address, len);
+                        let input = CbvInput::at(list, address, len, shadow.as_ref());
+                        let gpu = match shadow.filter(|_| input.gpu_source.is_some()) {
+                            Some(s) => self.fill_cbv(list, &s, address, len, input)?,
+                            None => scratch_constant(list, address, len)
+                                .ok_or("could not upload a table CBV")?,
                         };
+                        constants.push((address, len, input));
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
@@ -2740,7 +2995,8 @@ impl State {
                     }
                 }
             }
-            self.fresh_tables.insert(key, (first, copied_at));
+            self.fresh_tables
+                .insert(key, FreshTable { first, constants });
             self.new_descriptors.push(NewDescriptor::Table(key));
             made.push((slot, first * 32));
         }
@@ -2759,7 +3015,7 @@ impl State {
                 *offset |= xtp_shader::emit::REMAPPED_SLOT << 5;
             }
         }
-        made
+        Ok(made)
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -3319,6 +3575,10 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.dump_at_submission(list, Some(arguments));
+        }
         let _timed = crate::timestamps::command(
             list,
             crate::timestamps::What::Indirect(kind),
@@ -3741,7 +4001,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 pub(crate) mod tests {
     use super::*;
     use crate::descriptor::host::SHARED_CHUNK;
-    use crate::descriptor::{OWN_VIEW_HEAP, TestHeap};
+    use crate::descriptor::{OWN_SAMPLER_HEAP, OWN_VIEW_HEAP, TestHeap};
     use crate::host::Host;
     use crate::testgpu::{Kernel, Pass, TitleBuffer, TitleList, pattern};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -4774,7 +5034,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             heaps(&mut state, l);
             // The program's table, read as a draw reads it.
             state.set_table(true, 1, title.start);
-            state.tables(l, &used, true);
+            state.tables(l, &used, true).unwrap();
             if pass {
                 state.heap_textures(l);
             }
@@ -5292,6 +5552,90 @@ void main(uint3 id : SV_DispatchThreadID) {
         release(small);
     }
 
+    /// A served texture no pass could stage again (4 MiB, past a 1 MiB
+    /// staging limit and the refreshes' share of a 1 MiB pass: a table read
+    /// uploaded it, then its staging buffer was released) is left for its
+    /// next turn when it changes, and the checks go on past it: a changed
+    /// texture after it is refreshed, pass after pass, while the big one
+    /// keeps the texels it had. Before, it stopped the checks and the next
+    /// pass started with it again, so the textures after it stayed stale for
+    /// good (Codex's review of db37732, 3). In a child process whose passes
+    /// stage 1 MiB within a 1 MiB staging limit (`XTP_HEAP_TEXTURES`,
+    /// `XTP_PASS_STAGING`, read once).
+    #[test]
+    fn a_texture_no_pass_can_stage_again_leaves_the_next_ones_their_refresh() {
+        use crate::testgpu::TitleList;
+        const CHILD: &str = "XTP_TEST_SMALL_STAGING";
+        let test =
+            "draw::tests::a_texture_no_pass_can_stage_again_leaves_the_next_ones_their_refresh";
+        if std::env::var_os(CHILD).is_none() {
+            let Some(_gpu) = crate::testgpu::device(test) else {
+                return;
+            };
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("XTP_HEAP_TEXTURES", "1")
+                .env("XTP_PASS_STAGING", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "the child: {stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        assert_eq!(crate::descriptor::host::pass_staging(), 1 << 20);
+        let heap = crate::descriptor::TestHeap::views(4);
+        let views = crate::descriptor::heap(heap.0).host().expect("a host heap");
+        // The small one by a pass; the big one, 4 MiB of RGBA8 in the slot
+        // before it, by a table read (no pass stages it).
+        let small = filled_texture(heap.0, 2, 4, 4, 0x11);
+        let list = TitleList::new();
+        assert_eq!(pass_in(heap.0, &list).uploaded, 1);
+        list.run();
+        drop(list);
+        let big = filled_texture(heap.0, 1, 64, 16384, 0x55);
+        let list = TitleList::new();
+        let texture = crate::resource::host_resource(big).expect("resident");
+        assert!(crate::texture::upload(list.host(), big, texture));
+        views.texture_slot_tabled(1);
+        list.run();
+        drop(list);
+        assert_eq!(views.texture_queue().served_slots(), [1, 2]);
+        assert_eq!(texels_4x4(host, big), vec![0x5555_5555; 16]);
+        assert!(crate::texture::release_staging_now(big));
+        assert!(crate::texture::release_staging_now(small));
+        // Frames on, no table reads it: the passes check both, the big one
+        // first. A pass checks within `PASS_CHECKING` (1 ms), one at least:
+        // on a loaded machine the small one may wait for the next pass.
+        crate::descriptor::host::PASS_LATER.fetch_add(2, Ordering::Relaxed);
+        fill_texture(big, 0x66);
+        for byte in [0x22u8, 0x33] {
+            fill_texture(small, byte);
+            let want = vec![u32::from_ne_bytes([byte; 4]); 16];
+            let mut passes = 0;
+            while texels_4x4(host, small) != want {
+                passes += 1;
+                assert!(passes <= 3, "still stale after {passes} passes");
+                let list = TitleList::new();
+                pass_in(heap.0, &list);
+                list.run();
+            }
+            assert_eq!(texels_4x4(host, big), vec![0x5555_5555; 16], "as it was");
+        }
+        assert_eq!(host.log_messages(), None);
+        drop(heap);
+        release(big);
+        release(small);
+    }
+
     /// A list's state with the title view heap `heap` bound (none: null).
     fn state(heap: This) -> State {
         let mut state = State::default();
@@ -5301,9 +5645,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         state
     }
 
-    /// Sets the heaps a pipeline with root SRVs gets, as `bind` does.
+    /// Sets the heaps a pipeline gets (the title's, XTP's own where it binds
+    /// none), as `bind` does.
     fn heaps(state: &mut State, list: &HostList) {
-        let wanted = state.wanted_heaps(true);
+        let wanted = state.wanted_heaps();
         state.set_host_heaps(list, wanted);
     }
 
@@ -5352,9 +5697,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let words = |at| read(at, 0);
         assert_eq!(words(Some(16)), bounded(4, WORDS), "in place");
-        // Past the list's copy budget, zeros (as before copies were made);
-        // views in place need none.
-        assert_eq!(read(Some(4), LIST_COPIES), vec![0; WORDS], "spent");
+        // Views in place consume no copy budget.
         assert_eq!(read(Some(16), LIST_COPIES), bounded(4, WORDS));
         assert_eq!(words(Some(4)), bounded(1, WORDS), "copied");
         assert_eq!(words(Some(20)), bounded(5, WORDS), "copied");
@@ -5397,9 +5740,81 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(got, bounded(1, 63));
     }
 
-    /// A list that binds no view heap reads its root SRVs through tables in
-    /// XTP's own heap (the console needs none for root views), and keeps
-    /// that heap for draws without root SRVs until the title binds one.
+    /// A root SRV's one-view table in place views the rest of its buffer,
+    /// not 4 MiB of it (Watch 443, VIctory #1671): a shader reading 6 MiB
+    /// past the SRV reads the buffer there, as on the console.
+    #[test]
+    fn root_srv_tables_read_past_4_mib() {
+        const FAR: usize = 6 << 20;
+        let test = "draw::tests::root_srv_tables_read_past_4_mib";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let near = Reader::new(host, ReaderView::TableSrv);
+        let source = format!(
+            "ByteAddressBuffer src : register(t0, space1);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(128, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    dst.Store(id.x * 4, src.Load({FAR} + id.x * 4));
+}}"
+        );
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("far root view test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the test kernel compiles");
+        let code = code.expect("compiled code");
+        // SAFETY: the code and the root signature (the near reader's: the
+        // same views) live through the call.
+        let pso = unsafe {
+            host.device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&near.root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.GetBufferPointer(),
+                        BytecodeLength: code.GetBufferSize(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let far = Reader {
+            root: near.root.clone(),
+            pso,
+        };
+        let heap = TestHeap::views(16);
+        let src = TitleBuffer::new(8 << 20);
+        src.set_words(pattern);
+        let list = TitleList::new();
+        let mut state = state(heap.0);
+        let got = far.read(&list, |l| {
+            heaps(&mut state, l);
+            table(&mut state, l, Some(src.address() + 16))
+        });
+        let want: Vec<u32> = (0..WORDS).map(|i| pattern(4 + FAR / 4 + i)).collect();
+        assert_eq!(got, want);
+    }
+
+    /// A list binds XTP's own heap in each slot the title binds no hosted
+    /// heap of (the console needs none for root views), both before a
+    /// directly indexed root signature; root SRVs are read through tables
+    /// in its own view heap. A title heap takes its slot over; setting the
+    /// heaps again with the same ones does nothing.
     #[test]
     fn lists_without_a_view_heap_use_xtps_own() {
         let test = "draw::tests::lists_without_a_view_heap_use_xtps_own";
@@ -5412,17 +5827,53 @@ void main(uint3 id : SV_DispatchThreadID) {
         src.set_words(pattern);
         let list = TitleList::new();
         let mut state = state(std::ptr::null());
-        assert_eq!(state.wanted_heaps(false), [0, 0]);
-        assert_eq!(state.wanted_heaps(true), [OWN_VIEW_HEAP, 0]);
+        // Without heaps of the title's, XTP's own: a root signature that
+        // indexes both heaps directly needs both bound.
+        assert_eq!(state.wanted_heaps(), [OWN_VIEW_HEAP, OWN_SAMPLER_HEAP]);
         let got = reader.read(&list, |l| {
             heaps(&mut state, l);
             table(&mut state, l, Some(src.address() + 64))
         });
         assert_eq!(got, bounded(16, WORDS));
-        assert_eq!(state.wanted_heaps(false), [OWN_VIEW_HEAP, 0], "kept");
+        assert_eq!(state.wanted_heaps(), [OWN_VIEW_HEAP, OWN_SAMPLER_HEAP]);
         let heap = TestHeap::views(16);
         state.set_heaps(&[heap.0]);
-        assert_eq!(state.wanted_heaps(true), [heap.0 as usize, 0]);
+        assert_eq!(state.wanted_heaps(), [heap.0 as usize, OWN_SAMPLER_HEAP]);
+    }
+
+    /// A title sampler heap takes the sampler slot and XTP's own view heap
+    /// the view one; with a view heap too, both are the title's. Setting the
+    /// same heaps again does nothing (the root signatures stay set), other
+    /// heaps reset them.
+    #[test]
+    fn title_sampler_heaps_take_their_slot() {
+        let test = "draw::tests::title_sampler_heaps_take_their_slot";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let views = TestHeap::views(16);
+        let samplers = TestHeap::samplers(16);
+        let (v, s) = (views.0 as usize, samplers.0 as usize);
+        let list = TitleList::new();
+        let mut state = State::default();
+        state.set_heaps(&[samplers.0]);
+        assert_eq!(state.wanted_heaps(), [OWN_VIEW_HEAP, s], "samplers alone");
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [OWN_VIEW_HEAP, s]);
+        state.set_heaps(&[views.0, samplers.0]);
+        assert_eq!(state.wanted_heaps(), [v, s], "views and samplers");
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [v, s]);
+        // The same heaps again: nothing is set, the root signatures stay.
+        state.host_roots = [1, 2];
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [v, s]);
+        assert_eq!(state.host_roots, [1, 2], "unchanged heaps");
+        // Other heaps: set, and the root signatures with them.
+        state.set_heaps(&[views.0]);
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [v, OWN_SAMPLER_HEAP]);
+        assert_eq!(state.host_roots, [0; 2], "changed heaps");
     }
 
     /// Root SRV views in place are shared across lists, by host copy and
@@ -5457,7 +5908,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Copies: the list's own, made again after work that may write.
         let copied = slot(&mut a, &la, Some(4));
         assert_eq!(slot(&mut a, &la, Some(4)), copied);
-        a.writes += 1;
+        src.shadow().gpu_writes(la.host(), src.address() + 4, 4);
         let again = slot(&mut a, &la, Some(4));
         assert_ne!(again, copied);
         assert_eq!(
@@ -5548,14 +5999,25 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (out, data) = host.shared_buffer(WORDS as u64 * 4).unwrap();
         let mut state = state(std::ptr::null());
         let first = host.new_list().unwrap();
+        let kernel = Kernel::new(host);
         let (mut gate, address) = pending_cbv_writer(host, &first);
         heaps(&mut state, &second);
         let cbv = state.root_cbv(&second, address).unwrap();
+        // A dispatch writes a disjoint range in the same shadow.
+        kernel.dispatch(
+            &second,
+            Pass::Fill,
+            address + 2 * CBV_SPAN,
+            address + CBV_SPAN,
+        );
         // Without reuse, these binds alone spend the whole list's budget.
         for _ in 0..LIST_COPIES / CBV_SPAN {
-            assert_eq!(state.root_cbv(&second, address), Some(cbv));
+            assert_eq!(state.root_cbv(&second, address), Ok(cbv));
         }
         assert_eq!(state.own.copied, CBV_SPAN);
+        let shifted = state.root_cbv(&second, address + 16).unwrap();
+        assert_ne!(shifted, cbv, "different source offset");
+        assert_eq!(state.own.copied, 2 * CBV_SPAN);
         // SAFETY: the mapped output lives through the dispatch.
         reader.dispatch(&second, Bind::Cbv(cbv), unsafe {
             out.GetGPUVirtualAddress()
@@ -5598,13 +6060,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         }];
         let (out, data) = host.shared_buffer(WORDS as u64 * 4).unwrap();
         let first = host.new_list().unwrap();
+        let kernel = Kernel::new(host);
         let (mut gate, address) = pending_cbv_writer(host, &first);
         let bind = |state: &mut State, index: u64, bytes: u32| {
             let handle = title.start + index * 32;
             let desc = [address as u32, (address >> 32) as u32, bytes, 0];
             crate::descriptor::create_cbv(std::ptr::null(), &desc, handle);
             state.set_table(true, 0, handle);
-            let made = state.tables(&list, &used, true);
+            let made = state.tables(&list, &used, true).unwrap();
             assert_eq!(made.len(), 1);
             (made[0].1 / 32) & !xtp_shader::emit::REMAPPED_SLOT
         };
@@ -5623,11 +6086,22 @@ void main(uint3 id : SV_DispatchThreadID) {
             256 + 512,
             "another table reuses the same bytes"
         );
+        let slots = views.dynamic_use().0;
+        for _ in 0..8 {
+            kernel.dispatch(&list, Pass::Fill, address + 2 * CBV_SPAN, address + 512);
+            assert_eq!(bind(&mut state, 1, 512), long);
+        }
+        assert_eq!(views.dynamic_use().0, slots);
+        assert_eq!(state.own.copied, 256 + 512);
         gate.open();
         host.drain();
+        let uploaded = bind(&mut state, 1, 512);
+        assert_ne!(uploaded, long, "the queued writer finished");
+        assert_eq!(bind(&mut state, 1, 512), uploaded);
+        assert_eq!(state.own.copied, 256 + 512);
         assert!(crate::shadow::write(&list, address, 0x1234, 4));
         let updated = bind(&mut state, 1, 512);
-        assert_ne!(updated, long, "the GPU write invalidates the earlier table");
+        assert_ne!(updated, uploaded, "the GPU write invalidates the upload");
         assert_eq!(state.own.copied, 256 + 2 * 512);
         // SAFETY: the mapped output lives through the dispatch.
         reader.dispatch(&list, Bind::Table(views.gpu_handle(updated)), unsafe {
@@ -5644,6 +6118,195 @@ void main(uint3 id : SV_DispatchThreadID) {
         want[0] = 0x1234;
         want[100] = 0x5678;
         assert_eq!(got, want);
+    }
+
+    /// A table's constant view reads its title bytes, then zeros to its
+    /// 256-byte end (the console reads zeros past a view's size), not what
+    /// earlier work left in the list's memory: in scratch memory filled at
+    /// submission, or in a copy on the GPU (a source shaders write). Views
+    /// of no address or no bytes are null ones and take no memory; views
+    /// over 64 KiB take 64 KiB.
+    #[test]
+    fn table_cbvs_read_zeros_past_their_size() {
+        let test = "draw::tests::table_cbvs_read_zeros_past_their_size";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let reader = Reader::new(host, ReaderView::TableCbv);
+        let heap = TestHeap::views(16);
+        let title = crate::descriptor::heap(heap.0);
+        let views = title.host().unwrap();
+        let src = TitleBuffer::new(1 << 20);
+        src.set_words(pattern);
+        let written = TitleBuffer::new(1 << 17);
+        written.set_words(pattern);
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            slot: 0,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+        }];
+        let list = host.new_list().unwrap();
+        // What an earlier recording left in the list's scratch memory (a
+        // list not running keeps its chunks through a reset).
+        const STALE: u64 = 1 << 20;
+        let (_, stale) = list.scratch(STALE).unwrap();
+        // SAFETY: `STALE` bytes of the list's mapped scratch memory.
+        unsafe { stale.write_bytes(0xff, STALE as usize) };
+        list.close();
+        list.reset();
+        let mut state = state(heap.0);
+        heaps(&mut state, &list);
+        let bind = |state: &mut State, index: u64, address: u64, bytes: u32| {
+            let handle = title.start + index * 32;
+            let desc = [address as u32, (address >> 32) as u32, bytes, 0];
+            crate::descriptor::create_cbv(std::ptr::null(), &desc, handle);
+            state.set_table(true, 0, handle);
+            let made = state.tables(&list, &used, true).unwrap();
+            assert_eq!(made.len(), 1);
+            (made[0].1 / 32) & !xtp_shader::emit::REMAPPED_SLOT
+        };
+        let scratch_at = |list: &HostList| list.scratch(256).unwrap().0;
+
+        // 32 bytes through scratch memory.
+        let scratch = bind(&mut state, 0, src.address(), 32);
+
+        // 32 bytes copied on the GPU, into memory of the list's own that a
+        // longer copy (a root CBV's) filled first.
+        let at = written.address() + 4096 + 16;
+        written.shadow().gpu_writes(&list, at, 4);
+        state.root_cbv(&list, at).unwrap();
+        assert_eq!(state.own.gpu.len(), 1);
+        assert_eq!(state.own.copied, CBV_SPAN);
+        (state.own.gpu[0].used, state.own.copied) = (0, 0);
+        state.cbv_copies.clear();
+        let copied = bind(&mut state, 1, at, 32);
+        assert_eq!(state.own.copied, 32, "copied on the GPU");
+
+        // Null views, which take no scratch memory.
+        let before = scratch_at(&list);
+        let nulls = [(2, 0, 0), (3, src.address(), 0), (4, 0, 256)]
+            .map(|(index, address, bytes)| bind(&mut state, index, address, bytes));
+        assert_eq!(scratch_at(&list), before + 256, "null views take no memory");
+
+        // A view of 969,472 bytes (a size seen in a title's stale slot).
+        let before = scratch_at(&list);
+        let big = bind(&mut state, 5, src.address(), 969_472);
+        assert_eq!(
+            scratch_at(&list),
+            before + 256 + CBV_SPAN,
+            "64 KiB of scratch memory"
+        );
+
+        let slots = [scratch, copied, nulls[0], nulls[1], nulls[2], big];
+        let bytes = WORDS as u64 * 4;
+        let (out, data) = host.shared_buffer(slots.len() as u64 * bytes).unwrap();
+        // SAFETY: a live buffer.
+        let out_at = unsafe { out.GetGPUVirtualAddress() };
+        for (k, &slot) in slots.iter().enumerate() {
+            let to = out_at + k as u64 * bytes;
+            reader.dispatch(&list, Bind::Table(views.gpu_handle(slot)), to);
+        }
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: the GPU finished writing the mapped output.
+        let got = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), slots.len() * WORDS) };
+        let got = |k: usize| &got[k * WORDS..(k + 1) * WORDS];
+        assert_eq!(got(0), bounded(0, 8), "scratch: zeros past 32 bytes");
+        // Its first word is the shader's (`gpu_writes`), which wrote none:
+        // the host copy keeps its zeros there.
+        let mut want = bounded((4096 + 16) / 4, 8);
+        want[0] = 0;
+        assert_eq!(got(1), want, "GPU copy: zeros past 32 bytes");
+        for k in 2..5 {
+            assert_eq!(got(k), [0; WORDS], "null view {k}");
+        }
+        assert_eq!(got(5), bounded(0, WORDS), "the first 64 KiB");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn cbv_copy_budget_rejects_new_gpu_inputs_and_preserves_earlier_binds() {
+        let test =
+            "draw::tests::cbv_copy_budget_rejects_new_gpu_inputs_and_preserves_earlier_binds";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let src = TitleBuffer::new(2 << 16);
+        let address = src.address() + 16;
+        let heap = TestHeap::views(300);
+        let title = crate::descriptor::heap(heap.0);
+        let list = TitleList::new();
+        let l = list.host();
+        let mut state = state(heap.0);
+        heaps(&mut state, l);
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            slot: 0,
+            table_offset_dwords: 299 * 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+        }];
+        let desc = [address as u32, (address >> 32) as u32, 256, 0];
+        crate::descriptor::create_cbv(std::ptr::null(), &desc, title.start + 299 * 32);
+        state.set_table(true, 0, title.start);
+        src.shadow().gpu_writes(l, address, 4);
+        // The root copy includes this newer write beyond the table's CBV.
+        src.shadow().gpu_writes(l, address + 256, 4);
+        let original = state.root_cbv(l, address).unwrap();
+        let table = state.tables(l, &used, true).unwrap();
+        let slots = title.host().unwrap().dynamic_use().0;
+        assert_eq!(slots, 300);
+        let kernel = Kernel::new(gpu.host());
+        for _ in 0..8 {
+            kernel.dispatch(l, Pass::Fill, address, address + CBV_SPAN);
+            assert_eq!(state.root_cbv(l, address), Ok(original));
+            assert_eq!(state.tables(l, &used, true).unwrap(), table);
+        }
+        assert_eq!(title.host().unwrap().dynamic_use().0, slots);
+        assert_eq!(state.own.copied, CBV_SPAN);
+        state.own.copied = LIST_COPIES;
+
+        // The current shader's outputs follow its bindings, regardless of
+        // the order its stages declare their views.
+        l.begin_shader_outputs();
+        src.shadow().gpu_writes(l, address, 4);
+        assert_eq!(state.root_cbv(l, address), Ok(original));
+        assert_eq!(state.tables(l, &used, true).unwrap(), table);
+        l.end_shader_outputs(true);
+        assert_eq!(
+            state.root_cbv(l, address),
+            Err("could not copy a CBV on the GPU")
+        );
+        let before = state.recording.checkpoint();
+        assert_eq!(
+            state.with_bind_descriptors(|s| s.tables(l, &used, true).map(|_| ())),
+            Err("could not copy a CBV on the GPU")
+        );
+        assert_eq!(
+            state.with_bind_descriptors(|s| s.root_srv_slot(l, Some(address + 4)).map(|_| ())),
+            Err("could not copy a misaligned root SRV")
+        );
+        assert_eq!(state.recording.checkpoint(), before);
+        assert!(state.root_srv_slots.is_empty());
+        let upload_address = address + CBV_SPAN + 256;
+        let upload = state.root_cbv(l, upload_address).expect("disjoint upload");
+        assert_eq!(state.root_cbv(l, upload_address), Ok(upload));
+        l.defer_copy(address as *mut u8, upload_address as *const u8, 4);
+        assert_eq!(state.root_cbv(l, upload_address), Ok(upload));
+        l.defer_copy(upload_address as *mut u8, address as *const u8, 4);
+        assert_ne!(state.root_cbv(l, upload_address).unwrap(), upload);
+        assert_eq!(state.own.copied, LIST_COPIES);
     }
 
     /// A root CBV reads its 64 KiB inside memory the list holds: in place
@@ -5674,15 +6337,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             (got, in_place)
         };
         assert_eq!(words(0), (bounded(0, WORDS), true), "in place");
-        // Past the list's copy budget, in place (unbounded, as before; not
-        // run, since the read would leave the host copy).
+        // Reject a bind that would read past the end of the host copy.
         let list = TitleList::new();
         let mut spent = state(std::ptr::null());
         spent.own.copied = LIST_COPIES;
         let address = src.address() + 4 * (END as u64 - 64);
         assert_eq!(
             spent.root_cbv(list.host(), address),
-            Some(copy.gpu(address))
+            Err("could not copy a CBV on the GPU")
         );
         assert_eq!(
             words(16),
@@ -6214,7 +6876,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                     .ClearRenderTargetView(host.rtv(tex, None), &[0.; 4], None);
             }
             painter.bind(list.host());
-            crate::testgpu::bind_indexed_heaps(host, list.host());
+            crate::testgpu::bind_indexed_heaps(list.host());
             let mut state = State::default();
             // Les deux ordres de liaison doivent sélectionner la même variante.
             if typed {
@@ -6688,7 +7350,13 @@ float4 ps(V v) : SV_Target { return v.color; }
                 state.picked.push(heap);
                 state.heap_textured.push(heap);
             }
-            state.fresh_tables.insert((0x40, 0), (3, None));
+            state.fresh_tables.insert(
+                (0x40, 0),
+                FreshTable {
+                    first: 3,
+                    constants: vec![],
+                },
+            );
         };
         let only_other = |state: &State| {
             assert!(state.root_srv_slots.keys().all(|k| k.0 == other));
