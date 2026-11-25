@@ -1436,13 +1436,49 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// [`dispatch_x_groups`] makes of them; otherwise they are groups, as in
 /// `Dispatch`. Each pair of flags and program is logged the first time
 /// ([`note_dispatch_x`]).
+///
+/// What the flags mean is a hypothesis drawn from evidence, without any
+/// console SDK material:
+/// - In the Series S world BTP 6 passes two values, `0x20` and `0x8020`,
+///   each with one compute program of its ray-tracing acceleration
+///   structure builder library (session dispatchx-a, 2026-11-25; neither
+///   program translates yet, so these dispatches are dropped). The library
+///   calls this method at 0x280 (newer lists' layout, [`newer_slot`]) with
+///   `y = z = 1` and a computed `x`.
+/// - Where the list has room, the same code writes the command itself: a
+///   header, `x`, 1, 1, then the flags. That is the layout of the public
+///   `DISPATCH_DIRECT` packet (Mesa's radv driver), whose last word is the
+///   command processor's `COMPUTE_DISPATCH_INITIATOR` register.
+/// - In that register's public layout (the Linux amdgpu headers,
+///   `gc_10_3_0_sh_mask.h`) bit 5 says the sizes are threads, not thread
+///   groups; bit 15 runs the program in 32-lane waves; bit 1, which BTP 6
+///   never sets, lets the last group of each dimension run only the
+///   threads left.
+/// - So the flags are taken as that register, and bit 5
+///   ([`USE_THREAD_DIMENSIONS`]) makes the counts threads. Without bit 1
+///   the command processor runs whole groups, the last one rounded up (radv
+///   dispatches rays that way and lets its shaders check their bounds):
+///   what the host runs too, so no thread needs masking. A dispatch with
+///   bit 1 is logged ([`PARTIAL_GROUPS`]): there the host runs threads the
+///   console would not.
+///
+/// `XTP_DISPATCH_X_THREADS` sets other bits (`0` for none: every count is
+/// a group count, as before).
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
     {
         let pipeline = kept_pipeline(this);
         let host = crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
         let group = host.and_then(console_group);
-        let groups = dispatch_x_groups([x, y, z], flags, thread_count_flags(), group);
+        let threads = thread_count_flags();
+        if flags & threads != 0 && flags & PARTIAL_GROUPS != 0 {
+            warn_once!(
+                flags = format_args!("{flags:#x}"),
+                "DispatchX with partial groups: the host runs the last group of each dimension \
+                 whole, threads the console would not run"
+            );
+        }
+        let groups = dispatch_x_groups([x, y, z], flags, threads, group);
         note_dispatch_x(pipeline, host, ([x, y, z], flags), group, groups);
         let [x, y, z] = groups;
         state::dispatch(this, x, y, z);
@@ -1454,9 +1490,18 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     }
 }
 
+/// The dispatch register's bit that makes the sizes thread counts (see
+/// [`dispatch_x`]).
+#[cfg(windows)]
+const USE_THREAD_DIMENSIONS: u32 = 1 << 5;
+/// The dispatch register's bit that lets the last group of each dimension
+/// run only the threads left (see [`dispatch_x`]).
+#[cfg(windows)]
+const PARTIAL_GROUPS: u32 = 1 << 1;
+
 /// The `DispatchX` flag bits that make its counts threads rather than
-/// thread groups: `XTP_DISPATCH_X_THREADS` (hexadecimal, `0x` optional),
-/// read once; none without it.
+/// thread groups: [`USE_THREAD_DIMENSIONS`], or `XTP_DISPATCH_X_THREADS`
+/// (hexadecimal, `0x` optional; `0` for none), read once.
 #[cfg(windows)]
 fn thread_count_flags() -> u32 {
     static FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -1473,12 +1518,12 @@ fn thread_count_flags() -> u32 {
     })
 }
 
-/// [`thread_count_flags`] from the variable's value: no bits when it is
-/// unset or not a hexadecimal number.
+/// [`thread_count_flags`] from the variable's value: [`USE_THREAD_DIMENSIONS`]
+/// when it is unset or not a hexadecimal number.
 #[cfg(windows)]
 fn parse_thread_count_flags(value: Option<&str>) -> u32 {
     let Some(value) = value.map(str::trim) else {
-        return 0;
+        return USE_THREAD_DIMENSIONS;
     };
     let digits = value
         .strip_prefix("0x")
@@ -1487,9 +1532,9 @@ fn parse_thread_count_flags(value: Option<&str>) -> u32 {
     u32::from_str_radix(digits, 16).unwrap_or_else(|_| {
         tracing::warn!(
             value,
-            "XTP_DISPATCH_X_THREADS is not a hexadecimal number: ignored"
+            "XTP_DISPATCH_X_THREADS is not a hexadecimal number: the default bits are kept"
         );
-        0
+        USE_THREAD_DIMENSIONS
     })
 }
 
@@ -2685,9 +2730,9 @@ mod tests {
         }
     }
 
-    /// A thread-count flag bit for the tests below (the switch's value).
+    /// The thread-count bit, as BTP 6 sets it (see [`dispatch_x`]).
     #[cfg(windows)]
-    const THREADS: u32 = 0x10;
+    const THREADS: u32 = USE_THREAD_DIMENSIONS;
 
     /// `DispatchX`'s counts are groups unless one of the switch's bits is
     /// in its flags; then they are threads, run as whole groups of the
@@ -2698,9 +2743,19 @@ mod tests {
         let row = Some([64, 1, 1]);
         assert_eq!(dispatch_x_groups([5, 2, 1], 0, THREADS, row), [5, 2, 1]);
         assert_eq!(
-            dispatch_x_groups([5, 2, 1], 0x4, THREADS, row),
+            dispatch_x_groups([5, 2, 1], 0x8000, THREADS, row),
             [5, 2, 1],
-            "another flag"
+            "32-lane waves only"
+        );
+        assert_eq!(
+            dispatch_x_groups([45, 1, 1], 0x8020, THREADS, row),
+            [1, 1, 1],
+            "BTP 6's 32-lane form: one group where 45 ran before"
+        );
+        assert_eq!(
+            dispatch_x_groups([45, 1, 1], THREADS | PARTIAL_GROUPS, THREADS, row),
+            [1, 1, 1],
+            "partial groups: still whole groups on the host"
         );
         assert_eq!(
             dispatch_x_groups([5, 2, 1], THREADS, 0, row),
@@ -2716,7 +2771,7 @@ mod tests {
             [16, 1, 1]
         );
         assert_eq!(
-            dispatch_x_groups([1025, 1, 1], THREADS | 0x4, THREADS, row),
+            dispatch_x_groups([1025, 1, 1], THREADS | 0x8000, THREADS, row),
             [17, 1, 1],
             "with another flag"
         );
@@ -2747,15 +2802,27 @@ mod tests {
         );
     }
 
+    /// The register's thread-count bit unless `XTP_DISPATCH_X_THREADS`
+    /// gives others, in hexadecimal; `0` for none.
     #[cfg(windows)]
     #[test]
     fn thread_count_flags_are_read_in_hexadecimal() {
-        assert_eq!(parse_thread_count_flags(None), 0);
+        assert_eq!(USE_THREAD_DIMENSIONS, 0x20);
+        assert_eq!(parse_thread_count_flags(None), USE_THREAD_DIMENSIONS);
+        assert_eq!(
+            parse_thread_count_flags(Some("0")),
+            0,
+            "none: counts are groups"
+        );
         assert_eq!(parse_thread_count_flags(Some("0x20")), 0x20);
         assert_eq!(parse_thread_count_flags(Some("0X1")), 1);
         assert_eq!(parse_thread_count_flags(Some(" 30 ")), 0x30);
-        assert_eq!(parse_thread_count_flags(Some("threads")), 0, "not a number");
-        assert_eq!(parse_thread_count_flags(Some("")), 0);
+        assert_eq!(
+            parse_thread_count_flags(Some("threads")),
+            USE_THREAD_DIMENSIONS,
+            "not a number: the default"
+        );
+        assert_eq!(parse_thread_count_flags(Some("")), USE_THREAD_DIMENSIONS);
     }
 
     /// `DispatchX`'s two forms on the host GPU.
@@ -2854,12 +2921,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             let (root, pso) = counting(host);
             let group = Some([8, 4, 1]);
             // Counts, flags, then the threads run and the extent they cover.
-            let cases: [([u32; 3], u32, u32, [u32; 3]); 5] = [
+            let cases: [([u32; 3], u32, u32, [u32; 3]); 6] = [
                 ([3, 2, 1], 0, 192, [24, 8, 1]),
-                ([2, 1, 1], 0x4, 64, [16, 4, 1]),
+                ([2, 1, 1], 0x8000, 64, [16, 4, 1]),
                 ([20, 5, 1], THREADS, 192, [24, 8, 1]),
                 ([16, 8, 1], THREADS, 128, [16, 8, 1]),
                 ([1, 1, 1], THREADS, 32, [8, 4, 1]),
+                ([45, 1, 1], 0x8000 | THREADS, 192, [48, 4, 1]),
             ];
             let buffers: Vec<TitleBuffer> = cases.iter().map(|_| TitleBuffer::new(256)).collect();
             let list = TitleList::new();
