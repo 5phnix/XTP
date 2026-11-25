@@ -319,6 +319,9 @@ impl Tracer<'_> {
 
     fn uniform_now(&self, v: Value) -> bool {
         let n = v.0 as usize;
+        if self.spill.bindings.contains_key(&v) {
+            return true;
+        }
         if let Some(reg) = self.inputs[n] {
             return matches!(reg, Reg::S(_)) && !is_exec(reg);
         }

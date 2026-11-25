@@ -13,6 +13,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 256,
         layout: vec![],
         used: vec![],
@@ -65,6 +66,7 @@ fn lower_wave(
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64,
+        float_mode: 0,
         vgprs: 256,
         layout,
         used,
@@ -162,6 +164,7 @@ fn perm_features(selector: u32) -> u64 {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 256,
         layout: vec![],
         used: vec![],
@@ -514,6 +517,7 @@ fn selects_from_independently_written_mask_words() {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64,
+            float_mode: 0,
             vgprs: 4,
             layout: vec![RootParam {
                 root: RootType::Table,
@@ -550,16 +554,6 @@ fn selects_from_independently_written_mask_words() {
         };
         for target in [wave32_only, crate::emit::Target::ANY] {
             let result = crate::emit::emit_for(&c, &native, &p, &st, &io, &res, target);
-            if uses_select && threads > 64 && !target.runs(64) {
-                assert!(matches!(
-                    result,
-                    Err(crate::ShaderError::Unsupported {
-                        what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
-                        ..
-                    })
-                ));
-                continue;
-            }
             let shader = result.unwrap();
             let emitted = crate::Container::parse(&shader.dxil).unwrap();
             let features = emitted.part(crate::FourCC::SFI0).unwrap();

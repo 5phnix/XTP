@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::frames::{after, before, strip_colours};
+
 /// The title's executable in its folder.
 const TITLE: &str = "game_scarlett_master.exe";
 /// Where the autopilot logs from.
@@ -469,41 +471,6 @@ fn pump(
             line.clear();
         }
     })
-}
-
-/// Without ANSI escape sequences (`ESC [ ... letter`).
-fn strip_colours(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if chars.next() == Some('[') {
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// The number written just before `label` (`30.0 fps`).
-fn before(line: &str, label: &str) -> Option<f64> {
-    let head = &line[..line.find(label)?];
-    head.rsplit(|c: char| c.is_whitespace() || c == '(')
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// The number written just after `label` (`dropped 12`).
-fn after(line: &str, label: &str) -> Option<f64> {
-    let tail = &line[line.find(label)? + label.len()..];
-    tail.split_whitespace().next()?.parse().ok()
 }
 
 /// Reads one figure of a frame-rate line.

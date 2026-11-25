@@ -17,6 +17,32 @@ use xtp_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SP
 use super::{Shader, Translated};
 use crate::host::host;
 
+trait PipelineCaps: crate::resource::format::Caps {
+    fn logic_op(&self, format: DXGI_FORMAT) -> bool;
+}
+
+impl PipelineCaps for crate::resource::format::HostCaps {
+    fn logic_op(&self, format: DXGI_FORMAT) -> bool {
+        let Some(host) = host() else { return false };
+        let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: the query writes the format support structure of the given size.
+        let result = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut data).cast(),
+                size_of_val(&data) as u32,
+            )
+        };
+        result.is_ok()
+            && data
+                .Support2
+                .contains(D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP)
+    }
+}
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -219,12 +245,12 @@ impl GraphicsState {
 
     /// Why the host cannot make a pipeline with this state (its target,
     /// depth and vertex formats, sample count, blending); `None` if it can.
-    pub(crate) fn refusal(&self, caps: &impl crate::resource::format::Caps) -> Option<String> {
+    fn refusal(&self, caps: &impl PipelineCaps) -> Option<String> {
         use crate::resource::format::uses::*;
         let count = self.samples.Count;
         let targets = (self.targets.NumRenderTargets as usize).min(8);
-        for (i, f) in self.targets.RTFormats[..targets].iter().enumerate() {
-            let f = f.0 as u32;
+        for (i, &format) in self.targets.RTFormats[..targets].iter().enumerate() {
+            let f = format.0 as u32;
             if f == 0 {
                 continue;
             }
@@ -244,6 +270,9 @@ impl GraphicsState {
                 return Some(format!(
                     "render target format {f}: no per-target logic operations"
                 ));
+            }
+            if blend.LogicOpEnable.as_bool() && !caps.logic_op(format) {
+                return Some(format!("render target format {f}: no logic operations"));
             }
             if !caps.samples(f, count) {
                 return Some(format!("render target format {f}: no {count} samples"));
@@ -340,26 +369,20 @@ fn integer_target(format: DXGI_FORMAT) -> bool {
     )
 }
 
-/// GFX10 sets CB_COLORn_INFO.BLEND_BYPASS for UINT and SINT. A shared
-/// descriptor only needs splitting when bound targets need different enables.
+/// GFX10 sets CB_COLORn_INFO.BLEND_BYPASS for UINT and SINT. ROP3 still
+/// applies to these targets. Split shared blending only for a mixed set.
 fn bypass_integer_blend(blend: &mut D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) {
     let formats = &targets.RTFormats[..targets.NumRenderTargets.min(8) as usize];
-    let disable = |t: &mut D3D12_RENDER_TARGET_BLEND_DESC| {
-        t.BlendEnable = false.into();
-        t.LogicOpEnable = false.into();
-    };
     if !blend.IndependentBlendEnable.as_bool() {
         let shared = blend.RenderTarget[0];
-        if !(shared.BlendEnable.as_bool() || shared.LogicOpEnable.as_bool())
-            || !formats.iter().any(|&f| integer_target(f))
-        {
+        if !shared.BlendEnable.as_bool() || !formats.iter().any(|&f| integer_target(f)) {
             return;
         }
         if formats
             .iter()
             .all(|&f| f == DXGI_FORMAT_UNKNOWN || integer_target(f))
         {
-            disable(&mut blend.RenderTarget[0]);
+            blend.RenderTarget[0].BlendEnable = false.into();
             return;
         }
         blend.RenderTarget = [shared; 8];
@@ -367,7 +390,7 @@ fn bypass_integer_blend(blend: &mut D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_
     }
     for (&f, t) in formats.iter().zip(&mut blend.RenderTarget) {
         if integer_target(f) {
-            disable(t);
+            t.BlendEnable = false.into();
         }
     }
 }
@@ -1314,6 +1337,7 @@ mod tests {
         let native = xtp_shader::NativeProgram {
             stage: xtp_shader::HwStage::Ms,
             wave64: true,
+            float_mode: 0,
             vgprs: 16,
             layout: Vec::new(),
             used: Vec::new(),
@@ -1597,6 +1621,12 @@ mod tests {
         }
     }
 
+    impl PipelineCaps for Fake {
+        fn logic_op(&self, format: DXGI_FORMAT) -> bool {
+            matches!(format, DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R16_UINT)
+        }
+    }
+
     const HOST: Fake = Fake {
         targets: &[28, 54, 57, 62, 64],
         blend: &[28],
@@ -1676,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_targets_bypass_only_their_own_blend_and_logic_enables() {
+    fn integer_targets_bypass_only_their_own_blend() {
         let mut shared = GraphicsState::default().blend;
         shared.AlphaToCoverageEnable = true.into();
         shared.RenderTarget[0].BlendEnable = true.into();
@@ -1696,41 +1726,81 @@ mod tests {
                 assert_eq!(g.blend.RenderTarget[integer], off);
                 assert_eq!(g.blend.RenderTarget[colour], t);
             }
-            let mut logic = shared;
-            logic.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
-                LogicOpEnable: true.into(),
-                LogicOp: D3D12_LOGIC_OP_XOR,
-                ..off
-            };
-            let all = blend_stream(&[0, 62, 64], logic, first);
-            assert_eq!(all.refusal(&HOST), None);
-            assert!(!all.blend.IndependentBlendEnable.as_bool());
-            assert_eq!(
-                all.blend.RenderTarget[0],
-                D3D12_RENDER_TARGET_BLEND_DESC {
-                    LogicOp: D3D12_LOGIC_OP_XOR,
-                    ..off
-                }
-            );
-            // D3D12 cannot express a logic operation on just the UNORM target.
-            let mixed = blend_stream(&[62, 28], logic, first);
-            assert_eq!(
-                mixed.refusal(&HOST).as_deref(),
-                Some("render target format 28: no per-target logic operations")
-            );
-
             let mut independent = shared;
             independent.IndependentBlendEnable = true.into();
-            independent.RenderTarget[1] = logic.RenderTarget[0];
+            independent.RenderTarget[1].BlendEnable = true.into();
             let g = blend_stream(&[28, 62], independent, first);
-            independent.RenderTarget[1].LogicOpEnable = false.into();
+            independent.RenderTarget[1].BlendEnable = false.into();
             assert_eq!(g.blend, independent);
             assert_eq!(g.refusal(&HOST), None);
         }
     }
 
     #[test]
+    fn shared_logic_op_is_preserved_and_checked_for_each_target() {
+        let mut logic = GraphicsState::default().blend;
+        logic.RenderTarget[0].LogicOpEnable = true.into();
+        logic.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+        for first in [true, false] {
+            let supported = blend_stream(&[0, 62, 57], logic, first);
+            assert_eq!(supported.blend, logic);
+            assert_eq!(supported.refusal(&HOST), None);
+
+            // The integer blend bypass also applies when the title sets both enables.
+            let mut both = logic;
+            both.RenderTarget[0].BlendEnable = true.into();
+            assert_eq!(blend_stream(&[62], both, first).blend, logic);
+
+            for unsupported in [28, 64] {
+                let mixed = blend_stream(&[62, unsupported], logic, first);
+                assert_eq!(mixed.blend, logic);
+                assert_eq!(
+                    mixed.refusal(&HOST),
+                    Some(format!(
+                        "render target format {unsupported}: no logic operations"
+                    ))
+                );
+            }
+
+            let mut independent = GraphicsState::default().blend;
+            independent.IndependentBlendEnable = true.into();
+            independent.RenderTarget[1] = logic.RenderTarget[0];
+            let per_target = blend_stream(&[28, 62], independent, first);
+            assert_eq!(per_target.blend, independent);
+            assert_eq!(
+                per_target.refusal(&HOST).as_deref(),
+                Some("render target format 62: no per-target logic operations")
+            );
+        }
+    }
+
+    #[test]
     fn r8_uint_pipeline_writes_the_pixel_shader_value_unblended() {
+        let mut blend = GraphicsState::default().blend;
+        blend.RenderTarget[0].BlendEnable = true.into();
+        // With these factors the destination would keep its clear value.
+        blend.RenderTarget[0].SrcBlend = D3D12_BLEND_ZERO;
+        blend.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+        check_r8_uint_draw(
+            "r8_uint_pipeline_writes_the_pixel_shader_value_unblended",
+            blend,
+            73,
+        );
+    }
+
+    #[test]
+    fn r8_uint_pipeline_xors_the_pixel_shader_value_with_the_target() {
+        let mut blend = GraphicsState::default().blend;
+        blend.RenderTarget[0].LogicOpEnable = true.into();
+        blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+        check_r8_uint_draw(
+            "r8_uint_pipeline_xors_the_pixel_shader_value_with_the_target",
+            blend,
+            73 ^ 11,
+        );
+    }
+
+    fn check_r8_uint_draw(test: &str, blend: D3D12_BLEND_DESC, expected: u8) {
         use crate::object::{This, slot};
         use crate::resource::tests_support::{committed, read_back, target};
         use windows::Win32::Foundation::RECT;
@@ -1738,9 +1808,7 @@ mod tests {
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, Fxc::D3DCompile,
         };
         use windows::core::s;
-        let Some(host) =
-            crate::testgpu::device("r8_uint_pipeline_writes_the_pixel_shader_value_unblended")
-        else {
+        let Some(host) = crate::testgpu::device(test) else {
             return;
         };
         let shader = |stage, kind, source: &str, profile| {
@@ -1804,11 +1872,6 @@ mod tests {
             "uint main() : SV_Target { return 73u; }",
             s!("ps_5_1"),
         );
-        let mut blend = GraphicsState::default().blend;
-        blend.RenderTarget[0].BlendEnable = true.into();
-        // With these factors the destination would keep its clear value.
-        blend.RenderTarget[0].SrcBlend = D3D12_BLEND_ZERO;
-        blend.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
         let mut g = blend_stream(&[62], blend, false);
         g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
@@ -1852,7 +1915,7 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(image, 0x10)(image);
         assert_eq!(
             &bytes[..2],
-            &[73, 11],
+            &[expected, 11],
             "drawn pixel and untouched neighbour"
         );
     }

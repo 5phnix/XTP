@@ -330,14 +330,12 @@ impl Host {
         }
     }
 
-    /// For GPU tests outside this module: holds the host queue as
-    /// [`super::submissions::Gate`] does. What is submitted next stays in
-    /// flight on the GPU until the returned function is called or dropped
-    /// (or 20 s have passed).
+    /// Before the first submission in an isolated test, leave write-backs
+    /// pending until a caller settles them, even if the GPU is already done.
     #[cfg(test)]
-    pub(crate) fn hold_queue(&self) -> impl FnOnce() {
-        let mut gate = super::submissions::Gate::close(self);
-        move || gate.open()
+    pub(crate) fn finish_on_caller(&self) {
+        assert!(!self.finisher.is_completed());
+        self.finisher.call_once(|| {});
     }
 }
 

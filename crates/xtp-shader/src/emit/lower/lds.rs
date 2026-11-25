@@ -271,7 +271,10 @@ impl<'a> Lower<'a> {
             // next one. The halves are two host waves, both here (console
             // flow): a group barrier before each LDS access puts it after
             // every earlier one, whichever half made it.
-            let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+            // Paired lanes run in one host wave. Fence their shared
+            // accesses without synchronising independent console waves.
+            let sync = u32::from(!self.s.m.paired_lanes());
+            let (mode, void) = (self.s.m.i32(sync | 8), self.s.t.void);
             self.s
                 .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
@@ -554,6 +557,7 @@ mod tests {
         let n = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
+            float_mode: 0,
             vgprs: 16,
             layout: vec![table(0, 1), table(1, 2)],
             used: vec![used(ResourceType::Srv, 0, 1), used(ResourceType::Uav, 1, 2)],
