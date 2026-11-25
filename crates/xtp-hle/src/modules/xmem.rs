@@ -877,6 +877,37 @@ fn opened(section: &Section, index: usize, n: usize) {
     }
 }
 
+/// For DirectStorage's statistics (`XTP_MESH_STATS`), read only: of the
+/// pages behind bytes `[offset, offset + len)` of `pages`, how many there
+/// are, how many the title shows (at least one view), how many at more than
+/// one address, and at how many addresses those are shown in all: each is
+/// one `opened` opens after a write, while the GPU side guards anything.
+/// Zeros if a page is unknown.
+pub(crate) fn title_views(
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+) -> (usize, usize, usize, usize) {
+    let Some(runs) = runs(pages, offset, len) else {
+        return (0, 0, 0, 0);
+    };
+    let a = aliases();
+    let mut out = (0, 0, 0, 0);
+    for (slice, n) in &runs {
+        let key = Arc::as_ptr(&slice.section) as usize;
+        for index in slice.index..slice.index + n {
+            let shown = a.by_page.get(&(key, index)).map_or(0, Vec::len);
+            out.0 += 1;
+            out.1 += usize::from(shown > 0);
+            if shown > 1 {
+                out.2 += 1;
+                out.3 += shown;
+            }
+        }
+    }
+    out
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,

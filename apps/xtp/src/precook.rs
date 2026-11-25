@@ -32,11 +32,17 @@
 //!   as does `--force`. The host rejects the pipeline library after a
 //!   driver update, which the note does not see: `--force` then.
 //! - Generations: after a translator change (the note's key is another),
-//!   or once the library file passes `LIBRARY_REBUILD_BYTES`, the pass
-//!   makes the library a new generation, which holds what it makes and
-//!   nothing of the translators before (`xtp_gpu::pipeline::precook`).
+//!   or once the library file passes `LIBRARY_REBUILD_BYTES` (since the
+//!   pass the note is of, or to twice its size then), the pass makes the
+//!   library a new generation, which holds what it makes and nothing of the
+//!   translators before (`xtp_gpu::pipeline::precook`). This is looked at
+//!   before the note: a library that grew past its bound makes a whole
+//!   pass even when the note still holds.
+//! - The note says the kept descriptions that were made again: the file as
+//!   the precook read it, not as it is at the end, which a session may
+//!   have added to meanwhile (the next precook makes those).
 //! - A pass whose library is not saved, or whose kept descriptions are not
-//!   read, writes no note.
+//!   read, writes no note and fails (its exit code says so).
 //! - The kept pipelines take at most `XTP_PRECOOK_SECONDS` (default
 //!   [`REPLAY_SECONDS`]): those not started by then are left to the
 //!   session, and the note is not written, so the next precook goes on
@@ -177,7 +183,11 @@ fn precook(o: Options) -> Result<()> {
     let found = std::fs::read_to_string(&note_path)
         .ok()
         .and_then(|text| Note::parse(&text));
-    let plan = if o.force {
+    // Whether the library is made a new generation comes first: a library
+    // that grew past its bound while the note still holds is one too.
+    let generation = note.new_generation(found.as_ref(), gpu::LIBRARY_REBUILD_BYTES);
+    let plan = if o.force || generation.is_some() {
+        // A new generation holds what this pass makes: all of it.
         Plan::Whole
     } else {
         note.plan(found.as_ref())
@@ -189,24 +199,14 @@ fn precook(o: Options) -> Result<()> {
         );
         return Ok(());
     }
-    let library_bytes = note.pipelines.as_ref().map_or(0, |c| c.library);
-    let rebuild = o.pipelines
-        && (found.as_ref().is_some_and(|f| f.key != note.key)
-            || library_bytes > gpu::LIBRARY_REBUILD_BYTES);
-    // A new generation holds what this pass makes: all of it.
-    let plan = if rebuild { Plan::Whole } else { plan };
-    if rebuild {
+    if let Some(why) = generation {
         anyhow::ensure!(
             gpu::rebuild_library(),
             "the pipeline library was opened before its new generation"
         );
         println!(
-            "library      a new generation ({}; {library_bytes} bytes before)",
-            if found.as_ref().is_some_and(|f| f.key != note.key) {
-                "another translator"
-            } else {
-                "past its bound"
-            }
+            "library      a new generation ({why}; {} bytes before)",
+            note.pipelines.as_ref().map_or(0, |c| c.library)
         );
     }
     let opening = Instant::now();
@@ -251,33 +251,41 @@ fn precook(o: Options) -> Result<()> {
             gpu::refusals()
         )
     );
-    // The note only after a whole pass: refusals are answers kept in the
-    // cache too, so a pass with some is whole; one whose kept pipelines
-    // ran out of time or were not read is not, nor one whose library was
-    // not saved. What it came from is read again: the precook rewrites the
-    // kept descriptions past their bound, and saves the library.
-    let whole = replay
-        .as_ref()
-        .is_none_or(|r| r.left == 0 && r.error.is_none());
-    match (&saved, whole) {
-        (Err(e), _) => {
-            println!("note         not written: the pipeline library was not saved ({e})")
-        }
-        (Ok(()), false) => {
-            println!("note         not written: the kept pipelines are not all made")
-        }
-        (Ok(()), true) => {
-            let done = Note {
-                pipelines: cache(o.pipelines)?,
-                ..note
-            };
-            write_atomically(&note_path, done.text().as_bytes())
-                .with_context(|| format!("writing {}", note_path.display()))?;
-        }
-    }
     if let Some(out) = &o.list {
         std::fs::write(out, list(&pass)).with_context(|| format!("writing {}", out.display()))?;
         println!("list         {}", out.display());
+    }
+    // The note only after a whole pass: refusals are answers kept in the
+    // cache too, so a pass with some is whole; one whose kept pipelines
+    // ran out of time is not, nor one whose kept descriptions were not read
+    // or whose library was not saved, which fail. It says the descriptions
+    // that were made again: the file as the replay read it (after its
+    // rewrite), not as it is now, which a session may have added to
+    // meanwhile; and the library file as it is after its save.
+    match (&saved, replay.as_ref().and_then(|r| r.error.as_ref())) {
+        (Err(e), _) => {
+            println!("note         not written: the pipeline library was not saved");
+            anyhow::bail!("the pipeline library was not saved: {e}");
+        }
+        (Ok(()), Some(e)) => {
+            println!("note         not written: the kept pipelines were not read");
+            anyhow::bail!("the kept pipelines were not read: {e}");
+        }
+        (Ok(()), None) if replay.as_ref().is_some_and(|r| r.left > 0) => {
+            println!("note         not written: the kept pipelines are not all made");
+        }
+        (Ok(()), None) => {
+            let pipelines = match (cache(o.pipelines)?, &replay) {
+                (Some(now), Some(r)) => Some(Cache {
+                    recorded: r.digest.clone(),
+                    library: now.library,
+                }),
+                (now, _) => now,
+            };
+            let done = Note { pipelines, ..note };
+            write_atomically(&note_path, done.text().as_bytes())
+                .with_context(|| format!("writing {}", note_path.display()))?;
+        }
     }
     Ok(())
 }
@@ -370,6 +378,22 @@ impl Note {
             pipelines,
         };
         (note.text() == text).then_some(note)
+    }
+
+    /// Why this pass makes the pipeline library a new generation, if it does
+    /// (with pipelines only): another translator than the one `found`
+    /// notes, or a library file past `bound` that grew past it since that
+    /// pass, or to twice its size then. A library already past the bound
+    /// after a new generation holds the title's pipelines of this
+    /// translator: making it again would not shrink it.
+    fn new_generation(&self, found: Option<&Note>, bound: u64) -> Option<&'static str> {
+        let now = self.pipelines.as_ref()?.library;
+        if found.is_some_and(|f| f.key != self.key) {
+            return Some("another translator");
+        }
+        let then = found.and_then(|f| f.pipelines.as_ref()).map(|c| c.library);
+        (now > bound && then.is_none_or(|then| then <= bound || now >= then.saturating_mul(2)))
+            .then_some("past its bound")
     }
 
     /// What this pass has to do after the one `found` notes: nothing if it
@@ -600,6 +624,13 @@ struct Replay {
     /// The file was rewritten past its bound: its size before, and the
     /// descriptions that went.
     compacted: Option<(u64, usize)>,
+    /// The file was of an earlier version, started again: its size.
+    earlier: Option<u64>,
+    /// The file is past its bound but another process has it open.
+    not_compacted: bool,
+    /// The BLAKE3 of the file as read (the descriptions made), for the
+    /// note.
+    digest: String,
 }
 
 impl Replay {
@@ -666,6 +697,9 @@ fn replay(threads: usize, machine: Option<&Machine>, bound: Duration) -> Replay 
     out.repeated = recorded.repeated;
     out.path = recorded.path.clone();
     out.compacted = recorded.compacted;
+    out.earlier = recorded.earlier;
+    out.not_compacted = recorded.not_compacted;
+    out.digest = recorded.digest.clone();
     if !recorded.is_empty() {
         println!(
             "precook: {} graphics and mesh pipelines kept by sessions ({} s at most)",
@@ -945,6 +979,18 @@ fn replay_lines(r: &Replay) -> String {
             "  {dropped:>7}  dropped when the file was rewritten ({before} bytes before; the oldest go first)"
         );
     }
+    if let Some(before) = r.earlier {
+        let _ = writeln!(
+            o,
+            "  the file was of an earlier version ({before} bytes): started again, sessions keep their pipelines anew"
+        );
+    }
+    if r.not_compacted {
+        let _ = writeln!(
+            o,
+            "  the file is past its bound but another process has it open: rewritten by a later precook"
+        );
+    }
     for (n, what) in [
         (r.missing, "without their containers"),
         (r.damaged, "that do not read back"),
@@ -1170,6 +1216,50 @@ mod tests {
             None
         );
         assert_eq!(Note::parse(&format!("{text}more\n")), None);
+    }
+
+    /// A new generation for another translator, or for a library that grew
+    /// past its bound, whatever the rest of the note says (a session that
+    /// adds compute pipelines alone leaves the note as it was); not for one
+    /// that a new generation left past the bound, until it doubles.
+    #[test]
+    fn a_library_past_its_bound_is_made_again_before_the_note_holds() {
+        let note = |key: &str, library| Note {
+            key: key.into(),
+            pack: "pack".into(),
+            pipelines: Some(Cache {
+                recorded: "01".into(),
+                library,
+            }),
+        };
+        let bound = 2000;
+        let then = note("k", 1500);
+        assert_eq!(note("k", 1800).new_generation(Some(&then), bound), None);
+        let grown = note("k", 2500);
+        assert_eq!(grown.plan(Some(&then)), Plan::Nothing, "the note holds");
+        assert_eq!(
+            grown.new_generation(Some(&then), bound),
+            Some("past its bound"),
+            "looked at first"
+        );
+        assert_eq!(
+            note("j", 10).new_generation(Some(&then), bound),
+            Some("another translator")
+        );
+        assert_eq!(grown.new_generation(None, bound), Some("past its bound"));
+        // A new generation that is past the bound by itself.
+        let big = note("k", 3000);
+        assert_eq!(note("k", 3500).new_generation(Some(&big), bound), None);
+        assert_eq!(
+            note("k", 6000).new_generation(Some(&big), bound),
+            Some("past its bound")
+        );
+        // Without pipelines, the library is not this pass's business.
+        let without = Note {
+            pipelines: None,
+            ..note("j", 0)
+        };
+        assert_eq!(without.new_generation(Some(&then), bound), None);
     }
 
     #[test]

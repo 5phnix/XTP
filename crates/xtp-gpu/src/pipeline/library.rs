@@ -338,6 +338,10 @@ pub(crate) enum Saved {
 /// takes the lock every load waits for, and the cache's library had grown
 /// to 2.3 GB (2026-11-25), which a session wrote again every 20 s while it
 /// drew new pipelines that the library already held.
+///
+/// One save at a time ([`write_library`]): a worker's gives way to one
+/// under way, one asked `now` (at the end of a run or of a precook) waits
+/// for it.
 pub(crate) fn save(now: bool) -> Saved {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -351,8 +355,10 @@ pub(crate) fn save(now: bool) -> Saved {
         }
         *last = Some(std::time::Instant::now());
     }
-    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-    let saved = write_library(library, dir, |bytes| {
+    let saved = write_library(library, dir, now, |bytes| {
+        // Under the save's lock: whether the list changed since the last
+        // save that wrote it.
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
         if bytes.is_none() && !used_changed {
             return Ok(false);
         }
@@ -363,7 +369,12 @@ pub(crate) fn save(now: bool) -> Saved {
             .flatten()
             .cloned()
             .collect();
-        write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())?;
+        if let Err(e) = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+            if used_changed {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+            }
+            return Err(e);
+        }
         tracing::info!(
             library = bytes.is_some(),
             bytes = bytes.unwrap_or(0),
@@ -380,9 +391,6 @@ pub(crate) fn save(now: bool) -> Saved {
     });
     if let Saved::Failed(e) = &saved {
         tracing::warn!(error = %e, "host pipeline library not saved");
-        if used_changed {
-            USED_CHANGED.store(true, Ordering::Relaxed);
-        }
     }
     saved
 }
@@ -391,11 +399,27 @@ pub(crate) fn save(now: bool) -> Saved {
 /// `then` with its size (`None`: none written), which says whether it
 /// wrote something too. The pipelines the library holds stop counting as
 /// added once both are done, not before.
+///
+/// One at a time, from what it serialises to that count: two at once would
+/// both write what was added before them, then both stop counting it (the
+/// count would wrap), and share the temporary files. With `wait`, it waits
+/// for one under way; without, it gives way to it ([`Saved::Nothing`]).
 fn write_library(
     library: &RwLock<Library>,
     dir: &std::path::Path,
+    wait: bool,
     then: impl FnOnce(Option<usize>) -> std::io::Result<bool>,
 ) -> Saved {
+    static SAVING: Mutex<()> = Mutex::new(());
+    let _saving = if wait {
+        SAVING.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match SAVING.try_lock() {
+            Ok(saving) => saving,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Saved::Nothing,
+        }
+    };
     let serialised = {
         // Alone: no store between the size and the bytes.
         let l = library.write().unwrap_or_else(|e| e.into_inner());
@@ -434,7 +458,8 @@ fn write_library(
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part.
+/// `path`: a reader never sees a part. One save at a time uses it
+/// ([`save`]).
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
@@ -636,20 +661,22 @@ mod tests {
         let not_a_folder = dir.path().join("pipelines");
         std::fs::write(&not_a_folder, b"in the way").unwrap();
         assert!(matches!(
-            write_library(&library, &not_a_folder, |_| Ok(true)),
+            write_library(&library, &not_a_folder, true, |_| Ok(true)),
             Saved::Failed(_)
         ));
         assert_eq!(library.read().unwrap().added.load(Ordering::Relaxed), 2);
         // The early list not written: neither is the save.
         let good = dir.path().join("cache");
         assert!(matches!(
-            write_library(&library, &good, |_| Err(std::io::Error::other("full"))),
+            write_library(&library, &good, true, |_| Err(std::io::Error::other(
+                "full"
+            ))),
             Saved::Failed(_)
         ));
         assert_eq!(library.read().unwrap().added.load(Ordering::Relaxed), 2);
         let mut size = None;
         assert_eq!(
-            write_library(&library, &good, |bytes| {
+            write_library(&library, &good, true, |bytes| {
                 size = bytes;
                 Ok(true)
             }),
@@ -659,10 +686,53 @@ mod tests {
         let written = std::fs::metadata(good.join(LIBRARY_FILE)).unwrap().len();
         assert_eq!(Some(written as usize), size);
         assert_eq!(
-            write_library(&library, &good, |_| Ok(false)),
+            write_library(&library, &good, true, |_| Ok(false)),
             Saved::Nothing,
             "nothing new"
         );
+    }
+
+    /// Two saves at once: one asked to wait writes after the one under way,
+    /// which counts what it wrote first, so that what was added stops
+    /// counting once and the count does not wrap; one that does not wait
+    /// gives way.
+    #[test]
+    fn saves_at_once_count_what_they_wrote_once() {
+        let test = "pipeline::library::tests::saves_at_once_count_what_they_wrote_once";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let library = RwLock::new(open(&device, Vec::new()).unwrap());
+        library.read().unwrap().added.store(2, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let (inside, go) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                write_library(&library, dir.path(), true, |_| {
+                    inside.wait();
+                    go.wait();
+                    Ok(true)
+                })
+            });
+            inside.wait();
+            // The first is between its write and its count.
+            assert_eq!(
+                write_library(&library, dir.path(), false, |_| Ok(true)),
+                Saved::Nothing,
+                "gives way"
+            );
+            let second = s.spawn(|| write_library(&library, dir.path(), true, |_| Ok(false)));
+            go.wait();
+            assert_eq!(first.join().unwrap(), Saved::Written);
+            assert_eq!(
+                second.join().unwrap(),
+                Saved::Nothing,
+                "nothing new by then"
+            );
+        });
+        assert_eq!(library.read().unwrap().added.load(Ordering::Relaxed), 0);
     }
 
     /// A new generation takes what is asked for from the one before, and
@@ -679,7 +749,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let saved = |library: &RwLock<Library>| {
             assert_eq!(
-                write_library(library, dir.path(), |_| Ok(true)),
+                write_library(library, dir.path(), true, |_| Ok(true)),
                 Saved::Written
             );
             std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap()
