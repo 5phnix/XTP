@@ -36,9 +36,10 @@ fn run_parent() {
         .env_remove("XTP_RELAUNCHED_FROM")
         .status()
         .expect("spawn initial child");
-    assert!(
-        !status.success(),
-        "initial child should terminate with a fault"
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "initial child should terminate with exit code 1 after spawning its replacement"
     );
 
     // Wait for the restarted grandchild to start and log its PID.
@@ -58,21 +59,49 @@ fn run_parent() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Deterministically wait for the restarted grandchild to fault and exit so
-    // it is never left running and we know no third launch occurred.
-    if let Some(pid) = grandchild_pid {
-        use windows_sys::Win32::Foundation::CloseHandle;
+    // Deterministically wait for the restarted grandchild to fault and exit,
+    // killing it if the wait times out. Asserting its exit code is
+    // STATUS_ACCESS_VIOLATION (0xC0000005) proves it did not take the
+    // crash-restart path (which exits with 1) and therefore spawned no third
+    // process.
+    let pid = grandchild_pid.expect("restarted grandchild never logged its PID");
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
         };
-        // SAFETY: opening the grandchild PID for SYNCHRONIZE only.
-        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        // SAFETY: opening the grandchild PID to wait, query exit code, or kill
+        // on timeout.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
         if !handle.is_null() {
             // SAFETY: valid process handle returned by `OpenProcess`.
-            unsafe {
-                WaitForSingleObject(handle, 10_000);
-                CloseHandle(handle);
+            let wait = unsafe { WaitForSingleObject(handle, 10_000) };
+            if wait != WAIT_OBJECT_0 {
+                // SAFETY: terminating a timed-out test grandchild.
+                unsafe {
+                    TerminateProcess(handle, 1);
+                    CloseHandle(handle);
+                }
+                panic!("restarted grandchild (pid={pid}) did not exit within 10 s");
             }
+            let mut exit_code = 0u32;
+            // SAFETY: querying exit code of the exited grandchild handle.
+            let got = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+            // SAFETY: closing the handle from `OpenProcess`.
+            unsafe { CloseHandle(handle) };
+            assert_ne!(got, 0, "GetExitCodeProcess failed");
+            assert_eq!(
+                exit_code, STATUS_ACCESS_VIOLATION,
+                "grandchild should exit with STATUS_ACCESS_VIOLATION (not relaunch again), got {exit_code:#x}"
+            );
         }
     }
 

@@ -175,9 +175,10 @@ extern "system" fn write_event(
     S_OK
 }
 
-/// `TITLE_IID` exposes the three `XGame.h` functions in declaration order after
-/// `IUnknown`: `XGameGetXboxTitleId` (0x18), `XLaunchNewGame` (0x20), and
-/// `XLaunchRestartOnCrash` (0x28).
+/// `TITLE_IID` vtable: `XGameGetXboxTitleId` (0x18) and `XLaunchNewGame` (0x20)
+/// are confirmed; `XLaunchRestartOnCrash` at slot 0x28 is inferred from
+/// `XGame.h` declaration order after `IUnknown`, not confirmed against a live
+/// call site.
 static TITLE_VTABLE: Methods<6> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),

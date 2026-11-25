@@ -177,7 +177,7 @@ Legend: ✔ implemented and tested, ◐ partial, ✘ missing, — not needed.
 | Speech synthesis | ✔ Windows voices, text and SSML to 48 kHz PCM | → PC runtime | 4 / — | Done (R6) |
 | Closed captions, high contrast | ✔ Windows settings and title override | ✔ `accessibility.rs` | 5 / 3 | Done (R7) |
 | XError callback and options | ✘ class absent | ✔ | — / — | After xcl, if the title asks (R9) |
-| Relaunch (`XLaunchNewGame`), restart on crash | ✔ `XLaunchRestartOnCrash` tested; `XLaunchNewGame` untested live | ✔ both | 5 (lifecycle + `restart_on_crash`) / — | Partial (R10) |
+| Relaunch (`XLaunchNewGame`), restart on crash | ◐ `XLaunchRestartOnCrash` tested; `XLaunchNewGame` untested live | ✔ both | 5 (lifecycle + `restart_on_crash`) / — | Partial (R10) |
 | HDR, URIs, deferrals, screenshots | ✔ | ◐ | 1 / — | Keep XTP |
 
 ### 4.3 Audio
@@ -374,8 +374,8 @@ shows the title calls them.
 
 ### R10. Relaunch and restart on crash, live — S (restart-on-crash done; live relaunch untested)
 - **Goal:** confirm `XLaunchNewGame` (wait for the old process, start again
-  with the arguments) on the real title, and add `XLaunchRestartOnCrash`
-  (record the arguments; the crash reporter relaunches once).
+  with the arguments) on the real title. `XLaunchRestartOnCrash` (record the
+  arguments; the crash reporter relaunches once) is done.
 - **Files:** `crates/xtp-hle/src/modules/xgame.rs`, `modules/lifecycle.rs`,
   `apps/xtp/src/run.rs` (relaunch path).
 - **xcl ref:** `hle/xgameruntime/api.rs` `XLaunchNewGame`,

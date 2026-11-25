@@ -276,7 +276,14 @@ pub fn relaunch_on_crash() {
         return;
     };
     if relaunch_with_env(args, Some((CRASH_RESTARTED, "1"))) {
-        end_with(1);
+        // Terminate directly from the crash filter without running normal
+        // shutdown hooks (saving the pipeline cache or releasing input could
+        // deadlock if the faulting thread holds an internal lock).
+        // SAFETY: terminating our own crashing process after spawning the
+        // replacement; exit code 1 distinguishes a crash-restart exit.
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 1);
+        }
     }
 }
 
@@ -352,17 +359,13 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
-    end_with(0);
-}
-
-fn end_with(code: u32) {
     // A held cursor would outlive us.
     super::gameinput::release_mouse();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     xtp_gpu::pipeline::save_pipeline_cache();
     // SAFETY: ends this process, as the console ends a suspended title.
-    unsafe { TerminateProcess(GetCurrentProcess(), code) };
+    unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
 
 pub(crate) fn module() -> HleModule {
