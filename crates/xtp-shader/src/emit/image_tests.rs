@@ -1432,6 +1432,31 @@ fn forms_without_an_sm_6_6_equivalent_name_why() {
             false,
             "a comparison sample with explicit derivatives",
         ),
+        (
+            "image_sample_c_cd_g16",
+            false,
+            false,
+            "a comparison sample with explicit derivatives",
+        ),
+        (
+            "image_sample_c_cd_cl_g16",
+            false,
+            false,
+            "a comparison sample with explicit derivatives",
+        ),
+        ("image_gather4h", false, false, "image_gather4h"),
+        (
+            "image_sample_cd_g16",
+            false,
+            false,
+            "a sample with coarse packed derivatives",
+        ),
+        (
+            "image_sample_cd_cl_g16",
+            false,
+            false,
+            "a sample with coarse packed derivatives",
+        ),
     ];
     for &(name, zero_bias, zero_level, why) in cases {
         let dmask = if name.contains("_c") || name.starts_with("image_gather4") {

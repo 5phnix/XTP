@@ -185,7 +185,7 @@ fn sample_form(name: &str) -> Option<SampleForm> {
         gather,
         ..SampleForm::default()
     };
-    for token in rest.split('_').skip(1) {
+    for token in rest.strip_prefix('_').unwrap_or(rest).split_terminator('_') {
         let flag = match token {
             "c" => &mut f.c,
             "d" | "cd" => &mut f.d,
@@ -372,10 +372,19 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
+        let name = inst.name();
+        match name {
+            "image_gather4h" => return Err(name),
+            "image_sample_cd_g16" | "image_sample_cd_cl_g16" => {
+                // SampleGrad selects a level per lane. The coarse form
+                // selects one level per quad.
+                return Err("a sample with coarse packed derivatives");
+            }
+            _ => {}
+        }
         if *tfe || *lwe {
             return Err("an image access with tfe or lwe");
         }
-        let name = inst.name();
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);

@@ -254,7 +254,17 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         match w >> 26 {
             0x32 => (Encoding::Vintrp, (w >> 16) & 0x3, 1),
             0x33 => (Encoding::Vop3p, (w >> 16) & 0x7F, vop3(word(1)?)),
-            0x35 => (Encoding::Vop3, (w >> 16) & 0x3FF, vop3(word(1)?)),
+            0x35 => {
+                let op = (w >> 16) & 0x3FF;
+                // The e64 interpolation forms cannot take a literal. Their
+                // attribute field is 0xFF for attr63.w.
+                let len = if matches!(op, 0x200..=0x202) {
+                    2
+                } else {
+                    vop3(word(1)?)
+                };
+                (Encoding::Vop3, op, len)
+            }
             0x36 => (Encoding::Ds, (w >> 18) & 0xFF, 2),
             0x37 => {
                 let encoding = match (w >> 14) & 3 {
@@ -302,11 +312,12 @@ fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         Encoding::Vop2 => (t::VOP2, opcode),
         Encoding::Vop1 => (t::VOP1, opcode),
         Encoding::Vopc => (t::VOPC, opcode),
-        // VOP3 also encodes the VOPC, VOP2 and VOP1 opcodes at fixed bases.
+        // VOP3 also encodes the VOPC, VOP2, VOP1 and VINTRP opcodes at fixed bases.
         Encoding::Vop3 => match opcode {
             0x000..0x100 => (t::VOPC, opcode),
             0x100..0x140 => (t::VOP2, opcode - 0x100),
             0x180..0x200 => (t::VOP1, opcode - 0x180),
+            0x200..=0x202 => (t::VINTRP, opcode - 0x200),
             _ => (t::VOP3, opcode),
         },
         Encoding::Vop3p => (t::VOP3P, opcode),
@@ -408,6 +419,192 @@ mod tests {
         );
     }
 
+    // Encoding fixtures from llvm-project llvmorg-19.1.7, Apache-2.0 WITH
+    // LLVM-exception. The interpolation modifier combination is synthetic.
+    #[test]
+    fn vop3_interpolation_operands_and_modifiers() {
+        // llvm/test/MC/AMDGPU/gfx10_asm_vop3.s
+        let vgpr = |reg| Operand::Vector { reg, dwords: 1 };
+        let attr = Operand::Attr {
+            index: 0,
+            chan: 0,
+            high: false,
+        };
+        for (op, name, w1, src) in [
+            (0x200, "v_interp_p1_f32", 0x0002_0400, vgpr(2)),
+            (0x201, "v_interp_p2_f32", 0x0002_0400, vgpr(2)),
+            (0x202, "v_interp_mov_f32", 0, Operand::Const(0)),
+            (0x202, "v_interp_mov_f32", 0x400, Operand::Const(2)),
+        ] {
+            let words = [0xD400_0005 | op << 16, w1];
+            let inst = instruction(&bytes(&words), 0).unwrap();
+            assert_eq!(inst.words, words);
+            assert_eq!((inst.encoding, inst.opcode), (Encoding::Vop3, op as u16));
+            assert_eq!(inst.name(), Some(name));
+            assert_eq!(
+                inst.fields(false),
+                Fields::Valu(Valu {
+                    dst: Some(vgpr(5)),
+                    src: vec![attr, src],
+                    ..Valu::default()
+                })
+            );
+            if src == Operand::Const(2) {
+                assert_eq!(inst.text(false), "v_interp_mov_f32 v5, p0, attr0.x");
+            }
+        }
+
+        // attr63.w occupies the same field value as a generic VOP3 literal.
+        let words = [0xD600_8205, 0x4802_04FF, S_ENDPGM];
+        let decoded = decode(&bytes(&words)).unwrap();
+        assert_eq!(decoded[1].offset, 8);
+        assert_eq!(
+            decoded[0].fields(false),
+            Fields::Valu(Valu {
+                dst: Some(vgpr(5)),
+                src: vec![
+                    Operand::Attr {
+                        index: 63,
+                        chan: 3,
+                        high: false,
+                    },
+                    vgpr(2),
+                ],
+                neg: 0b010,
+                abs: 0b010,
+                clamp: true,
+                omod: 1,
+                ..Valu::default()
+            })
+        );
+    }
+
+    #[test]
+    fn mimg_gather4h_operands() {
+        // llvm/test/MC/AMDGPU/gfx10_asm_mimg.s
+        let words = [0xF184_021A, 0x0021_4020, 0x0000_2221];
+        let inst = instruction(&bytes(&words), 0).unwrap();
+        assert_eq!(inst.words, words);
+        assert_eq!((inst.encoding, inst.opcode), (Encoding::Mimg, 0x061));
+        assert_eq!(inst.name(), Some("image_gather4h"));
+        assert_eq!(
+            inst.fields(false),
+            Fields::Image {
+                data: Operand::Vector { reg: 64, dwords: 4 },
+                addr: (32..=34)
+                    .map(|reg| Operand::Vector { reg, dwords: 1 })
+                    .collect(),
+                rsrc: Operand::Scalar { code: 4, dwords: 8 },
+                sampler: Some(Operand::Scalar { code: 4, dwords: 4 }),
+                dmask: 2,
+                dim: 3,
+                unorm: false,
+                r128: false,
+                a16: false,
+                d16: false,
+                tfe: false,
+                lwe: false,
+                cache: Cache::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn mimg_coarse_g16_sample_operands() {
+        // llvm/test/MC/AMDGPU/gfx10_asm_mimg.s has 1D sequential and 2D NSA
+        // encodings for each form. The comparison and clamp each add one dword.
+        let cases: [(&str, u32, &[u32], &[u8]); 4] = [
+            (
+                "image_sample_cd_g16",
+                0xF1A0_0F01,
+                &[0xF1A0_0F0B, 0x0040_0000, 0x0005_0402],
+                &[0, 2, 4, 5],
+            ),
+            (
+                "image_sample_cd_cl_g16",
+                0xF1A4_0F01,
+                &[0xF1A4_0F0B, 0x0040_0000, 0x0605_0402],
+                &[0, 2, 4, 5, 6],
+            ),
+            (
+                "image_sample_c_cd_g16",
+                0xF1A8_0F01,
+                &[0xF1A8_0F0B, 0x0040_0000, 0x0605_0301],
+                &[0, 1, 3, 5, 6],
+            ),
+            (
+                "image_sample_c_cd_cl_g16",
+                0xF1AC_0F01,
+                &[0xF1AC_0F0D, 0x0040_0000, 0x0605_0301, 7],
+                &[0, 1, 3, 5, 6, 7],
+            ),
+        ];
+        for (name, w0, nsa, regs) in cases {
+            let sequential = [w0, 0x0040_0000];
+            for (words, dim, addr) in [
+                (
+                    &sequential[..],
+                    0,
+                    vec![Operand::Vector {
+                        reg: 0,
+                        dwords: regs.len() as u8 - 1,
+                    }],
+                ),
+                (
+                    nsa,
+                    1,
+                    regs.iter()
+                        .map(|&reg| Operand::Vector { reg, dwords: 1 })
+                        .collect(),
+                ),
+            ] {
+                let inst = instruction(&bytes(words), 0).unwrap();
+                assert_eq!(inst.words, words);
+                assert_eq!(inst.encoding, Encoding::Mimg);
+                assert_eq!(inst.name(), Some(name));
+                assert_eq!(
+                    inst.fields(false),
+                    Fields::Image {
+                        data: Operand::Vector { reg: 0, dwords: 4 },
+                        addr,
+                        rsrc: Operand::Scalar { code: 0, dwords: 8 },
+                        sampler: Some(Operand::Scalar { code: 8, dwords: 4 }),
+                        dmask: 0xF,
+                        dim,
+                        unorm: false,
+                        r128: false,
+                        a16: false,
+                        d16: false,
+                        tfe: false,
+                        lwe: false,
+                        cache: Cache::default(),
+                    },
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vop3p_signed_dot8_operands() {
+        // llvm/test/MC/AMDGPU/gfx1011_dlops.s
+        let words = [0xCC18_4000, 0x1C0E_0501];
+        let inst = instruction(&bytes(&words), 0).unwrap();
+        let vgpr = |reg| Operand::Vector { reg, dwords: 1 };
+        assert_eq!(inst.words, words);
+        assert_eq!((inst.encoding, inst.opcode), (Encoding::Vop3p, 0x018));
+        assert_eq!(inst.name(), Some("v_dot8_i32_i4"));
+        assert_eq!(
+            inst.fields(false),
+            Fields::Valu(Valu {
+                dst: Some(vgpr(0)),
+                src: vec![vgpr(1), vgpr(2), vgpr(3)],
+                opsel_hi: 0b111,
+                ..Valu::default()
+            })
+        );
+    }
+
     #[test]
     fn image_address_dwords_by_form() {
         // 2D: offset, bias and reference a dword each; 16-bit derivatives
@@ -422,6 +619,10 @@ mod tests {
             (0xA2, true, 3),     // image_sample_d_g16, a16
             (0xBB, false, 7),    // image_sample_c_d_cl_o_g16
             (0x33, true, 7),     // image_sample_d_cl_o, a16
+            (0xE8, true, 3),     // image_sample_cd_g16, a16
+            (0xE9, true, 4),     // image_sample_cd_cl_g16, a16
+            (0xEA, true, 4),     // image_sample_c_cd_g16, a16
+            (0xEB, true, 5),     // image_sample_c_cd_cl_g16, a16
         ] {
             let w0 = 0xF000_0000 | (op & 0x7F) << 18 | op >> 7 | 1 << 3 | 1 << 8;
             let d = decode(&bytes(&[w0, u32::from(a16) << 30, S_ENDPGM])).unwrap();

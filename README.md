@@ -123,6 +123,11 @@ xtp run <exe|folder> [--execute] [--unimplemented trap|zero] [--strict]
 xtp config
 ```
 
+`xtp shader-info --disasm` decodes the GFX10 e64 f32 interpolation forms,
+`image_gather4h`, the four coarse gradient samples with `_g16`, and
+`v_dot8_i32_i4`. Translating shaders that need these instructions still
+requires DXIL lowering for them.
+
 `xtp inspect --json` emits a stable JSON object (`"format": "xtp-inspect 1"`)
 with string fields `file`, `blake3`, `kind` (`"exe"` or `"dll"`), hex-string
 fields `machine`, `image_base` and `entry_rva`, numeric fields `subsystem` and
