@@ -54,11 +54,11 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `3173882c28a20b75` | Compute | Computes depth bounds on the 40×23 cluster tile grid. | [Light chain §3.1][tiles] | high |
 | `e18931c72af42e46` | Compute | Reduces buffered inputs into a four-word lighting record. The record's consumer is uncertain. | [Light chain §3.1][tiles], [Refusals §6.3][ref63], code | low |
 | `a7eeed0646be1ab7` | Compute | Zeros the per-cluster light masks before the light volumes are drawn. | [Light chain §3.1][tiles], [GPU frame §10.11][gpu1011] | high |
-| `0f0b95cf52ddeb26` | Compute | Initializes the bounds for the shadow masks. | [Light chain §3.1][tiles], code | high |
-| `a67d0bcde30cead3` | Vertex | Places light proxy geometry for rasterization into the cluster grid. | [Light chain §3.1][tiles] | high |
+| `0f0b95cf52ddeb26` | Compute | Initialises the bounds for the shadow masks. | [Light chain §3.1][tiles], code | high |
+| `a67d0bcde30cead3` | Vertex | Places light proxy geometry for rasterisation into the cluster grid. | [Light chain §3.1][tiles] | high |
 | `7f4b62129572a14d` | Vertex | Places a second light proxy shape in the same cluster grid. | [Light chain §3.1][tiles] | high |
-| `5ad3a82b1c3cc63a` | Pixel | Marks light coverage in cluster masks where the light proxies rasterize. | [Light chain §3.1][tiles], [GPU frame §10.11][gpu1011] | high |
-| `7c90a988167650a1` | Compute | Reads the rasterized cluster buffer and prepares a secondary cluster buffer. | [Light chain §§3.1, 5][tiles] | high |
+| `5ad3a82b1c3cc63a` | Pixel | Marks light coverage in cluster masks where the light proxies rasterise. | [Light chain §3.1][tiles], [GPU frame §10.11][gpu1011] | high |
+| `7c90a988167650a1` | Compute | Reads the rasterised cluster buffer and prepares a secondary cluster buffer. | [Light chain §§3.1, 5][tiles] | high |
 | `bad01f53f53248e5` | Compute | Classifies materials on the 80×45 grid and counts work for indirect lighting dispatches. | [Light chain §3.1][tiles], [PIX §11.3][pix113] | high |
 | `11eeb27c2d15980d` | Compute | Merges cluster masks across each tile's depth range, filters excluded lights and writes the 13-slice tile mask. | [Light chain §§3.1–3.3][tiles] | high |
 | `fea2b7d3f17b504f` | Compute | Builds coarse material classification over the 10×6 tile grid. | [Light chain §3.1][tiles], code | high |
@@ -69,8 +69,12 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `559d9f0184e15fe3` | Compute | Traces the queued local-light shadow rays for checkerboard visibility masks. | [Light chain §3.1][tiles], [Ray tracing §2][rt2] | high |
 | `0ea6fac38d096770` | Compute | Filters the traced shadow results into the wide tile visibility texture. | [Light chain §3.1][tiles], code | high |
 | `307e048e4cdd99d4` | Compute | Clears light bits from tile masks where the shadow visibility marks them occluded. | [Light chain §§3.1–3.2][tiles] | high |
+| `fb9c7f430da14c4c` | Compute | Computes sky spherical-harmonic sums and lighting scale factors, including the directional-light scale read by deferred shading, from exposure, sky texture and constant inputs. | [Lighting terms §4.3][terms43] | high |
+| `a5b1c338a9607317` | Compute | Writes the 16×1 ramp texture read by the directional-light diffuse term in deferred shading. | [Lighting terms §7][terms7], [Lighting terms §3][terms3] | high |
+| `5741294cf872ffb9` | Compute | Writes the 80×45 R8 per-tile mask used to gate directional-light deferred rectangles. | [Lighting terms §4.3][terms43] | high |
+| `f11c3ddeaeb7d602` | Compute | Reduces the 80×45 R8 directional-light tile mask to the 10×6 R8 mask read by the deferred-light rectangle vertex stage. | [Lighting terms §4.3][terms43] | high |
 | `25ebc92075b62822` | Vertex | Places deferred-light rectangles over the material tiles tested against the class depth plane. | [PIX §5.1][pix51], [World black §8.2][black82] | high |
-| `1cd9bc634417a981` | Pixel | Combines albedo, probe light and masked local lights into exposure-scaled deferred scene colour. | [PIX §11.3][pix113], [Light chain §3.1][tiles] | high |
+| `1cd9bc634417a981` | Pixel | Combines albedo with probe light, a directional-light term and masked local lights, adds a specular term, and scales by exposure for deferred scene colour. | [PIX §11.3][pix113], [Light chain §3.1][tiles], [Lighting terms §3][terms3] | high |
 | `1d2c970773ce2183` | Vertex | Places rectangles in a follow-up lighting pass. | [World black §8.2][black82], code | high |
 | `e070816c3b889df0` | Pixel | Shades rectangles in that follow-up lighting pass. | [World black §8.2][black82] | high |
 
@@ -106,7 +110,7 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `26b8bbb2e7ae4dc6` | Compute | Uses transmittance and multiple scattering to generate the 192×108 sky-view lookup textures. | [World black §8.3][black83] | high |
 | `348e1e8c414c7eca` | Compute | Evaluates the sky from scene depth, exposure and atmospheric lookup textures and writes scene colour. | [PIX §4][pix4], [World black §8.2][black82] | high |
 | `d91fdb5004fdadf1` | Vertex | Places the sky dome geometry. | [World black §8.2][black82] | high |
-| `3ae25b11290cadde` | Pixel | Shades the rasterized sky dome. | [World black §§8.2, 8.4][black82] | high |
+| `3ae25b11290cadde` | Pixel | Shades the rasterised sky dome. | [World black §§8.2, 8.4][black82] | high |
 | `6e750a37b1da6949` | Vertex | Places geometry for the cloud draw. | [World black §8.2][black82] | high |
 | `d7b97830ede61511` | Pixel | Shades the clouds over the sky. | [World black §8.2][black82] | high |
 | `d9978c76c746d809` | Compute | Reconstructs part of the 480×272 volumetric fog input from sampled textures. | [PIX §4][pix4], [World black §10][black10], code | high |
@@ -126,7 +130,7 @@ are open. The two skinned shadow programs have their own pass evidence.
 | `51e19585b4753814` | Compute | Reduces sampled colour across neighbouring lanes and writes two image outputs, including a 960×540 RGBA16F target. The downstream pass is open. | [World black §8.1][black81], code | medium |
 
 Two pixel programs in the pack sample a colour texture, apply a nonlinear
-curve and export a single colour. Their behavior fits the tone-mapping
+curve and export a single colour. Their behaviour fits the tone-mapping
 stage. The frame notes give only its RGB10A2 target and draw count.
 
 | Hash | Stage | Role | Evidence | Confidence |
@@ -146,9 +150,9 @@ no output bindings.
 | `b37565055f2f7d3b` | Pixel | Uses depth to select a light cell and shades the lights in its mask, within the uploaded index range. | [GPU frame §§10.7, 10.11][gpu1011] | high |
 | `24f989b98dcb03f0` | Compute | Transforms vertex data from buffers in the 32-thread transform family. | [GPU frame §10.7][gpu107] | high |
 | `3a79195f06d3ed85` | Compute | Transforms vertex data and writes three-component results. | [GPU frame §10.7][gpu107] | high |
-| `ebe4e53f031f5249` | Compute | Transforms vertex data from buffers in the 32-thread transform family. | [GPU frame §10.7][gpu107] | high |
+| `ebe4e53f031f5249` | Compute | Transforms vertex data from buffers in the 32-thread transform family. | [GPU frame §10.7][gpu107] | medium |
 | `12eae112b559091c` | Compute | Transforms vertex data from buffers in the 32-thread transform family. | [GPU frame §10.7][gpu107] | high |
-| `512416d975ace48b` | Compute | Transforms vertex data from buffers in the 32-thread transform family. | [GPU frame §10.7][gpu107] | high |
+| `512416d975ace48b` | Compute | Transforms vertex data from buffers in the 32-thread transform family. | [GPU frame §10.7][gpu107] | medium |
 | `53af89c0e1dccd2a` | Compute | Processes indexed records and writes several output buffer fields. The consumers are open. | [GPU frame §4.2][gpu42], code | low |
 | `a1d865bdfb3559eb` | Compute | Transforms values gathered from arrays and writes structured buffer results. | [GPU frame §4.2][gpu42], code | low |
 | `42683eebec081520` | Compute | Filters and combines image samples, sharing values across lanes before writing several image outputs. | [GPU frame §4.2][gpu42], code | medium |
@@ -160,7 +164,7 @@ no output bindings.
 | `660814153af43185` | Compute | Samples textures and writes work records, updating counters and bounds in buffers. The consumer is open. | [GPU frame §10.5][gpu105], code | low |
 | `f8f50ab85e7b10bb` | Compute | Samples textures and appends results to buffers for later work. The consumer is open. | [GPU frame §10.5][gpu105], code | low |
 | `c9da71da40af2e28` | Compute | Builds output buffer records and updates their counters during indirect work. | [GPU frame §10.5][gpu105], code | low |
-| `6a04b371a8e26853` | Compute | Initializes packed buffer entries without sampling input data. | [GPU frame §10.5][gpu105], code | medium |
+| `6a04b371a8e26853` | Compute | Initialises packed buffer entries without sampling input data. | [GPU frame §10.5][gpu105], code | medium |
 | `7de0f9db96ddd295` | Compute | Reduces packed buffer values within a group and writes a packed result. | [GPU frame §10.5][gpu105], code | medium |
 | `1d65098be346d062` | Vertex | Places a full-screen draw. | [GPU frame §10.4][gpu104] | high |
 | `5510a9fd27ceb4b1` | Pixel | Filters texture samples into one colour target in that full-screen draw. The effect is open. | [GPU frame §10.4][gpu104], code | medium |
@@ -185,53 +189,53 @@ system-library programs outside the pack, which are left for a separate map.
 
 | Hash | Stage | Role | Evidence | Confidence |
 |---|---|---|---|---|
-| `55679a0547649d0b` | Compute | Filters instances for each view and prepares lists and indirect draw arguments. | [Refusals §6.3][ref63] | high |
-| `17af15c4015cb4b6` | Compute | Filters another instance batch and prepares per-view indirect draw work. | [Refusals §6.3][ref63] | high |
-| `1c4b3c0547e3e6fa` | Compute | Produces an instance list and draw arguments for a per-view culling batch. | [Refusals §6.3][ref63] | high |
-| `42f717f1b4d18e94` | Compute | Filters a batch of instances before geometry and shadow draws. | [Refusals §6.3][ref63] | high |
-| `89d08e561897d4e5` | Compute | Builds draw work for a batch of visible instances. | [Refusals §6.3][ref63] | high |
-| `9209777e8face9dd` | Compute | Filters a separate per-view instance batch into draw work. | [Refusals §6.3][ref63] | high |
-| `fdd56d97a806bcca` | Compute | Prepares instance and indirect argument buffers in the culling lists. | [Refusals §6.3][ref63] | high |
-| `adc5c689b0552cc2` | Mesh | Emits foliage geometry for the G-buffer. | [Refusals §6.3][ref63] | high |
-| `ef5409053e14aa82` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | high |
-| `903776ba469c8bac` | Mesh | Emits geometry for G-buffer draws. | [Refusals §6.3][ref63] | high |
-| `4e35b816f2f91d68` | Vertex | Transforms vertices for a distant geometry draw in the G-buffer. | [Refusals §6.3][ref63] | high |
-| `45f081396c2c59ba` | Mesh | Emits distant geometry from a lower-detail mesh. | [Refusals §6.3][ref63] | high |
-| `89a622617919c92a` | Mesh | Emits foliage geometry for the G-buffer. | [Refusals §6.3][ref63] | high |
-| `b3ba0ef9ee352720` | Vertex | Transforms vertices for a distant geometry draw in the G-buffer. | [Refusals §6.3][ref63] | high |
-| `093c64546c55554e` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | high |
-| `5bd95fdec765c0d6` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | high |
-| `fe660f2d6d57de76` | Mesh | Emits geometry for G-buffer draws. | [Refusals §6.3][ref63] | high |
-| `a402e650d0acbc92` | Pixel | Shades character pixels into the G-buffer material targets. | [Refusals §6.3][ref63] | high |
-| `9aff566ca0fa7c98` | Mesh | Emits geometry for G-buffer draws. | [Refusals §6.3][ref63] | high |
-| `c0f0db84d228f441` | Mesh | Emits geometry for G-buffer draws. | [Refusals §6.3][ref63] | high |
-| `4ee6e34d8e008c63` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | high |
-| `e819d0b31c213166` | Pixel | Shades geometry into the G-buffer material targets. | [Refusals §6.3][ref63] | high |
-| `f841ad74ec6e7367` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | high |
-| `46395a33fdf2a3fa` | Pixel | Writes G-buffer material data for character geometry. | [Refusals §6.3][ref63] | high |
-| `0979c5189155cf3f` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | high |
-| `09a88636ff0d843c` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | high |
-| `235e56869c1ea883` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | high |
-| `c3ba22ec6fc5dd4a` | Mesh | Emits geometry in the character and general G-buffer lists. | [Refusals §6.3][ref63] | high |
-| `a223e485dd8247a3` | Pixel | Writes G-buffer material data for character geometry. | [Refusals §6.3][ref63] | high |
-| `36e010b53acffd77` | Compute | Skins character vertices for geometry and shadow passes. | [Refusals §6.3][ref63] | high |
-| `2bba29bbd7c019bc` | Compute | Skins character vertices for geometry and shadow passes. | [Refusals §6.3][ref63] | high |
-| `a31407f77c16d796` | Compute | Skins character vertices for geometry and shadow passes. | [Refusals §6.3][ref63] | high |
+| `55679a0547649d0b` | Compute | Filters instances for each view and prepares lists and indirect draw arguments. | [Refusals §6.3][ref63] | medium |
+| `17af15c4015cb4b6` | Compute | Filters another instance batch and prepares per-view indirect draw work. | [Refusals §6.3][ref63] | medium |
+| `1c4b3c0547e3e6fa` | Compute | Produces an instance list and draw arguments for a per-view culling batch. | [Refusals §6.3][ref63] | medium |
+| `42f717f1b4d18e94` | Compute | Filters a batch of instances before geometry and shadow draws. | [Refusals §6.3][ref63] | medium |
+| `89d08e561897d4e5` | Compute | Builds draw work for a batch of visible instances. | [Refusals §6.3][ref63] | medium |
+| `9209777e8face9dd` | Compute | Filters a separate per-view instance batch into draw work. | [Refusals §6.3][ref63] | medium |
+| `fdd56d97a806bcca` | Compute | Prepares instance and indirect argument buffers in the culling lists. | [Refusals §6.3][ref63] | medium |
+| `adc5c689b0552cc2` | Mesh | Emits foliage geometry for the G-buffer. | [Refusals §6.3][ref63] | medium |
+| `ef5409053e14aa82` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | medium |
+| `903776ba469c8bac` | Mesh | Emits geometry for G-buffer draws. | [Refusals §6.3][ref63] | medium |
+| `4e35b816f2f91d68` | Vertex | Transforms vertices for a distant geometry draw in the G-buffer. | [Refusals §6.3][ref63] | medium |
+| `45f081396c2c59ba` | Mesh | Emits distant geometry from a lower-detail mesh. | [Refusals §6.3][ref63] | medium |
+| `89a622617919c92a` | Mesh | Emits foliage geometry for the G-buffer. | [Refusals §6.3][ref63] | medium |
+| `b3ba0ef9ee352720` | Vertex | Transforms vertices for a distant geometry draw in the G-buffer. | [Refusals §6.3][ref63] | medium |
+| `093c64546c55554e` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | medium |
+| `5bd95fdec765c0d6` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | medium |
+| `fe660f2d6d57de76` | Mesh | Emits geometry for G-buffer draws. | [Refusals §6.3][ref63] | medium |
+| `a402e650d0acbc92` | Pixel | Shades character pixels into the G-buffer material targets. | [Refusals §6.3][ref63] | medium |
+| `9aff566ca0fa7c98` | Mesh | Emits geometry for G-buffer draws. | [Refusals §6.3][ref63] | medium |
+| `c0f0db84d228f441` | Mesh | Emits geometry for G-buffer draws. | [Refusals §6.3][ref63] | medium |
+| `4ee6e34d8e008c63` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | medium |
+| `e819d0b31c213166` | Pixel | Shades geometry into the G-buffer material targets. | [Refusals §6.3][ref63] | medium |
+| `f841ad74ec6e7367` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | medium |
+| `46395a33fdf2a3fa` | Pixel | Writes G-buffer material data for character geometry. | [Refusals §6.3][ref63] | medium |
+| `0979c5189155cf3f` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | medium |
+| `09a88636ff0d843c` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | medium |
+| `235e56869c1ea883` | Mesh | Emits character geometry for G-buffer shading. | [Refusals §6.3][ref63] | medium |
+| `c3ba22ec6fc5dd4a` | Mesh | Emits geometry in the character and general G-buffer lists. | [Refusals §6.3][ref63] | medium |
+| `a223e485dd8247a3` | Pixel | Writes G-buffer material data for character geometry. | [Refusals §6.3][ref63] | medium |
+| `36e010b53acffd77` | Compute | Skins character vertices for geometry and shadow passes. | [Refusals §6.3][ref63] | medium |
+| `2bba29bbd7c019bc` | Compute | Skins character vertices for geometry and shadow passes. | [Refusals §6.3][ref63] | medium |
+| `a31407f77c16d796` | Compute | Skins character vertices for geometry and shadow passes. | [Refusals §6.3][ref63] | medium |
 | `a1bf269d5b19f025` | Compute | Computes scattering for the lighting passes and contributes to their image targets. | [Refusals §6.3][ref63] | medium |
-| `6b6db9f1a526daeb` | Pixel | Writes into the small depth and surface map used for puddle detection. | [Refusals §6.3][ref63] | high |
+| `6b6db9f1a526daeb` | Pixel | Writes into the small depth and surface map used for puddle detection. | [Refusals §6.3][ref63] | medium |
 | `73644c6a0b7b5b35` | Pixel | Shades transparent geometry into HDR scene colour. | [Refusals §6.3][ref63] | medium |
-| `2fd01fca16993001` | Pixel | Writes into the small depth and surface map used for puddle detection. | [Refusals §6.3][ref63] | high |
+| `2fd01fca16993001` | Pixel | Writes into the small depth and surface map used for puddle detection. | [Refusals §6.3][ref63] | medium |
 | `5c6224a6bc3a4066` | Compute | Uses shared memory to process an image input and write a transparency-pass image. | [Refusals §6.3][ref63], code | medium |
 | `97175c2c1a214a2f` | Pixel | Shades fragments in the alpha pre-pass and scattering list. | [Refusals §6.3][ref63] | medium |
-| `b22a16a178976e1b` | Compute | Runs matrix products in a buffer-based compute graph. | [Refusals §6.3][ref63] | high |
+| `b22a16a178976e1b` | Compute | Runs matrix products in a buffer-based compute graph. | [Refusals §6.3][ref63] | medium |
 | `098fc28e44347a00` | Compute | Updates buffers for hair strands. The exact strand operation is open. | [Refusals §6.3][ref63] | medium |
 | `f7c4f227a2a4c4b2` | Compute | Updates buffers for hair strands. The exact strand operation is open. | [Refusals §6.3][ref63] | medium |
 | `b3e7781d53ff8326` | Compute | Updates buffers for hair strands. The exact strand operation is open. | [Refusals §6.3][ref63] | medium |
 | `02384a60fda6f2d0` | Compute | Processes buffers in the visual-effects pass. The consumers are open. | [Refusals §6.3][ref63] | low |
 | `aab1b3c7248ee5de` | Compute | Queues work records and writes an image result in the traced-lighting lists. The downstream consumer is open. | [Refusals §6.3][ref63], code | low |
-| `e30970f1727063fd` | Compute | Prepares transforms for impostor instances in the ray-tracing acceleration structure. | [Refusals §6.3][ref63] | high |
-| `82a2ad6d07417d36` | Compute | Skins geometry into vertex buffers for the ray-tracing acceleration structure. | [Refusals §6.3][ref63] | high |
-| `90a0692af4320129` | Compute | Skins geometry into vertex buffers for the ray-tracing acceleration structure. | [Refusals §6.3][ref63] | high |
+| `e30970f1727063fd` | Compute | Prepares transforms for impostor instances in the ray-tracing acceleration structure. | [Refusals §6.3][ref63] | medium |
+| `82a2ad6d07417d36` | Compute | Skins geometry into vertex buffers for the ray-tracing acceleration structure. | [Refusals §6.3][ref63] | medium |
+| `90a0692af4320129` | Compute | Skins geometry into vertex buffers for the ray-tracing acceleration structure. | [Refusals §6.3][ref63] | medium |
 | `21d27f785da6d2b1` | Compute | Processes indexed records and writes vector results to buffers. The pass is open. | [Refusals §6.1][ref61], code | low |
 | `77a7af30c430cd16` | Compute | Samples textures while processing indexed buffer records and writing vector results. The pass is open. | [Refusals §6.1][ref61], code | low |
 | `9aa4a785e0800cda` | Compute | Writes related vector records after reading buffers and sampled textures. The pass is open. | [Refusals §6.1][ref61], code | low |
@@ -246,49 +250,49 @@ the shared role at pass level. It leaves individual material variants open.
 
 | Hash | Stage | Role | Evidence | Confidence |
 |---|---|---|---|---|
-| `535f8a954d8ec638` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `3e7e04c03727b40c` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `df1c34cb6d9dbcfa` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `46539424133f9b74` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `02a4ed10c682ac3a` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `29be03ccaa4e353a` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `2a5cb98cf0749a82` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `2ec1dd27e95fdd16` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `2f12d0f639fb7ed0` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `34121970d8a2e435` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `355f182eb23a2ccf` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `571bf6d258f65ed0` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `8f8dd4e691330c74` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `479975ca9ff7e370` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `adc76ddaa3a13d20` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `d84c0ca92452e526` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `e0ba27015903a5f3` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `e90b8dcb8b4cfc6b` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `efc770e7f2c27b03` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `f6da51317fcef92e` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `f91ef42e5b381cb9` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `06989306fb3b54c2` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `072f5fe96efd27e1` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `0b3d156291158496` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `16622000e3a30bf0` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `203f78efece5bbdf` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `3fa1fda35402c93f` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `52ab310c43b9f99c` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `649850fad69f9228` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `74930ddd74e36464` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `a1266cc7391ae0d6` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `a4df980a1c65fdbe` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `a62731e90739f195` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `ad1cf51b8a6c7096` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `c3cb00c582d26394` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `de4e3af66d68d980` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `dffafa6052629c85` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `05ef21a2132db12d` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `1c02f8131c508c75` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `7f05ddab771799a9` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `d2c52fcd936985b4` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `d5ef4f2bb16d9fa3` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
-| `ad17f5c4f7acac25` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | high |
+| `535f8a954d8ec638` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `3e7e04c03727b40c` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `df1c34cb6d9dbcfa` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `46539424133f9b74` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `02a4ed10c682ac3a` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `29be03ccaa4e353a` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `2a5cb98cf0749a82` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `2ec1dd27e95fdd16` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `2f12d0f639fb7ed0` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `34121970d8a2e435` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `355f182eb23a2ccf` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `571bf6d258f65ed0` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `8f8dd4e691330c74` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `479975ca9ff7e370` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `adc76ddaa3a13d20` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `d84c0ca92452e526` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `e0ba27015903a5f3` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `e90b8dcb8b4cfc6b` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `efc770e7f2c27b03` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `f6da51317fcef92e` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `f91ef42e5b381cb9` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `06989306fb3b54c2` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `072f5fe96efd27e1` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `0b3d156291158496` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `16622000e3a30bf0` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `203f78efece5bbdf` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `3fa1fda35402c93f` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `52ab310c43b9f99c` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `649850fad69f9228` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `74930ddd74e36464` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `a1266cc7391ae0d6` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `a4df980a1c65fdbe` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `a62731e90739f195` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `ad1cf51b8a6c7096` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `c3cb00c582d26394` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `de4e3af66d68d980` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `dffafa6052629c85` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `05ef21a2132db12d` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `1c02f8131c508c75` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `7f05ddab771799a9` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `d2c52fcd936985b4` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `d5ef4f2bb16d9fa3` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
+| `ad17f5c4f7acac25` | Compute | Shades a material at ray hits for the half-resolution lighting group. | [Refusals §6.3][ref63] | medium |
 
 ## Coverage of the frame
 
@@ -313,7 +317,10 @@ pipeline records. The bilinear upscaler in the measured frame is XTP's
 [tiles]: light-chain.md#31-the-chain-frame-675-of-imgsrc-1
 [probes]: light-chain.md#4-the-screen-probe-light-ds-view-s01008
 [image41]: image-status.md#41-depth-albedo-lighting
+[terms3]: lighting-terms.md#3-the-lighting-pass-and-its-program
+[terms43]: lighting-terms.md#43-the-directional-light
 [terms44]: lighting-terms.md#44-the-lamps
+[terms7]: lighting-terms.md#7-sessions-lightterms-1-and-lightterms-2
 [rt2]: rt-standin.md#2-the-world-frame-pass-by-pass
 [gpu104]: gpu-frame.md#104-the-frame-and-the-gpu-by-kind
 [gpu105]: gpu-frame.md#105-by-program-the-top-20
