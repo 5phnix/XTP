@@ -248,6 +248,7 @@ impl Structure {
 
 /// The last structure actually reached in queue order at this title address.
 type Slot = Arc<Mutex<Option<Structure>>>;
+type WeakSlot = std::sync::Weak<Mutex<Option<Structure>>>;
 type Candidates = Arc<BTreeMap<u64, Slot>>;
 
 struct BuildSlot {
@@ -281,7 +282,7 @@ struct Registry {
     structures: BTreeMap<u64, Structure>,
     // Includes builds still recording, so removal also cancels their publication.
     ranges: BTreeMap<u64, Destination>,
-    waiting: BTreeMap<u64, (Option<usize>, std::sync::Weak<Mutex<Option<Structure>>>)>,
+    waiting: BTreeMap<u64, (Option<usize>, WeakSlot)>,
     generation: u64,
     snapshot: Option<Candidates>,
 }

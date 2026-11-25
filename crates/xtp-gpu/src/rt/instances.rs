@@ -36,15 +36,22 @@ impl UploadMap {
         {
             return Some(cached);
         }
-        let bytes = u32::try_from(generations.len()).ok()?.checked_mul(16)?;
-        if bytes == 0 {
+        let count = u32::try_from(generations.len()).ok()?;
+        let bytes = count.checked_add(1)?.checked_mul(16)?;
+        if count == 0 {
             return None;
         }
         let (upload, data) = crate::host::made()?.upload_buffer(bytes.into())?;
+        // SAFETY: the upload starts with a 16-byte header, followed by count rows.
+        unsafe {
+            data.cast::<u32>().write(count);
+        }
         for (i, (title, result)) in generations.iter().enumerate() {
             // SAFETY: one aligned row per entry in the mapped upload.
             unsafe {
-                data.cast::<[u64; 2]>().add(i).write([*title, result.gpu()]);
+                data.cast::<[u64; 2]>()
+                    .add(i + 1)
+                    .write([*title, result.gpu()]);
             }
         }
         let map = Arc::new(Self {
@@ -134,7 +141,7 @@ fn make_pipeline(device: &ID3D12Device5) -> Option<Rewrite> {
                 ..Default::default()
             })
             .ok()?;
-        let signature = dispatch::signature(&root, 1, true)?;
+        let signature = dispatch::signature(&root, 1)?;
         Some(Rewrite {
             root,
             pso,
@@ -166,29 +173,29 @@ pub(super) fn rewrite(
     let src = input_range(rec.list, address, bytes, 16)?;
     let dst = buffer(rec, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
     let pass = pipeline(rec.device)?;
-    let (args, data) = rec.list.upload(crate::host::made()?, 24)?;
+    let (args, data) = rec.list.upload(crate::host::made()?, 20)?;
     let mapped = data as usize;
     let groups = count.div_ceil(64);
     // A valid empty table still runs the rewrite and nulls every missing BLAS.
-    let empty = rec.list.scratch(16)?.0;
+    let (empty, header) = rec.list.scratch(16)?;
+    // SAFETY: this recording owns the aligned, 16-byte empty table header.
+    unsafe {
+        header.cast::<u32>().write(0);
+    }
     let recorded = registry().blas_candidates();
     let destination = map.clone();
     rec.list.defer_host((0, 0), move || {
         let current = registry().blas_candidates();
         let chosen = UploadMap::resolve(&recorded, &current);
-        let (gpu, count) = chosen.as_ref().map_or((empty, 0), |m| {
+        let gpu = chosen.as_ref().map_or(empty, |m| {
             // SAFETY: the map holds this immutable upload.
-            (
-                unsafe { m.upload.GetGPUVirtualAddress() },
-                m.generations.len() as u32,
-            )
+            unsafe { m.upload.GetGPUVirtualAddress() }
         });
-        // SAFETY: six packed words, rewritten only after this recording's prior fence.
+        // SAFETY: the upload contains one root SRV followed by a dispatch argument.
         unsafe {
-            (mapped as *mut [u32; 6]).write([
+            (mapped as *mut [u32; 5]).write([
                 gpu as u32,
                 (gpu >> 32) as u32,
-                count,
                 groups.min(65535),
                 groups.div_ceil(65535),
                 1,

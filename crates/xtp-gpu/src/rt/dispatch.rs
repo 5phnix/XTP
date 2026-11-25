@@ -2,12 +2,7 @@
 //! A missing TLAS sets that dispatch's command count to zero.
 use super::*;
 
-pub(super) fn signature(
-    root: &ID3D12RootSignature,
-    param: u32,
-    count: bool,
-) -> Option<ID3D12CommandSignature> {
-    let mut args = Vec::new();
+pub(super) fn signature(root: &ID3D12RootSignature, param: u32) -> Option<ID3D12CommandSignature> {
     let mut srv = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW,
         ..Default::default()
@@ -15,29 +10,19 @@ pub(super) fn signature(
     srv.Anonymous.ShaderResourceView = D3D12_INDIRECT_ARGUMENT_DESC_0_3 {
         RootParameterIndex: param,
     };
-    args.push(srv);
-    if count {
-        let mut constant = D3D12_INDIRECT_ARGUMENT_DESC {
-            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+    let args = [
+        srv,
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
             ..Default::default()
-        };
-        constant.Anonymous.Constant = D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
-            RootParameterIndex: 0,
-            DestOffsetIn32BitValues: 1,
-            Num32BitValuesToSet: 1,
-        };
-        args.push(constant);
-    }
-    args.push(D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-        ..Default::default()
-    });
+        },
+    ];
     let mut signature = None;
     // SAFETY: the descriptions match the packed upload record and live root signature.
     unsafe {
         crate::host::made()?.device.CreateCommandSignature(
             &D3D12_COMMAND_SIGNATURE_DESC {
-                ByteStride: if count { 24 } else { 20 },
+                ByteStride: 20,
                 NumArgumentDescs: args.len() as u32,
                 pArgumentDescs: args.as_ptr(),
                 NodeMask: 0,
@@ -79,7 +64,7 @@ pub(super) fn dispatch(
     param: u32,
     groups: [u32; 3],
 ) -> Option<()> {
-    let signature = signature(root, param, false)?;
+    let signature = signature(root, param)?;
     let (args, mapped) = list.upload(crate::host::made()?, 24)?;
     let mapped = mapped as usize;
     let slot = registry().trace_slot(address);
