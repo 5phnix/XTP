@@ -951,7 +951,9 @@ impl State {
     fn bind_pipeline(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let l = &list.list;
         let root = p.root.as_raw() as usize;
-        if self.host_roots[usize::from(compute)] != root {
+        if (!compute || self.pending_compute.is_none())
+            && self.host_roots[usize::from(compute)] != root
+        {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
@@ -964,7 +966,7 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        if self.pending_compute.is_none() && self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
@@ -989,9 +991,7 @@ impl State {
         let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
         let wanted = self.wanted_heaps(root_srvs);
         self.set_host_heaps(list, wanted);
-        if self.pending_compute.is_none() {
-            self.bind_pipeline(list, p, compute);
-        }
+        self.bind_pipeline(list, p, compute);
         let picked = p
             .stages
             .iter()
@@ -2251,16 +2251,31 @@ impl State {
         if p.compute != (kind == DISPATCH) || p.mesh != (kind == MESH) {
             return fail("another kind of pipeline bound".into());
         }
-        let split = matches!(kind, DISPATCH | MESH);
-        let signature = if split {
-            p.dispatch_signature
-                .get_or_init(|| crate::indirect::signature(kind, &p.root, p.group_base()))
-                .clone()
+        use crate::indirect::Output;
+        let dispatch = matches!(kind, DISPATCH | MESH);
+        let output = if dispatch {
+            Output::dispatch(p.group_base().is_some())
         } else {
-            host_signature(kind, 24)
+            Output::Draw
+        };
+        let signature = match output {
+            Output::Native => host_signature(kind, 12),
+            Output::Expanded | Output::NativePrefix => p
+                .dispatch_signature
+                .get_or_init(|| crate::indirect::signature(kind, &p.root, p.group_base()))
+                .clone(),
+            _ => host_signature(kind, 24),
         };
         let Some(signature) = signature else {
             return fail("no host signature".into());
+        };
+        let native = if output == Output::NativePrefix {
+            let Some(sig) = host_signature(kind, 12) else {
+                return fail("no native dispatch signature".into());
+            };
+            Some(sig)
+        } else {
+            None
         };
 
         let counter = counter.as_ref().map(|(s, at)| {
@@ -2270,8 +2285,8 @@ impl State {
         args.refresh(list, arguments, len);
         let writes = list.indirect_writes(&args.buffer, counter.map(|(s, _)| s));
         let compute = kind == DISPATCH;
+        self.pending_compute = Some(Vec::new());
         let ready = if compute {
-            self.pending_compute = Some(Vec::new());
             self.bind(list, p, true).map_err(Unready::from)
         } else {
             self.prepare_for(list, kind == INDEXED, kind == MESH)
@@ -2288,22 +2303,15 @@ impl State {
             counter,
             stats,
             writes,
-            true,
+            output,
         ) else {
             return fail("not bounded (no clamp or invalid arguments)".into());
         };
         if out.dispatched {
             self.host_roots[1] = 0;
-            if compute {
-                self.host_pipeline = 0;
-            } else {
-                // SAFETY: prepare_for a gardé le PSO et posé toutes les racines graphiques.
-                unsafe { list.list.SetPipelineState(&p.pso) };
-            }
+            self.host_pipeline = 0;
         }
-        if compute {
-            self.bind_pipeline(list, p, true);
-        }
+        self.bind_pipeline(list, p, compute);
         if let Some(roots) = roots {
             for (param, value) in roots {
                 value.set(list, param);
@@ -2323,7 +2331,7 @@ impl State {
             crate::pipeline::host_pipeline(self.pipeline as This),
         );
         let command = out.offset
-            + if split && p.group_base().is_none() {
+            + if output == Output::Expanded && p.group_base().is_none() {
                 16
             } else {
                 4
@@ -2332,6 +2340,16 @@ impl State {
         unsafe {
             if compute && std::mem::take(&mut self.dropped_dispatch) {
                 list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+            }
+            if let (Some(sig), Some(offset)) = (&native, out.native_offset) {
+                list.list.ExecuteIndirect(
+                    sig,
+                    max.min(out.capacity),
+                    &out.buffer,
+                    offset + 4,
+                    &out.buffer,
+                    offset,
+                );
             }
             list.list.ExecuteIndirect(
                 &signature,
@@ -2503,7 +2521,7 @@ fn note_vertex_id_rectangles(p: &HostPipeline) {
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+pub(crate) fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());

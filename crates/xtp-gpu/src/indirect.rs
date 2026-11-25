@@ -2,9 +2,12 @@
 //! title's own compute passes write most of them; a pass we drop or
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
-//! host resets the display driver. So every record is clamped on the GPU,
-//! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! host resets the display driver.
+//!
+//! Une passe de calcul borne une série d’exécutions à partir de sa table
+//! d’upload. Chaque commande et son compteur occupent une tranche privée.
+//! Les dispatches ordinaires y gardent le format natif XYZ, les morceaux
+//! qui utilisent une origine de groupe ont une signature distincte.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -44,6 +47,7 @@ RWByteAddressBuffer countBuffer : register(u3);
 RWByteAddressBuffer stats : register(u4);
 static const uint BUDGET = 1u << 27;
 static const uint LIMIT = 65535;
+static const uint MAX_GROUPS = BUDGET / 64;
 groupshared uint costs[64];
 groupshared uint sizes[64];
 groupshared uint starts[64];
@@ -64,7 +68,10 @@ void main(uint lane : SV_GroupIndex) {
         bool measure = (flags & 2) != 0;
         if (measure && lane < 16) metrics[lane] = 0;
         GroupMemoryBarrierWithGroupSync();
-        uint written = 0;
+        bool compact = (flags & 4) != 0;
+        bool prefix = (flags & 8) != 0;
+        uint nativeAt = offsets.z + 16 + 24 * min(records + MAX_GROUPS / LIMIT, MAX_GROUPS);
+        uint nativeCount = 0, written = 0;
         for (uint tile = 0; tile < records; tile += 64) {
             uint n = min(records - tile, 64u);
             uint at = offsets.x + (tile + lane) * stride;
@@ -100,7 +107,11 @@ void main(uint lane : SV_GroupIndex) {
                         if (g.x > BUDGET / weight / g.y / g.z) {
                             if (measure) InterlockedAdd(metrics[5], 1);
                         } else {
-                            cost = g.x * g.y * g.z * weight;
+                            uint groups = g.x * g.y * g.z;
+                            cost = groups * weight;
+                            // MeshGroup ne lit que X. Une origine X par morceau
+                            // conserve tous les identifiants de la grille linéarisée.
+                            if (kind == 10) g = uint3(groups, 1, 1);
                             uint3 tiles = (g - 1) / LIMIT + 1;
                             size = tiles.x * tiles.y * tiles.z;
                         }
@@ -119,7 +130,13 @@ void main(uint lane : SV_GroupIndex) {
                         if (measure) InterlockedAdd(metrics[6], 1);
                     } else {
                         left -= costs[i];
-                        written += sizes[i];
+                        if (measure && sizes[i] > 1) InterlockedAdd(metrics[14], 1);
+                        // Préfixe au format D3D12 natif jusqu’au premier
+                        // découpage. Le suffixe garde ensuite l’ordre du titre.
+                        if (prefix && written == 0 && sizes[i] == 1)
+                            starts[i] = 0x80000000 | nativeCount++;
+                        else
+                            written += sizes[i];
                     }
                 }
             }
@@ -129,25 +146,34 @@ void main(uint lane : SV_GroupIndex) {
                 if (costs[lane] == 0xffffffff) draw = 0;
                 pieces.Store4(dst, uint4(draw, args.Load2(at + 8)));
                 if (kind == 1) pieces.Store(dst + 16, args.Load(at + 16));
+            } else if (size != 0 && costs[lane] != 0xffffffff && (starts[lane] & 0x80000000)) {
+                pieces.Store3(nativeAt + 4 + 12 * (starts[lane] & 0x7fffffff), g);
             } else if (size != 0 && costs[lane] != 0xffffffff) {
                 // Deux axes > LIMIT dépasseraient déjà le budget de toute la liste.
                 uint3 step = uint3(g.x > LIMIT, g.y > LIMIT, g.z > LIMIT) * LIMIT;
                 for (uint j = 0; j < size; j++) {
                     uint3 base = step * j;
-                    uint dst = offsets.z + 4 + 24 * (starts[lane] + j);
-                    pieces.Store3(dst, base);
-                    pieces.Store3(dst + 12, min(g - base, LIMIT));
+                    uint index = starts[lane] + j;
+                    uint3 dims = min(g - base, LIMIT);
+                    if (compact) {
+                        pieces.Store3(offsets.z + 4 + 12 * index, dims);
+                    } else {
+                        uint dst = offsets.z + 4 + 24 * index;
+                        pieces.Store3(dst, base);
+                        pieces.Store3(dst + 12, dims);
+                    }
                 }
             }
             GroupMemoryBarrierWithGroupSync();
         }
         if (lane == 0) {
             pieces.Store(offsets.z, kind > 1 ? written : active);
+            if (prefix) pieces.Store(nativeAt, nativeCount);
             if (measure) {
                 stats.Store4(offsets.w + 0, uint4(metrics[0], metrics[1], metrics[2], metrics[3]));
                 stats.Store4(offsets.w + 16, uint4(metrics[4], metrics[5], metrics[6], active));
                 stats.Store4(offsets.w + 32, uint4(metrics[8], metrics[9], metrics[10], metrics[11]));
-                stats.Store2(offsets.w + 48, uint2(metrics[12], BUDGET - left));
+                stats.Store3(offsets.w + 48, uint3(metrics[12], BUDGET - left, metrics[14]));
             }
         }
         GroupMemoryBarrierWithGroupSync();
@@ -201,6 +227,7 @@ struct Counts {
     instance_limit: u64,
     over_million_groups: u64,
     max_list_cost: u32,
+    split_records: u64,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -240,6 +267,7 @@ impl Sample {
         c.instance_limit += u64::from(read(11));
         c.over_million_groups += u64::from(read(12));
         c.max_list_cost = c.max_list_cost.max(read(13));
+        c.split_records += u64::from(read(14));
     }
 }
 
@@ -433,11 +461,47 @@ pub(crate) struct Runs {
     ordered: std::collections::HashMap<usize, u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Output {
+    Rectangles,
+    Draw,
+    Expanded,
+    Native,
+    NativePrefix,
+}
+
+impl Output {
+    pub(crate) fn dispatch(has_base: bool) -> Self {
+        if expansion_control() {
+            Self::Expanded
+        } else if has_base {
+            Self::NativePrefix
+        } else {
+            Self::Native
+        }
+    }
+}
+
+// Témoin de mesure : mêmes séries et même budget, tous les dispatches au
+// format de cxhair (base + dimensions), dans sa mémoire système mappée.
+fn expansion_control() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("XTP_INDIRECT_EXPANSION_CONTROL").is_ok_and(|s| s == "1"))
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        false
+    }
+}
+
 pub(crate) struct Bounded {
     pub(crate) buffer: ID3D12Resource,
     pub(crate) offset: u64,
     pub(crate) capacity: u32,
     pub(crate) dispatched: bool,
+    pub(crate) native_offset: Option<u64>,
 }
 
 /// Une ressource peut dépasser la fenêtre de 4 Gio d’une vue HLSL brute.
@@ -465,7 +529,7 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     stats: Option<(u64, u32)>,
     writes: [u64; 2],
-    indirect: bool,
+    output: Output,
 ) -> Option<Bounded> {
     let min_stride = match kind {
         0 => 16,
@@ -494,7 +558,18 @@ pub(crate) fn bound(
         records.saturating_add(EXTRA).min(MAX_GROUPS)
     };
     // Douze octets en fin de tranche pour la signature qui saute la base XYZ.
-    let bytes = capacity.checked_mul(RECORD_BYTES)?.checked_add(16)?;
+    let stride_out = if output == Output::Native {
+        12
+    } else {
+        RECORD_BYTES
+    };
+    let base_bytes = capacity.checked_mul(stride_out)?.checked_add(16)?;
+    let native_bytes = if output == Output::NativePrefix {
+        records.min(MAX_GROUPS).checked_mul(12)?.checked_add(4)?
+    } else {
+        0
+    };
+    let bytes = base_bytes.checked_add(native_bytes)?;
     let mut runs = list.clamps.lock().unwrap_or_else(|e| e.into_inner());
     let join = runs
         .open
@@ -505,7 +580,10 @@ pub(crate) fn bound(
             .as_ref()
             .is_some_and(|p| bytes <= p.bytes - p.used);
     let at = if join { runs.page.as_ref()?.used } else { 0 };
-    let flags = u32::from(count.is_some()) | (u32::from(stats.is_some()) << 1);
+    let flags = u32::from(count.is_some())
+        | (u32::from(stats.is_some()) << 1)
+        | (u32::from(output == Output::Native) << 2)
+        | (u32::from(output == Output::NativePrefix) << 3);
     let row = [
         kind, stride, records, flags, args_at, count_at, at, stats_at,
     ];
@@ -528,7 +606,11 @@ pub(crate) fn bound(
             let new_page = runs.page.as_ref().is_none_or(|p| bytes > p.bytes);
             if new_page {
                 let bytes = bytes.max(PAGE_BYTES);
-                let buffer = crate::host::buffers::card_buffer(&host()?.device, bytes.into())?;
+                let buffer = if expansion_control() {
+                    host()?.shared_buffer(bytes.into())?.0
+                } else {
+                    crate::host::buffers::card_buffer(&host()?.device, bytes.into())?
+                };
                 list.keep(&buffer);
                 runs.page = Some(Page {
                     buffer,
@@ -582,8 +664,8 @@ pub(crate) fn bound(
     };
     let page = runs.page.as_mut()?;
     page.used = at + bytes;
-    page.state(list, indirect);
-    if !indirect && dispatched {
+    page.state(list, output != Output::Rectangles);
+    if output == Output::Rectangles && dispatched {
         // SAFETY: la passe des rectangles lit la sortie via une UAV.
         unsafe { list.list.ResourceBarrier(&[uav_barrier(&page.buffer)]) };
     }
@@ -592,6 +674,8 @@ pub(crate) fn bound(
         offset: at.into(),
         capacity,
         dispatched,
+        native_offset: (output == Output::NativePrefix)
+            .then(|| u64::from(at) + u64::from(base_bytes)),
     })
 }
 
@@ -630,6 +714,19 @@ pub(crate) fn signature(
     signature
 }
 
+/// Limite le travail avant de parcourir les morceaux sur le CPU. La multiplication
+/// protégée conserve les trois axes du calcul et linéarise ceux du mesh sur X.
+fn direct_groups(groups: [u32; 3], mesh: bool) -> Option<[u32; 3]> {
+    if groups.contains(&0) {
+        return Some([0, 1, 1]);
+    }
+    let [x, y, z] = groups;
+    if x > MAX_GROUPS / y / z {
+        return None;
+    }
+    Some(if mesh { [x * y * z, 1, 1] } else { groups })
+}
+
 pub(crate) fn direct(
     list: &HostList,
     groups: [u32; 3],
@@ -637,16 +734,13 @@ pub(crate) fn direct(
     mesh: bool,
     mut run: impl FnMut([u32; 3]),
 ) {
-    let mut extent = groups.map(|n| n.min(LIMIT));
+    let Some(groups) = direct_groups(groups, mesh) else {
+        return;
+    };
+    let extent = groups.map(|n| n.min(LIMIT));
     if groups.contains(&0) {
         run(extent);
         return;
-    }
-    if mesh {
-        // DispatchMesh limite également le produit XYZ d’une commande.
-        const MAX_MESH_GROUPS: u32 = (1 << 22) - 1;
-        extent[1] = extent[1].min(MAX_MESH_GROUPS / extent[0]);
-        extent[2] = extent[2].min(MAX_MESH_GROUPS / extent[0] / extent[1]);
     }
     if groups == extent {
         run(groups);
@@ -755,7 +849,7 @@ mod tests {
         }
         let mut commands = None;
         for _ in 0..calls {
-            commands = super::bound(&list, (&buffer, 0), spec, None, None, [0; 2], true);
+            commands = super::bound(&list, (&buffer, 0), spec, None, None, [0; 2], Output::Draw);
             assert!(commands.is_some());
         }
         let (_out, result) = read_commands(&list, &commands.unwrap(), 4 + u64::from(records) * 24);
@@ -805,7 +899,7 @@ mod tests {
         unsafe {
             let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), 18 * 4);
             for record in words.as_chunks_mut::<4>().0 {
-                record.copy_from_slice(&[70_000, 1, 1, 0]);
+                record.copy_from_slice(&[7000, 2, 5, 0]);
             }
             words[..3].fill(u32::MAX);
             words[3] = 17;
@@ -816,7 +910,7 @@ mod tests {
                 Some((&args, 12)),
                 Some((stats.GetGPUVirtualAddress(), 0)),
                 [0; 2],
-                true,
+                Output::Expanded,
             )
             .unwrap();
             let (_out, written) = read_commands(&list, &commands, 4 + 24 * 28);
@@ -831,8 +925,8 @@ mod tests {
                 assert_eq!(pair, [0, 0, 0, 65535, 1, 1, 65535, 0, 0, 4465, 1, 1]);
             }
             let metrics = std::slice::from_raw_parts(counts.cast::<u32>(), 8);
-            assert_eq!(metrics, [u32::MAX, u32::MAX, u32::MAX, 17, 0, 1, 2, 17]);
-            assert_eq!(words[4], 70000);
+            assert_eq!(metrics, [u32::MAX, u32::MAX, u32::MAX, 1, 0, 1, 2, 17]);
+            assert_eq!(words[4], 7000);
         }
     }
 
@@ -890,8 +984,26 @@ mod tests {
             let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), 12);
             words.copy_from_slice(&[1 << 24, 4, 3, 8, 1 << 24, 4, 1, 7, 3, 1, 9, 4]);
         }
-        let first = bound(&list, (&args, 0), (0, 16, 2), None, None, [0; 2], true).unwrap();
-        let second = bound(&list, (&args, 32), (0, 16, 1), None, None, [0; 2], true).unwrap();
+        let first = bound(
+            &list,
+            (&args, 0),
+            (0, 16, 2),
+            None,
+            None,
+            [0; 2],
+            Output::Draw,
+        )
+        .unwrap();
+        let second = bound(
+            &list,
+            (&args, 32),
+            (0, 16, 1),
+            None,
+            None,
+            [0; 2],
+            Output::Draw,
+        )
+        .unwrap();
         assert!(first.dispatched && !second.dispatched);
         let (_one, a) = read_commands(&list, &first, 52);
         let (_two, b) = read_commands(&list, &second, 20);
@@ -930,7 +1042,7 @@ mod tests {
                 Some((&c.buffer, c.offset(count.address()))),
                 None,
                 writes,
-                true,
+                Output::Draw,
             )
             .unwrap()
         };
@@ -962,6 +1074,75 @@ mod tests {
         assert!(!state.execute_indirect(list.host(), (10, 12, 1), args.address(), None));
         assert!(list.host().clamps.lock().unwrap().open.is_none());
         list.run();
+    }
+
+    #[test]
+    fn native_prefix_precedes_the_split_and_its_suffix() {
+        let test = "indirect::tests::native_prefix_precedes_the_split_and_its_suffix";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let list = host.new_list().unwrap();
+        let (args, data) = host.shared_buffer(36).unwrap();
+        // SAFETY: trois dispatches du test, lus après leur initialisation.
+        unsafe {
+            data.cast::<[u32; 9]>()
+                .write([5, 2, 1, 70000, 1, 1, 2, 3, 4]);
+        }
+        let prefix = bound(
+            &list,
+            (&args, 0),
+            (2, 12, 3),
+            None,
+            None,
+            [0; 2],
+            Output::NativePrefix,
+        )
+        .unwrap();
+        let skip = (prefix.native_offset.unwrap() - prefix.offset) as usize / 4;
+        let (_read, data) = read_commands(&list, &prefix, (skip as u64 + 4) * 4);
+        let compact = bound(
+            &list,
+            (&args, 0),
+            (2, 12, 3),
+            None,
+            None,
+            [0; 2],
+            Output::Native,
+        )
+        .unwrap();
+        let (_compact, packed) = read_commands(&list, &compact, 4 + 4 * 12);
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: les deux tranches copiées sont mappées et la soumission est terminée.
+        unsafe {
+            let words = std::slice::from_raw_parts(data.cast::<u32>(), skip + 4);
+            assert_eq!(&words[skip..], [1, 5, 2, 1]);
+            assert_eq!(
+                &words[..19],
+                [
+                    3, 0, 0, 0, 65535, 1, 1, 65535, 0, 0, 4465, 1, 1, 0, 0, 0, 2, 3, 4
+                ]
+            );
+            assert_eq!(
+                *packed.cast::<[u32; 13]>(),
+                [4, 5, 2, 1, 65535, 1, 1, 4465, 1, 1, 2, 3, 4]
+            );
+        }
+    }
+
+    #[test]
+    fn direct_grids_are_bounded_before_splitting() {
+        assert_eq!(direct_groups([u32::MAX; 3], false), None);
+        assert_eq!(
+            direct_groups([MAX_GROUPS, 1, 1], false),
+            Some([MAX_GROUPS, 1, 1])
+        );
+        assert_eq!(direct_groups([1, MAX_GROUPS + 1, 1], true), None);
+        assert_eq!(direct_groups([1000, 2, 3], true), Some([6000, 1, 1]));
+        assert_eq!(direct_groups([1000, 2, 3], false), Some([1000, 2, 3]));
     }
 
     #[test]

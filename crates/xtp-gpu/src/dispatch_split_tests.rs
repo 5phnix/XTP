@@ -60,7 +60,7 @@ fn every_group_runs_once_with_its_guest_id() {
         return;
     };
     let host = gpu.host();
-    for (axis, n) in [(0, 70000u32), (1, 65536), (2, (1 << 20) + 1)] {
+    for (axis, n) in [(0, 1000u32), (0, 70000), (1, 65536), (2, (1 << 20) + 1)] {
         let p = counting(axis);
         let base = p
             .group_base()
@@ -110,8 +110,16 @@ fn every_group_runs_once_with_its_guest_id() {
                 );
                 if indirect {
                     held = Some(
-                        indirect::bound(&list, (&args, 0), (2, 12, 1), None, None, [0; 2], true)
-                            .unwrap(),
+                        indirect::bound(
+                            &list,
+                            (&args, 0),
+                            (2, 12, 1),
+                            None,
+                            None,
+                            [0; 2],
+                            indirect::Output::NativePrefix,
+                        )
+                        .unwrap(),
                     );
                 }
                 let l = &list.list;
@@ -122,6 +130,16 @@ fn every_group_runs_once_with_its_guest_id() {
                 if let Some(scratch) = held.as_ref() {
                     let sig = indirect::signature(2, &p.root, Some(base)).unwrap();
                     list.keep(&sig);
+                    let native = crate::draw::host_signature(2, 12).unwrap();
+                    let offset = scratch.native_offset.unwrap();
+                    l.ExecuteIndirect(
+                        &native,
+                        1,
+                        &scratch.buffer,
+                        offset + 4,
+                        &scratch.buffer,
+                        offset,
+                    );
                     l.ExecuteIndirect(
                         &sig,
                         scratch.capacity,

@@ -1068,7 +1068,7 @@ pub(crate) fn expand(
         count.map(|(s, at)| (&s.buffer, s.offset(at))),
         stats,
         writes,
-        false,
+        crate::indirect::Output::Rectangles,
     )
     .ok_or("not bounded (no clamp)")?;
     let _expanding =
