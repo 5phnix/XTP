@@ -504,8 +504,10 @@ mod tests {
         host.drain();
         let words = out.words();
         let values: Vec<_> = words[..14]
-            .chunks_exact(2)
-            .map(|w| u64::from(w[0]) | (u64::from(w[1]) << 32))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[low, high]| u64::from(low) | (u64::from(high) << 32))
             .collect();
         let visible = 1 << 20;
         assert_eq!(values, [visible, visible, visible, 0, 0, visible, visible]);
