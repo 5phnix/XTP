@@ -387,8 +387,8 @@ impl Registry {
         );
         (
             BuildSlot {
-                known_extent: start != 0
-                    && bytes.map_or(owner.is_some(), |n| n > 0 && start.checked_add(n).is_some()),
+                known_extent: bytes
+                    .map_or(owner.is_some(), |n| n > 0 && start.checked_add(n).is_some()),
                 generation: self.generation,
                 slot,
                 overwritten,
@@ -493,6 +493,9 @@ unsafe fn build_one(
     title_bytes: Option<u64>,
 ) -> bool {
     let dst = desc.DestAccelerationStructureData;
+    if dst == 0 {
+        return false;
+    }
     let (generation, reuse) = registry().begin(dst, title_bytes);
     let built = (|| {
         if !generation.known_extent {
@@ -617,6 +620,9 @@ impl Builder {
     /// # Safety
     /// `list` is a live title list.
     pub unsafe fn copy(&self, list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
+        if dst == 0 {
+            return false;
+        }
         let (source, generation) = {
             let mut table = registry();
             let source = table.structures.get(&src).cloned();

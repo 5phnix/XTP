@@ -651,23 +651,23 @@ Per title structure address, as VIctory #702 keys them (section 11):
   to GPU-written index data without assuming the old topology. Host
   compaction uses a private postbuild slot, read after the producing
   submission's fence. A compact copy reserves the source capacity so the
-  destination also fits a replay with different geometry. Both paths publish a distinct destination and
-  preserve the title DLL's postbuild values.
+  destination also fits a replay with different geometry. Each copy publishes
+  a distinct destination and preserves the title DLL's postbuild values.
 - **TLAS.** A compute pass reads the 64-byte instance records on the GPU
   after preceding writers, preserves their transforms, masks, IDs and
   flags, and rewrites the BLAS addresses using a sorted table. A missing
   BLAS becomes a null, inactive instance. At submission the rewrite
   takes the BLAS generations published by preceding queue commands,
   including producers recorded after the TLAS. Its private indirect
-  argument selects the immutable upload and its row count. The TLAS retains the candidate BLAS generations across
-  address reuse. Every consuming recording pins the TLAS and its table.
+  argument selects the immutable upload, which contains the row count.
+  The TLAS retains the selected BLAS generations across address reuse. Every consuming recording pins the TLAS and its table.
 - **Allocation and ordering.** Small AS results share 1 MiB pages in 256-byte slices.
   Scratch and rewritten instances use separate on-demand heaps. RT backing
   allocations together may use up to one eighth of the DXGI local budget,
   capped at 512 MiB. Growth also preserves one sixteenth of the local
   budget (up to 256 MiB) for other work. If DXGI cannot report a budget
-  or either limit is reached, allocation is refused and logged. An unreferenced result at a reused title
-  address can be rebuilt in place if it is large enough. Scratch is reused
+  or either limit is reached, allocation is refused and logged. A result
+  can be rebuilt in place if unreferenced and large enough. Scratch is reused
   per list. Consecutive builds in a batch share their intervening UAV
   barrier. A title prebuild query supplies the guest span. A compact copy
   conservatively uses the source guest span when the title's compacted
@@ -675,8 +675,8 @@ Per title structure address, as VIctory #702 keys them (section 11):
   including in-progress builds. Releasing a title buffer or remapping
   loose memory retires its mappings as well.
 - **Lookup at dispatch.** `xtp_gpu::rt::host_tlas(list, title_tlas)` checks the
-  producer and retains the TLAS and its BLAS for that recording. Use it directly, or `descriptor_tlas` with the live title
-  descriptor handle. Resolve each descriptor independently, including
+  producer and retains the TLAS and its BLAS for that recording.
+  `descriptor_tlas` accepts the live title descriptor handle. Resolve each descriptor independently, including
   table 5 at byte offsets +0x60 and +0x80. A cross-list copy or direct
   binding whose producer has yet to be submitted is unavailable. Use
   `dispatch_descriptor_tlas` for the trace splice. It records an indirect
