@@ -1,14 +1,34 @@
 //! Admission du constructeur BVH complet (VIctory #2118).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use super::{Shader, make};
 
 struct Builder {
     members: HashMap<blake3::Hash, Arc<make::Pending>>,
     start: Once,
-    admitted: OnceLock<bool>,
+    decision: Mutex<Option<Decision>>,
+}
+
+#[derive(Clone, Copy)]
+enum Decision {
+    Preparing(u64),
+    Final(bool),
+}
+
+fn decide(last: &mut Option<Decision>, frame: u64, status: impl FnOnce() -> Option<bool>) -> bool {
+    match *last {
+        Some(Decision::Final(ready)) => return ready,
+        Some(Decision::Preparing(f)) if f == frame => return false,
+        _ => {}
+    }
+    let ready = status();
+    if ready.is_none() && last.is_none() {
+        tracing::info!(frame, "BVH builder held: preparing pipelines");
+    }
+    *last = Some(ready.map_or(Decision::Preparing(frame), Decision::Final));
+    ready == Some(true)
 }
 
 static BUILDER: OnceLock<Builder> = OnceLock::new();
@@ -27,7 +47,7 @@ pub fn register_builder<'a>(containers: impl Iterator<Item = &'a [u8]>) -> anyho
     if let Err(other) = BUILDER.set(Builder {
         members,
         start: Once::new(),
-        admitted: OnceLock::new(),
+        decision: Mutex::new(None),
     }) {
         let first = BUILDER.get().unwrap();
         anyhow::ensure!(
@@ -63,7 +83,8 @@ pub(super) fn member(shaders: &[Arc<Shader>]) -> Option<Arc<make::Pending>> {
 
 pub(super) fn admitted() -> bool {
     let group = BUILDER.get().expect("registered builder member");
-    *group.admitted.get_or_init(|| {
+    let mut last = group.decision.lock().unwrap_or_else(|e| e.into_inner());
+    decide(&mut last, crate::frame::current(), || {
         #[cfg(feature = "diagnostics")]
         if group.members.keys().any(|h| {
             super::skip_hashes()
@@ -74,8 +95,20 @@ pub(super) fn admitted() -> bool {
                 members = group.members.len(),
                 "BVH builder held: member explicitly skipped"
             );
-            return false;
+            return Some(false);
         }
         make::admit_builder(group.members.values())
     })
+}
+
+#[test]
+fn builder_finishes_preparation_between_frames() {
+    let mut decision = None;
+    assert!(!decide(&mut decision, 3, || None));
+    assert!(!decide(&mut decision, 3, || panic!("même image")));
+    assert!(decide(&mut decision, 4, || Some(true)));
+    assert!(decide(&mut decision, 5, || panic!("verdict définitif")));
+    let mut refused = None;
+    assert!(!decide(&mut refused, 3, || Some(false)));
+    assert!(!decide(&mut refused, 4, || panic!("refus définitif")));
 }

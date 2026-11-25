@@ -375,27 +375,18 @@ fn builder_verdict(states: impl Iterator<Item = Option<bool>>) -> Option<bool> {
     ready
 }
 
-pub(super) fn admit_builder<'a>(members: impl Iterator<Item = &'a Arc<Pending>> + Clone) -> bool {
+pub(super) fn admit_builder<'a>(
+    members: impl Iterator<Item = &'a Arc<Pending>> + Clone,
+) -> Option<bool> {
     let state = |p: &Arc<Pending>| p.made.get().map(Option::is_some);
-    // La première utilisation passe devant les autres compilations anticipées.
-    for p in members.clone() {
-        POOLS.start(p, URGENT);
+    let admitted = builder_verdict(members.clone().map(state))?;
+    let total = members.clone().count();
+    if admitted {
+        tracing::info!(members = total, "BVH builder admitted");
+    } else if let Some(p) = members.clone().find(|p| state(p) == Some(false)) {
+        tracing::warn!(members = total, refused = %p.shaders[0].hash, "BVH builder held");
     }
-    let (lock, done) = &DONE;
-    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        if let Some(admitted) = builder_verdict(members.clone().map(state)) {
-            drop(guard);
-            let total = members.clone().count();
-            if admitted {
-                tracing::info!(members = total, "BVH builder admitted");
-            } else if let Some(p) = members.clone().find(|p| state(p) == Some(false)) {
-                tracing::warn!(members = total, refused = %p.shaders[0].hash, "BVH builder held");
-            }
-            return admitted;
-        }
-        guard = done.wait(guard).unwrap_or_else(|e| e.into_inner());
-    }
+    Some(admitted)
 }
 
 #[test]

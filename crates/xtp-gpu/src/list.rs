@@ -1481,8 +1481,7 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
     {
         let pipeline = kept_pipeline(this);
-        // L'admission peut terminer la compilation du premier membre. Ses
-        // dimensions doivent être disponibles avant de convertir les threads.
+        // Une image en attente ignore aussi la conversion des dimensions.
         let host = if crate::pipeline::builder_held(pipeline) {
             None
         } else {
