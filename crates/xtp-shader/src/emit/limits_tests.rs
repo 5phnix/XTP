@@ -5,8 +5,8 @@
 //!   what passes (writes that change nothing the program computes, a 16-bit
 //!   rounding toward zero, which is counted).
 //! - Cube arrays (`Lower::cube_view`): a cube sample whose face operand is a
-//!   face id plus 8 × a slice declares a cube array, one of a face id a
-//!   cube; any other face operand is refused. The handle kinds come from
+//!   face id plus 8 × a slice declares a cube array, one of a face id (or
+//!   of a face operand traced to neither) a cube. The handle kinds come from
 //!   dxc's disassembly (the Windows SDK's `dxc.exe`, else not checked), and
 //!   `dxil.dll` validates every translation where it is found.
 
@@ -465,7 +465,7 @@ fn the_cube_encodings_read_back() {
 
 /// The face id alone is a cube; the face id plus 8 × a slice (a multiply-
 /// add by 8.0, or an addition of a product by 8.0) a cube array; a face
-/// operand the program loads is refused.
+/// operand the program loads stays a cube.
 #[test]
 fn a_cube_sample_declares_a_cube_or_a_cube_array_by_its_face_operand() {
     let sample = cube_mimg("image_sample_lz", 7);
@@ -482,15 +482,10 @@ fn a_cube_sample_declares_a_cube_or_a_cube_array_by_its_face_operand() {
         assert_eq!(a, [9]);
         assert_eq!(b, [9]);
     }
-    match translate(&cube_program(&[], sample)) {
-        Err(ShaderError::Unsupported { what, .. }) => {
-            assert!(
-                what.starts_with("a cube sample whose face operand"),
-                "{what}"
-            );
-        }
-        Err(e) => panic!("{e}"),
-        Ok(_) => panic!("a loaded face operand translated"),
+    // A face operand the program loads: a cube's, as before.
+    let loaded = translate(&cube_program(&[], sample)).unwrap();
+    if let Some(l) = image_kinds(&loaded) {
+        assert_eq!(l, [5]);
     }
 }
 

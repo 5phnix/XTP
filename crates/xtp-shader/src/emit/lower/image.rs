@@ -51,12 +51,6 @@ struct SampleForm {
 /// of four samples (`Lower::image`).
 const GATHER_AT_LEVEL: u32 = 1 << 16;
 
-/// A cube sample whose face operand is neither a face id nor a face id
-/// plus 8 × a slice ([`Lower::cube_view`]): the host view's dimension
-/// (cube or cube array) is not known.
-pub(super) const CUBE_FACE_UNTRACED: Why =
-    "a cube sample whose face operand is neither a face id nor a face id plus 8 times a slice";
-
 /// How far [`Lower::layer_of`] follows a face operand back.
 const LAYER_DEPTH: u32 = 12;
 
@@ -320,7 +314,7 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked image")?;
         if kind == 5 {
-            kind = self.cube_view(inst, src)?;
+            kind = self.cube_view(inst, src);
         }
         let store = name.starts_with("image_store");
         let uav = store
@@ -1200,9 +1194,10 @@ impl<'a> Lower<'a> {
     /// id plus 8 × the slice (Mesa `ac_prepare_cube_coords` does the same).
     /// A size query tells by asking for the layer count (a cube's HLSL size
     /// has none), or by a sample of the same descriptor that is an array's.
-    /// A sample whose face operand is neither is refused
-    /// ([`CUBE_FACE_UNTRACED`]).
-    fn cube_view(&self, inst: &Inst, src: &Source) -> Result<u32, Why> {
+    // shortcut: a face operand traced to neither (one the program loads, or
+    // computes otherwise) is taken as a cube's face, as before; a cube
+    // array's slice there reads slice 0.
+    fn cube_view(&self, inst: &Inst, src: &Source) -> u32 {
         let Fields::Image { dmask, .. } = &inst.fields else {
             unreachable!()
         };
@@ -1217,16 +1212,15 @@ impl<'a> Lower<'a> {
                     && matches!(other.fields, Fields::Image { dim: 3, .. })
                     && self.face_layer(other) == Layer::Slice
             });
-            return Ok(if dmask >> 2 & 1 != 0 || sampled_as_array {
+            return if dmask >> 2 & 1 != 0 || sampled_as_array {
                 9
             } else {
                 5
-            });
+            };
         }
         match self.face_layer(inst) {
-            Layer::Face => Ok(5),
-            Layer::Slice => Ok(9),
-            Layer::Unknown => Err(CUBE_FACE_UNTRACED),
+            Layer::Face | Layer::Unknown => 5,
+            Layer::Slice => 9,
         }
     }
 
