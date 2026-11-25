@@ -2400,10 +2400,6 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
-    #[cfg(feature = "diagnostics")]
-    if let View::Shader(r, _) | View::Unordered(r, ..) = view {
-        crate::passdump::binding(list, *r as This, u.slot, u.table_offset_dwords);
-    }
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
