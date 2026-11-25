@@ -173,6 +173,7 @@ impl<'a> Recorder<'a> {
             result,
             instances: None,
             compacted_size: postbuild.map(|(_, size)| size),
+            holds: None,
         })
     }
 
@@ -245,11 +246,17 @@ struct Structure {
     // Only TLAS generations refer to a snapshot of the BLAS address space.
     instances: Option<Arc<BlasMap>>,
     compacted_size: Option<Arc<AtomicU64>>,
+    /// A TLAS's stand-in BLAS, which its instances of a BLAS the host does
+    /// not have name ([`empty_tlas`]), or that of the empty TLAS it is.
+    holds: Option<Arc<ResultBuffer>>,
 }
 
 impl Structure {
     fn retain(&self, list: &HostList) {
         list.keep_rt_result(&self.result);
+        if let Some(blas) = &self.holds {
+            list.keep_rt_result(blas);
+        }
         if let Some(map) = &self.instances {
             map.capture(list);
         }
@@ -585,7 +592,11 @@ pub(crate) fn host_tlas_in(list: &HostList, title_tlas: u64) -> Option<u64> {
 /// divided by zero building a TLAS of no instance, and faulted on an
 /// instance of a null BLAS. One is built once and shared once its recording
 /// has reached the queue; until then a recording builds its own here.
-fn empty_tlas(rec: &Recorder<'_>) -> Option<Arc<ResultBuffer>> {
+///
+/// The TLAS and its BLAS, which the recording keeps: a title TLAS names
+/// that BLAS, with mask 0, for an instance of a BLAS the host does not have
+/// ([`instances::rewrite`]), and is that TLAS when it has no instance.
+fn empty_tlas(rec: &Recorder<'_>) -> Option<(Arc<ResultBuffer>, Arc<ResultBuffer>)> {
     /// The TLAS and the BLAS its instance names, which must outlive it.
     static EMPTY: Mutex<Option<(Structure, Arc<ResultBuffer>)>> = Mutex::new(None);
     let mut shared = EMPTY.lock().unwrap_or_else(|e| e.into_inner());
@@ -594,7 +605,7 @@ fn empty_tlas(rec: &Recorder<'_>) -> Option<Arc<ResultBuffer>> {
     {
         rec.list.keep_rt_result(blas);
         rec.list.keep_rt_result(&tlas.result);
-        return Some(tlas.result.clone());
+        return Some((tlas.result.clone(), blas.clone()));
     }
     let built = (|| {
         // Three vertices at the origin, then the instance record.
@@ -665,7 +676,7 @@ fn empty_tlas(rec: &Recorder<'_>) -> Option<Arc<ResultBuffer>> {
     };
     // Recordings that took an earlier one keep it; later ones wait for this
     // one's recording, which a recording that is never submitted cannot block.
-    let result = tlas.result.clone();
+    let result = (tlas.result.clone(), blas.clone());
     *shared = Some((tlas, blas));
     Some(result)
 }
@@ -674,7 +685,7 @@ fn empty_tlas(rec: &Recorder<'_>) -> Option<Arc<ResultBuffer>> {
 /// where a trace has no TLAS: every ray misses. Its build may be recorded
 /// here, so call it before binding the trace's PSO and root arguments.
 pub(crate) fn empty_tlas_in(list: &HostList) -> Option<u64> {
-    Some(empty_tlas(&Recorder::new(list)?)?.gpu())
+    Some(empty_tlas(&Recorder::new(list)?)?.0.gpu())
 }
 
 /// Compatibility name for the recording-scoped lookup.
@@ -758,15 +769,30 @@ unsafe fn build_one(
                 recorder.build(&inputs, Some(dst), ordered)
             }
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
-                let (inputs, map) = instances::rewrite(&recorder, title_list, &inputs)?;
-                let built = Structure {
-                    instances: Some(map),
-                    ..recorder.build(&inputs, Some(dst), ordered || inputs.NumDescs != 0)?
-                };
                 // The empty TLAS traces fall back to, made before they bind
-                // their state.
-                let _ = empty_tlas(&recorder);
-                Some(built)
+                // their state, and its BLAS, which stands in for the BLAS of
+                // an instance the host does not have.
+                let empty = empty_tlas(&recorder);
+                let stand_in = empty.as_ref().map_or(0, |(_, blas)| blas.gpu());
+                let (inputs, map) = instances::rewrite(&recorder, title_list, &inputs, stand_in)?;
+                if inputs.NumDescs == 0
+                    && let Some((tlas, blas)) = empty.clone()
+                {
+                    // WARP divides by zero building a TLAS of no instance:
+                    // the empty TLAS, which no ray hits either.
+                    return Some(Structure {
+                        producer: Producer::recorded(list),
+                        result: tlas,
+                        instances: Some(map),
+                        compacted_size: None,
+                        holds: Some(blas),
+                    });
+                }
+                Some(Structure {
+                    instances: Some(map),
+                    holds: empty.map(|(_, blas)| blas),
+                    ..recorder.build(&inputs, Some(dst), ordered || inputs.NumDescs != 0)?
+                })
             }
             _ => None,
         }

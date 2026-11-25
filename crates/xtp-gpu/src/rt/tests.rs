@@ -1,5 +1,5 @@
 use super::*;
-use crate::testgpu::{TitleBuffer, TitleList};
+use crate::testgpu::{Kernel, Pass, TitleBuffer, TitleList};
 
 fn geometry(vertices: &TitleBuffer, indices: &TitleBuffer) -> Geometry {
     Geometry {
@@ -600,6 +600,9 @@ fn rt_missing_tlas_writes_every_ray_as_a_miss() {
         (unwritten(), unwritten(), unwritten(), unwritten());
     let empty = Descriptor::new(nothing.address());
     let wrong = Descriptor::new(blas);
+    // A descriptor the decoder reads as no view at all.
+    let blank = Box::new(Descriptor([0; 4]));
+    let (blank_direct, blank_indirect) = (unwritten(), unwritten());
     let args = TitleBuffer::new(12);
     args.set_words(|_| 1);
     let list = TitleList::new();
@@ -612,10 +615,158 @@ fn rt_missing_tlas_writes_every_ray_as_a_miss() {
         &indirect,
     );
     trace(host, &list, Scene::Descriptor(wrong.handle()), &not_a_tlas);
+    trace(
+        host,
+        &list,
+        Scene::Descriptor(blank.handle()),
+        &blank_direct,
+    );
+    trace(
+        host,
+        &list,
+        Scene::Indirect(blank.handle(), args.address(), None),
+        &blank_indirect,
+    );
     list.run();
-    for out in [&direct, &spliced, &indirect, &not_a_tlas] {
+    for out in [
+        &direct,
+        &spliced,
+        &indirect,
+        &not_a_tlas,
+        &blank_direct,
+        &blank_indirect,
+    ] {
         assert_eq!(out.words(), MISSES, "the program ran and wrote its misses");
     }
+}
+
+/// Instance records naming each BLAS of `blas`, with an identity transform
+/// and mask 0xff.
+fn instances_of(blas: &[u64]) -> TitleBuffer {
+    let records = TitleBuffer::new(64 * blas.len());
+    records.set_words(|i| match i % 16 {
+        0 | 5 | 10 => 1f32.to_bits(),
+        12 => 0xff00_0000,
+        14 => blas[i / 16] as u32,
+        15 => (blas[i / 16] >> 32) as u32,
+        _ => 0,
+    });
+    records
+}
+
+/// A title TLAS of no instance, or of an instance of a BLAS the host does
+/// not have, makes every ray miss (WARP divided by zero building the first
+/// and faulted on the null BLAS of the second); the other instances of a
+/// TLAS keep their place and are hit.
+#[test]
+fn rt_tlas_of_no_instance_or_of_unknown_blas_misses() {
+    let test = "rt_tlas_of_no_instance_or_of_unknown_blas_misses";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    let world = World::new();
+    let nothing = TitleBuffer::new(1024);
+    let unknown = instances_of(&[nothing.address()]);
+    let mixed = instances_of(&[nothing.address(), world.blas.address()]);
+    let tlas: [TitleBuffer; 3] = std::array::from_fn(|_| TitleBuffer::new(1024));
+    let producer = TitleList::new();
+    // SAFETY: the title list and the instance buffers are live.
+    unsafe {
+        let mut none = tlas_desc(tlas[0].address(), &unknown);
+        none.Inputs.NumDescs = 0;
+        assert!(Builder.build(producer.this(), &none));
+        assert!(Builder.build(producer.this(), &tlas_desc(tlas[1].address(), &unknown)));
+        let mut two = tlas_desc(tlas[2].address(), &mixed);
+        two.Inputs.NumDescs = 2;
+        assert!(Builder.build(producer.this(), &two));
+    }
+    producer.run();
+    let held = |at: &TitleBuffer| registry().structures[&at.address()].holds.is_some();
+    assert!(tlas.iter().all(held), "each TLAS keeps its stand-in BLAS");
+    if !rays {
+        return;
+    }
+    let slots = tlas.each_ref().map(|t| Descriptor::new(t.address()));
+    let outs: [TitleBuffer; 3] = std::array::from_fn(|_| unwritten());
+    let list = TitleList::new();
+    for (slot, out) in slots.iter().zip(&outs) {
+        trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), out);
+    }
+    list.run();
+    assert_eq!(outs[0].words(), MISSES, "no instance");
+    assert_eq!(outs[1].words(), MISSES, "an unknown BLAS");
+    assert_eq!(outs[2].words(), hit(), "the known instance after it");
+}
+
+/// A trace recorded before the title releases its TLAS's buffer, and
+/// submitted after, misses: the release empties the slot the trace binds
+/// at submission (the old TLAS stayed alive in it and was hit).
+#[test]
+fn rt_a_tlas_released_before_its_trace_is_submitted_misses() {
+    let test = "rt_a_tlas_released_before_its_trace_is_submitted_misses";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let World {
+        tlas,
+        blas,
+        _inputs,
+    } = World::new();
+    let slot = Descriptor::new(tlas.address());
+    let (released, kept) = (unwritten(), unwritten());
+    let list = TitleList::new();
+    trace(
+        gpu.host(),
+        &list,
+        Scene::Descriptor(slot.handle()),
+        &released,
+    );
+    drop(tlas);
+    list.run();
+    assert_eq!(released.words(), MISSES);
+    // The same scene, not released, is hit.
+    let world = World::new();
+    let slot = Descriptor::new(world.tlas.address());
+    let list = TitleList::new();
+    trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &kept);
+    list.run();
+    assert_eq!(kept.words(), hit());
+    drop(blas);
+}
+
+/// An indirect trace whose groups a title shader wrote through a UAV
+/// earlier in its list: the arguments' buffer is then in the UAV state by
+/// promotion, which the preparation must not name as common (the D3D12
+/// debug layer, `XTP_D3D12_DEBUG=1`, fails the test on a wrong state).
+#[test]
+fn rt_indirect_trace_takes_groups_a_shader_wrote_in_its_list() {
+    let test = "rt_indirect_trace_takes_groups_a_shader_wrote_in_its_list";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let host = gpu.host();
+    let world = World::new();
+    let slot = Descriptor::new(world.tlas.address());
+    let kernel = Kernel::new(host);
+    let (written, args) = (TitleBuffer::new(256), TitleBuffer::new(256));
+    written.set_words(|i| u32::from(i < 3));
+    let list = TitleList::new();
+    kernel.dispatch(list.host(), Pass::Copy, written.address(), args.address());
+    let out = unwritten();
+    trace(
+        host,
+        &list,
+        Scene::Indirect(slot.handle(), args.address(), None),
+        &out,
+    );
+    list.run();
+    assert_eq!(out.words(), hit());
 }
 
 #[test]

@@ -163,10 +163,16 @@ pub(super) fn compute_pass(
     }
 }
 
+/// Rewrites the title's instances of `inputs` for a host TLAS build: each
+/// names the host BLAS at its title BLAS address in queue order, or, where
+/// the host has none, the BLAS at `stand_in` with mask 0, which no ray
+/// selects (the console's instance of a null BLAS is inactive; WARP faults
+/// on one).
 pub(super) fn rewrite(
     rec: &Recorder<'_>,
     title_list: *const Object,
     inputs: &Inputs,
+    stand_in: u64,
 ) -> Option<(Inputs, Arc<BlasMap>)> {
     let count = inputs.NumDescs;
     if inputs.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY
@@ -217,21 +223,19 @@ pub(super) fn rewrite(
         *destination.0.lock().unwrap_or_else(|e| e.into_inner()) = chosen;
     });
     rec.list.keep(&dst);
+    let constants = [count, stand_in as u32, (stand_in >> 32) as u32];
     // SAFETY: each root view covers the shader's checked range. The recording retains its
     // inputs and output, and the transition orders rewrite stores before the DXR build.
+    // The title's instances need no transition to be read as a UAV: a buffer in the common
+    // state is promoted to it, and one a title shader wrote earlier in the submission
+    // already is (a COMMON -> UNORDERED_ACCESS barrier would name the wrong state).
     unsafe {
         let gpu = dst.GetGPUVirtualAddress();
-        rec.commands.ResourceBarrier(&[
-            uav_barrier(),
-            crate::host::transition(
-                &src.buffer,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-        ]);
+        rec.commands.ResourceBarrier(&[uav_barrier()]);
         rec.commands.SetComputeRootSignature(&pass.root);
         rec.commands.SetPipelineState(&pass.pso);
-        rec.commands.SetComputeRoot32BitConstant(0, count, 0);
+        rec.commands
+            .SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
         rec.commands
             .SetComputeRootUnorderedAccessView(2, src.gpu(address));
         rec.commands.SetComputeRootUnorderedAccessView(3, gpu);
