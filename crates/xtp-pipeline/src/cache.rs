@@ -118,14 +118,16 @@ impl Cache {
     /// The entries are read from the index file at the root (`index`):
     /// one file, where looking at each entry took
     /// minutes for a cache of 157,805 (2026-11-25: sessions killed at 300 s
-    /// before the title drew). Without one, or with a damaged one, the
-    /// folder's entries are listed (their sizes and times, no file opened)
-    /// and the index written. Every publication and removal is appended to
-    /// it after. The index only sizes the cache: a read looks for its
-    /// entry's file whatever the index says, and checks it, so an index
-    /// that misses entries (written by a build without one) or lists gone
-    /// ones costs disk room or a stale count, never a wrong answer;
-    /// [`Cache::reindex`] sets it right.
+    /// before the title drew). Without one, or with a damaged one (a torn
+    /// record, a snapshot cut short: `disk::INDEX_FILE`), the folder's
+    /// entries are listed (their sizes and times, no file opened) and the
+    /// index written, unless a folder could not be listed. Every
+    /// publication and removal is appended to it after. The index only
+    /// sizes the cache: a read looks for its entry's file whatever the
+    /// index says, and checks it, so an index that misses entries (written
+    /// by a build without one, or appends lost with the machine) or lists
+    /// gone ones costs disk room or a stale count, never a wrong answer;
+    /// [`Cache::reindex`] sets it right (`xtp precook` before each pass).
     pub fn open_with_limit(root: impl Into<PathBuf>, limit: u64) -> Result<Self> {
         let root = root.into();
         xtp_core::ensure_outside_repo(&root)?;
@@ -162,8 +164,12 @@ impl Cache {
                     Opened::Index
                 }
                 None => {
-                    index.scan(&root);
-                    index.snapshot(&root);
+                    // A listing that missed a folder it could not read is
+                    // not written: the next open lists again, rather than
+                    // trust an index without that folder's entries.
+                    if index.scan(&root) {
+                        index.snapshot(&root);
+                    }
                     Opened::Scan
                 }
             };
@@ -213,21 +219,29 @@ impl Cache {
     /// Lists the folder's entries again (their sizes and times: no file is
     /// opened) and writes the index anew from them, then prunes to the
     /// limit: for entries the index misses (written by a build that kept
-    /// none, or appended to an index another process replaced) and gone
-    /// ones it still lists. The cache waits meanwhile: for a process that
-    /// can (`xtp precook`), not one a title waits on.
-    pub fn reindex(&self) {
+    /// none, appended to an index another process replaced, or appended by
+    /// a process stopped with the machine) and gone ones it still lists.
+    /// Old staging files of writes that were cut short go too. The cache
+    /// waits meanwhile: for a process that can (`xtp precook`), not one a
+    /// title waits on.
+    ///
+    /// False, with the index left as it was, if a folder of the cache could
+    /// not be listed: an index without its entries would be trusted after.
+    pub fn reindex(&self) -> bool {
         if self.store.limit == 0 {
-            return;
+            return true;
         }
         let mut index = lock(&self.store.index);
         let mut scanned = Index::default();
-        scanned.scan(&self.store.root);
+        if !scanned.scan(&self.store.root) {
+            return false;
+        }
         index.files = scanned.files;
         index.oldest = scanned.oldest;
         index.bytes = scanned.bytes;
         index.snapshot(&self.store.root);
         index.trim(&self.store.root, self.store.limit);
+        true
     }
 
     /// Returns an owned snapshot which remains readable after eviction.
@@ -380,17 +394,33 @@ impl Drop for Pin<'_> {
 }
 
 impl Index {
-    fn scan(&mut self, root: &Path) {
+    /// Adds the entries the folder at `root` holds, by its listing (no
+    /// entry opened), and removes staging files older than an hour. False
+    /// if part of it could not be listed: a folder, or an entry's size or
+    /// time (what was found is added all the same).
+    fn scan(&mut self, root: &Path) -> bool {
         fn hex(name: &std::ffi::OsStr, len: usize) -> bool {
             let s = name.as_encoded_bytes();
             s.len() == len
                 && s.iter()
                     .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
         }
-        fn children(path: &Path) -> impl Iterator<Item = fs::DirEntry> {
-            fs::read_dir(path).inspect_err(|e| tracing::warn!(path = %path.display(), error = %e, "could not scan cache directory"))
-                .into_iter().flatten().filter_map(Result::ok)
-        }
+        let complete = std::cell::Cell::new(true);
+        let incomplete = |path: &Path, e: &io::Error| {
+            tracing::warn!(path = %path.display(), error = %e, "could not scan cache directory");
+            complete.set(false);
+        };
+        let children = |path: &Path| -> Vec<fs::DirEntry> {
+            match fs::read_dir(path) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.inspect_err(|e| incomplete(path, e)).ok())
+                    .collect(),
+                Err(e) => {
+                    incomplete(path, &e);
+                    Vec::new()
+                }
+            }
+        };
         for shard in children(root) {
             if !hex(&shard.file_name(), 2) || !shard.file_type().is_ok_and(|ty| ty.is_dir()) {
                 continue;
@@ -399,9 +429,15 @@ impl Index {
                 if !file.file_type().is_ok_and(|ty| ty.is_file()) {
                     continue;
                 }
-                let Ok(meta) = file.metadata() else { continue };
-                let Ok(modified) = meta.modified() else {
-                    continue;
+                let found = file
+                    .metadata()
+                    .and_then(|meta| Ok((meta.len(), meta.modified()?)));
+                let (len, modified) = match found {
+                    Ok(found) => found,
+                    Err(e) => {
+                        incomplete(&file.path(), &e);
+                        continue;
+                    }
                 };
                 let name = file.file_name();
                 if name.as_encoded_bytes().starts_with(b".tmp")
@@ -424,9 +460,10 @@ impl Index {
                 // The directory entry's size and time: no file opened (on
                 // Windows the listing holds them), where reading each
                 // header took minutes cold.
-                self.insert(key, disk::payload_size(meta.len()), modified);
+                self.insert(key, disk::payload_size(len), modified);
             }
         }
+        complete.get()
     }
 
     fn insert(&mut self, key: CacheKey, bytes: u64, modified: SystemTime) {
@@ -471,6 +508,8 @@ impl Index {
                 modified,
             } => self.insert(CacheKey(key.into()), bytes, modified),
             disk::Change::Removed { key } => self.forget(CacheKey(key.into())),
+            // The snapshot's count: checked when the file is read.
+            disk::Change::Snapshot { .. } => {}
         }
     }
 
@@ -1119,19 +1158,17 @@ mod tests {
     fn index_records_round_trip_and_reject_damage() {
         let tmp = tempfile::tempdir().unwrap();
         let modified = SystemTime::UNIX_EPOCH + Duration::new(1_795_600_000, 123_456_700);
-        let changes = [
-            disk::Change::Published {
-                key: [7; 32],
-                bytes: 42,
-                modified,
-            },
-            disk::Change::Removed { key: [7; 32] },
-        ];
-        disk::write_index(tmp.path(), changes.into_iter()).unwrap();
-        assert_eq!(disk::read_index(tmp.path()), Some(changes.to_vec()));
+        let published = |k: u8| disk::Change::Published {
+            key: [k; 32],
+            bytes: 42 + u64::from(k),
+            modified,
+        };
+        let snapshot = [published(7), published(8)];
+        disk::write_index(tmp.path(), snapshot.into_iter()).unwrap();
+        assert_eq!(disk::read_index(tmp.path()), Some(snapshot.to_vec()));
         let path = tmp.path().join(disk::INDEX_FILE);
         let good = fs::read(&path).unwrap();
-        for at in [0, 16, 20, 60, good.len() - 1] {
+        for at in [0, 16, 20, 60, 80, good.len() - 1] {
             let mut bad = good.clone();
             bad[at] ^= 1;
             fs::write(&path, &bad).unwrap();
@@ -1141,11 +1178,189 @@ mod tests {
         assert_eq!(disk::read_index(tmp.path()), None, "none");
     }
 
-    /// Opening a real cache folder (`XTP_CACHE_PROBE`), three ways: each
+    /// A snapshot cut short is damage wherever the cut falls: inside a
+    /// record, between two (Codex review of c3da2f9, finding 2), down to
+    /// the magic alone. Changes appended after it read back with it; one cut
+    /// inside is damage, the last ones cut whole are not seen (only a
+    /// listing can tell: [`Cache::reindex`]). An index of the version
+    /// before (no snapshot record) is no index.
+    #[test]
+    fn a_snapshot_cut_short_is_damage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(disk::INDEX_FILE);
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_600_000);
+        let published = |k: u8| disk::Change::Published {
+            key: [k; 32],
+            bytes: u64::from(k),
+            modified,
+        };
+        let snapshot = [published(1), published(2), published(3)];
+        disk::write_index(tmp.path(), snapshot.into_iter()).unwrap();
+        let whole = fs::read(&path).unwrap();
+        let (magic, record) = (16, 64);
+        assert_eq!(whole.len(), magic + 4 * record);
+        for cut in [1, record - 1, record, 2 * record, 3 * record, 4 * record] {
+            assert_eq!(
+                disk::parse_index(&whole[..whole.len() - cut]),
+                None,
+                "{cut} bytes cut"
+            );
+        }
+        let mut journal = disk::Journal::new(tmp.path());
+        journal.append(&published(4));
+        journal.append(&disk::Change::Removed { key: [1; 32] });
+        let appended = fs::read(&path).unwrap();
+        let mut changes = snapshot.to_vec();
+        changes.extend([published(4), disk::Change::Removed { key: [1; 32] }]);
+        assert_eq!(disk::parse_index(&appended), Some(changes.clone()));
+        assert_eq!(disk::parse_index(&appended[..appended.len() - 1]), None);
+        assert_eq!(
+            disk::parse_index(&appended[..appended.len() - record]),
+            Some(changes[..4].to_vec()),
+            "an append cut whole is not seen"
+        );
+        // A second snapshot's record among the changes is damage.
+        let mut twice = appended.clone();
+        twice.extend_from_slice(&whole[magic..magic + record]);
+        assert_eq!(disk::parse_index(&twice), None);
+        // The version before: the magic's last byte 1, records alone.
+        let mut before = b"XTP cache index\x01".to_vec();
+        before.extend_from_slice(&whole[magic + record..]);
+        assert_eq!(disk::parse_index(&before), None);
+    }
+
+    /// A listing that cannot read one of the cache's folders (here: held
+    /// open by another handle that shares nothing) counts what it found but
+    /// writes no index, so the next open lists again rather than trust an
+    /// index without that folder (Codex review of c3da2f9, finding 3); a
+    /// reindex then leaves the index as it was. Once the folder reads, the
+    /// listing is written.
+    #[cfg(windows)]
+    #[test]
+    fn a_listing_that_misses_a_folder_is_not_written() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let tmp = tempfile::tempdir().unwrap();
+        let conv = upper(1);
+        let cache = Cache::open(tmp.path()).unwrap();
+        cache.get_or_convert(&conv, b"a").unwrap();
+        let shard = |input: &[u8]| {
+            cache
+                .path_for(&CacheKey::new(&conv, input))
+                .parent()
+                .unwrap()
+                .to_owned()
+        };
+        // Another entry, in another folder.
+        let other = (0u32..)
+            .map(|n| format!("other {n}").into_bytes())
+            .find(|input| shard(input.as_slice()) != shard(b"a"))
+            .unwrap();
+        cache.get_or_convert(&conv, &other).unwrap();
+        let held_folder = shard(b"a");
+        drop(cache);
+        let index = tmp.path().join(disk::INDEX_FILE);
+        fs::remove_file(&index).unwrap();
+        let hold = || {
+            fs::File::options()
+                .read(true)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&held_folder)
+                .unwrap()
+        };
+        let held = hold();
+        let cache = Cache::open(tmp.path()).unwrap();
+        assert_eq!(cache.opened(), Opened::Scan);
+        assert_eq!(cache.stats().entries, 1, "the folder it could read");
+        assert!(!index.exists(), "no index written from it");
+        assert!(!cache.reindex(), "nor by a reindex");
+        assert!(!index.exists());
+        drop(cache);
+        drop(held);
+        let cache = Cache::open(tmp.path()).unwrap();
+        assert_eq!(cache.opened(), Opened::Scan, "listed again");
+        assert_eq!(cache.stats().entries, 2);
+        drop(cache);
+        let cache = Cache::open(tmp.path()).unwrap();
+        assert_eq!(cache.opened(), Opened::Index, "then written");
+        assert_eq!(cache.stats().entries, 2);
+        // A reindex with a folder held keeps the index it had.
+        let held = hold();
+        assert!(!cache.reindex());
+        assert_eq!(cache.stats().entries, 2);
+        drop(held);
+        assert!(cache.reindex());
+        assert_eq!(cache.stats().entries, 2);
+    }
+
+    /// The staleness the review found (Codex review of c3da2f9, findings 1
+    /// to 3) is what a reindex sets right: appends cut whole at the end of
+    /// the index (an entry it misses), an entry file removed behind its
+    /// back (one it still lists, which would evict a live one to make room
+    /// for it), and an old staging file of a write cut short. `xtp precook`
+    /// reindexes before every pass.
+    #[test]
+    fn a_reindex_sets_a_stale_index_right() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let conv = upper(1);
+        let cache = Cache::open_with_limit(&root, 100).unwrap();
+        for input in [b"one".as_slice(), b"two"] {
+            cache.get_or_convert(&conv, input).unwrap();
+        }
+        let index = root.join(disk::INDEX_FILE);
+        let before_three = fs::metadata(&index).unwrap().len();
+        cache.get_or_convert(&conv, b"three").unwrap();
+        let gone = cache.path_for(&CacheKey::new(&conv, b"one"));
+        drop(cache);
+        // The machine stopped before "three"'s record reached the disk.
+        fs::File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_len(before_three)
+            .unwrap();
+        fs::remove_file(&gone).unwrap();
+        let staging = gone.with_file_name(".tmp-1-0");
+        fs::write(&staging, b"cut").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&staging)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        let cache = Cache::open_with_limit(&root, 100).unwrap();
+        assert_eq!(cache.opened(), Opened::Index);
+        assert_eq!(
+            (cache.stats().entries, cache.stats().bytes),
+            (2, 6),
+            "one (gone) and two, not three"
+        );
+        assert!(staging.exists());
+        assert!(cache.reindex());
+        assert_eq!(
+            (cache.stats().entries, cache.stats().bytes),
+            (2, 8),
+            "two and three"
+        );
+        assert!(!staging.exists(), "the old staging file went");
+        drop(cache);
+        let cache = Cache::open_with_limit(&root, 100).unwrap();
+        assert_eq!(cache.opened(), Opened::Index);
+        assert_eq!((cache.stats().entries, cache.stats().bytes), (2, 8));
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 3, "nothing made again");
+    }
+
+    /// Opening a real cache folder (`XTP_CACHE_PROBE`), four ways: each
     /// entry's header read (what an open did before the index), the folder
-    /// listed (the open without an index), and the index file read (written
-    /// to a folder of its own: the probed one is not changed). Run with
-    /// `--ignored --nocapture`, cold for the first figure that matters.
+    /// listed (the open without an index), the index file read (written to
+    /// a folder of its own: the probed one is not changed), and, on Windows,
+    /// the folder's own index file read cold (`cold`: unbuffered, so the
+    /// file is read from the disk whatever the system cache holds; Codex
+    /// review of c3da2f9, finding 4). Run with `--ignored --nocapture`
+    /// (`XTP_CACHE_PROBE_WAY` picks one: headers, listing, index, cold),
+    /// cold for the first two figures that matter.
     #[test]
     #[ignore = "a probe of a real cache folder (XTP_CACHE_PROBE)"]
     fn probe_opening_a_real_cache() {
@@ -1158,10 +1373,24 @@ mod tests {
             let started = std::time::Instant::now();
             let (entries, bytes) = f();
             println!(
-                "{what}: {entries} entries, {bytes} bytes, {:.1} s",
+                "{what}: {entries} entries, {bytes} bytes, {:.3} s",
                 started.elapsed().as_secs_f64()
             );
         };
+        #[cfg(windows)]
+        if way.is_empty() || way == "cold" {
+            timed("own index read cold", &|| {
+                let bytes = read_unbuffered(&root.join(disk::INDEX_FILE)).unwrap();
+                let mut read = Index::default();
+                for change in disk::parse_index(&bytes).expect("a sound index") {
+                    read.apply(change);
+                }
+                (read.files.len(), read.bytes)
+            });
+            if way == "cold" {
+                return;
+            }
+        }
         if way.is_empty() || way == "headers" {
             timed("headers read", &|| {
                 let mut entries = (0, 0);
@@ -1198,5 +1427,41 @@ mod tests {
             }
             (read.files.len(), read.bytes)
         });
+    }
+
+    /// The bytes of the file at `path`, read past the system's file cache
+    /// (`FILE_FLAG_NO_BUFFERING`: from the disk, in whole sectors, into a
+    /// buffer aligned to them).
+    #[cfg(windows)]
+    fn read_unbuffered(path: &Path) -> io::Result<Vec<u8>> {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        #[repr(C, align(4096))]
+        #[derive(Clone, Copy)]
+        struct Page([u8; 4096]);
+        const CHUNK: usize = 256;
+        let size = fs::metadata(path)?.len() as usize;
+        let mut file = fs::File::options()
+            .read(true)
+            .custom_flags(FILE_FLAG_NO_BUFFERING)
+            .open(path)?;
+        let mut pages = vec![Page([0; 4096]); size.div_ceil(4096).next_multiple_of(CHUNK)];
+        let mut read = 0;
+        for chunk in pages.chunks_mut(CHUNK) {
+            // SAFETY: whole pages, aligned to 4096 bytes (any sector size up
+            // to that), seen as bytes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast::<u8>(), chunk.len() * 4096)
+            };
+            let n = file.read(bytes)?;
+            read += n;
+            if n < bytes.len() {
+                break;
+            }
+        }
+        // SAFETY: as above, the pages as bytes, of which `read` were read.
+        let all = unsafe { std::slice::from_raw_parts(pages.as_ptr().cast::<u8>(), read) };
+        Ok(all.to_vec())
     }
 }

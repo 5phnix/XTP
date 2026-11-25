@@ -70,17 +70,19 @@ pub fn use_shader_cache(dir: PathBuf) {
 }
 
 /// Lists the cache's folder again and writes its index anew from what is
-/// there (`xtp_pipeline::Cache::reindex`), then trims it to its limit: the
-/// entries and bytes it holds after, `None` without a cache. The index only
-/// sizes the cache, and the sessions between two precooks can leave it
-/// stale (a process stopped between an entry's rename and its record, an
-/// index replaced under another process's appends, files removed by hand):
-/// `xtp precook` sets it right before each pass, while no title waits.
-pub fn reindex() -> Option<(usize, u64)> {
+/// there (`xtp_pipeline::Cache::reindex`), then trims it to its limit:
+/// whether it could (false: a folder of the cache could not be listed, and
+/// the index is left as it was), and the entries and bytes it holds after;
+/// `None` without a cache. The index only sizes the cache, and the sessions
+/// between two precooks can leave it stale (a process stopped between an
+/// entry's rename and its record, an index replaced under another
+/// process's appends, files removed by hand): `xtp precook` sets it right
+/// before each pass, while no title waits.
+pub fn reindex() -> Option<(bool, usize, u64)> {
     let cache = CACHE.get()?;
-    cache.reindex();
+    let listed = cache.reindex();
     let stats = cache.stats();
-    Some((stats.entries, stats.bytes))
+    Some((listed, stats.entries, stats.bytes))
 }
 
 /// Shaders found in the cache and translated since the start. Refusals,

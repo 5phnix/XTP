@@ -36,6 +36,17 @@
 //!   exceeds `LIBRARY_REBUILD_BYTES`, the next pass compacts it, even if
 //!   it crossed the bound during the last save. A compacted library still
 //!   above the bound is compacted again when it doubles or changes translator.
+//! - After a translator change every container is translated again (the
+//!   answer is always this build's), and compared with what the translator
+//!   of the last whole pass kept: the report's `compared` line. A pipeline
+//!   whose translations did not change keeps its name in the library, and
+//!   the precook does not load it (the library's names file says it holds
+//!   it; a session loads it when it needs it): it costs its name alone.
+//!   Only the pipelines of the changed programs are made.
+//! - Before every pass, up to date or not, the shader cache's index is set
+//!   right from its folder (`xtp_gpu::shader_cache::reindex`).
+//! - The times the report gives leave out the pauses a running title
+//!   caused (said apart), and `XTP_PRECOOK_SECONDS` counts without them.
 //! - The note says the kept descriptions that were made again: the file as
 //!   the precook read it, not as it is at the end, which a session may
 //!   have added to meanwhile (the next precook makes those).
@@ -157,10 +168,10 @@ fn precook(o: Options) -> Result<()> {
         ready.lanes.1,
         &ready.key[..16]
     );
-    // The note first: a precook that is up to date does not open the cache
-    // (before its index, opening read every entry's header: 85 s on the PC
-    // on 2026-11-25, the same check right after a pass 1 s), so its check
-    // stays a matter of seconds whatever the cache holds.
+    // The note first: what the pass has to do. Opening the shader cache
+    // reads its index file (before the index, every entry's header: 85 s on
+    // the PC on 2026-11-25), so an up-to-date check stays a matter of
+    // seconds whatever the cache holds, its listing included.
     // The pipeline cache beside the shader cache, where `use_shader_cache`
     // keeps it (set here first: the note reads it before the shader cache
     // is opened).
@@ -196,6 +207,28 @@ fn precook(o: Options) -> Result<()> {
     } else {
         note.plan(found.as_ref())
     };
+    // The shader cache, whatever the plan: its index is set right from the
+    // folder, which the sessions since the last precook may have left
+    // stale (it only sizes the cache), while no title waits: a listing (no
+    // entry opened) and the index rewritten.
+    let opening = Instant::now();
+    xtp_hle::modules::d3d12x::use_shader_cache(shaders.clone());
+    let opened = opening.elapsed().as_secs_f64();
+    let listing = Instant::now();
+    let listed = match xtp_gpu::shader_cache::reindex() {
+        Some((true, entries, bytes)) => format!(
+            "; listed again in {:.1} s: {entries} entries, {bytes} bytes",
+            listing.elapsed().as_secs_f64()
+        ),
+        Some((false, entries, bytes)) => format!(
+            "; not listed again, a folder could not be read: {entries} entries, {bytes} bytes as indexed"
+        ),
+        None => String::new(),
+    };
+    println!(
+        "cache        {} (opened in {opened:.1} s{listed})",
+        shaders.display()
+    );
     if plan == Plan::Nothing {
         println!(
             "up to date   for this translator, its settings, this pack and the kept pipelines ({:.1} s; --force passes again)",
@@ -220,24 +253,6 @@ fn precook(o: Options) -> Result<()> {
         .as_ref()
         .filter(|f| f.key != note.key && gpu::compare_with(&f.key))
         .map(|f| f.key.clone());
-    let opening = Instant::now();
-    xtp_hle::modules::d3d12x::use_shader_cache(shaders.clone());
-    let opened = opening.elapsed().as_secs_f64();
-    // Its index is set right from the folder, which the sessions since the
-    // last pass may have left stale (it only sizes the cache): while no
-    // title waits, a listing (no entry opened) and the index rewritten.
-    let listing = Instant::now();
-    let listed = match xtp_gpu::shader_cache::reindex() {
-        Some((entries, bytes)) => format!(
-            "; listed again in {:.1} s: {entries} entries, {bytes} bytes",
-            listing.elapsed().as_secs_f64()
-        ),
-        None => String::new(),
-    };
-    println!(
-        "cache        {} (opened in {opened:.1} s{listed})",
-        shaders.display()
-    );
 
     let threads = o
         .jobs
