@@ -10,10 +10,10 @@ use super::uniform::Level;
 use super::{Lower, UNTRACKED_SELECT, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
-use crate::gfx10::{Fields, Operand};
-use crate::ir::{EXEC, Inst, Reg, Value};
+use crate::gfx10::{Fields, NULL, Operand, Valu};
+use crate::ir::{EXEC, Inst, M0, Program, Reg, Value};
 use crate::resource::Site;
-use crate::structure::Bool;
+use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 
@@ -391,8 +391,9 @@ impl<'a> Lower<'a> {
                 let a = match s(self, 0) {
                     // shortcut: 0 for a descriptor's address or format
                     // copied into an element of an M0-indexed array that
-                    // nothing but the array's moves reads
-                    // (`unused_element`), assuming M0 never names it.
+                    // nothing but the array's moves reads, where every
+                    // `v_movrels_b32` that may read it has M0 proven below
+                    // it (`unused_element`, `Spans`).
                     Err(why)
                         if why == super::smem::DESCRIPTOR_WORD && self.unused_element(inst) =>
                     {
@@ -1086,9 +1087,10 @@ impl<'a> Lower<'a> {
     /// be a descriptor's address or format, and the moves name every VGPR
     /// from the array's first to the program's last. The light loop's
     /// preparation (11eeb27c2d15980d) fills v3..v18 from s0..s15, the
-    /// last four a UAV's first dwords; M0 is clamped to 0..11 there
-    /// (`v_med3_u32 …, 0, 11`), and v15..v18 are written again before
-    /// anything else reads them.
+    /// last four a UAV's first dwords; M0 there is a loop counter that
+    /// starts and ends in 0..11 (`v_med3_u32 …, 0, 11` at 0x234 and 0x23c)
+    /// and leaves the loop past its end (`v_cmpx_gt_u32` at 0x47c), and
+    /// v15..v18 are written again before anything else reads them.
     ///
     /// The copy is followed through joins, plain copies and the elements a
     /// `v_movreld_b32` keeps. Only its real operands are reads of an
@@ -1096,8 +1098,12 @@ impl<'a> Lower<'a> {
     /// reads ([`crate::ir`]), which is no use of it. That old value goes on
     /// in the new one where the write keeps it (lanes outside the guard,
     /// half writes: [`super::uniform::keeps_old`]), and refuses where the
-    /// instruction computes with it (`v_fmac_f32`, `v_writelane_b32`). Any
-    /// other read (an operand, the array's first element, the value a
+    /// instruction computes with it (`v_fmac_f32`, `v_writelane_b32`). A
+    /// `v_movrels_b32` reads it from an element past the first only where
+    /// M0 is proven below that element in every lane that runs it
+    /// ([`Spans`]): the guest would read the descriptor's dword where M0
+    /// names it, and the translation the 0 that stands for it. Any other
+    /// read (an operand, the array's first element, the value a
     /// `v_movreld_b32` stores, a non-VALU instruction) keeps the dword the
     /// program's: its read stops the program as before.
     // Ported from NuraadGit/VIctory (c1c3fbc) by NuraadGit, with the rule
@@ -1105,7 +1111,8 @@ impl<'a> Lower<'a> {
     // value (`DESCRIPTOR_WORD`, so a size the program reads stays its
     // query); operands are `source_regs`'s; a write keeps the old value
     // where its lowering does (`guard`, `keeps_old`); the copy is checked
-    // where it fails, not for every copy of the program.
+    // where it fails, not for every copy of the program; M0 is bounded at
+    // each indexed read instead of assumed never to name the element.
     fn unused_element(&self, inst: &Inst) -> bool {
         let p = self.x.p;
         let Fields::Valu(f) = &inst.fields else {
@@ -1146,6 +1153,7 @@ impl<'a> Lower<'a> {
                 joins.entry(arg).or_default().push(phi.value);
             }
         }
+        let mut spans = Spans::new(p, self.x.st, self.console_cf);
         let mut seen = HashSet::new();
         let mut work = vec![copy];
         while let Some(v) = work.pop() {
@@ -1154,7 +1162,7 @@ impl<'a> Lower<'a> {
             }
             work.extend(joins.get(&v).into_iter().flatten());
             for &site in readers.get(&v).into_iter().flatten() {
-                if !self.keeps_element(site, v, &mut work) {
+                if !self.keeps_element(site, v, &mut work, &mut spans) {
                     return false;
                 }
             }
@@ -1165,7 +1173,13 @@ impl<'a> Lower<'a> {
     /// Whether the instruction at `site` reads `v`, a value an unused array
     /// element may hold ([`Self::unused_element`]), without using it; the
     /// values that then hold it go to `work`.
-    fn keeps_element(&self, (b, i): Site, v: Value, work: &mut Vec<Value>) -> bool {
+    fn keeps_element(
+        &self,
+        (b, i): Site,
+        v: Value,
+        work: &mut Vec<Value>,
+        spans: &mut Spans<'_>,
+    ) -> bool {
         let x: &Inst = &self.x.p.blocks[b].insts[i];
         let Fields::Valu(f) = &x.fields else {
             return false;
@@ -1186,7 +1200,9 @@ impl<'a> Lower<'a> {
         let element = match name {
             // The array's first element, or the value stored.
             "v_movreld_b32" if !plain || holds(src) || holds(dst) => return false,
-            // Every other element keeps its value where M0 names another.
+            // Every other element keeps its value where M0 names another,
+            // and takes the stored one where M0 names it: no read of the
+            // dword either way, whatever M0 holds.
             "v_movreld_b32" => {
                 for r in x.reads.iter().filter(|r| r.1 == v) {
                     work.extend(x.write(r.0));
@@ -1194,6 +1210,9 @@ impl<'a> Lower<'a> {
                 return true;
             }
             "v_movrels_b32" if !plain || holds(src) => return false,
+            // An element past the first: read where M0 names it, so only
+            // where M0 is proven below it.
+            "v_movrels_b32" if !m0_below(x, v, spans) => return false,
             "v_movrels_b32" => true,
             "v_mov_b32" if plain && holds(src) => {
                 work.extend(dst.and_then(|r| x.write(r)));
@@ -1203,8 +1222,8 @@ impl<'a> Lower<'a> {
         };
         let sources = super::uniform::source_regs(x);
         for &(r, w) in &x.reads {
-            // An element `v_movrels_b32` names past its first: the
-            // shortcut's.
+            // An element `v_movrels_b32` names past its first, M0 proven
+            // below it (`m0_below`).
             if w != v || element && Some(r) != dst {
                 continue;
             }
@@ -1248,4 +1267,622 @@ fn computes_with_old(name: &str) -> bool {
         || name.starts_with("v_interp")
         || name.contains("permlane")
         || name.contains("writelane")
+}
+
+/// Whether M0 is proven below every element of `v_movrels_b32` `x` past its
+/// first that holds `v`, in every lane that runs it ([`Spans`]). Such an
+/// element is a register from the source up whose value is `v` (the
+/// destination too, where it lies in that range); the first is refused
+/// before ([`Lower::keeps_element`]).
+fn m0_below(x: &Inst, v: Value, spans: &mut Spans<'_>) -> bool {
+    let Fields::Valu(f) = &x.fields else {
+        return false;
+    };
+    let (Some(&Operand::Vector { reg: base, .. }), Some(m0)) = (f.src.first(), x.read(Reg::S(M0)))
+    else {
+        return false;
+    };
+    let nearest = x
+        .reads
+        .iter()
+        .filter(|r| r.1 == v)
+        .filter_map(|r| match r.0 {
+            Reg::V(n) if n >= base => Some(n - base),
+            _ => None,
+        })
+        .min();
+    match nearest {
+        // Only the destination's old value, below the array.
+        None => true,
+        Some(k) => spans.of(m0).is_some_and(|(_, hi)| hi < u32::from(k)),
+    }
+}
+
+/// Inclusive unsigned bounds `(lo, hi)` of a 32-bit value.
+type Span = (u32, u32);
+
+/// What [`Spans`] knows of a value it cannot follow.
+const ANY: Span = (0, u32::MAX);
+
+/// Rounds after which a span still growing jumps to the end it grows
+/// towards ([`Spans::of`]).
+const WIDEN: usize = 8;
+
+/// Values [`Spans::of`] follows for one bound before it gives up.
+const MAX_CONE: usize = 4096;
+
+/// Rounds [`Spans::of`] runs for one bound before it gives up.
+const MAX_ROUNDS: usize = 64;
+
+/// The instructions [`Spans`] follows besides `v_movreld_b32` ([`compute`]).
+const MODELED: &[&str] = &[
+    "v_mov_b32",
+    "s_mov_b32",
+    "v_readfirstlane_b32",
+    "v_and_b32",
+    "s_and_b32",
+    "v_add_nc_u32",
+    "v_add_co_u32",
+    "s_add_u32",
+    "s_add_i32",
+    "v_add3_u32",
+    "v_min_u32",
+    "s_min_u32",
+    "v_min3_u32",
+    "v_max_u32",
+    "s_max_u32",
+    "v_max3_u32",
+    "v_med3_u32",
+    "v_min_i32",
+    "s_min_i32",
+    "v_min3_i32",
+    "v_max_i32",
+    "s_max_i32",
+    "v_max3_i32",
+    "v_med3_i32",
+];
+
+/// How two 32-bit integers compare ([`Fact`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Test {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+impl Test {
+    fn parse(s: &str) -> Option<Test> {
+        Some(match s {
+            "lt" => Test::Lt,
+            "le" => Test::Le,
+            "gt" => Test::Gt,
+            "ge" => Test::Ge,
+            "eq" => Test::Eq,
+            "ne" | "lg" => Test::Ne,
+            _ => return None,
+        })
+    }
+
+    fn negated(self) -> Test {
+        match self {
+            Test::Lt => Test::Ge,
+            Test::Le => Test::Gt,
+            Test::Gt => Test::Le,
+            Test::Ge => Test::Lt,
+            Test::Eq => Test::Ne,
+            Test::Ne => Test::Eq,
+        }
+    }
+
+    /// The test with its operands exchanged.
+    fn swapped(self) -> Test {
+        match self {
+            Test::Lt => Test::Gt,
+            Test::Le => Test::Ge,
+            Test::Gt => Test::Lt,
+            Test::Ge => Test::Le,
+            t => t,
+        }
+    }
+}
+
+/// A 32-bit operand: a value, or a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Term {
+    Value(Value),
+    Const(u32),
+}
+
+/// `x test y`, as unsigned or (`signed`) signed integers, in every lane
+/// that takes an edge ([`Spans::edge_facts`]).
+#[derive(Debug, Clone, Copy)]
+struct Fact {
+    x: Value,
+    test: Test,
+    y: Term,
+    signed: bool,
+}
+
+/// Unsigned bounds of 32-bit values in every lane that holds them, for the
+/// M0 of an indexed read ([`m0_below`]). Each value's [`Span`] comes from
+/// its definition, from nothing up (`None`: no lane holds it yet), joined
+/// until no span grows; one still growing after [`WIDEN`] rounds jumps to
+/// the end it grows towards, so the search ends. What it does not follow
+/// is [`ANY`]: an input, an instruction outside the few it models, a write
+/// that keeps part of the old value.
+///
+/// The argument of a phi is narrowed by the tests the lanes taking its edge
+/// passed: what holds there ([`Structured::reach`] of the predecessor and
+/// its branch, [`LaneExit`]) about a compare that the predecessor, or the
+/// blocks it alone follows, ran on that argument. That is how a loop
+/// counter is bounded: in 11eeb27c2d15980d the lanes that go round again
+/// passed `!(counter > end)` (`v_cmpx_gt_u32 exec, v28, v19` at 0x47c),
+/// with `end` in 0..11. Only in the per-lane form: in the console flow
+/// every lane goes round with the wave, so a lane's counter can be past the
+/// end; there nothing narrows and such a bound is not proven.
+struct Spans<'a> {
+    p: &'a Program,
+    st: &'a Structured,
+    console: bool,
+    /// Each value's block, instruction (`None`: a phi) and register.
+    defs: HashMap<Value, (usize, Option<usize>, Reg)>,
+    /// What the lanes taking each edge know, by block and predecessor index.
+    facts: HashMap<(usize, usize), Vec<Fact>>,
+    done: HashMap<Value, Option<Span>>,
+}
+
+impl<'a> Spans<'a> {
+    fn new(p: &'a Program, st: &'a Structured, console: bool) -> Self {
+        let mut defs = HashMap::new();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                defs.insert(phi.value, (b, None, phi.reg));
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(r, v) in &inst.writes {
+                    defs.insert(v, (b, Some(i), r));
+                }
+            }
+        }
+        Spans {
+            p,
+            st,
+            console,
+            defs,
+            facts: HashMap::new(),
+            done: HashMap::new(),
+        }
+    }
+
+    /// The bounds of `v` in every lane that holds it (`None`: no lane can).
+    fn of(&mut self, v: Value) -> Option<Span> {
+        if let Some(&s) = self.done.get(&v) {
+            return s;
+        }
+        let mut cone = vec![v];
+        let mut in_cone: HashSet<Value> = HashSet::from([v]);
+        let mut known: HashMap<Value, Span> = HashMap::new();
+        let mut round = 0;
+        loop {
+            let mut grew = false;
+            let mut n = 0;
+            while n < cone.len() {
+                let x = cone[n];
+                n += 1;
+                let mut needs = Vec::new();
+                let new = self.transfer(x, &known, &mut needs);
+                for d in needs {
+                    if in_cone.insert(d) {
+                        cone.push(d);
+                        grew = true;
+                    }
+                }
+                if cone.len() > MAX_CONE {
+                    return Some(ANY);
+                }
+                let Some(new) = new else {
+                    continue;
+                };
+                let old = known.get(&x).copied();
+                let mut s = old.map_or(new, |o| (o.0.min(new.0), o.1.max(new.1)));
+                if let Some(o) = old
+                    && round >= WIDEN
+                {
+                    if s.0 < o.0 {
+                        s.0 = 0;
+                    }
+                    if s.1 > o.1 {
+                        s.1 = u32::MAX;
+                    }
+                }
+                if old != Some(s) {
+                    known.insert(x, s);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+            round += 1;
+            if round > MAX_ROUNDS {
+                return Some(ANY);
+            }
+        }
+        let s = known.get(&v).copied();
+        self.done.insert(v, s);
+        s
+    }
+
+    /// What the lanes holding `x` can hold, given `known` (absent: no lane
+    /// yet); the values it reads go to `needs`.
+    fn transfer(
+        &mut self,
+        x: Value,
+        known: &HashMap<Value, Span>,
+        needs: &mut Vec<Value>,
+    ) -> Option<Span> {
+        let Some(&(b, at, reg)) = self.defs.get(&x) else {
+            // An input: what the hardware or a fetch routine set up.
+            return Some(ANY);
+        };
+        let Some(i) = at else {
+            return self.joined(b, x, known, needs);
+        };
+        let p = self.p;
+        let mut get = |v: Value| {
+            needs.push(v);
+            known.get(&v).copied()
+        };
+        let inst = &p.blocks[b].insts[i];
+        let name = inst.name();
+        let vector = matches!(inst.fields, Fields::Valu(_));
+        // Lanes that reach a vector instruction without running it keep
+        // the old value: its guard in the per-lane form, EXEC in the
+        // console flow.
+        let guarded = vector
+            && if self.console {
+                self.st.execs[b].get(i).copied().flatten() != Some(Bool::TRUE)
+            } else {
+                self.st.guards[b].get(i).copied().flatten().is_some()
+            };
+        // A write that keeps part of the old value mixes the two.
+        if vector && matches!(reg, Reg::V(_)) && super::uniform::keeps_old(inst) {
+            return Some(ANY);
+        }
+        let old = match (guarded, reg, inst.read(reg)) {
+            (false, ..) => None,
+            (true, Reg::V(_), Some(o)) => Some(o),
+            // A scalar a vector instruction writes lists no old value.
+            (true, ..) => return Some(ANY),
+        };
+        let new = match &inst.fields {
+            Fields::Valu(f) if !plain(f) => return Some(ANY),
+            Fields::Valu(f) if name == "v_movreld_b32" => {
+                // Element k takes the stored value where M0 is k, and
+                // keeps its old one elsewhere.
+                let (Some(Operand::Vector { reg: d, .. }), Reg::V(r)) = (f.dst, reg) else {
+                    return Some(ANY);
+                };
+                let (Some(k), Some(prev), Some(m0), Some(stored)) = (
+                    r.checked_sub(d),
+                    inst.read(reg),
+                    inst.read(Reg::S(M0)),
+                    f.src.first().and_then(|o| operand(inst, o)),
+                ) else {
+                    return Some(ANY);
+                };
+                let prev = get(prev);
+                let named = get(m0).is_some_and(|(lo, hi)| (lo..=hi).contains(&u32::from(k)));
+                let stored = if named { term(stored, &mut get) } else { None };
+                union(prev, stored)
+            }
+            Fields::Valu(Valu { dst, src, .. })
+            | Fields::Sop {
+                dst,
+                src,
+                imm: None,
+            } if dst_reg(*dst) == Some(reg) && MODELED.contains(&name) => {
+                let mut spans = Vec::with_capacity(src.len());
+                for o in src {
+                    let Some(t) = operand(inst, o) else {
+                        return Some(ANY);
+                    };
+                    spans.push(term(t, &mut get));
+                }
+                let all: Option<Vec<Span>> = spans.into_iter().collect();
+                match all {
+                    // An operand no lane holds yet.
+                    None => None,
+                    Some(s) => match compute(name, &s) {
+                        Some(s) => Some(s),
+                        None => return Some(ANY),
+                    },
+                }
+            }
+            _ => return Some(ANY),
+        };
+        match old {
+            Some(o) => union(new, get(o)),
+            None => new,
+        }
+    }
+
+    /// A phi's span: each argument's, narrowed by what the lanes taking
+    /// its edge know.
+    fn joined(
+        &mut self,
+        h: usize,
+        x: Value,
+        known: &HashMap<Value, Span>,
+        needs: &mut Vec<Value>,
+    ) -> Option<Span> {
+        let p = self.p;
+        let Some(phi) = p.blocks[h].phis.iter().find(|q| q.value == x) else {
+            return Some(ANY);
+        };
+        let mut get = |v: Value| {
+            needs.push(v);
+            known.get(&v).copied()
+        };
+        let mut out = None;
+        for (n, &arg) in phi.args.iter().enumerate() {
+            if !self.facts.contains_key(&(h, n)) {
+                let f = self.edge_facts(h, n);
+                self.facts.insert((h, n), f);
+            }
+            let mut s = get(arg);
+            for f in self.facts[&(h, n)].iter().filter(|f| f.x == arg) {
+                let (Some(a), Some(t)) = (s, term(f.y, &mut get)) else {
+                    // No lane takes the edge with these yet.
+                    s = None;
+                    break;
+                };
+                s = narrow(a, f, t);
+            }
+            out = union(out, s);
+        }
+        out
+    }
+
+    /// What every lane taking the edge from the `n`th predecessor of block
+    /// `h` knows of the compares it has just run: those of the predecessor
+    /// and of the blocks before it that it alone follows (each the only
+    /// predecessor of the next), which ran on the values the edge carries.
+    /// None in the console flow, where every lane takes the wave's edge.
+    fn edge_facts(&self, h: usize, n: usize) -> Vec<Fact> {
+        let p = self.p;
+        if self.console {
+            return Vec::new();
+        }
+        let Some(&q) = p.blocks[h].preds.get(n) else {
+            return Vec::new();
+        };
+        let (Some(&reach), Some(exit)) = (self.st.reach.get(q), self.st.exits.get(q)) else {
+            return Vec::new();
+        };
+        let mut conds = vec![(reach, true)];
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = *exit
+            && taken != not_taken
+        {
+            conds.push((when, taken == h));
+        }
+        let mut chain = vec![q];
+        let mut last = q;
+        while let &[only] = &p.blocks[last].preds[..]
+            && !chain.contains(&only)
+        {
+            chain.push(only);
+            last = only;
+        }
+        let bools = &self.st.bools;
+        let mut atoms: Vec<Atom> = Vec::new();
+        for &(c, _) in &conds {
+            for a in bools.support(c) {
+                if !atoms.contains(&a) {
+                    atoms.push(a);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for atom in atoms {
+            let (Atom::Lane(c) | Atom::Uniform(c)) = atom else {
+                continue;
+            };
+            let Some(&(d, Some(i), _)) = self.defs.get(&c) else {
+                continue;
+            };
+            let Some(var) = bools.var(atom).filter(|_| chain.contains(&d)) else {
+                continue;
+            };
+            let some_lane = |holds: bool| {
+                let mut all = conds.clone();
+                all.push((var, holds));
+                bools.meet(&all)
+            };
+            let test_holds = match (some_lane(true), some_lane(false)) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => continue,
+            };
+            let Some((a, test, b, signed)) = compare(&p.blocks[d].insts[i]) else {
+                continue;
+            };
+            let test = if test_holds { test } else { test.negated() };
+            if let Term::Value(x) = a {
+                out.push(Fact {
+                    x,
+                    test,
+                    y: b,
+                    signed,
+                });
+            }
+            if let Term::Value(y) = b {
+                out.push(Fact {
+                    x: y,
+                    test: test.swapped(),
+                    y: a,
+                    signed,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// No modifier changes the operands or the result: no SDWA, DPP, abs,
+/// neg, clamp, output modifier or operand select.
+fn plain(f: &Valu) -> bool {
+    f.sdwa.is_none()
+        && f.dpp.is_none()
+        && f.abs == 0
+        && f.neg == 0
+        && !f.clamp
+        && f.omod == 0
+        && f.opsel == 0
+}
+
+/// The register a VALU or SALU destination names, its first dword.
+fn dst_reg(dst: Option<Operand>) -> Option<Reg> {
+    match dst? {
+        Operand::Vector { reg, .. } => Some(Reg::V(reg)),
+        Operand::Scalar { code, .. } if code != NULL => Some(Reg::S(code)),
+        _ => None,
+    }
+}
+
+/// A 32-bit operand of `inst`: the value it reads, or its constant.
+fn operand(inst: &Inst, op: &Operand) -> Option<Term> {
+    match *op {
+        Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).map(Term::Value),
+        Operand::Vector { reg, .. } => inst.read(Reg::V(reg)).map(Term::Value),
+        Operand::Const(c) => crate::resource::inline(c).map(Term::Const),
+        Operand::Literal(k) => Some(Term::Const(k)),
+        _ => None,
+    }
+}
+
+fn term(t: Term, get: &mut impl FnMut(Value) -> Option<Span>) -> Option<Span> {
+    match t {
+        Term::Const(k) => Some((k, k)),
+        Term::Value(v) => get(v),
+    }
+}
+
+fn union(a: Option<Span>, b: Option<Span>) -> Option<Span> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+/// The span of a 32-bit integer instruction named `name` whose operands
+/// have spans `s`; `None` for one it does not model.
+fn compute(name: &str, s: &[Span]) -> Option<Span> {
+    let lo: Vec<u32> = s.iter().map(|s| s.0).collect();
+    let hi: Vec<u32> = s.iter().map(|s| s.1).collect();
+    // Unsigned operations that never decrease when an operand grows: their
+    // bounds are their results on the bounds.
+    let monotone = |f: fn(&[u32]) -> Option<u32>| Some((f(&lo)?, f(&hi)?));
+    match name {
+        "v_mov_b32" | "s_mov_b32" | "v_readfirstlane_b32" if s.len() == 1 => Some(s[0]),
+        "v_and_b32" | "s_and_b32" if s.len() == 2 => Some((0, hi[0].min(hi[1]))),
+        "v_add_nc_u32" | "v_add_co_u32" | "s_add_u32" | "s_add_i32" | "v_add3_u32"
+            if s.len() >= 2 =>
+        {
+            // Only where no lane can wrap.
+            let sum = |v: &[u32]| v.iter().try_fold(0u32, |a, &b| a.checked_add(b));
+            Some((sum(&lo)?, sum(&hi)?))
+        }
+        "v_min_u32" | "s_min_u32" | "v_min3_u32" => monotone(|v| v.iter().copied().min()),
+        "v_max_u32" | "s_max_u32" | "v_max3_u32" => monotone(|v| v.iter().copied().max()),
+        "v_med3_u32" if s.len() == 3 => monotone(|v| Some(median(v[0], v[1], v[2]))),
+        "v_min_i32" | "s_min_i32" | "v_min3_i32" => signed(s, |v| v.iter().copied().min()),
+        "v_max_i32" | "s_max_i32" | "v_max3_i32" => signed(s, |v| v.iter().copied().max()),
+        "v_med3_i32" if s.len() == 3 => signed(s, |v| Some(median(v[0], v[1], v[2]))),
+        _ => None,
+    }
+}
+
+fn median<T: Ord + Copy>(a: T, b: T, c: T) -> T {
+    a.max(b).min(a.min(b).max(c))
+}
+
+/// A signed operation that never decreases when an operand grows, on
+/// spans read as signed: one that crosses from `i32::MAX` to `i32::MIN`
+/// stands for every signed value.
+fn signed(s: &[Span], f: fn(&[i32]) -> Option<i32>) -> Option<Span> {
+    let as_signed = |&(lo, hi): &Span| {
+        if (lo <= i32::MAX as u32) == (hi <= i32::MAX as u32) {
+            (lo as i32, hi as i32)
+        } else {
+            (i32::MIN, i32::MAX)
+        }
+    };
+    let s: Vec<(i32, i32)> = s.iter().map(as_signed).collect();
+    let lo: Vec<i32> = s.iter().map(|s| s.0).collect();
+    let hi: Vec<i32> = s.iter().map(|s| s.1).collect();
+    let (lo, hi) = (f(&lo)?, f(&hi)?);
+    if (lo < 0) == (hi < 0) {
+        Some((lo as u32, hi as u32))
+    } else {
+        Some(ANY)
+    }
+}
+
+/// `x`'s span `a` in the lanes where `f` holds, `y` in `t`; `None` when no
+/// lane can. A signed test narrows only where both lie in 0..=i32::MAX,
+/// where it orders them as the unsigned one does.
+fn narrow(a: Span, f: &Fact, t: Span) -> Option<Span> {
+    if f.signed && (a.1 > i32::MAX as u32 || t.1 > i32::MAX as u32) {
+        return Some(a);
+    }
+    let (lo, hi) = match f.test {
+        Test::Lt => (a.0, a.1.min(t.1.checked_sub(1)?)),
+        Test::Le => (a.0, a.1.min(t.1)),
+        Test::Gt => (a.0.max(t.0.checked_add(1)?), a.1),
+        Test::Ge => (a.0.max(t.0), a.1),
+        Test::Eq => (a.0.max(t.0), a.1.min(t.1)),
+        Test::Ne => a,
+    };
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// A 32-bit integer compare: its operands, test and signedness, for a
+/// plain `v_cmp*`/`v_cmpx*`/`s_cmp*`/`s_cmpk*` of `u32` or `i32`.
+fn compare(inst: &Inst) -> Option<(Term, Test, Term, bool)> {
+    let name = inst.name();
+    let rest = ["v_cmpx_", "v_cmp_", "s_cmpk_", "s_cmp_"]
+        .into_iter()
+        .find_map(|prefix| name.strip_prefix(prefix))?;
+    let (test, ty) = rest.split_once('_')?;
+    let test = Test::parse(test)?;
+    let signed = match ty {
+        "u32" => false,
+        "i32" => true,
+        _ => return None,
+    };
+    let (a, b) = match &inst.fields {
+        Fields::Valu(f) if plain(f) => (f.src.first()?, f.src.get(1)?),
+        Fields::Sop {
+            src, imm: Some(k), ..
+        } => {
+            let k = if signed {
+                *k as i16 as i32 as u32
+            } else {
+                u32::from(*k)
+            };
+            return Some((operand(inst, src.first()?)?, test, Term::Const(k), signed));
+        }
+        Fields::Sop { src, imm: None, .. } => (src.first()?, src.get(1)?),
+        _ => return None,
+    };
+    Some((operand(inst, a)?, test, operand(inst, b)?, signed))
 }
