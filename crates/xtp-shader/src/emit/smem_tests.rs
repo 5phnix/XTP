@@ -164,18 +164,15 @@ fn heap_program(words: &[u32]) -> crate::NativeProgram {
     )
 }
 
-/// The kind of view (`annotateHandle`'s first property: 11 a raw buffer,
-/// 13 a constant buffer, with 0x1000 unordered access) of every handle
-/// made from the resource heap in `shader`, in the disassembly's order;
-/// None where the Windows SDK's `dxc.exe` is not there.
-fn heap_kinds(shader: &HostShader) -> Option<Vec<u32>> {
+/// Désassemblage DXIL par le SDK Windows, lorsqu'il est installé.
+pub(super) fn disassembly(shader: &HostShader) -> Option<String> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dxc = match std::env::var_os("XTP_PC_DXC") {
         Some(p) => PathBuf::from(p),
         None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
     };
     if !dxc.exists() {
-        eprintln!("no dxc.exe; handle kinds not checked");
+        eprintln!("dxc.exe absent, désassemblage ignoré");
         return None;
     }
     let file = std::env::temp_dir().join(format!(
@@ -195,7 +192,15 @@ fn heap_kinds(shader: &HostShader) -> Option<Vec<u32>> {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let listing = String::from_utf8_lossy(&out.stdout);
+    Some(String::from_utf8(out.stdout).unwrap())
+}
+
+/// The kind of view (`annotateHandle`'s first property: 11 a raw buffer,
+/// 13 a constant buffer, with 0x1000 unordered access) of every handle
+/// made from the resource heap in `shader`, in the disassembly's order;
+/// None where the Windows SDK's `dxc.exe` is not there.
+fn heap_kinds(shader: &HostShader) -> Option<Vec<u32>> {
+    let listing = disassembly(shader)?;
     let mut heap = std::collections::HashSet::new();
     let mut kinds = Vec::new();
     for line in listing.lines() {
