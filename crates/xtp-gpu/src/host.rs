@@ -61,6 +61,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) depth_bounds: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -341,13 +342,20 @@ pub(crate) fn host() -> Option<&'static Host> {
 /// The host GPU, created on first use, or why there is none (tests print
 /// it when they skip: `crate::testgpu`).
 pub(crate) fn created() -> &'static Result<Host, String> {
-    HOST.get_or_init(|| {
+    let made = HOST.get_or_init(|| {
         let made = software().and_then(|software| create(software).map_err(|e| e.to_string()));
         if let Err(e) = &made {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
         }
         made
-    })
+    });
+    // In tests, the debug layer reports to `testgpu` from the device's first
+    // use on, whichever way a test reached it.
+    #[cfg(test)]
+    if let Ok(host) = made {
+        crate::testgpu::watch(host);
+    }
+    made
 }
 
 /// Whether the host device is made on the software adapter (WARP): in
@@ -420,6 +428,15 @@ fn create(software: bool) -> windows::core::Result<Host> {
             D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+        let depth_bounds = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS2,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+            && options.DepthBoundsTestSupported.as_bool();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -444,9 +461,14 @@ fn create(software: bool) -> windows::core::Result<Host> {
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         // Heaps for buffers, made from now on by threads of their own.
         buffers::start(&device);
-        tracing::info!(synchronous = sync_submit(), "host D3D12 device ready");
+        tracing::info!(
+            synchronous = sync_submit(),
+            depth_bounds,
+            "host D3D12 device ready"
+        );
         Ok(Host {
             device,
+            depth_bounds,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -663,6 +685,7 @@ pub(crate) struct HostList {
     /// Swapped for a fresh one when the list is reset while it runs.
     allocator: Mutex<ID3D12CommandAllocator>,
     pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) bounds_list: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1123,6 +1146,11 @@ impl Host {
             });
             Ok(HostList {
                 allocator: Mutex::new(allocator),
+                bounds_list: if self.depth_bounds {
+                    Some(list.cast()?)
+                } else {
+                    None
+                },
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -1756,6 +1784,13 @@ impl Host {
             }
         }
         text
+    }
+
+    /// The debug layer's message queue (`XTP_D3D12_DEBUG=1` in a
+    /// diagnostics build), for tests to fail on its errors.
+    #[cfg(test)]
+    pub(crate) fn message_queue(&self) -> Option<&ID3D12InfoQueue> {
+        self.messages.as_ref()
     }
 
     /// Moves the debug layer's messages into our log; returns the first
@@ -2965,6 +3000,12 @@ impl Meter {
             .take(frames, 8);
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(
+                pipelines = crate::pipeline::host::BOUNDED_PIPELINES.load(Ordering::Relaxed),
+                lists = crate::list::BOUNDED_LISTS.load(Ordering::Relaxed),
+                "title depth bounds"
+            );
             tracing::info!(
                 "{ab}{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \

@@ -750,9 +750,10 @@ mod tests {
     #[test]
     fn pooled_buffers_are_placed_zeroed_and_given_back() {
         let test = "host::buffers::tests::pooled_buffers_are_placed_zeroed_and_given_back";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !enabled() {
             return;
         }
@@ -815,9 +816,10 @@ mod tests {
     #[test]
     fn the_reserve_thread_makes_room_and_releases_spare_heaps() {
         let test = "host::buffers::tests::the_reserve_thread_makes_room_and_releases_spare_heaps";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let pool: &'static Pool = Box::leak(Box::new(Pool {
             kind: Kind::Upload,
             device: host.device.clone(),
@@ -851,9 +853,10 @@ mod tests {
     fn committed_buffers_come_back_with_xtp_buffer_pool_0() {
         const CHILD: &str = "XTP_TEST_BUFFER_POOL_OFF";
         let test = "host::buffers::tests::committed_buffers_come_back_with_xtp_buffer_pool_0";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let (shared, data) = host.shared_buffer(256).expect("a shared buffer");
         let (upload, _) = host.upload_buffer(256).expect("an upload buffer");
         if std::env::var_os(CHILD).is_some() {
@@ -888,9 +891,10 @@ mod tests {
     /// (`shadow::cards`; the limits are read once per process).
     fn with_cards(test: &str, body: impl FnOnce(&'static crate::host::Host)) {
         const CHILD: &str = "XTP_TEST_CARD_BUFFERS";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if std::env::var_os(CHILD).is_some() {
             body(host);
             return;
@@ -934,6 +938,8 @@ mod tests {
         use crate::testgpu::{Kernel, Pass, TitleBuffer, pattern};
         let test = "host::buffers::tests::a_shader_write_to_a_copy_on_the_card_goes_back";
         with_cards(test, |host| {
+            // The GPU copy within one buffer (`shadow::copy`).
+            crate::testgpu::known_layer_errors(&[538], "#45");
             let kernel = Kernel::new(host);
             let big = TitleBuffer::new(2 << 20);
             big.set_words(|i| 0x7e00_0000 + i as u32);

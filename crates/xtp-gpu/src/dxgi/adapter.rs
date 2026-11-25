@@ -190,9 +190,10 @@ mod tests {
     #[test]
     fn video_memory_has_a_budget() {
         let test = "dxgi::adapter::tests::video_memory_has_a_budget";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let (budget, usage) = video_memory(&host.device).expect("a budget");
         assert!(budget > 0, "{budget}");
         assert!(usage <= 1 << 40, "{usage}");

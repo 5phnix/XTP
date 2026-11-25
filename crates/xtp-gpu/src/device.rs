@@ -720,9 +720,11 @@ mod tests {
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
         };
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let test = "device::tests::the_hosts_children_hand_out_newer_device_levels";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
         };
+        let host = gpu.host();
         // SAFETY: plain calls on the host device and its fence.
         unsafe {
             let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
@@ -737,9 +739,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_hosts_wave_lanes_are_known() {
-        if crate::testgpu::device("device::tests::the_hosts_wave_lanes_are_known").is_none() {
+        let Some(_gpu) = crate::testgpu::device("device::tests::the_hosts_wave_lanes_are_known")
+        else {
             return;
-        }
+        };
         let (Some((min, max)), Some(model)) = (host_wave_lanes(), host_shader_model()) else {
             panic!("a host device without wave lanes or shader model");
         };
