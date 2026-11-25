@@ -32,7 +32,8 @@
 //! the GPU at their place in the list ([`copy`], [`write`]), so they see
 //! what shaders before them wrote and later commands see their result.
 //!
-//! Big title buffers have their copy in the card's own memory ([`cards`];
+//! With `XTP_CARD_BUFFERS=1`, big title buffers have their copy in the
+//! card's own memory ([`cards`], off by default;
 //! the idea comes from fxceless's VIctory fork, commit 578d459, its
 //! `cards`; reimplemented, none of its code is taken): shaders use it there
 //! without going through PCIe, and what they wrote is found on the card.
@@ -2450,22 +2451,28 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Whether the copies of big title buffers are in the card's own memory
-/// (see the module): unless `XTP_CARD_BUFFERS=0`, which keeps every copy in
-/// system memory as before. There shaders read and write it through PCIe,
-/// and finding what they wrote takes a snapshot of each declared range
-/// before the submission and a compare after it, on the CPU: 41.9 and about
-/// 80 ms of a Series S world frame, for about 620 MB a frame
+/// (see the module): with `XTP_CARD_BUFFERS=1`. Off by default, every copy
+/// in system memory as before: there shaders read and write it through
+/// PCIe, and finding what they wrote takes a snapshot of each declared
+/// range before the submission and a compare after it, on the CPU: 41.9
+/// and about 80 ms of a Series S world frame, for about 620 MB a frame
 /// (docs/analysis/lazy-copyback.md, session lazyback-mirrors-ab).
+///
+/// shortcut: off until measured on the PC. Its one Series S session there
+/// (n1b-cards, 2026-11-25 01:28) had a title submission run 19.7 s on the
+/// GPU, and the title stopped itself (its watchdog, a write to 0 at RVA
+/// `0x23cf683`); the cause is not known (the card's pool takes 512 MiB of
+/// the card's memory more, near the VidMm admission threshold of
+/// docs/analysis/stall.md?). On the cloud L4, 214 s of world ran with it
+/// and no slow frame, but the merge of what the card found changed still
+/// cost 71 to 78 ms a frame there, and copies in system memory compared
+/// about 230 MB a frame.
 pub(crate) fn cards() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("XTP_CARD_BUFFERS")
-            .ok()
-            .is_none_or(|v| v.trim() != "0");
-        if !on {
-            tracing::info!(
-                "copies of big title buffers stay in system memory (XTP_CARD_BUFFERS=0)"
-            );
+        let on = std::env::var("XTP_CARD_BUFFERS").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("copies of big title buffers in the card's memory (XTP_CARD_BUFFERS=1)");
         }
         on
     })
