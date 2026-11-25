@@ -85,6 +85,7 @@ fn mixed_sampler(compute: bool, comparison_first: bool, word0: u32) -> HostShade
     let native = NativeProgram {
         stage: if compute { HwStage::Cs } else { HwStage::Ps },
         wave64: false,
+        float_mode: 0,
         vgprs: 8,
         layout: vec![RootParam {
             root: RootType::Table,
