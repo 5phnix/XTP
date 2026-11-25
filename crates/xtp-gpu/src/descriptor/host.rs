@@ -1926,15 +1926,33 @@ impl HostHeap {
             .and_then(|slot| std::mem::replace(slot, resource))
     }
 
+    /// Makes slot `index` a null constant buffer view: it reads zeros, as
+    /// the console's empty or zero-sized constant views do. (A null 2D
+    /// texture view where the shader declares a constant buffer is a type
+    /// mismatch GPU-based validation reports.)
+    pub(crate) fn null_constant(&self, index: u32) {
+        self.forget_view(index);
+        self.keep(index, None);
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap; no description makes a null view.
+        unsafe { host.device.CreateConstantBufferView(None, self.cpu(index)) };
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
+    /// memory (the list's own, which it holds): [`constant_bytes`] of it,
+    /// whose bytes past `size` the caller zeroed. A view of nothing (no
+    /// address or no bytes) is a null one.
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        if gpu == 0 || size == 0 {
+            self.null_constant(index);
+            return;
+        }
         self.forget_view(index);
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_bytes(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -4203,6 +4221,41 @@ thread_local! {
     static NOT_RESIDENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Bytes of a host constant buffer view at most: the 64 KiB a shader can
+/// index (4096 vectors of 16 bytes). A larger view removes the device on
+/// NVIDIA (`0x887A0001`), and title heaps hold such sizes in slots they
+/// leave stale (969,472 and 1,306,368 bytes seen).
+pub(crate) const CBV_BYTES: u32 = 64 << 10;
+
+/// The bytes of the host's constant buffer view of a title one of `size`:
+/// whole 256s, at most [`CBV_BYTES`].
+pub(crate) fn constant_bytes(size: u32) -> u32 {
+    size.min(CBV_BYTES).next_multiple_of(256)
+}
+
+/// A title constant view's `size` capped at [`CBV_BYTES`], what the host
+/// reads of it. Larger sizes are logged (counted), with the largest seen.
+pub(crate) fn capped_constant(address: u64, size: u32) -> u32 {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    static LARGEST: AtomicU32 = AtomicU32::new(0);
+    if size <= CBV_BYTES {
+        return size;
+    }
+    let largest = LARGEST.fetch_max(size, Ordering::Relaxed).max(size);
+    let count = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        tracing::warn!(
+            count,
+            address = format_args!("{address:#x}"),
+            size,
+            largest,
+            "a constant buffer view over 64 KiB: the host views its first 64 KiB"
+        );
+    }
+    CBV_BYTES
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4219,6 +4272,12 @@ fn make_with(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            // No address or no bytes (a null description, or a slot the
+            // title cleared): a null view (`null_for`), not one of 0 bytes.
+            if address == 0 || size == 0 {
+                return None;
+            }
+            let size = capped_constant(address, size);
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -4230,7 +4289,7 @@ fn make_with(
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_bytes(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -4345,7 +4404,7 @@ fn make_with(
 /// buffer views.
 fn copy_range(view: &View) -> Option<(u64, u64)> {
     match view {
-        &View::Constant(address, size) => Some((address, u64::from(size))),
+        &View::Constant(address, size) => Some((address, u64::from(size.min(CBV_BYTES)))),
         View::Shader(r, Some(_)) | View::Unordered(r, _, Some(_)) => {
             crate::resource::buffer_bytes(*r as crate::object::This)
                 .map(|(data, len)| (data as u64, len))
@@ -4590,6 +4649,49 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Constant views over 64 KiB are cut to 64 KiB, and those of no
+    /// address or no bytes are null ones: in the title's slots (`make`) and
+    /// in dynamic ones (`constant_at`). The device stays (NVIDIA removes it
+    /// for a view over 64 KiB, VIctory #1640; WARP does not).
+    #[test]
+    fn constant_views_are_capped_at_64_kib_and_null_when_empty() {
+        use crate::testgpu::TitleBuffer;
+        let test =
+            "descriptor::host::tests::constant_views_are_capped_at_64_kib_and_null_when_empty";
+        assert_eq!(constant_bytes(480), 512);
+        assert_eq!(constant_bytes(64 << 10), 64 << 10);
+        assert_eq!(constant_bytes(969_472), 64 << 10);
+        assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+        assert_eq!(capped_constant(0x1000, 1_306_368), CBV_BYTES);
+        assert_eq!(capped_constant(0x1000, 4096), 4096);
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        // SAFETY: a plain device query.
+        let alive = || unsafe { host.device.GetDeviceRemovedReason() }.is_ok();
+        let heap = HostHeap::new(false, 4).expect("a host view heap");
+        // A title buffer of 1 MiB: views of the title's oversized sizes lie
+        // in its host copy.
+        let buffer = TitleBuffer::new(1 << 20);
+        let at = buffer.address();
+        for size in [969_472, 896_256] {
+            assert!(make(&View::Constant(at, size), heap.cpu(0)).is_some());
+            assert!(alive(), "a view of {size} bytes");
+        }
+        // No bytes or no address: no view of the host's (the slot gets a
+        // null one, `null_for`).
+        assert!(make(&View::Constant(at, 0), heap.cpu(1)).is_none());
+        assert!(make(&View::Constant(0, 256), heap.cpu(1)).is_none());
+        assert!(make(&View::Constant(0, 0), heap.cpu(1)).is_none());
+        let gpu_at = buffer.shadow().gpu(at);
+        heap.constant_at(2, gpu_at, 969_472);
+        heap.constant_at(3, gpu_at, 0);
+        heap.constant_at(3, 0, 256);
+        heap.null_constant(3);
+        assert!(alive(), "views of the list's own memory");
+    }
 
     /// A view whose buffer does not start on one of its elements in the
     /// host copy (watch.md items 180, 201) still gives the stride table its
