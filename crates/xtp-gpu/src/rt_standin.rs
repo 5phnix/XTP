@@ -1,0 +1,776 @@
+//! The ray tracing BTP 6 runs and XTP cannot run yet: which dropped
+//! dispatch is which trace, what it would have written, and a stand-in
+//! that makes its rays miss.
+//!
+//! The title's trace programs walk its ray-tracing structure in plain title
+//! memory, through addresses the translator does not follow ("an address
+//! not from a root parameter", docs/analysis/shadps4.md §3.2), so their
+//! dispatches are dropped (no host pipeline) and what they write keeps
+//! whatever was there. [`PROGRAMS`] names the thirteen by hash and role;
+//! `State::rt_dropped` (`draw.rs`) hands each dropped dispatch of one of
+//! them here with the views its program's own resource list names for
+//! unordered access, as the title's tables hold them at the dispatch.
+//!
+//! **Measurement** (every build): the first time a program is dropped with
+//! an output, the output is logged ("rt: dropped trace"): a texture's size
+//! and format, a buffer's range. Every [`REPORT_EVERY`] frames, and in
+//! diagnostics builds for each frame `XTP_CAPTURE_FRAMES` or
+//! `XTP_CAPTURE_WORLD` lists, one line gives the frame's drops by role and
+//! whether the stand-in ran. In diagnostics builds each drop is also an op
+//! of the pass dump (`XTP_PASS_DUMP`), so the dump shows where in the frame
+//! each trace would have run and what it would have written.
+//!
+//! **Stand-in** (`XTP_RT_STANDIN`, every build): `1` clears what a dropped
+//! trace would have written to its "every ray missed" value ([`Fill`]),
+//! `0` or unset leaves it, `ab…` alternates the two by A/B phase within one
+//! run (`xtp_core::ab`). Which output gets what is [`default_fill`],
+//! replaced output by output with `XTP_RT_STANDIN_FILL` ([`parse_fills`]).
+//! A clear is recorded where the dispatch would have run, through XTP's
+//! own view heap, as the title's UAV clears are (`list::clear_uav`).
+//!
+//! shortcut: a stand-in, not ray tracing, until the trace programs
+//! translate. A clear writes the whole view, where the trace may write part
+//! of it (a checkerboard, tiles, the entries a schedule picked); and what a
+//! miss means in a buffer is the program's layout, which nothing here
+//! reads, so buffers are left alone unless `XTP_RT_STANDIN_FILL` names
+//! them.
+
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
+
+use xtp_core::ab;
+use xtp_shader::{ResourceType, UsedResource};
+
+use windows::Win32::Graphics::Direct3D12::*;
+
+use crate::descriptor::View;
+use crate::host::HostList;
+use crate::object::This;
+
+/// What a refused trace program computes, as far as its outputs go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Role {
+    /// The sun's shadows traced past the shadow cascades (four variants:
+    /// plain, with a leak plug, each with or without a 4× temporal
+    /// upsample).
+    SunShadow,
+    /// Local lights' shadows: the tiled lights' traced shadows and the
+    /// checkerboard trace into the shadow mask.
+    LocalShadow,
+    /// The irradiance cache's shadow rays towards the lights.
+    CacheShadow,
+    /// Probe gathers through the structure: the primary probes, the
+    /// transparent surfaces' probes and the irradiance cache.
+    ProbeGather,
+    /// The screen probes' rays (indirect diffuse light).
+    ScreenProbes,
+    /// The screen rays' visibility buffer (reflections, before hit shading).
+    Reflections,
+    /// GPU particles colliding with the structure.
+    Particles,
+}
+
+impl Role {
+    /// Every role, in report order.
+    const ALL: [Role; 7] = [
+        Role::SunShadow,
+        Role::LocalShadow,
+        Role::CacheShadow,
+        Role::ProbeGather,
+        Role::ScreenProbes,
+        Role::Reflections,
+        Role::Particles,
+    ];
+
+    /// Its name in logs and in `XTP_RT_STANDIN_FILL`.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Role::SunShadow => "sun-shadow",
+            Role::LocalShadow => "local-shadow",
+            Role::CacheShadow => "cache-shadow",
+            Role::ProbeGather => "probe-gather",
+            Role::ScreenProbes => "screen-probes",
+            Role::Reflections => "reflections",
+            Role::Particles => "particles",
+        }
+    }
+
+    fn index(self) -> usize {
+        Role::ALL.iter().position(|&r| r == self).unwrap_or(0)
+    }
+
+    fn named(name: &str) -> Option<Role> {
+        Role::ALL.into_iter().find(|r| r.name() == name)
+    }
+}
+
+/// BTP 6's trace programs that do not translate, by the 16-digit hash the
+/// logs give (the first 8 bytes of the container's BLAKE3), with their
+/// roles (docs/analysis/refusals.md §6.3, docs/analysis/rt-standin.md).
+pub(crate) const PROGRAMS: [(&str, Role); 13] = [
+    ("a1b20bc47e3c9597", Role::SunShadow),
+    ("e8c962358d862e3f", Role::SunShadow),
+    ("17829ac71aab4e8d", Role::SunShadow),
+    ("afeea48bbb9913ad", Role::SunShadow),
+    ("32ed072b9f845048", Role::LocalShadow),
+    ("559d9f0184e15fe3", Role::LocalShadow),
+    ("f607780aa8e502d0", Role::CacheShadow),
+    ("3592426e3e9142d8", Role::ProbeGather),
+    ("36f04a4ed0ad1d9b", Role::ProbeGather),
+    ("b58eb3ca6ee46427", Role::ProbeGather),
+    ("f22a76fcb967ee59", Role::ScreenProbes),
+    ("6d7fe7745ab9c6d8", Role::Reflections),
+    ("caf96a3229145fa6", Role::Particles),
+];
+
+/// The entry of [`PROGRAMS`] of the program with log hash `hash`, if one
+/// is.
+fn known(hash: &str) -> Option<(&'static str, Role)> {
+    PROGRAMS.iter().find(|(h, _)| *h == hash).copied()
+}
+
+/// A dropped dispatch's program, when it is one of [`PROGRAMS`]: its hash,
+/// role and the resources its console code names.
+pub(crate) struct Program<'a> {
+    pub(crate) hash: &'static str,
+    pub(crate) role: Role,
+    used: &'a [UsedResource],
+}
+
+impl Program<'_> {
+    /// What the program writes through unordered access, in its resource
+    /// list's order: output `n` of the logs and of `XTP_RT_STANDIN_FILL`.
+    pub(crate) fn writes(&self) -> impl Iterator<Item = &UsedResource> {
+        self.used.iter().filter(|u| u.kind == ResourceType::Uav)
+    }
+}
+
+/// The trace program of title pipeline `pipeline`, if it runs one of
+/// [`PROGRAMS`]. Cheap for others: a hash compared with thirteen.
+pub(crate) fn program<'a>(pipeline: This) -> Option<Program<'a>> {
+    let shader = crate::pipeline::compute_shader(pipeline)?;
+    let (hash, role) = known(&shader.hash)?;
+    let used = shader.native().map(|n| &n.used[..]).unwrap_or(&[]);
+    Some(Program { hash, role, used })
+}
+
+/// What an output of a dropped trace is bound to at the dispatch.
+#[derive(Debug, Clone)]
+pub(crate) enum Bound {
+    /// A table entry's view.
+    View(View),
+    /// A root view's address (a buffer of no stated size).
+    Root(u64),
+    /// Nothing the title set.
+    Unset,
+}
+
+/// What "every ray missed" writes into an output.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Fill {
+    /// Left as it is.
+    Keep,
+    /// A float clear: the values in the view's format (textures and typed
+    /// buffer views).
+    Float([f32; 4]),
+    /// An integer clear: each value's low bits into each channel (any
+    /// unordered view, raw and structured buffers included).
+    Uint([u32; 4]),
+}
+
+/// The fill a role's output takes without `XTP_RT_STANDIN_FILL`: shadow
+/// traces' textures fully lit (visibility 1), everything else left (a
+/// gather's radiance, a visibility buffer's hit records and particles'
+/// state have no value that means "missed" without their layout).
+pub(crate) fn default_fill(role: Role, texture: bool) -> Fill {
+    match role {
+        Role::SunShadow | Role::LocalShadow | Role::CacheShadow if texture => Fill::Float([1.0; 4]),
+        _ => Fill::Keep,
+    }
+}
+
+/// What `XTP_RT_STANDIN_FILL` names: a program (hash) or a role, and one
+/// of its outputs or all.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Rule {
+    who: Who,
+    output: Option<u32>,
+    fill: Fill,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Who {
+    Program(String),
+    Role(Role),
+}
+
+/// `XTP_RT_STANDIN_FILL`: rules separated by `;`, each
+/// `<program hash or role>[.<output>]=<fill>`, the fill `lit` (float 1),
+/// `zero` (float 0), `keep`, `f:<v>[,<v>,<v>,<v>]` (floats; one value is
+/// taken for all four) or `u:<hex>[,<hex>,<hex>,<hex>]` (integers, the
+/// same). The last rule that matches an output wins; an output no rule
+/// names takes [`default_fill`]. A bad rule is reported and skipped.
+pub(crate) fn parse_fills(text: &str) -> (Vec<Rule>, Vec<String>) {
+    let mut rules = Vec::new();
+    let mut bad = Vec::new();
+    for part in text.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        match parse_rule(part) {
+            Some(rule) => rules.push(rule),
+            None => bad.push(part.to_owned()),
+        }
+    }
+    (rules, bad)
+}
+
+fn parse_rule(text: &str) -> Option<Rule> {
+    let (key, fill) = text.split_once('=')?;
+    let (who, output) = match key.trim().split_once('.') {
+        Some((who, n)) => (who.trim(), Some(n.trim().parse().ok()?)),
+        None => (key.trim(), None),
+    };
+    let who = match Role::named(who) {
+        Some(role) => Who::Role(role),
+        None if who.len() == 16 && who.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Who::Program(who.to_ascii_lowercase())
+        }
+        None => return None,
+    };
+    Some(Rule {
+        who,
+        output,
+        fill: parse_fill(fill.trim())?,
+    })
+}
+
+fn parse_fill(text: &str) -> Option<Fill> {
+    fn four<T: Copy>(values: Vec<T>) -> Option<[T; 4]> {
+        match values[..] {
+            [v] => Some([v; 4]),
+            [a, b, c, d] => Some([a, b, c, d]),
+            _ => None,
+        }
+    }
+    match text {
+        "lit" => return Some(Fill::Float([1.0; 4])),
+        "zero" => return Some(Fill::Float([0.0; 4])),
+        "keep" => return Some(Fill::Keep),
+        _ => {}
+    }
+    if let Some(values) = text.strip_prefix("f:") {
+        let values: Option<Vec<f32>> = values
+            .split(',')
+            .map(|v| v.trim().parse().ok().filter(|v: &f32| v.is_finite()))
+            .collect();
+        return four(values?).map(Fill::Float);
+    }
+    if let Some(values) = text.strip_prefix("u:") {
+        let values: Option<Vec<u32>> = values
+            .split(',')
+            .map(|v| {
+                let v = v.trim();
+                u32::from_str_radix(v.strip_prefix("0x").unwrap_or(v), 16).ok()
+            })
+            .collect();
+        return four(values?).map(Fill::Uint);
+    }
+    None
+}
+
+/// The fill output `output` of `hash` (role `role`, a texture or not)
+/// takes under `rules`.
+pub(crate) fn fill_for(rules: &[Rule], hash: &str, role: Role, output: u32, texture: bool) -> Fill {
+    rules
+        .iter()
+        .rev()
+        .find(|r| {
+            let who = match &r.who {
+                Who::Program(h) => h == hash,
+                Who::Role(r) => *r == role,
+            };
+            who && r.output.is_none_or(|n| n == output)
+        })
+        .map_or_else(|| default_fill(role, texture), |r| r.fill)
+}
+
+/// `XTP_RT_STANDIN`, read once: off unless asked (the A/B of
+/// docs/analysis/rt-standin.md decides whether it goes on by default).
+static STANDIN: LazyLock<ab::Switch<bool>> = LazyLock::new(|| {
+    let switch = ab::switch("XTP_RT_STANDIN", false);
+    let mode = match (switch.alternates(), switch.get()) {
+        (true, _) => "off in A/B phase A, on in phase B",
+        (false, true) => "on",
+        (false, false) => "off",
+    };
+    tracing::info!("ray-tracing stand-in (dropped traces miss): {mode}");
+    switch
+});
+
+/// `XTP_RT_STANDIN_FILL`, read once.
+static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
+    let text = std::env::var("XTP_RT_STANDIN_FILL").unwrap_or_default();
+    let (rules, bad) = parse_fills(&text);
+    for rule in bad {
+        tracing::warn!(
+            rule,
+            "XTP_RT_STANDIN_FILL: not <program hash or role>[.<output>]=lit|zero|keep|f:<v>[,…]|u:<hex>[,…]; skipped"
+        );
+    }
+    if !rules.is_empty() {
+        tracing::info!(?rules, "ray-tracing stand-in fills");
+    }
+    rules
+});
+
+/// Frames between two drop reports.
+pub(crate) const REPORT_EVERY: u64 = 256;
+
+/// Outputs logged at most (first drops).
+const LOGGED_AT_MOST: usize = 256;
+
+/// The frame being counted, and its drops (by role), clears and clears the
+/// host refused.
+struct Counts {
+    frame: AtomicU64,
+    drops: [AtomicU64; 7],
+    cleared: AtomicU64,
+    failed: AtomicU64,
+}
+
+static COUNTS: Counts = Counts {
+    frame: AtomicU64::new(u64::MAX),
+    drops: [const { AtomicU64::new(0) }; 7],
+    cleared: AtomicU64::new(0),
+    failed: AtomicU64::new(0),
+};
+
+/// An output logged: (program, output, what it is bound to).
+type Logged = (&'static str, u32, String);
+
+/// The outputs logged so far.
+static LOGGED: Mutex<Option<HashSet<Logged>>> = Mutex::new(None);
+
+/// A dispatch of `program` dropped in `list`, with what its outputs are
+/// bound to ([`Program::writes`]' order): counted, its outputs logged the
+/// first time, and with the stand-in on, cleared to their fills. True if
+/// the list's descriptor heaps changed (the caller's state must set the
+/// title's again).
+pub(crate) fn dropped(list: &HostList, program: &Program, bound: &[Bound]) -> bool {
+    let frame = crate::queue::presented() + 1;
+    count(frame, program.role);
+    let on = STANDIN.get();
+    let mut heaps = false;
+    for (n, b) in bound.iter().enumerate() {
+        let n = n as u32;
+        let what = describe(b);
+        note_first(program, n, &what);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!(
+                "rt: dropped {} {} output {n}: {what}",
+                program.role.name(),
+                program.hash
+            )
+        });
+        if !on {
+            continue;
+        }
+        let Bound::View(view) = b else {
+            continue;
+        };
+        let texture = texture_of(view).is_some();
+        let fill = fill_for(&RULES, program.hash, program.role, n, texture);
+        if fill == Fill::Keep {
+            continue;
+        }
+        match clear(list, view, fill) {
+            Ok(()) => {
+                heaps = true;
+                COUNTS.cleared.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(why) => {
+                let n_failed = COUNTS.failed.fetch_add(1, Ordering::Relaxed) + 1;
+                if n_failed.is_power_of_two() {
+                    tracing::warn!(
+                        program = program.hash,
+                        role = program.role.name(),
+                        output = n,
+                        what,
+                        why,
+                        failed = n_failed,
+                        "rt stand-in: an output not cleared"
+                    );
+                }
+            }
+        }
+    }
+    heaps
+}
+
+/// Counts a drop of `role` in `frame`; the first drop of a frame reports
+/// the frame before, when it is due ([`due`]).
+fn count(frame: u64, role: Role) {
+    let last = COUNTS.frame.swap(frame, Ordering::Relaxed);
+    if last != frame && last != u64::MAX {
+        let drops: Vec<u64> = COUNTS
+            .drops
+            .iter()
+            .map(|d| d.swap(0, Ordering::Relaxed))
+            .collect();
+        let cleared = COUNTS.cleared.swap(0, Ordering::Relaxed);
+        if due(last) {
+            tracing::info!(
+                frame = last,
+                drops = %report(&drops),
+                cleared,
+                standin = STANDIN.get(),
+                arm = %ab::current(),
+                "rt: dropped traces in a frame"
+            );
+        }
+    }
+    COUNTS.drops[role.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether frame `frame`'s drops are reported: every [`REPORT_EVERY`]
+/// frames, and (diagnostics) the frames captures list.
+fn due(frame: u64) -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::listed(frame) {
+        return true;
+    }
+    frame.is_multiple_of(REPORT_EVERY)
+}
+
+/// A frame's drops by role, as reported: `sun-shadow 4, probe-gather 3`.
+fn report(drops: &[u64]) -> String {
+    let parts: Vec<String> = Role::ALL
+        .iter()
+        .zip(drops)
+        .filter(|(_, n)| **n > 0)
+        .map(|(r, n)| format!("{} {n}", r.name()))
+        .collect();
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Logs output `n` of `program` the first time it is seen bound so.
+fn note_first(program: &Program, n: u32, what: &str) {
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    let logged = logged.get_or_insert_with(HashSet::new);
+    if logged.len() >= LOGGED_AT_MOST {
+        return;
+    }
+    if logged.insert((program.hash, n, what.to_owned())) {
+        tracing::info!(
+            program = program.hash,
+            role = program.role.name(),
+            output = n,
+            what,
+            "rt: dropped trace, output"
+        );
+    }
+}
+
+/// A texture view's host texture: (title resource, host resource).
+fn texture_of(view: &View) -> Option<(This, &'static ID3D12Resource)> {
+    let View::Unordered(resource, _, _) = view else {
+        return None;
+    };
+    let resource = *resource as This;
+    crate::resource::buffer_bytes(resource)
+        .is_none()
+        .then_some(())?;
+    Some((resource, crate::resource::host_resource(resource)?))
+}
+
+/// What an output is bound to, in a few words: a texture's resource, size
+/// and host format, or a buffer's title range (`buffer Some((<address>,
+/// <bytes>))`, which the pass dump samples when small).
+fn describe(bound: &Bound) -> String {
+    match bound {
+        Bound::Unset => "unset".into(),
+        Bound::Root(address) => format!("root view at {address:#x}"),
+        Bound::View(view) => {
+            if let Some((resource, texture)) = texture_of(view) {
+                // SAFETY: a live resource.
+                let d = unsafe { texture.GetDesc() };
+                return format!(
+                    "texture {resource:?} {}x{}x{} f{}",
+                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+                );
+            }
+            match crate::descriptor::host::buffer_range(view) {
+                Some(range) => format!("buffer {:?}", Some(range)),
+                None => match view {
+                    View::Placed(true, r, _) => {
+                        format!("placed texture dim {} {}x{}", r[0], r[4], r[6])
+                    }
+                    View::Unordered(r, ..) => format!("unordered {r:#x} without a host copy"),
+                    other => format!("{other:?}").chars().take(60).collect(),
+                },
+            }
+        }
+    }
+}
+
+/// CPU-only view descriptors for the clears' second handle, taken in turn
+/// (as `list::ClearSlots`).
+struct Slots {
+    /// Held: the descriptors live in it.
+    _heap: ID3D12DescriptorHeap,
+    start: usize,
+    step: usize,
+    next: usize,
+}
+
+// SAFETY: D3D12 descriptor heaps are free-threaded; the rest is plain data
+// behind the mutex.
+unsafe impl Send for Slots {}
+
+const SLOTS: usize = 64;
+
+impl Slots {
+    fn take(&mut self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let at = self.start + self.next * self.step;
+        self.next = (self.next + 1) % SLOTS;
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at }
+    }
+}
+
+/// The clears' CPU-only descriptors, made on first use; `None` without a
+/// host GPU.
+fn slots() -> Option<&'static Mutex<Slots>> {
+    static MADE: std::sync::OnceLock<Option<Mutex<Slots>>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let host = crate::host::host()?;
+        // SAFETY: plain heap creation and queries of a live heap.
+        unsafe {
+            let heap = host
+                .device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: SLOTS as u32,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .inspect_err(|e| tracing::warn!(error = %e, "rt stand-in: no CPU-only heap"))
+                .ok()?;
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            Some(Mutex::new(Slots {
+                _heap: heap,
+                start,
+                step,
+                next: 0,
+            }))
+        }
+    })
+    .as_ref()
+}
+
+/// Clears `view` to `fill` in `list`, where the dropped dispatch would have
+/// run: a texture's host copy, or a buffer range's host copy (which goes
+/// back to title memory after the submission, as shader writes do). Sets
+/// XTP's own view heap on the list. Why not if it cannot.
+fn clear(list: &HostList, view: &View, fill: Fill) -> Result<(), &'static str> {
+    const UNORDERED_ACCESS: u32 = 0x8;
+    let words: Option<&[u32]> = match view {
+        View::Unordered(_, _, desc) => desc.as_ref().map(|d| &d[..]),
+        View::Placed(true, _, desc) => Some(&desc[..10]),
+        _ => return Err("not an unordered access view"),
+    };
+    let range = crate::descriptor::host::buffer_range(view);
+    // A raw or structured buffer view (a stride, or the raw flag) has no
+    // format to clear in floats.
+    let untyped = words.is_some_and(|w| w[5] != 0 || w[8] & 1 != 0);
+    if matches!(fill, Fill::Float(_)) && range.is_some() && untyped {
+        return Err("a float fill of a raw or structured buffer");
+    }
+    let heap = crate::descriptor::own_view_heap().ok_or("no view heap of XTP's own")?;
+    let slots = slots().ok_or("no CPU-only heap")?;
+    let slot = heap
+        .dynamic(1)
+        .ok_or("no dynamic slot in XTP's view heap")?;
+    list.keep_dynamic(crate::descriptor::OWN_VIEW_HEAP, slot, 1);
+    let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
+    let at = slots.take();
+    let target =
+        crate::descriptor::host::make_view(view, at).ok_or("the host cannot make the view")?;
+    if !heap.make_at(slot, view) {
+        return Err("the host cannot place the view in its heap");
+    }
+    if let Some((address, len)) = range
+        && len > 0
+        && let Some(shadow) = crate::shadow::find(address, len)
+    {
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
+    } else if let View::Unordered(texture, _, _) = view {
+        let texture = *texture as This;
+        list.twin_use(texture, true, true);
+        list.twins_written();
+        crate::list::ensure_state(list, texture, UNORDERED_ACCESS);
+        // A view clears one subresource, not every texel of the texture.
+        crate::texture::gpu_write(list, texture, false);
+    }
+    #[cfg(feature = "diagnostics")]
+    if let View::Unordered(resource, _, _) = view {
+        // The pass dump samples what a "clear UAV … of <resource>" writes.
+        list.note_op(|| format!("clear UAV {fill:?} of {:#x} (rt stand-in)", *resource));
+    }
+    list.keep(&heap.heap);
+    list.keep(&target);
+    let gpu = heap.gpu_handle(slot);
+    // SAFETY: an open list; XTP's shader-visible heap, bound here, holds
+    // the view at `gpu`, the CPU-only one at `at`, both of the live
+    // `target`; the barriers name no resource.
+    unsafe {
+        list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+        // The clear is an unordered write: after the work before it that
+        // wrote the same memory, and before the work after it.
+        list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        match fill {
+            Fill::Uint(v) => {
+                // Drivers differ on values wider than their channels: the
+                // low bits only, in the format the clear writes (the
+                // texture's, a typed buffer view's, none for raw ones).
+                let own = target.GetDesc().Format.0 as u32;
+                let format = match (own, words) {
+                    (0, Some(w)) if !untyped => crate::resource::pc_format(w[0]),
+                    _ => own,
+                };
+                let v = crate::resource::format::uint_clear(format, v);
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu, at, &target, &v, &[]);
+            }
+            Fill::Float(v) => list
+                .list
+                .ClearUnorderedAccessViewFloat(gpu, at, &target, &v, &[]),
+            Fill::Keep => {}
+        }
+        list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+    }
+    drop(slots);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rt_standin_programs_are_distinct_log_hashes() {
+        let mut seen = HashSet::new();
+        for (hash, its) in PROGRAMS {
+            assert_eq!(hash.len(), 16, "{hash}");
+            assert!(
+                hash.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            );
+            assert!(seen.insert(hash), "{hash} twice");
+            assert_eq!(known(hash), Some((hash, its)), "{hash}");
+        }
+        assert_eq!(known("0000000000000000"), None);
+        // The thirteen consumers of shadps4.md §3.2, by role.
+        let n = |r| PROGRAMS.iter().filter(|(_, x)| *x == r).count();
+        assert_eq!(n(Role::SunShadow), 4);
+        assert_eq!(n(Role::LocalShadow), 2);
+        assert_eq!(n(Role::CacheShadow) + n(Role::ProbeGather), 4);
+        assert_eq!(n(Role::ScreenProbes) + n(Role::Reflections), 2);
+        assert_eq!(n(Role::Particles), 1);
+    }
+
+    #[test]
+    fn rt_standin_roles_round_trip_by_name() {
+        for role in Role::ALL {
+            assert_eq!(Role::named(role.name()), Some(role));
+            assert_eq!(Role::ALL[role.index()], role);
+        }
+        assert_eq!(Role::named("sun"), None);
+    }
+
+    #[test]
+    fn rt_standin_fills_parse() {
+        let (rules, bad) = parse_fills(
+            " sun-shadow=lit; 559D9F0184E15FE3.1=u:ffffffff ;probe-gather.0=f:0.25;\
+             screen-probes=f:0.1,0.2,0.3,1; reflections=keep; particles.2=zero",
+        );
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(rules.len(), 6);
+        assert_eq!(rules[0].who, Who::Role(Role::SunShadow));
+        assert_eq!(rules[0].fill, Fill::Float([1.0; 4]));
+        assert_eq!(rules[1].who, Who::Program("559d9f0184e15fe3".into()));
+        assert_eq!(rules[1].output, Some(1));
+        assert_eq!(rules[1].fill, Fill::Uint([0xffff_ffff; 4]));
+        assert_eq!(rules[2].fill, Fill::Float([0.25; 4]));
+        assert_eq!(rules[3].fill, Fill::Float([0.1, 0.2, 0.3, 1.0]));
+        assert_eq!(rules[4].fill, Fill::Keep);
+        assert_eq!(rules[5].fill, Fill::Float([0.0; 4]));
+        let (rules, bad) = parse_fills(
+            "sun=lit;1234=lit;sun-shadow.x=lit;sun-shadow=f:1,2;=;local-shadow=u:zz;cache-shadow=f:nan",
+        );
+        assert!(rules.is_empty(), "{rules:?}");
+        assert_eq!(bad.len(), 7);
+        assert_eq!(parse_fills("").0, Vec::new());
+    }
+
+    #[test]
+    fn rt_standin_fill_defaults_and_overrides() {
+        // Without rules: shadow traces' textures lit, the rest kept.
+        for role in [Role::SunShadow, Role::LocalShadow, Role::CacheShadow] {
+            assert_eq!(fill_for(&[], "x", role, 0, true), Fill::Float([1.0; 4]));
+            assert_eq!(fill_for(&[], "x", role, 0, false), Fill::Keep);
+        }
+        for role in [
+            Role::ProbeGather,
+            Role::ScreenProbes,
+            Role::Reflections,
+            Role::Particles,
+        ] {
+            assert_eq!(fill_for(&[], "x", role, 0, true), Fill::Keep);
+        }
+        let (rules, _) = parse_fills(
+            "local-shadow=u:1; 559d9f0184e15fe3.2=keep; probe-gather=f:0.5; 3592426e3e9142d8=zero",
+        );
+        let shadow_mask = "559d9f0184e15fe3";
+        assert_eq!(
+            fill_for(&rules, shadow_mask, Role::LocalShadow, 0, false),
+            Fill::Uint([1; 4])
+        );
+        assert_eq!(
+            fill_for(&rules, shadow_mask, Role::LocalShadow, 2, true),
+            Fill::Keep
+        );
+        // The last rule that matches wins.
+        assert_eq!(
+            fill_for(&rules, "3592426e3e9142d8", Role::ProbeGather, 1, true),
+            Fill::Float([0.0; 4])
+        );
+        assert_eq!(
+            fill_for(&rules, "36f04a4ed0ad1d9b", Role::ProbeGather, 1, true),
+            Fill::Float([0.5; 4])
+        );
+        // Rules of other roles leave the defaults.
+        assert_eq!(
+            fill_for(&rules, "a1b20bc47e3c9597", Role::SunShadow, 0, true),
+            Fill::Float([1.0; 4])
+        );
+    }
+
+    #[test]
+    fn rt_standin_reports_drops_by_role() {
+        let mut drops = [0u64; 7];
+        assert_eq!(report(&drops), "none");
+        drops[Role::ProbeGather.index()] = 3;
+        drops[Role::Particles.index()] = 30;
+        assert_eq!(report(&drops), "probe-gather 3, particles 30");
+        assert!(due(REPORT_EVERY * 3));
+    }
+}
