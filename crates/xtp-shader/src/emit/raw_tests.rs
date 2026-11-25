@@ -279,13 +279,31 @@ fn hosts() -> (
     } else {
         2
     });
+    if std::env::var("XTP_REQUIRE_GPU").as_deref() == Ok("1") {
+        let required = if super::host::test_adapter().is_some() {
+            "WARP"
+        } else {
+            "the default adapter"
+        };
+        assert!(
+            hosts.iter().any(|(name, _)| *name == required),
+            "missing required {required}"
+        );
+    }
     (one, hosts)
 }
 
 /// Runs `cs` over the buffer of `kind` holding [`data`] (an unordered view
-/// of zeros where `uav`) in heap slot 0 and a raw output of two dwords in
+/// of zeros where `uav`) in heap slot 0 and a raw output in
 /// slot 1, as `mode` views them: what each unordered view read back holds.
-fn run(host: &Host, cs: &HostShader, kind: Kind, uav: bool, mode: Mode) -> Vec<Vec<u32>> {
+fn run(
+    host: &Host,
+    cs: &HostShader,
+    kind: Kind,
+    uav: bool,
+    mode: Mode,
+    output_words: u32,
+) -> Vec<Vec<u32>> {
     let data = data();
     let stride = kind.view(mode);
     let views = [
@@ -297,12 +315,21 @@ fn run(host: &Host, cs: &HostShader, kind: Kind, uav: bool, mode: Mode) -> Vec<V
                 stride,
             }
         },
-        View::RawUav(2),
+        View::RawUav(output_words),
     ];
     let mut roots = vec![(
         0,
         Root::Constants(vec![0; cs.user_data_dwords().max(1) as usize]),
     )];
+    if !cs.root_srvs.is_empty() {
+        roots.push((
+            1,
+            Root::View {
+                srv: true,
+                data: data.clone(),
+            },
+        ));
+    }
     if cs.stride_table {
         // Each slot's own view, raw here (a typed one has no raw view of
         // its own: typed loads do not read the table).
@@ -317,7 +344,7 @@ fn run(host: &Host, cs: &HostShader, kind: Kind, uav: bool, mode: Mode) -> Vec<V
             Kind::Typed => StrideEntry::NONE,
             Kind::Structured(s) => own(0, s, BYTES / s),
         };
-        let table: Vec<u32> = [source, own(1, 0, 2)]
+        let table: Vec<u32> = [source, own(1, 0, output_words)]
             .iter()
             .flat_map(|e| {
                 let bits = e.bits().expect("an entry the table holds");
@@ -325,7 +352,7 @@ fn run(host: &Host, cs: &HostShader, kind: Kind, uav: bool, mode: Mode) -> Vec<V
             })
             .collect();
         roots.push((
-            1,
+            roots.len() as u32,
             Root::View {
                 srv: true,
                 data: table,
@@ -385,7 +412,7 @@ fn check(cases: &[Case]) -> Vec<String> {
                 && mode == Mode::Structured
                 && matches!(case.kind, Kind::Structured(_)));
             for (host_name, host) in &hosts {
-                let out = run(host, &cs, case.kind, case.uav, mode);
+                let out = run(host, &cs, case.kind, case.uav, mode, 2);
                 let got = out.last().expect("the output");
                 let count = case.kind.records();
                 if got[0] != count {
@@ -587,4 +614,218 @@ fn accesses_past_their_element_or_wrapping_reach_nothing() {
     .map(|c| Case { modes: RAW, ..c });
     let failures = check(&cases);
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Read every result register and the entire destination UAV. The first
+/// one, two or three components fit for x2, x3 and x4 respectively.
+#[test]
+fn raw_multidword_transfers_keep_each_in_range_component() {
+    let (_one, hosts) = hosts();
+    let kind = Kind::Structured(12);
+    let source = data();
+    for (count, opcode, offset) in [(2u32, 13u32, 8u32), (3, 15, 4), (4, 14, 0)] {
+        for store in [false, true] {
+            let mut access = vec![0x7e0c_0281]; // index 1 in v6
+            for k in 0..count {
+                // Preload v2 onwards with distinct nonzero values.
+                access.push(0x7e04_02aa + (k << 17) + k);
+            }
+            let op = opcode + if store { 16 } else { 0 };
+            access.extend([0xe000_2000 | (op << 18) | offset, 0x8002_0206]);
+            access.push(0xbf8c_3f70);
+            for k in 0..count {
+                // Export the registers independently to output dwords 2.. .
+                access.extend([0xe070_0008 + 4 * k, 0x8004_0200 + (k << 8)]);
+            }
+            let p = program(&access, kind, store);
+            for mode in [Mode::Raw, Mode::Table] {
+                let cs = translate(&p, mode).unwrap();
+                for (name, host) in &hosts {
+                    let out = run(host, &cs, kind, store, mode, 2 + count);
+                    let start = (12 + offset) as usize / 4;
+                    let mut want = vec![0; count as usize];
+                    let fits = count as usize - 1;
+                    if store {
+                        let mut memory = vec![0; (BYTES / 4) as usize];
+                        for (k, v) in want.iter_mut().enumerate() {
+                            *v = 42 + k as u32;
+                        }
+                        memory[start..start + fits].copy_from_slice(&want[..fits]);
+                        assert_eq!(out[0], memory, "store x{count} {mode:?} on {name}");
+                    } else {
+                        want[..fits].copy_from_slice(&source[start..start + fits]);
+                    }
+                    assert_eq!(
+                        out.last().unwrap()[2..],
+                        want,
+                        "x{count} {mode:?} on {name}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_scalar_offset_moves_the_base_for_load_store_and_atomic() {
+    let (_one, hosts) = hosts();
+    let kind = Kind::Structured(12);
+    for (op, uav) in [
+        (0xe030_2000, false),
+        (0xe070_2000, true),
+        (0xe0c8_2000, true),
+    ] {
+        let p = program(
+            &[
+                0x7e04_02aa, // v2 = 42
+                0x7e06_0280, // v3 = 0 (index)
+                0xbe94_038c, // s20 = 12 (SOFFSET)
+                op,
+                0x1402_0203,
+            ],
+            kind,
+            uav,
+        );
+        for mode in [Mode::Raw, Mode::Table] {
+            let cs = translate(&p, mode).unwrap();
+            for (name, host) in &hosts {
+                let out = run(host, &cs, kind, uav, mode, 2);
+                if uav {
+                    let mut memory = vec![0; (BYTES / 4) as usize];
+                    memory[3] = 42;
+                    assert_eq!(out[0], memory, "{op:x} {mode:?} on {name}");
+                } else {
+                    assert_eq!(out[0][1], data()[3], "{mode:?} on {name}");
+                }
+            }
+        }
+    }
+}
+
+/// Root SRV at s[2:3], descriptor at s[8:11], base displaced by 12.
+fn rebuilt_program(
+    stride: u32,
+    records: u32,
+    word3: u32,
+    threads: u32,
+    access: &[u32],
+) -> NativeProgram {
+    let mut words = vec![
+        PROLOGUE[0],
+        PROLOGUE[1],
+        PROLOGUE[4],
+        PROLOGUE[5],
+        PROLOGUE[6],
+        0x8008_8c02, // s_add_u32 s8, s2, 12
+        0x8209_8003, // s_addc_u32 s9, s3, 0
+        0x8809_ff09,
+        stride << 16, // s_or_b32 s9, s9, stride bits
+        0xbe8a_03ff,
+        records,
+        0xbe8b_03ff,
+        word3,
+    ];
+    words.extend_from_slice(access);
+    let mut p = program(&[], Kind::Raw, false);
+    p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    p.layout.push(RootParam {
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        sgprs: 2,
+        base_register: 0,
+        user_data: 2,
+        slot: 1,
+    });
+    p.used[0] = UsedResource {
+        root: RootType::Descriptor,
+        user_data: 2,
+        slot: 1,
+        ..entry(ResourceType::Srv, 0, 0)
+    };
+    if let StageIo::Cs(io) = &mut p.io {
+        io.rsrc2 = 4 << 1;
+        io.threads = [threads, 1, 1];
+    }
+    p
+}
+
+#[test]
+fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
+    let (_one, hosts) = hosts();
+    // The used-resource stride is deliberately absent: word 1 supplies it.
+    for (oob, records, index, within, scalar, want) in [
+        (0, 2, 0, 0, 0, Some(3)),
+        (0, 2, 0, 0, 12, Some(6)),
+        (0, 2, 0, 12, 0, None),
+        (0, 2, 2, 0, 0, None),
+        (1, 2, 0, 12, 0, Some(6)),
+        (1, 2, 2, 0, 0, None),
+        (2, 1, 2, 12, 0, Some(12)),
+        (2, 0, 0, 0, 0, None),
+        (3, 16, 0, 0, 12, Some(6)),
+        (3, 16, 0, 4, 12, None),
+        (3, 14, 0, 0, 12, None),
+    ] {
+        let mut access = vec![
+            0x7e02_0280, // v1 = 0
+            0x7e06_0280 + index,
+            0xbe94_0380 + scalar,
+            0xe030_2000 + within,
+            0x1402_0203,
+        ];
+        access.extend(EPILOGUE);
+        let p = rebuilt_program(12, records, 0x0101_4fac | (oob << 28), 1, &access);
+        for mode in [Mode::Raw, Mode::Table] {
+            let cs = translate(&p, mode).unwrap();
+            assert_eq!(cs.root_srvs, [1]);
+            for (name, host) in &hosts {
+                let out = run(host, &cs, Kind::Raw, false, mode, 2);
+                assert_eq!(
+                    out[0][1],
+                    want.map_or(0, |i| data()[i]),
+                    "OOB_SELECT={oob} count={records} index={index} offset={within} scalar={scalar} {mode:?} on {name}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_add_tid_indexes_by_console_lane_with_and_without_idxen() {
+    let (_one, hosts) = hosts();
+    let source = data();
+    for wave in [32, 64] {
+        for (idxen, add_tid) in [(false, false), (false, true), (true, true)] {
+            let access = [
+                0x7e06_0282, // v3 = 2 (used only with IDXEN)
+                0xe030_0000 | (u32::from(idxen) << 13),
+                0x8002_0203,
+                0xbf8c_3f70,
+                0x3408_0082, // v4 = group thread x * 4
+                0xe070_1000,
+                0x8004_0204, // output[v4] = v2, OFFEN
+                0xbf81_0000,
+            ];
+            let word3 = 0x0101_4fac | (u32::from(add_tid) << 23);
+            let mut p = rebuilt_program(4, 40, word3, 96, &access);
+            p.wave64 = wave == 64;
+            let want: Vec<_> = (0..96)
+                .map(|x| {
+                    let lane = if add_tid { x % wave } else { 0 };
+                    let index = lane + usize::from(idxen) * 2;
+                    if index < 40 { source[3 + index] } else { 0 }
+                })
+                .collect();
+            for mode in [Mode::Raw, Mode::Table] {
+                let cs = translate(&p, mode).unwrap();
+                for (name, host) in &hosts {
+                    let out = run(host, &cs, Kind::Raw, false, mode, 96);
+                    assert_eq!(
+                        out[0], want,
+                        "wave{wave} idxen={idxen} ADD_TID_ENABLE={add_tid} {mode:?} on {name}"
+                    );
+                }
+            }
+        }
+    }
 }

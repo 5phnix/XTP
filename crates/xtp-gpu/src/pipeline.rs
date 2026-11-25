@@ -238,6 +238,20 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn dispatch_hash(this: This) -> Option<String> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let shader = p
+        .shaders
+        .iter()
+        .find(|s| matches!(s.stage, "mesh" | "compute" | "vertex"))
+        .or_else(|| p.shaders.first())?;
+    Some(shader.hash.clone())
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
@@ -568,6 +582,8 @@ pub(crate) extern "system" fn create_stream(
                 at,
                 "pipeline subobject of unknown size; the rest is ignored"
             );
+            #[cfg(windows)]
+            kept.unknown();
             break;
         };
         if let Some(stage) = stage {

@@ -111,6 +111,7 @@ fn shader(words: &[u32], uav: u32, io: ComputeIo) -> HostShader {
     HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
+        group_base: l.group_base,
         user_data: l.user_data,
         samplers: l.samplers,
         static_samplers: Vec::new(),
@@ -481,8 +482,8 @@ fn reads_past_the_view_or_its_element_read_zero() {
         for (index, off, want) in [
             (0, 0, [dword(0, 0), dword(0, 0), dword(0, 4)]),
             (3, 4, [dword(3, 4), dword(3, 4), dword(3, 8)]),
-            // The last dword of the last element: one dword fits, two not.
-            (3, 8, [dword(3, 8), 0, 0]),
+            // The last dword of the last element: only the first component fits.
+            (3, 8, [dword(3, 8), dword(3, 8), 0]),
             // Past the count: the buffer's next bytes are not read.
             (4, 0, [0, 0, 0]),
             // Past the element: not the next element's first dword.
@@ -738,6 +739,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
     let cs = HostShader {
         stage: HwStage::Cs,
         dxil: plain.dxil,
+        group_base: plain.group_base,
         user_data: plain.user_data,
         samplers: plain.samplers,
         static_samplers: Vec::new(),
@@ -758,6 +760,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
         HostShader {
             stage: HwStage::Cs,
             dxil: l.dxil,
+            group_base: l.group_base,
             user_data: l.user_data,
             samplers: l.samplers,
             static_samplers: Vec::new(),
