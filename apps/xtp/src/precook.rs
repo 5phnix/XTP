@@ -232,7 +232,8 @@ fn precook(o: Options) -> Result<()> {
             o.pipelines,
             threads,
             o.wait.then_some(&machine),
-            |c, s, p| gpu::container(c, s, p).into(),
+            |c, s, p| gpu::prepare(c, s, p).map_err(Outcome::from),
+            |compute| compute.pipeline().into(),
         ),
         // The containers are as the note says: the kept pipelines alone.
         Plan::Nothing | Plan::Kept => Pass { items: Vec::new() },
@@ -528,20 +529,52 @@ fn container_bytes<'a>(source: &'a Source<'_>) -> Option<Cow<'a, [u8]>> {
 }
 
 /// Precooks every container of the pack in `data` on `threads` threads with
-/// `cook` (container, stage, pipelines), pausing while `machine` says a
-/// title runs.
-fn pass<C>(data: &[u8], pipelines: bool, threads: usize, machine: Option<&Machine>, cook: C) -> Pass
-where
-    C: Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Outcome + Sync,
-{
+/// separate translation and compute phases, pausing while a title runs.
+fn pass<T: Send + Sync>(
+    data: &[u8],
+    pipelines: bool,
+    threads: usize,
+    machine: Option<&Machine>,
+    prepare: impl Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Result<Option<T>, Outcome> + Sync,
+    compute: impl Fn(&T) -> Outcome + Sync,
+) -> Pass {
+    let started = Instant::now();
     let sources = sources(data);
     let seen = Mutex::new(std::collections::HashSet::new());
-    let mut items = parallel(sources.len(), threads, machine, "records", None, |i| {
-        item(&sources[i], &seen, pipelines, &cook)
+    let mut records = parallel(sources.len(), threads, machine, "records", None, |i| {
+        item(&sources[i], &seen, pipelines, &prepare)
     });
-    // In the pack's order (`sources`'s), whichever thread took each.
-    items.sort_by_key(|&(i, _)| i);
-    let mut items: Vec<Item> = items.into_iter().map(|(_, item)| item).collect();
+    records.sort_unstable_by_key(|&(i, _)| i);
+    let mut items = Vec::with_capacity(records.len());
+    let mut pending = Vec::new();
+    for (i, (item, shader)) in records {
+        if let Some(shader) = shader {
+            pending.push((i, shader));
+        }
+        items.push(item);
+    }
+    println!(
+        "translation  {:.3} s (including unpacking and cache access)",
+        started.elapsed().as_secs_f64()
+    );
+    if pipelines {
+        let started = Instant::now();
+        for (j, done) in parallel(
+            pending.len(),
+            threads,
+            machine,
+            "compute pipelines",
+            None,
+            |j| {
+                caught(|| compute(&pending[j].1))
+                    .map(|o| Done::Cooked(Some(xtp_shader::HwStage::Cs), o))
+                    .unwrap_or_else(|panic| panic)
+            },
+        ) {
+            items[pending[j].0].done = done;
+        }
+        println!("compute PSOs {:.3} s", started.elapsed().as_secs_f64());
+    }
     first_takes_the_outcome(&mut items);
     Pass { items }
 }
@@ -563,6 +596,9 @@ where
     T: Send,
     W: Fn(usize) -> T + Sync,
 {
+    if total == 0 {
+        return Vec::new();
+    }
     let next = AtomicUsize::new(0);
     let finished = AtomicUsize::new(0);
     let paused = AtomicBool::new(false);
@@ -884,26 +920,26 @@ fn first_takes_the_outcome(items: &mut [Item]) {
 }
 
 /// Precooks one record's container, once per distinct container.
-fn item<C>(
+fn item<T>(
     source: &Source<'_>,
     seen: &Mutex<std::collections::HashSet<[u8; 32]>>,
     pipelines: bool,
-    cook: &C,
-) -> Item
-where
-    C: Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Outcome,
-{
+    prepare: &impl Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Result<Option<T>, Outcome>,
+) -> (Item, Option<T>) {
     let (offset, name) = match source {
         Source::Raw { offset, .. } => (*offset, None),
         Source::Packed(r) => (r.offset, r.name.map(str::to_owned)),
     };
     let Some(bytes) = container_bytes(source) else {
-        return Item {
-            offset,
-            name,
-            hash: String::new(),
-            done: Done::Corrupt,
-        };
+        return (
+            Item {
+                offset,
+                name,
+                hash: String::new(),
+                done: Done::Corrupt,
+            },
+            None,
+        );
     };
     let full = blake3::hash(&bytes);
     let hash = full.to_hex().to_string();
@@ -912,31 +948,43 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(*full.as_bytes());
     if !first {
-        return Item {
+        return (
+            Item {
+                offset,
+                name,
+                hash,
+                done: Done::Repeated,
+            },
+            None,
+        );
+    }
+    let stage = stage_of(&bytes);
+    let (done, shader) = match caught(|| prepare(&bytes, stage, pipelines)) {
+        Ok(Ok(shader)) => (Done::Cooked(stage, Outcome::Ready), shader),
+        Ok(Err(outcome)) => (Done::Cooked(stage, outcome), None),
+        Err(panic) => (panic, None),
+    };
+    (
+        Item {
             offset,
             name,
             hash,
-            done: Done::Repeated,
-        };
-    }
-    let stage = stage_of(&bytes);
-    // A panic is a translator bug: counted, not fatal.
-    let done = match catch_unwind(AssertUnwindSafe(|| cook(&bytes, stage, pipelines))) {
-        Ok(outcome) => Done::Cooked(stage, outcome),
-        Err(panic) => Done::Panicked(
+            done,
+        },
+        shader,
+    )
+}
+
+fn caught<T>(work: impl FnOnce() -> T) -> Result<T, Done> {
+    catch_unwind(AssertUnwindSafe(work)).map_err(|panic| {
+        Done::Panicked(
             panic
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_owned())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_default(),
-        ),
-    };
-    Item {
-        offset,
-        name,
-        hash,
-        done,
-    }
+        )
+    })
 }
 
 /// The stage of the program a translation of `container` takes.
@@ -1551,12 +1599,12 @@ mod tests {
         let cook = |c: &[u8], _: Option<xtp_shader::HwStage>, _: bool| {
             cooked.lock().unwrap().push(c.to_vec());
             if c == b.as_slice() {
-                Outcome::Refused("a scalar memory read as data".into())
+                Err(Outcome::Refused("a scalar memory read as data".into()))
             } else {
-                Outcome::Ready
+                Ok(None::<()>)
             }
         };
-        let pass = pass(&file, true, 3, None, cook);
+        let pass = pass(&file, true, 3, None, cook, |_| unreachable!());
         let mut seen = cooked.into_inner().unwrap();
         seen.sort();
         let mut want = vec![a.clone(), b.clone()];

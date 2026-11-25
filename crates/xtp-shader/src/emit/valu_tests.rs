@@ -20,7 +20,7 @@ const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
 }
 
 /// SOP2 `op sdst, src0, src1`.
-const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
+pub(super) const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
     0x8000_0000
         | (op as u32 & 0x7F) << 23
         | (sdst as u32 & 0x7F) << 16
@@ -37,12 +37,12 @@ const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
 }
 
 /// VOP1 `op vdst, src0` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
-const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
+pub(super) const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
     0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
 /// VOP3 `op vdst, src0, src1, src2` (no modifiers).
-const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+pub(super) const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     [
         0x35 << 26 | (op as u32 & 0x3FF) << 16 | vdst as u32,
         (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
@@ -61,14 +61,14 @@ const fn sgpr(n: u8) -> u16 {
     n as u16
 }
 
-const fn vgpr(n: u8) -> u16 {
+pub(super) const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
-fn build_valu_cs(body: &[u32]) -> HostShader {
+pub(super) fn build_valu_cs(body: &[u32]) -> HostShader {
     build_valu_cs_with_mode(body, 0)
 }
 

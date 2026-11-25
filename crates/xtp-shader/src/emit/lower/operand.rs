@@ -181,8 +181,10 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A 64-bit source (a register pair; inline constants sign-extend).
-    pub(super) fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+    /// An integer register pair or constant. RDNA2 §6.2.1 expands a literal
+    /// according to the type of this operand, including the addend of a MAD.
+    /// Ported from Marvisak/VIctory#2261 (440da6e) by Calvix2k.
+    pub(super) fn src64(&mut self, inst: &Inst, k: usize, signed: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -211,8 +213,8 @@ impl<'a> Lower<'a> {
                 let x = crate::resource::inline(k).ok_or("a special operand")?;
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
+            Operand::Literal(x) if signed => Ok(self.s.m.int_const(i64t, i64::from(x as i32))),
             _ => {
-                // Literals and the null register: zero-extended.
                 let x = self.operand(inst, &op)?;
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
@@ -228,6 +230,22 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::LShr, x, k32);
         let hi = self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32);
         (lo, hi)
+    }
+
+    pub(super) fn write64(
+        &mut self,
+        inst: &Inst,
+        dst: Option<Operand>,
+        value: V,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let Some(Operand::Vector { reg, .. }) = dst else {
+            return Err("a 64-bit result");
+        };
+        let (lo, hi) = self.split64(value);
+        self.write(inst, Reg::V(reg), lo, guard);
+        self.write(inst, Reg::V(reg + 1), hi, guard);
+        Ok(())
     }
 
     /// The float value of a register value.
