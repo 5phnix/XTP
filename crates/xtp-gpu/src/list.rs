@@ -578,8 +578,8 @@ pub(crate) struct CopyLocation {
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer (a read-back) on the GPU
+/// into the buffer's host copy ([`read_back`]).
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -603,8 +603,7 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            read_back(list, dst, [x, y, z], src, source_box);
             return;
         };
         // A destination whose host format stands in for the title's.
@@ -702,6 +701,141 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Texture to buffer (a read-back) into footprint `dst` of a title buffer:
+/// copied on the GPU, in list order, into the buffer's host copy as the
+/// footprint lays the texels out (rows at the title's pitch; the texture's
+/// console tiling is its host copy's business, as for the other copies),
+/// then into title memory once the list has run, as buffer copies go
+/// ([`crate::shadow::copy`]). The footprint's range is brought up to date
+/// from title memory first, so the bytes the copy leaves (between rows,
+/// outside its box) go back as the title had them.
+/// shortcut: the host places a footprint 512 bytes apart in its buffer,
+/// with rows a multiple of 256 bytes apart; BTP 6's read-back in VIctory
+/// #1583's run (5x1 texels of format 2, rows 256 bytes apart) fits. Another
+/// placement, a texture whose host format stands in for the title's (the
+/// bytes would need converting back) and a source that is no texture are
+/// logged once and not copied.
+#[cfg(windows)]
+fn read_back(
+    list: &crate::host::HostList,
+    dst: CopyLocation,
+    at: [u32; 3],
+    src: CopyLocation,
+    source_box: *const [u32; 6],
+) {
+    use std::sync::Once;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BOX, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+    };
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    let footprint = dst.footprint;
+    // Also a texture destination whose host copy is not ready.
+    if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                dst = dst.kind,
+                src = src.kind,
+                "a texture copy to a destination without a host copy that is no read-back: not done"
+            )
+        });
+        return;
+    }
+    let Some(texture) = crate::resource::host_resource(src.resource) else {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| tracing::warn!("a read-back of a texture without a host copy: not done"));
+        return;
+    };
+    // SAFETY: a live texture.
+    let host_format = unsafe { texture.GetDesc() }.Format.0 as u32;
+    let format = crate::resource::texture_memory(src.resource)
+        .map_or(footprint.format(), |(_, desc)| desc.format());
+    if crate::resource::format::conversion(format, host_format).is_some() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format,
+                host_format,
+                "a read-back of a texture whose host format stands in for the title's: not done"
+            )
+        });
+        return;
+    }
+    let Some(bytes) = footprint.bytes() else {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format = footprint.format(),
+                "a read-back in a format of unknown size: not done"
+            )
+        });
+        return;
+    };
+    let Some(target) = buffer_range(dst.resource, footprint.offset, bytes) else {
+        return;
+    };
+    let target = target as u64;
+    let Some(copy) = crate::shadow::find(target, bytes) else {
+        return;
+    };
+    let offset = copy.offset(target);
+    let (_, _, _, pitch) = footprint.shape();
+    if !offset.is_multiple_of(512) || !pitch.is_multiple_of(256) {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                offset,
+                pitch,
+                "a read-back the host cannot place (footprints 512 bytes apart, rows 256): not done"
+            )
+        });
+        return;
+    }
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    list.twin_use(src.resource, false, false);
+    ensure_state(list, src.resource, COPY_SOURCE);
+    // What the copy leaves keeps the title's bytes; the whole range goes
+    // back.
+    copy.refresh(list, target, bytes);
+    copy.gpu_copies(list, target, bytes);
+    let mut to = dst;
+    to.resource = copy.buffer.as_raw().cast_const().cast();
+    to.footprint.offset = offset;
+    let mut from = src;
+    from.resource = texture.as_raw().cast_const().cast();
+    let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!(
+            "read back {:?} into {:?} {footprint:?} at {at:?}",
+            src.resource, dst.resource
+        )
+    });
+    let (common, dest) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    // SAFETY: an open list; both locations in the host's layout, naming a
+    // live texture and the host copy the list keeps (`refresh`), the
+    // footprint inside it; the box is the title's (same layout).
+    unsafe {
+        list.list.ResourceBarrier(&[
+            crate::host::uav_barrier(),
+            crate::host::transition(&copy.buffer, common, dest),
+        ]);
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(),
+            at[0],
+            at[1],
+            at[2],
+            (&raw const from).cast(),
+            host_box,
+        );
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&copy.buffer, dest, common)]);
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -2720,6 +2854,94 @@ mod tests {
                 }
             });
             assert_eq!(release(allocator), 0);
+        }
+
+        /// A copy location as the title passes one: a resource, the kind (0
+        /// a subresource index, 1 a placed footprint), then the index or the
+        /// footprint (offset, format, width, height, depth, row pitch).
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            offset: u64,
+            format: u32,
+            width: u32,
+            height: u32,
+            depth: u32,
+            row_pitch: u32,
+        }
+
+        /// Texture copies into title buffers (read-backs) run on the GPU in
+        /// list order, after the draws that wrote the texture, and reach
+        /// title memory once the list has run, as the title's footprints
+        /// lay them out: at their offset, rows at their pitch, a box at its
+        /// place. The bytes the copies leave keep what the title wrote.
+        /// Before, these copies were skipped ("texture to buffer copies not
+        /// implemented").
+        #[test]
+        fn texture_read_backs_reach_title_buffers_as_their_footprints_lay_them_out() {
+            let test = "list::tests::gpu::texture_read_backs_reach_title_buffers_as_their_footprints_lay_them_out";
+            let Some(_gpu) = device(test) else { return };
+            const TITLE: u32 = 0xdead_beef;
+            let (outer, inner) = ([1, 2, 3, 4], [9, 8, 7, 6]);
+            let t = texture(4, 4);
+            let list = TitleList::new();
+            fill(list.this(), t, (0, 0, 4, 4), outer);
+            fill(list.this(), t, (1, 1, 3, 3), inner);
+            let dst = TitleBuffer::new(4096);
+            dst.set_words(|_| TITLE);
+            let footprint = |offset| Location {
+                resource: dst.resource(),
+                kind: 1,
+                offset,
+                format: RGBA8,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 256,
+            };
+            let source = Location {
+                resource: t,
+                kind: 0,
+                offset: 0,
+                format: 0,
+                width: 0,
+                height: 0,
+                depth: 0,
+                row_pitch: 0,
+            };
+            let copy = |to: &Location, [x, y, z]: [u32; 3], area: Option<&[u32; 6]>| {
+                copy_texture_region(
+                    list.this(),
+                    std::ptr::from_ref(to).cast(),
+                    x,
+                    y,
+                    z,
+                    (&raw const source).cast(),
+                    area.map_or(std::ptr::null(), std::ptr::from_ref),
+                )
+            };
+            // All of it 512 bytes in; its middle 2x2 to (2, 1) of a
+            // footprint 2048 bytes in (a box: left, top, front, right,
+            // bottom, back).
+            copy(&footprint(512), [0, 0, 0], None);
+            copy(&footprint(2048), [2, 1, 0], Some(&[1, 1, 0, 3, 3, 1]));
+            list.run();
+            release(t);
+            let mut want = vec![TITLE; 1024];
+            for y in 0..4 {
+                for x in 0..4 {
+                    let middle = (1..3).contains(&x) && (1..3).contains(&y);
+                    want[(512 + y * 256) / 4 + x] =
+                        u32::from_le_bytes(if middle { inner } else { outer });
+                }
+            }
+            for y in 1..3 {
+                for x in 2..4 {
+                    want[(2048 + y * 256) / 4 + x] = u32::from_le_bytes(inner);
+                }
+            }
+            assert_eq!(dst.words(), want);
         }
 
         /// A title resource description (`D3D12_RESOURCE_DESC`), as the
