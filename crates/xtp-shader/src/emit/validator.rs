@@ -114,13 +114,19 @@ static BLOB_VTABLE: BlobVtable = BlobVtable {
     len: blob_len,
 };
 
+/// A DXC validator belongs to the thread that called [`Validator::load`].
+/// Each worker can create and use its own instance.
+///
+/// ```compile_fail,E0277
+/// use xtp_shader::emit::validator::Validator;
+///
+/// fn transfer(validator: Validator) {
+///     std::thread::spawn(move || drop(validator));
+/// }
+/// ```
 pub struct Validator {
     object: Object,
 }
-
-// SAFETY: the validator object is free-threaded (DXC's validator has no
-// thread affinity); calls are serialised by `&mut self`.
-unsafe impl Send for Validator {}
 
 impl Validator {
     /// Where `dxil.dll` is looked for.

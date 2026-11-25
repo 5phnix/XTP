@@ -57,7 +57,14 @@
 //! the next upload makes the buffer again, detiling and copying only what
 //! changed (or for a host copy not known to hold it). Before, a staging
 //! buffer lived as long as its texture, and the world's thousands filled
-//! the staging limit of the textures picked by index for good.
+//! the staging limit of the textures picked by index for good. An upload
+//! of a texture whose host copy holds what was detiled last, its memory
+//! unchanged by what the write watch or the guards tell, makes nothing
+//! again. No copy reads a buffer made again before something is detiled
+//! into it: under a predicate, its decision at submission says so; without
+//! one, the buffer is filled when the copy is recorded, or no copy is
+//! recorded. The memory is read for a detiling into one room shared by the
+//! checks, not into a copy of its own kept per texture.
 //!
 //! Textures read through descriptor tables are brought up to date by the
 //! draws that read them. Directly indexed views are not known per draw:
@@ -81,7 +88,9 @@
 //! the rest stays as the title filled it. VIctory #1934 (zondy1i) decides
 //! both at submission too; this was written without its code.
 //! shortcut: without a predicate (`XTP_TEXTURE_PREDICATION=0`, or none
-//! left) an upload's copy runs whatever was submitted before it, as before.
+//! left) an upload's copy runs whatever was submitted before it, as before
+//! (from a staging buffer that holds the title's bytes: the module doc's
+//! staging release).
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Plane 0 is uploaded (every mip and array slice), depth and stencil
@@ -179,14 +188,16 @@ struct Seen {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into; and the submission that checked it
-/// last (`timestamps::submissions` then, diagnostics).
+/// (memory not watched), or the write-watch asking it was detiled after;
+/// and the submission that checked it last (`timestamps::submissions`
+/// then, diagnostics). The memory is read into the room the checks share
+/// ([`SNAPSHOT`]): a room of its own, kept at the texture's size, held a
+/// copy of every write-watched texture detiled so far, about 2 GiB for
+/// four 512 MiB batches of them (Codex's review of c44a716, 3).
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    read: Vec<u8>,
     #[cfg(feature = "diagnostics")]
     checked: Option<u64>,
 }
@@ -219,7 +230,11 @@ impl Drop for Upload {
     }
 }
 
-/// Calls of [`release_staging`] so far: the clock of [`Staging::recorded`].
+/// Calls of [`release_staging`] so far (a pass each): the clock of
+/// [`Staging::recorded`]. Tests sweep at later times of it rather than
+/// advance it: advanced by them, every other test's texture looked idle to
+/// that test's own passes, which released its buffers inside their timed
+/// windows.
 static SWEEPS: AtomicU64 = AtomicU64::new(0);
 
 /// Staging buffers released so far: count and bytes.
@@ -230,8 +245,27 @@ static RELEASED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static RELEASE_CURSOR: Mutex<usize> = Mutex::new(0);
 
 /// Room for a check's snapshot of texture memory, kept at the largest
-/// changed so far.
+/// changed so far: the one room the checks read memory into, write-watched
+/// or not ([`Last`]).
 static SNAPSHOT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// [`SNAPSHOT`]'s room, `len` bytes of it, out of the lock: a check that
+/// finds it taken (another check at the same time) reads into a room of
+/// its own, given back after ([`give_room`]).
+fn take_room(len: usize) -> Vec<u8> {
+    let mut room = std::mem::take(&mut *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()));
+    room.resize(len, 0);
+    room
+}
+
+/// Gives a room [`take_room`] handed out back to [`SNAPSHOT`], which keeps
+/// the larger of it and what it holds.
+fn give_room(room: Vec<u8>) {
+    let mut kept = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
+    if room.capacity() > kept.capacity() {
+        *kept = room;
+    }
+}
 
 /// Textures whose host copy a GPU write (a copy or resolve into it) was
 /// submitted for, as their lists' submissions are prepared ([`gpu_write`]):
@@ -354,8 +388,10 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. The copy runs only if the host copy
 /// has not got the staging buffer's bytes yet and no GPU write into it was
-/// submitted before (both decided at submission, see the module). Leaves
-/// the texture in the copy destination state. Whether a copy was recorded.
+/// submitted before (both decided at submission, see the module); without
+/// a predicate to decide it, it is recorded only from a staging buffer
+/// that holds a detiling. Leaves the texture in the copy destination state
+/// if a copy was recorded. Whether one was.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
     #[cfg(feature = "diagnostics")]
     summary_due();
@@ -364,33 +400,59 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if gpu_written(resource as usize) || !list.first_use(resource as usize) {
         return false;
     }
+    // The host copy `texture` is: what the copy writes (the list holds it
+    // through its state below).
+    let target = crate::resource::host_copy(resource)
+        .filter(|c| c.texture.as_raw() == texture.as_raw())
+        .map(|c| Arc::downgrade(&c));
+    // Released, and its host copy has what is in the memory: nothing to
+    // make again, nor to copy. Before, a table read made the buffer again
+    // whatever the room, only for the check at submission to find nothing
+    // to detile (Codex's review of c44a716, 3).
+    if state_of(resource).is_some_and(|s| s.current(target.as_ref())) {
+        return false;
+    }
     // Made again if it was released: this list holds it from now on.
     let Ok(staging) = staging(resource, texture) else {
         return false;
     };
+    // Without a predicate (none left, or predication off) the copy runs.
+    let predicate = target
+        .as_ref()
+        .filter(|_| may_predicate())
+        .and_then(|_| Predicate::take());
+    // A buffer made again after a release (or new) holds nothing.
+    if staging.blank.load(Ordering::Acquire) {
+        match &predicate {
+            // Its copy is decided at submission, not from a blank buffer:
+            // an unchanged texture whose host copy has what was detiled
+            // last needs neither a detiling nor a copy, any other gets one.
+            Some(_) => {
+                if !staging.holds(target.as_ref()) {
+                    staging.force.store(true, Ordering::Release);
+                }
+            }
+            // Its copy runs at submission whatever the buffer holds then:
+            // the buffer is filled now, or no copy is recorded and the host
+            // copy keeps its texels. Before, the check at submission could
+            // leave it blank (the memory not mapped, or a GPU write into
+            // the texture submitted meanwhile), and the copy replaced valid
+            // texels with it (Codex's review of c44a716, 1).
+            None => {
+                if !staging.fill() {
+                    return false;
+                }
+            }
+        }
+    }
     let Some(buffer) = staging.buffer() else {
         return false;
     };
     staging
         .recorded
         .store(SWEEPS.load(Ordering::Relaxed), Ordering::Relaxed);
-    // The host copy `texture` is: what the copy writes (the list holds it
-    // through its state below).
-    let target = crate::resource::host_copy(resource)
-        .filter(|c| c.texture.as_raw() == texture.as_raw())
-        .map(|c| Arc::downgrade(&c));
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
-    // Without a predicate (none left, or predication off) the copy runs.
-    let predicate = target.as_ref().and_then(|_| Predicate::take());
-    // A buffer made again after a release holds nothing: an unchanged
-    // texture whose host copy has what was detiled last needs neither a
-    // detiling nor a copy (decided at submission), any other gets one.
-    if staging.blank.load(Ordering::Acquire)
-        && (predicate.is_none() || !staging.holds(target.as_ref()))
-    {
-        staging.force.store(true, Ordering::Release);
-    }
     let timed = crate::timestamps::command(list, crate::timestamps::What::TextureUpload, None);
     if let Some(p) = &predicate {
         // SAFETY: an open list; the predicate's buffer lives for the run.
@@ -512,42 +574,28 @@ pub(crate) fn memory_change(resource: This) -> Change {
     if gpu_written(resource as usize) {
         return Change::No;
     }
-    let staging = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        map.as_ref()
-            .and_then(|map| map.get(&(resource as usize)).cloned())
-    };
-    let Some(staging) = staging else {
+    match state_of(resource) {
+        Some(staging) => staging.change(),
         // Not "clean": nothing was ever uploaded from it.
-        return Change::Yes;
-    };
-    // Never detiled (its memory was not mapped at the checks so far).
-    if staging.suspect.load(Ordering::Relaxed) || staging.written.load(Ordering::Acquire) == 0 {
-        return Change::Yes;
+        None => Change::Yes,
     }
-    let asked = staging.last.lock().unwrap_or_else(|e| e.into_inner()).asked;
-    let (start, end) = staging.range();
-    let since = || {
-        if crate::watch::changed_since(start, end, asked) {
-            Change::Yes
-        } else {
-            Change::No
-        }
-    };
-    if crate::watch::writes(start, end, false).is_some() {
-        return since();
+}
+
+/// `resource`'s staging state, if it has one (its buffer may be released).
+fn state_of(resource: This) -> Option<Arc<Staging>> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|map| map.get(&(resource as usize)).cloned())
+}
+
+/// Whether uploads may take a predicate: always, but on a test's thread
+/// that runs as if there were none left ([`tests::WithoutPredicates`]).
+fn may_predicate() -> bool {
+    #[cfg(test)]
+    if tests::WITHOUT_PREDICATES.get() {
+        return false;
     }
-    if guards() && crate::watch::writes(start, end, true).is_some() {
-        let change = since();
-        if change == Change::Yes {
-            return change;
-        }
-        if !verify_guards() {
-            staging.sampled.store(true, Ordering::Relaxed);
-            return change;
-        }
-    }
-    Change::Unknown(staging.layout.size)
+    true
 }
 
 /// The bytes of `resource`'s staging buffer, if it has one now (tests).
@@ -590,6 +638,86 @@ pub(crate) fn stage(resource: This, texture: &ID3D12Resource, room: u64) -> Stag
         Ok((_, new)) => Staged::Ready(new),
         Err(why) => why,
     }
+}
+
+/// The staging buffers a pass's checks of served textures make again
+/// (`draw.rs` `heap_textures`): those of textures uploaded before, whose
+/// buffer was released ([`release_staging`]) and whose memory changed.
+/// They take a share of the pass's budget of their own
+/// ([`REFRESH_SHARE`]), which the first uploads checked before them cannot
+/// spend (the first one of a pass fits whatever its bytes), and may pass
+/// the staging limit by that share, which first uploads fill. Before, such
+/// a texture took its bytes from what the first uploads left of the pass's
+/// budget: none while the world loads, the shaders reading its old texels
+/// all along (Codex's review of c44a716, 2). With its buffer, its refresh
+/// costs nothing, as before buffers were released.
+pub(crate) struct Refreshes {
+    share: u64,
+    made: u64,
+}
+
+/// [`Refreshes`]' share of a pass's budget: a quarter.
+const REFRESH_SHARE: u64 = 4;
+
+impl Refreshes {
+    /// For a pass that may stage `budget` bytes.
+    pub(crate) fn of(budget: u64) -> Refreshes {
+        Refreshes {
+            share: budget / REFRESH_SHARE,
+            made: 0,
+        }
+    }
+
+    /// The bytes made again so far.
+    pub(crate) fn made(&self) -> u64 {
+        self.made
+    }
+
+    /// Makes the staging buffer of served texture `resource` again if it
+    /// was released, within the share left: what came of it (as [`stage`]
+    /// tells). `None` if it was never staged: a first upload, which the
+    /// pass stages within its own budget.
+    pub(crate) fn stage(&mut self, resource: This) -> Option<Staged> {
+        if gpu_written(resource as usize) {
+            return Some(Staged::Host);
+        }
+        let staging = state_of(resource)?;
+        let room = refresh_room(
+            self.share,
+            self.made,
+            crate::descriptor::host::pass_staging(),
+            staged_total(),
+        );
+        Some(match staging.make_upload(room) {
+            Ok(made) => {
+                self.made += made;
+                Staged::Ready(made)
+            }
+            Err(why) => why,
+        })
+    }
+}
+
+/// The bytes the next staging buffer [`Refreshes`] makes again may take,
+/// `made` of its `share` made so far, `staged` bytes of staging buffers
+/// living under the staging limit `limit`.
+fn refresh_room(share: u64, made: u64, limit: u64, staged: u64) -> u64 {
+    let pass = if made == 0 {
+        u64::MAX
+    } else {
+        share.saturating_sub(made)
+    };
+    pass.min(limit.saturating_add(share).saturating_sub(staged))
+}
+
+/// Releases `resource`'s staging buffer at once if no list holds it,
+/// whatever uploads were recorded lately (tests elsewhere: other tests'
+/// textures are left as they are); whether it went.
+#[cfg(test)]
+pub(crate) fn release_staging_now(resource: This) -> bool {
+    let key = resource as usize;
+    let now = SWEEPS.load(Ordering::Relaxed);
+    release_staging_of(now, 0, usize::MAX, |r| r == key).0 == 1
 }
 
 /// Whether `resource` has a staging buffer over title memory at `address`:
@@ -636,14 +764,29 @@ pub(crate) fn released_total() -> (u64, u64) {
 /// looks at `looks` textures in turns, and the buffers are destroyed out
 /// of the map's lock.
 pub(crate) fn release_staging(idle: u64, looks: usize) -> (u64, u64) {
-    release_staging_of(idle, looks, |_| true)
+    #[cfg(test)]
+    let alone = SWEPT_ALONE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    #[cfg(not(test))]
+    let alone: [usize; 0] = [];
+    let now = SWEEPS.fetch_add(1, Ordering::Relaxed) + 1;
+    release_staging_of(now, idle, looks, |r| !alone.contains(&r))
 }
 
-/// [`release_staging`] for the resources `of` takes (tests: other tests'
-/// textures are in the same map).
-fn release_staging_of(idle: u64, looks: usize, of: impl Fn(usize) -> bool) -> (u64, u64) {
+/// The textures tests here sweep themselves (`tests::SweptAlone`): the
+/// passes of other tests, whose sweeps go over every texture, leave them
+/// as they are, so that a test tells what its own sweeps release, and
+/// when. Before, such a pass could release a test's buffer first (once
+/// passes elsewhere had advanced [`SWEEPS`] past its idle time).
+#[cfg(test)]
+static SWEPT_ALONE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// [`release_staging`] at time `now` of [`SWEEPS`], for the resources `of`
+/// takes (tests: other tests' textures are in the same map).
+fn release_staging_of(now: u64, idle: u64, looks: usize, of: impl Fn(usize) -> bool) -> (u64, u64) {
     use std::ops::Bound::{Excluded, Unbounded};
-    let now = SWEEPS.fetch_add(1, Ordering::Relaxed) + 1;
     let mut gone = Vec::new();
     {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1054,7 +1197,7 @@ static PREDICATE_WORDS: OnceLock<Option<Predicates>> = OnceLock::new();
 /// One copy's predicate word: the copy runs unless it is 0. It goes back
 /// when its holder goes (the list's submission step, dropped once the list
 /// is reset and nothing running uses its recording).
-struct Predicate {
+pub(crate) struct Predicate {
     of: &'static Predicates,
     at: u32,
     /// The submission being prepared (`timestamps::submissions`, plus one)
@@ -1065,7 +1208,7 @@ struct Predicate {
 impl Predicate {
     /// A free word, set to run (so a copy whose step never ran would run);
     /// `None` without predication or once they are all taken (logged once).
-    fn take() -> Option<Predicate> {
+    pub(crate) fn take() -> Option<Predicate> {
         let of = PREDICATE_WORDS
             .get_or_init(|| {
                 if !predication() {
@@ -1093,6 +1236,25 @@ impl Predicate {
         Some(p)
     }
 
+    pub(crate) fn bind(&self, list: &HostList) {
+        // SAFETY: the predicate word stays allocated until this list finishes.
+        unsafe {
+            list.list.SetPredication(
+                &self.of.buffer,
+                self.offset(),
+                D3D12_PREDICATION_OP_EQUAL_ZERO,
+            )
+        };
+    }
+
+    pub(crate) fn unbind(list: &HostList) {
+        // SAFETY: the command list is open.
+        unsafe {
+            list.list
+                .SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)
+        };
+    }
+
     fn offset(&self) -> u64 {
         u64::from(self.at) * 8
     }
@@ -1103,7 +1265,7 @@ impl Predicate {
     /// one word, so the second decision must not take the copy from the
     /// first (VIctory #1500, by A6thGraderFr, handles that case too).
     /// Returns whether the copy runs.
-    fn decide(&self, due: bool, submission: u64) -> bool {
+    pub(crate) fn decide(&self, due: bool, submission: u64) -> bool {
         let this = submission + 1;
         let runs = due || self.ran_in.load(Ordering::Relaxed) == this;
         if runs {
@@ -1295,6 +1457,54 @@ impl Staging {
             .is_some_and(|(w, t)| *w == written && Weak::ptr_eq(t, target))
     }
 
+    /// [`memory_change`] for this texture: whether its memory changed since
+    /// it was last detiled, as the write watch or the guards tell.
+    fn change(&self) -> Change {
+        // Never detiled (its memory was not mapped at the checks so far).
+        if self.suspect.load(Ordering::Relaxed) || self.written.load(Ordering::Acquire) == 0 {
+            return Change::Yes;
+        }
+        let asked = self.last.lock().unwrap_or_else(|e| e.into_inner()).asked;
+        let (start, end) = self.range();
+        let since = || {
+            if crate::watch::changed_since(start, end, asked) {
+                Change::Yes
+            } else {
+                Change::No
+            }
+        };
+        if crate::watch::writes(start, end, false).is_some() {
+            return since();
+        }
+        if guards() && crate::watch::writes(start, end, true).is_some() {
+            let change = since();
+            if change == Change::Yes {
+                return change;
+            }
+            if !verify_guards() {
+                self.sampled.store(true, Ordering::Relaxed);
+                return change;
+            }
+        }
+        Change::Unknown(self.layout.size)
+    }
+
+    /// Whether its staging buffer was released and an upload into host copy
+    /// `target` needs none: the host copy has what was detiled last, and the
+    /// memory is unchanged since, as the write watch or the guards tell
+    /// (memory only a hash tells gets one, for the check at submission).
+    fn current(&self, target: Option<&Weak<crate::resource::HostTexture>>) -> bool {
+        let released = self
+            .upload
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none();
+        released
+            && !self.host_owned.load(Ordering::Relaxed)
+            && self.holds(target)
+            && self.change() == Change::No
+    }
+
     /// Makes its staging buffer again if it was released, within `room`
     /// bytes: the bytes made (0 if it had one). The new one is blank.
     fn make_upload(&self, room: u64) -> Result<u64, Staged> {
@@ -1342,16 +1552,42 @@ impl Staging {
 
     /// Returns the bytes of title memory read.
     fn refresh_now(&self, before_write: impl FnOnce()) -> usize {
-        let size = self.layout.size as usize;
-        let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let last = &mut *last;
         // A blank buffer a copy is due from (`upload`): detiled whatever the
         // memory's checks say, as at its first check.
         if self.force.swap(false, Ordering::AcqRel) {
             last.asked = 0;
             last.hash = None;
         }
+        self.check(&mut last, before_write)
+    }
+
+    /// When a copy no predicate decides is recorded ([`upload`]): detiles
+    /// the memory into a blank staging buffer, whatever its checks say, as
+    /// its first check does. Whether the buffer holds a detiling now: not
+    /// if the memory is not mapped, or a GPU write into the texture was
+    /// submitted (its host copy keeps the host's contents). No copy reads a
+    /// blank buffer (its decision at submission skips it, or none was
+    /// recorded), so none is waited for; one that is not blank any more
+    /// (detiled by a check meanwhile) is not written again.
+    fn fill(&self) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.blank.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.host_owned.load(Ordering::Relaxed) {
+            return false;
+        }
+        last.asked = 0;
+        last.hash = None;
+        self.check(&mut last, || ());
+        !self.blank.load(Ordering::Acquire)
+    }
+
+    /// [`Staging::refresh_now`] under the lock of `last`.
+    fn check(&self, last: &mut Last, before_write: impl FnOnce()) -> usize {
+        let size = self.layout.size as usize;
+        let start = self.memory as usize;
         #[cfg(feature = "diagnostics")]
         {
             let submission = crate::timestamps::submissions();
@@ -1367,10 +1603,11 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+            let mut read = take_room(size);
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
             before_write();
-            self.detile(&last.read);
+            self.detile(&read);
+            give_room(read);
             self.written.fetch_add(1, Ordering::Release);
             #[cfg(feature = "diagnostics")]
             {
@@ -1431,8 +1668,7 @@ impl Staging {
         // Hashed and detiled from one snapshot (module doc), taken through
         // the copy, which stands pages unmapped since the check above. The
         // room is shared, and not held during the wait.
-        let mut snapshot = std::mem::take(&mut *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()));
-        snapshot.resize(size, 0);
+        let mut snapshot = take_room(size);
         crate::host::copy_mapped(snapshot.as_mut_ptr(), self.memory, size, false);
         let hash = self.hash(&snapshot);
         if last.hash != Some(hash) {
@@ -1449,7 +1685,7 @@ impl Staging {
                 self.seen.changed.fetch_add(1, Ordering::Relaxed);
             }
         }
-        *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+        give_room(snapshot);
         size
     }
 
@@ -2888,6 +3124,7 @@ mod tests {
             return;
         };
         let (resource, texture) = texture_4x4(0x11);
+        let _alone = SweptAlone::new(resource);
         let Staged::NoRoom(bytes) = stage(resource, texture, 16) else {
             panic!("{:?}", stage(resource, texture, 16));
         };
@@ -2927,18 +3164,19 @@ mod tests {
         }
         const IDLE: u64 = 1000;
         let (resource, texture) = texture_4x4(0x11);
+        let _alone = SweptAlone::new(resource);
         let key = resource as usize;
-        // Other tests' textures are in the same map: only this one goes.
-        let sweep = || release_staging_of(IDLE, usize::MAX, |r| r == key);
-        // Sweeps until it goes: the buffers and bytes released.
-        let sweep_out = || {
-            let mut released = (0, 0);
-            for _ in 0..=IDLE {
-                let (n, b) = sweep();
-                released = (released.0 + n, released.1 + b);
-            }
-            released
+        // Other tests' textures are in the same map: only this one goes. A
+        // sweep `later` passes on from now (without moving the passes'
+        // clock, which other tests' passes read).
+        let sweep_at = |later: u64| {
+            let now = SWEEPS.load(Ordering::Relaxed) + later;
+            release_staging_of(now, IDLE, usize::MAX, |r| r == key)
         };
+        // The next pass's sweep; one past the idle time: the buffers and
+        // bytes released.
+        let sweep = || sweep_at(1);
+        let sweep_out = || sweep_at(IDLE + 1);
         let state = || {
             let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
             map.as_ref().unwrap().get(&key).unwrap().clone()
@@ -2991,6 +3229,316 @@ mod tests {
         assert_eq!(decided_id(id), [true, false, false, true, true]);
         assert!(!state().blank.load(Ordering::Acquire));
         assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x3333_3333));
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+    }
+
+    thread_local! {
+        /// Uploads recorded on this thread take no predicate
+        /// ([`WithoutPredicates`]).
+        pub(super) static WITHOUT_PREDICATES: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// While it lives, uploads recorded on this thread take no predicate,
+    /// as with `XTP_TEXTURE_PREDICATION=0` or once they are all taken.
+    struct WithoutPredicates;
+
+    impl WithoutPredicates {
+        fn new() -> WithoutPredicates {
+            WITHOUT_PREDICATES.set(true);
+            WithoutPredicates
+        }
+    }
+
+    impl Drop for WithoutPredicates {
+        fn drop(&mut self) {
+            WITHOUT_PREDICATES.set(false);
+        }
+    }
+
+    /// While it lives, only the test that made it releases the staging
+    /// buffer of its resource: the passes of other tests leave it as it is
+    /// (`SWEPT_ALONE`).
+    struct SweptAlone(usize);
+
+    impl SweptAlone {
+        fn new(resource: This) -> SweptAlone {
+            let key = resource as usize;
+            SWEPT_ALONE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(key);
+            SweptAlone(key)
+        }
+    }
+
+    impl Drop for SweptAlone {
+        fn drop(&mut self) {
+            let mut alone = SWEPT_ALONE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = alone.iter().position(|&r| r == self.0) {
+                alone.swap_remove(at);
+            }
+        }
+    }
+
+    /// `len` bytes of committed memory of our own: write-watched as the
+    /// runtime reserves the title's if `watched`, plain otherwise (neither
+    /// write-watched nor guarded: only a hash tells a change, and a check
+    /// needs all of it committed).
+    fn private_memory(len: usize, watched: bool) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let kind = MEM_RESERVE | MEM_COMMIT | if watched { MEM_WRITE_WATCH } else { 0 };
+        // SAFETY: a fresh allocation of our own.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), len, kind, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0, "memory of our own");
+        at
+    }
+
+    /// Gives back memory [`private_memory`] made, once nothing is placed in
+    /// it any more.
+    fn free_memory(at: usize, len: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        crate::resource::memory_remapped(at, len);
+        // SAFETY: an allocation of ours; nothing is placed in it now.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Releases `resource`'s staging buffer, unless a sweep of another
+    /// test's did: it has none after.
+    fn released(resource: This) {
+        release_staging_now(resource);
+        assert_eq!(staged_bytes(resource), None, "released");
+    }
+
+    /// Without a predicate (`XTP_TEXTURE_PREDICATION=0`, or none left), a
+    /// copy recorded runs at submission whatever the staging buffer holds
+    /// then: it is recorded only from one that holds a detiling. A buffer
+    /// made again after its release is filled when the copy is recorded;
+    /// if the memory is not mapped then (decommitted), no copy is recorded
+    /// and the host copy keeps its texels. A GPU write into the texture
+    /// submitted between the recording and the list's submission (whose
+    /// check then detiles nothing) finds it filled: the copy brings the
+    /// title's bytes, as without predicates before buffers were released.
+    /// Before, both copies read the blank buffer made again (Codex's review
+    /// of c44a716, 1).
+    #[test]
+    fn copies_without_a_predicate_never_read_a_blank_buffer() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let test = "texture::tests::copies_without_a_predicate_never_read_a_blank_buffer";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let _none = WithoutPredicates::new();
+        const LEN: usize = 64 << 10;
+        let at = private_memory(LEN, false);
+        let (resource, texture) = texture_in(at);
+        let _alone = SweptAlone::new(resource);
+        let (id, size) = {
+            let state = staging(resource, texture).unwrap();
+            (state.id, state.layout.size as usize)
+        };
+        assert!(size <= LEN);
+        // SAFETY: the texture's memory, ours, `size` bytes of it.
+        let fill = |byte: u8| unsafe { (at as *mut u8).write_bytes(byte, size) };
+        let all = |byte: u8| texels_of(host, texture).iter().all(|&b| b == byte);
+
+        // The first upload: filled when recorded, then copied.
+        fill(0x11);
+        sample_in(host, resource, 1);
+        assert_eq!(decided_id(id), [true]);
+        assert!(all(0x11));
+        released(resource);
+
+        // Its memory decommitted: the buffer made again cannot be filled,
+        // and no copy is recorded.
+        // SAFETY: pages of our allocation; nothing reads them meanwhile.
+        assert_ne!(unsafe { VirtualFree(at as *mut _, LEN, MEM_DECOMMIT) }, 0);
+        let list = host.new_list().unwrap();
+        assert!(
+            !upload(&list, resource, texture),
+            "a copy from a blank buffer"
+        );
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        drop(list);
+        assert_eq!(decided_id(id), [true]);
+        assert!(all(0x11), "{:x?}", &texels_of(host, texture)[..16]);
+
+        // Mapped again with other bytes: filled when recorded, then copied.
+        // SAFETY: the pages decommitted above, committed again.
+        let again = unsafe { VirtualAlloc(at as *const _, LEN, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!again.is_null());
+        fill(0x22);
+        sample_in(host, resource, 1);
+        assert_eq!(decided_id(id), [true, true]);
+        assert!(all(0x22));
+
+        // Released again, then written, and recorded before a GPU write
+        // into the texture is submitted: the copy brings what was filled.
+        released(resource);
+        fill(0x33);
+        let reader = host.new_list().unwrap();
+        assert!(upload(&reader, resource, texture));
+        reader.close();
+        let writer = host.new_list().unwrap();
+        gpu_write(&writer, resource, true);
+        writer.close();
+        host.execute(&[&writer]);
+        host.execute(&[&reader]);
+        host.drain();
+        assert_eq!(decided_id(id), [true, true, true]);
+        assert!(all(0x33), "{:x?}", &texels_of(host, texture)[..16]);
+        drop((reader, writer));
+
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+        free_memory(at, LEN);
+    }
+
+    /// A texture in write-watched memory whose staging buffer was released:
+    /// uploads while its host copy has what was detiled last and the memory
+    /// is not written make nothing again and record no copy; once the
+    /// memory is written, the next makes the buffer again, and the memory
+    /// is read into the room the checks share, detiled and copied. Before,
+    /// an upload made the buffer again whatever the memory, and each
+    /// detiling of such a texture kept a copy of its memory of its own as
+    /// long as it lived (Codex's review of c44a716, 3).
+    #[test]
+    fn write_watched_textures_are_made_again_only_once_written() {
+        let test = "texture::tests::write_watched_textures_are_made_again_only_once_written";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        const LEN: usize = 64 << 10;
+        let at = private_memory(LEN, true);
+        let (resource, texture) = texture_in(at);
+        let _alone = SweptAlone::new(resource);
+        let (id, size) = {
+            let state = staging(resource, texture).unwrap();
+            (state.id, state.layout.size as usize)
+        };
+        // SAFETY: the texture's memory, ours, `size` bytes of it.
+        let fill = |byte: u8| unsafe { (at as *mut u8).write_bytes(byte, size) };
+        let all = |byte: u8| texels_of(host, texture).iter().all(|&b| b == byte);
+
+        fill(0x11);
+        sample_in(host, resource, 1);
+        assert!(all(0x11));
+        assert_eq!(memory_change(resource), Change::No, "write-watched, clean");
+        released(resource);
+        let decided = decided_id(id).len();
+        sample_in(host, resource, 2);
+        assert_eq!(staged_bytes(resource), None, "not made again");
+        assert_eq!(decided_id(id).len(), decided, "no copy recorded");
+
+        fill(0x44);
+        assert_eq!(memory_change(resource), Change::Yes);
+        sample_in(host, resource, 1);
+        assert!(staged_bytes(resource).is_some(), "made again");
+        assert_eq!(decided_id(id).last(), Some(&true));
+        assert!(all(0x44), "{:x?}", &texels_of(host, texture)[..16]);
+        assert_eq!(memory_change(resource), Change::No, "detiled");
+
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+        free_memory(at, LEN);
+    }
+
+    /// A pass's checks make the released staging buffers of served textures
+    /// again from a share of the pass's budget of their own: the first
+    /// whatever its bytes, the next ones within what is left of the share;
+    /// one whose buffer lives costs nothing, one never staged is not theirs
+    /// (a first upload), one a GPU write was submitted into needs none. The
+    /// share may pass the staging limit by itself, not more.
+    #[test]
+    fn released_served_textures_are_made_again_from_a_share_of_their_own() {
+        let test =
+            "texture::tests::released_served_textures_are_made_again_from_a_share_of_their_own";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let [(a, ta), (b, tb), (never, _)] = [0x11, 0x22, 0x33].map(texture_4x4);
+        let _alone = [a, b, never].map(SweptAlone::new);
+        let bytes = staging(a, ta).unwrap().size;
+        assert_eq!(staging(b, tb).unwrap().size, bytes);
+        released(a);
+        released(b);
+
+        // A pass whose budget leaves one of them to the share.
+        let mut refreshes = Refreshes::of(REFRESH_SHARE * bytes);
+        assert_eq!(refreshes.stage(never), None, "a first upload");
+        assert_eq!(refreshes.stage(a), Some(Staged::Ready(bytes)));
+        assert_eq!(refreshes.stage(a), Some(Staged::Ready(0)), "it has one");
+        assert_eq!(refreshes.stage(b), Some(Staged::NoRoom(bytes)), "past it");
+        assert_eq!(refreshes.made(), bytes);
+        // The first of a pass whatever its bytes.
+        assert_eq!(Refreshes::of(0).stage(b), Some(Staged::Ready(bytes)));
+        // One the host GPU writes.
+        let list = host.new_list().unwrap();
+        gpu_write(&list, a, true);
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        assert_eq!(Refreshes::of(0).stage(a), Some(Staged::Host));
+
+        // The room: the share, the first one past it, the staging limit
+        // passed by the share at most.
+        const MIB: u64 = 1 << 20;
+        assert_eq!(refresh_room(16 * MIB, 0, 1024 * MIB, 0), 1040 * MIB);
+        assert_eq!(refresh_room(16 * MIB, 4 * MIB, 1024 * MIB, 0), 12 * MIB);
+        assert_eq!(refresh_room(16 * MIB, 20 * MIB, 1024 * MIB, 0), 0);
+        assert_eq!(refresh_room(16 * MIB, 0, 1024 * MIB, 1030 * MIB), 10 * MIB);
+        assert_eq!(refresh_room(16 * MIB, 0, 1024 * MIB, 2048 * MIB), 0);
+
+        type Release = extern "system" fn(This) -> u32;
+        for r in [a, b, never] {
+            assert_eq!(crate::object::slot::<Release>(r, 0x10)(r), 0);
+        }
+    }
+
+    /// A list reset while its submission runs hands what it holds to the
+    /// timeline until that submission has run: a sweep in between releases
+    /// nothing, however idle the texture; one after it releases the buffer
+    /// (Codex's review of c44a716: the test of a sweep between a list reset
+    /// and its fence was missing).
+    #[test]
+    fn a_list_reset_in_flight_keeps_its_staging_buffer_until_its_submission_ran() {
+        let test = "texture::tests::a_list_reset_in_flight_keeps_its_staging_buffer_until_its_submission_ran";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let (resource, texture) = texture_4x4(0x11);
+        let _alone = SweptAlone::new(resource);
+        let list = host.new_list().unwrap();
+        assert!(upload(&list, resource, texture));
+        list.close();
+        let mut gate = crate::host::Gate::close(host);
+        // As the title submits: the list may be reset while it runs.
+        host.submit(&[&list]);
+        assert!(list.running(), "held behind the gate");
+        list.reset();
+        assert!(
+            !release_staging_now(resource),
+            "held by the submission in flight"
+        );
+        assert!(staged_bytes(resource).is_some());
+        gate.open();
+        host.drain();
+        released(resource);
+        list.close();
+        drop(list);
+        assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x1111_1111));
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
     }

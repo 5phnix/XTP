@@ -110,6 +110,50 @@ fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
 }
 
 #[test]
+fn nested_descriptor_joins_can_reload_the_same_table_entry() {
+    // A and B join before meeting C. All three paths load the view used
+    // by the typed read, whose result is stored in LDS.
+    let mut words = [
+        0xBE84_0300, // s4 = table
+        0xBE85_0380, // s5 = 0
+        0xBF06_8001, // selector == 0
+        0xBF85_0009, // branch to C
+        0xBF06_8101, // selector == 1
+        0xBF85_0003, // branch to B
+        0xF408_0202,
+        0xFA00_0020, // A
+        0xBF82_0002, // branch to the inner join
+        0xF408_0202,
+        0xFA00_0020, // B
+        0xBF80_0000, // inner join
+        0xBF82_0002, // branch to the read
+        0xF408_0202,
+        0xFA00_0020, // C
+        0xE000_2000,
+        0x8002_0100, // typed read
+        0xD834_0000,
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let run = |code: &[u32]| {
+        lower_with(
+            code,
+            vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)],
+            vec![],
+        )
+    };
+    run(&words).unwrap();
+    words[10] = 0xFA00_0040;
+    assert!(matches!(
+        run(&words),
+        Err(crate::ShaderError::Unsupported {
+            what: "a descriptor chosen by control flow",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn a_scalar_carry_chain_reaches_the_select() {
     // The high dword of a 64-bit add or subtract, then a select on the
     // carry (borrow) the high half leaves in SCC, and a branch on it

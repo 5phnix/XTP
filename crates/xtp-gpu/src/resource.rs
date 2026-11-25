@@ -8,6 +8,8 @@
 
 #[cfg(windows)]
 mod alias;
+#[cfg(windows)]
+pub(crate) mod decode;
 pub(crate) mod format;
 #[cfg(windows)]
 mod pool;
@@ -864,6 +866,10 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    #[cfg(test)]
+    decode_count: std::sync::atomic::AtomicU64,
+    decode_tracked: bool,
+    content: std::sync::atomic::AtomicU64,
     /// Bytes of video memory it takes (counted in [`format::report`]).
     pub(crate) bytes: u64,
     /// Of them, what its stand-in format takes beyond the title's.
@@ -1196,6 +1202,12 @@ fn host_texture(desc: &ResourceDesc, state: u32, clear: Option<[u32; 5]>) -> Opt
     Some(HostTexture {
         texture,
         state: state.into(),
+        #[cfg(test)]
+        decode_count: Default::default(),
+        decode_tracked: desc.sample_count == 1
+            && ((d.flags & 5 != 0 && element(stand_in) == Some((4, 1)))
+                || (desc.format == 67 && stand_in == 10)),
+        content: decode::revision().into(),
         bytes,
         extra,
         residency,
@@ -2289,10 +2301,6 @@ void main(uint3 id : SV_DispatchThreadID) {
 struct Decode {
     root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
     pso: windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
-    /// The list it records into, run before the next title submission
-    /// ([`run_decodes`]), and whether it is open with work in it.
-    list: crate::host::HostList,
-    open: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the pass is used under its lock.
@@ -2355,14 +2363,7 @@ fn make_decode(host: &crate::host::Host) -> windows::core::Result<Decode> {
                 },
                 ..Default::default()
             })?;
-        let list = host.new_list()?;
-        list.close();
-        Ok(Decode {
-            root,
-            pso,
-            list,
-            open: false,
-        })
+        Ok(Decode { root, pso })
     }
 }
 
@@ -2429,8 +2430,6 @@ struct Decoded {
         windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
-    /// The frame it was last decoded for (`queue::presented`).
-    frame: u64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; used under its map's lock.
@@ -2456,24 +2455,27 @@ fn decodes(title: u32, from: &HostTexture, to: &HostTexture) -> bool {
         && t.SampleDesc.Count == 1
 }
 
-/// Writes the R9G9B9E5 texels `from` holds (as words: a GPU-written
-/// R32 texture) into `to`, the RGBA16F stand-in of a texture that reads
-/// them as R9G9B9E5, decoded on the GPU: in a list of ours, run before the
-/// next title submission ([`run_decodes`]), so it sees what the lists
-/// submitted before it wrote (what lists not yet submitted write shows a
-/// frame later); every decoding of the moment shares the one submission. Once a frame per texture
-/// (`placed`, the title resource of `to`; `source`, that of `from`).
-/// False if the decoding cannot be made (shapes or layouts that differ).
+/// Decodes the source words at the point where this list reads the view.
+/// Earlier submissions determine whether the first read needs a decode.
 #[cfg(windows)]
 fn decode_now(
+    list: &crate::host::HostList,
     host: &crate::host::Host,
     placed: This,
     source: This,
     from: &Arc<HostTexture>,
     to: &Arc<HostTexture>,
 ) -> bool {
+    use std::sync::atomic::Ordering;
     use windows::Win32::Graphics::Direct3D12::*;
-    let frame = crate::queue::presented();
+    if list
+        .decode_uses
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .current(from, to)
+    {
+        return true;
+    }
     let mut decoded = DECODED.lock().unwrap_or_else(|e| e.into_inner());
     let decoded = decoded.get_or_insert_with(std::collections::HashMap::new);
     let fits = |d: &Decoded| {
@@ -2490,9 +2492,6 @@ fn decode_now(
     let Some(d) = decoded.get_mut(&(placed as usize)) else {
         return false;
     };
-    if d.frame == frame + 1 {
-        return true;
-    }
     let mut pass = DECODE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pass) = pass
         .get_or_insert_with(|| match make_decode(host) {
@@ -2508,12 +2507,7 @@ fn decode_now(
     };
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let list = &pass.list;
-    if !pass.open {
-        list.reset();
-        pass.open = true;
-    }
-    crate::list::ensure_state(list, source, COPY_SOURCE);
+    let before = alias_source(list, source, COPY_SOURCE);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
@@ -2543,6 +2537,12 @@ fn decode_now(
     );
     let t = crate::host::transition;
     let l = &list.list;
+    let predicate = crate::texture::Predicate::take();
+    if let Some(p) = &predicate {
+        p.bind(list);
+    }
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("decode R9G9B9E5 from {source:?} into {placed:?}"));
     // SAFETY: our open list, pass and buffers (kept with the pair); live
     // textures the list holds through their states; every copy and store
     // inside the layouts the buffers were sized for.
@@ -2598,24 +2598,33 @@ fn decode_now(
         }
         l.ResourceBarrier(&[t(&d.texels, copy_source, common)]);
     }
-    d.frame = frame + 1;
+    if predicate.is_some() {
+        crate::texture::Predicate::unbind(list);
+    }
+    list.keep(&d.words);
+    list.keep(&d.texels);
+    // The same command may read the source through an SRV or write its UAV.
+    if let Some(before) = before {
+        crate::list::ensure_state(list, source, before);
+    }
+    list.decode_pipeline.store(true, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    let count = crate::frameprobe::decoding(list, placed);
+    decode::recorded(
+        list,
+        from,
+        to,
+        predicate,
+        #[cfg(feature = "diagnostics")]
+        count,
+    );
     true
 }
 
-/// Runs the decodings [`decode_now`] recorded since the last call, if any:
-/// before a title submission (`Host::submit`), so that lists recorded
-/// after them see what they wrote.
+/// Compatibility entry point for callers of Host::submit.
+/// Each reader's list already contains its decode commands.
 #[cfg(windows)]
-pub(crate) fn run_decodes(host: &crate::host::Host) {
-    let mut pass = DECODE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(Some(pass)) = pass.as_mut()
-        && pass.open
-    {
-        pass.list.close();
-        host.execute(&[&pass.list]);
-        pass.open = false;
-    }
-}
+pub(crate) fn run_decodes(_: &crate::host::Host) {}
 
 /// The buffers and layouts [`decode_now`] needs for `from` and `to`, if
 /// they have the same shape (levels, layers, sizes).
@@ -2684,7 +2693,24 @@ fn decoding(
         from: Arc::downgrade(from),
         to: Arc::downgrade(to),
         parts: of_words.into_iter().zip(of_texels).collect(),
-        frame: 0,
+    })
+}
+
+/// Transitions the source for copying and saves its previous state in case
+/// the command already bound it as a render target or UAV.
+#[cfg(windows)]
+fn alias_source(list: &crate::host::HostList, source: This, state: u32) -> Option<u32> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES;
+    list.transition(source, state).map(|(texture, before)| {
+        let state = crate::host::legal_state(texture, state);
+        let barrier = crate::host::transition(
+            texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(state as i32),
+        );
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        before
     })
 }
 
@@ -2696,7 +2722,7 @@ fn decoding(
 /// copy, through a buffer (the host copies between two formats in no other
 /// way): the first time the list reads it, and again whenever the list used
 /// the written texture otherwise since. Where the host keeps R9G9B9E5 as
-/// RGBA16F, the texels are decoded instead, once a frame ([`decode_now`]). Title memory does not have them: a
+/// RGBA16F, [`decode_now`] converts the texels in this list. Title memory does not have them: a
 /// copy filled from it is black. Leaves `placed` in the copy destination
 /// state and keeps its host copy from being filled from title memory again
 /// (`texture::gpu_write`). True if `placed` is such a texture.
@@ -2733,7 +2759,7 @@ pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
     // The host has R9G9B9E5 as RGBA16F (`format`, the RTX 4080): texels
     // of another width, decoded rather than copied.
     if decodes(r.desc.format, &from, &to) {
-        let decoded = decode_now(host, placed, source as This, &from, &to);
+        let decoded = decode_now(list, host, placed, source as This, &from, &to);
         if decoded {
             crate::texture::gpu_write(list, placed, true);
         }
@@ -2751,19 +2777,7 @@ pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
-    let before = list
-        .transition(source, COPY_SOURCE)
-        .map(|(texture, before)| {
-            let state = crate::host::legal_state(texture, COPY_SOURCE);
-            let barrier = crate::host::transition(
-                texture,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATES(state as i32),
-            );
-            // SAFETY: an open list and a live texture.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
-            before
-        });
+    let before = alias_source(list, source, COPY_SOURCE);
     crate::texture::gpu_write(list, placed, true);
     if !first && before.is_none() {
         return true;
@@ -2880,6 +2894,10 @@ fn own_texture(
     HostTexture {
         texture,
         state: state.into(),
+        #[cfg(test)]
+        decode_count: Default::default(),
+        decode_tracked: false,
+        content: decode::revision().into(),
         bytes: 0,
         extra: 0,
         residency: Arc::new(residency::Residency::resident()),
@@ -4249,6 +4267,46 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn resident(r: This) {
+        let copy = resource(r).host.as_ref().unwrap();
+        assert!(copy.residency.wait(std::time::Duration::from_secs(5)));
+    }
+
+    /// A new view may still be waiting for residency. Wait for its fence before
+    /// requesting the resident view from the same entry point.
+    #[cfg(windows)]
+    fn resident_view(address: u64, desc: &[u32; 14]) -> This {
+        if let Some(view) = texture_at(address, desc) {
+            return view;
+        }
+        let key = (address, canonical_resource_desc(*desc));
+        let view = placed_textures()[&key].resource as This;
+        resident(view);
+        texture_at(address, desc).unwrap()
+    }
+
+    /// Drain only the deferred references for this test's memory.
+    #[cfg(windows)]
+    fn release_views_at(address: u64) {
+        let mut due = Vec::new();
+        RELEASED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(_, raw)| {
+                let r = raw as This;
+                if resource(r).data() as u64 == address {
+                    due.push(r);
+                    false
+                } else {
+                    true
+                }
+            });
+        for r in due {
+            resource_release(r);
+        }
+    }
+
+    #[cfg(windows)]
     fn same_copy(a: This, b: This) -> bool {
         Arc::ptr_eq(&host_copy(a).unwrap(), &host_copy(b).unwrap())
     }
@@ -4521,21 +4579,23 @@ mod tests {
                 ..texture(16, 16, R32_FLOAT, 1)
             },
         );
-        let rtv = [0u64; 16];
+        resident(target);
+        let mut descriptor = [0u64; 16];
+        let rtv = descriptor.as_mut_ptr() as u64;
         let null = std::ptr::null();
-        crate::descriptor::create_rtv(null, target, null.cast(), rtv.as_ptr() as u64);
+        crate::descriptor::create_rtv(null, target, null.cast(), rtv);
         let list = crate::testgpu::TitleList::new();
         type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
         let packed = [f32::from_bits(PACKED), 0.0, 0.0, 0.0];
         let clear = slot::<Clear>(list.this(), 0x1a0);
-        clear(list.this(), rtv.as_ptr() as u64, &packed, 0, null.cast());
+        clear(list.this(), rtv, &packed, 0, null.cast());
         list.run();
 
         const R9G9B9E5: u32 = 67;
-        let view = texture_at(address, &words(&texture(16, 16, R9G9B9E5, 1), [1, 2])).unwrap();
+        let view = resident_view(address, &words(&texture(16, 16, R9G9B9E5, 1), [1, 2]));
         assert!(!same_copy(view, target), "two formats: two copies");
-        let word = |words: &[u32], x: usize, y: usize| words[y * 64 + x];
-        assert_eq!(word(&read_words(host, view), 3, 5), 0, "title memory");
+        let source = read_words(host, target);
+        assert_eq!(source[0], PACKED, "packed word written to the R32 source");
 
         let reads = crate::testgpu::TitleList::new();
         assert!(alias_copy(reads.host(), view));
@@ -4545,8 +4605,19 @@ mod tests {
         );
         reads.run();
         let texels = read_words(host, view);
+        // SAFETY: the reader's command list retains the view's host copy.
+        let format = unsafe { host_resource(view).unwrap().GetDesc() }.Format.0 as u32;
         for (x, y) in [(0, 0), (15, 15), (7, 9)] {
-            assert_eq!(word(&texels, x, y), PACKED, "texel {x},{y}");
+            let row = y * 64;
+            match format {
+                R9G9B9E5 => assert_eq!(texels[row + x], PACKED, "texel {x},{y}"),
+                10 => assert_eq!(
+                    texels[row + 2 * x..row + 2 * x + 2],
+                    [0x3400_3800, 0x3c00_3000],
+                    "RGBA16F texel {x},{y}"
+                ),
+                other => panic!("unexpected host format {other}"),
+            }
         }
         // A texture of the target's own format over it is no such alias.
         let same = texture_at(address, &words(&texture(16, 16, R32_FLOAT, 1), [3, 4])).unwrap();
@@ -4577,33 +4648,54 @@ mod tests {
                 ..texture(16, 16, R32_FLOAT, 1)
             },
         );
-        let rtv = [0u64; 16];
+        resident(target);
+        let mut descriptor = [0u64; 16];
+        let rtv = descriptor.as_mut_ptr() as u64;
         let null = std::ptr::null();
-        crate::descriptor::create_rtv(null, target, null.cast(), rtv.as_ptr() as u64);
+        crate::descriptor::create_rtv(null, target, null.cast(), rtv);
         let list = crate::testgpu::TitleList::new();
         type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
         let packed = [f32::from_bits(PACKED), 0.0, 0.0, 0.0];
         let clear = slot::<Clear>(list.this(), 0x1a0);
-        clear(list.this(), rtv.as_ptr() as u64, &packed, 0, null.cast());
-        list.run();
+        clear(list.this(), rtv, &packed, 0, null.cast());
 
-        const R16G16B16A16_FLOAT: u32 = 10;
+        const RGBA16F: u32 = 10;
+        let stand_in = at(written.address(), &texture(16, 16, 67, 1));
+        // SAFETY: this test owns the view and has not used it yet. WARP normally
+        // keeps format 67. Give it the same host copy used on RTX hardware.
+        let view = unsafe { &mut *stand_in.cast_mut().cast::<Resource>() };
+        view.host = host_texture(&texture(16, 16, RGBA16F, 1), 0, None).map(Arc::new);
+        resident(stand_in);
+        let to = host_copy(stand_in).unwrap();
         let elsewhere = fresh_memory(&mut held);
-        let stand_in = at(elsewhere.address(), &texture(16, 16, R16G16B16A16_FLOAT, 1));
-        let (from, to) = (host_copy(target).unwrap(), host_copy(stand_in).unwrap());
-        assert!(
-            !decodes(R16G16B16A16_FLOAT, &from, &to),
-            "only R9G9B9E5 reads"
+        let snapshot = at(elsewhere.address(), &texture(16, 16, RGBA16F, 1));
+        resident(snapshot);
+        const SHADER_RESOURCE: u32 = 0xc0;
+        crate::list::ensure_state(list.host(), target, SHADER_RESOURCE);
+        assert!(alias_copy(list.host(), stand_in));
+        assert!(list.host().transition(target, SHADER_RESOURCE).is_none());
+        assert!(alias_copy(list.host(), stand_in));
+        // The GPU read between the two clears captures the first color.
+        crate::list::ensure_state(list.host(), stand_in, 0x800);
+        crate::list::ensure_state(list.host(), snapshot, 0x400);
+        // SAFETY: the textures have matching formats and are in their copy states.
+        unsafe {
+            list.host()
+                .list
+                .CopyResource(host_resource(snapshot).unwrap(), &to.texture)
+        };
+        let second = [f32::from_bits(PACKED + (1 << 27)), 0.0, 0.0, 0.0];
+        clear(list.this(), rtv, &second, 0, null.cast());
+        assert!(alias_copy(list.host(), stand_in));
+        // Record before submitting the list that fills the view, then replay.
+        let again = crate::testgpu::TitleList::new();
+        assert!(alias_copy(again.host(), stand_in));
+        list.run();
+        assert_eq!(
+            to.decode_count.load(std::sync::atomic::Ordering::Relaxed),
+            2
         );
-        assert!(decodes(67, &from, &to));
-        assert!(decode_now(host, stand_in, target, &from, &to));
-        assert!(
-            decode_now(host, stand_in, target, &from, &to),
-            "once a frame"
-        );
-        run_decodes(host);
-        host.drain();
-        let words = read_words(host, stand_in);
+        let words = read_words(host, snapshot);
         for (x, y) in [(0, 0), (15, 15), (7, 9)] {
             let at = y * 64 + 2 * x;
             // Halves 0.5 and 0.25, then 0.125 and 1.
@@ -4613,7 +4705,27 @@ mod tests {
                 "texel {x},{y}"
             );
         }
-        for r in [stand_in, target] {
+        let words = read_words(host, stand_in);
+        assert_eq!([words[0], words[1]], [0x3800_3c00, 0x3c00_3400]);
+        again.run();
+        let expected = if crate::texture::predication() { 2 } else { 3 };
+        assert_eq!(
+            to.decode_count.load(std::sync::atomic::Ordering::Relaxed),
+            expected
+        );
+        // A clear in another list precedes the same read on replay.
+        let writer = crate::testgpu::TitleList::new();
+        clear(writer.this(), rtv, &packed, 0, null.cast());
+        writer.host().close();
+        host.submit(&[writer.host(), again.host()]);
+        host.drain();
+        assert_eq!(
+            to.decode_count.load(std::sync::atomic::Ordering::Relaxed),
+            expected + 1
+        );
+        let words = read_words(host, stand_in);
+        assert_eq!([words[0], words[1]], [0x3400_3800, 0x3c00_3000]);
+        for r in [snapshot, stand_in, target] {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
     }
@@ -4658,7 +4770,7 @@ mod tests {
         assert_eq!(texture_at(address, &view), Some(after));
         // The resource it replaced goes after its grace.
         memory_remapped(address as usize, KIB_64 as usize);
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
         assert_eq!(Arc::strong_count(&replaced), 1, "released");
     }
 
@@ -4687,12 +4799,12 @@ mod tests {
             .keys()
             .all(|&(a, _)| a != address);
         assert!(gone);
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
         assert_eq!(Arc::strong_count(&copy), 1, "the resource let go of it");
         let again = texture_at(address, &view).unwrap();
         assert!(!Arc::ptr_eq(&host_copy(again).unwrap(), &copy));
         memory_remapped(address as usize, KIB_64 as usize);
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
     }
 
     /// A remapped range that starts inside a placed view's texture takes it
@@ -4724,7 +4836,7 @@ mod tests {
             .keys()
             .all(|&(a, _)| a != address);
         assert!(gone, "a texture over the remapped memory stays");
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
     }
 
     /// A view that shows a released target's copy keeps it until the title
@@ -4743,7 +4855,7 @@ mod tests {
         let plain = texture(16, 16, 28, 1);
         let target = at(address, &ResourceDesc { flags: 1, ..plain });
         let view = words(&plain, [0, 0]);
-        let shown = texture_at(address, &view).unwrap();
+        let shown = resident_view(address, &view);
         assert!(same_copy(shown, target));
         let drawn = host_copy(target).unwrap();
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
@@ -4754,13 +4866,15 @@ mod tests {
         );
         // The title puts a texture of its own there.
         let streamed = at(address, &plain);
-        let now = texture_at(address, &view).unwrap();
-        assert_ne!(now, shown);
+        release_views_at(address);
+        // The allocator can reuse the released object's address. The host copy
+        // retained in drawn identifies the contents being replaced.
+        let now = resident_view(address, &view);
         assert!(!Arc::ptr_eq(&host_copy(now).unwrap(), &drawn));
         assert!(crate::texture::title_written(host_resource(now).unwrap()));
         assert_eq!(slot::<Release>(streamed, 0x10)(streamed), 0);
         memory_remapped(address as usize, KIB_64 as usize);
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
     }
 
     /// Textures the title fills itself are placed in the texture pool;

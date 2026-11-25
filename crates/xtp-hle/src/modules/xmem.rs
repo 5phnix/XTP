@@ -1687,7 +1687,7 @@ pub(crate) mod ledger {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
-        // Les autres fonctions de cet ensemble restent fournies par Windows.
+        // The other functions of this set are still provided by Windows.
         dlls: &["xmem.dll", "api-ms-win-core-memory-*"],
         exports: vec![
             HleExport {
@@ -2193,13 +2193,13 @@ mod tests {
         assert_eq!(bytes, [0x83; 4]);
 
         publish(2, 0xc1);
-        // SAFETY: les deux vues désignent la même page du titre.
+        // SAFETY: both views map the same page of the title.
         unsafe { alias.cast::<u8>().write_volatile(0x75) };
         assert_eq!(&page_bytes(pages[0])[..4], &[0x75, 0xc1, 0xc1, 0xc1]);
 
         publish(4, 0x33);
         let mut old = 0;
-        // SAFETY: deux vues du test et une sortie valide pour la protection précédente.
+        // SAFETY: two views of the test and a valid output for the previous protection.
         unsafe {
             let ro = windows_sys::Win32::System::Memory::PAGE_READONLY;
             assert_ne!(xtp_gpu::title_virtual_protect(alias, 4096, ro, &mut old), 0);

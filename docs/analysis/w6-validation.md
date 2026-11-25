@@ -1,49 +1,43 @@
-# W6 — validation des signatures DXIL sur la L4
+# W6 — DXIL signature validation on the L4
 
-## Conditions de mesure
+## Measurement conditions
 
-Le 25 novembre 2026, les exécutables Windows ont été construits depuis des
-arbres Git propres avec `cargo build --locked --profile diag -p xtp`. La
-L4 a exécuté le relevé suivant pour `2545065` et `7b63628`,
-avec le validateur 1.9 du SDK 26100 (dxil.dll 1.9.2602.17).
+On 25 November 2026, the Windows executables were built from clean Git
+trees with `cargo build --locked --profile diag -p xtp`. The L4 ran the
+following survey for `2545065` and `7b63628`,
+with the 1.9 validator from SDK 26100 (dxil.dll 1.9.2602.17).
 
 ```powershell
 .\xtp.exe shader-survey D:\game\shaders.rpf --validate --host-lanes 32-32 --json releve.json
 ```
 
-Le pack de 411 695 600 octets a pour BLAKE3
+The 411,695,600-byte pack has the BLAKE3 hash
 `2b023331518b1b7827aa7c9e478e78888c0d52c705fd980ddc04ae9ee14d20b5`.
-Les JSON permettent de joindre chaque programme par le couple
-(`record`, `program`). L’empreinte `output` couvre les octets du
-conteneur DXIL avant signature par le validateur ainsi que les tables de
-liaison. Les relevés et les journaux sont sur la L4 dans
-`D:\xtp-data\w6-841901`, préfixés par la révision.
+The JSON files let each program be joined by the (`record`, `program`)
+pair. The `output` fingerprint covers the bytes of the DXIL container
+before the validator signs it, as well as the binding tables. The surveys
+and logs are on the L4 in `D:\xtp-data\w6-841901`, prefixed by the
+revision.
 
-## Gain de 7b63628
+## Gain of 7b63628
 
-**117 validations gagnées, aucune perdue.** Les 26 698 clés sont uniques
-et communes aux deux relevés. Les deux révisions traduisent 25 441
-programmes. Les 1 257 autres échouent avant le validateur.
+**117 validations gained, none lost.** The 26,698 keys are unique
+and shared by both surveys. Both revisions translate 25,441
+programs. The other 1,257 fail before the validator.
 
-| Premier verdict de dxil.dll | `2545065` | `7b63628` | Programmes concernés avant le correctif |
+| First dxil.dll verdict | `2545065` | `7b63628` | Programs affected before the fix |
 |---|---:|---:|---|
-| Accepté | 25 253 | 25 370 | Les 25 253 restent acceptés avec la même empreinte |
-| Signature d’entrée ISG1 | 27 | 0 | 27 PS |
-| Signature de sortie OSG1 | 34 | 0 | 26 VS, 8 MS |
-| Interpolations incompatibles dans une ligne | 56 | 0 | 36 PS, 15 VS, 5 MS |
-| Sorties de mesh dépassant 32 768 octets | 71 | 71 | Les mêmes 71 MS |
+| Accepted | 25,253 | 25,370 | The 25,253 stay accepted with the same fingerprint |
+| ISG1 input signature | 27 | 0 | 27 PS |
+| OSG1 output signature | 34 | 0 | 26 VS, 8 MS |
+| Incompatible interpolations in one row | 56 | 0 | 36 PS, 15 VS, 5 MS |
+| Mesh outputs exceeding 32,768 bytes | 71 | 71 | The same 71 MS |
 
-Les 117 empreintes qui changent appartiennent exactement aux 117 programmes
-qui passent de refusé à accepté. Pour chacun des 24 275 succès du témoin
-historique, l’empreinte à `2545065` est identique à celle à `7b63628`.
+The 117 fingerprints that change belong exactly to the 117 programs
+that go from refused to accepted. For each of the 24,275 successes of the
+historical reference, the fingerprint at `2545065` is identical to the one at `7b63628`.
 
-La création de pipelines D3D12 a un comptage distinct. À la remise de ce
-lot, la commande `translate --validate --pipelines --host-lanes 32-32`
-avait été arrêtée à `2545065` avant son bilan. L’exécution à `7b63628`
-restait à faire. La tâche Hangar `6d512c1f` reprend les deux mesures avec
-les exécutables conservés sur la L4.
-
-Cette vérification lit les deux JSON depuis le répertoire des relevés.
+This check reads both JSON files from the survey directory.
 
 ```python
 import json
@@ -65,61 +59,100 @@ assert len(valides) == 25_253 and all(apres[k]["validator"] == "ok" for k in val
 assert modifies == gagnes and len(gagnes) == 117
 ```
 
-## Origine des 24 275 validations
+## D3D12 pipeline creation on the NVIDIA L4
 
-Le fichier historique `D:\xtp-data\w6-before.json` correspond à
-`37ee7ea`. Son empreinte globale des sorties
+Both revisions created **24,811 pipelines** on the L4 (driver 596.86).
+After input deduplication, `7b63628` gained **115 validations**
+(102 VS and PS combined, 13 MS). Both runs used the same pack and
+validator as the survey, from `D:\xtp-data\w6-841901`.
+
+```powershell
+$env:XTP_DXIL = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxil.dll'
+.\2545065.exe translate D:\game\shaders.rpf --validate --pipelines --host-lanes 32-32
+.\7b63628.exe translate D:\game\shaders.rpf --validate --pipelines --host-lanes 32-32
+```
+
+Both commands exited with code 0. The directory above contains each run's
+stdout in `<revision>-6d512c1f-translate-verified.log` and its exit code
+in the adjacent `.log.exit` file.
+
+`translate` hashes each input container's DXIL part with BLAKE3 and skips
+repeat hashes before enumerating native programs. Each run read
+26,503 containers, skipped 614 duplicates, and translated all 26,084
+remaining native programs to IR. The survey counts 26,698 program
+occurrences by record and program index.
+
+| Revision | Stage | Programs reaching emission | DXIL emitted | Validated | Pipelines created |
+|---|---|---:|---:|---:|---:|
+| `2545065` | VS + PS | 14,247 | 13,844 | 13,742 | 13,844 |
+| `2545065` | CS | 2,617 | 2,319 | 2,319 | 2,303 |
+| `2545065` | MS | 8,765 | 8,664 | 8,580 | 8,664 |
+| `7b63628` | VS + PS | 14,247 | 13,844 | 13,844 | 13,844 |
+| `7b63628` | CS | 2,617 | 2,319 | 2,319 | 2,303 |
+| `7b63628` | MS | 8,765 | 8,664 | 8,593 | 8,664 |
+
+Each emitted shader gets its own pipeline creation attempt before validation.
+VS and MS use a stub pixel shader, PS uses a matching stub vertex shader,
+and CS uses a compute pipeline. On both revisions, all 2,319 emitted CS
+passed validation and 16 failed pipeline creation. Every emitted VS, PS
+and MS produced a pipeline, including the 71 MS that still failed
+validation at `7b63628`.
+
+## Origin of the 24,275 validations
+
+The historical file `D:\xtp-data\w6-before.json` corresponds to
+`37ee7ea`. Its global output fingerprint
 (`9255acc313a2b4dd337d2bceef409118d5b0753c09e3568bbbd9e2358a305b06`),
-le pack, les 24 433 traductions et les 158 refus concordent avec le relevé
-consigné dans la tâche Hangar `7452518e`.
+the pack, the 24,433 translations and the 158 refusals match the survey
+recorded in Hangar task `7452518e`.
 
-Les 24 275 programmes de ce témoin restent acceptés à `2545065`. Entre
-`37ee7ea` et `2545065`, l’empreinte de 824 d’entre eux avait déjà changé
-(558 CS, 258 PS, 8 MS) et 978 programmes supplémentaires avaient été
-acceptés. La base de comparaison du correctif est donc de **25 253**
+The 24,275 programs of this reference stay accepted at `2545065`. Between
+`37ee7ea` and `2545065`, the fingerprint of 824 of them had already changed
+(558 CS, 258 PS, 8 MS) and 978 additional programs had been
+accepted. The comparison baseline for the fix is therefore **25,253**
 validations.
 
-## Accès au tas dans deux programmes du pack
+## Heap access in two programs of the pack
 
-Les deux programmes ont été traduits à `7b63628`, pour 32–32 lanes.
-Les opérations ci-dessous sont les appels du module désassemblé avec
-`dxc -dumpbin`. Les deux validateurs ont reçu les mêmes octets émis.
+Both programs were translated at `7b63628`, for 32–32 lanes.
+The operations below are the calls in the module disassembled with
+`dxc -dumpbin`. Both validators received the same emitted bytes.
 
-| Programme (`record/program`) | Opérations et ressource | ShaderFlags DXIL | SFI0 | dxil.dll 1.6 (PC) | dxil.dll 1.9 (L4) |
+| Program (`record/program`) | Operations and resource | DXIL ShaderFlags | SFI0 | dxil.dll 1.6 (PC) | dxil.dll 1.9 (L4) |
 |---|---|---:|---:|---|---|
-| VS de skinning `0x54c00/0` | `createHandleFromHeap` puis `annotateHandle` en `RWStructuredBuffer` de pas 12. Trois `rawBufferStore.i32` sur ce handle, aux offsets 0, 4 et 8. | `0x40100010` | `0x02008000` | Refus PSV0 | Accepté |
-| MS d’ombres de maillage skinné `0x49fec/0` | Neuf `createHandleFromHeap`. Lectures SRV par `rawBufferLoad` et `bufferLoad`. Les écritures `storeVertexOutput` et `emitIndices` portent sur la géométrie. | `0x40000010` | `0x02000000` | Accepté | Accepté |
+| Skinning VS `0x54c00/0` | `createHandleFromHeap` then `annotateHandle` as an `RWStructuredBuffer` with stride 12. Three `rawBufferStore.i32` on this handle, at offsets 0, 4 and 8. | `0x40100010` | `0x02008000` | PSV0 refusal | Accepted |
+| Skinned-mesh shadow MS `0x49fec/0` | Nine `createHandleFromHeap`. SRV reads through `rawBufferLoad` and `bufferLoad`. The `storeVertexOutput` and `emitIndices` writes target geometry. | `0x40000010` | `0x02000000` | Accepted | Accepted |
 
-Sur les 9 181 MS traduits à `7b63628`, les 4 653 empreintes distinctes
-ont été reproduites sur la L4. Leurs modules comptent zéro appel de
-stockage de buffer ou de texture, d’atomique UAV ou de mise à jour de
-compteur UAV. Le VS fournit le cas positif d’écriture par le tas.
+Of the 9,181 MS translated at `7b63628`, the 4,653 distinct fingerprints
+were reproduced on the L4. Their modules contain zero buffer or texture
+store calls, UAV atomics or UAV counter updates. The VS provides the
+positive case of a write through the heap.
 
-Le VS écrit dans un UAV du tas avec le bit 16 des ShaderFlags et le bit
-`0x4` de SFI0 tous deux à zéro. Avec le SDK 22621, le validateur 1.6
-signale uniquement `Pipeline State Validation`. Son assembleur reconstruit
-une partie PSV0 de 288 octets (272 dans la traduction). Remplacer cette
-seule partie fait accepter le VS en 1.6, à DXIL et SFI0 identiques.
-Le témoin réassemblé avec le PSV0 original conserve le refus. La tâche
-précédente avait aussi observé le diagnostic PSV0 en 1.6 pour trois tests
-préexistants et pour les 35 sorties dès la rotation 0.
+The VS writes to a heap UAV with ShaderFlags bit 16 and SFI0 bit
+`0x4` both at zero. With SDK 22621, the 1.6 validator
+reports only `Pipeline State Validation`. Its assembler rebuilds a
+288-byte PSV0 part (272 in the translation). Replacing only this
+part makes 1.6 accept the VS, with identical DXIL and SFI0.
+The control reassembled with the original PSV0 keeps the refusal. The
+previous task had also observed the PSV0 diagnostic in 1.6 for three
+pre-existing tests and for the 35 outputs from rotation 0 onward.
 
-## Contrôle des signatures synthétiques
+## Check of the synthetic signatures
 
-Sur la L4, le relevé du correctif de tri `2d41fc1` est identique octet
-pour octet à celui de son premier parent `a012d2c`. Les deux JSON ont
-pour SHA-256 `32cbc24159467d1091ce0b8f820606cbada02565ed26af02397e7e82eba93c4b`.
-Les 25 768 traductions, dont 25 697 acceptées, conservent leurs empreintes
-et leurs verdicts.
+On the L4, the survey for the sorting fix `2d41fc1` is byte-for-byte
+identical to the one for its first parent `a012d2c`. Both JSON files
+have the SHA-256 `32cbc24159467d1091ce0b8f820606cbada02565ed26af02397e7e82eba93c4b`.
+The 25,768 translations, 25,697 of them accepted, keep their fingerprints
+and verdicts.
 
-Les 11 tests du filtre `validator` passent sur la ferme Windows.
-`IDxcVersionInfo::GetVersion` renvoie 1.9 pour la DLL x64 du SDK 26100.
-Dans les signatures à 35 éléments, les rotations 15 et 16 donnent
-respectivement les indices [0, 1] et [1, 0] pour les deux distances de
-clipping dans ISG1 et OSG1. Le validateur accepte les deux ordres dans
-leurs conteneurs respectifs.
+The 11 tests of the `validator` filter pass on the Windows farm.
+`IDxcVersionInfo::GetVersion` returns 1.9 for the x64 DLL of SDK 26100.
+In the 35-element signatures, rotations 15 and 16 give
+the indices [0, 1] and [1, 0] respectively for the two clipping
+distances in ISG1 and OSG1. The validator accepts both orders in
+their respective containers.
 
-Pour PSG1, le mesh témoin avec un seul `SV_PrimitiveID` passe. En ajouter
-un deuxième dans le même registre permet de tester la permutation des lignes
-de même clé dans le conteneur émis. Le test vérifie leurs deux ordres et
-le refus attendu de la sémantique répétée.
+For PSG1, the control mesh with a single `SV_PrimitiveID` passes. Adding
+a second one in the same register makes it possible to test the permutation
+of same-key rows in the emitted container. The test checks both orders and
+the expected refusal of the repeated semantic.

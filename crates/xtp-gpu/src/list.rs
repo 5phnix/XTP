@@ -151,6 +151,12 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// A host compute pass replaced the title's root signature and pipeline.
+#[cfg(windows)]
+pub(crate) fn forget_host_bindings(this: This) {
+    with_state(this, |_, state| state.forget_host());
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -555,6 +561,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(src, false, false);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            crate::resource::decode::wrote(list, dst);
             crate::texture::gpu_write(list, dst, true);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -647,6 +654,7 @@ extern "system" fn copy_texture_region(
                 source_box,
             )
         {
+            crate::resource::decode::wrote(list, dst.resource);
             return;
         }
         let mut from = src;
@@ -706,6 +714,7 @@ extern "system" fn copy_texture_region(
         }
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
+        crate::resource::decode::wrote(list, dst.resource);
         crate::texture::gpu_write(list, dst.resource, false);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
@@ -1124,6 +1133,7 @@ extern "system" fn resolve(
         list.twin_use(src, false, false);
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
+        crate::resource::decode::wrote(list, dst);
         crate::texture::gpu_write(list, dst, false);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
@@ -1207,6 +1217,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            crate::resource::decode::wrote(list, record.resource);
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -1466,6 +1477,7 @@ fn clear_uav(
                 list.twin_use(texture, true, true);
                 list.twins_written();
                 ensure_state(list, texture, UNORDERED_ACCESS);
+                crate::resource::decode::wrote(list, texture);
                 crate::texture::gpu_write(list, texture, false);
             }
             let rects: &[RECT] = if count > 0 && !rects.is_null() {
@@ -1806,6 +1818,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         ensure_state(list, color, NON_PIXEL_SHADER_RESOURCE);
         ensure_state(list, output, UNORDERED_ACCESS);
+        crate::resource::decode::wrote(list, output);
         crate::texture::gpu_write(list, output, false);
         #[cfg(feature = "diagnostics")]
         {

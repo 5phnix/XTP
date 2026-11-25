@@ -122,7 +122,9 @@ extern "system" fn copy(this: Object, list: Object, dst: u64, src: u64, mode: i3
         compact = mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT.0,
         "copy"
     );
-    copy::original()(this, list, dst, src, mode)
+    copy::original()(this, list, dst, src, mode);
+    // SAFETY: the DLL receives this same live title list.
+    unsafe { xtp_gpu::rt::Builder.copy(list.cast(), dst, src, mode) };
 }
 
 // Une frame est échantillonnée à l'entrée. L'identifiant relie les lignes même si
@@ -191,6 +193,8 @@ impl Call {
                         flags,
                         vertex_format = t.VertexFormat.0,
                         index_format = t.IndexFormat.0,
+                        vertex_address = t.VertexBuffer.StartAddress,
+                        index_address = t.IndexBuffer,
                         vertices = t.VertexCount,
                         indices = t.IndexCount,
                         stride = t.VertexBuffer.StrideInBytes,
@@ -276,7 +280,14 @@ extern "system" fn build(this: Object, list: Object, count: u32, entries: *const
             }
         }
     }
-    build::original()(this, list, count, entries)
+    build::original()(this, list, count, entries);
+    if !entries.is_null() {
+        // SAFETY: the title supplies count live entries and records no intervening list commands.
+        unsafe {
+            let entries = std::slice::from_raw_parts(entries, count as usize);
+            xtp_gpu::rt::Builder.build_batch(list.cast(), entries.iter().map(|entry| &entry.build));
+        }
+    }
 }
 
 extern "system" fn prebuild(
@@ -333,7 +344,22 @@ extern "system" fn rehydrate(
             }
         }
     }
-    rehydrate::original()(this, list, count, descs, cpu)
+    let hr = rehydrate::original()(this, list, count, descs, cpu);
+    if hr >= 0 && !descs.is_null() {
+        let mut recorded = 0;
+        for i in 0..count {
+            // SAFETY: the original call accepted this list and array of count descriptions.
+            recorded +=
+                u32::from(unsafe { xtp_gpu::rt::rehydrate(list.cast(), &*descs.add(i as usize)) });
+        }
+        debug!(
+            count,
+            recorded,
+            unavailable = count - recorded,
+            "rehydrated host BLAS recordings"
+        );
+    }
+    hr
 }
 
 #[cfg(test)]

@@ -643,8 +643,8 @@ fn raw_multidword_transfers_keep_each_in_range_component() {
             for mode in [Mode::Raw, Mode::Table] {
                 let cs = translate(&p, mode).unwrap();
                 if !store && let Some(ir) = super::smem_tests::disassembly(&cs) {
-                    // La table se lit par paires de dwords. Aucun load scalaire
-                    // ne doit apparaître dans ces programmes de lecture vectorielle.
+                    // The table is read in pairs of dwords. No scalar load may
+                    // appear in these vector read programs.
                     let loads: Vec<_> = ir
                         .lines()
                         .filter(|line| {
@@ -664,7 +664,7 @@ fn raw_multidword_transfers_keep_each_in_range_component() {
                         assert_eq!(loads.len(), 1);
                     }
                     eprintln!(
-                        "x{count} {mode:?} : {} octets DXIL, {} lectures, {} handles du tas, {} branches conditionnelles",
+                        "x{count} {mode:?}: {} DXIL bytes, {} reads, {} heap handles, {} conditional branches",
                         cs.dxil.len(),
                         loads.len(),
                         ir.lines()
@@ -753,7 +753,7 @@ fn rebuilt_program(
         0x8008_8c02, // s_add_u32 s8, s2, 12
         0x8209_8003, // s_addc_u32 s9, s3, 0
         0x8809_ff09,
-        word1, // s_or_b32 s9, s9, contrôles du descripteur
+        word1, // s_or_b32 s9, s9, descriptor controls
         0xbe8a_03ff,
         records,
         0xbe8b_03ff,
@@ -786,13 +786,13 @@ fn rebuilt_program(
 #[test]
 fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
     let (_one, hosts) = hosts();
-    // Le stride vient du mot 1 du descripteur reconstruit.
+    // The stride comes from word 1 of the rebuilt descriptor.
     for (oob, stride, records, index, within, scalar, want) in [
         (0, 12, 2, 0, 0, 0, Some(3)),
         (0, 12, 2, 0, 0, 12, Some(6)),
         (0, 12, 2, 0, 12, 0, None),
         (0, 12, 2, 2, 0, 0, None),
-        (0, 6, 2, 0, 4, 0, None), // Deux octets du dword dépassent du record.
+        (0, 6, 2, 0, 4, 0, None), // Two bytes of the dword overrun the record.
         (1, 12, 2, 0, 12, 0, Some(6)),
         (1, 12, 2, 2, 0, 0, None),
         (2, 12, 1, 2, 12, 0, Some(12)),
@@ -801,18 +801,18 @@ fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
         (3, 12, 16, 0, 4, 12, None),
         (3, 12, 14, 0, 0, 12, None),
         (3, 12, 14, 0, 12, 0, None),
-        (3, 0, 20, 0, 8, 8, Some(7)), // Le dernier octet tient exactement.
-        // Vecteurs de docs/buffer_bounds.md, projet de @ubiquitarianism
-        // (GPL-3.0, mesures SHADER-116 et SHADER-341 sur gfx1036/gfx1011).
-        // Source également citée par rminzao : https://github.com/Marvisak/VIctory/pull/2084
+        (3, 0, 20, 0, 8, 8, Some(7)), // The last byte fits exactly.
+        // Vectors from docs/buffer_bounds.md, a project by @ubiquitarianism
+        // (GPL-3.0, measurements SHADER-116 and SHADER-341 on gfx1036/gfx1011).
+        // Source also cited by rminzao: https://github.com/Marvisak/VIctory/pull/2084
         (3, 0, 18, 0, 8, 8, None),
         (3, 16, 18, 0, 8, 8, None),
         (3, 18, 18, 0, 8, 8, None),
-        (3, 16, 18, 4, 0, 0, Some(19)), // Index × stride déplace seulement l'adresse.
+        (3, 16, 18, 4, 0, 0, Some(19)), // Index × stride only moves the address.
         (0, 16, 18, 0, 13, 0, None),
         (0, 16, 18, 0, 12, 0, Some(6)),
     ] {
-        // OFFEN fournit l'offset en octets, comme dans la sonde matérielle.
+        // OFFEN gives the offset in bytes, as in the hardware probe.
         let (op, addr) = if index == 0 {
             (0xe030_1000, 0x1402_0204) // v4 (offset)
         } else {
@@ -893,8 +893,8 @@ fn raw_add_tid_indexes_by_console_lane_with_and_without_idxen() {
 fn raw_rebuilt_vector_and_swizzled_format_respect_the_record_end() {
     let (_one, hosts) = hosts();
     let src = data();
-    // Index 9 : deuxième groupe de 8, lane 1. SOFFSET décale la base
-    // d'un dword après le swizzle. En MTBUF les deux canaux doivent tenir.
+    // Index 9: second group of 8, lane 1. SOFFSET shifts the base by one
+    // dword after the swizzle. In MTBUF both channels must fit.
     for (swizzle, opcode, want) in [
         (false, 0xe038_2000, vec![src[31], src[32], src[33], 0]),
         (true, 0xe038_2000, vec![src[29], src[37], src[45], 0]),
@@ -921,7 +921,7 @@ fn raw_rebuilt_vector_and_swizzled_format_respect_the_record_end() {
                 let out = run(host, &cs, Kind::Raw, false, mode, want.len() as u32);
                 assert_eq!(
                     out[0], want,
-                    "{opcode:x} swizzle={swizzle} {mode:?} sur {name}"
+                    "{opcode:x} swizzle={swizzle} {mode:?} on {name}"
                 );
             }
         }

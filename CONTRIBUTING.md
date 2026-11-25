@@ -6,6 +6,7 @@ follows it is labelled, checked and routed to a reviewer without anyone
 having to ask.
 
 New to the code? Read [docs/dev/START_HERE.md](docs/dev/START_HERE.md) first.
+No PC that runs the title? See [docs/contributing-without-a-gaming-pc.md](docs/contributing-without-a-gaming-pc.md).
 
 Contents: [the rules](#the-rules) ·
 [writing about titles](#writing-about-titles) ·
@@ -205,6 +206,8 @@ Every commit message and every pull request title starts with a header:
   and says why.
 - `fixup!` / `squash!` commits and `Revert "..."` are accepted as git writes
   them; merge commits are not checked.
+- Commit messages, code comments and docs are in English. The check rejects
+  French in a message and in the Rust comments a change adds.
 
 `cargo xtask conventions --title "..."` checks a header; the `commit-msg` hook
 checks each commit; the "PR conventions" check checks the title and every

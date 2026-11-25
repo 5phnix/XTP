@@ -23,6 +23,13 @@ pub(super) const SMALL_STRIDE: Why = "a structured buffer of stride 1 to 3";
 
 /// What the refusal of a buffer read by element with a known stride past 4
 /// but off a multiple of 4 says (watch.md item 318).
+///
+/// With the switches off (a target without the stride table) a program is
+/// refused exactly where 8d503f9 refused it; only the text of these two
+/// refusals differs: 8d503f9 said [`UNKNOWN_STRIDE`] for every stride below
+/// 4 or off a multiple of 4 (Codex review of 244cf78; the text is
+/// `buffer.rs`'s to change, which another task holds): the logs and counts
+/// of refusals name them apart, the outcome is the same.
 pub(super) const ODD_STRIDE: Why = "a structured buffer of stride off a multiple of 4";
 
 /// A runtime stride table entry ([`StrideEntry`]) as a program reads it.
@@ -269,6 +276,24 @@ impl<'a> Lower<'a> {
         sampler: bool,
         marked: bool,
     ) -> Result<V, Why> {
+        // Nested joins can reload the same view on every path. Rebuild its
+        // address from the root table, which dominates the final access.
+        if args.iter().any(|arg| matches!(arg, Source::Phi { .. }))
+            && let Some((param, offset)) = self.common_table_address(args)
+        {
+            let Val::I32(base) = self.user(param, 0) else {
+                return Err("a descriptor outside the heaps");
+            };
+            let delta = self.s.m.i32(offset);
+            let addr = self.s.m.bin(self.cur, Bin::Add, base, delta);
+            let shift = self.s.m.i32(if sampler { 4 } else { 5 });
+            let index = self.s.m.bin(self.cur, Bin::LShr, addr, shift);
+            return Ok(if marked {
+                index
+            } else {
+                self.unmarked(index, sampler)
+            });
+        }
         let mut incoming = Vec::new();
         for (&q, arg) in self.x.p.blocks[block].preds.iter().zip(args) {
             if self.block[q].is_none() {
@@ -287,6 +312,31 @@ impl<'a> Lower<'a> {
         let phi = self.s.m.phi(join, self.s.t.i32);
         self.s.m.set_phi(phi, incoming);
         Ok(phi)
+    }
+
+    /// The byte in the root table shared by every incoming load, if any.
+    fn common_table_address(&self, args: &[Source]) -> Option<(usize, u32)> {
+        let mut common = None;
+        for arg in args {
+            let address = match arg {
+                Source::Loaded { load, first } => {
+                    let a = self.scalar.get(load)?;
+                    if a.dynamic.is_some()
+                        || self.x.native.layout.get(a.param)?.root != RootType::Table
+                    {
+                        return None;
+                    }
+                    (a.param, a.offset.wrapping_add(4 * u32::from(*first)))
+                }
+                Source::Phi { args, .. } => self.common_table_address(args)?,
+                _ => return None,
+            };
+            if common.is_some_and(|prev| prev != address) {
+                return None;
+            }
+            common = Some(address);
+        }
+        common
     }
 
     /// The heap index of a descriptor of two picked by SCC (uniform);
@@ -321,7 +371,7 @@ impl<'a> Lower<'a> {
         let waterfall = |l: &Self, s: &Source| matches!(s, Source::Loaded { load, .. } if l.x.res.waterfall.loads.contains(load));
         match src {
             Source::Loaded { load, first } => Ok((
-                self.marked_heap_index(*load, *first, false)?,
+                self.index_of(*load, *first, false, true)?,
                 waterfall(self, src),
             )),
             Source::Phi { block, args } => {
@@ -350,6 +400,9 @@ impl<'a> Lower<'a> {
     /// host remapped ([`REMAPPED_SLOT`]) below the entries the header
     /// counts, for a title slot below the title slots the host mirrors.
     /// Any other slot reads the header's first entry, which holds no view.
+    /// A remapped slot past its own table's slots is one of those
+    /// ([`Self::within_table`]): the next table's, in the dynamic slots
+    /// after it, is not read.
     pub(super) fn stride_entry(&mut self, src: &Source) -> Result<Entry, Why> {
         let key = match src {
             Source::Loaded { load, first } => Some((self.cur, *load, *first)),
@@ -465,11 +518,11 @@ impl<'a> Lower<'a> {
             Source::Loaded { load, first } => self.index_of(*load, *first, sampler, marked),
             Source::Fetched { load, first } => {
                 let index = self.marked_fetched_index(*load, *first, sampler)?;
-                Ok(if marked {
-                    index
+                if marked {
+                    self.within_table(*load, *first, index)
                 } else {
-                    self.unmarked(index, sampler)
-                })
+                    Ok(self.unmarked(index, sampler))
+                }
             }
             Source::Lanes { mask, args } | Source::Select { scc: mask, args } => {
                 let [a, b] = &args[..] else {
@@ -577,14 +630,79 @@ impl<'a> Lower<'a> {
         self.index_of(load, first, sampler, false)
     }
 
-    /// [`Self::heap_index`], or with `marked` [`Self::marked_heap_index`].
+    /// [`Self::heap_index`], or with `marked` [`Self::marked_heap_index`]
+    /// bounded by its table ([`Self::within_table`]).
     fn index_of(&mut self, load: Site, first: u8, sampler: bool, marked: bool) -> Result<V, Why> {
         let index = self.marked_heap_index(load, first, sampler)?;
-        Ok(if marked {
-            index
+        if marked {
+            self.within_table(load, first, index)
         } else {
-            self.unmarked(index, sampler)
-        })
+            Ok(self.unmarked(index, sampler))
+        }
+    }
+
+    /// `index`, the marked heap index of the descriptor at dword `first` of
+    /// what the load at `load` reads, as the stride table reads it: for a
+    /// table the host remapped ([`REMAPPED_SLOT`] set), a slot past the
+    /// table's own becomes the last marked slot, which no table reaches
+    /// ([`Self::stride_entry`] then reads the header's first entry: no
+    /// view). Codex review of 244cf78, finding 1: bounded by the whole
+    /// table, a descriptor array indexed past its table read the next
+    /// table the host made in the dynamic slots after it (A's third slot,
+    /// of two, was B's first).
+    ///
+    /// The table's slots are those the host makes afresh (`draw.rs`
+    /// `tables`): one per descriptor up to the last its root parameter's
+    /// used-resource entries name, the same entries the program has here.
+    /// The descriptor's place in the table is the load's address less the
+    /// root parameter's (the constant and computed parts the resource
+    /// tracking found): a title table (not marked) is left as it is, its
+    /// slots are the title's.
+    fn within_table(&mut self, load: Site, first: u8, index: V) -> Result<V, Why> {
+        let a = *self
+            .scalar
+            .get(&load)
+            .ok_or("an untracked descriptor load")?;
+        let Some(rp) = self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .filter(|p| p.root == RootType::Table)
+            .copied()
+        else {
+            // The heaps themselves: never remapped.
+            return Ok(index);
+        };
+        let slots = self
+            .x
+            .native
+            .used
+            .iter()
+            .filter(|u| u.root == RootType::Table && u.slot == rp.slot)
+            .map(|u| u.table_offset_dwords / 8 + 1)
+            .max()
+            .unwrap_or(1);
+        let c = self.cur;
+        let constant = self.s.m.i32(a.offset.wrapping_add(4 * u32::from(first)));
+        let bytes = match a.dynamic {
+            Some(v) => {
+                let dynamic = self.i32_of(v)?;
+                self.s.m.bin(c, Bin::Add, dynamic, constant)
+            }
+            None => constant,
+        };
+        let shift = self.s.m.i32(5);
+        let slot = self.s.m.bin(c, Bin::LShr, bytes, shift);
+        let len = self.s.m.i32(slots);
+        let inside = self.s.m.cmp(c, pred::IULT, slot, len);
+        let mark = self.s.m.i32(REMAPPED_SLOT);
+        let marked = self.s.m.bin(c, Bin::And, index, mark);
+        let zero = self.s.m.i32(0);
+        let title = self.s.m.cmp(c, pred::EQ, marked, zero);
+        let kept = self.s.m.bin(c, Bin::Or, title, inside);
+        let nowhere = self.s.m.i32(REMAPPED_SLOT | (REMAPPED_SLOT - 1));
+        Ok(self.s.m.select(c, kept, index, nowhere))
     }
 
     /// `index` without [`REMAPPED_SLOT`], in the current block, on a target

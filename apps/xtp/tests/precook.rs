@@ -214,6 +214,14 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
         return;
     };
     let out = &first.out;
+    for phase in ["translation  ", "compute PSOs ", "library save "] {
+        let seconds = out
+            .lines()
+            .find_map(|line| line.strip_prefix(phase))
+            .and_then(|time| time.split_once(" s"))
+            .and_then(|(seconds, _)| seconds.parse::<f64>().ok());
+        assert!(seconds.is_some_and(|s| s >= 0.0), "{phase}\n{out}");
+    }
     assert!(
         out.contains("containers   2 in 3 records (1 repeated)"),
         "{out}\n{}",
@@ -243,7 +251,7 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
         listed.contains("refused: malformed shader: no DXIL part"),
         "{listed}"
     );
-    let library = pipelines.join("host-pipelines.bin").is_file();
+    assert!(pipelines.join("host-pipelines.bin").is_file(), "{out}");
     let kept = std::fs::read_to_string(pipelines.join("early-pipelines.txt")).unwrap();
     let mut kept: Vec<&str> = kept.lines().collect();
     kept.sort();
@@ -262,12 +270,10 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     assert_eq!(figure(out, "translated"), Some(0), "{out}");
     assert_eq!(figure(out, "from cache"), Some(1), "{out}");
     assert_eq!(figure(out, "refused"), Some(1), "the refusal, kept: {out}");
-    if library {
-        assert!(
-            out.contains("1 programs: 0 host pipelines made, 1 from the library"),
-            "{out}"
-        );
-    }
+    assert!(
+        out.contains("1 programs: 0 host pipelines made, 1 from the library"),
+        "{out}"
+    );
 
     // Another build of the same translator.
     let other = dir.path().join("xtp-other.exe");
@@ -311,30 +317,45 @@ fn precook_keeps_pipelines_across_translation_keys() {
     write_pack(64);
     let Some(first) = run("128") else { return };
     assert_eq!(figure(&first.out, "translated"), Some(2), "{}", first.out);
-    let library = dir
-        .path()
-        .join("cache/pipelines/host-pipelines.bin")
-        .is_file();
+    let library = dir.path().join("cache/pipelines/host-pipelines.bin");
+    assert!(library.is_file(), "{}", first.out);
 
     write_pack(128);
     let changed = run("256").unwrap().out;
     assert_eq!(figure(&changed, "translated"), Some(2), "{changed}");
     assert!(!changed.contains("a new generation"), "{changed}");
-    if library {
-        assert!(
-            changed.contains("1 host pipelines made, 1 from the library"),
-            "{changed}"
-        );
-    }
+    assert!(
+        changed.contains("1 host pipelines made, 1 from the library"),
+        "{changed}"
+    );
 
     // The replaced pipeline is still available to a session using the old build.
     write_pack(64);
     let original = run("128").unwrap().out;
     assert_eq!(figure(&original, "from cache"), Some(2), "{original}");
-    if library {
-        assert!(
-            original.contains("0 host pipelines made, 2 from the library"),
-            "{original}"
-        );
-    }
+    assert!(
+        original.contains("0 host pipelines made, 2 from the library"),
+        "{original}"
+    );
+
+    // A driver-rejected file is replaced with a usable library.
+    std::fs::write(library, b"invalid pipeline library").unwrap();
+    let repaired = run("128").unwrap().out;
+    assert!(
+        repaired.contains("2 host pipelines made, 0 from the library"),
+        "{repaired}"
+    );
+    let forced = precook_with_settings(
+        xtp,
+        dir.path(),
+        &path,
+        &["--force"],
+        &[("XTP_SHADER_LOOP_LIMIT", "128")],
+    )
+    .unwrap()
+    .out;
+    assert!(
+        forced.contains("0 host pipelines made, 2 from the library"),
+        "{forced}"
+    );
 }

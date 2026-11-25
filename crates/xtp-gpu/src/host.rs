@@ -800,6 +800,7 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    pub(crate) rt_scratch: Mutex<Option<ID3D12Resource>>,
     pub(crate) query_resolves: crate::query::Resolves,
     /// Swapped for a fresh one when the list is reset while it runs.
     allocator: Mutex<ID3D12CommandAllocator>,
@@ -831,6 +832,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
+    pub(crate) decode_uses: Mutex<crate::resource::decode::Uses>,
+    pub(crate) decode_pipeline: std::sync::atomic::AtomicBool,
     pub(crate) clamps: Mutex<crate::indirect::Runs>,
     /// The host fence value of its last submission (0: none): it is not
     /// dropped before that one has finished.
@@ -868,6 +871,9 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// next recording afresh without taking them from it.
 #[derive(Clone, Default)]
 struct Recorded {
+    rt_sizes: std::sync::Arc<Vec<crate::rt::compaction::CompactedSize>>,
+    #[cfg(feature = "diagnostics")]
+    rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
     #[cfg(feature = "diagnostics")]
     dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
@@ -1044,11 +1050,17 @@ impl Drop for DynamicLease {
     }
 }
 
+/// Work a list runs as it closes ([`HostList::at_close`]).
+type Closing = Box<dyn FnOnce(&HostList) + Send>;
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    rt_sizes: std::sync::Arc<Vec<crate::rt::compaction::CompactedSize>>,
+    #[cfg(feature = "diagnostics")]
+    rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
     #[cfg(feature = "diagnostics")]
     dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     /// What the list's draws read and its dispatches wrote, in recorded
@@ -1064,11 +1076,20 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Immutable BLAS generations referenced by TLAS builds and traces on this recording.
+    rt_maps: Vec<std::sync::Arc<crate::rt::BlasMap>>,
+    rt_recording: Option<std::sync::Arc<()>>,
+    rt_size_page: crate::rt::compaction::SizePage,
+    rt_results: Vec<std::sync::Arc<ID3D12Resource>>,
     /// Dynamic descriptor slots leased by this recording.
     dynamic: Vec<DynamicLease>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Times `refreshed` was emptied ([`HostList::refresh_epoch`]).
+    refresh_epoch: u64,
+    /// Work the list runs as it closes ([`HostList::at_close`]).
+    closing: Vec<Closing>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1281,6 +1302,7 @@ impl Host {
                 format!("xtp host prelude {:#x}", prelude.as_raw() as usize)
             });
             Ok(HostList {
+                rt_scratch: Mutex::default(),
                 allocator: Mutex::new(allocator),
                 bounds_list: if self.depth_bounds {
                     Some(list.cast()?)
@@ -1298,6 +1320,8 @@ impl Host {
                 writer: AtomicU64::new(0),
                 buffer_writes: AtomicU64::new(0),
                 budget: Mutex::default(),
+                decode_uses: Mutex::default(),
+                decode_pipeline: Default::default(),
                 clamps: Mutex::default(),
                 last: AtomicU64::new(0),
                 fresh_after: AtomicU64::new(0),
@@ -1549,6 +1573,9 @@ impl Host {
         let reached = unsafe { self.fence.GetCompletedValue() };
         let seen = std::time::Instant::now();
         self.timeline.finish(reached, |p| self.complete(p, seen));
+        // Raw views of the stride tables that the fence has reached go
+        // back to their pools now, however long their heap stays unused.
+        crate::descriptor::host::fence_reached();
     }
 
     /// Finishes every submission up to the one that signals `value`,
@@ -1777,6 +1804,9 @@ impl Host {
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             self.removed(Some(&p));
         }
+        for size in p.recorded.iter().flat_map(|r| r.rt_sizes.iter()) {
+            size.complete();
+        }
         // About how long it ran: from its submission or the end of the one
         // before, whichever is later, until it was seen done.
         let ran = {
@@ -1805,6 +1835,10 @@ impl Host {
         // same big ranges dozens of times).
         #[cfg(feature = "diagnostics")]
         for sample in p.recorded.iter().flat_map(|r| r.dispatch_samples.iter()) {
+            sample.report();
+        }
+        #[cfg(feature = "diagnostics")]
+        for sample in p.recorded.iter().flat_map(|r| r.rt_samples.iter()) {
             sample.report();
         }
         // `XTP_MESH_STATS`: what the draws read, as the GPU left it.
@@ -2137,6 +2171,11 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // What the recording asked to run as it closes ([`HostList::at_close`]).
+        let closing = std::mem::take(&mut self.deferred().closing);
+        for work in closing {
+            work(self);
+        }
         // Depth textures whose twins the list wrote last get what was
         // written (`twins`).
         self.twins_to_depth();
@@ -2242,6 +2281,11 @@ impl HostList {
             }
             allocator.clone()
         };
+        self.decode_uses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.decode_pipeline.store(false, Ordering::Relaxed);
         *self.clamps.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // New ones: a submission in flight keeps its own (`Recorded`).
@@ -2397,7 +2441,13 @@ impl HostList {
             let deferred = self.deferred();
             (deferred.dispatch_samples.clone(), deferred.meshes.clone())
         };
+        #[cfg(feature = "diagnostics")]
+        let rt_samples = self.deferred().rt_samples.clone();
+        let rt_sizes = self.deferred().rt_sizes.clone();
         Recorded {
+            rt_sizes,
+            #[cfg(feature = "diagnostics")]
+            rt_samples,
             #[cfg(feature = "diagnostics")]
             dispatch_samples,
             pipelines: self
@@ -2410,6 +2460,11 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             meshes,
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn rt_sample(&self, sample: crate::rt::probe::Sample) {
+        std::sync::Arc::make_mut(&mut self.deferred().rt_samples).push(sample);
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2442,6 +2497,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.refresh_epoch += 1;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2465,6 +2521,19 @@ impl HostList {
             return;
         }
         deferred.copies.push(Step::Fill(dst, src, len));
+    }
+
+    /// Counts the title copies after which [`HostList::defer_refresh`]
+    /// refreshes a range again: a caller that refreshed what it reads at
+    /// one count has nothing to refresh again while it holds.
+    pub(crate) fn refresh_epoch(&self) -> u64 {
+        self.deferred().refresh_epoch
+    }
+
+    /// Runs `work` as the list closes (before its commands end), in the
+    /// order given; dropped with the recording if it never closes.
+    pub(crate) fn at_close(&self, work: impl FnOnce(&HostList) + Send + 'static) {
+        self.deferred().closing.push(Box::new(work));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2673,6 +2742,28 @@ impl HostList {
         }
     }
 
+    pub(crate) fn rt_recording(&self) -> std::sync::Arc<()> {
+        self.deferred()
+            .rt_recording
+            .get_or_insert_with(Default::default)
+            .clone()
+    }
+
+    pub(crate) fn rt_compacted_size(&self) -> Option<(u64, crate::rt::compaction::CompactedSize)> {
+        let mut deferred = self.deferred();
+        let (address, slot) = deferred.rt_size_page.reserve()?;
+        std::sync::Arc::make_mut(&mut deferred.rt_sizes).push(slot.clone());
+        Some((address, slot))
+    }
+
+    pub(crate) fn keep_rt_result(&self, result: &std::sync::Arc<ID3D12Resource>) {
+        self.deferred().rt_results.push(result.clone());
+    }
+
+    pub(crate) fn keep_rt_map(&self, map: &std::sync::Arc<crate::rt::BlasMap>) {
+        self.deferred().rt_maps.push(map.clone());
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -2700,6 +2791,7 @@ impl HostList {
             .copies
             .push(Step::Run(Box::new(work), writes, reads));
         deferred.refreshed.clear();
+        deferred.refresh_epoch += 1;
     }
 
     /// As [`HostList::defer`], for work that writes only host memory (and

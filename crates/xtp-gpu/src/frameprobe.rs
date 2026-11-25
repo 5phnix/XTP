@@ -39,17 +39,9 @@
 //!
 //! Every listed frame also gets the R9G9B9E5 timeline (upstream watch item
 //! 360): each texture an op reads through a table in title format 67 (an
-//! R9G9B9E5 view, which the host keeps as an RGBA16F stand-in that
-//! `resource::decode_now` fills on the GPU, in a list of XTP's own run
-//! at the start of the next title submission), each texture an op writes
-//! through unordered access at the same title address, and the title
-//! submissions with their lists in order. The report names, per R9G9B9E5
-//! texture, the submission whose start runs its decoding (the first after
-//! the frame's first read of it) and the submissions of its writers.
-//!
-//! shortcut: the decoding is inferred from where the first read stands
-//! (`resource::decode_now` is not told about), so a texture whose
-//! decoding could not be made is reported as decoded too.
+//! R9G9B9E5 view), and each UAV write at the same address.
+//! Each decode command counts the submissions in which its predicate
+//! allowed the conversion to run.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -219,6 +211,7 @@ struct Frame {
     matched: usize,
     ops: Vec<Op>,
     textures: Vec<TextureUse>,
+    decodings: Vec<(u64, usize, u64, std::sync::Arc<AtomicU64>)>,
     readback: Option<ID3D12Resource>,
     used: u64,
     /// Title submissions made while it was recorded or ran: number, lists.
@@ -277,6 +270,7 @@ fn frame_mut(frames: &mut Vec<Frame>, frame: u64) -> &mut Frame {
         matched: 0,
         ops: Vec::new(),
         textures: Vec::new(),
+        decodings: Vec::new(),
         readback: None,
         used: 0,
         submissions: Vec::new(),
@@ -705,6 +699,21 @@ pub(crate) fn texture(list: &HostList, resource: This, write: bool) {
     frame_mut(&mut frames(), frame).textures.push(use_);
 }
 
+/// Counts submissions that enable this command's predicate. The list can be
+/// discarded or submitted again.
+pub(crate) fn decoding(list: &HostList, resource: This) -> Option<std::sync::Arc<AtomicU64>> {
+    let frame = recording()?;
+    let (address, _) = crate::resource::texture_memory(resource)?;
+    let count = std::sync::Arc::new(AtomicU64::new(0));
+    frame_mut(&mut frames(), frame).decodings.push((
+        address as u64,
+        key(list),
+        SUBMISSIONS.load(Ordering::Relaxed),
+        count.clone(),
+    ));
+    Some(count)
+}
+
 /// `Host::submit`: a title submission of `runs`, in order, before its
 /// refreshes. Takes the probed ranges' title memory for the ops of these
 /// lists, and reports the frames presented since, once what was submitted
@@ -903,51 +912,39 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
             "texture {:#x} (title format {}, {}):",
             t.address, t.title_format, t.host
         );
-        let decoded = t.after + 1;
         let _ = writeln!(
             out,
-            "  first read by {} in {}: its decoding runs at the start of submission {decoded}",
+            "  first read by {} in {}",
             t.program,
             list_name(t.list, t.after),
         );
         // Each program and list once, with how many uses.
         let mut uses: Vec<(bool, &str, usize, u64, u32, usize)> = Vec::new();
         for u in f.textures.iter().filter(|u| u.address == t.address) {
-            let sub = submission_of(f, u.list, u.after).unwrap_or(0);
             match uses
                 .iter_mut()
-                .find(|x| x.0 == u.write && x.1 == u.program && x.2 == u.list)
+                .find(|x| x.0 == u.write && x.1 == u.program && x.2 == u.list && x.3 == u.after)
             {
                 Some(x) => x.5 += 1,
-                None => uses.push((u.write, &u.program, u.list, sub, u.title_format, 1)),
+                None => uses.push((u.write, &u.program, u.list, u.after, u.title_format, 1)),
             }
         }
-        for &(write, program, list, _, format, n) in &uses {
+        for &(write, program, list, after, format, n) in &uses {
             let _ = writeln!(
                 out,
                 "  {} by {program} in {} ({n} uses, title format {format})",
                 if write { "written" } else { "read" },
-                list_name(list, 0)
+                list_name(list, after)
             );
         }
-        let late: Vec<u64> = uses
-            .iter()
-            .filter(|x| x.0 && x.3 >= decoded)
-            .map(|x| x.3)
-            .collect();
-        let _ = writeln!(
-            out,
-            "  => {}",
-            if !uses.iter().any(|x| x.0) {
-                "no unordered-access writer at this address in the frame's tables".to_owned()
-            } else if late.is_empty() {
-                "every writer's list ran before the decoding".to_owned()
-            } else {
-                format!(
-                    "the decoding runs before writers in submissions {late:?}: their texels show a frame later"
-                )
-            }
-        );
+        for (_, list, after, count) in f.decodings.iter().filter(|d| d.0 == t.address) {
+            let _ = writeln!(
+                out,
+                "  decode in {}: {} executions",
+                list_name(*list, *after),
+                count.load(Ordering::Relaxed)
+            );
+        }
     }
     let _ = writeln!(out, "\n== Title submissions");
     for (n, lists) in &f.submissions {

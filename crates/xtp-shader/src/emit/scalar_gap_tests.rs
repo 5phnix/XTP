@@ -1,6 +1,6 @@
 use super::valu_tests::{build_valu_cs_with_mode, run_cases};
 
-// v_cvt_f32_f64 v0, v[1:2] ; les deux mots viennent des constantes racines.
+// v_cvt_f32_f64 v0, v[1:2]; both words come from the root constants.
 const CVT: u32 = 0x7e00_1f01;
 
 fn check(body: &[u32], mode: u8, cases: &[(u64, u32)]) {
@@ -46,11 +46,11 @@ fn double_to_float_exact_bits() {
 
 #[test]
 fn double_literal_and_source_modifiers() {
-    // Le littéral fournit le mot haut. La constante flottante intégrée
-    // utilise directement sa représentation en double précision.
+    // The literal gives the high word. The inline float constant uses its
+    // double-precision representation directly.
     check(&[0x7e00_1eff, 0x400c_0000], 0xf0, &[(0, 3.5f32.to_bits())]);
     check(&[0x7e00_1ef8], 0xf0, &[(0, 0x3e22_f983)]);
-    // VOP3, -abs(s[0:1]) ; la négation agit aussi sur le zéro signé.
+    // VOP3, -abs(s[0:1]); the negation also acts on the signed zero.
     check(
         &[0xd58f_0100, 0x2000_0000],
         0xf0,
@@ -60,7 +60,7 @@ fn double_literal_and_source_modifiers() {
 
 #[test]
 fn double_to_float_obeys_mode_writes() {
-    // Arrondi vers +∞ puis conservation des dénormalisés de sortie f32.
+    // Round toward +∞, then keep the f32 output denormals.
     check(
         &[0xbfa4_0001, 0xbfa5_000f, CVT],
         0,
@@ -71,7 +71,7 @@ fn double_to_float_obeys_mode_writes() {
             (0xffef_ffff_ffff_ffff, 0xff7f_ffff),
         ],
     );
-    // MODE[1:0] = 2, écrit par littéral. Les sorties dénormalisées restent à zéro.
+    // MODE[1:0] = 2, written by a literal. Denormal outputs stay flushed to zero.
     check(
         &[0xba80_0801, 2, CVT],
         0xc0,
@@ -82,14 +82,14 @@ fn double_to_float_obeys_mode_writes() {
         ],
     );
     check(&[CVT], 0x23, &[(0x7fef_ffff_ffff_ffff, 0x7f7f_ffff)]);
-    // Même en arrondi vers +∞, une entrée f64 dénormalisée ramenée à zéro reste nulle.
+    // Even when rounding toward +∞, a denormal f64 input flushed to zero stays zero.
     check(&[CVT], 0x21, &[(1, 0)]);
 }
 
 #[test]
 fn getpc_read_as_data() {
-    // Le préambule fait sept mots. On écrit d’abord les deux destinations
-    // pour détecter aussi bien un mot conservé qu’un PC décalé de quatre octets.
+    // The preamble is seven words long. Both destinations are written first,
+    // to catch a kept word as well as a PC shifted by four bytes.
     for (source, expected) in [(6, 40), (7, 0)] {
         check(
             &[0xbe86_03c1, 0xbe87_03c1, 0xbe86_1f00, 0x7e00_0200 | source],
@@ -101,8 +101,8 @@ fn getpc_read_as_data() {
 
 #[test]
 fn conversion_uses_the_mode_at_a_control_flow_join() {
-    // Si s2 est nul, on garde MODE à l’entrée. Sinon s2 remplace
-    // les deux bits d’arrondi, puis les deux chemins rejoignent la conversion.
+    // If s2 is zero, MODE at entry is kept. Otherwise s2 replaces the two
+    // rounding bits, then both paths join at the conversion.
     let shader = build_valu_cs_with_mode(&[0xbf06_8002, 0xbf85_0001, 0xb982_0801, CVT], 0xf0);
     let cases = [
         [0x1000_0000, 0x3ff0_0000, 0, 0],

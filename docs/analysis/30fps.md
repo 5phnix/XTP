@@ -552,3 +552,71 @@ across protection changes.**
     have.
   - A second session with the sampler, to tell whether it caused A's stop.
   - GPU timestamps with the 3D on (N6).
+
+## 11. N4 — write journal and GUARDS contention in the Series S world
+
+The baseline (`760a4ac`) adds the contention counter to `6f3d435`.
+The candidate (`bd5ab9c`) reads page generations from an atomic table,
+limits root SRV refreshes to their accessible ranges and keeps disjoint
+intervals in `Batch`. The comparison measures these changes together.
+
+The L4 requests were withdrawn while waiting for the shared VM. The
+measurements use the PC in §1 and its FIFO game-session queue. From each
+revision's worktree, build the diagnostics executable and enqueue the
+session (use `n4-new` for the candidate).
+
+```powershell
+& E:\xtp-data\tools\cargo-slot.ps1 build --profile diag -p xtp --features diagnostics --locked
+& E:\tools\stall-probe\queue-session.ps1 -Name n4-ref -Worktree (Get-Location).Path `
+    -Measure 60 -Limit 300 -EnvPairs 'XTP_SKIP_INTRO=1;XTP_FRAME_LINE=5;XTP_WATCHDOG_HOOK=1;XTP_RAW_STRUCTURED=1'
+```
+
+Each window starts when line 22 of `gameplay.txt` confirms that the
+golden save has loaded into the world. Keep the frame reports timestamped
+in the next 60 seconds with at least 100 draws/frame. The meter updates
+on a present after at least a second has elapsed. It prints one such
+sample about every five seconds. Each retained report has equal weight.
+
+Both targets are **5 ms/frame**. The `guards and write watch per frame`
+line measures preparation time in `watch::writes`. The calling phase
+accounts for atomic journal reads during copies. The `GUARDS contention
+outside preparation per frame` line sums time spent acquiring a busy
+mutex and time spent in fault-handler branches that encountered the busy
+mutex, across threads outside preparation.
+
+### Matched 60-second windows on the PC
+
+Times are UTC on 2026-11-25. The frame logs are under
+`E:\xtp-data\cache\play\<run>\run.log`. The corresponding
+`E:\xtp-data\runs\stall-n4-{ref,new}` folders hold the environment,
+session times and title exit status. Total PC CPU utilization was
+sampled every five seconds during gameplay.
+
+| Revision | Run | World window (UTC) | Kept / reported | Draws/frame, median (min–max) | Total CPU, median (min–max) |
+| --- | --- | --- | ---: | ---: | ---: |
+| Reference `760a4ac` | `20261125-104834` | 10:49:11.445–10:50:11.445 | 11/11 | 2,768 (585–4,143) | 41.7% (20.7–72.5%) |
+| Candidate `bd5ab9c` | `20261125-105221` | 10:52:53.752–10:53:53.752 | 11/11 | 2,889 (261–3,557) | 44.2% (28.3–75.6%) |
+
+| Counter (ms/frame) | Reference median (min–max) | Candidate median (min–max) | Change in median | Candidate over 5 ms | Samples ≤5 ms, ref → new |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Guards and write watch in preparation | 16.613 (9.266–21.541) | 11.926 (6.512–17.186) | −4.687 | +6.926 | 0/11 → 0/11 |
+| GUARDS contention outside preparation | 10.129 (2.413–36.383) | 9.376 (2.895–23.596) | −0.753 | +4.376 | 2/11 → 2/11 |
+
+The candidate exceeds both targets. Preparation fell 28% by median.
+The 7% drop in median contention is small compared with the spread
+within each session. The runs used the same translator cache key
+(`923a98d358489409`). The reference precook populated the cache and the
+candidate found it up to date before entering the game. Both runs
+exited normally after the full window. The first and last retained
+reports fell at +3.373 and +58.475 s for the reference, +2.192 and
++57.266 s for the candidate. The runs sample different frames of the
+same save and provide one before/after pair.
+
+The separate copy-statistics line counted a median of 1,769 protection
+changes per frame on the reference and 1,657 on the candidate. It averages
+over all frames since the previous printed report and gives a count across
+sites. The time spent changing protections under `GUARDS` in `protect`,
+`protect_other_views`, `title_virtual_protect` and `readmap::Owners`
+remains unmeasured. The queued
+profiling run was withdrawn before it started to free the PC for lighting
+measurements.

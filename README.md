@@ -207,6 +207,8 @@ maps the code and lists good first issues. Before opening a pull request, run
 cargo xtask pr-check     # what CI checks, with a summary
 ```
 
+No PC that runs the title? [docs/contributing-without-a-gaming-pc.md](docs/contributing-without-a-gaming-pc.md) lists work that needs no GPU.
+
 Report vulnerabilities privately as [SECURITY.md](SECURITY.md) describes.
 Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
