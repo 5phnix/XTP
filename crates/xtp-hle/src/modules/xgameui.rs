@@ -1,11 +1,13 @@
 //! System dialogs a title opens (XGameUi). A profile card has nothing to
-//! show and closes at once. Text entry, message dialogs and error dialogs
-//! open a small host dialog on a thread of their own and complete the async
-//! call with the user's answer, or as cancelled (`E_ABORT`) when the dialog
-//! cannot open. When `XTP_DIALOGS=auto` (or [`set_auto_dismiss`] in
+//! show and closes at once. Text entry opens a small host dialog on a thread
+//! of its own and completes with what the user typed, or `E_ABORT` on
+//! Cancel/Esc or when it cannot open. Message and error dialogs likewise run
+//! on a worker thread: Esc and the close box on a message dialog complete with
+//! `S_OK` and `cancel_button`, while `E_ABORT` is returned when no window can
+//! be opened. When `XTP_DIALOGS=auto` (or [`set_auto_dismiss`] in
 //! unattended/autopilot runs) is enabled, message dialogs complete immediately
 //! with `cancel_button` (`S_OK`) and error dialogs complete immediately with
-//! `S_OK` without opening a window.
+//! `S_OK` without opening a window (text entry is unaffected).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -34,7 +36,8 @@ pub const IID_2026: Guid = Guid::new(
 pub static OBJECT: Object = Object::new("game ui", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, IID_2026, &OBJECT)];
 
-/// Environment variable that auto-dismisses modal dialogs when set to `auto`.
+/// Environment variable that auto-dismisses message and error dialogs when set
+/// to `auto` (does not affect text entry).
 pub const DIALOGS_ENV: &str = "XTP_DIALOGS";
 
 /// `E_INVALIDARG` (`0x80070057`).
@@ -350,12 +353,42 @@ mod dialog {
     use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, DLGTEMPLATE};
 
     const EDIT: i32 = 100;
-    const BTN_BASE: i32 = 200;
+    pub(super) const BTN_BASE: i32 = 200;
     // Static control style: do not interpret '&' as a mnemonic prefix.
     const SS_NOPREFIX: u32 = 0x0080;
     // Edit control messages (the controls headers).
     const EM_SETSEL: u32 = 0xb1;
     const EM_LIMITTEXT: u32 = 0xc5;
+
+    /// Pick the control ID that should receive initial focus: `default_button`
+    /// if present among `button_ids`, otherwise the first visible button.
+    pub(super) fn focus_button_id(button_ids: &[u32], default_button: u32) -> i32 {
+        let target = if button_ids.contains(&default_button) {
+            default_button
+        } else {
+            button_ids.first().copied().unwrap_or(0)
+        };
+        BTN_BASE + target as i32
+    }
+
+    /// Map a `WM_COMMAND` control ID to the chosen `XGameUiMessageDialogButton`
+    /// enum value (`IDCANCEL` -> `cancel_button`, `BTN_BASE + v` -> `v` if visible).
+    pub(super) fn command_to_button(
+        id: i32,
+        button_ids: &[u32],
+        cancel_button: u32,
+    ) -> Option<u32> {
+        if id == wm::IDCANCEL {
+            return Some(cancel_button);
+        }
+        if id >= BTN_BASE {
+            let value = (id - BTN_BASE) as u32;
+            if button_ids.contains(&value) {
+                return Some(value);
+            }
+        }
+        None
+    }
 
     struct MessageState {
         chosen: Option<u32>,
@@ -467,12 +500,10 @@ mod dialog {
                 wm::WM_INITDIALOG => {
                     wm::SetWindowLongPtrW(dialog, wm::GWLP_USERDATA, lparam);
                     let state = &*(lparam as *const MessageState);
-                    let target = if state.button_ids.contains(&state.default_button) {
-                        state.default_button
-                    } else {
-                        state.button_ids.first().copied().unwrap_or(0)
-                    };
-                    let btn = wm::GetDlgItem(dialog, BTN_BASE + target as i32);
+                    let btn = wm::GetDlgItem(
+                        dialog,
+                        focus_button_id(&state.button_ids, state.default_button),
+                    );
                     if !btn.is_null() {
                         SetFocus(btn);
                         0 // focus explicitly set on the default button
@@ -484,18 +515,12 @@ mod dialog {
                     let state = &mut *(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA)
                         as *mut MessageState);
                     let id = (wparam & 0xffff) as i32;
-                    if id == wm::IDCANCEL {
-                        state.chosen = Some(state.cancel_button);
+                    if let Some(choice) =
+                        command_to_button(id, &state.button_ids, state.cancel_button)
+                    {
+                        state.chosen = Some(choice);
                         wm::EndDialog(dialog, 1);
                         return 1;
-                    }
-                    if id >= BTN_BASE {
-                        let value = (id - BTN_BASE) as u32;
-                        if state.button_ids.contains(&value) {
-                            state.chosen = Some(value);
-                            wm::EndDialog(dialog, 1);
-                            return 1;
-                        }
                     }
                     0
                 }
@@ -953,5 +978,42 @@ mod tests {
         assert_eq!(show(this, &mut b, E_ABORT, std::ptr::null()), S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), E_ABORT);
         assert_eq!(result(this, &mut b), E_ABORT);
+    }
+
+    #[test]
+    fn message_proc_helpers_map_focus_esc_and_gapped_buttons() {
+        let gapped = [BUTTON_FIRST, BUTTON_THIRD];
+        // Default button present -> focused directly.
+        assert_eq!(
+            dialog::focus_button_id(&gapped, BUTTON_THIRD),
+            dialog::BTN_BASE + BUTTON_THIRD as i32
+        );
+        // Missing default button -> falls back to first visible button.
+        assert_eq!(
+            dialog::focus_button_id(&gapped, BUTTON_SECOND),
+            dialog::BTN_BASE + BUTTON_FIRST as i32
+        );
+        // Esc (IDCANCEL = 2) -> cancel_button.
+        assert_eq!(
+            dialog::command_to_button(2, &gapped, BUTTON_THIRD),
+            Some(BUTTON_THIRD)
+        );
+        // Visible gapped button keeps its enum value; absent button ignored.
+        assert_eq!(
+            dialog::command_to_button(
+                dialog::BTN_BASE + BUTTON_THIRD as i32,
+                &gapped,
+                BUTTON_FIRST
+            ),
+            Some(BUTTON_THIRD)
+        );
+        assert_eq!(
+            dialog::command_to_button(
+                dialog::BTN_BASE + BUTTON_SECOND as i32,
+                &gapped,
+                BUTTON_FIRST
+            ),
+            None
+        );
     }
 }

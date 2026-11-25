@@ -358,7 +358,7 @@ shows the title calls them.
   presses, focus loss resets everything.
 - **Depends on:** I1.
 
-### R5. Message and error dialogs — M
+### R5. Message and error dialogs — M (done)
 - **Goal:** `XGameUiShowMessageDialogAsync`/`Result` and
   `XGameUiShowErrorDialogAsync`/`Result` as host task dialogs on a thread of
   their own (like text entry), returning the chosen button; cancel → the
@@ -509,7 +509,7 @@ shows the title calls them.
 | 7 | R3 waiters, XThread | S | (R1) |
 | 8 | A1 Opus check | S | — |
 | 9 | I2 mouse as right stick | M | I1 |
-| 10 | R5 message/error dialogs | M | (R1) |
+| 10 | R5 message/error dialogs (done) | M | (R1) |
 | 11 | R10 relaunch, restart on crash | S | — |
 | 12 | R7 closed captions, high contrast (done) | S | — |
 | 13 | R6 speech synthesis (done) | M | — |
