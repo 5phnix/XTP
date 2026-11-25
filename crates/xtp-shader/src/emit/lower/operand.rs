@@ -3,7 +3,7 @@
 //! to registers under their lane guards.
 
 use super::{Lower, Val, Why};
-use crate::emit::bitcode::{Bin, Cast, Term, V};
+use crate::emit::bitcode::{Bin, Cast, V};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Reg, Value};
@@ -421,7 +421,7 @@ impl<'a> Lower<'a> {
     pub(super) fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
         let g = guard?;
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
-        self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
+        self.s.m.guard_branch(self.cur, g, then, join);
         let head = self.cur;
         self.cur = then;
         Some((head, join))
@@ -433,15 +433,15 @@ impl<'a> Lower<'a> {
             return values.iter().map(|v| v.0).collect();
         };
         let then = self.cur;
-        self.s.m.terminate(then, Term::Br(join));
+        self.s.m.guard_end(then, join);
         self.cur = join;
         values
             .iter()
             .map(|&(inside, outside)| {
                 let ty = self.s.m.type_of(inside);
-                let phi = self.s.m.phi(join, ty);
-                self.s.m.set_phi(phi, vec![(inside, then), (outside, head)]);
-                phi
+                self.s
+                    .m
+                    .guard_phi(join, ty, (inside, then), (outside, head))
             })
             .collect()
     }

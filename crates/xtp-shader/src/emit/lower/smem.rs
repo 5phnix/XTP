@@ -10,7 +10,7 @@ use super::{Lower, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, V, pred};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Reg, Value};
-use crate::native::ResourceType;
+use crate::native::{ResourceType, UsedResource};
 use crate::resource::{Address, CODE, Role, Site, Source};
 
 /// What a descriptor dword with no host value (an address, a format,
@@ -206,7 +206,9 @@ impl<'a> Lower<'a> {
     /// rebuilt from the host view's dimensions in the GFX10 layout (image
     /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
     /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
-    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
+    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count:
+    /// elements of a structured or typed view, bytes of a raw one, as
+    /// [`Self::record_count_view`] asks for them).
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
@@ -258,7 +260,8 @@ impl<'a> Lower<'a> {
         };
         let use_at =
             uses(&|load| load == site).or_else(|| uses(&|load| self.twin_loads(site, load)));
-        let (first, src, props, image, uav) = match use_at {
+        // `per`: the stride the size is divided by (see `record_count_view`).
+        let (first, src, props, image, uav, per) = match use_at {
             Some((at, first)) => {
                 let src = Source::Loaded { load: site, first };
                 let used = self.used_kind(&src);
@@ -268,7 +271,7 @@ impl<'a> Lower<'a> {
                     || un.contains("atomic")
                     || used.is_some_and(|u| u.kind == ResourceType::Uav);
                 let u = if uav { 0x1000 } else { 0 };
-                let (props, image) = match &ui.fields {
+                let ((props, per), image) = match &ui.fields {
                     Fields::Image { dim, .. } => {
                         let kind = match dim {
                             0 => 1,
@@ -278,31 +281,38 @@ impl<'a> Lower<'a> {
                             5 => 7,
                             _ => return Err("an image dimension (cube or MSAA)"),
                         };
-                        ((kind | u, 0x409), Some(kind))
+                        (((kind | u, 0x409), None), Some(kind))
                     }
-                    Fields::Buffer { idxen, format, .. } => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        let props = if un.starts_with("buffer_load_format")
-                            || un.starts_with("buffer_store_format")
-                        {
-                            (10 | u, 0x409)
-                        } else if *idxen
-                            && format.is_none()
-                            && stride >= 4
-                            && stride.is_multiple_of(4)
-                        {
-                            (12 | u, stride)
-                        } else {
-                            (11 | u, 0)
-                        };
+                    Fields::Buffer { format, .. } => {
                         if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                             return Err("a constant buffer's descriptor read as data");
                         }
-                        (props, None)
+                        let view = if un.starts_with("buffer_load_format")
+                            || un.starts_with("buffer_store_format")
+                        {
+                            ((10 | u, 0x409), None)
+                        } else if format.is_none() {
+                            Self::record_count_view(used, 11 | u)
+                        } else {
+                            ((11 | u, 0), None)
+                        };
+                        (view, None)
+                    }
+                    Fields::Smem { .. } => {
+                        // An `s_buffer_load`: the slot's kind as `smem` reads
+                        // it (raw, unordered where the slot is written).
+                        let raw = match used.map(|u| u.kind) {
+                            Some(ResourceType::Srv) => 11,
+                            Some(ResourceType::Uav) => 11 | 0x1000,
+                            Some(_) => return Err("a constant buffer's descriptor read as data"),
+                            None => self.slot_raw_kind(&src),
+                        };
+                        (Self::record_count_view(used, raw), None)
                     }
                     _ => return Err("a scalar memory read as data"),
                 };
-                (first, src, props, image, uav)
+                let uav = uav || props.0 & 0x1000 != 0;
+                (first, src, props, image, uav, per)
             }
             None => {
                 // An image the program only measures (it reads the size
@@ -325,7 +335,7 @@ impl<'a> Lower<'a> {
                 if count != 8 || !image {
                     return Err("a descriptor read only as data");
                 }
-                (0, src, (2, 0x409), Some(2), false)
+                (0, src, (2, 0x409), Some(2), false, None)
             }
         };
         // A heap index per lane where the load's offset is a waterfall
@@ -358,7 +368,14 @@ impl<'a> Lower<'a> {
                 l.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
             let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
             let Some(kind) = image else {
-                return Ok(vec![field(l, 0)]);
+                let size = field(l, 0);
+                let Some(stride) = per else {
+                    return Ok(vec![size]);
+                };
+                // The raw view's bytes over the stride: whole elements, the
+                // host's raw view holding the structured one's bytes only.
+                let stride = l.s.m.i32(stride);
+                return Ok(vec![l.s.m.bin(c, Bin::UDiv, size, stride)]);
             };
             let one = l.s.m.i32(1);
             let w = field(l, 0);
@@ -398,6 +415,42 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The handle a buffer's record count (descriptor dword 2) is asked
+    /// through, for an untyped access (`raw`: the raw kind, 11, with the
+    /// unordered-access bit where the access has it), and the stride the
+    /// size it gives is divided by. The console's count is in elements for
+    /// a structured view (what a used-resource entry of a stride of 4 bytes
+    /// or more says the slot holds), whatever the access: by index, by
+    /// byte offset (`offen`) or by a scalar load; in bytes for a raw one.
+    ///
+    /// The host's view of a structured slot is structured, where a
+    /// structured handle gives the elements; with `XTP_RAW_STRUCTURED=1`
+    /// ([`crate::emit::raw_structured`]) it is a raw view of the same bytes,
+    /// which cannot keep the title's count (its elements are dwords), and a
+    /// structured handle over it gives other numbers on NVIDIA (VIctory
+    /// #1762, an RTX 5080: 64 for 16 elements of 16 bytes through a shader
+    /// view, 256 through an unordered one). So the size is asked through a
+    /// raw handle, in bytes, and divided by the entry's stride.
+    // shortcut: with `XTP_RAW_STRUCTURED=1`, a structured view the host
+    // cannot make raw (bytes off 16 in its copy, `descriptor/host.rs`)
+    // stays structured, and a raw handle's size of it is undefined, as are
+    // the raw reads of it.
+    // Ported from marquezinii/VIctory@f6bb5d5 by marquezinii (the raw
+    // handle and the division) and AlanQiang0418/VIctory@b86d853 by
+    // AlanQiang0418 (the stride for accesses by byte offset too).
+    fn record_count_view(used: Option<&UsedResource>, raw: u32) -> ((u32, u32), Option<u32>) {
+        match used.map_or(0, |u| u.stride) {
+            s if s >= 4 && s.is_multiple_of(4) => {
+                if crate::emit::raw_structured() {
+                    ((raw, 0), Some(s))
+                } else {
+                    (((raw & !0xFF) | 12, s), None)
+                }
+            }
+            _ => ((raw, 0), None),
+        }
     }
 
     /// Two scalar loads of the same dwords: same opcode and immediate
