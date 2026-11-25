@@ -160,7 +160,30 @@ runs these tests, on the host GPU or WARP:
 
 ## 7. Session
 
-Pending.
+Pending: this part was delivered once its tests passed, without waiting
+for the PC session. The session to run:
+
+- the diagnostics build of this branch;
+- the same settings as `faces2-off`, so that their captures compare
+  (`E:\xtp-data\pix\faces2-off`);
+- DRED on;
+- every wait logged.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\tools\stall-probe\queue-session.ps1 `
+    -Name qwait-1 -Worktree <this worktree> -EnvPairs `
+    'XTP_CAPTURE=E:\xtp-data\pix\qwait-1;XTP_CAPTURE_WORLD=900:60:4:60;XTP_HEAP_SYNC=0;XTP_PASS_DUMP=1280;XTP_PRESENT_TARGET=1280x720:f27;XTP_RT_BUILDS=0;XTP_TEXTURE_POOL=1;XTP_D3D12_DRED=1;XTP_VALUE_WAIT_LOG=100000'
+```
+
+To read:
+
+- the `list waits for memory values so far` lines;
+- the `a submitted list waits for a memory value` lines, giving each wait's
+  queue, address, comparison, reference, and whether it was met at
+  submission;
+- the warnings `a list runs before a memory value it waits for is met`;
+- the captured frames and `passes-<n>.txt`, against `faces2-off`'s:
+  characters' hair and faces.
 
 ## 8. What next
 
