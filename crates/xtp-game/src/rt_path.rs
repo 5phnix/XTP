@@ -6,7 +6,15 @@
 //! title's own answer (`XTP_RT_PATH=0` in the A/B lines), phase B the
 //! fallback (`=1`).
 //!
-//! Why (docs/analysis/rt-fallback.md). The title chooses between its traced
+//! Why it stays off by default (rt-fallback.md §8, one Series S session
+//! with `ab`): in phase B the fallback passes run and no trace program is
+//! dispatched any more, but the scene is no brighter, and frames take
+//! about 17 % longer.
+//! - On the one view both arms showed, the lit HDR before fog moved by
+//!   0.3 %.
+//! - The irradiance atlas read 0 in both arms.
+//!
+//! Why the switch exists (docs/analysis/rt-fallback.md). The title chooses between its traced
 //! passes, which walk a ray-tracing structure that XTP cannot translate yet
 //! (their dispatches are dropped), and their non-traced fallbacks, which
 //! translate, by one predicate that reads only its own state: no system or
