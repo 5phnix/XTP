@@ -146,7 +146,7 @@ pub(super) fn rewrite(
     // SAFETY: the caller selected TOP_LEVEL, whose active union member is the instance GPU address.
     let address = unsafe { inputs.Anonymous.InstanceDescs };
     let src = input_range(rec.list, address, bytes, 16)?;
-    let dst = buffer(rec.device, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+    let dst = buffer(rec, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
     let pass = pipeline(rec.device)?;
     let mapping = map.for_list(rec.list)?;
     rec.list.keep(&dst);

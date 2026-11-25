@@ -43,11 +43,35 @@ fn device(host: &Host) -> Option<&'static ID3D12Device5> {
         .as_ref()
 }
 
-fn buffer(
-    device: &ID3D12Device5,
-    bytes: u64,
-    state: D3D12_RESOURCE_STATES,
-) -> Option<ID3D12Resource> {
+fn buffer(rec: &Recorder<'_>, bytes: u64, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
+    let device = rec.device;
+    let started = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+    if let Some(buffer) = crate::host::buffers::rt_buffer(device, bytes, state) {
+        // SAFETY: the recording activates the new placed buffer before its first use.
+        // Earlier recordings have released the lease on any overlapping resource.
+        unsafe {
+            rec.commands.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                        pResourceBefore: std::mem::ManuallyDrop::new(None),
+                        pResourceAfter: std::mem::transmute_copy(&buffer),
+                    }),
+                },
+                ..Default::default()
+            }]);
+        }
+        rec.list.keep(&buffer);
+        if let Some(started) = started {
+            tracing::debug!(
+                bytes,
+                state = state.0,
+                us = started.elapsed().as_micros() as u64,
+                "host DXR buffer allocation"
+            );
+        }
+        return Some(buffer);
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -67,7 +91,6 @@ fn buffer(
         ..Default::default()
     };
     let mut resource = None;
-    let started = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
     // SAFETY: one committed, shader-writable buffer with a state matching its use.
     unsafe {
         device.CreateCommittedResource(
@@ -125,7 +148,7 @@ impl<'a> Recorder<'a> {
         let result = match reuse {
             Some(resource) if width(&resource) >= sizes.ResultDataMaxSizeInBytes => resource,
             _ => Arc::new(buffer(
-                self.device,
+                self,
                 sizes.ResultDataMaxSizeInBytes,
                 D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
             )?),
@@ -139,11 +162,7 @@ impl<'a> Recorder<'a> {
         let mut scratch_address = 0;
         if bytes != 0 {
             if scratch.as_ref().is_none_or(|buffer| width(buffer) < bytes) {
-                *scratch = Some(buffer(
-                    self.device,
-                    bytes,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )?);
+                *scratch = Some(buffer(self, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?);
             }
             let current = scratch.as_ref()?;
             self.list.keep(current);
@@ -207,7 +226,7 @@ impl<'a> Recorder<'a> {
             _ => return None,
         };
         let dest = buffer(
-            self.device,
+            self,
             bytes,
             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
         )?;

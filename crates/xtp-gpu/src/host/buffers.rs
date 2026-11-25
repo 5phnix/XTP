@@ -244,29 +244,40 @@ pub(crate) fn start(device: &ID3D12Device) {
         return;
     }
     let mut made = false;
-    let new = |kind| Pool {
-        kind,
-        device: device.clone(),
-        state: Mutex::default(),
-        changed: Condvar::new(),
-        waited: Default::default(),
-    };
     let pools = POOLS.get_or_init(|| {
         made = true;
-        [Kind::System, Kind::Upload].map(new)
+        [Kind::System, Kind::Upload].map(|kind| Pool::new(kind, device))
     });
     if !made {
         return;
     }
-    let cards = crate::shadow::cards().then(|| CARDS.get_or_init(|| new(Kind::Card)));
-    for pool in pools.iter().chain(cards) {
-        let spawned = std::thread::Builder::new()
-            .name(format!("xtp-gpu-{:?}-buffers", pool.kind).to_lowercase())
-            .spawn(move || pool.reserve());
-        if let Err(e) = spawned {
-            tracing::warn!(error = %e, kind = ?pool.kind, "no buffer reserve thread");
-        }
+    for pool in pools {
+        pool.start_reserve();
     }
+    if crate::shadow::cards() {
+        let _ = card_pool(device);
+    }
+}
+
+/// Start the card reserve on its first DXR use when shadow copies use system memory.
+fn card_pool(device: &ID3D12Device) -> Option<&'static Pool> {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    if !enabled() {
+        return None;
+    }
+    let pool = CARDS.get_or_init(|| Pool::new(Kind::Card, device));
+    STARTED.get_or_init(|| pool.start_reserve()).then_some(pool)
+}
+
+/// Place an RT result, scratch or instance buffer in its required initial state.
+pub(crate) fn rt_buffer(
+    device: &ID3D12Device,
+    size: u64,
+    state: D3D12_RESOURCE_STATES,
+) -> Option<ID3D12Resource> {
+    card_pool(device)?
+        .place_in_state(size, state)
+        .map(|(resource, _)| resource)
 }
 
 /// A buffer of `size` bytes of `kind`, mapped (but a [`Kind::Card`] one,
@@ -274,7 +285,7 @@ pub(crate) fn start(device: &ID3D12Device) {
 /// heap; `None` without pools (the caller makes a committed one).
 pub(crate) fn buffer(kind: Kind, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let pool = match kind {
-        Kind::Card => CARDS.get()?,
+        Kind::Card => card_pool(&CARDS.get()?.device)?,
         kind => &POOLS.get()?[kind as usize],
     };
     pool.place(size)
@@ -358,6 +369,27 @@ pub(crate) fn summary() -> Option<String> {
 }
 
 impl Pool {
+    fn new(kind: Kind, device: &ID3D12Device) -> Self {
+        Self {
+            kind,
+            device: device.clone(),
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            waited: Default::default(),
+        }
+    }
+
+    fn start_reserve(&'static self) -> bool {
+        let spawned = std::thread::Builder::new()
+            .name(format!("xtp-gpu-{:?}-buffers", self.kind).to_lowercase())
+            .spawn(move || self.reserve());
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, kind = ?self.kind, "no buffer reserve thread");
+            return false;
+        }
+        true
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -502,6 +534,19 @@ impl Pool {
     }
 
     fn place(&'static self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let state = if self.kind == Kind::Upload {
+            D3D12_RESOURCE_STATE_GENERIC_READ
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        self.place_in_state(size, state)
+    }
+
+    fn place_in_state(
+        &'static self,
+        size: u64,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         #[cfg(test)]
         before_placing(size);
         let len = size.max(1).next_multiple_of(ALIGN);
@@ -511,12 +556,10 @@ impl Pool {
             offset,
             dirty,
         } = self.room(len)?;
-        let (state, flags) = match self.kind {
-            Kind::System | Kind::Card => (
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ),
-            Kind::Upload => (D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE),
+        let flags = if self.kind == Kind::Upload {
+            D3D12_RESOURCE_FLAG_NONE
+        } else {
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
