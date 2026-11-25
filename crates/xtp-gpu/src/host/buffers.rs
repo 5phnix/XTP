@@ -1023,12 +1023,13 @@ mod tests {
             "host::buffers::tests::overlapping_card_copies_publish_each_submissions_own_words";
         with_cards(test, |host| {
             let big = TitleBuffer::new(2 << 20);
+            let input = TitleBuffer::new(2 * crate::watch::PAGE);
             let at = big.address();
             let page = crate::watch::PAGE as u64;
-            big.set_words(|i| 0x1000 + i as u32);
+            input.set_words(|i| 0x1000 + i as u32);
             assert!(big.shadow().carded());
             let [first, second] = std::array::from_fn(|_| host.new_list().unwrap());
-            for (list, source) in [(&first, at), (&second, at + page)] {
+            for (list, source) in [(&first, input.address()), (&second, input.address() + page)] {
                 assert!(crate::shadow::copy(list, at + 2 * page, source, 256));
                 list.close();
             }
@@ -1053,7 +1054,7 @@ mod tests {
                 );
             });
             host.drain();
-            assert_eq!(words(&big, 2 * page), words(&big, page));
+            assert_eq!(words(&big, 2 * page), words(&input, page));
         });
     }
 
