@@ -489,7 +489,6 @@ impl Stage {
 }
 
 pub(crate) struct HostPipeline {
-    pub(crate) dispatch_signature: std::sync::OnceLock<Option<ID3D12CommandSignature>>,
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
@@ -776,11 +775,6 @@ fn native_refusal(stage: &str, shader: &Shader) -> Option<String> {
 }
 
 impl HostPipeline {
-    pub(crate) fn group_base(&self) -> Option<(u32, u32)> {
-        let stage = self.stages.first()?;
-        Some((stage.user_data?.0, stage.translated().host.group_base?))
-    }
-
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
@@ -1003,7 +997,6 @@ impl HostPipeline {
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
-                dispatch_signature: Default::default(),
                 compute: true,
                 mesh: false,
                 pso,
@@ -1040,7 +1033,6 @@ impl HostPipeline {
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
-                dispatch_signature: Default::default(),
                 compute: false,
                 mesh: true,
                 pso,
@@ -1155,7 +1147,6 @@ impl HostPipeline {
             "host graphics state"
         );
         Some(HostPipeline {
-            dispatch_signature: Default::default(),
             compute: false,
             mesh: false,
             pso,
@@ -1575,7 +1566,6 @@ mod tests {
             host: xtp_shader::emit::HostShader {
                 stage: xtp_shader::HwStage::Ms,
                 dxil: b"not a container".to_vec(),
-                group_base: None,
                 user_data: Vec::new(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
@@ -1855,7 +1845,6 @@ mod tests {
                     host: xtp_shader::emit::HostShader {
                         stage: kind,
                         dxil,
-                        group_base: None,
                         user_data: vec![],
                         samplers: vec![],
                         static_samplers: vec![],
@@ -2236,7 +2225,3 @@ mod tests {
         made.is_err()
     }
 }
-
-#[cfg(test)]
-#[path = "../dispatch_split_tests.rs"]
-mod indirect_dispatch_tests;

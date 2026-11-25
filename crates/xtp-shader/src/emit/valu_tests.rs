@@ -151,7 +151,6 @@ pub(super) fn build_valu_cs_with_mode(body: &[u32], float_mode: u8) -> HostShade
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
-        group_base: lowered.group_base,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),

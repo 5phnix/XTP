@@ -141,10 +141,12 @@ impl<'a> Lower<'a> {
                 return Val::I32(self.flat_thread_id(c));
             }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return Val::I32(self.group_id(c)),
+            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
-                let g = self.group_id(0);
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
                 let n = self.s.m.i32(self.x.mesh_stride);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Mul, g, n));
             }
