@@ -652,12 +652,24 @@ const MS_CASES: &[(&str, u32, &str)] = &[
 ];
 
 fn tools() -> Option<(PathBuf, PathBuf)> {
-    let console = PathBuf::from(std::env::var_os("XTP_CONSOLE_DXC")?);
+    let Some(console) = std::env::var_os("XTP_CONSOLE_DXC")
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+    else {
+        super::host::skip_once(xtp_testkit::reason::NO_CONSOLE_DXC);
+        return None;
+    };
     let pc = match std::env::var_os("XTP_PC_DXC") {
         Some(p) => PathBuf::from(p),
-        None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
+        None => super::validator::Validator::default_path()
+            .map(|p| p.with_file_name("dxc.exe"))
+            .unwrap_or_default(),
     };
-    (console.exists() && pc.exists()).then_some((console, pc))
+    if !pc.exists() {
+        super::host::skip_once(xtp_testkit::reason::NO_DXC);
+        return None;
+    }
+    Some((console, pc))
 }
 
 fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
@@ -715,11 +727,9 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
 #[test]
 fn translated_shaders_draw_as_pc_ones() {
     let Some((console, pc)) = tools() else {
-        eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some(host) = Host::test_device() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("xtp-diff-{}", std::process::id()));
@@ -871,11 +881,9 @@ fn translated_shaders_draw_as_pc_ones() {
 #[test]
 fn translated_mesh_shaders_draw_as_pc_ones() {
     let Some((console, pc)) = tools() else {
-        eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some(host) = Host::test_device() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("xtp-diff-ms-{}", std::process::id()));
@@ -988,11 +996,9 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
 fn float_semantics_are_the_consoles() {
     use super::host::{Dispatch, View};
     let Some((console, _)) = tools() else {
-        eprintln!("no console compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some(host) = Host::test_device() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("xtp-float-{}", std::process::id()));
@@ -1077,11 +1083,9 @@ fn close(a: u32, b: u32) -> bool {
 fn translated_compute_matches_pc() {
     use super::host::{Dispatch, Stride, View};
     let Some((console, pc)) = tools() else {
-        eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some(host) = Host::test_device() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("xtp-diff-cs-{}", std::process::id()));

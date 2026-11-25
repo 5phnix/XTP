@@ -173,9 +173,9 @@ fn emit(loops: Loops, bound: u32, target: Target) -> HostShader {
         .unwrap_or_else(|e| panic!("{loops:?}, {target:?}: {e}"))
 }
 
-/// What WARP stores with lane `long` the long one (`u32::MAX`: none), or
-/// none without a WARP device. Panics if the dispatch does not finish in
-/// time.
+/// What the test device stores with lane `long` the long one (`u32::MAX`:
+/// none), or none without a device. Panics if the dispatch does not finish
+/// in time.
 fn run(cs: &HostShader, long: u32) -> Option<Vec<u32>> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -185,7 +185,7 @@ fn run(cs: &HostShader, long: u32) -> Option<Vec<u32>> {
     // The device lives on a thread of its own: a dispatch that never ends
     // stays there, and the test fails.
     std::thread::spawn(move || {
-        let out = Host::new(true).ok().map(|host| {
+        let out = Host::new(false).map(|host| {
             let (root, pso) = host.compute_pipeline(&cs).expect("pipeline");
             let mut user = vec![0; (cs.user_data_dwords() as usize).max(2)];
             user[1] = long;
@@ -205,7 +205,11 @@ fn run(cs: &HostShader, long: u32) -> Option<Vec<u32>> {
         let _ = tx.send(out);
     });
     match rx.recv_timeout(Duration::from_secs(120)) {
-        Ok(out) => out,
+        Ok(Ok(out)) => Some(out),
+        Ok(Err(e)) => {
+            super::host::skip_gpu(&e);
+            None
+        }
         Err(_) => panic!(
             "lane {long} long: the dispatch did not finish in 120 s (a group barrier waits for a lane that left?)"
         ),
@@ -262,7 +266,6 @@ fn a_lane_stopped_through_a_conditional_back_edge_stores_nothing() {
     );
     for long in [5, 37] {
         let Some(out) = run(&cs, long) else {
-            eprintln!("no WARP device; skipped");
             return;
         };
         assert_eq!(out, want(long, SHORT, None), "lane {long} long");
@@ -278,7 +281,6 @@ fn the_group_barrier_after_a_stopped_lane_is_passed() {
         let cs = emit(Loops::One(back), above_the_limit(), Target::ANY);
         for long in [u32::MAX, 0, 31, 32, 63] {
             let Some(out) = run(&cs, long) else {
-                eprintln!("no WARP device; skipped");
                 return;
             };
             assert_eq!(out, want(long, SHORT, None), "{back:?}, lane {long} long");
@@ -300,7 +302,6 @@ fn nested_loops_stop_at_the_budget_of_all_loops_together() {
         let cs = emit(Loops::Nested, outer, Target::ANY);
         for long in [9, 40] {
             let Some(out) = run(&cs, long) else {
-                eprintln!("no WARP device; skipped");
                 return;
             };
             let long_count = (!stops).then_some(outer * INNER);

@@ -1312,8 +1312,8 @@ mod tests {
             let _one = crate::emit::valu_tests::ONE_AT_A_TIME
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let Ok(host) = Host::new(true) else {
-                eprintln!("no WARP device; skipped");
+            // Kept on WARP: the old handle causes undefined behaviour on hardware.
+            let Some(host) = Host::test_warp() else {
                 return;
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1387,8 +1387,7 @@ mod tests {
             let _one = crate::emit::valu_tests::ONE_AT_A_TIME
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let Ok(host) = Host::new(true) else {
-                eprintln!("no WARP device; skipped");
+            let Some(host) = Host::test_device() else {
                 return;
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();

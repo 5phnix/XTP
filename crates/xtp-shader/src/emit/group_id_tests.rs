@@ -88,16 +88,9 @@ fn flat_ids_on_warp() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let host = match Host::new(true) {
-        Ok(host) => host,
-        Err(e) => {
-            assert!(
-                std::env::var("XTP_REQUIRE_GPU").as_deref() != Ok("1"),
-                "{e}"
-            );
-            eprintln!("WARP: {e}; skipped");
-            return;
-        }
+    // Kept on WARP to cover 4-lane waves; flat_ids_and_lanes_on_nvidia covers hardware.
+    let Some(host) = Host::test_warp() else {
+        return;
     };
     check(&host, host.target().runs(32));
 }

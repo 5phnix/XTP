@@ -107,8 +107,7 @@ fn dispatch_reads_spilled_constants_and_the_spilled_table() {
     {
         validator.validate(&mut shader.dxil).unwrap();
     }
-    let Ok(host) = Host::new(true) else {
-        eprintln!("no WARP device; skipped");
+    let Some(host) = Host::test_device() else {
         return;
     };
     let (root, pso) = host.compute_pipeline(&shader).unwrap();
@@ -303,7 +302,9 @@ fn reads_a_packed_address_and_an_adjacent_pair_from_spilled_constants() {
     assert!(track(&program(&words)).is_err());
     let bytes = crate::dxbc::build(&[]);
     let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
-    let Ok(host) = Host::new(false) else { return };
+    let Some(host) = Host::test_device() else {
+        return;
+    };
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
     let mut ud = vec![0; cs.user_data_dwords() as usize];
     for u in &cs.user_data {
@@ -391,8 +392,7 @@ fn indexed_spilled_buffer_uses_the_matching_carry_and_gpu_offset() {
 
     let bytes = crate::dxbc::build(&[]);
     let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
-    let Ok(host) = Host::new(false) else {
-        assert!(std::env::var_os("XTP_REQUIRE_GPU").is_none());
+    let Some(host) = Host::test_device() else {
         return;
     };
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -540,7 +540,9 @@ fn phi_reads_the_spilled_word_only_on_the_edge_that_keeps_it() {
     n.layout.push(param(RootType::Constants, 18, 2, 6));
     let bytes = crate::dxbc::build(&[]);
     let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
-    let Ok(host) = Host::new(false) else { return };
+    let Some(host) = Host::test_device() else {
+        return;
+    };
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
     for (condition, expected) in [(0, 71), (1, 9)] {
         let mut ud = vec![0; cs.user_data_dwords() as usize];
@@ -603,7 +605,9 @@ fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
     let n = root_uav_program(&words, [64, 1, 1], true);
     let bytes = crate::dxbc::build(&[]);
     let c = Container::parse(&bytes).unwrap();
-    let Ok(host) = Host::new(false) else { return };
+    let Some(host) = Host::test_device() else {
+        return;
+    };
     for lanes in [32, 64] {
         let target = super::Target {
             lanes_min: lanes,
@@ -695,7 +699,9 @@ fn root_halfword_crosses_a_dword_and_typed_access_preserves_its_value() {
     let n = root_uav_program(&words, [1; 3], false);
     let bytes = crate::dxbc::build(&[]);
     let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
-    let Ok(host) = Host::new(false) else { return };
+    let Some(host) = Host::test_device() else {
+        return;
+    };
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
     let mut ud = vec![0; cs.user_data_dwords() as usize];
     let bias = cs

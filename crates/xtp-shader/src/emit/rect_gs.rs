@@ -898,8 +898,8 @@ mod tests {
     use super::*;
 
     /// Validates `container` with the system's `dxil.dll` when there is
-    /// one (as the other emission tests do; a skip is said on standard
-    /// error).
+    /// one (as the other emission tests do; noted on standard error
+    /// without one).
     fn validate(what: &str, container: &[u8]) {
         use super::super::validator::Validator;
         match Validator::load(Validator::default_path().as_deref()) {
@@ -908,7 +908,7 @@ mod tests {
                     panic!("{what}: validation: {e}");
                 }
             }
-            Err(e) => eprintln!("SKIPPED validation of {what}: {e}"),
+            Err(e) => eprintln!("{what}: not validated ({e})"),
         }
     }
 

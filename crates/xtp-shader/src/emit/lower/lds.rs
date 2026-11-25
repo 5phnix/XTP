@@ -668,19 +668,15 @@ mod tests {
         let _one = crate::emit::valu_tests::ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let host = match Host::new(false) {
-            Ok(h) => h,
-            Err(e) => {
-                translate(&words, Target::ANY).unwrap();
-                eprintln!("no SM 6.6 device ({e}); skipped");
-                return;
-            }
+        let Some(host) = Host::test_device() else {
+            translate(&words, Target::ANY).unwrap();
+            return;
         };
         // A group of one console wave using LDS declares its wave size.
         let s = match translate(&words, host.target()) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("not for this device ({e}); skipped");
+                crate::emit::host::skip_once(&format!("not for this device ({e})"));
                 return;
             }
         };

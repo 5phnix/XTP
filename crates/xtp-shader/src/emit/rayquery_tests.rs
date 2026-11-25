@@ -568,9 +568,12 @@ fn check_dxil(cs: &HostShader) {
         bindings(&cs.dxil)
     );
     let path = super::validator::Validator::default_path();
-    let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
-        eprintln!("no dxil.dll; not validated");
-        return;
+    let mut v = match super::validator::Validator::load(path.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("not validated: {e}");
+            return;
+        }
     };
     eprintln!(
         "dxil.dll {} (validator {:?})",
@@ -1229,8 +1232,8 @@ fn rayquery_spliced_program_traces_on_warp() {
             assert!((a.t - t).abs() < 1e-5, "{a:?}, {t}");
         }
     }
-    let Ok(host) = super::host::Host::new(true) else {
-        eprintln!("no WARP device; skipped");
+    // Kept on WARP: warp::run binds only the view heap before a directly indexed root signature.
+    let Some(host) = super::host::Host::test_warp() else {
         return;
     };
     // Ray n for thread n; the first rays again for the rest of the wave.
@@ -1258,7 +1261,7 @@ fn rayquery_spliced_program_traces_on_warp() {
     let out = match warp::run(&host, &cs, &skeleton_scene(), &views, true) {
         Ok(Some(out)) => out,
         Ok(None) => {
-            eprintln!("WARP has no ray-tracing tier 1.1; skipped");
+            super::host::skip_once("WARP has no ray-tracing tier 1.1");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1737,8 +1740,7 @@ fn rayquery_proof_refuses_what_the_walk_does_not_do() {
 fn rayquery_family_a_misses_rays_dxr_leaves_undefined_on_warp() {
     let (native, site) = family_a();
     let cs = translate_with(&without_lds(&native), &site, false).unwrap();
-    let Ok(host) = super::host::Host::new(true) else {
-        eprintln!("no WARP device; skipped");
+    let Some(host) = super::host::Host::test_warp() else {
         return;
     };
     let square = Blas {
@@ -1799,7 +1801,7 @@ fn rayquery_family_a_misses_rays_dxr_leaves_undefined_on_warp() {
     let out = match warp::run(&host, &cs, &scene, &views, true) {
         Ok(Some(out)) => out,
         Ok(None) => {
-            eprintln!("WARP has no ray-tracing tier 1.1; skipped");
+            super::host::skip_once("WARP has no ray-tracing tier 1.1");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -2046,13 +2048,12 @@ fn rayquery_family_a_translates_validates_and_binds_alone() {
     check_dxil(&translate_with(&native, &site, true).unwrap());
     let cs = translate_with(&without_lds(&native), &site, false).unwrap();
     assert_eq!(cs.wave_size(), None);
-    let Ok(host) = super::host::Host::new(true) else {
-        eprintln!("no WARP device; skipped");
+    let Some(host) = super::host::Host::test_warp() else {
         return;
     };
     match warp::run(&host, &cs, &skeleton_scene(), &[], false) {
         Ok(Some(_)) => {}
-        Ok(None) => eprintln!("WARP has no ray-tracing tier 1.1; skipped"),
+        Ok(None) => super::host::skip_once("WARP has no ray-tracing tier 1.1"),
         Err(e) => panic!("{e}"),
     }
 }
@@ -2106,8 +2107,7 @@ fn rayquery_family_a_end_to_end_on_warp() {
         .compare(11, &played, &mut proof::Report::default())
         .unwrap_or_else(|f| panic!("{f:?}"));
     let cs = translate_with(&without_lds(&native), &site, false).unwrap();
-    let Ok(host) = super::host::Host::new(true) else {
-        eprintln!("no WARP device; skipped");
+    let Some(host) = super::host::Host::test_warp() else {
         return;
     };
     let w = &played.world;
@@ -2132,7 +2132,7 @@ fn rayquery_family_a_end_to_end_on_warp() {
     let out = match warp::run(&host, &cs, &scene, &views, true) {
         Ok(Some(out)) => out,
         Ok(None) => {
-            eprintln!("WARP has no ray-tracing tier 1.1; skipped");
+            super::host::skip_once("WARP has no ray-tracing tier 1.1");
             return;
         }
         Err(e) => panic!("{e}"),

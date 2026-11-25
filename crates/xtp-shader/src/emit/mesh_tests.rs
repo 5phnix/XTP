@@ -524,10 +524,7 @@ fn the_programs_decode_as_written() {
 /// on this PC), translated for the adapter's waves: the target, the mesh
 /// module's operations and the texels. `None` without an SM 6.6 device.
 fn draw_flat(native: &NativeProgram, size: (u32, u32)) -> Option<(Target, String, Vec<[f32; 4]>)> {
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return None;
-    };
+    let host = Host::test_device()?;
     Some(draw_flat_on(&host, native, size))
 }
 

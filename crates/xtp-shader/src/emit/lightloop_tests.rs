@@ -329,12 +329,7 @@ fn refusal_with(parts: &[&[u32]], vgprs: u16) -> Option<&'static str> {
 /// WARP, and checks what it stores.
 fn run(shader: &HostShader, cases: &[[u32; 4]], want: impl Fn([u32; 4]) -> u32) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
+    for (label, host) in Host::test_hosts() {
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: {e}"));
@@ -361,9 +356,7 @@ fn run(shader: &HostShader, cases: &[[u32; 4]], want: impl Fn([u32; 4]) -> u32) 
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(out[0][0], want(case), "{label} {case:?}");
         }
-        ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
 const CASES: [[u32; 4]; 4] = [

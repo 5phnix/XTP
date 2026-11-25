@@ -1144,8 +1144,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
-        let Ok(host) = super::host::Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
+        let Some(host) = super::host::Host::test_device() else {
             return;
         };
         let ps = super::HostShader {
@@ -1206,7 +1205,7 @@ mod tests {
         let mut c = constant_color();
         let path = super::validator::Validator::default_path();
         let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
+            super::host::skip_once(xtp_testkit::reason::NO_DXIL);
             return;
         };
         let ours = c[4..20].to_vec();
@@ -1458,8 +1457,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn what_translates_for_the_host_creates_a_pipeline() {
-        let Ok(host) = super::host::Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
+        let Some(host) = super::host::Host::test_device() else {
             return;
         };
         let target = host.target();
@@ -1491,16 +1489,32 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
-        let Ok(names) = super::host::adapters() else {
-            eprintln!("no DXGI; skipped");
+        if super::host::test_adapter().as_deref() == Some("warp") {
+            super::host::skip_once("hardware adapters kept out (XTP_TEST_ADAPTER=warp)");
             return;
+        }
+        if super::host::test_adapter().is_some() {
+            let _ = super::host::Host::test_device();
+            return;
+        }
+        let names = match super::host::adapters() {
+            Ok(names) => names,
+            Err(e) => {
+                super::host::skip_gpu(&format!("no DXGI ({e})"));
+                return;
+            }
         };
         let words = [0xD760_0000, 0x0001_0B00, 0x7E02_0200, 0xBF81_0000];
+        let mut ran = 0;
         for name in names {
-            let Ok(host) = super::host::Host::on(&name) else {
-                eprintln!("{name}: no SM 6.6 device; skipped");
-                continue;
+            let host = match super::host::Host::on(&name) {
+                Ok(host) => host,
+                Err(e) => {
+                    eprintln!("{name}: no SM 6.6 device ({e})");
+                    continue;
+                }
             };
+            ran += 1;
             let target = host.target();
             eprintln!("{name}: waves {}-{}", target.lanes_min, target.lanes_max);
             let one = match emit_for(&compute(&words, true), target) {
@@ -1515,6 +1529,9 @@ mod tests {
             let two = emit_for(&compute_of(&words, true, 128), target).unwrap();
             host.compute_pipeline(&two)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        if ran == 0 {
+            super::host::skip_gpu("no hardware adapter with an SM 6.6 device");
         }
     }
 

@@ -357,13 +357,7 @@ fn draw_pixels(ps: &HostShader) -> Option<Vec<[f32; 4]>> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let host = match Host::new(true) {
-        Ok(host) => host,
-        Err(e) => {
-            eprintln!("WARP indisponible ({e})");
-            return None;
-        }
-    };
+    let host = Host::test_device()?;
     let mut attr = element("TEXCOORD", 0, 0);
     attr.usage = 15;
     attr.interp = 2;

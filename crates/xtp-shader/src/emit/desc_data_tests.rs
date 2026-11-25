@@ -209,13 +209,7 @@ fn run(
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let host = match Host::new(false) {
-        Ok(host) => host,
-        Err(e) => {
-            eprintln!("no SM 6.6 device ({e}); skipped");
-            return None;
-        }
-    };
+    let host = Host::test_device()?;
     let mut roots = vec![(
         0,
         Root::Constants(vec![0; cs.user_data_dwords().max(1) as usize]),

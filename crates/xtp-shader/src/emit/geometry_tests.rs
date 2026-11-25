@@ -1130,7 +1130,7 @@ fn validate(what: &str, container: &[u8]) {
                 panic!("{what}: validation: {e}");
             }
         }
-        Err(e) => eprintln!("SKIPPED validation of {what}: {e}"),
+        Err(e) => eprintln!("{what}: not validated ({e})"),
     }
 }
 
@@ -1503,13 +1503,7 @@ fn device() -> Option<(Host, std::sync::MutexGuard<'static, ()>)> {
     let one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    match Host::new(false) {
-        Ok(host) => Some((host, one)),
-        Err(e) => {
-            eprintln!("no SM 6.6 device ({e}); skipped");
-            None
-        }
-    }
+    Some((Host::test_device()?, one))
 }
 
 /// The probe vertex shader over [`item`] (positions, floats and uints per

@@ -382,10 +382,12 @@ fn heap_kinds(shader: &HostShader) -> Option<Vec<u32>> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dxc = match std::env::var_os("XTP_PC_DXC") {
         Some(p) => PathBuf::from(p),
-        None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
+        None => super::validator::Validator::default_path()
+            .map(|p| p.with_file_name("dxc.exe"))
+            .unwrap_or_default(),
     };
     if !dxc.exists() {
-        eprintln!("no dxc.exe; handle kinds not checked");
+        eprintln!("no dxc.exe at {}; handle kinds not checked", dxc.display());
         return None;
     }
     let file = std::env::temp_dir().join(format!(

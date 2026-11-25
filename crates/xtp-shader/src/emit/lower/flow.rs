@@ -2226,7 +2226,7 @@ mod tests {
 
     /// The descriptor edge of [`DESCRIPTOR_JOIN`] brings an undefined dword
     /// instead of stopping the program ("a descriptor's address or format
-    /// read as data"), and both edges give what the console does (on WARP).
+    /// read as data"), and both edges give what the console does on the host.
     #[test]
     fn descriptor_dwords_join_data_as_undefined_on_their_edge() {
         let cs = emit_for(
@@ -2237,8 +2237,7 @@ mod tests {
         #[cfg(windows)]
         {
             use crate::emit::host::{Dispatch, Host, Root, Stride, View};
-            let Ok(host) = Host::new(true) else {
-                eprintln!("no WARP device; skipped");
+            let Some(host) = Host::test_device() else {
                 return;
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2346,7 +2345,7 @@ mod tests {
     /// `s_or`, then `s_cbranch_vccnz` past the store). On the descriptor's
     /// edge the flag alone takes the branch, whatever s8 holds: the dword
     /// is dead there and the program translates; both edges give what the
-    /// console does (on WARP), as [`DESCRIPTOR_JOIN`] does.
+    /// console does on the host, as [`DESCRIPTOR_JOIN`] does.
     const FLAG_AND_WORD: [u32; 30] = [
         0x3408_0082, // v_lshlrev_b32 v4, 2, v0
         0xBE84_0300, // s_mov_b32 s4, s0
@@ -2388,8 +2387,7 @@ mod tests {
         #[cfg(windows)]
         {
             use crate::emit::host::{Dispatch, Host, Root, Stride, View};
-            let Ok(host) = Host::new(true) else {
-                eprintln!("no WARP device; skipped");
+            let Some(host) = Host::test_device() else {
                 return;
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();

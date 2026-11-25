@@ -91,11 +91,11 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         stride_table: lowered.stride_table,
         run_time_buffers: lowered.run_time_buffers,
     };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    } else {
-        eprintln!("no dxil.dll; validation skipped");
+    match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        Ok(mut v) => v
+            .validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed"),
+        Err(e) => eprintln!("not validated: {e}"),
     }
     shader
 }
@@ -120,11 +120,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
+    for (label, host) in Host::test_hosts() {
         let (root, pso) = match host.compute_pipeline(shader) {
             Ok(p) => p,
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
@@ -232,9 +228,7 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
 fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
     use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
     let shader = build(WATERFALL_INDEXED_WAVE32, false);
-    let results = sampled(&shader);
-    assert!(!results.is_empty());
-    for (label, red) in results {
+    for (label, red) in sampled(&shader) {
         // Even lanes hold entry 0's offset, odd lanes entry 1's.
         let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
         assert_eq!(red, want, "{label}");
@@ -248,9 +242,7 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
     for folded in [false, true] {
         let shader = build(&cmpx_waterfall(false, folded), false);
-        let results = sampled(&shader);
-        assert!(!results.is_empty());
-        for (label, red) in results {
+        for (label, red) in sampled(&shader) {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
     }

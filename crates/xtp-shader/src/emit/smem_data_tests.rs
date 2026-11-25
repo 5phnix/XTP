@@ -92,55 +92,23 @@ fn build(words: &[u32]) -> HostShader {
 
 /// `shader` checked by dxil.dll, where it is.
 fn validate(shader: &HostShader) {
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .unwrap_or_else(|e| panic!("DXIL validation failed: {e}"));
-    } else {
-        eprintln!("no dxil.dll; validation skipped");
+    match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        Ok(mut v) => v
+            .validate(&mut shader.dxil.clone())
+            .unwrap_or_else(|e| panic!("DXIL validation failed: {e}")),
+        Err(e) => eprintln!("not validated: {e}"),
     }
-}
-
-/// The devices these tests run on, by label: the first hardware adapter
-/// ("hardware"), unless `XTP_TEST_ADAPTER` keeps hardware out (`warp` on the
-/// person's PC), and WARP. Without its device a run is left out, and with
-/// `XTP_REQUIRE_GPU` set (the L4's `-GpuTests`) a missing hardware adapter
-/// fails the test: there, "hardware" is a real GPU, never WARP standing in.
-fn devices() -> Vec<(&'static str, Host)> {
-    let strict = std::env::var_os("XTP_REQUIRE_GPU").is_some_and(|v| !v.is_empty() && v != "0");
-    let mut out = Vec::new();
-    match super::host::test_adapter() {
-        Some(t) => eprintln!("hardware: kept out (XTP_TEST_ADAPTER={t})"),
-        None => {
-            let hardware = super::host::adapters().and_then(|a| match a.first() {
-                Some(name) => Host::on(name),
-                None => Err("no hardware adapter".to_string()),
-            });
-            match hardware {
-                Ok(host) => out.push(("hardware", host)),
-                Err(e) if strict => panic!("hardware: {e} (XTP_REQUIRE_GPU is set)"),
-                Err(e) => eprintln!("hardware: {e}"),
-            }
-        }
-    }
-    match Host::new(true) {
-        Ok(host) => out.push(("warp", host)),
-        Err(e) => eprintln!("warp: {e}"),
-    }
-    if out.is_empty() {
-        eprintln!("no SM 6.6 device; skipped");
-    }
-    out
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on each of
-/// [`devices`] and returns, per one that ran, the UAV's 32 dwords.
+/// [`Host::test_hosts`] and returns, per one that ran, the UAV's 32 dwords.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let mut out = Vec::new();
     // One GPU test at a time (see `valu_tests::ONE_AT_A_TIME`).
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, host) in devices() {
+    for (label, host) in Host::test_hosts() {
         let (root, pso) = match host.compute_pipeline(shader) {
             Ok(p) => p,
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
@@ -683,7 +651,7 @@ fn a_mask_joined_with_a_number_exports_the_arms_number() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, host) in devices() {
+    for (label, host) in Host::test_hosts() {
         for &(shape, body, s8, want) in &cases {
             let texels = draw(&host, label, &drawn(body), s8);
             assert_eq!(texels.len(), 2 * COLUMNS as usize, "{label}");
