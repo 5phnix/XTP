@@ -906,12 +906,15 @@ pub(crate) fn around(rays: &[(usize, Ray)], root: Root, mask: u32, rng: &mut Rng
     };
     for n in 0..count {
         let (to_object, translation_only) = transform(rng);
-        // A mask outside the query's, or one with at least one of its bits.
+        // One bit of eight (each tells a walk's mask from another), a mask
+        // outside the query's, or one with at least one of its bits.
         let bits: Vec<u32> = (0..8).filter(|b| mask >> b & 1 != 0).collect();
-        let inst_mask = if bits.is_empty() || rng.chance(0.25) {
-            (rng.bits() as u32 & !mask & 0xFF) as u8
-        } else {
-            (rng.bits() as u32 & 0xFF | 1 << bits[rng.below(bits.len())]) as u8
+        let inst_mask = match rng.below(3) {
+            0 => 1 << rng.below(8),
+            1 if !bits.is_empty() => {
+                (rng.bits() as u32 & 0xFF | 1 << bits[rng.below(bits.len())]) as u8
+            }
+            _ => (rng.bits() as u32 & !mask & 0xFF) as u8,
         };
         let mut flags = rng.below(4) as u8;
         if rng.chance(0.25) {

@@ -394,11 +394,13 @@ fn rayquery_refuses_walks_that_do_not_always_reach_their_exit() {
         splice(ir(&ends), &SITE).err(),
         Some("a ray-tracing walk with a path that ends the program")
     );
-    // The loop never leaves (0xc8: s_branch 0x8c): only the skip path
-    // reaches the exit.
-    let never = patched(&native(), 0xc8, &[0xBF82_FFF0]);
+    // The loop's way out goes back to the header (0xcc: s_branch 0x8c),
+    // and the empty-structure check to the exit itself (0x64:
+    // s_cbranch_scc0 0xd4): only that check reaches the exit.
+    let never = patched(&native(), 0xcc, &[0xBF82_FFEF]);
+    let never = patched(&never, 0x64, &[0xBF84_001B]);
     assert_eq!(
-        splice(ir(&never), &SITE).err(),
+        splice(ir(&never), &Site { skip: None, ..SITE }).err(),
         Some("a ray-tracing walk whose header never reaches its exit")
     );
 }
@@ -1237,7 +1239,9 @@ fn push_far() -> String {
 /// Family A's walk, written for these tests (see the module notes). The
 /// table at `s0` holds the rays' descriptor at 0x00 (32-byte records:
 /// origin, t-max, direction), the structure's at 0x20, the output's at
-/// 0x40 and the tile masks' at 0x60; `s1` is the group.
+/// 0x40 and the tile masks' at 0x60; one group (no group id, which would
+/// make the translation ask for 32-lane waves, which the farm's WARP does
+/// not make pipelines for).
 fn family_a_text() -> String {
     let prologue = "
     s_mov_b32 s3, 0
@@ -1246,7 +1250,6 @@ fn family_a_text() -> String {
     s_load_dwordx4 s[8:11], s[2:3], 0x000040
     s_load_dwordx4 s[12:15], s[2:3], 0x000020
     s_load_dwordx4 s[16:19], s[2:3], 0x000060
-    v_lshl_add_u32 v0, s1, 5, v0
     s_mov_b32 s28, exec_lo
     v_lshrrev_b32 v1, 5, v0
     v_lshlrev_b32 v1, 2, v1
@@ -1478,8 +1481,8 @@ fn family_a_with(edit: impl Fn(String) -> String) -> (NativeProgram, Site) {
             used(ResourceType::Srv, 24),
         ],
         io: StageIo::Cs(ComputeIo {
-            // One user SGPR, the group's x, 2 KiB of LDS.
-            rsrc2: 1 << 1 | 1 << 7 | 4 << 15,
+            // One user SGPR, 2 KiB of LDS.
+            rsrc2: 1 << 1 | 4 << 15,
             threads: [THREADS, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
