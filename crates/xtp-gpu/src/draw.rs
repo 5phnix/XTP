@@ -104,6 +104,12 @@ pub(crate) struct State {
     /// View heaps whose buffer views of slots picked at run time this
     /// recording brought up to date ([`State::picked_buffers`]).
     picked: Vec<usize>,
+    /// The pipeline being bound writes buffers through view-heap slots its
+    /// shaders pick at run time (`RUN_TIME_WRITES`).
+    picking_writes: bool,
+    /// The listings of [`State::picked_writes`] this recording declared
+    /// written, by view heap.
+    picked_written: Vec<(usize, std::sync::Arc<crate::descriptor::host::Picked>)>,
     /// View heaps this recording asked for a pass over the textures shaders
     /// pick by index ([`State::heap_textures`]).
     heap_textured: Vec<usize>,
@@ -957,6 +963,7 @@ impl State {
             .iter()
             .fold(0, |bits, s| bits | s.translated().host.run_time_buffers);
         if picked != 0 && crate::device::run_time_views_on() {
+            self.picking_writes = picked & xtp_shader::emit::RUN_TIME_WRITES != 0;
             self.picked_buffers(list, &p.name);
         }
         // Textures shaders may pick from the view heap by index: a pass
@@ -1100,6 +1107,15 @@ impl State {
     /// picked at run time are another matter (`texture.rs`).
     fn picked_buffers(&mut self, list: &HostList, name: &str) {
         let heap = self.host_heaps[0];
+        // Since the Codex review of 54ab53d: at every draw or dispatch, and
+        // in every list. The views the title wrote since are made, and each
+        // list refreshes what they read for its own submission (whichever
+        // the title submits first), declaring written what shaders that
+        // write through picked slots may write.
+        if heap != 0 && heap != crate::descriptor::OWN_VIEW_HEAP && self.picked.contains(&heap) {
+            self.picked_again(list, heap);
+            return;
+        }
         if heap == 0 || heap == crate::descriptor::OWN_VIEW_HEAP || self.picked.contains(&heap) {
             return;
         }
@@ -1118,7 +1134,51 @@ impl State {
             for (copy, from, to) in &picked.reads {
                 copy.refresh(list, *from, to - from);
             }
+            self.picked_writes(list, heap, &picked);
         }
+    }
+
+    /// [`State::picked_buffers`] for a list that did once already: the
+    /// views the title wrote since made, and what they read refreshed
+    /// (once per range until a title copy intervenes, `defer_refresh`).
+    fn picked_again(&mut self, list: &HostList, heap: usize) {
+        let title = crate::descriptor::heap(heap as This);
+        let Some(host) = title.host() else {
+            return;
+        };
+        if let Some(picked) = host.picked_spans(title.start) {
+            for (copy, from, to) in &picked.reads {
+                copy.refresh(list, *from, to - from);
+            }
+            self.picked_writes(list, heap, &picked);
+        }
+    }
+
+    /// For a shader that writes through view-heap slots it picks
+    /// ([`State::picking_writes`]): the spans the heap's unordered views
+    /// write, declared written once per listing and recording (after
+    /// their refresh), so that what the GPU writes goes back to title
+    /// memory and no later refresh copies title memory over it.
+    fn picked_writes(
+        &mut self,
+        list: &HostList,
+        heap: usize,
+        picked: &std::sync::Arc<crate::descriptor::host::Picked>,
+    ) {
+        if !self.picking_writes {
+            return;
+        }
+        let seen = self
+            .picked_written
+            .iter()
+            .any(|(h, p)| *h == heap && std::sync::Arc::ptr_eq(p, picked));
+        if seen {
+            return;
+        }
+        for (copy, from, to) in &picked.writes {
+            copy.gpu_writes(list, *from, to - from);
+        }
+        self.picked_written.push((heap, picked.clone()));
     }
 
     /// For shaders that pick textures from the view heap set on the host
@@ -1902,6 +1962,21 @@ impl State {
                 }
             }
             made.push((slot, first * 32));
+        }
+        // A table made afresh in the dynamic slots of a view heap with a
+        // stride table says so in its user data, for the shader to tell
+        // it from a title table there (`emit::REMAPPED_SLOT`).
+        for (slot, offset) in &mut made {
+            let remapped = match self.roots_ref(compute).get(usize::from(*slot)) {
+                Some(&Root::Table(table)) => self
+                    .heap_of(table)
+                    .and_then(|heap| heap.host())
+                    .is_some_and(|host| host.stride_table().is_some()),
+                _ => false,
+            };
+            if remapped {
+                *offset |= xtp_shader::emit::REMAPPED_SLOT << 5;
+            }
         }
         made
     }
@@ -2938,6 +3013,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        // Views kept for slots picked at run time, as `XTP_RUN_TIME_VIEWS=1`
+        // has them.
+        crate::descriptor::host::RUN_TIME_VIEWS_TEST.set(Some(true));
         let host = gpu.host();
         let cs = picking_program();
         assert_eq!(cs.run_time_buffers, xtp_shader::emit::RUN_TIME_READS);
@@ -3083,6 +3161,59 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         views.forget_picked_pass();
         assert_eq!(run(true), want);
+        // Codex review of 54ab53d, P1: the frame's first list to sweep took
+        // the frame's refresh for its own submission; one dropped unsubmitted
+        // left the frame's other lists the data of before. Each list now
+        // refreshes what it reads.
+        a.set_words(|i| 300 + i as u32);
+        b.set_words(|i| 400 + i as u32);
+        {
+            let list = TitleList::new();
+            let mut first = state(heap.0);
+            heaps(&mut first, list.host());
+            first.picked_buffers(list.host(), "test");
+        }
+        let mut fresh = vec![0; 32];
+        for l in 0..4 {
+            fresh[8 * l] = 301 + 4 * l as u32;
+            fresh[8 * l + 4] = 401 + 4 * l as u32;
+        }
+        assert_eq!(run(true), fresh, "the frame's second list");
+        // Codex review of 54ab53d, P2: what shaders wrote through views of
+        // the heap that no draw declared written went back to no title
+        // memory. For a pipeline that writes through slots it picks, the
+        // heap's unordered views are declared written by the sweep.
+        let run_writing = |writes: bool| -> Vec<u32> {
+            out.set_words(|_| 0);
+            let list = TitleList::new();
+            let l = list.host();
+            let mut state = state(heap.0);
+            heaps(&mut state, l);
+            state.picking_writes = writes;
+            state.picked_buffers(l, "test");
+            l.keep(&root);
+            l.keep(&pso);
+            let zeros = vec![0u32; cs.user_data_dwords() as usize];
+            // SAFETY: an open list with the heap and every root argument
+            // set; what it names outlives the run.
+            unsafe {
+                l.list.SetComputeRootSignature(&root);
+                l.list.SetPipelineState(&pso);
+                l.list.SetComputeRoot32BitConstants(
+                    0,
+                    zeros.len() as u32,
+                    zeros.as_ptr().cast(),
+                    0,
+                );
+                l.list.Dispatch(2, 1, 1);
+            }
+            drop(state);
+            list.run();
+            out.words()[..32].to_vec()
+        };
+        assert_eq!(run_writing(false), vec![0; 32], "written nowhere");
+        assert_eq!(run_writing(true), fresh, "declared written");
+        crate::descriptor::host::RUN_TIME_VIEWS_TEST.set(None);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

@@ -3,7 +3,7 @@
 //! R3 (structured buffers of unknown stride: through the host's runtime
 //! stride table, [`Lower::runtime_access`]).
 
-use super::descriptor::{Entry, UNKNOWN_STRIDE};
+use super::descriptor::{Entry, ODD_STRIDE, SMALL_STRIDE, UNKNOWN_STRIDE};
 use super::{Lower, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
@@ -708,13 +708,19 @@ impl<'a> Lower<'a> {
     /// host makes structured views raw then, and a structured handle over
     /// a raw view reads zeros on NVIDIA (watch.md item 160); the table's
     /// raw views are raw over raw whatever the slot holds.
+    ///
+    /// The refusals say which stride they saw (watch.md item 318): none
+    /// ([`UNKNOWN_STRIDE`], what the table translates), 1 to 3 bytes
+    /// ([`SMALL_STRIDE`]), or another off a multiple of 4 ([`ODD_STRIDE`]).
     fn runtime_stride(&self, used: Option<&UsedResource>) -> Result<bool, Why> {
         match used.map_or(0, |u| u.stride) {
             s if s >= 4 && s.is_multiple_of(4) => {
                 Ok(self.x.target.stride_table && crate::emit::raw_structured())
             }
             0 if self.x.target.stride_table => Ok(true),
-            _ => Err(UNKNOWN_STRIDE),
+            0 => Err(UNKNOWN_STRIDE),
+            1..=3 => Err(SMALL_STRIDE),
+            _ => Err(ODD_STRIDE),
         }
     }
 

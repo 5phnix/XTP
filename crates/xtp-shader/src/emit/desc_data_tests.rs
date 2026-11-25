@@ -228,6 +228,9 @@ fn run(
                 [bits as u32, (bits >> 32) as u32]
             })
             .collect();
+        // The table's header first (`emit::STRIDE_HEADER`): every slot mirrored.
+        let n = strides.len() as u32;
+        let data = [vec![0, n, 0, n], data].concat();
         roots.push((1, Root::View { srv: true, data }));
     }
     let (root, pso) = host.compute_pipeline(cs).expect("a pipeline");

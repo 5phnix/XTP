@@ -320,6 +320,24 @@ pub const RUN_TIME_READS: u8 = 1;
 /// picked at run time (they may be written).
 pub const RUN_TIME_WRITES: u8 = 2;
 
+/// Entries before slot 0's in the host's runtime stride table
+/// ([`StrideEntry`]): slot `i`'s entry is at `(i + STRIDE_HEADER) * 8`. The
+/// first holds, in its high dword, the title slots the host heap mirrors;
+/// the second, the entries after the header; both low dwords are 0, so
+/// either reads as no view. The table is a root SRV, which has no size: a
+/// shader reads an entry only below those counts, and the first otherwise.
+pub const STRIDE_HEADER: u32 = 2;
+
+/// The bit of a view-heap index (bit 31 of the byte offset in the user
+/// data) that says the host remapped it: a table the host made afresh in
+/// dynamic slots. Only for targets with the stride table, where every heap
+/// index loses it before a handle is made. Through the table, an index
+/// with it reads the entry of its dynamic slot; one without it is the
+/// title's, read only below the slots the host mirrors (a title slot past
+/// a capped host heap has no host slot, and dynamic slots hold other
+/// tables there).
+pub const REMAPPED_SLOT: u32 = 1 << 26;
+
 impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
