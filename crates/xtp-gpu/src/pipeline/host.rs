@@ -30,7 +30,7 @@ pub(crate) struct GraphicsState {
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
-    /// The targets' title formats ([`blend_without_alpha`]).
+    /// The formats used to adjust the title's blend state before host substitution.
     title_targets: D3D12_RT_FORMAT_ARRAY,
     depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
@@ -105,7 +105,7 @@ impl GraphicsState {
             match kind {
                 8 => {
                     self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned();
-                    blend_without_alpha(&mut self.blend, &self.title_targets);
+                    self.adjust_blend();
                 }
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
@@ -164,7 +164,7 @@ impl GraphicsState {
                     // The blend and the formats come in either order: each
                     // applies it, and twice changes nothing more.
                     self.title_targets = self.targets;
-                    blend_without_alpha(&mut self.blend, &self.title_targets);
+                    self.adjust_blend();
                     for f in &mut self.targets.RTFormats {
                         f.0 = crate::resource::pc_format(f.0 as u32) as i32;
                     }
@@ -177,6 +177,11 @@ impl GraphicsState {
                 _ => {}
             }
         }
+    }
+
+    fn adjust_blend(&mut self) {
+        bypass_integer_blend(&mut self.blend, &self.title_targets);
+        blend_without_alpha(&mut self.blend, &self.title_targets);
     }
 
     /// Everything the state holds, as text: part of a pipeline's name in
@@ -234,6 +239,11 @@ impl GraphicsState {
             }
             if blend.BlendEnable.as_bool() && support & BLENDABLE == 0 {
                 return Some(format!("render target format {f}: no blending"));
+            }
+            if self.blend.IndependentBlendEnable.as_bool() && blend.LogicOpEnable.as_bool() {
+                return Some(format!(
+                    "render target format {f}: no per-target logic operations"
+                ));
             }
             if !caps.samples(f, count) {
                 return Some(format!("render target format {f}: no {count} samples"));
@@ -300,6 +310,67 @@ pub(crate) struct Input {
 /// The console's own primitive topology types.
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
+
+/// Typed integer colour formats. Depth/stencil views and typeless resources
+/// are not integer colour targets.
+fn integer_target(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// GFX10 sets CB_COLORn_INFO.BLEND_BYPASS for UINT and SINT. A shared
+/// descriptor only needs splitting when bound targets need different enables.
+fn bypass_integer_blend(blend: &mut D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) {
+    let formats = &targets.RTFormats[..targets.NumRenderTargets.min(8) as usize];
+    let disable = |t: &mut D3D12_RENDER_TARGET_BLEND_DESC| {
+        t.BlendEnable = false.into();
+        t.LogicOpEnable = false.into();
+    };
+    if !blend.IndependentBlendEnable.as_bool() {
+        let shared = blend.RenderTarget[0];
+        if !(shared.BlendEnable.as_bool() || shared.LogicOpEnable.as_bool())
+            || !formats.iter().any(|&f| integer_target(f))
+        {
+            return;
+        }
+        if formats
+            .iter()
+            .all(|&f| f == DXGI_FORMAT_UNKNOWN || integer_target(f))
+        {
+            disable(&mut blend.RenderTarget[0]);
+            return;
+        }
+        blend.RenderTarget = [shared; 8];
+        blend.IndependentBlendEnable = true.into();
+    }
+    for (&f, t) in formats.iter().zip(&mut blend.RenderTarget) {
+        if integer_target(f) {
+            disable(t);
+        }
+    }
+}
 
 /// A pipeline's blending for render targets of title formats `targets`,
 /// with those whose stand-in has an alpha the title's format lacks
@@ -1527,7 +1598,7 @@ mod tests {
     }
 
     const HOST: Fake = Fake {
-        targets: &[28, 57],
+        targets: &[28, 54, 57, 62, 64],
         blend: &[28],
         depth: &[40],
         vertex: &[2, 28],
@@ -1554,12 +1625,12 @@ mod tests {
             state(&[28], 55).refusal(&HOST).as_deref(),
             Some("depth format 55: no depth-stencil targets")
         );
-        // Blending a target that cannot blend (an integer format).
-        let mut blended = state(&[28, 57], 0);
+        // A floating-point target on a host that cannot blend it.
+        let mut blended = state(&[28, 54], 0);
         blended.blend.RenderTarget[0].BlendEnable = true.into();
         assert_eq!(
             blended.refusal(&HOST).as_deref(),
-            Some("render target format 57: no blending")
+            Some("render target format 54: no blending")
         );
         blended.blend.IndependentBlendEnable = true.into();
         assert_eq!(blended.refusal(&HOST), None, "only target 0 blends");
@@ -1577,6 +1648,212 @@ mod tests {
         assert_eq!(
             inputs.refusal(&HOST).as_deref(),
             Some("vertex format 86: not a vertex buffer format")
+        );
+    }
+
+    fn blend_stream(
+        formats: &[u32],
+        blend: D3D12_BLEND_DESC,
+        formats_first: bool,
+    ) -> GraphicsState {
+        #[repr(C)]
+        struct Sub<T>(u32, T);
+        let formats = Sub(15, state(formats, 0).targets);
+        let blend = Sub(8, blend);
+        let mut objects = [
+            (formats.0, std::ptr::from_ref(&formats).cast()),
+            (blend.0, std::ptr::from_ref(&blend).cast()),
+        ];
+        if !formats_first {
+            objects.reverse();
+        }
+        let mut g = GraphicsState::default();
+        for (kind, at) in objects {
+            // SAFETY: both subobjects have a four-byte-aligned payload at +4.
+            unsafe { g.read(kind, at) };
+        }
+        g
+    }
+
+    #[test]
+    fn integer_targets_bypass_only_their_own_blend_and_logic_enables() {
+        let mut shared = GraphicsState::default().blend;
+        shared.AlphaToCoverageEnable = true.into();
+        shared.RenderTarget[0].BlendEnable = true.into();
+        shared.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+        shared.RenderTarget[0].RenderTargetWriteMask = 5;
+        let t = shared.RenderTarget[0];
+        let off = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: false.into(),
+            ..t
+        };
+        for first in [true, false] {
+            for (formats, integer, colour) in [([57, 0, 28], 0, 2), ([28, 0, 64], 2, 0)] {
+                let g = blend_stream(&formats, shared, first);
+                assert_eq!(g.refusal(&HOST), None);
+                assert!(g.blend.IndependentBlendEnable.as_bool());
+                assert!(g.blend.AlphaToCoverageEnable.as_bool());
+                assert_eq!(g.blend.RenderTarget[integer], off);
+                assert_eq!(g.blend.RenderTarget[colour], t);
+            }
+            let mut logic = shared;
+            logic.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+                LogicOpEnable: true.into(),
+                LogicOp: D3D12_LOGIC_OP_XOR,
+                ..off
+            };
+            let all = blend_stream(&[0, 62, 64], logic, first);
+            assert_eq!(all.refusal(&HOST), None);
+            assert!(!all.blend.IndependentBlendEnable.as_bool());
+            assert_eq!(
+                all.blend.RenderTarget[0],
+                D3D12_RENDER_TARGET_BLEND_DESC {
+                    LogicOp: D3D12_LOGIC_OP_XOR,
+                    ..off
+                }
+            );
+            // D3D12 cannot express a logic operation on just the UNORM target.
+            let mixed = blend_stream(&[62, 28], logic, first);
+            assert_eq!(
+                mixed.refusal(&HOST).as_deref(),
+                Some("render target format 28: no per-target logic operations")
+            );
+
+            let mut independent = shared;
+            independent.IndependentBlendEnable = true.into();
+            independent.RenderTarget[1] = logic.RenderTarget[0];
+            let g = blend_stream(&[28, 62], independent, first);
+            independent.RenderTarget[1].LogicOpEnable = false.into();
+            assert_eq!(g.blend, independent);
+            assert_eq!(g.refusal(&HOST), None);
+        }
+    }
+
+    #[test]
+    fn r8_uint_pipeline_writes_the_pixel_shader_value_unblended() {
+        use crate::object::{This, slot};
+        use crate::resource::tests_support::{committed, read_back, target};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::{
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, Fxc::D3DCompile,
+        };
+        use windows::core::s;
+        let Some(host) =
+            crate::testgpu::device("r8_uint_pipeline_writes_the_pixel_shader_value_unblended")
+        else {
+            return;
+        };
+        let shader = |stage, kind, source: &str, profile| {
+            let mut blob = None;
+            // SAFETY: the source lives through compilation and the blob owns its bytes.
+            let dxil = unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    PCSTR::null(),
+                    None,
+                    None,
+                    s!("main"),
+                    profile,
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .unwrap();
+                let blob = blob.unwrap();
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+                .to_vec()
+            };
+            Arc::new(Shader {
+                stage,
+                hash: format!("r8-uint-{stage}"),
+                container: Vec::new(),
+                native: Default::default(),
+                translated: std::sync::OnceLock::from(Some(Translated {
+                    host: xtp_shader::emit::HostShader {
+                        stage: kind,
+                        dxil,
+                        user_data: vec![],
+                        samplers: vec![],
+                        static_samplers: vec![],
+                        root_cbvs: vec![],
+                        root_srvs: vec![],
+                        stride_table: false,
+                        run_time_buffers: 0,
+                    },
+                    used: vec![],
+                    wave64: false,
+                })),
+            })
+        };
+        let vs = shader(
+            "vertex",
+            xtp_shader::HwStage::Vs,
+            "float4 main(uint id : SV_VertexID) : SV_Position {
+                return float4(id == 1 ? 3 : -1, id == 2 ? 3 : -1, 0, 1);
+            }",
+            s!("vs_5_1"),
+        );
+        let ps = shader(
+            "pixel",
+            xtp_shader::HwStage::Ps,
+            "uint main() : SV_Target { return 73u; }",
+            s!("ps_5_1"),
+        );
+        let mut blend = GraphicsState::default().blend;
+        blend.RenderTarget[0].BlendEnable = true.into();
+        // With these factors the destination would keep its clear value.
+        blend.RenderTarget[0].SrcBlend = D3D12_BLEND_ZERO;
+        blend.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+        let mut g = blend_stream(&[62], blend, false);
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        g.depth.DepthEnable = false.into();
+        let p = HostPipeline::new(&[vs, ps], Some(&g)).expect("R8_UINT pipeline");
+
+        let image = committed(&target(2, 1, 62));
+        let texture = crate::resource::host_resource(image).expect("R8_UINT texture");
+        let rtv = host.rtv(texture, None);
+        let list = crate::testgpu::TitleList::new();
+        let l = &list.host().list;
+        let render = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        // SAFETY: the pipeline, target and view live through the draw and readback.
+        unsafe {
+            l.ResourceBarrier(&[crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATE_COMMON,
+                render,
+            )]);
+            l.ClearRenderTargetView(rtv, &[11.0; 4], None);
+            l.OMSetRenderTargets(1, Some(&rtv), false, None);
+            l.SetGraphicsRootSignature(&p.root);
+            l.SetPipelineState(&p.pso);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            l.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: 2.0,
+                Height: 1.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            l.RSSetScissorRects(&[RECT {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            }]);
+            l.DrawInstanced(3, 1, 0, 0);
+        }
+        list.run();
+        let bytes = read_back(host, texture, render.0 as u32);
+        slot::<extern "system" fn(This) -> u32>(image, 0x10)(image);
+        assert_eq!(
+            &bytes[..2],
+            &[73, 11],
+            "drawn pixel and untouched neighbour"
         );
     }
 
