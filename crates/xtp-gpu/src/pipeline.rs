@@ -265,6 +265,20 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The compute program of a title pipeline, made or not (`None` for a null
+/// pipeline or a graphics one): how [`crate::rt_standin`] tells a dropped
+/// dispatch's program, which has no host pipeline to ask.
+#[cfg(windows)]
+pub(crate) fn compute_shader<'a>(this: This) -> Option<&'a Shader> {
+    if this.is_null() {
+        return None;
+    }
+    match pipeline(this).shaders.as_slice() {
+        [shader] if shader.stage == "compute" => Some(shader),
+        _ => None,
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
