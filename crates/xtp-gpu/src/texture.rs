@@ -3294,7 +3294,10 @@ mod tests {
         // SAFETY: pages of our allocation; nothing reads them meanwhile.
         assert_ne!(unsafe { VirtualFree(at as *mut _, LEN, MEM_DECOMMIT) }, 0);
         let list = host.new_list().unwrap();
-        assert!(!upload(&list, resource, texture), "a copy from a blank buffer");
+        assert!(
+            !upload(&list, resource, texture),
+            "a copy from a blank buffer"
+        );
         list.close();
         host.execute(&[&list]);
         host.drain();

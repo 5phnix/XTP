@@ -4193,10 +4193,7 @@ mod tests {
         assert_eq!(pass_staging_of(Some("65536")), PASS_STAGING_MOST, "capped");
         // From 2^44 MiB on: bounded before the shift, not wrapped to 0
         // (Codex's review of c44a716, 5).
-        assert_eq!(
-            pass_staging_of(Some("17592186044416")),
-            PASS_STAGING_MOST
-        );
+        assert_eq!(pass_staging_of(Some("17592186044416")), PASS_STAGING_MOST);
         assert_eq!(
             pass_staging_of(Some(&u64::MAX.to_string())),
             PASS_STAGING_MOST
