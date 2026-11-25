@@ -2,6 +2,7 @@
 
 mod conventions;
 mod frames;
+mod gfx10_corpus;
 mod play;
 mod policy;
 mod pr_check;
@@ -96,6 +97,20 @@ enum Cmd {
         #[arg(long)]
         no_precook: bool,
     },
+    /// Generate the GFX10 decoder conformance corpus from LLVM MC AMDGPU tests.
+    Gfx10Corpus {
+        /// Optional local directory containing `llvm/test/MC/AMDGPU/*.s`.
+        /// When omitted, fetches the pinned LLVM release files over HTTPS.
+        #[arg(long, value_name = "DIR")]
+        llvm_dir: Option<PathBuf>,
+        /// Output directory for generated corpus shards (default:
+        /// `crates/xtp-shader/tests/data`).
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<PathBuf>,
+        /// Keep all unique encodings instead of one per mnemonic, length and selector combination.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -156,6 +171,11 @@ fn main() -> Result<()> {
                 no_precook,
             },
         ),
+        Cmd::Gfx10Corpus {
+            llvm_dir,
+            out_dir,
+            full,
+        } => gfx10_corpus::run(&root, llvm_dir.as_deref(), out_dir.as_deref(), full),
     }
 }
 
