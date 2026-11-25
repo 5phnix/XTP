@@ -208,7 +208,8 @@ The verification session is in section 7.
 ## 7. Verification
 
 - The RT GPU tests on the L4 (NVIDIA, each test in a process of its
-  own, at d4192fa): 30 of 30 pass, no GPU reset logged.
+  own, this change before the test fix below): 30 of 30 pass, no GPU
+  reset logged.
 - On WARP (the build farm), the `rt` tests pass, alone and in parallel
   (8 runs of 80). In parallel, the existing
   `rt_tlas_rebuilds_reuse_a_result_nothing_holds` failed 3 times in 8
@@ -217,6 +218,6 @@ The verification session is in section 7.
   the longer suite made them overlap. A try that a release covering its
   TLAS cut into now runs again; its assertions are unchanged.
 - A world session on the L4 (`blasin-verify`, autopilot, 900 s, no
-  DRED) was started from 3a6cf51 when this was written. Its counts (BLAS
+  DRED) was started from this change's code when this was written. Its counts (BLAS
   refused on the GPU and when recorded, GPU loss, captured frames) are
   reported on task 39e97d58.
