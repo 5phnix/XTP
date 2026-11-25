@@ -28,6 +28,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod frameprobe;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

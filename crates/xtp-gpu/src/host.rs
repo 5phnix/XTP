@@ -1255,6 +1255,8 @@ impl Host {
     pub(crate) fn submit(&self, runs: &[&HostList]) {
         #[cfg(feature = "diagnostics")]
         crate::passdump::submitted(runs);
+        #[cfg(feature = "diagnostics")]
+        crate::frameprobe::submitted(runs);
         // Light the lists read through views in another format, decoded
         // first (`resource::alias_copy`).
         crate::resource::run_decodes(self);
