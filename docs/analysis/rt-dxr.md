@@ -15,7 +15,7 @@ Their own AnyPS5 already runs RDNA2 traversal loops on host ray queries
 ## 1. Summary
 
 - **The starting point is AnyPS5's hardware ray tracing** (section 2).
-  It recognises the title's traversal loop around each BVH intersection,
+  It recognises a guest program's traversal loop around each BVH intersection,
   runs a host ray query instead, and hands the code after the loop what
   the walk would have produced. Each result is classed by kind: hit,
   t, word, instance, u, v, node. The meaning of the loop's outputs is
@@ -47,8 +47,8 @@ Their own AnyPS5 already runs RDNA2 traversal loops on host ray queries
     walked per lane.
 
   Both keep a short stack in LDS, cap the walk with an iteration
-  counter (0xfffe where read), test instance masks, cull through instance flags and
-  handle triangle pairs. The gathers probably run alpha tests inside the
+  counter (0xfffe where read), test instance masks, cull through
+  instance flags and handle triangle pairs. The gathers probably run alpha tests inside the
   loop (per-candidate memory reads and texture samples between
   intersections).
 - **The prototype's program is `32ed072b9f845048`**, the local lights'
