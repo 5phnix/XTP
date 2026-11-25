@@ -478,7 +478,10 @@ impl<'a> Lower<'a> {
         };
         if typed
             && let Some((desc, _)) = built
-            && used.is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
+            // Pour un TBUFFER sur SRV, le format vient de l'instruction.
+            // Le chemin de lecture brut existant le décode déjà.
+            && used.is_some_and(|u| u.kind == ResourceType::Uav
+                || u.kind == ResourceType::Srv && format.is_none())
         {
             // La vue hôte reste brute. Les canaux de 32 bits conservent
             // leur représentation pour FLOAT, UINT et SINT.

@@ -402,6 +402,29 @@ fn root_uav_program(words: &[u32], threads: [u32; 3], wave64: bool) -> NativePro
 
 #[cfg(windows)]
 #[test]
+fn tbuffer_keeps_its_instruction_format_on_a_root_srv() {
+    let words = [
+        PTR.as_slice(),
+        &[
+            0xF404_0201,
+            0xFA00_0000,
+            0xBE8A_03C1,
+            0xBE8B_0380,
+            0xE828_1000,
+            0x8002_0200,
+            END, // Le format 8_UINT est dans l'instruction.
+        ],
+    ]
+    .concat();
+    let mut n = root_uav_program(&words, [1; 3], false);
+    n.used[0].kind = ResourceType::Srv;
+    let bytes = crate::dxbc::build(&[]);
+    let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
+    assert_eq!(cs.root_srvs, [3]);
+}
+
+#[cfg(windows)]
+#[test]
 fn phi_reads_the_spilled_word_only_on_the_edge_that_keeps_it() {
     use super::host::{Dispatch, Host, Root, View};
     let words = [
