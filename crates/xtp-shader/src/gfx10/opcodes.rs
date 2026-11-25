@@ -1,7 +1,7 @@
 // LLVM MC encodings (llvm-project llvmorg-19.1.7, Apache-2.0 WITH
 // LLVM-exception) supply VOP3P 0x018 and MIMG 0x061 and 0x0e8..=0x0eb.
-// MIMG 0x0ec..=0x0ef are the offset forms identified in review, following
-// the same opcode pattern as the coarse offset pairs in LLVM MC.
+// MIMG 0x0ec..=0x0ef (image_sample_*cd*_o_g16) are the GFX10 opcodes that
+// LLVM's llvm/lib/Target/AMDGPU/MIMGInstructions.td gives at the same tag.
 // The remaining rows come from Mesa's src/amd/compiler/aco_opcodes.py
 // (tag mesa-22.3.0, GFX10 column), which carries this notice:
 //

@@ -970,9 +970,10 @@ impl<'a> Lower<'a> {
                     sampler.sample(self, "sampleBias.f32", 61, &mut args)
                 }
                 63 => {
-                    // The coarse forms (`_cd`, including `_g16`) compute one
-                    // level per quad. SampleGrad selects a level per lane,
-                    // which agrees when the gradients match across the quad.
+                    // shortcut: the coarse forms (`_cd`, including `_g16`)
+                    // compute one level per quad; SampleGrad selects a level
+                    // per lane, which agrees when the gradients match across
+                    // the quad.
                     let mut g = vec![fu; 6];
                     if let Some(face) = cube_face {
                         // The face coordinates' derivatives, as the
