@@ -384,7 +384,10 @@ mod tests {
     #[test]
     fn pipelines_are_loaded_and_stored_side_by_side() {
         let test = "pipeline::library::tests::pipelines_are_loaded_and_stored_side_by_side";
-        if crate::testgpu::device(test).is_none() || library().is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        if library().is_none() {
             return;
         }
         let shaders: Vec<_> = [1, 2, 4, 8]

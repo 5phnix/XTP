@@ -1869,9 +1869,10 @@ mod tests {
 
     fn check_r8_uint_draw(test: &str, blend: D3D12_BLEND_DESC, expected: u8) {
         use windows::Win32::Foundation::RECT;
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let mut g = blend_stream(&[62], blend, false);
         g.depth.DepthEnable = false.into();
         let bytes = render_r8_uint(host, g, 2, |list, _| {
@@ -1917,9 +1918,10 @@ mod tests {
         use crate::object::{This, slot};
         use windows::Win32::Foundation::RECT;
         let test = "depth_bounds_filter_stored_depth";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !host.depth_bounds {
             crate::testgpu::skip(test, "DepthBoundsTestSupported = FALSE");
             return;
