@@ -750,9 +750,10 @@ fn pixel_lane_reads_are_quad_reads_or_wave_operations_with_helper_lanes() {
     assert!(!ops.contains("isHelperLane"), "{ops}");
 }
 
-/// A pixel program with wave operations declares SM 6.7 (for
-/// `WaveOpsIncludeHelperLanes`); one with quad reads only keeps SM 6.6
-/// and its DXIL, as every other program does.
+/// A pixel program with wave operations declares SM 6.7 and
+/// `WaveOpsIncludeHelperLanes` (`"waveops-include-helper-lanes"` on
+/// `main`); one with quad reads only keeps SM 6.6 and its DXIL, as every
+/// other program does.
 #[test]
 fn only_pixel_programs_with_wave_operations_take_sm_6_7() {
     let cases = [
@@ -768,13 +769,21 @@ fn only_pixel_programs_with_wave_operations_take_sm_6_7() {
         ),
         ("section_max", wave32(section_max()), (6, 7)),
     ];
-    let wrong: Vec<String> = cases
-        .iter()
-        .filter_map(|(name, p, model)| {
-            let got = shader_model(&translate(p).0);
-            (got != *model).then(|| format!("{name}: SM {got:?}, not {model:?}"))
-        })
-        .collect();
+    let mut wrong = Vec::new();
+    for (name, p, model) in &cases {
+        let ps = translate(p).0;
+        let got = shader_model(&ps);
+        if got != *model {
+            wrong.push(format!("{name}: SM {got:?}, not {model:?}"));
+        }
+        // `main`'s attribute, where the SDK's dxc.exe lists the module.
+        if let Some(listing) = super::shader::tests::listing(&ps) {
+            let has = listing.contains("\"waveops-include-helper-lanes\"");
+            if has != (*model == (6, 7)) {
+                wrong.push(format!("{name}: waveops-include-helper-lanes {has}"));
+            }
+        }
+    }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
