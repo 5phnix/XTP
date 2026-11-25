@@ -293,7 +293,8 @@ mod tests {
     /// it ran empty). One more record follows them and must stay as
     /// written. `None` without a host GPU (`test`'s skip is reported).
     fn clamped(test: &str, kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
-        let host = device(test)?;
+        let gpu = device(test)?;
+        let host = gpu.host();
         // Words in a record of `kind`.
         let per: usize = match kind {
             0 => 4,

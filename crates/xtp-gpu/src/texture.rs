@@ -1674,9 +1674,10 @@ mod tests {
     #[test]
     fn a_texture_is_copied_once_until_its_memory_changes() {
         let test = "texture::tests::a_texture_is_copied_once_until_its_memory_changes";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !predication() {
             return;
         }
@@ -1727,7 +1728,6 @@ mod tests {
         sample_in(host, resource, 2);
         assert_eq!(decided(&staging), [true, false, false, true, false]);
         assert!(texels().iter().all(|&b| b == 0x33));
-        assert_eq!(host.log_messages(), None);
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
     }
@@ -1738,9 +1738,9 @@ mod tests {
     #[test]
     fn another_host_copy_is_copied_into() {
         let test = "texture::tests::another_host_copy_is_copied_into";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let [first, second] = [0, 1].map(|_| committed(&sampled(16, 16, 28)));
         let started = std::time::Instant::now();
         while [first, second]
@@ -1791,9 +1791,10 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
         };
         let test = "texture::tests::a_texture_in_a_view_is_hashed_only_after_a_write";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || !predication() {
             return;
         }
@@ -1869,7 +1870,6 @@ mod tests {
         assert_eq!(hashes(&staging), 3);
         assert_eq!(decided(&staging).last(), Some(&true));
         assert!(texels().iter().all(|&b| b == 0x66));
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
@@ -1887,10 +1887,12 @@ mod tests {
     /// submissions are counted with timestamps off too (the default here).
     #[test]
     fn a_list_named_twice_in_a_submission_copies() {
+        crate::testgpu::known_layer_errors(&[553], "#45");
         let test = "texture::tests::a_list_named_twice_in_a_submission_copies";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !predication() {
             return;
         }
@@ -2116,9 +2118,10 @@ mod tests {
     #[test]
     fn a_texture_is_hashed_as_it_is_detiled() {
         let test = "texture::tests::a_texture_is_hashed_as_it_is_detiled";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || !predication() {
             return;
         }
@@ -2146,7 +2149,6 @@ mod tests {
         sample_in(host, resource, 1);
         let texels = texels_of(host, texture);
         assert!(texels.iter().all(|&b| b == 0x22), "{:x?}", &texels[..16]);
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
@@ -2163,9 +2165,10 @@ mod tests {
     #[test]
     fn a_write_no_guard_saw_is_found_by_the_safety_net() {
         let test = "texture::tests::a_write_no_guard_saw_is_found_by_the_safety_net";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || !predication() || net_budget() == 0 {
             return;
         }
@@ -2220,7 +2223,6 @@ mod tests {
         }
         assert_eq!(hashes(&staging), hashed);
         assert_eq!(staging.missed.load(Ordering::Relaxed), 1);
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
@@ -2239,9 +2241,10 @@ mod tests {
     #[test]
     fn a_look_before_an_upload_tells_written_memory() {
         let test = "texture::tests::a_look_before_an_upload_tells_written_memory";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || verify_guards() || !predication() {
             return;
         }
@@ -2286,7 +2289,6 @@ mod tests {
         host.drain();
         assert_eq!(memory_change(plain), Change::No);
         assert_eq!(staged_bytes(plain), None, "its staging buffer goes");
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         for r in [resource, plain] {
@@ -2306,9 +2308,10 @@ mod tests {
     #[ignore = "benchmark"]
     fn memory_change_costs() {
         let test = "texture::tests::memory_change_costs";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || verify_guards() {
             return;
         }
@@ -2478,9 +2481,10 @@ mod tests {
     #[test]
     fn late_mips_and_other_slices_are_found_changed() {
         let test = "texture::tests::late_mips_and_other_slices_are_found_changed";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || verify_guards() || !predication() {
             return;
         }
@@ -2530,7 +2534,6 @@ mod tests {
             crate::watch::title_memory_remapped(view, LEN);
             let _ = other;
         }
-        assert_eq!(host.log_messages(), None);
     }
 
     /// Texture writes follow submission order, not recording order
@@ -2556,9 +2559,10 @@ mod tests {
     fn texture_writes_follow_submission_order() {
         use crate::testgpu::TitleList;
         let test = "texture::tests::texture_writes_follow_submission_order";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !predication() {
             return;
         }

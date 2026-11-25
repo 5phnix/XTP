@@ -2761,9 +2761,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     #[test]
     fn a_missing_stride_table_drops_the_draw() {
         let test = "draw::tests::a_missing_stride_table_drops_the_draw";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let list = crate::testgpu::TitleList::new();
         let l = list.host();
         // No view heap of the title's: XTP's own, which has no table.
@@ -2870,9 +2870,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         use crate::testgpu::{TitleBuffer, TitleList};
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let test = "draw::tests::buffer_views_of_slots_picked_at_run_time_are_made_and_read";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let cs = picking_program();
         assert_eq!(cs.run_time_buffers, xtp_shader::emit::RUN_TIME_READS);
         // Root signature: the user data, the heaps indexed directly.
@@ -3174,9 +3175,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         use crate::resource::tests_support::{committed, sampled, target};
         use crate::testgpu::{TitleBuffer, TitleList};
         let test = "draw::tests::textures_of_slots_picked_at_run_time_are_made_and_kept_up_to_date";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if crate::descriptor::host::heap_textures_budget().is_none() {
             return;
         }
@@ -3336,7 +3338,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         list.run();
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         crate::object::slot::<Release>(object, 0x10)(object);
@@ -3366,9 +3367,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         const N: u32 = 2048;
         const STEP: u64 = 1 << 16;
         let test = "draw::tests::heap_texture_costs";
-        if crate::testgpu::device(test).is_none()
-            || crate::descriptor::host::heap_textures_budget().is_none()
-        {
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        if crate::descriptor::host::heap_textures_budget().is_none() {
             return;
         }
         // SAFETY: a fresh reservation of our own.
@@ -3730,10 +3732,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// buffer's end either way; unset, it reads zeros.
     #[test]
     fn root_srv_tables_read_their_range() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
         let test = "draw::tests::root_srv_tables_read_their_range";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let reader = Reader::new(host, false);
         let heap = TestHeap::views(16);
         let src = TitleBuffer::new(1 << 16);
@@ -3776,10 +3780,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// reads what a dispatch recorded before it wrote there.
     #[test]
     fn copied_root_srvs_see_what_the_list_wrote_before() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
         let test = "draw::tests::copied_root_srvs_see_what_the_list_wrote_before";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let reader = Reader::new(host, false);
         let kernel = Kernel::new(host);
         let heap = TestHeap::views(16);
@@ -3800,10 +3806,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// that heap for draws without root SRVs until the title binds one.
     #[test]
     fn lists_without_a_view_heap_use_xtps_own() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
         let test = "draw::tests::lists_without_a_view_heap_use_xtps_own";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let reader = Reader::new(host, false);
         let src = TitleBuffer::new(1 << 16);
         src.set_words(pattern);
@@ -3829,9 +3837,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     #[test]
     fn root_srv_views_are_shared_across_lists_and_given_back() {
         let test = "draw::tests::root_srv_views_are_shared_across_lists_and_given_back";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = TestHeap::views(16);
         let views = crate::descriptor::heap(heap.0).host().expect("a host heap");
         let src = TitleBuffer::new(1 << 16);
@@ -3891,10 +3899,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// (on the GPU when 256-byte aligned, from title memory when not).
     #[test]
     fn root_cbvs_read_inside_memory_the_list_holds() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
         let test = "draw::tests::root_cbvs_read_inside_memory_the_list_holds";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let reader = Reader::new(host, true);
         let src = TitleBuffer::new(1 << 16);
         src.set_words(pattern);
@@ -3965,9 +3975,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     #[test]
     fn dropped_dispatches_mark_the_list_for_one_barrier() {
         let test = "draw::tests::dropped_dispatches_mark_the_list_for_one_barrier";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let list = TitleList::new();
         let mut state = State::default();
         assert!(!state.dropped_dispatch);
@@ -3984,9 +3994,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     #[test]
     fn indirect_executions_without_records_draw_nothing() {
         let test = "draw::tests::indirect_executions_without_records_draw_nothing";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let list = TitleList::new();
         let args = TitleBuffer::new(256);
         let mut state = State::default();
@@ -4386,9 +4396,10 @@ float4 ps(V v) : SV_Target { return v.color; }
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let test = "draw::tests::indirect_rectangles_draw_from_the_lists_arguments";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let painter = Painter::new(host, true);
         let (_positions, _colors, views) = cell_rectangles();
         let args = title_records(&[[6, 1, 0, 0], [3, 1, 6, 0], [3, 1, 9, 0]]);
@@ -4456,9 +4467,10 @@ float4 ps(V v) : SV_Target { return v.color; }
             .unwrap_or_else(|e| e.into_inner());
         let test =
             "draw::tests::indirect_rectangles_without_vertex_inputs_draw_their_first_triangles";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let painter = Painter::new(host, false);
         let args = title_records(&[[3, 1, 6, 0], [6, 1, 9, 0]]);
         let args_copy = args.shadow();
@@ -4504,9 +4516,9 @@ float4 ps(V v) : SV_Target { return v.color; }
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let test = "draw::tests::a_lists_rectangle_scratch_waits_for_its_recording";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let (_positions, _colors, views) = cell_rectangles();
         let args = title_records(&[[3, 1, 0, 0]]);
         let args_copy = args.shadow();

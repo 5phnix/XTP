@@ -2330,7 +2330,8 @@ mod tests {
         #[test]
         fn buffer_copies_run_between_dispatches_in_list_order() {
             let test = "list::tests::gpu::buffer_copies_run_between_dispatches_in_list_order";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let [a, b, c] = [(); 3].map(|()| TitleBuffer::new(256));
             a.set_words(|i| 0xdead_0000 + i as u32);
@@ -2357,8 +2358,10 @@ mod tests {
         /// source were read whole first.
         #[test]
         fn resource_and_memory_copies_run_on_the_gpu() {
+            crate::testgpu::known_layer_errors(&[538], "#45");
             let test = "list::tests::gpu::resource_and_memory_copies_run_on_the_gpu";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let (d, e) = (TitleBuffer::new(512), TitleBuffer::new(512));
             let at = d.address();
@@ -2382,9 +2385,9 @@ mod tests {
         #[test]
         fn copies_without_host_copies_stay_on_the_cpu() {
             let test = "list::tests::gpu::copies_without_host_copies_stay_on_the_cpu";
-            if device(test).is_none() {
+            let Some(_gpu) = device(test) else {
                 return;
-            }
+            };
             let (a, b) = (TitleBuffer::new(256), TitleBuffer::new(256));
             a.set_words(|i| 3 * i as u32);
             let list = TitleList::new();
@@ -2400,7 +2403,8 @@ mod tests {
         #[test]
         fn memory_writes_reach_later_commands_of_the_list() {
             let test = "list::tests::gpu::memory_writes_reach_later_commands_of_the_list";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let (w, c) = (TitleBuffer::new(256), TitleBuffer::new(256));
             w.set_words(|_| 0x1111_1111);
@@ -2519,7 +2523,8 @@ mod tests {
         #[test]
         fn the_fidelityfx_upscale_is_bilinear_jittered_and_stays_in_its_regions() {
             let test = "list::tests::gpu::the_fidelityfx_upscale_is_bilinear_jittered_and_stays_in_its_regions";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let (color, plain, jittered) = (texture(8, 2), texture(16, 6), texture(16, 6));
             let list = TitleList::new();
             for (i, red) in [0u8, 64, 128, 192].into_iter().enumerate() {
@@ -2597,7 +2602,8 @@ mod tests {
         #[test]
         fn uav_clears_of_a_texture_go_through_host_views() {
             let test = "list::tests::gpu::uav_clears_of_a_texture_go_through_host_views";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let image = texture(4, 4);
             let heap = crate::descriptor::TestHeap::views(4);
             let mut cpu = [0u64; 4];
@@ -2640,9 +2646,9 @@ mod tests {
         #[test]
         fn uav_clears_of_a_buffer_reach_title_memory() {
             let test = "list::tests::gpu::uav_clears_of_a_buffer_reach_title_memory";
-            if device(test).is_none() {
+            let Some(_gpu) = device(test) else {
                 return;
-            }
+            };
             const R32_UINT: u32 = 42;
             const R32_TYPELESS: u32 = 39;
             const BUFFER: u32 = 1;
@@ -2700,9 +2706,9 @@ mod tests {
         #[test]
         fn uav_clears_of_typed_buffers_write_the_documented_bits() {
             let test = "list::tests::gpu::uav_clears_of_typed_buffers_write_the_documented_bits";
-            if device(test).is_none() {
+            let Some(_gpu) = device(test) else {
                 return;
-            }
+            };
             const BUFFER: u32 = 1;
             // (view format, values, the word each of the 4 elements holds)
             let uint: [(u32, [u32; 4], u32); 7] = [
@@ -2952,7 +2958,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         #[test]
         fn dispatch_x_runs_thread_counts_as_whole_groups() {
             let test = "list::tests::dispatch_x_gpu::dispatch_x_runs_thread_counts_as_whole_groups";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let (root, pso) = counting(host);
             let group = Some([8, 4, 1]);
             // Counts, flags, then the threads run and the extent they cover.

@@ -3272,9 +3272,9 @@ mod tests {
     fn views_off_their_elements_give_the_table_their_bytes() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::views_off_their_elements_give_the_table_their_bytes";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let buffer = TitleBuffer::new(1 << 16);
         let copy = buffer.shadow();
@@ -3728,9 +3728,9 @@ mod tests {
         use crate::testgpu::TitleBuffer;
         let test =
             "descriptor::host::tests::shared_views_are_made_once_and_make_room_when_slots_run_out";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new(false, 4).expect("a host view heap");
         let buffer = TitleBuffer::new(1 << 16);
         let copy = buffer.shadow();
@@ -3772,9 +3772,9 @@ mod tests {
     fn buffer_slots_get_their_host_copy_made_first() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::buffer_slots_get_their_host_copy_made_first";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = crate::descriptor::TestHeap::views(4);
         let host = crate::descriptor::heap(heap.0).host().expect("a host heap");
         let buffer = TitleBuffer::new(1 << 16);
@@ -3810,9 +3810,9 @@ mod tests {
         use crate::object::{S_OK, This, guid, slot};
         use crate::resource::tests_support::target;
         let test = "descriptor::host::tests::placed_texture_slots_follow_their_replacement";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         const KIB_64: u64 = 1 << 16;
         // Freed only once nothing is placed in it any more (a failing
         // assertion leaks it rather than leave textures over freed memory).
@@ -3928,9 +3928,9 @@ mod tests {
     fn stride_table_entries_follow_the_views() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::stride_table_entries_follow_the_views";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let none = HostHeap::new(false, 8).expect("a host view heap");
         assert!(heap.stride_table().is_some() && none.stride_table().is_none());
@@ -3980,9 +3980,9 @@ mod tests {
     fn raw_views_a_list_in_flight_may_read_are_kept_until_it_has_run() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::raw_views_a_list_in_flight_may_read_are_kept_until_it_has_run";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let buffer = TitleBuffer::new(1 << 12);
         let pool = heap.alias_base();
@@ -4016,9 +4016,9 @@ mod tests {
     fn buffer_views_are_cut_to_their_host_copy() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::buffer_views_are_cut_to_their_host_copy";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let buffer = TitleBuffer::new(1 << 16);
         let copy = buffer.shadow();
@@ -4201,11 +4201,13 @@ mod tests {
     /// load at 4 and the store at 8 are past the element: 0, dropped).
     #[test]
     fn a_translated_program_reads_and_writes_through_the_heaps_table() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::{TitleBuffer, TitleList};
         let test = "descriptor::host::tests::a_translated_program_reads_and_writes_through_the_heaps_table";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let cs = unknown_stride_program();
         let (root, pso) = table_pipeline(&host.device, &cs);
@@ -4288,9 +4290,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
         let test = "descriptor::host::tests::root_srv_views_read_zeros_past_their_end";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let heap = HostHeap::new(false, 4).expect("a host view heap");
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call.
