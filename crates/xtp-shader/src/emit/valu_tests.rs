@@ -224,42 +224,6 @@ pub(super) fn run_cases(
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-#[test]
-fn legacy_mad_mac_round_product_and_preserve_zero_rule() {
-    let a = 1.0 + 1.0 / 4096.0;
-    let c = -(1.0 + 1.0 / 2048.0);
-    let cases = [
-        // The rounded product cancels c. A fused operation gives 2^-24.
-        ([a, a, c, 0.0], 0.0),
-        ([0.0, f32::INFINITY, 1.0, 0.0], 1.0),
-        ([f32::NAN, 0.0, 1.0, 0.0], 1.0),
-        // The legacy product is +0, so adding -0 must still give +0.
-        ([0.0, -5.0, -0.0, 0.0], 0.0),
-    ];
-    let inputs = cases.map(|(input, _)| input.map(f32::to_bits));
-
-    let mad = vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3));
-    let mac_e32 = 0x006 << 25 | 2 << 9 | u32::from(vgpr(1)); // v0, v1, v2
-    let mac_e64 = vop3(0x106, 0, vgpr(1), vgpr(2), 0);
-    let acc = vop1(0x001, 0, vgpr(3)); // v_mov_b32 v0, v3
-    let programs: [(&str, &[u32]); 3] = [
-        ("v_mad_legacy_f32", &mad),
-        ("v_mac_legacy_f32_e32", &[acc, mac_e32]),
-        ("v_mac_legacy_f32_e64", &[acc, mac_e64[0], mac_e64[1]]),
-    ];
-    let shaders = programs.map(|(name, body)| (name, build_valu_cs(body)));
-    for (name, shader) in shaders {
-        run_cases(&shader, &inputs, |backend, i, _, got| {
-            assert_eq!(
-                got,
-                f32::to_bits(cases[i].1),
-                "{backend}: {name} with {:?}, got {got:#010x}",
-                &cases[i].0[..3]
-            );
-        });
-    }
-}
-
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
@@ -1033,4 +997,40 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+#[test]
+fn legacy_mad_mac_round_product_and_preserve_zero_rule() {
+    let a = 1.0 + 1.0 / 4096.0;
+    let c = -(1.0 + 1.0 / 2048.0);
+    let cases = [
+        // The rounded product cancels c. A fused operation gives 2^-24.
+        ([a, a, c, 0.0], 0.0),
+        ([0.0, f32::INFINITY, 1.0, 0.0], 1.0),
+        ([f32::NAN, 0.0, 1.0, 0.0], 1.0),
+        // The legacy product is +0, so adding -0 must still give +0.
+        ([0.0, -5.0, -0.0, 0.0], 0.0),
+    ];
+    let inputs = cases.map(|(input, _)| input.map(f32::to_bits));
+
+    let mad = vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3));
+    let mac_e32 = 0x006 << 25 | 2 << 9 | u32::from(vgpr(1)); // v0, v1, v2
+    let mac_e64 = vop3(0x106, 0, vgpr(1), vgpr(2), 0);
+    let acc = vop1(0x001, 0, vgpr(3)); // v_mov_b32 v0, v3
+    let programs: [(&str, &[u32]); 3] = [
+        ("v_mad_legacy_f32", &mad),
+        ("v_mac_legacy_f32_e32", &[acc, mac_e32]),
+        ("v_mac_legacy_f32_e64", &[acc, mac_e64[0], mac_e64[1]]),
+    ];
+    let shaders = programs.map(|(name, body)| (name, build_valu_cs(body)));
+    for (name, shader) in shaders {
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            assert_eq!(
+                got,
+                f32::to_bits(cases[i].1),
+                "{backend}: {name} with {:?}, got {got:#010x}",
+                &cases[i].0[..3]
+            );
+        });
+    }
 }
