@@ -37,12 +37,6 @@ Les 117 empreintes qui changent appartiennent exactement aux 117 programmes
 qui passent de refusé à accepté. Pour chacun des 24 275 succès du témoin
 historique, l’empreinte à `2545065` est identique à celle à `7b63628`.
 
-La création de pipelines D3D12 a un comptage distinct. À la remise de ce
-lot, la commande `translate --validate --pipelines --host-lanes 32-32`
-avait été arrêtée à `2545065` avant son bilan. L’exécution à `7b63628`
-restait à faire. La tâche Hangar `6d512c1f` reprend les deux mesures avec
-les exécutables conservés sur la L4.
-
 Cette vérification lit les deux JSON depuis le répertoire des relevés.
 
 ```python
@@ -64,6 +58,45 @@ modifies = {k for k in avant if avant[k].get("output") != apres[k].get("output")
 assert len(valides) == 25_253 and all(apres[k]["validator"] == "ok" for k in valides)
 assert modifies == gagnes and len(gagnes) == 117
 ```
+
+## D3D12 pipeline creation on the NVIDIA L4
+
+Both revisions created **24,811 pipelines** on the L4 (driver 596.86).
+After input deduplication, `7b63628` gained **115 validations**
+(102 VS and PS combined, 13 MS). Both runs used the same pack and
+validator as the survey, from `D:\xtp-data\w6-841901`.
+
+```powershell
+$env:XTP_DXIL = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxil.dll'
+.\2545065.exe translate D:\game\shaders.rpf --validate --pipelines --host-lanes 32-32
+.\7b63628.exe translate D:\game\shaders.rpf --validate --pipelines --host-lanes 32-32
+```
+
+Both commands exited with code 0. The directory above contains each run's
+stdout in `<revision>-6d512c1f-translate-verified.log` and its exit code
+in the adjacent `.log.exit` file.
+
+`translate` hashes each input container's DXIL part with BLAKE3 and skips
+repeat hashes before enumerating native programs. Each run read
+26,503 containers, skipped 614 duplicates, and translated all 26,084
+remaining native programs to IR. The survey counts 26,698 program
+occurrences by record and program index.
+
+| Revision | Stage | Programs reaching emission | DXIL emitted | Validated | Pipelines created |
+|---|---|---:|---:|---:|---:|
+| `2545065` | VS + PS | 14,247 | 13,844 | 13,742 | 13,844 |
+| `2545065` | CS | 2,617 | 2,319 | 2,319 | 2,303 |
+| `2545065` | MS | 8,765 | 8,664 | 8,580 | 8,664 |
+| `7b63628` | VS + PS | 14,247 | 13,844 | 13,844 | 13,844 |
+| `7b63628` | CS | 2,617 | 2,319 | 2,319 | 2,303 |
+| `7b63628` | MS | 8,765 | 8,664 | 8,593 | 8,664 |
+
+Each emitted shader gets its own pipeline creation attempt before validation.
+VS and MS use a stub pixel shader, PS uses a matching stub vertex shader,
+and CS uses a compute pipeline. On both revisions, all 2,319 emitted CS
+passed validation and 16 failed pipeline creation. Every emitted VS, PS
+and MS produced a pipeline, including the 71 MS that still failed
+validation at `7b63628`.
 
 ## Origine des 24 275 validations
 
