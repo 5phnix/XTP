@@ -1176,13 +1176,26 @@ impl State {
         let handle = |index: u32| title.start + u64::from(index) * 32;
         // Each staging buffer is upload memory of its texture's size for as
         // long as the texture lives: past the limit, no more are made.
-        let full = crate::texture::staged_total() >= PASS_STAGING;
-        if full {
+        let staging_full = crate::texture::staged_total() >= PASS_STAGING;
+        if staging_full {
             once!(
                 mib = crate::texture::staged_total() >> 20,
                 "textures shaders pick by index: staging memory full, the rest wait"
             );
         }
+        // Nor host textures past a share of the video memory budget: the
+        // video memory manager would evict at every submission.
+        let video = crate::host::host().and_then(|h| crate::dxgi::video_memory(&h.device));
+        let video_full = !crate::descriptor::host::room_for_textures(video);
+        if video_full {
+            once!(
+                usage_mib = video.map_or(0, |v| v.1 >> 20),
+                budget_mib = video.map_or(0, |v| v.0 >> 20),
+                "textures shaders pick by index: video memory near its budget, the rest wait"
+            );
+        }
+        let full = staging_full || video_full;
+        counts.full = u64::from(full);
         let mut spent = 0;
         for &(index, write) in &pass.due {
             if full || spent >= budget || started.elapsed() > PASS_MAKING {

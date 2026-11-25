@@ -1691,8 +1691,28 @@ pub(crate) const PASS_HASHING: u64 = 4 << 20;
 /// The bytes of staging buffers past which a pass uploads no texture for
 /// the first time (tables' textures counted): each one is upload memory
 /// of its texture's size, held for as long as the texture lives, and the
-/// heap may hold views of thousands. Those past it wait (logged once).
-pub(crate) const PASS_STAGING: u64 = 3 << 30;
+/// world's heap holds views of some 32,000 textures. Those past it wait
+/// (logged once). It was 3 GiB: reached in the first world session
+/// (heaptex-A, PC, 2026-11-25), beside the title's own memory, it left the
+/// PC's memory nearly full.
+pub(crate) const PASS_STAGING: u64 = 1 << 30;
+
+/// The share of its local video memory budget (percent) past which a pass
+/// makes no host texture for a first upload: in heaptex-A the passes made
+/// one for each of 17,500 slots, the process's local memory went from the
+/// 10.5 GB of the same world without them to 13.3 GB resident, past what
+/// a 16 GB card shared with the desktop's programs has, and the video
+/// memory manager's evictions at each submission's preparation took the
+/// frame to 1-11 s on the GPU. Those past it wait for room (the title's
+/// own textures and targets come first).
+pub(crate) const PASS_VIDEO_SHARE: u64 = 85;
+
+/// Whether a pass may make host textures, by the process's local video
+/// memory `(budget, usage)` (`crate::dxgi::video_memory`; `None`, unknown:
+/// yes).
+pub(crate) fn room_for_textures(memory: Option<(u64, u64)>) -> bool {
+    memory.is_none_or(|(budget, usage)| usage < budget / 100 * PASS_VIDEO_SHARE)
+}
 
 /// The bytes a frame's pass stages for first uploads of textures shaders
 /// pick by index (`XTP_HEAP_TEXTURES`, MiB, 64 by default: the detiling at
@@ -2041,8 +2061,11 @@ pub(crate) struct PassCounts {
     pub(crate) changed: u64,
     pub(crate) hashed: u64,
     /// Due slots left for later passes by the budgets (bytes, time,
-    /// staging memory).
+    /// staging memory, video memory).
     pub(crate) left: u64,
+    /// 1 if the pass made no first upload for want of room: staging memory
+    /// past [`PASS_STAGING`], or video memory past [`PASS_VIDEO_SHARE`].
+    pub(crate) full: u64,
     /// Microseconds the pass took.
     pub(crate) us: u64,
 }
@@ -2069,6 +2092,7 @@ static PASS_WINDOW: Mutex<PassWindow> = Mutex::new(PassWindow {
         changed: 0,
         hashed: 0,
         left: 0,
+        full: 0,
         us: 0,
     },
     longest: 0,
@@ -2220,6 +2244,7 @@ impl HostHeap {
         s.changed += counts.changed;
         s.hashed += counts.hashed;
         s.left += counts.left;
+        s.full += counts.full;
         s.us += counts.us;
         w.longest = w.longest.max(counts.us);
         // The first pass, then a line a window.
@@ -2237,6 +2262,9 @@ impl HostHeap {
         let n = window.passes.max(1) as f64;
         let per = |v: u64| (v as f64 / n * 10.0).round() / 10.0;
         let s = window.sum;
+        let (budget, usage) = host()
+            .and_then(|h| crate::dxgi::video_memory(&h.device))
+            .unwrap_or_default();
         tracing::info!(
             passes = window.passes,
             seconds = now.saturating_duration_since(began).as_secs(),
@@ -2244,6 +2272,7 @@ impl HostHeap {
             mib = per(s.bytes >> 20),
             away = per(s.away),
             left = per(s.left),
+            full_passes = s.full,
             checked = per(s.checked),
             changed = per(s.changed),
             hashed = per(s.hashed),
@@ -2257,6 +2286,8 @@ impl HostHeap {
             tabled_writes = TABLED_WRITES[0].load(Ordering::Relaxed),
             tabled_out = TABLED_WRITES[1].load(Ordering::Relaxed),
             staging_mib = crate::texture::staged_total() >> 20,
+            video_mib = usage >> 20,
+            video_budget_mib = budget >> 20,
             "textures shaders pick by index, per pass (a frame)"
         );
     }
@@ -3353,6 +3384,22 @@ mod tests {
         for off in ["0", "off", "False"] {
             assert_eq!(heap_textures_budget_of(Some(off)), None, "{off}");
         }
+    }
+
+    /// Passes make host textures below 85 % of the local video memory
+    /// budget only (heaptex-A: 13.3 GB resident on a 16 GB card shared with
+    /// the desktop, 1-11 s a frame on the GPU); unknown, they may.
+    #[test]
+    fn passes_make_textures_below_a_share_of_the_video_budget() {
+        const GB: u64 = 1 << 30;
+        assert!(room_for_textures(None));
+        assert!(room_for_textures(Some((14 * GB, 10 * GB))));
+        assert!(
+            !room_for_textures(Some((14 * GB, 12 * GB))),
+            "85 %: 11.9 GB"
+        );
+        assert!(!room_for_textures(Some((14 * GB, 15 * GB))));
+        assert!(!room_for_textures(Some((0, 0))), "no budget at all");
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
