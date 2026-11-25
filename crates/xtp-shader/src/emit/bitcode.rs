@@ -134,7 +134,7 @@ pub(crate) mod pred {
     pub const SLE: u8 = 41;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Op {
     Bin(Bin, V, V),
     Cast(Cast, V),
@@ -483,6 +483,14 @@ impl Module {
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        #[cfg(debug_assertions)]
+        if let (Some(pair), Term::CondBr(cond, ..)) = (&mut self.paired, t) {
+            pair.branches.push(cond);
+        }
+        self.terminate_one(block, t);
+    }
+
+    fn terminate_one(&mut self, block: usize, t: Term) {
         self.blocks[block].term = Some(t);
     }
 
