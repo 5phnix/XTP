@@ -3,7 +3,7 @@
 Task W10 (5eaf5f2a), 2026-11-25, first phase: the design and the core
 lowering in new files. The title is BTP 6, build 1.0.2.1; programs are
 named by hash (the runtime's: the first 16 hex digits of the container's
-BLAKE3). The records were read from the person's pack (`E:\uwu\shaders.rpf`,
+BLAKE3). The records were read from the title's own shader pack (`shaders.rpf`,
 read-only) into the session's scratch folder and disassembled with
 `xtp shader-info --disasm`; nothing of them is in the repository, and no
 translation loop ran on this PC.
