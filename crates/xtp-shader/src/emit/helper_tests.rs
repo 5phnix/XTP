@@ -23,7 +23,8 @@
 //! * `ds_swizzle` in quad mode;
 //! * a waterfall loop over `v_readfirstlane_b32`, bounded to 64 passes in
 //!   the program itself so that a lane never served ends with -1 instead
-//!   of running to the loop limit;
+//!   of running to the loop limit (the program and the triangle follow
+//!   KomanderDG88's test in VIniVIdiVIci, ec96861336, GPL-3.0);
 //! * a whole-wave section (the console's expansion of `WaveActiveMax`).
 
 use super::container::{self, SigElement};
