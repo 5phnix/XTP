@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -69,7 +69,8 @@ pub(super) struct TwinUses {
     /// title's state back (`planes_now`).
     ours: bool,
     /// Queries of the title's open in the list, which would count what a
-    /// pass draws (`HostList::twins_query`).
+    /// pass draws (`HostList::twins_query`): in one, planes are copied
+    /// into instead (`HostList::copy_plane`).
     queries: u32,
     /// Probes of the passes recorded in the list, until it is submitted
     /// (`HostList::twins_submitted`).
@@ -168,6 +169,7 @@ pub(super) type TwinSync = (Arc<HostTexture>, Arc<Twin>, bool);
 
 const UNORDERED_ACCESS: u32 = 0x8;
 const DEPTH_WRITE: u32 = 0x10;
+const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 const PIXEL_SHADER_RESOURCE: u32 = 0x80;
 const COPY_DEST: u32 = 0x400;
@@ -227,8 +229,10 @@ impl HostList {
     /// shortcut: every depth target bound for a draw counts as written
     /// (also when the draw only tests), and every unordered access view a
     /// shader names as written; views a shader picks from the heap by a
-    /// computed index are not seen here. A plane due inside a query of the
-    /// title's waits for the query's end (`twins_query`), with this use.
+    /// computed index are not seen here. Inside a query of the title's, the
+    /// plane is copied into rather than drawn (`copy_plane`): a draw would
+    /// count in the query. Before, it waited for the query's end, and a
+    /// clear or copy in the query met the plane as it was.
     pub(crate) fn twin_use(
         &self,
         resource: crate::object::This,
@@ -245,7 +249,8 @@ impl HostList {
         };
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-        let now = twins.now() && twins.queries == 0;
+        let now = twins.now();
+        let in_query = twins.queries > 0;
         let u = twins
             .by_twin
             .entry(Arc::as_ptr(&twin) as usize)
@@ -301,11 +306,7 @@ impl HostList {
             self.move_to(&twin.colour, UNORDERED_ACCESS);
         }
         if pass {
-            #[cfg(feature = "diagnostics")]
-            stale::pass(true);
-            self.pass_plane(&depth, &twin);
-            #[cfg(feature = "diagnostics")]
-            probe::record(self, &depth, &twin, true);
+            self.plane_between(&depth, &twin, in_query);
         }
         // The depth plane's twin is written through unordered access too.
         if colour && let Some(plane) = &twin.plane {
@@ -383,13 +384,164 @@ impl HostList {
         self.move_to(plane, UNORDERED_ACCESS);
     }
 
-    /// Records `due` (`TwinUses::take_due`) between the title's commands.
+    /// `pass_plane` inside a query of the title's, which would count what
+    /// the pass draws: the twin goes into the plane by a dispatch and
+    /// copies, which no occlusion query counts (a pipeline statistics query
+    /// counts the dispatch's threads). For each mip and slice, the dispatch
+    /// writes each texel of the twin as the plane holds it into rows laid
+    /// out as the host copies the plane, and the rows are copied into the
+    /// plane, whole subresources. 16-bit steps go through the table of
+    /// what the pass draws for each (`PlanePass::steps_table`), so the
+    /// plane gets the bits the pass would have drawn. The depth texture is
+    /// left in the copy destination state, the twin in unordered access;
+    /// the list's descriptor heap, compute root signature and pipeline are
+    /// ours. False if the host has no pipeline, table or buffer for it:
+    /// nothing is recorded.
+    /// shortcut: floats go into a 24-bit plane as WARP converts them
+    /// ([`UNORM24`]); D3D lets another host round them differently by up to
+    /// 0.6 of a step, where the pass has the host's own rounding. BTP 6's
+    /// planes drawn from twins are 24-bit planes of 16-bit steps, which the
+    /// table gives exactly on any host.
+    fn copy_plane(&self, depth: &Arc<HostTexture>, twin: &Twin) -> bool {
+        let Some(plane) = &twin.plane else {
+            return true;
+        };
+        let Some(host) = host() else { return false };
+        let pass = plane_pass();
+        // SAFETY: live textures.
+        let (of, steps) = unsafe { (depth.texture.GetDesc(), plane.texture.GetDesc()) };
+        // An R16 typeless twin (53) holds steps, an R32 typeless one
+        // floats; R24G8 depth (44 to 47) is 24-bit, R32G8X24 (19 to 22) a
+        // float.
+        let kind = match (steps.Format.0 == 53, of.Format.0) {
+            (true, 44..=47) => PlaneCopy::Steps,
+            (false, 44..=47) => PlaneCopy::Floats24,
+            (false, 19..=22) => PlaneCopy::Floats32,
+            _ => return false,
+        };
+        let table = match kind {
+            PlaneCopy::Steps => match pass.steps_table() {
+                Some(table) => Some(table),
+                None => return false,
+            },
+            PlaneCopy::Floats24 | PlaneCopy::Floats32 => None,
+        };
+        // The depth plane's subresources come first, mip by mip in each
+        // slice, as the views of the twin (`PlaneViews`).
+        let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
+        let mut rows = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); planes as usize];
+        let mut bytes = 0;
+        // SAFETY: a plain query writing `planes` footprints.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &of,
+                0,
+                planes,
+                0,
+                Some(rows.as_mut_ptr()),
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        let (Some((root, pipeline)), Some(views), Some(through)) = (
+            pass.copier(kind),
+            pass.views(plane),
+            pass.rows(plane, bytes),
+        ) else {
+            return false;
+        };
+        self.keep(&views.heap);
+        self.keep(&through);
+        if let Some(table) = &table {
+            self.keep(table);
+        }
+        self.move_to(plane, NON_PIXEL_SHADER_RESOURCE);
+        self.move_to(depth, COPY_DEST);
+        let l = &self.list;
+        let (common, unordered, source) = (
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        // SAFETY: an open list; our heap, buffers and pipeline, kept by the
+        // list (the pipeline lives as long as the process); each dispatch
+        // writes inside its subresource's footprint, which the buffer was
+        // made as big as; the buffer rests in the common state between
+        // uses, the textures are in the states set above.
+        unsafe {
+            let base = through.GetGPUVirtualAddress();
+            l.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&pipeline);
+            if let Some(table) = &table {
+                l.SetComputeRootShaderResourceView(3, table.GetGPUVirtualAddress());
+            }
+            l.ResourceBarrier(&[transition(&through, common, unordered)]);
+            for (i, row) in rows.iter().enumerate() {
+                let f = row.Footprint;
+                l.SetComputeRootDescriptorTable(
+                    0,
+                    D3D12_GPU_DESCRIPTOR_HANDLE {
+                        ptr: views.gpu + i as u64 * u64::from(views.step),
+                    },
+                );
+                l.SetComputeRootUnorderedAccessView(1, base + row.Offset);
+                let size = [f.RowPitch, f.Width, f.Height];
+                l.SetComputeRoot32BitConstants(2, 3, size.as_ptr().cast(), 0);
+                l.Dispatch(f.Width.div_ceil(8), f.Height.div_ceil(8), 1);
+            }
+            l.ResourceBarrier(&[transition(&through, unordered, source)]);
+            for (i, row) in rows.iter().enumerate() {
+                l.CopyTextureRegion(
+                    &subresource_at(&depth.texture, i as u32),
+                    0,
+                    0,
+                    0,
+                    &placed_at(&through, row),
+                    None,
+                );
+            }
+            l.ResourceBarrier(&[transition(&through, source, common)]);
+        }
+        self.move_to(plane, UNORDERED_ACCESS);
+        true
+    }
+
+    /// Records the depth plane of `depth` drawn from its twin between the
+    /// title's commands: by the pass, or inside a query of the title's
+    /// (`in_query`) by a dispatch and copies (`copy_plane`). If the host
+    /// cannot copy it, the plane stays behind its twin and waits for the
+    /// next draw or dispatch after the query, as before.
+    fn plane_between(&self, depth: &Arc<HostTexture>, twin: &Arc<Twin>, in_query: bool) {
+        let recorded = if in_query {
+            self.copy_plane(depth, twin)
+        } else {
+            self.pass_plane(depth, twin);
+            true
+        };
+        if !recorded {
+            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(u) = twins.by_twin.get_mut(&(Arc::as_ptr(twin) as usize)) {
+                u.plane_behind = true;
+            }
+            self.twins_due.store(true, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        if recorded {
+            stale::pass(true);
+            probe::record(self, depth, twin, true);
+        }
+    }
+
+    /// Records `due` (`TwinUses::take_due`) between the title's commands,
+    /// inside a query of the title's if `in_query` (`plane_between`).
     /// Each depth texture is left in the state the list had it in, or
     /// readable by shaders if the list had not used it yet (as at the
     /// close) or only through unordered access, which leaves a depth
     /// texture in the common state (`legal_state`), where no shader reads
     /// it.
-    fn record_due(&self, due: &[Due]) {
+    fn record_due(&self, due: &[Due], in_query: bool) {
         for d in due {
             let state = match self.state_now(&d.depth) {
                 None | Some(0) => SHADER_RESOURCE,
@@ -399,11 +551,7 @@ impl HostList {
                 self.twin_copy(&d.depth, &d.twin, false);
             }
             if d.pass {
-                #[cfg(feature = "diagnostics")]
-                stale::pass(true);
-                self.pass_plane(&d.depth, &d.twin);
-                #[cfg(feature = "diagnostics")]
-                probe::record(self, &d.depth, &d.twin, true);
+                self.plane_between(&d.depth, &d.twin, in_query);
             }
             self.move_to(&d.depth, state);
         }
@@ -426,8 +574,11 @@ impl HostList {
     /// scissor and the topology of its own. The title's viewports and
     /// scissors are set back here (none if it set none, as the list
     /// started), the caller sets the rest (`draw::State::after_our_pass`).
-    /// In a query of the title's, the passes wait for its end: they would
-    /// count in it (`twins_query`).
+    /// In a query of the title's, a pass would count in it: the planes are
+    /// copied into instead (`copy_plane`), which sets a descriptor heap, a
+    /// compute root signature and a pipeline of its own, set back the same
+    /// way. Before, they waited for the query's end, and a draw in the
+    /// query tested the classes of before.
     /// `XTP_PLANE_NOW=0` keeps the old way.
     ///
     /// A list that has nothing due takes no lock here.
@@ -441,16 +592,19 @@ impl HostList {
             return false;
         }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-        let due = if twins.now() && twins.queries == 0 {
+        let due = if twins.now() {
             twins.take_due()
         } else {
             Vec::new()
         };
+        let in_query = twins.queries > 0;
         let ours = std::mem::take(&mut twins.ours);
         let title = ours.then(|| (twins.viewports.clone(), twins.scissors.clone()));
         self.twins_due.store(twins.due(), Ordering::Relaxed);
         drop(twins);
-        self.record_due(&due);
+        // A plane the host cannot copy in a query is due again after this
+        // (`plane_between`).
+        self.record_due(&due, in_query);
         let Some((viewports, scissors)) = title else {
             return false;
         };
@@ -493,10 +647,12 @@ impl HostList {
     /// of host query type `kind`. An occlusion query counts the samples a
     /// pass draws (its depth test passes them all), a pipeline statistics
     /// query its vertices and pixels: the planes due are drawn before a
-    /// query opens, and those due inside one wait for its end
-    /// (`planes_now`). Before, a dispatch in an open occlusion query drew
-    /// a plane in it, and an object the title had found hidden counted as
-    /// visible.
+    /// query opens, and those due inside one are copied into
+    /// (`copy_plane`). Before round 2, a dispatch in an open occlusion
+    /// query drew a plane in it, and an object the title had found hidden
+    /// counted as visible; in round 2, they waited for its end, and what
+    /// the title drew, cleared or copied in the query met the classes of
+    /// before.
     pub(crate) fn twins_query(&self, kind: u32, open: bool) {
         const TIMESTAMP: u32 = 2;
         if kind == TIMESTAMP {
@@ -515,7 +671,8 @@ impl HostList {
         twins.queries += 1;
         self.twins_due.store(twins.due(), Ordering::Relaxed);
         drop(twins);
-        self.record_due(&due);
+        // Before the query opens: drawn.
+        self.record_due(&due, false);
     }
 
     /// Before the list closes: the depth textures whose twins it wrote last
@@ -591,6 +748,9 @@ impl HostList {
     pub(super) fn twin_syncs(&self) -> Vec<TwinSync> {
         let mut syncs = Vec::new();
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        // The list runs again: its probes wait for this run (diagnostics).
+        #[cfg(feature = "diagnostics")]
+        probe::submitting(&twins.probes);
         for u in twins.by_twin.values() {
             let real = u.twin.behind.load(Ordering::Relaxed);
             let mut behind = [real & 1 != 0, real & 2 != 0];
@@ -617,12 +777,14 @@ impl HostList {
 
     /// `Host::run`: the list was submitted, in a submission whose last
     /// command signals `fence`: the probes of its passes are read once the
-    /// GPU has reached it (diagnostics, [`probe`]).
+    /// GPU has reached it (diagnostics, [`probe`]). The list keeps them
+    /// until it is reset: submitted again, it writes their buffers again,
+    /// and they are read once that run is over.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn twins_submitted(&self, fence: u64) {
-        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         if !twins.probes.is_empty() {
-            probe::submitted(std::mem::take(&mut twins.probes), fence);
+            probe::submitted(&twins.probes, fence);
         }
     }
 }
@@ -644,7 +806,8 @@ fn unordered_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// it lacks, for the frame line (`log`). A use of the depth texture of a
 /// depth plane's twin that shaders of the same list wrote since the plane
 /// was last drawn is *late* (`TwinUse::plane_behind`); the pass is then
-/// recorded before it, unless it is a draw's depth target or in a query.
+/// recorded before it (in a query, the copy: `HostList::copy_plane`),
+/// unless it is a draw's depth target.
 /// That use and those after it until the pass find the plane *stale*.
 /// Uses are counted for the pipeline last bound on the thread
 /// (`HostList::twin_reader`); the copies, resolves and clears of
@@ -792,6 +955,7 @@ pub(super) mod stale {
 #[cfg(feature = "diagnostics")]
 mod probe {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
     use windows::Win32::Graphics::Direct3D12::*;
@@ -799,8 +963,13 @@ mod probe {
 
     use super::{COPY_SOURCE, HostList, HostTexture, Twin, UNORDERED_ACCESS, host};
 
+    /// A probe's fence while a submission of its list is being prepared,
+    /// and before the first: never reached.
+    const PENDING: u64 = u64::MAX;
+
     /// A pass's read-backs: subresource 0 of the twin and of the plane,
-    /// each a buffer and its row pitch.
+    /// each a buffer and its row pitch. Its list and [`PROBES`] share it.
+    #[derive(Clone)]
     pub(super) struct Probe {
         frame: u64,
         /// Between the title's commands, or at the close.
@@ -813,9 +982,10 @@ mod probe {
         height: u32,
         twin: (ID3D12Resource, u32),
         plane: (ID3D12Resource, u32),
-        /// The fence value the submission of the probe's list signals once
-        /// run (`submitted`).
-        fence: u64,
+        /// The fence value the last submission of the probe's list signals
+        /// once run (`submitted`), [`PENDING`] while the next is prepared
+        /// (`submitting`).
+        fence: Arc<AtomicU64>,
     }
 
     // SAFETY: D3D12 objects are free-threaded.
@@ -953,28 +1123,56 @@ mod probe {
                 height: of.Height,
                 twin: twin_copy,
                 plane: plane_copy,
-                fence: 0,
+                fence: Arc::new(AtomicU64::new(PENDING)),
             });
     }
 
-    /// `HostList::twins_submitted`: `probes` are read once the GPU has
-    /// reached `fence`. Before, a probe was read 3 s after it was recorded,
-    /// whether its list had run or not: a list kept longer (or never
-    /// submitted) gave two untouched buffers, "no texel differs".
-    pub(super) fn submitted(probes: Vec<Probe>, fence: u64) {
-        let mut all = PROBES.lock().unwrap_or_else(|e| e.into_inner());
-        all.extend(probes.into_iter().map(|p| Probe { fence, ..p }));
+    /// `HostList::twin_syncs`, before a submission of the probes' list
+    /// runs: they wait for it, wherever they are.
+    pub(super) fn submitting(probes: &[Probe]) {
+        for p in probes {
+            p.fence.store(PENDING, Ordering::SeqCst);
+        }
     }
 
-    /// The probes whose submissions the GPU has run, once `completed` is
-    /// the fence value it has reached.
-    pub(super) fn ready(completed: u64) -> Vec<Probe> {
+    /// `HostList::twins_submitted`: `probes` are read once the GPU has
+    /// reached `fence`, the last submission of their list. Before, a probe
+    /// was read 3 s after it was recorded, whether its list had run or
+    /// not: a list kept longer (or never submitted) gave two untouched
+    /// buffers, "no texel differs". In round 2, a probe was read once the
+    /// first submission of its list had run, even if the list was
+    /// submitted again meanwhile, which wrote the same buffers again.
+    pub(super) fn submitted(probes: &[Probe], fence: u64) {
+        let mut all = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+        for p in probes {
+            p.fence.store(fence, Ordering::SeqCst);
+            if !all.iter().any(|q| Arc::ptr_eq(&q.fence, &p.fence)) {
+                all.push(p.clone());
+            }
+        }
+    }
+
+    /// The probes whose lists' last submissions the GPU has run, once
+    /// `completed` is the fence value it has reached.
+    fn ready(completed: u64) -> Vec<Probe> {
+        ready_of(completed, None)
+    }
+
+    /// [`ready`], only those of `frame` if given (tests, which run side by
+    /// side, take only theirs).
+    pub(super) fn ready_of(completed: u64, frame: Option<u64>) -> Vec<Probe> {
         let mut probes = PROBES.lock().unwrap_or_else(|e| e.into_inner());
-        let (ready, waiting) = std::mem::take(&mut *probes)
-            .into_iter()
-            .partition(|p| p.fence <= completed);
+        let (ready, waiting) = std::mem::take(&mut *probes).into_iter().partition(|p| {
+            reached(p.fence.load(Ordering::SeqCst), completed) && frame.is_none_or(|f| f == p.frame)
+        });
         *probes = waiting;
         ready
+    }
+
+    /// Whether a probe whose fence is `fence` has run, once the GPU has
+    /// reached `completed`.
+    fn reached(fence: u64, completed: u64) -> bool {
+        fence != PENDING && fence <= completed
     }
 
     /// The bytes of a read-back buffer.
@@ -1077,11 +1275,24 @@ mod probe {
         })
     }
 
-    /// The frame line's: one line per probe whose list has run.
+    /// The frame line's: one line per probe whose list has run. A probe
+    /// whose list is submitted again while it is read is skipped: that run
+    /// may have written what was read, and the probe is read again once it
+    /// is over (`submitted`).
     pub(super) fn log() {
         let Some(host) = host() else { return };
-        for p in ready(host.completed()) {
-            let Some(found) = found(&p) else { continue };
+        let completed = host.completed();
+        for p in ready(completed) {
+            let fence = p.fence.load(Ordering::SeqCst);
+            if !reached(fence, completed) {
+                continue;
+            }
+            let found = found(&p);
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if p.fence.load(Ordering::SeqCst) != fence {
+                continue;
+            }
+            let Some(found) = found else { continue };
             tracing::info!(
                 frame = p.frame,
                 when = if p.now {
@@ -1161,13 +1372,17 @@ pub(super) fn sync_states(
 /// shaders multiply the class number by that constant), so the pass and
 /// the draw give the host the same float, and the host turns the same
 /// float into the same 24 bits.
+///
+/// The twin's view is volatile data, as the copy's (`copy_source`): the
+/// pass's root signature stays set while shaders write the twin again and
+/// the title dispatches, which binds only its compute side.
 const PLANE_CORNERS: &str = r#"
 float4 corner(uint i : SV_VertexID) : SV_Position {
     return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
 }
 "#;
 const PLANE_STEPS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
+#define RS "DescriptorTable(SRV(t0, flags = DATA_VOLATILE), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<uint> twin : register(t0);
 [RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
@@ -1175,7 +1390,7 @@ float plane(float4 p : SV_Position) : SV_Depth {
 }
 "#;
 const PLANE_FLOATS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
+#define RS "DescriptorTable(SRV(t0, flags = DATA_VOLATILE), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<float> twin : register(t0);
 [RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
@@ -1183,11 +1398,96 @@ float plane(float4 p : SV_Position) : SV_Depth {
 }
 "#;
 
+/// The table of what the pass draws into a 24-bit plane for each 16-bit
+/// step (`PlanePass::steps_table`): texel `y * 256 + x` of a 256×256 plane
+/// gets step `y * 256 + x`, computed as `PLANE_STEPS` computes it, so the
+/// host turns the same float into the same 24 bits.
+const PLANE_TABLE: &str = r#"
+#define RS "RootFlags(0)"
+[RootSignature(RS)]
+float plane(float4 p : SV_Position) : SV_Depth {
+    return float(uint(p.y) * 256 + uint(p.x)) * asfloat(0x37800080);
+}
+"#;
+
+/// A float as a 24-bit depth (`PlaneCopy::Floats24`): clamped to 0..1
+/// (NaN 0), times 2^24 - 1 in 32-bit floats, rounded to nearest even, as
+/// WARP writes depth. D3D's rule (times 2^24 - 1, plus a half, truncated)
+/// computed exactly gave one step more than WARP on 992 of 65,536 floats,
+/// those whose product is within half a float step of a half: WARP rounds
+/// the product to a float first, and an exact half to even.
+const UNORM24: &str = r#"
+uint unorm24(float f) {
+    return uint(round(saturate(f) * 16777215.0));
+}
+"#;
+
+/// How a copy in a query (`HostList::copy_plane`) gives a depth plane its
+/// twin's texels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlaneCopy {
+    /// 16-bit steps into a 24-bit plane: each looked up in the table of
+    /// what the pass draws for it (`PlanePass::steps_table`).
+    Steps,
+    /// Floats into a 24-bit plane: converted as WARP converts depth
+    /// ([`UNORM24`]).
+    Floats24,
+    /// Floats into a 32-bit float plane: as they are, from 0 to 1, as the
+    /// pass's viewport clamps the depth it writes.
+    Floats32,
+}
+
+/// The compute shader of a copy of kind `kind`: each texel of one mip and
+/// slice of the twin (`t0`), as its plane holds it, into rows `pitch`
+/// bytes apart (`u0`, 4 bytes a texel, the layout of a copy of the plane);
+/// for steps, through the table (`t1`). The twin's view is volatile data:
+/// the copy's root signature stays set while shaders write the twin again
+/// and the title draws, which binds only its graphics side (as static
+/// data, the debug layer's message 1003 at the title's next draw).
+fn copy_source(kind: PlaneCopy) -> String {
+    let (table, texel, depth) = match kind {
+        PlaneCopy::Steps => (", SRV(t1)", "uint", "table.Load(texel * 4) & 0xffffff"),
+        PlaneCopy::Floats24 => ("", "float", "unorm24(texel)"),
+        PlaneCopy::Floats32 => ("", "float", "asuint(saturate(texel))"),
+    };
+    format!(
+        r#"
+#define RS "DescriptorTable(SRV(t0, flags = DATA_VOLATILE)), UAV(u0), RootConstants(num32BitConstants = 3, b0){table}"
+Texture2DArray<{texel}> twin : register(t0);
+ByteAddressBuffer table : register(t1);
+RWByteAddressBuffer rows : register(u0);
+cbuffer Rows : register(b0) {{ uint pitch; uint width; uint height; }};
+{UNORM24}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void copy(uint3 id : SV_DispatchThreadID) {{
+    if (id.x < width && id.y < height) {{
+        {texel} texel = twin.Load(int4(id.xy, 0, 0));
+        rows.Store(id.y * pitch + id.x * 4, {depth});
+    }}
+}}
+"#
+    )
+}
+
 /// What the pass draws with: per kind of twin (16-bit steps or floats)
 /// and depth format the root signature and pipeline, made when first
 /// needed (`None`: the host refused), and the views of the twins it reads.
+/// In a query of the title's, what its copies use (`HostList::copy_plane`).
 struct PlanePass {
     made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
+    /// The copies' root signatures and pipelines by kind, made when first
+    /// needed (`None`: the host refused).
+    copiers: Mutex<Vec<(PlaneCopy, Option<PlanePipeline>)>>,
+    /// By depth plane twin (its address): the twin, weakly, and the buffer
+    /// its copies go through, as big as its depth texture's depth plane
+    /// laid out for a copy. Lists recording at once may share it: each
+    /// fills it and copies from it in turn, in the order they run.
+    rows: Mutex<HashMap<usize, (Weak<HostTexture>, ID3D12Resource)>>,
+    /// The table of 16-bit steps' depths in a 24-bit plane and the list of
+    /// ours that makes it (`steps_table`), made when first needed (`None`:
+    /// the host refused).
+    table: OnceLock<Option<(ID3D12Resource, HostList)>>,
     /// By depth plane twin (its address): the twin, weakly, and the views
     /// of its mips and slices (`PlaneViews`). Made once and never written
     /// again, so a view outlives every list that reads it, each keeping
@@ -1219,6 +1519,9 @@ unsafe impl Sync for PlanePass {}
 fn plane_pass() -> &'static PlanePass {
     static PASS: LazyLock<PlanePass> = LazyLock::new(|| PlanePass {
         made: Mutex::default(),
+        copiers: Mutex::default(),
+        rows: Mutex::default(),
+        table: OnceLock::new(),
         views: Mutex::default(),
     });
     &PASS
@@ -1297,10 +1600,16 @@ impl PlanePass {
     }
 
     fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
+        Self::graphics(if steps { PLANE_STEPS } else { PLANE_FLOATS }, format)
+    }
+
+    /// A pipeline drawing one triangle over the target with pixel shader
+    /// `plane` of `source` (its root signature inside) as the depth, into
+    /// a depth target of `format`.
+    fn graphics(source: &str, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
         use windows::core::s;
         let device = &host().ok_or_else(windows::core::Error::empty)?.device;
         let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
-        let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
         let ps = compile(source, s!("plane"), s!("ps_5_1"))?;
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
@@ -1339,6 +1648,279 @@ impl PlanePass {
             let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
             Ok((root, pipeline))
         }
+    }
+
+    /// The root signature and pipeline of a copy of kind `kind`
+    /// (`HostList::copy_plane`).
+    fn copier(&self, kind: PlaneCopy) -> Option<PlanePipeline> {
+        let mut copiers = self.copiers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, pipeline)) = copiers.iter().find(|c| c.0 == kind) {
+            return pipeline.clone();
+        }
+        let pipeline = match Self::compute(&copy_source(kind)) {
+            Ok(pipeline) => Some(pipeline),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    ?kind,
+                    "no pipeline to copy a depth plane from its twin in a query: such planes \
+                     wait for the query's end"
+                );
+                None
+            }
+        };
+        copiers.push((kind, pipeline.clone()));
+        pipeline
+    }
+
+    /// A compute pipeline of function `copy` of `source` (its root
+    /// signature inside).
+    fn compute(source: &str) -> windows::core::Result<PlanePipeline> {
+        use windows::core::s;
+        let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+        let cs = compile(source, s!("copy"), s!("cs_5_1"))?;
+        // SAFETY: the root signature is inside the shader; the description
+        // points at live data and never releases its pointer.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &cs[..])?;
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: cs.as_ptr().cast(),
+                    BytecodeLength: cs.len(),
+                },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState = device.CreateComputePipelineState(&desc)?;
+            Ok((root, pipeline))
+        }
+    }
+
+    /// The buffer the copies of depth plane twin `plane` go through,
+    /// `bytes` long (`rows`), made on its first copy.
+    fn rows(&self, plane: &Arc<HostTexture>, bytes: u64) -> Option<ID3D12Resource> {
+        let key = Arc::as_ptr(plane) as usize;
+        let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, made)) = rows.get(&key) {
+            return Some(made.clone());
+        }
+        rows.retain(|_, (twin, _)| twin.strong_count() > 0);
+        let made = match buffer(bytes, true) {
+            Ok(made) => made,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    bytes,
+                    "no buffer to copy a depth plane from its twin in a query: it waits for \
+                     the query's end"
+                );
+                return None;
+            }
+        };
+        rows.insert(key, (Arc::downgrade(plane), made.clone()));
+        Some(made)
+    }
+
+    /// The table of what the pass draws into a 24-bit plane for each
+    /// 16-bit step: word `step` of the buffer holds, in its low 24 bits,
+    /// the depth the host writes for the step's float. Made on the first
+    /// copy of steps, by a list of ours submitted then: every list that
+    /// reads it is submitted after it, on the one host queue. Kept, with
+    /// that list, as long as the process (dropping the list would wait for
+    /// the GPU).
+    fn steps_table(&self) -> Option<ID3D12Resource> {
+        self.table
+            .get_or_init(|| match Self::make_table() {
+                Ok(made) => Some(made),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "no table of depths for 16-bit steps: in a query, such planes wait \
+                         for its end"
+                    );
+                    None
+                }
+            })
+            .as_ref()
+            .map(|(table, _)| table.clone())
+    }
+
+    fn make_table() -> windows::core::Result<(ID3D12Resource, HostList)> {
+        let host = host().ok_or_else(windows::core::Error::empty)?;
+        let device = &host.device;
+        let (root, pipeline) = Self::graphics(PLANE_TABLE, DXGI_FORMAT_D24_UNORM_S8_UINT)?;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R24G8_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0;
+        // SAFETY: plain creation and a plain query for one subresource; the
+        // out pointers are ours.
+        unsafe {
+            device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                None,
+                &mut texture,
+            )?;
+            device.GetCopyableFootprints(
+                &desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        let texture = texture.ok_or_else(windows::core::Error::empty)?;
+        // Step `y * 256 + x` at byte `(y * 256 + x) * 4`: rows of 1024 bytes.
+        if footprint.Footprint.RowPitch != 1024 {
+            return Err(windows::core::Error::new(
+                windows::Win32::Foundation::E_UNEXPECTED,
+                format!("rows {} bytes apart", footprint.Footprint.RowPitch),
+            ));
+        }
+        let table = buffer(bytes, false)?;
+        crate::host::name(&table, || "depths of 16-bit steps".to_string());
+        let list = host.new_list()?;
+        let target = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let target = host.dsv(&texture, Some(&target));
+        let l = &list.list;
+        // SAFETY: an open list of ours; live objects, kept by the list or
+        // the process; the buffer as big as the footprint, promoted from
+        // the common state by the copy.
+        unsafe {
+            l.SetGraphicsRootSignature(&root);
+            l.SetPipelineState(&pipeline);
+            l.IASetPrimitiveTopology(
+                windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            );
+            l.OMSetRenderTargets(0, None, false, Some(&target));
+            l.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: 256.0,
+                Height: 256.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            l.RSSetScissorRects(&[RECT {
+                left: 0,
+                top: 0,
+                right: 256,
+                bottom: 256,
+            }]);
+            l.DrawInstanced(3, 1, 0, 0);
+            l.ResourceBarrier(&[transition(
+                &texture,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyTextureRegion(
+                &placed_at(&table, &footprint),
+                0,
+                0,
+                0,
+                &subresource_at(&texture, 0),
+                None,
+            );
+        }
+        list.keep(&texture);
+        list.keep(&root);
+        list.keep(&pipeline);
+        list.close();
+        host.execute(&[&list]);
+        Ok((table, list))
+    }
+}
+
+/// A buffer of ours in the card's memory, `bytes` long, in the common
+/// state; written by shaders if `unordered`.
+fn buffer(bytes: u64, unordered: bool) -> windows::core::Result<ID3D12Resource> {
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes.max(1),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: if unordered {
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+        } else {
+            D3D12_RESOURCE_FLAG_NONE
+        },
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; the out pointer is ours.
+    unsafe {
+        device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )?;
+    }
+    buffer.ok_or_else(windows::core::Error::empty)
+}
+
+/// Copy location: subresource `index` of `texture`.
+fn subresource_at(texture: &ID3D12Resource, index: u32) -> D3D12_TEXTURE_COPY_LOCATION {
+    D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index,
+        },
+    }
+}
+
+/// Copy location: `footprint` in `buffer`.
+fn placed_at(
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) -> D3D12_TEXTURE_COPY_LOCATION {
+    D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *footprint,
+        },
     }
 }
 
@@ -2365,18 +2947,10 @@ mod tests {
         release(depth);
     }
 
-    /// Two occlusion queries of the title's around draws that pass no
-    /// sample ("equal" 7 against classes 65 and 129): classes written
-    /// before the first are drawn into the plane as it opens, those written
-    /// in the second after it ends (the draw after it finds them). Both
-    /// count 0. Before, the passes came before the draws, in the queries,
-    /// and each counted the plane's 16 texels.
-    #[test]
-    fn a_pass_does_not_count_in_a_query_of_the_titles() {
-        let test = "host::twins::tests::a_pass_does_not_count_in_a_query_of_the_titles";
-        let Some(_gpu) = crate::testgpu::device(test) else {
-            return;
-        };
+    const OCCLUSION: u32 = 0;
+
+    /// A title heap of `count` occlusion queries.
+    fn occlusion_heap(count: u32) -> This {
         #[repr(C)]
         struct Desc {
             kind: u32,
@@ -2389,11 +2963,10 @@ mod tests {
             0x469e,
             [0xa6, 0x1d, 0x97, 0x0e, 0xc5, 0x83, 0xca, 0xb4],
         );
-        const OCCLUSION: u32 = 0;
         let mut heap = std::ptr::null();
         let desc = Desc {
             kind: OCCLUSION,
-            count: 2,
+            count,
             nodes: 0,
         };
         assert_eq!(
@@ -2405,8 +2978,60 @@ mod tests {
             ),
             crate::object::S_OK
         );
-        let out = crate::testgpu::TitleBuffer::new(256);
+        heap
+    }
+
+    /// The title's BeginQuery (`open`) or EndQuery of occlusion query
+    /// `index` of `heap` in `list`.
+    fn query(list: &crate::testgpu::TitleList, heap: This, index: u32, open: bool) {
+        let this = list.this();
+        let offset = if open { 0xe0 } else { 0xe8 };
+        crate::object::slot::<extern "system" fn(This, This, u32, u32)>(this, offset)(
+            this, heap, OCCLUSION, index,
+        );
+    }
+
+    /// The title's ResolveQueryData of the first `count` occlusion
+    /// queries of `heap` into `out`, in `list`; `out` starts as 0xface
+    /// words.
+    fn resolve(
+        list: &crate::testgpu::TitleList,
+        heap: This,
+        count: u32,
+        out: &crate::testgpu::TitleBuffer,
+    ) {
         out.set_words(|_| 0xface);
+        let this = list.this();
+        crate::object::slot::<extern "system" fn(This, This, u32, u32, u32, This, u64)>(this, 0xf0)(
+            this,
+            heap,
+            OCCLUSION,
+            0,
+            count,
+            out.resource(),
+            0,
+        );
+    }
+
+    /// Two occlusion queries of the title's. The first is around a draw
+    /// that passes no sample ("equal" 7 against classes 65): the classes
+    /// written before it are drawn into the plane as it opens, and it
+    /// counts 0. In the second, shaders write classes 129 (left) and 65,
+    /// then a draw tests "equal" 129: it lights the left, and the query
+    /// counts those 8 samples only. The plane is copied in the query
+    /// (`copy_plane`), which counts nothing. In round 2, the pass waited
+    /// for the query's end: the draw found 65 everywhere, nothing was lit
+    /// and the query counted 0 (the Codex review's reproduction). Before,
+    /// the passes came before the draws, in the queries, and each counted
+    /// the plane's 16 texels.
+    #[test]
+    fn a_draw_in_a_query_tests_the_classes_written_in_it() {
+        let test = "host::twins::tests::a_draw_in_a_query_tests_the_classes_written_in_it";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let heap = occlusion_heap(2);
+        let out = crate::testgpu::TitleBuffer::new(256);
         let scene = Scene::new(1);
         let (none, lit) = (equal_pipeline(7), equal_pipeline(129));
         let before = crate::testgpu::TitleList::new();
@@ -2415,39 +3040,397 @@ mod tests {
 
         let frame = crate::testgpu::TitleList::new();
         let list = frame.host();
-        let this = frame.this();
-        let mark = |offset, index| {
-            crate::object::slot::<extern "system" fn(This, This, u32, u32)>(this, offset)(
-                this, heap, OCCLUSION, index,
-            )
-        };
-        let (begin, end) = (0xe0, 0xe8);
         write_classes(list, scene.depth, 65, 65);
         let mut state = scene.state(list, 0, true);
-        mark(begin, 0);
+        query(&frame, heap, 0, true);
         draw(list, &mut state, none);
-        mark(end, 0);
-        mark(begin, 1);
+        query(&frame, heap, 0, false);
+        query(&frame, heap, 1, true);
         write_classes(list, scene.depth, 129, 65);
-        draw(list, &mut state, none);
-        mark(end, 1);
-        crate::object::slot::<extern "system" fn(This, This, u32, u32, u32, This, u64)>(this, 0xf0)(
-            this,
-            heap,
-            OCCLUSION,
-            0,
-            2,
-            out.resource(),
-            0,
-        );
         draw(list, &mut state, lit);
+        query(&frame, heap, 1, false);
+        resolve(&frame, heap, 2, &out);
         frame.run();
 
-        assert_eq!(out.words()[..4], [0; 4], "samples counted by the queries");
+        assert_eq!(
+            out.words()[..4],
+            [0, 0, 8, 0],
+            "samples counted by the queries"
+        );
         assert_eq!(scene.lit(0), lit_where(|x, _| x < 2));
         release(none);
         release(lit);
         release(heap);
+    }
+
+    /// In an occlusion query of the title's, shaders write classes 129
+    /// (left) and 65 into the depth plane's twin, then the title clears the
+    /// left half of the depth plane to 0; after the query, draws test
+    /// "equal" 0, then 65. The plane is copied before the clear, in the
+    /// query (`copy_plane`): 0 on the left, 65 on the right, and the query
+    /// counts nothing. In round 2, the pass waited for the query's end and
+    /// drew 129 and 65 over the clear: no texel was 0 (the Codex review's
+    /// case 1 in a query).
+    #[test]
+    fn a_depth_clear_in_a_query_is_not_drawn_over() {
+        let test = "host::twins::tests::a_depth_clear_in_a_query_is_not_drawn_over";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let heap = occlusion_heap(1);
+        let out = crate::testgpu::TitleBuffer::new(256);
+        let scene = Scene::new(2);
+        let (cleared, written) = (equal_pipeline(0), equal_pipeline(65));
+        let before = crate::testgpu::TitleList::new();
+        write_classes(before.host(), scene.depth, 33, 33);
+        before.run();
+
+        let frame = crate::testgpu::TitleList::new();
+        let list = frame.host();
+        query(&frame, heap, 0, true);
+        write_classes(list, scene.depth, 129, 65);
+        let left = RECT {
+            right: 2,
+            bottom: 4,
+            ..Default::default()
+        };
+        clear_depth(&frame, &scene, 0.0, &[left]);
+        query(&frame, heap, 0, false);
+        resolve(&frame, heap, 1, &out);
+        let mut state = scene.state(list, 0, true);
+        draw(list, &mut state, cleared);
+        scene.target(list, &mut state, 1);
+        draw(list, &mut state, written);
+        frame.run();
+
+        assert_eq!(out.words()[..2], [0; 2], "samples counted by the query");
+        assert_eq!(scene.lit(0), lit_where(|x, _| x < 2), "the clear");
+        assert_eq!(scene.lit(1), lit_where(|x, _| x >= 2), "the classes");
+        assert_eq!(classes(scene.depth), [[0, 0, 65, 65]; 4]);
+        release(cleared);
+        release(written);
+        release(heap);
+    }
+
+    /// In an occlusion query of the title's, shaders write classes 129
+    /// (left) and 65 into the depth plane's twin, then the title copies the
+    /// depth texture into another: the copy has them, the plane copied
+    /// before it in the query (`copy_plane`), which counts nothing. In
+    /// round 2, the pass waited for the query's end: the copy took the
+    /// frame before's 65 everywhere (the Codex review's case 3 in a query).
+    #[test]
+    fn a_copy_in_a_query_takes_the_classes_written_before_it() {
+        let test = "host::twins::tests::a_copy_in_a_query_takes_the_classes_written_before_it";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let heap = occlusion_heap(1);
+        let out = crate::testgpu::TitleBuffer::new(256);
+        let scene = Scene::new(0);
+        let other = depth(4, 4, D16_UNORM_S8_UINT);
+        let before = crate::testgpu::TitleList::new();
+        write_classes(before.host(), scene.depth, 65, 65);
+        before.run();
+
+        let frame = crate::testgpu::TitleList::new();
+        query(&frame, heap, 0, true);
+        write_classes(frame.host(), scene.depth, 129, 65);
+        let this = frame.this();
+        crate::object::slot::<extern "system" fn(This, This, This)>(this, 0x88)(
+            this,
+            other,
+            scene.depth,
+        );
+        query(&frame, heap, 0, false);
+        resolve(&frame, heap, 1, &out);
+        frame.run();
+
+        assert_eq!(out.words()[..2], [0; 2], "samples counted by the query");
+        assert_eq!(classes(other), [[129, 129, 65, 65]; 4]);
+        release(other);
+        release(heap);
+    }
+
+    /// Records into `list` the copy of `texels` (rows of `row` bytes, one
+    /// after the other) into subresource `index` of `texture`, in the copy
+    /// destination state, laid out as the host copies it.
+    fn fill_rows(list: &HostList, texture: &ID3D12Resource, index: u32, texels: &[u8], row: usize) {
+        let host = host().unwrap();
+        // SAFETY: a live texture.
+        let d = unsafe { texture.GetDesc() };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0;
+        // SAFETY: a plain query for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                index,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        let (upload, data) = host.upload_buffer(bytes).unwrap();
+        let pitch = footprint.Footprint.RowPitch as usize;
+        for (y, texels) in texels.chunks(row).enumerate() {
+            // SAFETY: the buffer's mapping holds the footprint's rows.
+            unsafe {
+                std::ptr::copy_nonoverlapping(texels.as_ptr(), data.add(y * pitch), texels.len());
+            }
+        }
+        footprint.Offset = 0;
+        // SAFETY: an open list and live resources.
+        unsafe {
+            list.list.CopyTextureRegion(
+                &subresource_at(texture, index),
+                0,
+                0,
+                0,
+                &placed_at(&upload, &footprint),
+                None,
+            );
+        }
+        list.keep(&upload);
+    }
+
+    /// Subresource `index` of `texture` (in `state`): its rows, one after
+    /// the other, each `row` bytes long.
+    fn read_rows(texture: &ID3D12Resource, state: u32, index: u32, row: usize) -> Vec<u8> {
+        let host = host().unwrap();
+        // SAFETY: a live texture.
+        let d = unsafe { texture.GetDesc() };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0;
+        // SAFETY: a plain query for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                index,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        footprint.Offset = 0;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a read-back buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let list = host.new_list().unwrap();
+        let state = D3D12_RESOURCE_STATES(super::super::legal_state(texture, state) as i32);
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: an open list and live resources.
+        unsafe {
+            if state != source {
+                list.list
+                    .ResourceBarrier(&[transition(texture, state, source)]);
+            }
+            list.list.CopyTextureRegion(
+                &placed_at(&readback, &footprint),
+                0,
+                0,
+                0,
+                &subresource_at(texture, index),
+                None,
+            );
+            if state != source {
+                list.list
+                    .ResourceBarrier(&[transition(texture, source, state)]);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let mut rows = Vec::with_capacity(row * footprint.Footprint.Height as usize);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy ran (drained); the buffer holds the footprint.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let all = std::slice::from_raw_parts(mapped.cast::<u8>(), bytes as usize);
+            for y in 0..footprint.Footprint.Height as usize {
+                rows.extend_from_slice(&all[y * pitch..][..row]);
+            }
+            readback.Unmap(0, None);
+        }
+        rows
+    }
+
+    /// A 256×256 title depth texture of console format `format` with a
+    /// depth plane twin holding `texels` (4 or 2 bytes each, row by row):
+    /// its plane drawn from the twin by the pass, and the plane of another
+    /// such texture copied from the same twin as in a query
+    /// (`copy_plane`), both read back, 4 bytes a texel.
+    fn drawn_and_copied(format: u32, texels: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let host = host().unwrap();
+        let (drawn, copied) = (depth(256, 256, format), depth(256, 256, format));
+        let list = host.new_list().unwrap();
+        for (d, copy) in [(drawn, false), (copied, true)] {
+            assert!(crate::resource::twin_view(d, None).is_some());
+            let (depth, twin) = (
+                crate::resource::host_copy(d).unwrap(),
+                crate::resource::twin(d).unwrap(),
+            );
+            let plane = twin.plane.clone().expect("a depth plane twin");
+            list.move_to(&plane, COPY_DEST);
+            fill_rows(&list, &plane.texture, 0, texels, texels.len() / 256);
+            list.move_to(&plane, UNORDERED_ACCESS);
+            if copy {
+                assert!(list.copy_plane(&depth, &twin), "a copy");
+            } else {
+                list.pass_plane(&depth, &twin);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        let [drawn_plane, copied_plane] = [drawn, copied].map(|d| {
+            let copy = crate::resource::host_copy(d).unwrap();
+            read_rows(
+                &copy.texture,
+                copy.state.load(Ordering::Relaxed),
+                0,
+                256 * 4,
+            )
+        });
+        release(drawn);
+        release(copied);
+        (drawn_plane, copied_plane)
+    }
+
+    /// The texels where two planes of 24-bit depth (4 bytes a texel, the
+    /// depth in the low 24 bits) differ: (texel, first, second).
+    fn differ_24(a: &[u8], b: &[u8]) -> Vec<(usize, u32, u32)> {
+        let word = |bytes: &[u8], at: usize| {
+            u32::from_le_bytes(bytes[at * 4..at * 4 + 4].try_into().unwrap()) & 0xff_ffff
+        };
+        (0..a.len() / 4)
+            .map(|i| (i, word(a, i), word(b, i)))
+            .filter(|(_, x, y)| x != y)
+            .collect()
+    }
+
+    /// Every 16-bit step (0 to 65535, texel `y * 256 + x`) copied into a
+    /// 24-bit plane, as in a query, gets the very depth the pass draws for
+    /// it: the table holds what the host's depth writes give each step's
+    /// float (`PlanePass::steps_table`), which the lighting's "equal" draws
+    /// get too.
+    #[test]
+    fn a_plane_copied_in_a_query_holds_what_the_pass_draws_for_each_step() {
+        let test =
+            "host::twins::tests::a_plane_copied_in_a_query_holds_what_the_pass_draws_for_each_step";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let steps: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        let (drawn, copied) = drawn_and_copied(D16_UNORM_S8_UINT, &steps);
+        let differ = differ_24(&drawn, &copied);
+        assert!(
+            differ.is_empty(),
+            "{} steps differ, first (step, drawn, copied): {:?}",
+            differ.len(),
+            &differ[..differ.len().min(8)]
+        );
+    }
+
+    /// Floats spread over the depths a plane holds (below 0, 0 to 1 at
+    /// every exponent from 2^-31, the lighting's class steps, 1 and above),
+    /// 65536 of them, 4 bytes each.
+    fn spread_floats() -> Vec<u8> {
+        let step = f32::from_bits(0x3780_0080);
+        let mut seed = 0x2545_f491_u32;
+        let floats: Vec<f32> = (0..65536u32)
+            .map(|i| match i {
+                0 => -0.25,
+                1 => 0.0,
+                2 => 1.0,
+                3 => 1.5,
+                4 => f32::from_bits(0x3f7f_ffff),
+                5..=4100 => (i - 5) as f32 * step,
+                _ => {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    f32::from_bits(0x3000_0000 + seed % (0x3f80_0000 - 0x3000_0000))
+                }
+            })
+            .collect();
+        floats.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    /// Floats copied into a 24-bit plane, as in a query, get the depth the
+    /// pass draws for them on WARP ([`UNORM24`]). With D3D's rule computed
+    /// exactly, 992 of these floats got one step more.
+    #[test]
+    fn a_24_bit_plane_copied_in_a_query_holds_what_the_pass_draws_for_floats() {
+        let test = "host::twins::tests::a_24_bit_plane_copied_in_a_query_holds_what_the_pass_draws_for_floats";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        const D24_UNORM_S8_UINT: u32 = 45;
+        let (drawn, copied) = drawn_and_copied(D24_UNORM_S8_UINT, &spread_floats());
+        let differ = differ_24(&drawn, &copied);
+        assert!(
+            differ.is_empty(),
+            "{} floats differ, first (texel, drawn, copied): {:?}",
+            differ.len(),
+            &differ[..differ.len().min(8)]
+        );
+    }
+
+    /// Floats copied into a 32-bit float plane, as in a query, are what the
+    /// pass draws for them: the same floats, from 0 to 1.
+    #[test]
+    fn a_float_plane_copied_in_a_query_holds_what_the_pass_draws() {
+        let test = "host::twins::tests::a_float_plane_copied_in_a_query_holds_what_the_pass_draws";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        const D32_FLOAT_S8X24_UINT: u32 = 20;
+        let (drawn, copied) = drawn_and_copied(D32_FLOAT_S8X24_UINT, &spread_floats());
+        let differ: Vec<usize> = (0..drawn.len() / 4)
+            .filter(|i| drawn[i * 4..i * 4 + 4] != copied[i * 4..i * 4 + 4])
+            .collect();
+        assert!(
+            differ.is_empty(),
+            "{} floats differ, first texels: {:?}",
+            differ.len(),
+            &differ[..differ.len().min(8)]
+        );
     }
 
     /// The title sets a viewport and no scissor, then draws: with a pass
@@ -2501,15 +3484,60 @@ mod tests {
             crate::resource::twin(depth).unwrap(),
         );
         probe::record_in(&list, &copy, &twin, true, 1);
-        assert!(probe::ready(u64::MAX).is_empty(), "read before it ran");
+        assert!(
+            probe::ready_of(u64::MAX, Some(1)).is_empty(),
+            "read before it ran"
+        );
         list.close();
         host.execute(&[&list]);
         host.drain();
-        let ready = probe::ready(host.completed());
+        let ready = probe::ready_of(host.completed(), Some(1));
         assert_eq!(ready.len(), 1);
         let found = probe::found(&ready[0]).unwrap();
         assert_eq!((found.differ, found.texels), (0, 16));
         assert_eq!(found.classes, [(65, 8), (129, 8)]);
+        release(depth);
+    }
+
+    /// `XTP_PLANE_PROBE`: a closed list submitted a second time before its
+    /// probe is read writes the probe's buffers again, so the probe waits
+    /// for that run: it is not read at the first run's fence, and is read
+    /// once after the second. In round 2, the first submission took the
+    /// probe from the list with its fence, and the second was not seen (the
+    /// Codex review's case 9, closed list submitted again).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_probe_waits_for_its_lists_last_run() {
+        let test = "host::twins::tests::a_probe_waits_for_its_lists_last_run";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        const FRAME: u64 = 2;
+        let host = gpu.host();
+        let depth = depth(4, 4, D16_UNORM_S8_UINT);
+        assert!(crate::resource::twin_view(depth, None).is_some());
+        let list = host.new_list().unwrap();
+        write_classes(&list, depth, 65, 129);
+        assert!(list.planes_now(), "a pass");
+        let (copy, twin) = (
+            crate::resource::host_copy(depth).unwrap(),
+            crate::resource::twin(depth).unwrap(),
+        );
+        probe::record_in(&list, &copy, &twin, true, FRAME);
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        let first = host.completed();
+        host.execute(&[&list]);
+        assert!(
+            probe::ready_of(first, Some(FRAME)).is_empty(),
+            "read at the first run's fence"
+        );
+        host.drain();
+        let ready = probe::ready_of(host.completed(), Some(FRAME));
+        assert_eq!(ready.len(), 1, "read once");
+        let found = probe::found(&ready[0]).unwrap();
+        assert_eq!((found.differ, found.texels), (0, 16));
         release(depth);
     }
 
