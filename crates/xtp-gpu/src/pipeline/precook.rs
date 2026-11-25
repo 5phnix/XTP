@@ -1045,9 +1045,18 @@ pub(in crate::pipeline) mod tests {
         assert!(counts().made > made, "compiled");
         let loaded = counts().loaded;
         assert_eq!(replay(&recorded, 0), Replayed::Ready);
-        if super::super::library::available() {
-            assert!(counts().loaded > loaded, "found in the library");
-        }
+        assert!(counts().loaded > loaded, "found in the library");
         assert_eq!(replay(&recorded, 1), Replayed::Untranslated);
+
+        // Keep the same translated shaders and change only the topology.
+        // The new state needs its own library entry.
+        let mut state = stream.state().unwrap();
+        state.topology = windows::Win32::Graphics::Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        let made = counts().made;
+        assert!(HostPipeline::new(&shaders, Some(&state)).is_some());
+        assert!(counts().made > made, "compiled for the changed topology");
+        let loaded = counts().loaded;
+        assert!(HostPipeline::new(&shaders, Some(&state)).is_some());
+        assert!(counts().loaded > loaded, "loaded for the same topology");
     }
 }
