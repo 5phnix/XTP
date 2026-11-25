@@ -62,6 +62,14 @@ const EMIT: u32 = 0xBF90_0022;
 const CUT: u32 = 0xBF90_0012;
 const EMIT_CUT: u32 = 0xBF90_0032;
 const DONE: u32 = 0xBF90_0003;
+/// GS_DONE carrying a last EMIT, CUT or EMIT_CUT (its operation in bits
+/// 4-5, as GS's).
+const DONE_EMIT: u32 = DONE | 2 << 4;
+const DONE_CUT: u32 = DONE | 1 << 4;
+const DONE_EMIT_CUT: u32 = DONE | 3 << 4;
+const S_AND_SAVEEXEC_B64: u32 = 0x24;
+const S_OR_B64: u32 = 0x11;
+const EXEC: u8 = 126;
 
 /// A VGPR as a 9-bit source operand.
 fn vgpr(n: u8) -> u32 {
@@ -232,6 +240,8 @@ enum Step {
     Emit(u8),
     /// The same with GS EMIT_CUT.
     EmitCut(u8),
+    /// The same with GS_DONE carrying the emit.
+    EmitDone(u8),
     Cut,
     Done,
 }
@@ -242,12 +252,12 @@ fn gs_program(steps: &[Step], max_vertices: u32) -> Program {
     let mut n = 0;
     for &step in steps {
         match step {
-            Step::Emit(k) | Step::EmitCut(k) => {
+            Step::Emit(k) | Step::EmitCut(k) | Step::EmitDone(k) => {
                 gs_vertex(&mut code, n, k);
-                code.add([if matches!(step, Step::Emit(_)) {
-                    EMIT
-                } else {
-                    EMIT_CUT
+                code.add([match step {
+                    Step::Emit(_) => EMIT,
+                    Step::EmitCut(_) => EMIT_CUT,
+                    _ => DONE_EMIT,
                 }]);
                 n += 1;
             }
@@ -313,6 +323,10 @@ fn slot(vertex: u32, dword: u32) -> Slot {
     Slot { vertex, dword }
 }
 
+fn emit(vertex: u32, cut: bool, done: bool) -> Message {
+    Message::Emit { vertex, cut, done }
+}
+
 fn flat(accesses: &[RingAccess]) -> Vec<(Reg, Slot)> {
     accesses.iter().flat_map(|a| a.dwords.clone()).collect()
 }
@@ -365,19 +379,10 @@ fn geometry_plan_resolves_the_rings_and_numbers_the_emits() {
     assert_eq!(
         messages,
         [
-            Message::Emit {
-                vertex: 0,
-                cut: false
-            },
-            Message::Emit {
-                vertex: 1,
-                cut: false
-            },
-            Message::Emit {
-                vertex: 2,
-                cut: false
-            },
-            Message::Cut,
+            emit(0, false, false),
+            emit(1, false, false),
+            emit(2, false, false),
+            Message::Cut { done: false },
             Message::Done,
         ]
     );
@@ -646,6 +651,152 @@ fn geometry_plans_refuse_what_emits_cannot_give() {
     assert_eq!(geometry::es_plan(&code.program()), Err(geometry::RING));
 }
 
+/// A ring write may store its own address as data (Codex review of W10's
+/// first phase): the address's set-up then computes a value the write
+/// exports, and is no longer left out. In an ES, the item's address as
+/// item dword 8; in a GS, the vertex's address as vertex 0's dword 4 (the
+/// loaded base then feeds an output, and only the input vertices' set-up
+/// and M0's stay out).
+#[test]
+fn geometry_plan_keeps_an_address_stored_as_data() {
+    let mut code = es_code();
+    es_position(&mut code, ES_CONSTANTS[..4].try_into().unwrap());
+    code.add(ds_at(DS_WRITE_B32, 0, 15, 15, 32));
+    code.add([S_BARRIER, sop1(S_SETPC_B64, 0, 6)]);
+    let plan = geometry::es_plan(&code.program()).expect("a plan");
+    assert_eq!(plan.item_bytes, 48);
+    assert_eq!(
+        plan.writes.last().map(|w| w.dwords.clone()),
+        Some(es_item(&[(15, 8)]))
+    );
+    assert_eq!(plan.address_only, BTreeSet::new(), "the address is data");
+
+    let mut code = Code::default();
+    gs_prelude(&mut code, 3 * VERTEX_DWORDS * 4);
+    code.add(ds_at(DS_WRITE_B32, 0, 13, 13, 16));
+    for (n, k) in [0, 1, 2].into_iter().enumerate() {
+        let d = (VERTEX_DWORDS * n as u32) as u8;
+        let b = 20 + 10 * k;
+        code.add(ds(DS_WRITE2_B32, 0, 13, [b, b + 1], d, d + 1));
+        code.add(ds(DS_WRITE2_B32, 0, 13, [b + 2, b + 3], d + 2, d + 3));
+        code.add([EMIT]);
+    }
+    code.add([DONE, S_ENDPGM]);
+    let plan = geometry::gs_plan(&code.program(), &shape(3)).expect("a plan");
+    let first = &plan.emits[&plan.messages[0].0];
+    assert!(
+        first
+            .iter()
+            .any(|w| w.dword == 4 && w.reg == Reg::V(13) && w.site.1 == PRELUDE_SETUP + 15),
+        "vertex 0's dword 4 is the address: {first:?}"
+    );
+    // Kept: the base's load, its shift and offset (6-8), the lane and the
+    // address (9-11). Left out: the input vertices' offsets and M0.
+    let setup: BTreeSet<Site> = [0, 1, 2, 3, 4, 5, 12, 13].map(|i| (0, i)).into();
+    assert_eq!(plan.address_only, setup);
+}
+
+/// GS_DONE carries an operation as GS does (Codex review of W10's first
+/// phase): a last emit, cut or emit-and-cut, which the plan numbers and
+/// checks as the others, with nothing after it.
+#[test]
+fn geometry_gs_done_carries_its_last_emit() {
+    let plan = plan(&[Step::Emit(0), Step::Emit(1), Step::EmitDone(2)], 3).expect("a plan");
+    let messages: Vec<Message> = plan.messages.iter().map(|m| m.1).collect();
+    assert_eq!(
+        messages,
+        [
+            emit(0, false, false),
+            emit(1, false, false),
+            emit(2, false, true)
+        ]
+    );
+    assert_eq!(plan.emitted, 3);
+    let last = &plan.emits[&plan.messages[2].0];
+    assert_eq!(
+        last.len(),
+        10,
+        "the last emit takes its vertex's ten dwords"
+    );
+    let with = |extra: &[u32], max: u32| {
+        let mut code = Code::default();
+        gs_prelude(&mut code, max * VERTEX_DWORDS * 4);
+        for (n, k) in [0, 1, 2].into_iter().enumerate() {
+            gs_vertex(&mut code, n as u32, k);
+            code.add([EMIT]);
+        }
+        code.add(extra.iter().copied());
+        code.add([S_ENDPGM]);
+        geometry::gs_plan(&code.program(), &shape(max)).map(|p| (p.messages, p.emitted))
+    };
+    let last = |extra: &[u32], max: u32| with(extra, max).map(|(m, e)| (m[m.len() - 1].1, e));
+    assert_eq!(last(&[DONE_CUT], 3), Ok((Message::Cut { done: true }, 3)));
+    // GS_DONE's emit past the most vertices, after another GS_DONE, or
+    // followed by a message; on stream 1; GS_DONE alone naming a stream.
+    assert_eq!(last(&[DONE_EMIT], 3), Err(geometry::TOO_MANY));
+    let mut code = Code::default();
+    gs_prelude(&mut code, 4 * VERTEX_DWORDS * 4);
+    for n in 0..4 {
+        gs_vertex(&mut code, n, 0);
+        code.add([if n == 3 { DONE_EMIT_CUT } else { EMIT }]);
+    }
+    code.add([S_ENDPGM]);
+    let plan = geometry::gs_plan(&code.program(), &shape(4)).expect("a plan");
+    assert_eq!(plan.messages[3].1, emit(3, true, true));
+    assert_eq!(plan.emitted, 4);
+    assert_eq!(with(&[DONE, DONE_CUT], 3), Err(geometry::AFTER_DONE));
+    assert_eq!(with(&[DONE_CUT, CUT], 3), Err(geometry::AFTER_DONE));
+    assert_eq!(with(&[DONE_CUT | 1 << 8], 3), Err(geometry::STREAM));
+    assert_eq!(with(&[DONE | 1 << 8], 3), Err(geometry::MESSAGE));
+}
+
+/// Emits and cuts under different lane masks are refused (Codex review of
+/// W10's first phase): a lane outside one emit's EXEC counts its later
+/// vertices one fewer than the path does. Under one mask, even a narrower
+/// one than the entry's, they are numbered; GS_DONE alone may come after
+/// the mask is restored.
+#[test]
+fn geometry_emits_share_one_lane_mask() {
+    let saveexec = sop1(S_AND_SAVEEXEC_B64, 40, 42);
+    let restore = sop2(S_OR_B64, EXEC, u32::from(EXEC), 40);
+    let program = |masked: &[usize], cut_masked: bool| {
+        let mut code = Code::default();
+        gs_prelude(&mut code, 3 * VERTEX_DWORDS * 4);
+        let mut inside = false;
+        let mut set = |code: &mut Code, want: bool| {
+            if want != inside {
+                code.add([if want { saveexec } else { restore }]);
+                inside = want;
+            }
+        };
+        for (n, k) in [0u8, 1, 2].into_iter().enumerate() {
+            set(&mut code, masked.contains(&n));
+            gs_vertex(&mut code, n as u32, k);
+            code.add([EMIT]);
+        }
+        set(&mut code, cut_masked);
+        code.add([CUT]);
+        set(&mut code, false);
+        code.add([DONE, S_ENDPGM]);
+        geometry::gs_plan(&code.program(), &shape(3))
+    };
+    let all = program(&[0, 1, 2], true).expect("one mask");
+    let vertices: Vec<u32> = all
+        .messages
+        .iter()
+        .filter_map(|m| match m.1 {
+            Message::Emit { vertex, .. } => Some(vertex),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(vertices, [0, 1, 2]);
+    assert!(program(&[], false).is_ok());
+    assert_eq!(program(&[1], false), Err(geometry::MASKED));
+    assert_eq!(program(&[0], false), Err(geometry::MASKED));
+    assert_eq!(program(&[0, 1, 2], false), Err(geometry::MASKED));
+    assert_eq!(program(&[], true), Err(geometry::MASKED));
+}
+
 /// D3D12's geometry-shader limits, and the codes DXIL gives the shapes.
 #[test]
 fn geometry_shapes_within_d3d12_limits() {
@@ -776,7 +927,7 @@ fn lower_gs(p: &Program, plan: &GsPlan, shape: &GsShape) -> Vec<u8> {
                     }
                     continue;
                 }
-                Some(Message::Cut) => {
+                Some(Message::Cut { .. }) => {
                     Vertices::cut(&mut s, block);
                     continue;
                 }
@@ -1343,6 +1494,24 @@ fn geometry_shader_vertex_counts() {
     let second = [v(1, 1), v(3, 0), v(2, 2)];
     let turned = (0..3).any(|r| (0..3).all(|i| got[3 + i] == second[(i + r) % 3]));
     assert!(turned, "second triangle {:?}", &got[3..]);
+}
+
+/// GS_DONE's own emit is drawn as the others are: two emits, then GS_DONE
+/// carrying the third, one triangle per invocation (before the Codex
+/// review's fix it was dropped, and nothing was drawn).
+#[test]
+fn geometry_shader_streams_out_the_emit_gs_done_carries() {
+    let steps = [Step::Emit(1), Step::Emit(0), Step::EmitDone(2)];
+    let Some(words) = run_gs(&steps, 3, 2) else {
+        return;
+    };
+    let mut want = Vec::new();
+    for prim in 0..2 {
+        for (n, k) in [1, 0, 2].into_iter().enumerate() {
+            want.push(record(probe_word, prim, n as u32, k));
+        }
+    }
+    assert_eq!(records(&words), want);
 }
 
 /// The pair, both halves made from console programs: the ES's ring item
