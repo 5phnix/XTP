@@ -42,6 +42,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 32,
         layout: vec![table(0), table(1)],
         used: vec![

@@ -51,10 +51,21 @@
 //! `docs/analysis/gpu-frame.md`). `XTP_TEXTURE_PREDICATION=0` runs every
 //! list's copy, as before.
 //!
+//! Textures read through descriptor tables are brought up to date by the
+//! draws that read them. Directly indexed views are not known per draw:
+//! the textures shaders pick from the view heap by an index they compute
+//! are uploaded by a pass once a frame (`draw.rs` `heap_textures`, the
+//! queue of `descriptor::host::TextureQueue`), the slots the title wrote
+//! last first, and then checked for changes in turns at record time
+//! ([`memory_change`]: the guards or the write watch, no hash), the changed
+//! ones uploaded as a table read does (memory neither covers within a
+//! budget of bytes a pass, as the check at submission hashes it). Ported
+//! from fxceless's VIctory fork (commit 578d459), which uploads such a
+//! texture once and again only when the title rewrites its slot.
+//!
 //! shortcut: a change detiles the whole texture, not the pages written.
-//! Only textures read through descriptor tables are brought up to date
-//! (directly indexed views are not known per draw); plane 0 is uploaded
-//! (every mip and array slice), depth and stencil planes are not.
+//! Plane 0 is uploaded (every mip and array slice), depth and stencil
+//! planes are not.
 //!
 //! shortcut: the safety net covers guarded textures only, not those in
 //! write-watched memory.
@@ -154,6 +165,10 @@ unsafe impl Sync for Staging {}
 /// Staging states by title resource, in the order the safety net walks.
 static STAGING: Mutex<Option<BTreeMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
+/// The bytes of the staging buffers in [`STAGING`] (upload memory held for
+/// as long as their textures live).
+static STAGED: AtomicU64 = AtomicU64::new(0);
+
 /// Room for a check's snapshot of texture memory, kept at the largest
 /// changed so far.
 static SNAPSHOT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
@@ -172,8 +187,10 @@ pub(crate) fn host_written(resource: This) {
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if let Some(map) = map.as_mut()
+        && let Some(gone) = map.remove(&resource)
+    {
+        STAGED.fetch_sub(gone.size, Ordering::Relaxed);
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
@@ -302,6 +319,126 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             .unwrap_or_else(|e| e.into_inner())
             .push((staging.id, runs));
     });
+}
+
+/// What a look at a texture's memory before its upload is recorded tells
+/// ([`memory_change`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Change {
+    /// Not written since its staging buffer was detiled; or nothing to
+    /// upload (no staging buffer, the host GPU's own contents).
+    No,
+    /// Written since, suspected by the safety net, or never detiled.
+    Yes,
+    /// Memory neither the write watch nor the guards cover (or guards that
+    /// are off or verified): only the check at submission, which hashes its
+    /// bytes (these many), tells.
+    Unknown(u64),
+}
+
+/// Whether the memory of `resource`, a texture a shader picks from the view
+/// heap by index, changed since its staging buffer was last detiled: asked
+/// at record time by the pass over such textures (`draw.rs`
+/// `heap_textures`), so that the unchanged ones record no upload. The
+/// write watch or the guards answer as they do for the check at
+/// submission, without its hash; nothing is taken from them (the journal
+/// keeps the writes for the check). A texture its guards find clean is the
+/// safety net's to hash, as one a check found clean.
+pub(crate) fn memory_change(resource: This) -> Change {
+    let staging = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()
+            .and_then(|map| map.get(&(resource as usize)).cloned())
+    };
+    let Some(staging) = staging else {
+        return Change::No;
+    };
+    let host_written = HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)));
+    if host_written {
+        return Change::No;
+    }
+    // Never detiled (its memory was not mapped at the checks so far).
+    if staging.suspect.load(Ordering::Relaxed) || staging.written.load(Ordering::Acquire) == 0 {
+        return Change::Yes;
+    }
+    let asked = staging.last.lock().unwrap_or_else(|e| e.into_inner()).asked;
+    let (start, end) = staging.range();
+    let since = |written: &[(usize, u64)]| {
+        if written.iter().any(|&(_, w)| w > asked) {
+            Change::Yes
+        } else {
+            Change::No
+        }
+    };
+    if let Some((_, written)) = crate::watch::writes(start, end, false) {
+        return since(&written);
+    }
+    if guards()
+        && let Some((_, written)) = crate::watch::writes(start, end, true)
+    {
+        let change = since(&written);
+        if change == Change::Yes {
+            return change;
+        }
+        if !verify_guards() {
+            staging.sampled.store(true, Ordering::Relaxed);
+            return change;
+        }
+    }
+    Change::Unknown(staging.layout.size)
+}
+
+/// The bytes of `resource`'s staging buffer, if it has one.
+pub(crate) fn staged_bytes(resource: This) -> Option<u64> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()?.get(&(resource as usize)).map(|s| s.size)
+}
+
+/// The bytes of every staging buffer there is.
+pub(crate) fn staged_total() -> u64 {
+    STAGED.load(Ordering::Relaxed)
+}
+
+/// The bytes of title memory a texture the title placed itself takes, by
+/// its resource description; `None` without a console layout for it.
+pub(crate) fn placed_len(resource: &[u32; 14]) -> Option<usize> {
+    let words = crate::resource::canonical_resource_desc(*resource);
+    // SAFETY: 56 bytes in the description's layout, as `texture_at` reads
+    // them.
+    let desc = unsafe {
+        words
+            .as_ptr()
+            .cast::<crate::resource::ResourceDesc>()
+            .read_unaligned()
+    };
+    Some(crate::resource::texture_layout(&desc)?.size as usize)
+}
+
+/// Whether any of `[at, at + len)` is committed memory (a texture streaming
+/// in has some of its pages mapped before the others, not always its
+/// first).
+pub(crate) fn any_committed(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut p = at as usize;
+    let end = p.saturating_add(len.max(1));
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        if info.State == MEM_COMMIT {
+            return true;
+        }
+        p = info.BaseAddress as usize + info.RegionSize;
+    }
+    false
 }
 
 /// Each copy decided in tests: its staging state's [`Staging::id`] and
@@ -1178,6 +1315,18 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    // Under a target of its own, one line a texture: which title memory
+    // gets uploaded at all, through tables or by index
+    // (`XTP_LOG=info,xtp_gpu::texture_memory=debug`).
+    tracing::debug!(
+        target: "xtp_gpu::texture_memory",
+        memory = ?memory,
+        width = d.Width,
+        height = d.Height,
+        format = d.Format.0,
+        bytes = layout.size,
+        "a texture the title fills gets a staging buffer"
+    );
     let s = Arc::new(Staging {
         buffer,
         size: total,
@@ -1199,6 +1348,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         #[cfg(feature = "diagnostics")]
         seen: Seen::default(),
     });
+    STAGED.fetch_add(s.size, Ordering::Relaxed);
     map.insert(resource as usize, s.clone());
     Some(s)
 }
@@ -1909,5 +2059,412 @@ mod tests {
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
         crate::watch::title_memory_remapped(view, LEN);
+    }
+
+    /// The look a pass over the textures shaders pick by index takes before
+    /// it records an upload (`memory_change`): a texture without a staging
+    /// buffer has nothing to upload; one never detiled is due; one in view
+    /// memory its guards find clean is not, and is once the CPU wrote it,
+    /// until a check has detiled the write (asking takes nothing from the
+    /// check); one in memory neither guarded nor write-watched only the
+    /// check's hash tells.
+    #[test]
+    fn a_look_before_an_upload_tells_written_memory() {
+        let test = "texture::tests::a_look_before_an_upload_tells_written_memory";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !guards() || verify_guards() || !predication() {
+            return;
+        }
+        let _serial = crate::watch::tests::serial();
+        const LEN: usize = 64 << 10;
+        let (view, other) = section_views(LEN);
+        let (resource, texture) = texture_in(view);
+        assert_eq!(memory_change(resource), Change::No, "no staging buffer");
+        let staging = staging(resource, texture).unwrap();
+        assert_eq!(memory_change(resource), Change::Yes, "never detiled");
+        let size = staging.layout.size as usize;
+        // SAFETY: bytes of the title's view, as its CPU writes them (a
+        // fault into the guards' handler).
+        let fill = |byte: u8| unsafe { (view as *mut u8).write_bytes(byte, size) };
+        fill(0x11);
+        sample_in(host, resource, 1);
+        assert_eq!(memory_change(resource), Change::No, "clean");
+        fill(0x22);
+        assert_eq!(memory_change(resource), Change::Yes, "written");
+        assert_eq!(memory_change(resource), Change::Yes, "still, until a check");
+        sample_in(host, resource, 1);
+        assert!(texels_of(host, texture).iter().all(|&b| b == 0x22));
+        assert_eq!(memory_change(resource), Change::No, "detiled");
+
+        // A committed texture: memory of its own, which neither covers.
+        let plain = committed(&sampled(16, 16, 28));
+        let started = Instant::now();
+        while crate::resource::host_resource(plain).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never resident");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let own = super::staging(plain, crate::resource::host_resource(plain).unwrap()).unwrap();
+        sample_in(host, plain, 1);
+        assert_eq!(memory_change(plain), Change::Unknown(own.layout.size));
+        // One the host copied into keeps the host's contents.
+        host_written(plain);
+        assert_eq!(memory_change(plain), Change::No);
+        assert_eq!(host.log_messages(), None);
+
+        type Release = extern "system" fn(This) -> u32;
+        for r in [resource, plain] {
+            assert_eq!(crate::object::slot::<Release>(r, 0x10)(r), 0);
+        }
+        crate::watch::title_memory_remapped(view, LEN);
+        let _ = other;
+    }
+
+    /// What the look before an upload costs (`memory_change`), out of the
+    /// game: 1,024 textures in view memory, as the title's texture pool is
+    /// (guarded), each 64 KiB from the next, staged and detiled once, then
+    /// looked at with none written (best of three rounds), and after the
+    /// CPU wrote each. Run with
+    /// `cargo test --release -p xtp-gpu -- --ignored --nocapture memory_change_costs`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn memory_change_costs() {
+        let test = "texture::tests::memory_change_costs";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !guards() || verify_guards() {
+            return;
+        }
+        let _serial = crate::watch::tests::serial();
+        const N: usize = 1024;
+        const STEP: usize = 64 << 10;
+        let (view, other) = section_views(N * STEP);
+        let textures: Vec<(This, &ID3D12Resource)> =
+            (0..N).map(|i| texture_in(view + i * STEP)).collect();
+        // One list stages and uploads them all.
+        let list = host.new_list().unwrap();
+        for &(resource, texture) in &textures {
+            upload(&list, resource, texture);
+        }
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        let round = || -> (f64, usize) {
+            let started = Instant::now();
+            let changed = textures
+                .iter()
+                .filter(|(r, _)| memory_change(*r) != Change::No)
+                .count();
+            (started.elapsed().as_secs_f64() * 1e6 / N as f64, changed)
+        };
+        let clean = (0..3).map(|_| round()).fold((f64::INFINITY, 0), |best, r| {
+            (best.0.min(r.0), best.1.max(r.1))
+        });
+        for i in 0..N {
+            // SAFETY: the first byte of each texture's memory, in the view.
+            unsafe { ((view + i * STEP) as *mut u8).write_volatile(0x5a) };
+        }
+        let written = round();
+        eprintln!(
+            "the look before an upload, {N} guarded textures: {:.2} us each clean ({} not clean), \
+             {:.2} us each written ({} found)",
+            clean.0, clean.1, written.0, written.1
+        );
+        type Release = extern "system" fn(This) -> u32;
+        for (r, _) in textures {
+            crate::object::slot::<Release>(r, 0x10)(r);
+        }
+        crate::watch::title_memory_remapped(view, N * STEP);
+        let _ = other;
+    }
+
+    /// A copy location as a title passes one (D3D12's layout): a resource,
+    /// the kind (0 a subresource index, 1 a placed footprint), then the
+    /// index or the footprint.
+    #[repr(C)]
+    struct Location {
+        resource: This,
+        kind: u32,
+        offset: u64,
+        format: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        row_pitch: u32,
+    }
+
+    /// A 2×2 RGBA8 block of `texel`s, in a title buffer (rows 256 bytes apart).
+    fn block_of(texel: u32) -> crate::testgpu::TitleBuffer {
+        let buffer = crate::testgpu::TitleBuffer::new(1 << 12);
+        buffer.set_words(|i| if i % 64 < 2 && i < 128 { texel } else { 0 });
+        buffer
+    }
+
+    /// Records, in `list` as the title does, the copy of `block` (a 2×2
+    /// block in a title buffer) to texel `(x, y)` of subresource 0 of `dst`.
+    fn copy_block(
+        list: &crate::testgpu::TitleList,
+        dst: This,
+        (x, y): (u32, u32),
+        block: &crate::testgpu::TitleBuffer,
+    ) {
+        let to = Location {
+            resource: dst,
+            kind: 0,
+            offset: 0,
+            format: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+            row_pitch: 0,
+        };
+        let from = Location {
+            resource: block.resource(),
+            kind: 1,
+            offset: 0,
+            format: 28,
+            width: 2,
+            height: 2,
+            depth: 1,
+            row_pitch: 256,
+        };
+        type Copy = extern "system" fn(
+            This,
+            *const Location,
+            u32,
+            u32,
+            u32,
+            *const Location,
+            *const [u32; 6],
+        );
+        let this = list.this();
+        crate::object::slot::<Copy>(this, 0x80)(this, &to, x, y, 0, &from, std::ptr::null());
+    }
+
+    /// The 16 texels of a 4×4 RGBA8 host copy, row by row.
+    fn texels_4x4(host: &crate::host::Host, texture: &ID3D12Resource) -> Vec<u32> {
+        let read = read_back(host, texture, COPY_DEST);
+        (0..16)
+            .map(|i| {
+                let at = (i / 4) * 256 + (i % 4) * 4;
+                u32::from_le_bytes(read[at..at + 4].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    /// A fresh 4×4 RGBA8 texture the title fills with `background`, once
+    /// its host copy is resident.
+    fn texture_4x4(background: u8) -> (This, &'static ID3D12Resource) {
+        let resource = committed(&sampled(4, 4, 28));
+        let started = Instant::now();
+        while crate::resource::host_resource(resource).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never resident");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (memory, desc) = crate::resource::texture_memory(resource).unwrap();
+        let size = crate::resource::texture_layout(&desc).unwrap().size as usize;
+        // SAFETY: the texture's own title memory, `size` bytes.
+        unsafe { memory.cast_mut().write_bytes(background, size) };
+        (resource, crate::resource::host_resource(resource).unwrap())
+    }
+
+    /// What native D3D12 holds after copies of 2×2 blocks of the given
+    /// texels at the given places, in submission order, over `background`.
+    fn expected(background: u32, copies: &[((u32, u32), u32)]) -> Vec<u32> {
+        let mut texels = vec![background; 16];
+        for &((x, y), texel) in copies {
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                texels[((y + dy) * 4 + x + dx) as usize] = texel;
+            }
+        }
+        texels
+    }
+
+    /// A 2D RGBA8 texture of `slices` array slices and `mips` mips, `width`
+    /// square, that shaders sample (the layout library's pick).
+    fn sampled_chain(width: u64, slices: u16, mips: u16) -> crate::resource::ResourceDesc {
+        let desc = sampled(width, width as u32, 28);
+        // SAFETY: a description is 56 bytes, 14 words; word 7 holds the
+        // array size (low half) and the mip count (high half).
+        let mut words: [u32; 14] = unsafe { std::mem::transmute_copy(&desc) };
+        words[7] = u32::from(slices) | u32::from(mips) << 16;
+        // SAFETY: as above, the same layout back.
+        unsafe { std::mem::transmute_copy(&words) }
+    }
+
+    /// Data that arrives after a texture's upload in a late mip only (the
+    /// smallest, in the mip tail) or in another array slice only is found
+    /// by the look before an upload and detiled into that subresource of
+    /// the staging buffer. The cases of victory-fork #559 (NickJBc), whose
+    /// fingerprint of three windows missed them; here the guards cover
+    /// every page of the texture, so no window is needed.
+    #[test]
+    fn late_mips_and_other_slices_are_found_changed() {
+        let test = "texture::tests::late_mips_and_other_slices_are_found_changed";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !guards() || verify_guards() || !predication() {
+            return;
+        }
+        let _serial = crate::watch::tests::serial();
+        const LEN: usize = 1 << 20;
+        // A 256-wide chain of 9 mips (1x1 last), then an array of 6 slices.
+        for (case, desc, (mip, slice)) in [
+            ("the last mip", sampled_chain(256, 1, 9), (8, 0)),
+            ("slice 3 of 6", sampled_chain(64, 6, 1), (0, 3)),
+        ] {
+            let (view, other) = section_views(LEN);
+            let resource = crate::resource::tests_support::at_address(view as u64, &desc);
+            let started = Instant::now();
+            while crate::resource::host_resource(resource).is_none() {
+                assert!(started.elapsed().as_secs() < 5, "never resident");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let texture = crate::resource::host_resource(resource).unwrap();
+            let staging = staging(resource, texture).unwrap();
+            let size = staging.layout.size as usize;
+            assert!(size <= LEN, "{case}: {size}");
+            // SAFETY: bytes of the title's view, as its CPU writes them.
+            unsafe { (view as *mut u8).write_bytes(0x11, size) };
+            sample_in(host, resource, 1);
+            assert_eq!(memory_change(resource), Change::No, "{case}: clean");
+            // The element (0, 0) of that mip and slice only.
+            let at = staging.layout.offset(mip, 0, 0, slice).unwrap() as usize;
+            assert!(at + 4 <= size, "{case}: {at}");
+            // SAFETY: inside the texture's memory, in the view.
+            unsafe { ((view + at) as *mut u32).write_unaligned(0x7777_7777) };
+            assert_eq!(memory_change(resource), Change::Yes, "{case}: written");
+            let before = staging.written.load(Ordering::Acquire);
+            sample_in(host, resource, 1);
+            assert!(
+                staging.written.load(Ordering::Acquire) > before,
+                "{case}: detiled"
+            );
+            // D3D12's subresource order: mips of slice 0, then of slice 1...
+            let sub = (slice * staging.mips + mip) as usize;
+            let offset = staging.footprints[sub].Offset as usize;
+            // SAFETY: the mapped staging buffer; nothing writes it now.
+            let texel = unsafe { staging.data.add(offset).cast::<u32>().read_unaligned() };
+            assert_eq!(texel, 0x7777_7777, "{case}: subresource {sub}");
+            assert_eq!(memory_change(resource), Change::No, "{case}: clean again");
+            type Release = extern "system" fn(This) -> u32;
+            assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+            crate::watch::title_memory_remapped(view, LEN);
+            let _ = other;
+        }
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// Texture writes follow submission order, not recording order
+    /// (watch.md item 263; reimplemented after andrewpozdnakov7-jpg's test
+    /// on VIctory #1891). A 4×4 RGBA8 texture the title fills with a
+    /// background; two lists copy overlapping 2×2 blocks, A at (0, 0) and
+    /// B at (1, 1), recorded A, B or B, A and submitted A, B or B, A:
+    /// native D3D12 keeps the background where neither copied and the
+    /// block submitted last where both did, whatever the recording order.
+    /// Then a list that samples the texture (its upload) and one that
+    /// copies A into it, in the four orders: sampling writes nothing, so
+    /// the texture ends as the background with A over it. Each case on a
+    /// texture of its own; the cases that differ from native are listed
+    /// together.
+    ///
+    /// Fails today, on WARP (2026-11-25): 4 of 4 two-copy cases lose the
+    /// background (a partial copy into a texture the title fills does not
+    /// first bring its title bytes: `list.rs` `copy_texture_region`), and
+    /// 3 of 4 sample-and-copy cases differ: `host_written` is set when a
+    /// copy is recorded, so a sampling list recorded after it never uploads
+    /// the background, and one recorded before it but submitted after
+    /// overwrites the copy with its first upload. VIctory #1934 (zondy1i)
+    /// resolves both at submission, in `list.rs`, `resource.rs`, `host.rs`
+    /// and here; until that is ported, run it with `--ignored`.
+    #[test]
+    #[ignore = "known failure, watch item 263 (VIctory #1891): the fix needs list.rs and resource.rs"]
+    fn texture_writes_follow_submission_order() {
+        use crate::testgpu::TitleList;
+        let test = "texture::tests::texture_writes_follow_submission_order";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let (background, a, b) = (0x1111_1111u32, 0xaaaa_aaaa, 0xbbbb_bbbb);
+        let (block_a, block_b) = (block_of(a), block_of(b));
+        let mut wrong = Vec::new();
+        let release = |r: This| {
+            type Release = extern "system" fn(This) -> u32;
+            crate::object::slot::<Release>(r, 0x10)(r);
+        };
+        // Two copies.
+        for (recorded_a_first, submitted_a_first) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let (resource, texture) = texture_4x4(0x11);
+            let (la, lb) = (TitleList::new(), TitleList::new());
+            let mut record = [(&la, (0, 0), &block_a), (&lb, (1, 1), &block_b)];
+            if !recorded_a_first {
+                record.reverse();
+            }
+            for (list, at, block) in record {
+                copy_block(list, resource, at, block);
+            }
+            let (first, second) = if submitted_a_first {
+                (&la, &lb)
+            } else {
+                (&lb, &la)
+            };
+            first.run();
+            second.run();
+            let submitted = if submitted_a_first {
+                [((0, 0), a), ((1, 1), b)]
+            } else {
+                [((1, 1), b), ((0, 0), a)]
+            };
+            let got = texels_4x4(host, texture);
+            let want = expected(background, &submitted);
+            if got != want {
+                wrong.push(format!(
+                    "copies recorded {} submitted {}: {} of 16 as native, got {got:08x?}",
+                    if recorded_a_first { "A, B" } else { "B, A" },
+                    if submitted_a_first { "A, B" } else { "B, A" },
+                    got.iter().zip(&want).filter(|(g, w)| g == w).count()
+                ));
+            }
+            release(resource);
+        }
+        // A sampling list and a copying one.
+        for (recorded_s_first, submitted_s_first) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let (resource, texture) = texture_4x4(0x11);
+            let (ls, lc) = (TitleList::new(), TitleList::new());
+            let sample = || upload(ls.host(), resource, texture);
+            if recorded_s_first {
+                sample();
+                copy_block(&lc, resource, (0, 0), &block_a);
+            } else {
+                copy_block(&lc, resource, (0, 0), &block_a);
+                sample();
+            }
+            let (first, second) = if submitted_s_first {
+                (&ls, &lc)
+            } else {
+                (&lc, &ls)
+            };
+            first.run();
+            second.run();
+            let got = texels_4x4(host, texture);
+            let want = expected(background, &[((0, 0), a)]);
+            if got != want {
+                wrong.push(format!(
+                    "sample and copy recorded {} submitted {}: {} of 16 as native, got {got:08x?}",
+                    if recorded_s_first { "S, C" } else { "C, S" },
+                    if submitted_s_first { "S, C" } else { "C, S" },
+                    got.iter().zip(&want).filter(|(g, w)| g == w).count()
+                ));
+            }
+            release(resource);
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }

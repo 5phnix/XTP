@@ -242,6 +242,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Une somme f64 de lanes masquées lit les votes de la vague console.
+    emitted_double_count: bool,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     group_base_row: Option<V>,
@@ -744,6 +746,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            emitted_double_count: false,
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             group_base_row: None,
@@ -1015,6 +1018,7 @@ impl<'a> Lower<'a> {
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
         let r = match &inst.fields {
+            _ if inst.write(Reg::FloatMode).is_some() => self.set_float_mode(inst),
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
@@ -1052,6 +1056,16 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+        }?;
+        if !self.bad.is_empty() {
+            for &(_, w) in &inst.writes {
+                if self.bad.get(&w) == Some(&mask::LANE_MASK)
+                    && let Ok(word) = self.mask_dword(w)
+                {
+                    self.vals.insert(w, Val::I32(word));
+                }
+            }
         }
+        Ok(())
     }
 }
