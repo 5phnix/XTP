@@ -282,7 +282,9 @@ pub struct HostShader {
 
 /// Whether buffers read by element with a stride known at translation are
 /// read through raw handles (`index * stride + offset`) instead of
-/// structured ones: `XTP_RAW_STRUCTURED=1`, read once. `xtp-gpu` then makes
+/// structured ones: on by default since 2026-11-25 (every image session ran
+/// with it; without it the world draws black), `XTP_RAW_STRUCTURED=0` turns
+/// it off, read once. `xtp-gpu` then makes
 /// the title's structured views raw views of the same bytes where it can
 /// (Marvisak/VIctory#1762, after fxceless's VIctory fork's `raw_window`):
 /// on NVIDIA a raw read through a structured view returns other dwords or
@@ -297,7 +299,7 @@ pub fn raw_structured() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "0"))
 }
 
 #[cfg(test)]
