@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{Lower, Stop, Val, Why, unsupported};
 use crate::emit::bitcode::{Attr, Bin, Rmw, Term, V, pred};
-use crate::gfx10::{Fields, NULL, Operand};
+use crate::gfx10::{Encoding, Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
@@ -1090,6 +1090,11 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // Where the program reads the joined value, an edge whose value
+            // has no DXIL form brings an undefined one only if no lane that
+            // takes it reads the register before writing it again
+            // (`unread_on_edge`). A join nothing reads takes any value.
+            let read = self.read_phis.contains(&phi.value);
             // A join of computed numbers (`dead_at_join`): an SGPR, not a
             // mask itself, some of whose incoming values are numbers and
             // none a constant.
@@ -1122,15 +1127,18 @@ impl<'a> Lower<'a> {
                     // data: the registers are reused after the descriptor's
                     // last access, so the program reads the joined value
                     // only after the data edge (the console compiler's phi
-                    // of a value defined on one edge only). Only dwords
+                    // of a value defined on one edge only). Undefined on
+                    // the descriptor's edge where no lane that takes it
+                    // reads the register (`unread_on_edge`); a read there
+                    // stops the program, as a direct read does. Only dwords
                     // that have no host value (addresses, formats): any
                     // other reason the descriptor load stopped with (a cube
                     // or MSAA image, a constant buffer's descriptor read as
                     // data) stops the program as it would without the join.
-                    // shortcut: undefined on the descriptor edge; wrong if
-                    // the program read the descriptor's dwords as data there.
                     (Some(Val::Missing(why)), false)
-                        if why == super::smem::DESCRIPTOR_WORD && self.descriptor_dword(arg) =>
+                        if why == super::smem::DESCRIPTOR_WORD
+                            && self.descriptor_dword(arg)
+                            && (!read || self.unread_on_edge(phi.reg, q, b)) =>
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
@@ -1140,7 +1148,9 @@ impl<'a> Lower<'a> {
                         self.s.m.i32(0)
                     }
                     (Some(Val::Missing(_)), false)
-                        if numbers && self.dead_at_join(arg, &mut Vec::new()) =>
+                        if numbers
+                            && self.dead_at_join(arg, &mut Vec::new())
+                            && (!read || self.unread_on_edge(phi.reg, q, b)) =>
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
@@ -1195,34 +1205,34 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Whether `v`, an incoming value of a join of computed numbers, is a
-    /// register the program reads as no number there: a descriptor's dword
-    /// with no host value ([`super::smem::DESCRIPTOR_WORD`]), a lane mask's
-    /// dword outside compute (where no ballot gives it as data), or a join
-    /// of only such values. Compiled code joins numbers with numbers: a
-    /// physical register that holds a mask on one path and a number on the
-    /// other holds two variables, and the program reads the joined value
-    /// only where the number's path set it (behind a flag kept in a VGPR:
-    /// the skinned and shadow mesh programs 235e56869c1ea883 at 0x1980,
-    /// c3ba22ec6fc5dd4a at 0x1b48). That edge brings an undefined value.
-    // shortcut: wrong where a mask meets a computed number and the program
-    // reads the mask's side as data after the join (in compute, where
-    // ballots are exact, such a join stays refused, as does one with a
-    // constant: `cond ? ballot : 5`).
+    /// Whether `v`, an incoming value of a join of computed numbers, is of
+    /// a kind compiled code holds in a register it then reuses for a
+    /// number: a descriptor's dword with no host value
+    /// ([`super::smem::DESCRIPTOR_WORD`], in every stage, as the rule for a
+    /// descriptor's dword joined directly), a lane mask's dword outside
+    /// compute (where no ballot gives it as data), or a join of only such
+    /// values. A physical register that holds a mask on one path and a
+    /// number on the other holds two variables, and the program reads the
+    /// joined value only where the number's path set it: behind a flag kept
+    /// in a VGPR, 0 on the mask's edge (the skinned and shadow mesh programs
+    /// 235e56869c1ea883 at 0x1980, c3ba22ec6fc5dd4a at 0x1b48). The join
+    /// takes an undefined value on that edge only where
+    /// [`Self::unread_on_edge`] proves it: a program that reads the mask's
+    /// side after the join stops, as a direct read does. In compute
+    /// (ballots are exact) such a join stays refused, as does one with a
+    /// constant (`cond ? ballot : 5`).
     // Ported from fxceless's VIctory fork (commit 578d459) by fxceless
     // (`dead` and its arm in the joins). Here: undefined rather than 0, as
-    // the descriptor-word rule above; not in compute; not where a number of
-    // the join is a constant.
+    // the descriptor-word rule above; only where no lane on the edge reads
+    // the register; not for masks in compute; not where a number of the
+    // join is a constant.
     fn dead_at_join(&self, v: Value, seen: &mut Vec<Value>) -> bool {
-        if matches!(self.vals.get(&v), Some(Val::Missing(w)) if *w == super::smem::DESCRIPTOR_WORD)
-            && self.descriptor_dword(v)
-        {
-            return true;
-        }
         let st = self.x.st;
-        if self.mask_data != super::mask::MaskData::Console
-            && (st.masks.contains_key(&v) || st.highs.contains_key(&v))
-        {
+        let word = matches!(self.vals.get(&v), Some(Val::Missing(w)) if *w == super::smem::DESCRIPTOR_WORD)
+            && self.descriptor_dword(v);
+        let mask = self.mask_data != super::mask::MaskData::Console
+            && (st.masks.contains_key(&v) || st.highs.contains_key(&v));
+        if word || mask {
             return true;
         }
         let Some(&(b, i)) = self.phi_at.get(&v) else {
@@ -1237,6 +1247,374 @@ impl<'a> Lower<'a> {
             .iter()
             .all(|&a| self.dead_at_join(a, seen))
     }
+
+    /// Whether no lane that enters join `b` from `pred` reads `reg`, from
+    /// the join on, before writing it again: what the register held on that
+    /// edge is then no value the program uses, and the join may take an
+    /// undefined one there.
+    ///
+    /// Per lane, a path follows only the branches the lane can take with
+    /// what it knows ([`Path`]): what holds on entering `pred` and its
+    /// branch to the join, the branches taken since, the constants the
+    /// join's phis take on that edge (a flag VGPR that is 0 on the mask's
+    /// edge and that the program tests before reading the register), and a
+    /// comparison already decided on the path made again of the same
+    /// values. Vector instructions whose guard cannot hold do not run. Back
+    /// to the join, an indirect jump, or a search of more than
+    /// [`UNREAD_STEPS`] blocks: no proof. In the console flow (branches
+    /// taken wave-wide) every successor is followed and every instruction
+    /// runs, and only a scalar instruction's write ends a path.
+    fn unread_on_edge(&self, reg: Reg, pred: usize, b: usize) -> bool {
+        let (p, st) = (self.x.p, self.x.st);
+        let per_lane = !self.console_cf;
+        let Some(n) = p.blocks[b].preds.iter().position(|&q| q == pred) else {
+            return false;
+        };
+        let joined: HashMap<Value, u32> = p.blocks[b]
+            .phis
+            .iter()
+            .filter_map(|phi| Some((phi.value, self.word_of(phi.args[n])?)))
+            .collect();
+        // What lanes entering `pred` know, and its branch to the join.
+        // Over a back edge it holds for the iteration that ends.
+        let mut known = Vec::new();
+        if per_lane && self.rpo[b] > self.rpo[pred] {
+            let none = HashMap::new();
+            let entry = Path {
+                joined: &none,
+                at: pred,
+                from: None,
+                known: &[],
+            };
+            known = self.learn(&entry, st.reach[pred], true);
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = st.exits[pred]
+                && taken != not_taken
+            {
+                let more = self.learn(
+                    &Path {
+                        known: &known,
+                        ..entry
+                    },
+                    when,
+                    taken == b,
+                );
+                known.extend(more);
+            }
+        }
+        let mut work = vec![(pred, b, known)];
+        let mut seen = HashSet::new();
+        let mut steps = 0;
+        'paths: while let Some((from, at, known)) = work.pop() {
+            if !seen.insert((from, at, known.clone())) {
+                continue;
+            }
+            steps += 1;
+            if steps > UNREAD_STEPS {
+                return false;
+            }
+            let path = Path {
+                joined: &joined,
+                at,
+                from: Some(from),
+                known: &known,
+            };
+            for (i, inst) in p.blocks[at].insts.iter().enumerate() {
+                let guard = if per_lane { st.guards[at][i] } else { None };
+                let (runs, skips) = guard.map_or((true, false), |g| self.outcomes(g, &path));
+                if runs && inst.read(reg).is_some() {
+                    return false;
+                }
+                let scalar = matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. });
+                if inst.write(reg).is_some() && !skips && (per_lane || scalar) {
+                    continue 'paths;
+                }
+            }
+            let next: Vec<(usize, Option<(Bool, bool)>)> = match (st.exits[at], &p.blocks[at].exit)
+            {
+                (_, Exit::Indirect) | (LaneExit::Indirect, _) => return false,
+                (
+                    LaneExit::Branch {
+                        when,
+                        taken,
+                        not_taken,
+                    },
+                    _,
+                ) if per_lane && taken != not_taken => {
+                    let (can, cannot) = self.outcomes(when, &path);
+                    let mut next = Vec::new();
+                    if can {
+                        next.push((taken, Some((when, true))));
+                    }
+                    if cannot {
+                        next.push((not_taken, Some((when, false))));
+                    }
+                    next
+                }
+                (_, exit) => exit.successors().into_iter().map(|t| (t, None)).collect(),
+            };
+            for (to, branch) in next {
+                if to == b {
+                    return false;
+                }
+                // Over a back edge the loop redefines what the lane knew.
+                let mut k = Vec::new();
+                if self.rpo[to] > self.rpo[at] {
+                    k.clone_from(&known);
+                    if let Some((when, holds)) = branch {
+                        let more = self.learn(&path, when, holds);
+                        k.extend(more);
+                    }
+                    // Knowing less only adds paths.
+                    let over = k.len().saturating_sub(MAX_KNOWN);
+                    k.drain(..over);
+                }
+                work.push((at, to, k));
+            }
+        }
+        true
+    }
+
+    /// The atoms that `b` holding as `holds` decides on `path`, which it
+    /// does not know yet (none when `b` tests more than [`MAX_LEARN`]).
+    fn learn(&self, path: &Path, b: Bool, holds: bool) -> Vec<(Atom, bool)> {
+        let atoms = self.x.st.bools.support(b);
+        if atoms.len() > MAX_LEARN {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for atom in atoms {
+            if self.atom_value(atom, path).is_some() {
+                continue;
+            }
+            for value in [false, true] {
+                let mut known = path.known.to_vec();
+                known.push((atom, value));
+                let (t, f) = self.outcomes(b, &Path {
+                    known: &known,
+                    ..*path
+                });
+                if !(if holds { t } else { f }) {
+                    out.push((atom, !value));
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `b` can hold, and whether it can fail, in a lane on `path`.
+    fn outcomes(&self, b: Bool, path: &Path) -> (bool, bool) {
+        self.outcomes_in(b, path, &mut HashMap::new(), &mut HashMap::new())
+    }
+
+    fn outcomes_in(
+        &self,
+        b: Bool,
+        path: &Path,
+        memo: &mut HashMap<Bool, (bool, bool)>,
+        atoms: &mut HashMap<Atom, Option<bool>>,
+    ) -> (bool, bool) {
+        if b == Bool::TRUE {
+            return (true, false);
+        }
+        if b == Bool::FALSE {
+            return (false, true);
+        }
+        if let Some(&r) = memo.get(&b) {
+            return r;
+        }
+        let Some((atom, low, high)) = self.x.st.bools.node(b) else {
+            return (true, true);
+        };
+        let value = match atoms.get(&atom) {
+            Some(&v) => v,
+            None => {
+                let v = self.atom_value(atom, path);
+                atoms.insert(atom, v);
+                v
+            }
+        };
+        let r = match value {
+            Some(v) => self.outcomes_in(if v { high } else { low }, path, memo, atoms),
+            None => {
+                let (lt, lf) = self.outcomes_in(low, path, memo, atoms);
+                let (ht, hf) = self.outcomes_in(high, path, memo, atoms);
+                (lt || ht, lf || hf)
+            }
+        };
+        memo.insert(b, r);
+        r
+    }
+
+    /// An atom's value in a lane on `path`: known there, a comparison of
+    /// two constants, or the same comparison of the same values as an atom
+    /// known there.
+    fn atom_value(&self, atom: Atom, path: &Path) -> Option<bool> {
+        if let Some(&(_, v)) = path.known.iter().find(|k| k.0 == atom) {
+            return Some(v);
+        }
+        let (rel, ops, negated) = match self.condition(atom, path)? {
+            Cond::Fixed(v) => return Some(v),
+            Cond::Compare(rel, ops, negated) => (rel, ops, negated),
+        };
+        if let [Op::Word(x), Op::Word(y)] = ops {
+            return Some(rel.holds(x, y) != negated);
+        }
+        path.known
+            .iter()
+            .find_map(|&(other, v)| match self.condition(other, path) {
+                Some(Cond::Compare(r, o, n)) if r == rel && o == ops => Some((v != n) != negated),
+                _ => None,
+            })
+    }
+
+    /// A lane's bit of a VALU compare or an SCC of a scalar compare, of
+    /// 32-bit integers with no modifier, as a [`Cond`] of its operands on
+    /// `path`.
+    fn condition(&self, atom: Atom, path: &Path) -> Option<Cond> {
+        let (Atom::Lane(v) | Atom::Uniform(v)) = atom else {
+            return None;
+        };
+        let &cb = self.def_block.get(&v)?;
+        let inst = self.x.p.blocks[cb]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        let name = inst.name();
+        let (rest, ops) = match (&inst.fields, atom) {
+            (Fields::Valu(alu), Atom::Lane(_))
+                if matches!(inst.machine.encoding, Encoding::Vopc | Encoding::Vop3)
+                    && alu.sdwa.is_none()
+                    && alu.dpp.is_none()
+                    && alu.neg == 0
+                    && alu.abs == 0
+                    && !alu.clamp
+                    && alu.omod == 0
+                    && alu.src.len() == 2 =>
+            {
+                let rest = name
+                    .strip_prefix("v_cmp_")
+                    .or_else(|| name.strip_prefix("v_cmpx_"))?;
+                (rest, [alu.src[0], alu.src[1]])
+            }
+            (Fields::Sop { src, imm: None, .. }, Atom::Uniform(_)) if src.len() == 2 => {
+                (name.strip_prefix("s_cmp_")?, [src[0], src[1]])
+            }
+            _ => return None,
+        };
+        let (rel, ty) = rest.split_once('_')?;
+        let signed = match ty {
+            "u32" => false,
+            "i32" => true,
+            _ => return None,
+        };
+        match rel {
+            "f" => return Some(Cond::Fixed(false)),
+            "t" => return Some(Cond::Fixed(true)),
+            _ => {}
+        }
+        let x = self.compare_word(inst, cb, ops[0], path)?;
+        let y = self.compare_word(inst, cb, ops[1], path)?;
+        let lt = Rel::Lt { signed };
+        Some(match rel {
+            "eq" => Cond::Compare(Rel::Eq, [x.min(y), x.max(y)], false),
+            "ne" | "lg" => Cond::Compare(Rel::Eq, [x.min(y), x.max(y)], true),
+            "lt" => Cond::Compare(lt, [x, y], false),
+            "ge" => Cond::Compare(lt, [x, y], true),
+            "gt" => Cond::Compare(lt, [y, x], false),
+            "le" => Cond::Compare(lt, [y, x], true),
+            _ => return None,
+        })
+    }
+
+    /// A compare's 32-bit operand on `path`: a constant where it is one
+    /// there (a phi of the block the lane is in, by the edge it came from;
+    /// one of the join's, by the join's edge), else the value it reads.
+    fn compare_word(&self, inst: &Inst, cb: usize, op: Operand, path: &Path) -> Option<Op> {
+        let reg = match op {
+            Operand::Const(c) => return crate::resource::inline(c).map(Op::Word),
+            Operand::Literal(k) => return Some(Op::Word(k)),
+            Operand::Scalar { code: NULL, .. } => return Some(Op::Word(0)),
+            Operand::Scalar { code, dwords: 1 } => Reg::S(code),
+            Operand::Vector { reg, dwords: 1 } => Reg::V(reg),
+            _ => return None,
+        };
+        let mut x = inst.read(reg)?;
+        let block = &self.x.p.blocks[cb];
+        if cb == path.at
+            && let Some(from) = path.from
+            && let Some(phi) = block.phis.iter().find(|phi| phi.value == x)
+        {
+            x = phi.args[block.preds.iter().position(|&q| q == from)?];
+        }
+        Some(match path.joined.get(&x).copied().or_else(|| self.word_of(x)) {
+            Some(k) => Op::Word(k),
+            None => Op::Value(x),
+        })
+    }
+
+    /// The DXIL constant an IR value is, as a dword.
+    fn word_of(&self, v: Value) -> Option<u32> {
+        match self.vals.get(&v)? {
+            Val::I32(x) => self.s.m.int_value(*x).map(|k| k as u32),
+            _ => None,
+        }
+    }
+}
+
+/// Blocks [`Lower::unread_on_edge`] searches at most.
+const UNREAD_STEPS: usize = 4096;
+/// Atoms a path keeps at most (the latest).
+const MAX_KNOWN: usize = 32;
+/// Atoms of a condition beyond which a path learns nothing from it.
+const MAX_LEARN: usize = 16;
+
+/// What a lane knows on a path from a join it entered by one edge
+/// ([`Lower::unread_on_edge`]).
+#[derive(Clone, Copy)]
+struct Path<'p> {
+    /// The constants the join's phis take on that edge.
+    joined: &'p HashMap<Value, u32>,
+    /// The block the lane is in, and the one it came from (none: unknown).
+    at: usize,
+    from: Option<usize>,
+    /// Atoms that what the lane passed decides, since the last back edge.
+    known: &'p [(Atom, bool)],
+}
+
+/// A lane's bit or an SCC as a comparison ([`Lower::condition`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cond {
+    Fixed(bool),
+    /// The operands in that relation, negated where the flag is set.
+    Compare(Rel, [Op; 2], bool),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rel {
+    Eq,
+    Lt { signed: bool },
+}
+
+impl Rel {
+    fn holds(self, x: u32, y: u32) -> bool {
+        match self {
+            Rel::Eq => x == y,
+            Rel::Lt { signed: false } => x < y,
+            Rel::Lt { signed: true } => (x as i32) < (y as i32),
+        }
+    }
+}
+
+/// A compare's operand: a constant, or the value it reads.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Op {
+    Word(u32),
+    Value(Value),
 }
 
 #[cfg(test)]
@@ -1638,6 +2016,32 @@ mod tests {
                 assert_eq!(out[0], want, "s1 = {choice}");
             }
         }
+    }
+
+    /// [`DESCRIPTOR_JOIN`] without the join's test (its `s_cmp` and
+    /// `s_cbranch_scc0` made `s_nop`): every lane reads the joined s8, so
+    /// where s1 chose the load it reads the descriptor's first dword, an
+    /// address. That stops the program, as a direct read of the dword does
+    /// (the review of meshdata), instead of reading an undefined value.
+    #[test]
+    fn a_descriptor_dword_read_on_its_edge_after_a_join_stops() {
+        const S_NOP: u32 = 0xBF80_0000;
+        let mut words = DESCRIPTOR_JOIN;
+        words[17] = S_NOP;
+        words[18] = S_NOP;
+        let mut p = descriptor_join(ResourceType::Srv);
+        p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let r = emit_for(&p, crate::emit::Target::ANY);
+        assert!(
+            matches!(
+                r,
+                Err(crate::ShaderError::Unsupported {
+                    what: "a descriptor's address or format read as data",
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
     }
 
     /// The same join with entry 0 a constant buffer: its descriptor's
