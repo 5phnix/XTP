@@ -1109,7 +1109,11 @@ impl<'a> Lanes<'a> {
     /// Its result is a number, not a mask.
     fn tests_a_reused_number(&self, inst: &Inst, src: &[Operand]) -> bool {
         let p = self.p;
-        let all = if p.wave64 { u64::MAX } else { u64::from(u32::MAX) };
+        let all = if p.wave64 {
+            u64::MAX
+        } else {
+            u64::from(u32::MAX)
+        };
         let constant = |v: u64| v != 0 && v != all;
         let lane_set = src.iter().any(|op| match *op {
             Operand::Literal(x) => constant(u64::from(x)),
@@ -1594,6 +1598,100 @@ mod tests {
                     .any(|a| matches!(a, Atom::Uniform(_)))
             );
         }
+    }
+
+    /// A register the compiler reuses across paths: s2 is a mask (a compare
+    /// result) where the load is skipped and a loaded number where it is
+    /// not; a bit test of it with a constant after the join is the number's,
+    /// not a mask operation. The same test of the compare's own mask stays
+    /// one (wave32).
+    #[test]
+    fn a_bit_test_of_a_reused_register_is_a_number() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0002, // s_cbranch_scc1 -> 24
+                0xF400_0080,
+                0xFA00_0000, // s_load_dword s2, s[0:1], 0x0
+                0x8703_FF02,
+                0x0000_0100, // 24: s_and_b32 s3, s2, lit(0x100)
+                0x8704_FF6A,
+                0x0000_0100, // s_and_b32 s4, vcc_lo, lit(0x100)
+                0xBF06_8003, // s_cmp_eq_u32 s3, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let join = p.blocks.iter().find(|b| b.offset == 24).unwrap();
+        assert_eq!(join.insts[0].name(), "s_and_b32");
+        let number = join.insts[0].write(Reg::S(3)).unwrap();
+        let mask = join.insts[1].write(Reg::S(4)).unwrap();
+        let scc = join.insts[2].write(Reg::Scc).unwrap();
+        let s = structure(&p).unwrap();
+        assert!(!s.masks.contains_key(&number), "{:?}", s.masks);
+        assert!(!s.sccs.contains_key(&scc));
+        assert!(s.masks.contains_key(&mask));
+    }
+
+    /// The console form without what lanes know on entering each block (its
+    /// fallback when that grows too large) has the same masks, EXECs and
+    /// SCCs; each block is entered knowing nothing.
+    #[test]
+    fn the_console_form_without_path_knowledge_keeps_its_masks() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+                0xBF84_0001, // s_cbranch_scc0 -> 20
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x88FE_0A7E, // 20: s_or_b64 exec, exec, s[10:11]
+                0xBF12_7E6A, // s_cmp_eq_u64 vcc, exec
+                S_ENDPGM,
+            ],
+            true,
+        );
+        // Booleans of two runs compared by their diagrams (the same atoms,
+        // made in the same order: the same reduced diagrams).
+        fn show(b: &Bools, x: Bool) -> String {
+            match b.node(x) {
+                None => format!("{}", x == Bool::TRUE),
+                Some((a, lo, hi)) => format!("({a:?} ? {} : {})", show(b, hi), show(b, lo)),
+            }
+        }
+        let full = structure_console(&p).unwrap();
+        let mut l = Lanes::new(&p, true).unwrap();
+        l.unknowing = true;
+        let bare = run(l).unwrap();
+        assert!(bare.reach.iter().all(|&r| r == Bool::TRUE));
+        let execs = |s: &Structured| -> Vec<Vec<Option<String>>> {
+            s.execs
+                .iter()
+                .map(|b| b.iter().map(|e| e.map(|e| show(&s.bools, e))).collect())
+                .collect()
+        };
+        assert_eq!(execs(&bare), execs(&full));
+        let masks = |s: &Structured| -> Vec<(Value, String)> {
+            let mut m: Vec<_> = s
+                .masks
+                .iter()
+                .map(|(&v, &b)| (v, show(&s.bools, b)))
+                .collect();
+            m.sort_unstable();
+            m
+        };
+        assert_eq!(masks(&bare), masks(&full));
+        let sccs = |s: &Structured| -> Vec<(Value, String, bool)> {
+            let mut m: Vec<_> = s
+                .sccs
+                .iter()
+                .map(|(&v, &(b, n))| (v, show(&s.bools, b), n))
+                .collect();
+            m.sort_unstable();
+            m
+        };
+        assert_eq!(sccs(&bare), sccs(&full));
     }
 
     #[test]
