@@ -2570,7 +2570,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.settle(src, len, false);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    // SAFETY: la liste conserve la destination mappée et indépendante
+                    // de la mémoire du titre jusqu’à la fin de la soumission.
+                    unsafe { crate::shadow::fill_upload(dst as *mut u8, src, len) };
                     len
                 }
                 Step::Refresh(shadow, address, len) => {

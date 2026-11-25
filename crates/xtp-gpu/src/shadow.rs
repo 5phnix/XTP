@@ -1698,6 +1698,35 @@ unsafe fn try_copy(dst: *mut u8, src: *const u8, len: usize) -> usize {
     len - at
 }
 
+/// Remplit la mémoire d’upload par lectures directes (TG0000, VIctory #1010).
+/// Le gestionnaire de XTP reprend après une page illisible et conserve les
+/// octets lisibles de part et d’autre, même si le début n’est pas aligné.
+///
+/// # Safety
+///
+/// `dst` désigne `len` octets accessibles en écriture, réservés à la liste
+/// et disjoints de la source. Les pages lisibles de `src` appartiennent au titre.
+pub(super) unsafe fn fill_upload(dst: *mut u8, src: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::mode() != 0 {
+        // Les modes de mesure gardent leur copie brute, absente ou noyau.
+        crate::host::copy_mapped(dst, src as *const u8, len, false);
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let moved = std::time::Instant::now();
+    let _zeros = read_title(dst, src, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::MoveUs, moved.elapsed().as_micros() as u64);
+        if _zeros != 0 {
+            add(C::Fallbacks, 1);
+            add(C::Unmapped, _zeros as u64);
+        }
+    }
+}
+
 /// Copies title memory `[src, src + len)` into memory of ours at `dst`
 /// with plain loads; what cannot be read is left as zeros (as the kernel's
 /// copy did). Returns the bytes zeroed.
@@ -4817,6 +4846,13 @@ mod tests {
         crate::host::copy_mapped(kernel.as_mut_ptr(), src as *const u8, n, false);
         assert!(plain == kernel, "as the kernel's copy");
         assert_eq!(zeros, PAGE + 4096);
+        let mut upload = vec![0xee; n];
+        // SAFETY: le vecteur couvre toute la destination, hors de la réservation.
+        unsafe { fill_upload(upload.as_mut_ptr(), src, n) };
+        assert!(
+            upload == kernel,
+            "le remplissage doit reprendre après les pages illisibles"
+        );
         assert_eq!(&plain[..0x40], &title(src, 0x40)[..]);
         let mut buffer = vec![0u8; 2 * PAGE];
         // SAFETY: our buffer; title memory a fault leaves alone.
