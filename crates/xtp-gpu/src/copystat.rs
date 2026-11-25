@@ -126,8 +126,9 @@ pub(crate) enum C {
     KernelReadNs,
     DeferredBytes,
     BackScanNs,
+    Count,
 }
-const COUNTERS: usize = 65;
+const COUNTERS: usize = C::Count as usize;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
