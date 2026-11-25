@@ -4812,11 +4812,34 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn packed_light_is_decoded_into_an_rgba16f_stand_in() {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+        };
+
         let test = "resource::tests::packed_light_is_decoded_into_an_rgba16f_stand_in";
         let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
         let host = gpu.host();
+        // SAFETY: plain DXGI queries for the adapter of this test's device.
+        let adapter = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .unwrap()
+                .EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+                .unwrap()
+                .GetDesc1()
+                .unwrap()
+        };
+        let end = adapter
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(adapter.Description.len());
+        let name = String::from_utf16_lossy(&adapter.Description[..end]);
+        eprintln!(
+            "{test}: selected DXGI adapter {name:?}, vendor {:#06x}, device {:#06x}, flags {:#x}",
+            adapter.VendorId, adapter.DeviceId, adapter.Flags
+        );
         let mut held = Vec::new();
         let written = fresh_memory(&mut held);
         const PACKED: u32 = 256 | 128 << 9 | 64 << 18 | 15 << 27;
@@ -4853,6 +4876,10 @@ mod tests {
         .map(Arc::new);
         resident(stand_in);
         let to = host_copy(stand_in).unwrap();
+        // SAFETY: the test retains the stand-in's live host copy.
+        let format = unsafe { to.texture.GetDesc() }.Format.0 as u32;
+        assert_eq!(format, RGBA16F, "forced stand-in host format");
+        eprintln!("{test}: forced stand-in host format {format}");
         let elsewhere = fresh_memory(&mut held);
         let snapshot = at(elsewhere.address(), &texture(16, 16, RGBA16F, 1));
         resident(snapshot);
@@ -4911,6 +4938,31 @@ mod tests {
         );
         let words = read_words(host, stand_in);
         assert_eq!([words[0], words[1]], [0x3400_3800, 0x3c00_3000]);
+        // Independent binary16 values: (1 + 1020/1024) * 2^15 = 65408
+        // is 0x7bfc; 2^-24 is 0x0001; 2^-16 is 0x0100; 1 is 0x3c00.
+        // Blue=256 keeps the minimum-red payload normal as R32_FLOAT,
+        // so the clear does not flush its packed bits as a subnormal.
+        for (case, packed, expected) in [
+            ("maximum", 511 | 31 << 27, [0x0000_7bfc, 0x3c00_0000]),
+            ("minimum", 1 | 256 << 18, [0x0000_0001, 0x3c00_0100]),
+            ("zero", 0, [0x0000_0000, 0x3c00_0000]),
+        ] {
+            let list = crate::testgpu::TitleList::new();
+            let color = [f32::from_bits(packed), 0.0, 0.0, 0.0];
+            clear(list.this(), rtv, &color, 0, null.cast());
+            assert!(alias_copy(list.host(), stand_in), "{case} decode");
+            list.run();
+            assert_eq!(read_words(host, target)[0], packed, "{case} source bits");
+            let words = read_words(host, stand_in);
+            eprintln!(
+                "{test}: {case}: host format {format}, packed {packed:#010x}, expected {expected:08x?}, actual {:08x?}",
+                [words[0], words[1]]
+            );
+            for (x, y) in [(0, 0), (15, 15), (7, 9)] {
+                let at = y * 64 + 2 * x;
+                assert_eq!([words[at], words[at + 1]], expected, "{case} texel {x},{y}");
+            }
+        }
         for r in [snapshot, stand_in, target] {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
