@@ -26,10 +26,23 @@
 //! is kept: the host driver's compile, where out of memory and a removed
 //! device happen, comes after this cache, and an entry that cannot be
 //! written is answered from the translation without being kept.
+//!
+//! Across translator builds, nothing is served that this build's translator
+//! did not make: an entry is found only under this build's key. What
+//! carries over a translator change is downstream of the translation: a
+//! host pipeline is named by the bytes of its translated shaders, root
+//! signature and state (`pipeline::library`), so a translation whose bytes
+//! did not change finds its pipelines again, and one that did gets new
+//! ones. `xtp precook` translates the pack again after a change and
+//! compares each answer with the entry the translator before kept
+//! ([`compare_with`]): a count, for what the change altered, never an
+//! answer. (A per-program fingerprint of the translator code a translation
+//! ran is not one that can be proven: code changes a translation without
+//! running, through constants, types, inlined generics and tables.)
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use xtp_pipeline::{Cache, Converter};
 use xtp_shader::emit::{HostShader, StaticSampler, Target, UserData};
@@ -54,6 +67,20 @@ pub fn use_shader_cache(dir: PathBuf) {
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
     }
+}
+
+/// Lists the cache's folder again and writes its index anew from what is
+/// there (`xtp_pipeline::Cache::reindex`), then trims it to its limit: the
+/// entries and bytes it holds after, `None` without a cache. The index only
+/// sizes the cache, and the sessions between two precooks can leave it
+/// stale (a process stopped between an entry's rename and its record, an
+/// index replaced under another process's appends, files removed by hand):
+/// `xtp precook` sets it right before each pass, while no title waits.
+pub fn reindex() -> Option<(usize, u64)> {
+    let cache = CACHE.get()?;
+    cache.reindex();
+    let stats = cache.stats();
+    Some((stats.entries, stats.bytes))
 }
 
 /// Shaders found in the cache and translated since the start. Refusals,
@@ -156,7 +183,14 @@ pub(crate) fn host_es_shader(container: &[u8], target: Target) -> Result<HostSha
     let translate =
         |c: &[u8]| xtp_shader::emit::translate_es_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &es_key(&key(build(), target)), container, translate),
+        Some(cache) => {
+            let key = key(build(), target);
+            let earlier = EARLIER
+                .get()
+                .filter(|(now, _)| *now == key)
+                .map(|(_, e)| es_key(e));
+            compared(cache, &es_key(&key), earlier.as_ref(), container, translate)
+        }
         None => translate(container),
     }
 }
@@ -182,7 +216,113 @@ pub(crate) fn kept(
     target: Target,
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    cached(cache, &key(build(), target), container, translate)
+    let key = key(build(), target);
+    let earlier = EARLIER
+        .get()
+        .filter(|(now, _)| *now == key)
+        .map(|&(_, e)| e);
+    compared(cache, &key, earlier.as_ref(), container, translate)
+}
+
+/// The key this build's translations are compared under, and the key of
+/// the translator before ([`compare_with`]).
+static EARLIER: OnceLock<([u8; 32], [u8; 32])> = OnceLock::new();
+
+/// How this build's translations compare with the translator before's
+/// ([`compare_with`]): the same answer (translation or refusal, byte for
+/// byte), another one, or none kept to compare with.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Compared {
+    pub same: u64,
+    pub changed: u64,
+    pub unknown: u64,
+    /// The first containers whose answer changed: their BLAKE3's first 16
+    /// hexadecimal digits (the pipeline log's `hash=`).
+    pub examples: Vec<String>,
+}
+
+static COMPARED: Mutex<Compared> = Mutex::new(Compared {
+    same: 0,
+    changed: 0,
+    unknown: 0,
+    examples: Vec::new(),
+});
+
+/// Changed containers [`Compared`] names, at most.
+const EXAMPLES: usize = 16;
+
+/// From now on, each container this build translates for the host
+/// ([`host_shader`], [`host_es_shader`]) is compared with the entry the
+/// translator of key `earlier` (a host key, [`host_key`]'s, of another
+/// build) kept for it, if the cache holds one. That entry is read, never
+/// answered: the answer is this build's translation. False if it is too
+/// late (a comparison is already set).
+#[cfg(windows)]
+pub(crate) fn compare_with(earlier: [u8; 32]) -> bool {
+    EARLIER.set((host_key(), earlier)).is_ok()
+}
+
+/// The comparisons so far ([`compare_with`]).
+pub(crate) fn compared_counts() -> Compared {
+    COMPARED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// [`cached_made`]'s answer, comparing a translation made now with the
+/// entry the translator of key `earlier` kept for `container`.
+fn compared(
+    cache: &Cache,
+    key: &[u8; 32],
+    earlier: Option<&[u8; 32]>,
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<HostShader, String> {
+    let (answer, made) = cached_made(cache, key, container, translate);
+    if let Some(earlier) = earlier
+        && made
+    {
+        let now = match &answer {
+            Ok(shader) => encode(shader),
+            Err(error) => encode_failure(error),
+        };
+        let kept = entry(cache, earlier, container);
+        let mut c = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
+        match kept {
+            None => c.unknown += 1,
+            Some(kept) if *kept == *now => c.same += 1,
+            Some(_) => {
+                c.changed += 1;
+                if c.examples.len() < EXAMPLES {
+                    c.examples
+                        .push(blake3::hash(container).to_hex()[..16].to_owned());
+                }
+            }
+        }
+    }
+    answer
+}
+
+/// The entry kept under `key` for `container` (a translation or a refusal,
+/// encoded), if the cache holds a sound one: read only, never made.
+fn entry(cache: &Cache, key: &[u8; 32], container: &[u8]) -> Option<Arc<[u8]>> {
+    /// [`Translate`]'s identity, with nothing to translate with.
+    struct Peek;
+    impl Converter for Peek {
+        fn id(&self) -> &'static str {
+            CONVERTER
+        }
+        fn version(&self) -> u32 {
+            CONVERTER_VERSION
+        }
+        fn convert(&self, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("not kept")
+        }
+    }
+    let input = [&key[..], container].concat();
+    cache
+        .get_or_convert_with(&Peek, &input, |bytes| {
+            (decode(&bytes).is_some() || decode_failure(&bytes).is_some()).then_some(bytes)
+        })
+        .ok()
 }
 
 /// The part of an entry's key before the container: the build, and the
@@ -210,13 +350,18 @@ impl<F> Translate<F> {
     }
 }
 
+/// The converter's identity in the cache's keys ([`Translate`], and
+/// [`entry`]'s reader).
+const CONVERTER: &str = "shader.dxil";
+/// The build fingerprint in the input does the versioning.
+const CONVERTER_VERSION: u32 = 1;
+
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
     fn id(&self) -> &'static str {
-        "shader.dxil"
+        CONVERTER
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        CONVERTER_VERSION
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -227,28 +372,46 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
+/// [`cached_made`]'s answer alone (the tests' way in).
+#[cfg(test)]
 fn cached(
     cache: &Cache,
     key: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
+    cached_made(cache, key, container, translate).0
+}
+
+/// `translate`'s answer for `container` from `cache` under `key`, made
+/// and stored on a miss, and whether `translate` made it now (a miss whose
+/// answer the cache gave back: not a failure of the cache itself, which is
+/// no answer of this translator to compare).
+fn cached_made(
+    cache: &Cache,
+    key: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> (Result<HostShader, String>, bool) {
     let input = [&key[..], container].concat();
     let converter = Translate::new(translate);
-    let result = cache
-        .get_or_convert_with(&converter, &input, |bytes| {
-            decode(&bytes)
-                .map(Ok)
-                .or_else(|| decode_failure(&bytes).map(Err))
-        })
-        .map_err(|e| format!("{e:#}"))?;
-    let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+    let result = cache.get_or_convert_with(&converter, &input, |bytes| {
+        decode(&bytes)
+            .map(Ok)
+            .or_else(|| decode_failure(&bytes).map(Err))
+    });
+    let made = converter.ran.load(Ordering::Relaxed);
+    let result = match result {
+        Ok(result) => result,
+        Err(e) => return (Err(format!("{e:#}")), false),
+    };
+    let (counter, what) = if made {
         (&MISSES, "translated")
     } else {
         (&HITS, "from the cache")
     };
     tracing::debug!(ok = result.is_ok(), "shader {what}");
-    count(counter, result)
+    (count(counter, result), made)
 }
 
 /// For tests: [`wave64_program`] with its lane reads.
@@ -975,6 +1138,70 @@ mod tests {
                 "setting {i}"
             );
         }
+    }
+
+    /// After a translator change, a translation made is compared with the
+    /// entry the translator before kept for its container: the same bytes,
+    /// other bytes (another translation, or a refusal lifted), or none
+    /// kept. That entry is only read: the answer is the new translator's,
+    /// the entry before stays as it was, and one served from the cache is
+    /// not compared again.
+    #[test]
+    fn translations_are_compared_with_the_translator_befores() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let (before, now) = ([1u8; 32], [2u8; 32]);
+        let other = HostShader {
+            dxil: b"DXBC and something else".to_vec(),
+            ..shader()
+        };
+        for container in [b"same".as_slice(), b"changed"] {
+            assert_eq!(
+                cached(&cache, &before, container, |_| Ok(shader())),
+                Ok(shader())
+            );
+        }
+        let refused = Err::<HostShader, _>("not supported".to_owned());
+        assert_eq!(
+            cached(&cache, &before, b"refused", |_| refused.clone()),
+            refused
+        );
+
+        let start = compared_counts();
+        let get = |container: &[u8], answer: &HostShader| {
+            compared(&cache, &now, Some(&before), container, |_| {
+                Ok(answer.clone())
+            })
+        };
+        assert_eq!(get(b"same", &shader()), Ok(shader()));
+        assert_eq!(get(b"changed", &other), Ok(other.clone()), "the answer now");
+        assert_eq!(get(b"refused", &shader()), Ok(shader()), "a refusal lifted");
+        assert_eq!(get(b"new", &shader()), Ok(shader()), "none kept before");
+        assert_eq!(get(b"same", &other), Ok(shader()), "from the cache now");
+        let end = compared_counts();
+        assert_eq!(
+            (
+                end.same - start.same,
+                end.changed - start.changed,
+                end.unknown - start.unknown
+            ),
+            (1, 2, 1)
+        );
+        let hash = |c: &[u8]| blake3::hash(c).to_hex()[..16].to_owned();
+        assert!(
+            end.examples.len() == EXAMPLES
+                || end.examples[start.examples.len()..] == [hash(b"changed"), hash(b"refused")],
+            "{:?}",
+            end.examples
+        );
+        assert_eq!(
+            cached(&cache, &before, b"changed", |_| unreachable!()),
+            Ok(shader()),
+            "the entry before, as it was"
+        );
+        assert_eq!(entry(&cache, &[3; 32], b"same"), None, "read only");
+        assert_eq!(walk(dir.path()).len(), 7, "nothing kept under the key read");
     }
 
     #[test]
