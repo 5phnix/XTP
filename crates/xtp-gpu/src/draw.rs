@@ -3581,9 +3581,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     fn a_pass_upload_submitted_after_a_copy_keeps_the_copy() {
         use crate::testgpu::TitleList;
         let test = "draw::tests::a_pass_upload_submitted_after_a_copy_keeps_the_copy";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if crate::descriptor::host::heap_textures_budget().is_none()
             || !crate::texture::predication()
         {
@@ -3627,9 +3628,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     fn a_served_texture_never_staged_is_uploaded_at_its_check() {
         use crate::testgpu::TitleList;
         let test = "draw::tests::a_served_texture_never_staged_is_uploaded_at_its_check";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if crate::descriptor::host::heap_textures_budget().is_none() {
             return;
         }
@@ -3661,9 +3663,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     fn textures_the_hashing_budget_left_out_come_first_next() {
         use crate::testgpu::TitleList;
         let test = "draw::tests::textures_the_hashing_budget_left_out_come_first_next";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if crate::descriptor::host::heap_textures_budget().is_none() {
             return;
         }
