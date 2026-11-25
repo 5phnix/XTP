@@ -678,11 +678,12 @@ fn picked_refresh(
 }
 
 /// The host heap behind a key of [`State::host_heaps`]: a title heap, or
-/// XTP's own view heap.
+/// XTP's own view or sampler heap.
 fn host_heap(key: usize) -> Option<&'static crate::descriptor::host::HostHeap> {
     match key {
         0 => None,
         crate::descriptor::OWN_VIEW_HEAP => crate::descriptor::own_view_heap(),
+        crate::descriptor::OWN_SAMPLER_HEAP => crate::descriptor::own_sampler_heap(),
         h => crate::descriptor::heap(h as This).host(),
     }
 }
@@ -1290,18 +1291,19 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
-    /// The heaps the host list is to have: the title's, with XTP's own view
-    /// heap in place of a view heap where the title binds none (or one
-    /// without a host heap) and the pipeline reads root SRVs (`root_srvs`),
-    /// which are bound as tables in a view heap; the console needs no heap
-    /// for root views. Once the list has XTP's heap, it keeps it until the
-    /// title binds a view heap.
-    fn wanted_heaps(&self, tabled: bool) -> [usize; 2] {
+    /// The heaps the host list is to have: the title's, with XTP's own in
+    /// place of each the title binds none of (or one without a host heap).
+    /// Pipelines' root signatures index both heaps directly, and D3D12 lets
+    /// such a root signature be set only once both are bound (debug layer
+    /// message 1419); root SRVs, bound as tables, also need a view heap.
+    fn wanted_heaps(&self) -> [usize; 2] {
         let mut wanted = self.heaps;
-        let title_views =
-            wanted[0] != 0 && crate::descriptor::heap(wanted[0] as This).host().is_some();
-        if !title_views && (tabled || self.host_heaps[0] == crate::descriptor::OWN_VIEW_HEAP) {
+        let hosted = |h: usize| h != 0 && crate::descriptor::heap(h as This).host().is_some();
+        if !hosted(wanted[0]) {
             wanted[0] = crate::descriptor::OWN_VIEW_HEAP;
+        }
+        if !hosted(wanted[1]) {
+            wanted[1] = crate::descriptor::OWN_SAMPLER_HEAP;
         }
         wanted
     }
@@ -1346,9 +1348,17 @@ impl State {
         if self.host_heaps == wanted && !replaced {
             return;
         }
-        let heaps: Vec<Option<ID3D12DescriptorHeap>> = heaps
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = wanted
             .into_iter()
-            .flatten()
+            .zip(heaps)
+            .filter_map(|(key, heap)| {
+                if key != 0 && heap.is_none() {
+                    // A root signature that indexes the heaps directly then
+                    // meets message 1419 again.
+                    once!(key, "no host descriptor heap to bind in a heap slot");
+                }
+                heap
+            })
             .map(|h| Some(h.clone()))
             .collect();
         heaps.iter().flatten().for_each(|h| list.keep(h));
@@ -1394,6 +1404,10 @@ impl State {
 
     fn bind_pipeline(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let l = &list.list;
+        // Heaps first: a root signature with directly indexed heaps must be
+        // set after them.
+        let wanted = self.wanted_heaps();
+        self.set_host_heaps(list, wanted);
         let root = p.root.as_raw() as usize;
         if (!compute || self.pending_compute.is_none())
             && self.host_roots[usize::from(compute)] != root
@@ -1479,28 +1493,9 @@ impl State {
         limits: [u32; 3],
     ) -> Result<(), &'static str> {
         let l = &list.list;
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
-        let root_uavs = p.stages.iter().any(|s| !s.root_uavs.is_empty());
         use xtp_shader::emit::{
             INDEXED_ADDRESS_SRV, PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV,
         };
-        let constant_reads = p.stages.iter().any(|s| {
-            s.translated().host.user_data.iter().any(|u| {
-                matches!(
-                    u.root,
-                    INDEXED_ADDRESS_SRV
-                        | PACKED_ADDRESS_SRV
-                        | SCALAR_ADDRESS_SRV
-                        | VECTOR_ADDRESS_SRV
-                )
-            })
-        });
-        let wanted = self.wanted_heaps(
-            constant_reads || root_uavs || root_srvs && crate::pipeline::host::bounded_root_srvs(),
-        );
-        self.set_host_heaps(list, wanted);
         list.decode_uses
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3829,7 +3824,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 pub(crate) mod tests {
     use super::*;
     use crate::descriptor::host::SHARED_CHUNK;
-    use crate::descriptor::{OWN_VIEW_HEAP, TestHeap};
+    use crate::descriptor::{OWN_SAMPLER_HEAP, OWN_VIEW_HEAP, TestHeap};
     use crate::host::Host;
     use crate::testgpu::{Kernel, Pass, TitleBuffer, TitleList, pattern};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -5473,9 +5468,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         state
     }
 
-    /// Sets the heaps a pipeline with root SRVs gets, as `bind` does.
+    /// Sets the heaps a pipeline gets (the title's, XTP's own where it binds
+    /// none), as `bind` does.
     fn heaps(state: &mut State, list: &HostList) {
-        let wanted = state.wanted_heaps(true);
+        let wanted = state.wanted_heaps();
         state.set_host_heaps(list, wanted);
     }
 
@@ -5567,9 +5563,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(got, bounded(1, 63));
     }
 
-    /// A list that binds no view heap reads its root SRVs through tables in
-    /// XTP's own heap (the console needs none for root views), and keeps
-    /// that heap for draws without root SRVs until the title binds one.
+    /// A list binds XTP's own heap in each slot the title binds no hosted
+    /// heap of (the console needs none for root views), both before a
+    /// directly indexed root signature; root SRVs are read through tables
+    /// in its own view heap. A title heap takes its slot over; setting the
+    /// heaps again with the same ones does nothing.
     #[test]
     fn lists_without_a_view_heap_use_xtps_own() {
         let test = "draw::tests::lists_without_a_view_heap_use_xtps_own";
@@ -5582,17 +5580,53 @@ void main(uint3 id : SV_DispatchThreadID) {
         src.set_words(pattern);
         let list = TitleList::new();
         let mut state = state(std::ptr::null());
-        assert_eq!(state.wanted_heaps(false), [0, 0]);
-        assert_eq!(state.wanted_heaps(true), [OWN_VIEW_HEAP, 0]);
+        // Without heaps of the title's, XTP's own: a root signature that
+        // indexes both heaps directly needs both bound.
+        assert_eq!(state.wanted_heaps(), [OWN_VIEW_HEAP, OWN_SAMPLER_HEAP]);
         let got = reader.read(&list, |l| {
             heaps(&mut state, l);
             table(&mut state, l, Some(src.address() + 64))
         });
         assert_eq!(got, bounded(16, WORDS));
-        assert_eq!(state.wanted_heaps(false), [OWN_VIEW_HEAP, 0], "kept");
+        assert_eq!(state.wanted_heaps(), [OWN_VIEW_HEAP, OWN_SAMPLER_HEAP]);
         let heap = TestHeap::views(16);
         state.set_heaps(&[heap.0]);
-        assert_eq!(state.wanted_heaps(true), [heap.0 as usize, 0]);
+        assert_eq!(state.wanted_heaps(), [heap.0 as usize, OWN_SAMPLER_HEAP]);
+    }
+
+    /// A title sampler heap takes the sampler slot and XTP's own view heap
+    /// the view one; with a view heap too, both are the title's. Setting the
+    /// same heaps again does nothing (the root signatures stay set), other
+    /// heaps reset them.
+    #[test]
+    fn title_sampler_heaps_take_their_slot() {
+        let test = "draw::tests::title_sampler_heaps_take_their_slot";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let views = TestHeap::views(16);
+        let samplers = TestHeap::samplers(16);
+        let (v, s) = (views.0 as usize, samplers.0 as usize);
+        let list = TitleList::new();
+        let mut state = State::default();
+        state.set_heaps(&[samplers.0]);
+        assert_eq!(state.wanted_heaps(), [OWN_VIEW_HEAP, s], "samplers alone");
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [OWN_VIEW_HEAP, s]);
+        state.set_heaps(&[views.0, samplers.0]);
+        assert_eq!(state.wanted_heaps(), [v, s], "views and samplers");
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [v, s]);
+        // The same heaps again: nothing is set, the root signatures stay.
+        state.host_roots = [1, 2];
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [v, s]);
+        assert_eq!(state.host_roots, [1, 2], "unchanged heaps");
+        // Other heaps: set, and the root signatures with them.
+        state.set_heaps(&[views.0]);
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [v, OWN_SAMPLER_HEAP]);
+        assert_eq!(state.host_roots, [0; 2], "changed heaps");
     }
 
     /// Root SRV views in place are shared across lists, by host copy and
@@ -6595,7 +6629,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                     .ClearRenderTargetView(host.rtv(tex, None), &[0.; 4], None);
             }
             painter.bind(list.host());
-            crate::testgpu::bind_indexed_heaps(host, list.host());
+            crate::testgpu::bind_indexed_heaps(list.host());
             let mut state = State::default();
             // Les deux ordres de liaison doivent sélectionner la même variante.
             if typed {

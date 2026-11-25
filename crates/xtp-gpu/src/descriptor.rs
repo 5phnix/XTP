@@ -867,13 +867,42 @@ pub(crate) const OWN_VIEW_HEAP: usize = usize::MAX;
 #[cfg(windows)]
 const OWN_DYNAMIC: u32 = 1 << 14;
 
-/// XTP's own view heap (made on first use), for lists that bind no view
-/// heap of the title's but read root SRVs, which are bound as tables.
+/// XTP's own view heap (made on first use): bound in the view slot of a
+/// list that binds no hosted view heap of the title's, since a root
+/// signature that indexes the heaps directly needs both slots bound, and
+/// root SRVs are read through tables in it.
 #[cfg(windows)]
 pub(crate) fn own_view_heap() -> Option<&'static host::HostHeap> {
     static OWN: std::sync::OnceLock<Option<host::HostHeap>> = std::sync::OnceLock::new();
     OWN.get_or_init(|| host::HostHeap::own(OWN_DYNAMIC))
         .as_ref()
+}
+
+/// The key of XTP's own sampler heap (no title heap is at this address).
+#[cfg(windows)]
+pub(crate) const OWN_SAMPLER_HEAP: usize = usize::MAX - 1;
+
+/// XTP's own sampler heap (made on first use), of null samplers: bound for
+/// lists that bind no sampler heap of the title's, since a root signature
+/// that indexes the sampler heap directly may only be set once one is
+/// bound (D3D12 debug layer message 1419).
+#[cfg(windows)]
+pub(crate) fn own_sampler_heap() -> Option<&'static host::HostHeap> {
+    static OWN: std::sync::OnceLock<Option<host::HostHeap>> = std::sync::OnceLock::new();
+    OWN.get_or_init(host::HostHeap::own_samplers).as_ref()
+}
+
+/// In tests: the heaps to set before a root signature that indexes both
+/// heaps directly (message 1419): `views` (XTP's own view heap if none),
+/// with XTP's own sampler heap.
+#[cfg(all(windows, test))]
+pub(crate) fn heaps_with_own_samplers(
+    views: Option<&windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>,
+) -> [Option<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>; 2] {
+    let views = views
+        .cloned()
+        .or_else(|| own_view_heap().map(|h| h.heap.clone()));
+    [views, own_sampler_heap().map(|h| h.heap.clone())]
 }
 
 /// Gives back what a list held, in one batch per heap: each host heap is
@@ -1512,13 +1541,22 @@ pub(crate) struct TestHeap(pub(crate) This);
 impl TestHeap {
     /// A heap of `count` view slots, made as the title makes one.
     pub(crate) fn views(count: u32) -> TestHeap {
+        Self::made(VIEWS_KIND, count)
+    }
+
+    /// A heap of `count` sampler slots, made as the title makes one.
+    pub(crate) fn samplers(count: u32) -> TestHeap {
+        Self::made(SAMPLERS, count)
+    }
+
+    fn made(kind: u32, count: u32) -> TestHeap {
         /// What newer titles pass, so that reading the placement stays
         /// inside the value.
         #[repr(C)]
         struct Extended(HeapDesc, Placement);
         let extended = Extended(
             HeapDesc {
-                kind: VIEWS_KIND,
+                kind,
                 count,
                 flags: SHADER_VISIBLE,
                 nodes: 0,
@@ -1530,7 +1568,7 @@ impl TestHeap {
         );
         let mut out = std::ptr::null();
         let made = create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut out);
-        assert_eq!(made, crate::object::S_OK, "a title view heap");
+        assert_eq!(made, crate::object::S_OK, "a title heap");
         TestHeap(out)
     }
 }

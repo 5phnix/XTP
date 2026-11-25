@@ -262,7 +262,7 @@ fn trace(host: &Host, title_list: &TitleList, tlas: Scene, output: &TitleBuffer)
     // completion.
     unsafe {
         let (param, root) = if spliced {
-            crate::testgpu::bind_indexed_heaps(host, list);
+            crate::testgpu::bind_indexed_heaps(list);
             spliced_root(host)
         } else {
             (0, host.device.CreateRootSignature(0, &code).unwrap())
