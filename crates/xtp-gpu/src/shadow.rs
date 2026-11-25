@@ -4140,7 +4140,10 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let removed = buffers().remove(&(start, resource));
+    if let Some(entry) = removed {
+        crate::rt::release_buffer(Some(resource), start, entry.end);
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -4220,6 +4223,16 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         );
     }
     Some(made)
+}
+
+/// The innermost title resource containing this address.
+pub(crate) fn buffer_owner(address: u64) -> Option<usize> {
+    buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, entry)| entry.end > address)
+        .map(|(key, _)| key.1)
 }
 
 /// The title buffers holding `address`, innermost first (the one [`find`]

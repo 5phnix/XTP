@@ -1218,6 +1218,7 @@ pub unsafe extern "system" fn title_virtual_protect(
 /// are opened with it. The runtime forgets it in its index once it is
 /// gone, before the report after.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::rt::release_buffer(None, at as u64, at.saturating_add(len) as u64);
     crate::resource::memory_remapped(at, len);
     let range = blocks(at, len);
     let mut lock = settled(range.clone());

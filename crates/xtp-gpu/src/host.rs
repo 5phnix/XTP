@@ -869,6 +869,9 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// next recording afresh without taking them from it.
 #[derive(Clone, Default)]
 struct Recorded {
+    rt_sizes: std::sync::Arc<Vec<crate::rt::compaction::CompactedSize>>,
+    #[cfg(feature = "diagnostics")]
+    rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
     #[cfg(feature = "diagnostics")]
     dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
@@ -1053,6 +1056,9 @@ type Closing = Box<dyn FnOnce(&HostList) + Send>;
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    rt_sizes: std::sync::Arc<Vec<crate::rt::compaction::CompactedSize>>,
+    #[cfg(feature = "diagnostics")]
+    rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
     #[cfg(feature = "diagnostics")]
     dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     /// What the list's draws read and its dispatches wrote, in recorded
@@ -1068,6 +1074,11 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Immutable BLAS generations referenced by TLAS builds and traces on this recording.
+    rt_maps: Vec<std::sync::Arc<crate::rt::BlasMap>>,
+    rt_recording: Option<std::sync::Arc<()>>,
+    rt_size_page: crate::rt::compaction::SizePage,
+    rt_results: Vec<std::sync::Arc<ID3D12Resource>>,
     /// Dynamic descriptor slots leased by this recording.
     dynamic: Vec<DynamicLease>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -1798,6 +1809,9 @@ impl Host {
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             self.removed(Some(&p));
         }
+        for size in p.recorded.iter().flat_map(|r| r.rt_sizes.iter()) {
+            size.complete();
+        }
         // About how long it ran: from its submission or the end of the one
         // before, whichever is later, until it was seen done.
         let ran = {
@@ -1826,6 +1840,10 @@ impl Host {
         // same big ranges dozens of times).
         #[cfg(feature = "diagnostics")]
         for sample in p.recorded.iter().flat_map(|r| r.dispatch_samples.iter()) {
+            sample.report();
+        }
+        #[cfg(feature = "diagnostics")]
+        for sample in p.recorded.iter().flat_map(|r| r.rt_samples.iter()) {
             sample.report();
         }
         // `XTP_MESH_STATS`: what the draws read, as the GPU left it.
@@ -2428,7 +2446,13 @@ impl HostList {
             let deferred = self.deferred();
             (deferred.dispatch_samples.clone(), deferred.meshes.clone())
         };
+        #[cfg(feature = "diagnostics")]
+        let rt_samples = self.deferred().rt_samples.clone();
+        let rt_sizes = self.deferred().rt_sizes.clone();
         Recorded {
+            rt_sizes,
+            #[cfg(feature = "diagnostics")]
+            rt_samples,
             #[cfg(feature = "diagnostics")]
             dispatch_samples,
             pipelines: self
@@ -2441,6 +2465,11 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             meshes,
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn rt_sample(&self, sample: crate::rt::probe::Sample) {
+        std::sync::Arc::make_mut(&mut self.deferred().rt_samples).push(sample);
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2707,6 +2736,28 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn rt_recording(&self) -> std::sync::Arc<()> {
+        self.deferred()
+            .rt_recording
+            .get_or_insert_with(Default::default)
+            .clone()
+    }
+
+    pub(crate) fn rt_compacted_size(&self) -> Option<(u64, crate::rt::compaction::CompactedSize)> {
+        let mut deferred = self.deferred();
+        let (address, slot) = deferred.rt_size_page.reserve()?;
+        std::sync::Arc::make_mut(&mut deferred.rt_sizes).push(slot.clone());
+        Some((address, slot))
+    }
+
+    pub(crate) fn keep_rt_result(&self, result: &std::sync::Arc<ID3D12Resource>) {
+        self.deferred().rt_results.push(result.clone());
+    }
+
+    pub(crate) fn keep_rt_map(&self, map: &std::sync::Arc<crate::rt::BlasMap>) {
+        self.deferred().rt_maps.push(map.clone());
     }
 
     /// Whether this is the first time since the reset that the list asks

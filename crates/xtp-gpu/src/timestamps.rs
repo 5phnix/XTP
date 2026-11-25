@@ -105,6 +105,7 @@ pub(crate) enum What {
     Clamp,
     /// XTP's passes that expand indirect rectangle lists (`rectangles`).
     RectangleExpansion,
+    RaytracingBuild,
     /// The indirect draw of expanded rectangles.
     Rectangles,
     /// A texture's staging copy into its host copy (`texture::upload`).
@@ -125,6 +126,7 @@ impl std::fmt::Display for What {
             What::Indirect(10) => f.write_str("indirect mesh dispatch"),
             What::Indirect(kind) => write!(f, "indirect kind {kind}"),
             What::Clamp => f.write_str("indirect argument clamp"),
+            What::RaytracingBuild => f.write_str("host DXR build"),
             What::RectangleExpansion => f.write_str("rectangle expansion"),
             What::Rectangles => f.write_str("indirect rectangles"),
             What::TextureUpload => f.write_str("texture upload"),
