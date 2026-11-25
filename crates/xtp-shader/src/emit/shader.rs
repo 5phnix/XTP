@@ -758,6 +758,10 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
+        // Validator 1.6: the parts (ISG1, OSG1, PSV0 runtime info version
+        // 2) are written as it writes them. Validators 1.8 and 1.9 check
+        // such a module by its rules; declared 1.8, they want PSV0 version 3
+        // and other signature parts (they refuse every module otherwise).
         self.m.named_md("dx.valver", vec![version]);
         // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
