@@ -850,14 +850,15 @@ impl<'a> Lower<'a> {
     /// budget enter: an atomic add of those lanes to the first dword of the
     /// loop-limit counter (`u0` in
     /// [`LOOP_COUNTER_SPACE`](crate::emit::LOOP_COUNTER_SPACE)), which the
-    /// host points at the pipeline's own dword. A host lane that carries two
-    /// console lanes (paired lanes) adds 2. In the console flow every lane
-    /// of a stopped wave counts, active in the console's EXEC or not; a
-    /// pixel's helper lanes write no UAV, so they do not.
+    /// host points at the pipeline's own counter. Each lane adds 1: a host
+    /// lane that carries two console lanes (paired lanes) runs the atomic
+    /// once for each, as every atomic of the paired flow. In the console
+    /// flow every lane of a stopped wave counts, active in the console's
+    /// EXEC or not; a pixel's helper lanes write no UAV, so they do not.
     fn count_exit(&mut self, block: usize) {
         let h = self.s.loop_counter_handle(block);
         let i32t = self.s.t.i32;
-        let lanes = self.s.m.i32(if self.s.m.paired_lanes() { 2 } else { 1 });
+        let lanes = self.s.m.i32(1);
         // Add (0), at byte 0.
         let (add, at) = (self.s.m.i32(0), self.s.m.i32(0));
         let undef = self.s.m.undef(i32t);
@@ -2606,6 +2607,67 @@ mod tests {
                     "@dx.op.createHandleFromBinding(i32 217, %dx.types.ResBind {{ i32 0, i32 0, i32 {space}, i8 1 }}"
                 )),
                 "{what}: the counter's binding"
+            );
+        }
+    }
+
+    /// In the console flow with paired lanes (a wave64 group of 128 threads
+    /// on a host of 32-lane waves), each physical lane carries two console
+    /// lanes and runs every atomic once for each, the counter's too: each
+    /// copy adds 1, so a group the limit stops whole adds its 128 console
+    /// lanes, not 256. The validator, where one is installed, takes it; the
+    /// listing (`dxc -dumpbin`) shows the two adds of 1.
+    #[cfg(windows)]
+    #[test]
+    fn paired_lanes_add_one_per_console_lane_to_the_loop_counter() {
+        // Lane t loops t + 1 times and counts the exit mask inside the loop:
+        // a lane mask read as data, which takes the console flow.
+        let words = [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE8A_0480, // s_mov_b64 s[10:11], 0
+            0x4A02_0281, // 8: v_add_nc_u32 v1, 1, v1
+            0x7D88_0101, // v_cmp_gt_u32 vcc, v1, v0
+            0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+            0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+            0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+            0xBF89_FFFA, // s_cbranch_execnz -> 8
+            0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+            0x7E04_0209, // v_mov_b32 v2, s9
+            S_ENDPGM,
+        ];
+        let native = crate::emit::tests::compute_of(&words, true, 128);
+        let wave32 = crate::emit::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+            stride_table: false,
+        };
+        let mut on = crate::emit::with_loop_count(|| emit_for(&native, wave32))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let summary = crate::emit::last_module_summary();
+        assert!(
+            summary.ends_with("console flow with paired lanes"),
+            "{summary}"
+        );
+        assert!(on.loop_counter());
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut on.dxil)
+                .unwrap_or_else(|e| panic!("validation: {e}"));
+        }
+        let Some(listing) = crate::emit::shader::tests::listing(&on) else {
+            return;
+        };
+        let atomics: Vec<&str> = listing
+            .lines()
+            .filter(|l| l.contains("call i32 @dx.op.atomicBinOp.i32("))
+            .collect();
+        // One per console lane of the pair, each an add (0) of 1 at byte 0.
+        assert_eq!(atomics.len(), 2, "{atomics:?}");
+        for atomic in &atomics {
+            assert!(
+                atomic.contains(", i32 0, i32 0, i32 undef, i32 undef, i32 1)"),
+                "{atomic}"
             );
         }
     }
