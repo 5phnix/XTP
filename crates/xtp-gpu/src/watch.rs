@@ -91,18 +91,50 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+// Windows x64 user addresses have 31 page-number bits. A 4 GiB region
+// allocates a directory on its first write, then 2 KiB per 16 MiB touched.
+// Readers never allocate. Only the holder of JOURNAL publishes a stamp.
+type Stamps = [std::sync::atomic::AtomicU64; 256];
+type StampRegion = [OnceLock<Box<Stamps>>; 256];
+static STAMPS: [OnceLock<Box<StampRegion>>; 1 << 15] = [const { OnceLock::new() }; 1 << 15];
+
+fn stamp(page: usize, now: u64) {
+    let Some(region) = STAMPS.get(page >> 16) else {
+        return;
+    };
+    let region = region.get_or_init(|| Box::new(std::array::from_fn(|_| OnceLock::new())));
+    let stamps =
+        region[(page >> 8) & 255].get_or_init(|| Box::new(std::array::from_fn(|_| 0.into())));
+    stamps[page & 255].store(now, std::sync::atomic::Ordering::Release);
+}
+
+/// A concurrent poll or kernel write may already have advanced the stamp.
+/// Copies record only their own poll number, so the later write stays due.
+pub(crate) fn last_write(page: usize) -> u64 {
+    let Some(region) = STAMPS.get(page >> 16) else {
+        return u64::MAX;
+    };
+    region
+        .get()
+        .and_then(|region| region[(page >> 8) & 255].get())
+        .map_or(0, |stamps| {
+            stamps[page & 255].load(std::sync::atomic::Ordering::Acquire)
+        })
+}
+
+pub(crate) fn changed_since(start: usize, end: usize, since: u64) -> bool {
+    (start / PAGE..end.div_ceil(PAGE)).any(|page| last_write(page) > since)
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
     found: Vec::new(),
 });
 
@@ -132,12 +164,18 @@ impl Journal {
     }
 }
 
-/// The pages of `[start, end)` (whole pages) as last written, for pages
-/// written since tracking began: `(page number, asking)` in page order, and
-/// this asking's number, which is higher than any in the list but those the
-/// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
-pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+/// Poll the kernel or guards for this range, publish changed page stamps,
+/// and return the poll number. Readers can then consult individual pages.
+pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<u64> {
+    with_writes(start, end, guarded, |now| now)
+}
+
+fn with_writes<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    result: impl FnOnce(u64) -> T,
+) -> Option<T> {
     let _watch = crate::host::preparation::Phase::Watch.enter();
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Une vue de section ne peut pas avoir MEM_WRITE_WATCH.
@@ -181,15 +219,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(dirty);
     for page in pages {
-        j.written.insert(page, now);
+        stamp(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some(result(now))
 }
 
 /// Guarded blocks of view memory: one page each, so a block shows one
@@ -879,7 +911,7 @@ fn kernel_write_done(pages: Range<usize>) {
     j.asked += 1;
     let now = j.asked;
     for page in pages {
-        j.written.insert(page, now);
+        stamp(page, now);
     }
 }
 
@@ -1029,7 +1061,7 @@ pub(super) fn publish(
     journal.asked += 1;
     let now = journal.asked;
     for view in views {
-        journal.written.insert(view, now);
+        stamp(view, now);
         g.clean.insert(view);
     }
     Some((written, now))
@@ -1118,14 +1150,11 @@ pub fn guarding() -> bool {
 /// write-watched nor a view.
 #[doc(hidden)]
 pub fn copy_asks(start: usize, end: usize) -> Option<Vec<usize>> {
-    let (now, pages) = writes(start, end, true)?;
-    Some(
-        pages
-            .into_iter()
-            .filter(|&(_, asking)| asking == now)
-            .map(|(page, _)| page)
-            .collect(),
-    )
+    with_writes(start, end, true, |now| {
+        (start / PAGE..end.div_ceil(PAGE))
+            .filter(|&page| last_write(page) == now)
+            .collect()
+    })
 }
 
 /// Applique la protection demandée par le titre après restitution de la page.
@@ -2114,9 +2143,9 @@ pub(crate) mod tests {
         assert!(writes(view, end, false).is_none());
         // SAFETY: writing our mapped view goes through the guard handler.
         unsafe { (view as *mut u8).write_volatile(1) };
-        let (now, pages) = writes(view, end, true).expect("known view");
-        assert!(pages.contains(&(view / PAGE, now)));
-        assert!(!pages.contains(&(next / PAGE, now)));
+        let now = writes(view, end, true).expect("known view");
+        assert_eq!(last_write(view / PAGE), now);
+        assert_ne!(last_write(next / PAGE), now);
         assert_eq!(WATCH_QUERIES.get(), queries + 2);
 
         title_memory_remapped(view, PAGE);
@@ -2189,16 +2218,16 @@ pub(crate) mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (first, before) = writes(start, end, false).expect("watched");
-        assert!(before.iter().all(|&(_, asking)| asking < first));
+        let first = writes(start, end, false).expect("watched");
+        assert!((start / PAGE..end / PAGE).all(|page| last_write(page) < first));
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
-        assert!(after.contains(&(p / PAGE + 1, now)));
+        let now = writes(start, end, false).expect("watched");
+        assert_eq!(last_write(p / PAGE + 1), now);
         // Another asker after the kernel's bit was cleared still sees it.
-        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
+        let later = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
-        assert!(again.contains(&(p / PAGE + 1, now)));
+        assert_eq!(last_write(p / PAGE + 1), now);
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -2289,8 +2318,8 @@ pub(crate) mod tests {
         let mut copy = vec![0u8; LEN];
         let ask = || {
             let started = std::time::Instant::now();
-            let (_, pages) = writes(p, p + LEN, false).expect("watched");
-            (started.elapsed(), pages.len())
+            writes(p, p + LEN, false).expect("watched");
+            started.elapsed()
         };
         ask();
         let few: Vec<_> = (0..20)
@@ -2299,7 +2328,7 @@ pub(crate) mod tests {
                 for i in 0..50 {
                     title[(k * 7919 + i * 104_729) * 4096 % LEN] ^= 1;
                 }
-                ask().0
+                ask()
             })
             .collect();
         let many: Vec<_> = (0..5)
@@ -2307,7 +2336,7 @@ pub(crate) mod tests {
                 for page in (0..LEN).step_by(4096) {
                     title[page] ^= 1;
                 }
-                ask().0
+                ask()
             })
             .collect();
         let per_call =
@@ -3006,21 +3035,14 @@ pub(crate) mod tests {
         fn copy_stale(
             heap: usize,
             pages: std::ops::Range<usize>,
-            (now, written): (u64, &[(usize, u64)]),
+            now: u64,
             copied: &mut [u64],
             copy: &mut [u8],
         ) -> usize {
             let base = heap / PAGE;
-            let mut writes = written.iter().peekable();
             let (mut bytes, mut run) = (0, None);
             for page in pages.clone() {
-                let write = match writes.peek() {
-                    Some(&&(p, w)) if p == page => {
-                        writes.next();
-                        w
-                    }
-                    _ => 0,
-                };
+                let write = last_write(page);
                 let at = &mut copied[page - base];
                 if *at == 0 || write > *at {
                     *at = now;
@@ -3054,11 +3076,11 @@ pub(crate) mod tests {
                 for (block, n) in ranges {
                     let (from, to) = (heap + block * BLOCK, heap + (block + n) * BLOCK);
                     let started = Instant::now();
-                    let (now, written) = writes(from, to, true).expect("a view");
+                    let now = writes(from, to, true).expect("a view");
                     asking += started.elapsed();
                     let started = Instant::now();
                     let pages = from / PAGE..to / PAGE;
-                    bytes += copy_stale(heap, pages, (now, &written), copied, copy);
+                    bytes += copy_stale(heap, pages, now, copied, copy);
                     copying += started.elapsed();
                 }
             }
@@ -3298,14 +3320,12 @@ pub(crate) mod tests {
         writes(start, end, false).expect("watched");
         let writing = kernel_writing(p + PAGE, 2 * PAGE);
         // A copy asks while the device writes: nothing to see yet.
-        let (during, _) = writes(start, end, false).unwrap();
+        let during = writes(start, end, false).unwrap();
         drop(writing);
-        let (after, written) = writes(start, end, false).unwrap();
+        let after = writes(start, end, false).unwrap();
         assert!(after > during);
-        let noted: Vec<usize> = written
-            .iter()
-            .filter(|&&(_, asking)| asking > during)
-            .map(|&(page, _)| page)
+        let noted: Vec<_> = (start / PAGE..end / PAGE)
+            .filter(|&page| last_write(page) > during)
             .collect();
         assert_eq!(noted, [p / PAGE + 1, p / PAGE + 2]);
         // An announcement outside write-watched memory notes nothing.
@@ -3316,13 +3336,6 @@ pub(crate) mod tests {
         unmapped(view, 1);
         // SAFETY: our allocation.
         assert_ne!(unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) }, 0);
-        // Its pages leave the journal, as other tests may get the address.
-        let mine = p / PAGE..p / PAGE + 4;
-        JOURNAL
-            .lock()
-            .unwrap()
-            .written
-            .retain(|page, _| !mine.contains(page));
     }
 
     /// Whether one protection change over a run of blocks costs less than

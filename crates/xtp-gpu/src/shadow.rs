@@ -1104,7 +1104,7 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return;
         }
-        let Some((now, _)) = crate::watch::writes(first * PAGE, (last + 1) * PAGE, true) else {
+        let Some(now) = crate::watch::writes(first * PAGE, (last + 1) * PAGE, true) else {
             return;
         };
         let start = self.start as usize;
@@ -1181,12 +1181,9 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED && !whole_ranges() {
             #[cfg(test)]
             tests::ASKED.set(tests::ASKED.get() + 1);
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some(now) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied: usize = gaps
-                    .iter()
-                    .map(|&(a, b)| self.copy_stale(a, b, now, &written))
-                    .sum();
+                let copied: usize = gaps.iter().map(|&(a, b)| self.copy_stale(a, b, now)).sum();
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -1237,15 +1234,13 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
-        let Some((_, written)) = crate::watch::writes(from, to, true) else {
+        if crate::watch::writes(from, to, true).is_none() {
             return true;
-        };
+        }
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         (from / PAGE..=(to - 1) / PAGE).any(|page| {
-            let write = written
-                .binary_search_by_key(&page, |&(p, _)| p)
-                .map_or(0, |i| written[i].1);
+            let write = crate::watch::last_write(page);
             let at = page * PAGE;
             !copied[page - base].holds(from.max(at) - at, to.min(at + PAGE) - at, write)
         })
@@ -1257,9 +1252,9 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED && !whole_ranges() {
             #[cfg(test)]
             tests::ASKED.set(tests::ASKED.get() + 1);
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some(now) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -1274,29 +1269,20 @@ impl Shadow {
     }
 
     /// Copies the parts in `[from, to)` of the pages written after the copy
-    /// took them (`written`: last writes by page, in page order, from
-    /// `from`'s page or before; `now`: this asking), whole pages within the
+    /// took them (`now`: this asking), whole pages within the
     /// buffer. A page only partly in the range is copied in part, and that
     /// part is kept ([`Taken`]): a refresh of it (or of less) finds it
     /// current until the title writes the page. (Before W1, such a page
     /// stayed stale, and was copied at every refresh: the ends of every
     /// range that does not start and end on a page, each submission.)
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(&self, from: usize, to: usize, now: u64) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let first = written.partition_point(|&(p, _)| p < from / PAGE);
-        let mut writes = written[first..].iter().peekable();
         let (mut bytes, mut run) = (0, None::<usize>);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
+            let write = crate::watch::last_write(page);
             let at = page * PAGE;
             // The page's part in the range, and in the buffer (offsets in
             // the page).
@@ -2109,13 +2095,6 @@ pub(crate) mod census {
         (0..SMALL).filter(move |i| mask & (1 << i) != 0)
     }
 
-    /// The journal's last writing of `block`'s page (0: none known).
-    fn last_write(written: &[(usize, u64)], block: usize) -> u64 {
-        written
-            .binary_search_by_key(&block, |&(p, _)| p)
-            .map_or(0, |i| written[i].1)
-    }
-
     /// How a copy-back takes part: whether the census counts it, and
     /// guards its range after.
     #[derive(Clone, Copy)]
@@ -2166,7 +2145,7 @@ pub(crate) mod census {
                     // same submission: the same GPU work.
                     continue;
                 }
-                let written = asked.as_ref().map_or(0, |(_, w)| last_write(w, block));
+                let written = asked.map_or(0, |_| crate::watch::last_write(block));
                 // Written since it was guarded: a write the guard did not see
                 // (which may have taken the guards off), unless a store to
                 // one of its pages faulted, which the journal cannot tell
@@ -2243,7 +2222,7 @@ pub(crate) mod census {
             );
             let pages = mask(a, b);
             let bytes = ((b - a) * KERNEL_PAGE) as u64;
-            let Some((now, written)) = &asked else {
+            let Some(now) = asked else {
                 add(K::Unarmed, bytes);
                 continue;
             };
@@ -2256,7 +2235,7 @@ pub(crate) mod census {
             }
             let ours = gpu.iter().any(|&n| n != 0);
             // Where the copy-back wrote, its write and another's look alike.
-            let theirs = !ours && last_write(written, block) == *now;
+            let theirs = !ours && crate::watch::last_write(block) >= now;
             let Census { blocks, ever, .. } = census;
             let entry = blocks.entry(block).or_insert(Block {
                 submission,
@@ -2275,7 +2254,7 @@ pub(crate) mod census {
             let intact = entry.guarded & pages == pages && !ours && !theirs;
             *entry = Block {
                 submission,
-                asked: *now,
+                asked: now,
                 armed: pages,
                 guarded: entry.guarded,
                 gpu,
@@ -5199,9 +5178,9 @@ mod tests {
             assert!(writable(view + PAGE), "the guard opened the block");
             assert!(!writable(view), "and only it");
             // Noted written, as the guard's handler notes a write.
-            let (now, written) = crate::watch::writes(view, view + 2 * PAGE, true).unwrap();
-            assert!(written.contains(&(view / PAGE + 1, now)));
-            assert!(!written.contains(&(view / PAGE, now)));
+            let now = crate::watch::writes(view, view + 2 * PAGE, true).unwrap();
+            assert_eq!(crate::watch::last_write(view / PAGE + 1), now);
+            assert_ne!(crate::watch::last_write(view / PAGE), now);
         });
     }
 

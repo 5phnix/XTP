@@ -621,6 +621,9 @@ fn capped_split(limit: u32) -> (u32, u32) {
     (limit - dynamic, dynamic)
 }
 
+/// D3D12 limits a raw buffer view to 2^27 four-byte elements.
+pub(crate) const MAX_RAW_VIEW_BYTES: u64 = 4 << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
+
 impl HostHeap {
     /// A host heap for a title heap of `count` slots; view heaps get a
     /// runtime stride table with `XTP_STRIDE_TABLE=1`.
@@ -1220,9 +1223,8 @@ impl HostHeap {
     /// copies are rounded up to 64 KiB, so it is inside `buffer`), and the
     /// view stops at D3D12's 2^27 buffer view elements (512 MiB).
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
-        const MAX_ELEMENTS: u64 = 1 << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
         let Some(host) = host() else { return };
-        let elements = len.div_ceil(4).clamp(1, MAX_ELEMENTS) as u32;
+        let elements = len.div_ceil(4).clamp(1, MAX_RAW_VIEW_BYTES / 4) as u32;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,

@@ -206,11 +206,6 @@ pub(crate) struct State {
     /// Root CBVs copied on the GPU in this list: (host copy, address,
     /// [`State::writes`]) → host address.
     cbv_copies: std::collections::HashMap<(usize, u64, u64), u64>,
-    /// Per host copy, the lowest address a root SRV of the list views it
-    /// from: the copy is refreshed from there to its end, the reach of
-    /// every view of the list in it, once per list (until a title copy
-    /// intervenes).
-    refreshed: std::collections::HashMap<usize, u64>,
     /// The draws and dispatches recorded so far that may write GPU memory
     /// (compute, unordered access): a copy of the list's own made before
     /// one is not reused after it.
@@ -1931,18 +1926,22 @@ impl State {
         // By host copy too: a buffer the title makes at the address of one
         // it released while recording the list has a copy of its own.
         let copy = s.buffer.as_raw() as usize;
-        let from = self.refreshed.entry(copy).or_insert(a);
-        *from = (*from).min(a);
-        s.refresh(list, *from, s.left(*from));
         let offset = s.offset(a);
         let in_place = offset.is_multiple_of(16);
+        let limit = if in_place {
+            crate::descriptor::host::MAX_RAW_VIEW_BYTES
+        } else {
+            MISALIGNED_SPAN
+        };
+        let bytes = s.left(a).min(limit);
+        s.refresh(list, a, bytes);
         let key = (heap, a, copy, if in_place { 0 } else { self.writes + 1 });
         if let Some(&slot) = self.root_srv_slots.get(&key) {
             return Ok((host, slot));
         }
         note_root_srv(a, &s);
         let slot = if in_place {
-            let slot = host.shared_raw(&s, offset, s.left(a));
+            let slot = host.shared_raw(&s, offset, bytes);
             if let Some(slot) = slot {
                 self.recording.shared(list, heap, slot);
             }
