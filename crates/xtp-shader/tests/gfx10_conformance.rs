@@ -25,20 +25,7 @@ const UNRESOLVED_LEGACY_NAMES: &[(&str, &str)] = &[
 ];
 
 /// Valid LLVM MC mnemonics for which XTP currently returns no name.
-const KNOWN_DECODER_GAPS: &[&str] = &[
-    // VOP3 0x200..=0x202 needs aliases to the VINTRP table.
-    "v_interp_p1_f32",
-    "v_interp_p2_f32",
-    "v_interp_mov_f32",
-    // MIMG 0x061 and 0x0e8..=0x0eb are missing from the opcode table.
-    "image_gather4h",
-    "image_sample_cd_g16",
-    "image_sample_cd_cl_g16",
-    "image_sample_c_cd_g16",
-    "image_sample_c_cd_cl_g16",
-    // VOP3P 0x018 is missing from the opcode table.
-    "v_dot8_i32_i4",
-];
+const KNOWN_DECODER_GAPS: &[&str] = &[];
 
 fn load_corpus() -> Vec<(String, Vec<u32>)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");

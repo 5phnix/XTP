@@ -22,7 +22,8 @@ pub enum Operand {
     },
     /// Inline constant or read-only special source, by operand code
     /// (128-192: 0-64, 193-208: -1 to -16, 240-248: floats, 251-254: vccz,
-    /// execz, scc, lds_direct).
+    /// execz, scc, lds_direct). For `v_interp_mov_f32`, a parameter selector
+    /// (0 `p10`, 1 `p20`, 2 `p0`).
     Const(u8),
     /// The 32-bit literal that follows the instruction.
     Literal(u32),
@@ -552,6 +553,7 @@ impl Instruction {
                     0x000..0x100 => 2,
                     0x100..0x140 => 2 + usize::from(carry_in),
                     0x180..0x200 => 1,
+                    0x200..=0x202 => 2,
                     _ if VOP3_TWO_SOURCES.contains(&name) => 2,
                     _ => 3,
                 };
@@ -564,6 +566,8 @@ impl Instruction {
                                 chan: (code >> 6 & 3) as u8,
                                 high: code >> 8 & 1 == 1,
                             }
+                        } else if i == 1 && name == "v_interp_mov_f32" {
+                            Operand::Const(code as u8)
                         } else if i == 2 && carry_in {
                             source(code, lanes, w(2))
                         } else {
