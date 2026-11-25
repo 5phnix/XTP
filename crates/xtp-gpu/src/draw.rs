@@ -7374,6 +7374,214 @@ float4 ps(V v) : SV_Target { return v.color; }
         assert_eq!(state.tlas_view_at(d, true), None);
     }
 
+    /// Which TLAS a spliced trace reads. The title's table at the trace's
+    /// root parameter holds a decoy's descriptor at +0x00 and the trace's at
+    /// +0x20 ([`xtp_shader::emit::TlasDescriptor`]), and the trace's names a
+    /// TLAS the title built 0x100 bytes into its buffer. The binding
+    /// ([`State::tlas_view_at`], then `rt::descriptor_tlas_in`) gives the
+    /// host TLAS of that title address, the one its root address gives, not
+    /// the decoy's: the same rays traced through either give the same words,
+    /// and other words through the decoy.
+    ///
+    /// After the test of Xbox2Windows commit 1b753c5828 by tedin7, which
+    /// traces rays through a TLAS published at a non-zero offset, against
+    /// the root address and a decoy (MIT License, Copyright (c) 2026
+    /// Xbox2Windows contributors); written anew here, none of its code.
+    #[test]
+    fn a_trace_reads_the_tlas_its_descriptor_names_not_a_decoy() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R32G32_FLOAT,
+        };
+        let test = "draw::tests::a_trace_reads_the_tlas_its_descriptor_names_not_a_decoy";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        // SAFETY: the output is the options structure the feature names.
+        let tier = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS5,
+                (&raw mut caps).cast(),
+                size_of_val(&caps) as u32,
+            )
+        }
+        .map_or(D3D12_RAYTRACING_TIER_NOT_SUPPORTED, |()| {
+            caps.RaytracingTier
+        });
+        if tier.0 < D3D12_RAYTRACING_TIER_1_1.0 {
+            crate::testgpu::skip(test, "inline ray queries require DXR tier 1.1");
+            return;
+        }
+        // One triangle about x = `x` at z = 0, as a TLAS built at `at`: of
+        // `ray_test.hlsl`'s two rays along +z from z = -2, at x = 0 and
+        // x = 4, the one at `x` hits it two units on.
+        let producer = TitleList::new();
+        let scene = |x: f32, at: u64| -> Vec<TitleBuffer> {
+            let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+            let positions = [x - 1., -1., x, 1., x + 1., -1.];
+            vertices.set_words(|i| positions[i].to_bits());
+            indices.set_words(|i| [1 << 16, 2][i]);
+            let (blas, instances) = (TitleBuffer::new(1024), TitleBuffer::new(64));
+            instances.set_words(|i| match i {
+                0 | 5 | 10 => 1f32.to_bits(),
+                12 => 0xff00_0000,
+                14 => blas.address() as u32,
+                15 => (blas.address() >> 32) as u32,
+                _ => 0,
+            });
+            let geometry = D3D12_RAYTRACING_GEOMETRY_DESC {
+                Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                    Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                        IndexFormat: DXGI_FORMAT_R16_TYPELESS,
+                        VertexFormat: DXGI_FORMAT_R32G32_FLOAT,
+                        IndexCount: 3,
+                        VertexCount: 3,
+                        IndexBuffer: indices.address(),
+                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                            StartAddress: vertices.address(),
+                            StrideInBytes: 8,
+                        },
+                        ..Default::default()
+                    },
+                },
+            };
+            let inputs = |kind, descs| D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                Type: kind,
+                NumDescs: 1,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: descs,
+                ..Default::default()
+            };
+            let blas_inputs = inputs(
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    pGeometryDescs: &geometry,
+                },
+            );
+            let tlas_inputs = inputs(
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    InstanceDescs: instances.address(),
+                },
+            );
+            // SAFETY: the title list and the CPU arrays are live for each call.
+            unsafe {
+                for (dst, inputs) in [(blas.address(), blas_inputs), (at, tlas_inputs)] {
+                    assert!(crate::rt::Builder.build(
+                        producer.this(),
+                        &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                            DestAccelerationStructureData: dst,
+                            Inputs: inputs,
+                            ..Default::default()
+                        }
+                    ));
+                }
+            }
+            vec![vertices, indices, blas, instances]
+        };
+        // The trace's TLAS 0x100 bytes into the title's buffer; the decoy's.
+        let (placed, decoy) = (TitleBuffer::new(4096), TitleBuffer::new(1024));
+        let at = placed.address() + 0x100;
+        let _inputs = [scene(0., at), scene(4., decoy.address())];
+        producer.run();
+        // The title's table: the decoy's descriptor, then the trace's.
+        let heap = TestHeap::views(16);
+        let title = crate::descriptor::heap(heap.0);
+        for (k, address) in [decoy.address(), at].into_iter().enumerate() {
+            let mut srv = [0u32; 10];
+            srv[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+            srv[4] = address as u32;
+            srv[5] = (address >> 32) as u32;
+            let slot = title.start + k as u64 * 32;
+            crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &srv, slot);
+        }
+        let list = TitleList::new();
+        let mut state = state(heap.0);
+        state.set_table(true, 1, title.start);
+        let d = xtp_shader::emit::TlasDescriptor {
+            slot: 1,
+            offset: 0x20,
+        };
+        let view = state.tlas_view_at(d, true).expect("the trace's view");
+        assert_eq!(view, title.start + 0x20);
+        let bound = crate::rt::descriptor_tlas_in(list.host(), view).expect("its host TLAS");
+        // SAFETY: the test's live list.
+        let (root, other) = unsafe {
+            (
+                crate::rt::host_tlas(list.this(), at).expect("the root address's TLAS"),
+                crate::rt::host_tlas(list.this(), decoy.address()).expect("the decoy's"),
+            )
+        };
+        assert_eq!(bound, root);
+        assert_ne!(bound, other);
+        // The same rays through each.
+        let dxc = std::env::var_os("XTP_PC_DXC")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                xtp_shader::emit::validator::Validator::default_path()
+                    .map(|p| p.with_file_name("dxc.exe"))
+            })
+            .expect("Windows SDK DXC for the inline ray test");
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("ray.dxil");
+        let compiled = std::process::Command::new(dxc)
+            .args(["-T", "cs_6_5", "-E", "main", "-Fo"])
+            .arg(&binary)
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rt/ray_test.hlsl"))
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let code = std::fs::read(binary).unwrap();
+        let l = list.host();
+        let outputs: Vec<TitleBuffer> = (0..3).map(|_| TitleBuffer::new(16)).collect();
+        // SAFETY: the root signature is the one DXC embeds; the list keeps it,
+        // the PSO and the outputs' copies, and the structures are pinned.
+        unsafe {
+            let root_signature: ID3D12RootSignature =
+                host.device.CreateRootSignature(0, &code).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root_signature),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            l.keep(&root_signature);
+            l.keep(&pso);
+            for (tlas, output) in [bound, root, other].into_iter().zip(&outputs) {
+                output.set_words(|_| 77);
+                let shadow = output.shadow();
+                shadow.refresh(l, output.address(), 16);
+                shadow.gpu_writes(l, output.address(), 16);
+                l.list.SetPipelineState(&pso);
+                l.list.SetComputeRootSignature(&root_signature);
+                l.list.SetComputeRootShaderResourceView(0, tlas);
+                l.list
+                    .SetComputeRootUnorderedAccessView(1, shadow.gpu(output.address()));
+                l.list.Dispatch(1, 1, 1);
+                l.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+            }
+        }
+        list.run();
+        let [through_table, through_root, through_decoy] =
+            [0, 1, 2].map(|k| outputs[k].words());
+        let two = 2.0f32.to_bits();
+        assert_eq!(through_table, [1, two, 0, 0], "the trace's rays");
+        assert_eq!(through_table, through_root);
+        assert_eq!(through_decoy, [0, 0, 1, two], "the decoy's rays");
+    }
+
     /// A title heap released while a list records and another made at its
     /// address keep the key the state compares, not the host heap: the
     /// host list gets the new heap (and root signatures again after it),
