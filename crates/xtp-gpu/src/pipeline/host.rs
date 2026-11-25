@@ -254,6 +254,20 @@ impl GraphicsState {
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
+        self.describe_with(self.depth_bounds)
+    }
+
+    /// [`Self::describe`] of the state a host makes, for the library's
+    /// name: the depth bounds test only where the host has one, as the
+    /// pipeline's description sets it (`g.depth_bounds &&
+    /// host.depth_bounds`). The title's ask alone named two descriptions
+    /// alike on hosts with and without it (Codex review of d286ffd, point
+    /// 5).
+    pub(crate) fn describe_on(&self, host_depth_bounds: bool) -> String {
+        self.describe_with(self.depth_bounds && host_depth_bounds)
+    }
+
+    fn describe_with(&self, depth_bounds: bool) -> String {
         let inputs: Vec<String> = self
             .inputs
             .iter()
@@ -270,11 +284,7 @@ impl GraphicsState {
                 )
             })
             .collect();
-        let bounds = if self.depth_bounds {
-            " depth-bounds"
-        } else {
-            ""
-        };
+        let bounds = if depth_bounds { " depth-bounds" } else { "" };
         format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{bounds}",
             self.blend,
@@ -1248,7 +1258,8 @@ impl HostPipeline {
         if let Some(why) = g.refusal(&crate::resource::format::HostCaps) {
             return refuse(why, shaders);
         }
-        let state = g.describe();
+        // The state the host makes names the pipeline in the library.
+        let state = g.describe_on(host.depth_bounds);
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh",
@@ -2305,6 +2316,11 @@ mod tests {
             depth.1.DepthBoundsTestEnable = true.into();
             g.read(21, (&raw const depth).cast());
             assert_ne!(g.describe(), disabled);
+            // The library's name: the state the host makes (Codex review
+            // of d286ffd, point 5): without the test on a host without it,
+            // as the pipeline's description has it there.
+            assert_eq!(g.describe_on(true), g.describe());
+            assert_eq!(g.describe_on(false), disabled);
             let legacy = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth);
             g.read(11, (&raw const legacy).cast());
             assert_eq!(g.describe(), disabled);
@@ -3168,8 +3184,44 @@ mod tests {
         f(&classic, &streamed.desc(), meshed.as_ref())
     }
 
+    /// The mesh stages as builds before 284010f streamed them: the mesh and
+    /// pixel programs, no primitive topology.
+    #[repr(C)]
+    struct Before(Sub<D3D12_SHADER_BYTECODE>, Sub<D3D12_SHADER_BYTECODE>);
+
+    /// The mesh pipeline of the stream description `meshed` (made by
+    /// [`with_descs`] from a `Stream<MeshStages>`) as a build before
+    /// 284010f streamed it: without its primitive topology.
+    ///
+    /// # Safety
+    /// `meshed` points at a live `Stream<MeshStages>`.
+    unsafe fn before(meshed: &D3D12_PIPELINE_STATE_STREAM_DESC) -> Stream<Before> {
+        // SAFETY: the caller's.
+        let now = unsafe {
+            &*meshed
+                .pPipelineStateSubobjectStream
+                .cast::<Stream<MeshStages>>()
+        };
+        Stream {
+            root: Sub(now.root.0, now.root.1),
+            stages: Before(
+                Sub(now.stages.0.0, now.stages.0.1),
+                Sub(now.stages.1.0, now.stages.1.1),
+            ),
+            blend: Sub(now.blend.0, now.blend.1),
+            mask: Sub(now.mask.0, now.mask.1),
+            raster: Sub(now.raster.0, now.raster.1),
+            depth: Sub(now.depth.0, now.depth.1),
+            targets: Sub(now.targets.0, now.targets.1),
+            dsv: Sub(now.dsv.0, now.dsv.1),
+            samples: Sub(now.samples.0, now.samples.1),
+        }
+    }
+
     /// What loads, in a library of `blob`, of [`with_descs`]' three
-    /// pipelines stored under the names "classic", "stream" and "mesh".
+    /// pipelines stored under the names "classic", "stream" and "mesh",
+    /// and under "before" the mesh pipeline a build before 284010f made
+    /// and stored ([`before`]), loaded with this build's stream.
     fn loads(host: &crate::host::Host, blob: &[u8]) -> String {
         use windows::core::{HSTRING, Interface, PCWSTR};
         let device = host.device.cast::<ID3D12Device1>().unwrap();
@@ -3192,13 +3244,21 @@ mod tests {
                 (
                     library.LoadGraphicsPipeline(PCWSTR(name("classic").as_ptr()), classic),
                     library.LoadPipeline(PCWSTR(name("stream").as_ptr()), streamed),
-                    meshed.map(|m| library.LoadPipeline(PCWSTR(name("mesh").as_ptr()), m)),
+                    meshed.map(|m| {
+                        (
+                            library.LoadPipeline(PCWSTR(name("mesh").as_ptr()), m),
+                            library.LoadPipeline(PCWSTR(name("before").as_ptr()), m),
+                        )
+                    }),
                 )
             }
         });
-        let meshed = meshed.map_or_else(|| "none".to_owned(), said);
+        let meshed = meshed.map_or_else(
+            || "mesh=none".to_owned(),
+            |(now, before)| format!("mesh={} before={}", said(now), said(before)),
+        );
         format!(
-            "classic={} stream={} mesh={meshed}",
+            "classic={} stream={} {meshed}",
             said(classic),
             said(streamed)
         )
@@ -3264,14 +3324,28 @@ mod tests {
                     library
                         .StorePipeline(PCWSTR(name("mesh").as_ptr()), &made)
                         .unwrap();
+                    // The library a build before 284010f left: its stream
+                    // made and stored the pipeline (Codex review of
+                    // d286ffd, point 4). The name a session gives it is the
+                    // same in both builds (the topology is not in it, the
+                    // program's `PSV0` is, unchanged); D3D12 matches the
+                    // description, which this build's stream must load.
+                    let made: ID3D12PipelineState =
+                        device2.CreatePipelineState(&before(m).desc()).unwrap();
+                    library
+                        .StorePipeline(PCWSTR(name("before").as_ptr()), &made)
+                        .unwrap();
                 }
             }
             meshed.is_some()
         });
+        if !mesh {
+            // Strict mode fails here: the mesh pipeline is what it checks.
+            crate::testgpu::skip(test, "no mesh shaders on this host");
+        }
         let all = if mesh {
-            "classic=ok stream=ok mesh=ok"
+            "classic=ok stream=ok mesh=ok before=ok"
         } else {
-            eprintln!("no mesh shaders on this host: the mesh pipeline is not checked");
             "classic=ok stream=ok mesh=none"
         };
         // SAFETY: a live library; the buffer is its serialised size.
@@ -3285,31 +3359,11 @@ mod tests {
         // The mesh stream as it was, without its topology, does not load
         // the entry: the cause, not only the cure.
         if let Some(ms) = triangle_mesh(host) {
-            #[repr(C)]
-            struct Before(Sub<D3D12_SHADER_BYTECODE>, Sub<D3D12_SHADER_BYTECODE>);
             with_descs(host, |_, _, meshed| {
                 let meshed = meshed.expect("a mesh pipeline");
                 // SAFETY: the stream description was made by `with_descs`
                 // from a `Stream<MeshStages>`, alive meanwhile.
-                let now = unsafe {
-                    &*meshed
-                        .pPipelineStateSubobjectStream
-                        .cast::<Stream<MeshStages>>()
-                };
-                let mut before = Stream {
-                    root: Sub(now.root.0, now.root.1),
-                    stages: Before(
-                        Sub(now.stages.0.0, now.stages.0.1),
-                        Sub(now.stages.1.0, now.stages.1.1),
-                    ),
-                    blend: Sub(now.blend.0, now.blend.1),
-                    mask: Sub(now.mask.0, now.mask.1),
-                    raster: Sub(now.raster.0, now.raster.1),
-                    depth: Sub(now.depth.0, now.depth.1),
-                    targets: Sub(now.targets.0, now.targets.1),
-                    dsv: Sub(now.dsv.0, now.dsv.1),
-                    samples: Sub(now.samples.0, now.samples.1),
-                };
+                let mut before = unsafe { before(meshed) };
                 assert_eq!(
                     mesh_topology(&ms.dxil),
                     D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
@@ -3346,13 +3400,14 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stdout)
         );
-        let Ok(said) = std::fs::read_to_string(dir.path().join("loads.txt")) else {
-            eprintln!(
-                "the child had no device: {}",
+        // The same machine: a child without the parent's device is a
+        // failure, not a pass without the next process's answer.
+        let said = std::fs::read_to_string(dir.path().join("loads.txt")).unwrap_or_else(|_| {
+            panic!(
+                "the child answered nothing: {}",
                 String::from_utf8_lossy(&out.stderr)
-            );
-            return;
-        };
+            )
+        });
         assert_eq!(said, all, "the next process");
     }
 

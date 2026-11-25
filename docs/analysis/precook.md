@@ -195,3 +195,52 @@ from the disk, whatever the system cache holds) with
 (records decoded and applied: 111,630 entries, 8,589,877,367 bytes) in
 0.068 to 0.078 s. Before the index, the same open read every entry's
 header: 122.9 s for 25,925 entries cold (task 13245ce1).
+
+## 6. The Codex review of d286ffd, and a session lost at its start
+
+- **A start that waited on the shader cache (`stall-lightsrc-9`,
+  2026-11-25).** The title's start waited more than 5 minutes in the
+  cache's open, one `CreateFileW` per entry, cold. That session ran a
+  branch older than the cache's index (c3da2f9): its precook printed
+  `cache … (opened in 362.3 s)`, without the listing main's precook
+  prints. On main an open reads the index file, and without one lists
+  the folder (sizes and times from the listing, no entry opened). The
+  test `cache::tests::opening_opens_no_entry_file` holds every entry
+  open, shared with no one, so that any open of one fails: an open from
+  the index and one from a listing both count every entry and its
+  bytes. A branch older than c3da2f9 must merge main before its next
+  session.
+- **Point 1: "up to date" for other pipelines.** The note kept the
+  translation key alone, so a setting that changes the pipelines and
+  not the translations (`XTP_ROOT_SRV_DIRECT=1`: the root signatures)
+  left it up to date, and each session made the new pipelines at their
+  first use. The note (version 4) now also keeps those settings by their
+  effective values (`PipelineSettings`: the root SRVs' binding, the
+  wave64 mesh programs refused, the host's waves, shader model, depth
+  bounds and mesh shaders), and other settings make a whole pass.
+- **Point 2: an append lost to a snapshot.** A snapshot (a listing, or
+  a rewrite of the index read) replaced the index file without the
+  records other processes appended to it meanwhile. It now carries
+  them: the records after the file as the listing or read found it, or
+  after the snapshot that replaced it since. The snapshot holds the file
+  against appends while it reads them and renames (a handle shared
+  without writing; an append holds the file shared without deleting), so
+  that none goes in between.
+- **Point 3: an eviction on an incomplete listing.** A listing that
+  missed a folder no longer evicts anything, at the open or at any
+  access after, until a whole listing (`xtp precook` reindexes before
+  each pass): the oldest entries may be in the folder it missed, and the
+  counts may be an index's that lists entries gone since. The cache may
+  pass its budget meanwhile.
+- **Point 4: the mesh library entry an older build left.** The test of
+  970/972 now also stores the mesh pipeline as builds before 284010f
+  made it (its stream without the primitive topology) and loads it with
+  this build's stream, in this process and the next. It fails in strict
+  mode (`XTP_REQUIRE_GPU`) on a host without mesh shaders, and whenever
+  the child process gives no answer.
+- **Point 5: the depth bounds in a pipeline's name.** The name hashed
+  the depth bounds test the title asks for; the pipeline has it only
+  where the host does. The name now hashes the state the host makes.
+- **Point 6.** The loop limit's test changed the limit by halving it,
+  which gives 1 again for `XTP_SHADER_LOOP_LIMIT=1`; it now flips its
+  lowest bit, another value whatever the run's.

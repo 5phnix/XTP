@@ -228,9 +228,44 @@ impl Change {
 /// The changes the index file at `root` holds, in order (the snapshot's
 /// entries first); `None` without one, or for one that is damaged anywhere
 /// we can tell ([`INDEX_FILE`]: a torn or changed record, a snapshot cut
-/// short, another version): the cache then lists its folder instead.
+/// short, another version): the cache then lists its folder instead. The
+/// cache reads it with its mark ([`read_index_marked`]).
+#[cfg(test)]
 pub(super) fn read_index(root: &Path) -> Option<Vec<Change>> {
-    parse_index(&fs::read(root.join(INDEX_FILE)).ok()?)
+    read_index_marked(root).0
+}
+
+/// What the index file at a cache's root held when a listing or a read of
+/// it started: its size and the BLAKE3 of those bytes. A snapshot written
+/// after carries what other processes appended to that file since
+/// ([`write_index`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Mark {
+    len: usize,
+    hash: blake3::Hash,
+}
+
+impl Mark {
+    fn of(bytes: &[u8]) -> Mark {
+        Mark {
+            len: bytes.len(),
+            hash: blake3::hash(bytes),
+        }
+    }
+}
+
+/// The index file at `root` as it is now ([`Mark`]); `None` without one.
+pub(super) fn mark(root: &Path) -> Option<Mark> {
+    fs::read(root.join(INDEX_FILE)).ok().map(|b| Mark::of(&b))
+}
+
+/// [`read_index`], and the file it read ([`Mark`]: also for a damaged one,
+/// whose appends a snapshot carries all the same).
+pub(super) fn read_index_marked(root: &Path) -> (Option<Vec<Change>>, Option<Mark>) {
+    match fs::read(root.join(INDEX_FILE)) {
+        Ok(bytes) => (parse_index(&bytes), Some(Mark::of(&bytes))),
+        Err(_) => (None, None),
+    }
 }
 
 /// The records of an index file of this version or the one before (the
@@ -252,6 +287,11 @@ pub(super) fn records_of_any_version(bytes: &[u8]) -> Option<Vec<Change>> {
 
 /// [`read_index`] of the file's bytes.
 pub(super) fn parse_index(bytes: &[u8]) -> Option<Vec<Change>> {
+    parse_index_parts(bytes).map(|(_, changes)| changes)
+}
+
+/// [`parse_index`], and how many of the changes are the snapshot's.
+fn parse_index_parts(bytes: &[u8]) -> Option<(usize, Vec<Change>)> {
     let (records, torn) = bytes
         .strip_prefix(INDEX_MAGIC.as_slice())?
         .as_chunks::<RECORD>();
@@ -272,16 +312,22 @@ pub(super) fn parse_index(bytes: &[u8]) -> Option<Vec<Change>> {
         && !appended
             .iter()
             .any(|c| matches!(c, Change::Snapshot { .. }));
-    sound.then_some(changes)
+    sound.then_some((entries, changes))
 }
 
 /// Replaces the index file at `root` with one holding `entries` (published
-/// changes) after the snapshot's record: written beside it, then renamed
-/// over it.
+/// changes) after the snapshot's record, then the changes other processes
+/// appended to the file since `since` (the file as the listing or read
+/// that gave `entries` found it): written beside it, then renamed over it,
+/// with the file held against appends meanwhile ([`hold`]). Those changes
+/// are returned, for the caller's index. Before, an entry another process
+/// published while the listing ran was appended to the file the snapshot
+/// then replaced, and lost (Codex review of d286ffd, point 2).
 pub(super) fn write_index(
     root: &Path,
     entries: impl ExactSizeIterator<Item = Change>,
-) -> io::Result<()> {
+    since: Option<&Mark>,
+) -> io::Result<Vec<Change>> {
     let mut bytes = INDEX_MAGIC.to_vec();
     let count = Change::Snapshot {
         entries: entries.len() as u64,
@@ -289,11 +335,102 @@ pub(super) fn write_index(
     for change in std::iter::once(count).chain(entries) {
         bytes.extend_from_slice(&change.encode());
     }
+    let path = root.join(INDEX_FILE);
     let tmp = root.join(format!("{INDEX_FILE}.{}.tmp", std::process::id()));
+    let held = hold(&path)?;
+    let appended = held
+        .as_ref()
+        .map_or_else(Vec::new, |(_, now)| appended_since(now, since));
+    for change in &appended {
+        bytes.extend_from_slice(&change.encode());
+    }
     fs::write(&tmp, &bytes)?;
-    fs::rename(&tmp, root.join(INDEX_FILE)).inspect_err(|_| {
+    let renamed = retried(|| fs::rename(&tmp, &path)).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
-    })
+    });
+    drop(held);
+    renamed.map(|()| appended)
+}
+
+/// The changes appended to the index file `now` since `since`: the records
+/// after the bytes `since` marks if the file still begins with them; else
+/// (another process's snapshot replaced it, or there was none) those
+/// appended after its own snapshot. Up to the first that does not read.
+fn appended_since(now: &[u8], since: Option<&Mark>) -> Vec<Change> {
+    let after_mark = since.and_then(|m| {
+        let prefix = now.get(..m.len)?;
+        let aligned = m
+            .len
+            .checked_sub(INDEX_MAGIC.len())
+            .is_some_and(|n| n % RECORD == 0);
+        (aligned && blake3::hash(prefix) == m.hash).then(|| &now[m.len..])
+    });
+    let changes: Vec<Change> = match after_mark {
+        Some(tail) => tail
+            .as_chunks::<RECORD>()
+            .0
+            .iter()
+            .map_while(Change::decode)
+            .collect(),
+        None => match parse_index_parts(now) {
+            Some((entries, changes)) => changes[entries..].to_vec(),
+            None => Vec::new(),
+        },
+    };
+    changes
+        .into_iter()
+        .filter(|c| !matches!(c, Change::Snapshot { .. }))
+        .collect()
+}
+
+/// The index file at `path` held against appends while a snapshot replaces
+/// it (a handle that shares reading and deleting, not writing: an append
+/// opens the file to write, and holds it shared with no deleting, so
+/// neither starts while the other is under way), and its bytes; `None`
+/// without one. Waits for an append under way.
+fn hold(path: &Path) -> io::Result<Option<(File, Vec<u8>)>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+    }
+    match retried(|| options.open(path)) {
+        Ok(mut file) => {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(Some((file, bytes)))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 1;
+#[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 2;
+#[cfg(windows)]
+const FILE_SHARE_DELETE: u32 = 4;
+
+/// `op`, tried again for up to two seconds while the index file is in
+/// another process's hands (a sharing violation, or a rename over a file
+/// open without deleting shared).
+fn retried<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match op() {
+            Err(e)
+                if cfg!(windows)
+                    && matches!(e.raw_os_error(), Some(5 | 32 | 33))
+                    && std::time::Instant::now() < until =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            done => return done,
+        }
+    }
 }
 
 /// Appends changes to the index file at a cache's root, one record per
@@ -302,9 +439,10 @@ pub(super) fn write_index(
 /// that is there now, so what this one appends goes to the index the next
 /// open reads, not to the file the other replaced (Codex review of
 /// 12556d6, point 2: those records were lost, entries the index missed
-/// until the next [`super::Cache::reindex`]). An entry this process
-/// published before the other's snapshot and that the other did not know
-/// of is still missed until a listing; a budget is still each process's
+/// until the next [`super::Cache::reindex`]). One appended while the
+/// other's listing ran is carried by its snapshot ([`write_index`]), and a
+/// snapshot does not replace the file while a record goes in (each holds
+/// it shared without the other's access: [`hold`]). A budget is still each process's
 /// own (two may each find room for their entry): an open past the limit
 /// lists the folder before it evicts. A failed write leaves a record torn
 /// or missing: the next open sees damage, or misses an entry.
@@ -328,9 +466,16 @@ impl Journal {
         // Only to the file there is: a file made here would hold these
         // changes without the entries before them, and the next open would
         // trust it. Without one, the next open looks at every entry.
-        let written = fs::OpenOptions::new()
-            .append(true)
-            .open(&self.path)
+        let mut options = fs::OpenOptions::new();
+        options.append(true);
+        // Shared with no deleting: a snapshot does not replace the file
+        // while this record goes in ([`hold`]).
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        let written = retried(|| options.open(&self.path))
             .and_then(|mut file| file.write_all(&change.encode()));
         if let Err(e) = written {
             tracing::warn!(path = %self.path.display(), error = %e, "cache index not appended to; the next open may look at every entry");
