@@ -2575,7 +2575,7 @@ fn decoding(
 /// RGBA16F, the texels are decoded instead, once a frame ([`decode_now`]). Title memory does not have them: a
 /// copy filled from it is black. Leaves `placed` in the copy destination
 /// state and keeps its host copy from being filled from title memory again
-/// (`texture::host_written`). True if `placed` is such a texture.
+/// (`texture::gpu_write`). True if `placed` is such a texture.
 ///
 /// Ported from fxceless's VIctory fork (commit 4e17478: `alias_of` in
 /// `resource.rs`, `texture::alias`), reworked onto XTP's alias registry.
@@ -2611,7 +2611,7 @@ pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
     if decodes(r.desc.format, &from, &to) {
         let decoded = decode_now(host, placed, source as This, &from, &to);
         if decoded {
-            crate::texture::host_written(placed);
+            crate::texture::gpu_write(list, placed, true);
         }
         return decoded;
     }
@@ -2640,7 +2640,7 @@ pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
             unsafe { list.list.ResourceBarrier(&[barrier]) };
             before
         });
-    crate::texture::host_written(placed);
+    crate::texture::gpu_write(list, placed, true);
     if !first && before.is_none() {
         return true;
     }
