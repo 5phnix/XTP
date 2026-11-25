@@ -481,8 +481,8 @@ fn reads_past_the_view_or_its_element_read_zero() {
         for (index, off, want) in [
             (0, 0, [dword(0, 0), dword(0, 0), dword(0, 4)]),
             (3, 4, [dword(3, 4), dword(3, 4), dword(3, 8)]),
-            // The last dword of the last element: one dword fits, two not.
-            (3, 8, [dword(3, 8), 0, 0]),
+            // The last dword of the last element: only the first component fits.
+            (3, 8, [dword(3, 8), dword(3, 8), 0]),
             // Past the count: the buffer's next bytes are not read.
             (4, 0, [0, 0, 0]),
             // Past the element: not the next element's first dword.
