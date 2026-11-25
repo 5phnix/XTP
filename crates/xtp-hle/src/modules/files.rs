@@ -1692,7 +1692,7 @@ pub extern "C" fn _fsopen(path: *const c_char, mode: *const c_char, share: i32) 
 const INVALID_USER_BUFFER: u32 = 1784;
 const IO_PENDING: u32 = 997;
 
-/// Le statut du noyau reste associé à la garde de la source ou de la destination.
+/// The kernel status stays tied to the guard of the source or the destination.
 type PendingIo = (usize, Box<dyn Send>);
 static PENDING_IO: Mutex<Vec<PendingIo>> = Mutex::new(Vec::new());
 static IO_PENDING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
@@ -1729,8 +1729,8 @@ fn hold_until_done(overlapped: usize, buffer: impl Send + 'static) {
     IO_PENDING_CHANGED.notify_one();
 }
 
-/// Windows remplace STATUS_PENDING dans le premier champ de l'OVERLAPPED
-/// à la fin de l'E/S. Le titre peut ensuite libérer cette structure.
+/// Windows replaces STATUS_PENDING in the first field of the OVERLAPPED
+/// at the end of the I/O. The title may then free that structure.
 fn finish_overlapped_io() {
     const STATUS_PENDING: usize = 0x103;
     let mut pending = PENDING_IO.lock().unwrap_or_else(|e| e.into_inner());
@@ -1804,7 +1804,7 @@ pub extern "system" fn WriteFile(
     finish_overlapped_io();
     let pin = xtp_gpu::pin_title_read(buffer as usize, len as usize);
     let result = host(file, buffer, len, written, overlapped);
-    // SAFETY: sauvegarde de la dernière erreur sur le thread appelant.
+    // SAFETY: saves the last error on the calling thread.
     let error = unsafe { GetLastError() };
     if let Some(pin) = pin
         && result == 0
@@ -1813,7 +1813,7 @@ pub extern "system" fn WriteFile(
     {
         hold_until_done(overlapped as usize, pin);
     }
-    // SAFETY: le titre doit recevoir l'erreur de WriteFile.
+    // SAFETY: the title must receive the error from WriteFile.
     unsafe { SetLastError(error) };
     result
 }
