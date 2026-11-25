@@ -702,10 +702,56 @@ fn raw_scalar_offset_moves_the_base_for_load_store_and_atomic() {
     }
 }
 
+/// Root SRV at s[2:3], descriptor at s[8:11], base displaced by 12.
+fn rebuilt_program(
+    stride: u32,
+    records: u32,
+    word3: u32,
+    threads: u32,
+    access: &[u32],
+) -> NativeProgram {
+    let mut words = vec![
+        PROLOGUE[0],
+        PROLOGUE[1],
+        PROLOGUE[4],
+        PROLOGUE[5],
+        PROLOGUE[6],
+        0x8008_8c02, // s_add_u32 s8, s2, 12
+        0x8209_8003, // s_addc_u32 s9, s3, 0
+        0x8809_ff09,
+        stride << 16, // s_or_b32 s9, s9, stride bits
+        0xbe8a_03ff,
+        records,
+        0xbe8b_03ff,
+        word3,
+    ];
+    words.extend_from_slice(access);
+    let mut p = program(&[], Kind::Raw, false);
+    p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    p.layout.push(RootParam {
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        sgprs: 2,
+        base_register: 0,
+        user_data: 2,
+        slot: 1,
+    });
+    p.used[0] = UsedResource {
+        root: RootType::Descriptor,
+        user_data: 2,
+        slot: 1,
+        ..entry(ResourceType::Srv, 0, 0)
+    };
+    if let StageIo::Cs(io) = &mut p.io {
+        io.rsrc2 = 4 << 1;
+        io.threads = [threads, 1, 1];
+    }
+    p
+}
+
 #[test]
 fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
     let (_one, hosts) = hosts();
-    // Root SRV at s[2:3], descriptor at s[8:11], base displaced by 12.
     // The used-resource stride is deliberately absent: word 1 supplies it.
     for (oob, records, index, within, scalar, want) in [
         (0, 2, 0, 0, 0, Some(3)),
@@ -720,45 +766,15 @@ fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
         (3, 16, 0, 4, 12, None),
         (3, 14, 0, 0, 12, None),
     ] {
-        let mut words = vec![
-            PROLOGUE[0],
-            PROLOGUE[1],
-            PROLOGUE[4],
-            PROLOGUE[5],
-            PROLOGUE[6],
-            0x8008_8c02, // s_add_u32 s8, s2, 12
-            0x8209_8003, // s_addc_u32 s9, s3, 0
-            0x8809_ff09,
-            12 << 16, // s_or_b32 s9, s9, stride bits
-            0xbe8a_0380 + records,
-            0xbe8b_03ff,
-            0x0101_4fac | (oob << 28),
+        let mut access = vec![
             0x7e02_0280, // v1 = 0
             0x7e06_0280 + index,
             0xbe94_0380 + scalar,
             0xe030_2000 + within,
             0x1402_0203,
         ];
-        words.extend(EPILOGUE);
-        let mut p = program(&[], Kind::Raw, false);
-        p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        p.layout.push(RootParam {
-            root: RootType::Descriptor,
-            table_offset_dwords: 0,
-            sgprs: 2,
-            base_register: 0,
-            user_data: 2,
-            slot: 1,
-        });
-        p.used[0] = UsedResource {
-            root: RootType::Descriptor,
-            user_data: 2,
-            slot: 1,
-            ..entry(ResourceType::Srv, 0, 0)
-        };
-        if let StageIo::Cs(io) = &mut p.io {
-            io.rsrc2 = 4 << 1;
-        }
+        access.extend(EPILOGUE);
+        let p = rebuilt_program(12, records, 0x0101_4fac | (oob << 28), 1, &access);
         for mode in [Mode::Raw, Mode::Table] {
             let cs = translate(&p, mode).unwrap();
             assert_eq!(cs.root_srvs, [1]);
@@ -769,6 +785,46 @@ fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
                     want.map_or(0, |i| data()[i]),
                     "OOB_SELECT={oob} count={records} index={index} offset={within} scalar={scalar} {mode:?} on {name}"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_add_tid_indexes_by_console_lane_with_and_without_idxen() {
+    let (_one, hosts) = hosts();
+    let source = data();
+    for wave in [32, 64] {
+        for (idxen, add_tid) in [(false, false), (false, true), (true, true)] {
+            let access = [
+                0x7e06_0282, // v3 = 2 (used only with IDXEN)
+                0xe030_0000 | (u32::from(idxen) << 13),
+                0x8002_0203,
+                0xbf8c_3f70,
+                0x3408_0082, // v4 = group thread x * 4
+                0xe070_1000,
+                0x8004_0204, // output[v4] = v2, OFFEN
+                0xbf81_0000,
+            ];
+            let word3 = 0x0101_4fac | (u32::from(add_tid) << 23);
+            let mut p = rebuilt_program(4, 40, word3, 96, &access);
+            p.wave64 = wave == 64;
+            let want: Vec<_> = (0..96)
+                .map(|x| {
+                    let lane = if add_tid { x % wave } else { 0 };
+                    let index = lane + usize::from(idxen) * 2;
+                    if index < 40 { source[3 + index] } else { 0 }
+                })
+                .collect();
+            for mode in [Mode::Raw, Mode::Table] {
+                let cs = translate(&p, mode).unwrap();
+                for (name, host) in &hosts {
+                    let out = run(host, &cs, Kind::Raw, false, mode, 96);
+                    assert_eq!(
+                        out[0], want,
+                        "wave{wave} idxen={idxen} ADD_TID_ENABLE={add_tid} {mode:?} on {name}"
+                    );
+                }
             }
         }
     }

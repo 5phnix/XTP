@@ -18,6 +18,7 @@ use crate::resource::{CODE, Source};
 pub(super) struct BufferDescriptor {
     pub stride: u32,
     pub swizzle_enable: bool,
+    pub add_tid_enable: bool,
     pub dst_sel: [u8; 4],
     pub format: u8,
     /// Number of contiguous indices (8, 16, 32 or 64).
@@ -38,6 +39,7 @@ impl BufferDescriptor {
         Self {
             stride: (word1 >> 16) & 0x3fff,
             swizzle_enable: word1 & (1 << 31) != 0,
+            add_tid_enable: word3 & (1 << 23) != 0,
             dst_sel: std::array::from_fn(|k| ((word3 >> (3 * k)) & 7) as u8),
             format: ((word3 >> 12) & 0x7f) as u8,
             index_stride: 8 << ((word3 >> 21) & 3),
@@ -343,10 +345,22 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
-        let built = matches!(src, Source::Built { .. }) && crate::emit::raw_structured();
+        let built = match src {
+            Source::Built { bits, words, .. } => {
+                Some((BufferDescriptor::decode(*bits, words[1]), words[0]))
+            }
+            _ => None,
+        };
+        let add_tid = built.is_some_and(|(d, _)| d.add_tid_enable);
+        let index = if add_tid {
+            let lane = self.buffer_lane();
+            Some(index.map_or(lane, |i| self.s.m.bin(c, Bin::Add, i, lane)))
+        } else {
+            index
+        };
         let raw = !typed
             && !used.is_some_and(|r| r.kind == ResourceType::Cbv)
-            && (built
+            && (built.is_some() && (crate::emit::raw_structured() || add_tid)
                 || self.through_table(index, used, src)?
                 || (index.is_some() && crate::emit::raw_structured()));
         let mut within = self.s.m.i32(u32::from(*offset));
@@ -401,8 +415,12 @@ impl<'a> Lower<'a> {
                 let c = l.cur;
                 let byte = match index {
                     Some(i) => {
-                        let sixteen = l.s.m.i32(16);
-                        let rows = l.s.m.bin(c, Bin::Mul, i, sixteen);
+                        let stride = l.s.m.i32(
+                            built
+                                .filter(|(d, _)| d.add_tid_enable)
+                                .map_or(16, |(d, _)| d.stride),
+                        );
+                        let rows = l.s.m.bin(c, Bin::Mul, i, stride);
                         l.s.m.bin(c, Bin::Add, rows, off)
                     }
                     None => off,
@@ -424,9 +442,8 @@ impl<'a> Lower<'a> {
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         let raw_view = |l: &mut Self| -> Result<RawView, Why> {
-            Ok(match src {
-                Source::Built { bits, words, .. } => {
-                    let desc = BufferDescriptor::decode(*bits, words[1]);
+            Ok(match built {
+                Some((desc, records)) => {
                     if desc.swizzle_enable {
                         return Err("a swizzled raw buffer descriptor");
                     }
@@ -434,7 +451,7 @@ impl<'a> Lower<'a> {
                     RawView::Built {
                         handle,
                         stride: desc.stride,
-                        records: words[0],
+                        records,
                         mode: desc.oob_select,
                     }
                 }
@@ -699,6 +716,33 @@ impl<'a> Lower<'a> {
             0 if self.x.target.stride_table => Ok(true),
             _ => Err(UNKNOWN_STRIDE),
         }
+    }
+
+    /// GFX10 ADD_TID_ENABLE uses the lane within the console wave. For
+    /// compute, derive it from the same group numbering as the thread ID,
+    /// including both halves of a wave64 on a narrower host.
+    fn buffer_lane(&mut self) -> V {
+        let mask = self.s.m.i32(self.wave() - 1);
+        let flat = if self.s.mesh.is_some() {
+            self.mesh_thread()
+        } else if self.s.threads.is_some() {
+            if self.console_lanes {
+                self.console_flat()
+            } else {
+                self.s.op(
+                    self.s.entry,
+                    "flattenedThreadIdInGroup.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    96,
+                    &[],
+                )
+            }
+        } else {
+            self.s.flags |= flags::WAVE_OPS;
+            self.lane_index()
+        };
+        self.s.m.bin(self.cur, Bin::And, flat, mask)
     }
 
     /// MUBUF checks DWORDX2/3/4 one component at a time (ISA section 8.1.5).
@@ -1160,6 +1204,7 @@ mod descriptor_tests {
                 BufferDescriptor {
                     stride: 12,
                     swizzle_enable: true,
+                    add_tid_enable: true,
                     dst_sel: [4, 5, 6, 7],
                     format: 0x52,
                     index_stride: 8 << k,
@@ -1168,5 +1213,6 @@ mod descriptor_tests {
             );
         }
         assert!(!BufferDescriptor::decode(1 << 30, u32::MAX).swizzle_enable);
+        assert!(!BufferDescriptor::decode(u32::MAX, !(1 << 23)).add_tid_enable);
     }
 }
