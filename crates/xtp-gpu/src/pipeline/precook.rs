@@ -212,6 +212,9 @@ pub struct Recorded {
     pub damaged: usize,
     pub missing: usize,
     pub repeated: usize,
+    /// Of those made again, the pipelines a session drew with (the early
+    /// list's): they come first.
+    pub drawn: usize,
     /// The file's size, and where it is (none without a pipeline cache).
     pub bytes: u64,
     pub path: Option<std::path::PathBuf>,
@@ -282,6 +285,7 @@ impl Recorded {
             damaged: 0,
             missing: 0,
             repeated: 0,
+            drawn: 0,
             bytes: 0,
             path: None,
             digest: "none".into(),
@@ -294,7 +298,9 @@ impl Recorded {
 
 /// [`recorded`] of the file in `dir`, rewritten first down to `to` bytes
 /// if it is larger than `at` (or started again if it is of an earlier
-/// version), unless another process has it open.
+/// version), unless another process has it open. The pipelines a session
+/// drew with come first: a session keeps every pipeline the title creates
+/// (some 80,000), and draws with a few thousand of them.
 fn recorded_in(dir: &std::path::Path, at: u64, to: u64) -> Result<Recorded, String> {
     let mut out = Recorded::none();
     let mut file = super::record::read(dir)?;
@@ -330,6 +336,7 @@ fn recorded_in(dir: &std::path::Path, at: u64, to: u64) -> Result<Recorded, Stri
     out.digest = file.digest.clone();
     out.damaged = file.damaged;
     let mut seen = HashSet::new();
+    let mut others = Vec::new();
     for kept in &file.pipelines {
         out.shader_sets
             .insert(shader_set(kept.shaders.iter().map(|(_, hash)| hash)));
@@ -346,12 +353,19 @@ fn recorded_in(dir: &std::path::Path, at: u64, to: u64) -> Result<Recorded, Stri
             out.missing += 1;
             continue;
         };
-        if !seen.insert(super::make::key(&shaders, Some(&state))) {
+        let key = super::make::key(&shaders, Some(&state));
+        if !seen.insert(key.clone()) {
             out.repeated += 1;
             continue;
         }
-        out.pipelines.push(Description { shaders, state });
+        if super::library::wanted_early(&key) {
+            out.pipelines.push(Description { shaders, state });
+        } else {
+            others.push(Description { shaders, state });
+        }
     }
+    out.drawn = out.pipelines.len();
+    out.pipelines.extend(others);
     Ok(out)
 }
 
@@ -525,6 +539,32 @@ pub(in crate::pipeline) mod tests {
         assert_eq!((r.compacted, r.len()), (Some((before, 0)), 1));
         let r = recorded_in(dir.path(), 0, 0).unwrap();
         assert_eq!((r.compacted, r.len()), (Some((before, 1)), 0));
+    }
+
+    /// A pipeline a session drew with (the early list's) is made first,
+    /// whatever its place in the file.
+    #[test]
+    fn pipelines_a_session_drew_with_come_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = |pixel: &[u8]| {
+            let shaders = vec![
+                super::super::shader("vertex", b"precook drawn: vertex"),
+                super::super::shader("pixel", pixel),
+            ];
+            let stream = super::super::record::stream_of(&[(14, words(&[3]))]);
+            assert!(super::super::record::keep_in(dir.path(), &shaders, &stream));
+            super::super::make::key(&shaders, stream.state().as_ref())
+        };
+        let first = keep(b"precook drawn: never drawn");
+        let drawn = keep(b"precook drawn: drawn");
+        super::super::library::note_used(&drawn);
+        let r = recorded_in(dir.path(), u64::MAX, u64::MAX).unwrap();
+        let keys: Vec<String> = r
+            .pipelines
+            .iter()
+            .map(|d| super::super::make::key(&d.shaders, Some(&d.state)))
+            .collect();
+        assert_eq!((r.drawn, keys), (1, vec![drawn, first]));
     }
 
     /// The descriptions made again are those of the file as read: its

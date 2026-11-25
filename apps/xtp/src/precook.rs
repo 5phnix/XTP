@@ -610,8 +610,10 @@ fn replay_bound() -> Duration {
 /// What became of the graphics and mesh pipelines sessions kept.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Replay {
-    /// The kept pipelines to make (each once).
+    /// The kept pipelines to make (each once), and of them those a session
+    /// drew with (made first).
     kept: usize,
+    drawn: usize,
     ready: usize,
     untranslated: usize,
     refused: usize,
@@ -801,6 +803,7 @@ fn replay(threads: usize, machine: Option<&Machine>, bound: Duration) -> Replay 
     out.damaged = recorded.damaged;
     out.missing = recorded.missing;
     out.repeated = recorded.repeated;
+    out.drawn = recorded.drawn;
     out.path = recorded.path.clone();
     out.compacted = recorded.compacted;
     out.earlier = recorded.earlier;
@@ -1064,9 +1067,10 @@ fn replay_lines(r: &Replay) -> String {
     }
     let _ = writeln!(
         o,
-        "graphics     {} kept pipelines: {} ready ({} host pipelines made, {} from the library), \
-         {} with shaders that do not translate, {} refused, in {:.1} s",
-        r.kept, r.ready, r.made, r.loaded, r.untranslated, r.refused, r.seconds
+        "graphics     {} kept pipelines ({} drawn by sessions, made first): {} ready ({} host \
+         pipelines made, {} from the library), {} with shaders that do not translate, {} \
+         refused, in {:.1} s",
+        r.kept, r.drawn, r.ready, r.made, r.loaded, r.untranslated, r.refused, r.seconds
     );
     if r.panicked > 0 {
         let _ = writeln!(o, "  {:>7}  panicked (translator bugs)", r.panicked);
