@@ -273,7 +273,13 @@ pub(crate) fn splice(mut p: Program, site: &Site) -> Result<Program, Why> {
         .iter()
         .zip(&walk)
         .any(|(b, &w)| !w && b.insts.iter().any(lds));
-    for i in p.blocks.iter().zip(&walk).filter(|w| *w.1).flat_map(|w| &w.0.insts) {
+    for i in p
+        .blocks
+        .iter()
+        .zip(&walk)
+        .filter(|w| *w.1)
+        .flat_map(|w| &w.0.insts)
+    {
         let name = i.name();
         let control = name.starts_with("s_cbranch") || name == "s_branch";
         let local = matches!(i.fields, Fields::Ds { gds: false, .. }) && !lds_outside;
@@ -333,7 +339,8 @@ pub(crate) fn splice(mut p: Program, site: &Site) -> Result<Program, Why> {
             todo.extend(p.blocks[b].exit.successors());
         }
     }
-    let leaves = (0..p.blocks.len()).any(|b| walked[b] && p.blocks[b].exit.successors().contains(&exit));
+    let leaves =
+        (0..p.blocks.len()).any(|b| walked[b] && p.blocks[b].exit.successors().contains(&exit));
     if !leaves {
         return Err("a ray-tracing walk whose header never reaches its exit");
     }
