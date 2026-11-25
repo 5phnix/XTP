@@ -242,12 +242,16 @@ fn clip_distances_sharing_a_sort_key_validate_in_large_signatures() {
         for rotation in 0..outputs.len() {
             let vs = vertex(outputs.clone());
             if count == 32 && matches!(rotation, 15 | 16) {
-                let clips: Vec<_> = rows_of(&vs, FourCC::OSG1)
-                    .into_iter()
-                    .filter(|(name, ..)| name == "SV_ClipDistance")
-                    .map(|(_, index, ..)| index)
-                    .collect();
-                assert_eq!(clips, if rotation == 15 { [0, 1] } else { [1, 0] });
+                let ps = pixel(outputs.clone(), &[]);
+                for (blob, part) in [(&vs, FourCC::OSG1), (&ps, FourCC::ISG1)] {
+                    let clips: Vec<_> = rows_of(blob, part)
+                        .into_iter()
+                        .filter(|(name, ..)| name == "SV_ClipDistance")
+                        .map(|(_, index, ..)| index)
+                        .collect();
+                    assert_eq!(clips, if rotation == 15 { [0, 1] } else { [1, 0] });
+                }
+                validates(&format!("ISG1, 35 entrées, rotation {rotation}"), &ps);
             }
             validates(
                 &format!("OSG1, {} sorties, rotation {rotation}", outputs.len()),
@@ -255,6 +259,58 @@ fn clip_distances_sharing_a_sort_key_validate_in_large_signatures() {
             );
             outputs.rotate_left(1);
         }
+    }
+}
+
+#[test]
+fn mesh_primitive_rows_with_equal_keys_follow_the_validator_order() {
+    let mesh = |prims: Vec<SigElement>| {
+        let mut s = Shader::new(false);
+        s.mesh = Some(super::shader::Mesh {
+            max_vertices: 3,
+            max_primitives: 1,
+            topology: 2,
+        });
+        s.threads = Some([1, 1, 1]);
+        s.prims = prims;
+        let zero = s.m.i32(0);
+        s.op(
+            s.entry,
+            "setMeshOutputCounts",
+            Attr::NoUnwind,
+            s.t.void,
+            168,
+            &[zero, zero],
+        );
+        s.m.terminate(s.entry, Term::Ret);
+        s.finish()
+    };
+    let mut prims: Vec<_> = (0..33u32)
+        .map(|i| el("TEXCOORD", i, 0, 5, 1, Some(i / 2), (i % 2) as u8, 1))
+        .collect();
+    prims.push(el("SV_PrimitiveID", 0, 10, 5, 1, Some(17), 0, 1));
+    validates("PSG1, un identifiant de primitive", &mesh(prims.clone()));
+
+    // Une deuxième occurrence crée une égalité de clés dans PSG1. DXIL
+    // limite SV_PrimitiveID à une occurrence, même si ses lignes sont bien triées.
+    prims.push(el("SV_PrimitiveID", 1, 10, 5, 1, Some(17), 1, 1));
+    prims.rotate_left(15);
+    for expected in [[0, 1], [1, 0]] {
+        let ms = mesh(prims.clone());
+        let ids: Vec<_> = rows_of(&ms, FourCC::PSG1)
+            .into_iter()
+            .filter(|(name, ..)| name == "SV_PrimitiveID")
+            .map(|(_, index, ..)| index)
+            .collect();
+        assert_eq!(ids, expected);
+        if let Some(r) = verdict("PSG1, deux identifiants de primitive", &ms) {
+            let diagnostic = r.expect_err("SV_PrimitiveID répété");
+            assert!(
+                diagnostic.contains("appears more than once"),
+                "{diagnostic}"
+            );
+        }
+        prims.rotate_left(1);
     }
 }
 

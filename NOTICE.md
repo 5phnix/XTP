@@ -31,6 +31,14 @@ Choix du registre statique adapté de MartinIndra02 dans fxceless/victory-fork#2
 (`cb80bf0`). Dessin de vérification adapté de JRamos1993 dans le même fork,
 #718 (`77f83f9`). Ces deux contributions sont sous GPL-3.0.
 
+## Tri des signatures DXIL
+
+`sort_signature_rows` adapte en Rust le `std::sort` de la STL Microsoft pour
+reproduire l’ordre des éléments de même clé dans les signatures DXIL.
+Copyright (c) Microsoft Corporation.
+[Code source](https://github.com/microsoft/STL/blob/vs-2022-17.14/stl/inc/algorithm)
+· [Licence Apache-2.0 WITH LLVM-exception](LICENSES/Microsoft-STL.txt).
+
 ## References that are not copied
 
 The following projects are studied as references only. **No code is copied
