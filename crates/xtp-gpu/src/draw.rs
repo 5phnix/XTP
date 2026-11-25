@@ -2682,6 +2682,23 @@ void main(uint3 id : SV_DispatchThreadID) {
             want[8 * l] = 101 + 4 * l as u32;
             want[8 * l + 4] = 201 + 4 * l as u32;
         }
+        // A pass makes waiting views for 8 ms and leaves the rest to the
+        // next frames' passes (`picked_spans`): on a loaded machine one pass
+        // may not make all four (xtp-farm-2 at 2a63867 made those of slots 0
+        // to 2, and group 1 read zeros). So passes go on, as the first lists
+        // of the frames that follow make them, until none waits: one view a
+        // pass at least, four passes at most. Then the dispatch runs in the
+        // first list of a frame of its own, which brings their memory up to
+        // date.
+        let views = title.host().unwrap();
+        let mut passes = 0;
+        while views.waiting() > 0 {
+            passes += 1;
+            assert!(passes <= 4, "each pass makes one waiting view at least");
+            views.forget_picked_pass();
+            run(true);
+        }
+        views.forget_picked_pass();
         assert_eq!(run(true), want);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());

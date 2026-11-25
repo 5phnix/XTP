@@ -2220,7 +2220,10 @@ mod tests {
         assert_ne!(CreateDirectoryW(first.as_ptr(), null), 0);
         assert_ne!(CreateDirectoryW(w(&deep).as_ptr(), null), 0);
         let file = format!("{deep}/../{}/f.txt", "b".repeat(100));
-        let f = _wfopen(w(&file).as_ptr(), w("wb").as_ptr());
+        // `N`: a child of another test holding the file (see
+        // `writes_renames_and_deletes_leave_the_package_byte_identical`)
+        // would fail its delete.
+        let f = _wfopen(w(&file).as_ptr(), w("wbN").as_ptr());
         assert!(!f.is_null(), "{file}");
         host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
         assert_ne!(DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()), 0);
@@ -2250,8 +2253,11 @@ mod tests {
         close(h);
         assert!(dir.path().join("created.bin").is_file());
 
-        let path = format!("{letter}:/opened.txt\0");
-        let f = fopen(path.as_ptr().cast(), c"wb".as_ptr());
+        // `N`: a child of another test holding the file (see
+        // `writes_renames_and_deletes_leave_the_package_byte_identical`)
+        // would fail its `remove` below.
+        let opened = format!("{letter}:/opened.txt\0");
+        let f = fopen(opened.as_ptr().cast(), c"wbN".as_ptr());
         assert!(!f.is_null());
         fclose(f);
         assert!(dir.path().join("opened.txt").is_file());
@@ -2263,8 +2269,10 @@ mod tests {
         fclose(f);
         assert!(dir.path().join("stream.txt").is_file());
 
-        assert_eq!(remove(path.as_ptr().cast()), 0);
-        assert!(!dir.path().join("stream.txt").exists());
+        // The file `fopen` made, not the stream's: a stream's open mode
+        // cannot ask for `N`, so a child may hold that one.
+        assert_eq!(remove(opened.as_ptr().cast()), 0);
+        assert!(!dir.path().join("opened.txt").exists());
         let f = fiopen_wide(w(&format!("{letter}:/wide.txt")).as_ptr(), OUT, 0x40);
         assert!(!f.is_null());
         fclose(f);
@@ -2635,7 +2643,11 @@ mod tests {
         assert_eq!(tr(r"GAME:\readme.txt"), Some(lower.clone()));
         assert_eq!(tr("game:/readme.txt"), Some(lower));
 
-        let f = _wfopen(w(r"GAME:\readme.txt").as_ptr(), w("a").as_ptr());
+        // `N`, or a child another test starts while the copy is open keeps
+        // it open with write access, and the read below, which shares only
+        // reading, fails with ERROR_SHARING_VIOLATION (xtp-farm-3 at
+        // 2a63867; see `writes_renames_and_deletes_leave_the_package_byte_identical`).
+        let f = _wfopen(w(r"GAME:\readme.txt").as_ptr(), w("aN").as_ptr());
         assert!(!f.is_null());
         let fwrite =
             host!("ucrtbase.dll", "fwrite": extern "C" fn(*const u8, usize, usize, File) -> usize);
