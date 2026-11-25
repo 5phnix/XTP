@@ -1,4 +1,4 @@
-//! Tables synthÃ©tiques de paramÃ¨tres dÃ©portÃ©s. Cas de rÃ©Ã©criture des registres :
+//! Tables synthétiques de paramètres déportés. Cas de réécriture des registres :
 //! Ported from Marvisak/VIctory#489 (head fe7210e) by louketa.
 
 use super::{HostShader, translate_program};
@@ -299,7 +299,7 @@ fn root_uav_program(words: &[u32], threads: [u32; 3], wave64: bool) -> NativePro
 }
 
 /// Ported from fxceless's VIctory fork #646 (head 170c24269) by mynzjerko.
-/// Une barriÃ¨re sÃ©pare le comptage d'EXEC de l'Ã©criture dans la vue racine.
+/// Une barrière sépare le comptage d'EXEC de l'écriture dans la vue racine.
 #[cfg(windows)]
 #[test]
 fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
@@ -308,11 +308,11 @@ fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
         PTR.as_slice(),
         &[
             0xF404_0201,
-            0xFA00_0000, // s[8:9] reÃ§oit l'adresse de l'UAV.
+            0xFA00_0000, // s[8:9] reçoit l'adresse de l'UAV.
             0xBE8A_03C1,
             0xBE8B_03FF,
             0x3101_4FAC,
-            0xBE86_107E, // s6 reÃ§oit la population d'EXEC.
+            0xBE86_107E, // s6 reçoit la population d'EXEC.
             0xBF8A_0000,
             0x3402_0082,
             0x7E04_0206,

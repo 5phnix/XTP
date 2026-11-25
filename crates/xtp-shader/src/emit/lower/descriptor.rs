@@ -183,7 +183,7 @@ impl<'a> Lower<'a> {
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
                 // Portage de VIctory #1477, commit 2286e038, par geiyiliyabumo.
-                // Le filtre de chaque registre statique est fixÃ© dÃ¨s le premier accÃ¨s.
+                // Le filtre de chaque registre statique est fixé dès le premier accès.
                 let comparison = props.0 & 0x8000 != 0;
                 let slot = self.samplers.iter().enumerate().position(|(n, w)| {
                     *w == words && (self.s.cmp_samplers >> n & 1 != 0) == comparison

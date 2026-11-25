@@ -330,6 +330,10 @@ pub const RUN_TIME_WRITES: u8 = 2;
 pub const ROOT_UAV_BIAS: RootType = RootType::Other(0x103);
 /// Limite de chaque axe d'un DispatchX exprimé en threads, zéro pour un axe entier.
 pub const DISPATCH_THREADS: RootType = RootType::Other(0x104);
+/// Indices de SRV calculés à partir des constantes racine du dispatch.
+pub const PACKED_ADDRESS_SRV: RootType = RootType::Other(0x105);
+pub const SCALAR_ADDRESS_SRV: RootType = RootType::Other(0x106);
+pub const VECTOR_ADDRESS_SRV: RootType = RootType::Other(0x107);
 
 impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a

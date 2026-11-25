@@ -1964,7 +1964,7 @@ mod tests {
         // SAFETY: sous-objet complet, dans la disposition du flux du titre.
         unsafe { g.read(21, (&raw const sub).cast()) };
         let mut depth: Option<ID3D12Resource> = None;
-        // SAFETY: description d'une texture de quatre pixels, sans donnÃ©es initiales.
+        // SAFETY: description d'une texture de quatre pixels, sans données initiales.
         unsafe {
             host.device.CreateCommittedResource(
                 &D3D12_HEAP_PROPERTIES {
@@ -1993,7 +1993,7 @@ mod tests {
         let bytes = render_r8_uint(host, g, 4, |list, rtv| {
             let dsv = host.dsv(&depth, None);
             let l = &list.host().list;
-            // SAFETY: les vues et leurs ressources restent vivantes jusqu'Ã  la lecture.
+            // SAFETY: les vues et leurs ressources restent vivantes jusqu'à la lecture.
             unsafe {
                 for (x, z) in [0.125, 0.25, 0.75, 0.875].into_iter().enumerate() {
                     let pixel = RECT {

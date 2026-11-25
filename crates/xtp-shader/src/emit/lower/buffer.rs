@@ -1024,7 +1024,21 @@ impl<'a> Lower<'a> {
         );
     }
 
-    fn raw_dword(&mut self, h: V, byte: V) -> V {
+    pub(super) fn constant_read_handle(
+        &mut self,
+        read: crate::resource::ConstantRead,
+        scalar: bool,
+    ) -> V {
+        let kind = match (read.packed, scalar) {
+            (true, _) => crate::emit::PACKED_ADDRESS_SRV,
+            (false, true) => crate::emit::SCALAR_ADDRESS_SRV,
+            (false, false) => crate::emit::VECTOR_ADDRESS_SRV,
+        };
+        let index = self.host_word(kind, read.slot, read.dword);
+        self.s.heap_handle(self.cur, index, false, false, (11, 0))
+    }
+
+    pub(super) fn raw_dword(&mut self, h: V, byte: V) -> V {
         let undef = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(1);
         let align = self.s.m.i32(4);
@@ -1148,14 +1162,23 @@ impl<'a> Lower<'a> {
             "sshort" => (1, Some((16, true))),
             _ => return Err(name),
         };
-        let a = *self
-            .scalar
-            .get(&(b, i))
-            .ok_or("an untracked global address")?;
         let guard = self.effect_guard(b, i)?;
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
+        if let Some(&read) = self.x.res.constant_reads.get(&(b, i)) {
+            let h = self.constant_read_handle(read, false);
+            for k in 0..n {
+                let at = self.s.m.i32(read.offset + 4 * k);
+                let x = self.raw_dword(h, at);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
+        let a = *self
+            .scalar
+            .get(&(b, i))
+            .ok_or("an untracked global address")?;
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
         if let Some(d) = a.dynamic {

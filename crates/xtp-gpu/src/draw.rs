@@ -945,8 +945,18 @@ impl State {
         // set after them.
         let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
         let root_uavs = p.stages.iter().any(|s| !s.root_uavs.is_empty());
-        let wanted =
-            self.wanted_heaps(root_uavs || root_srvs && crate::pipeline::host::bounded_root_srvs());
+        use xtp_shader::emit::{PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV};
+        let constant_reads = p.stages.iter().any(|s| {
+            s.translated().host.user_data.iter().any(|u| {
+                matches!(
+                    u.root,
+                    PACKED_ADDRESS_SRV | SCALAR_ADDRESS_SRV | VECTOR_ADDRESS_SRV
+                )
+            })
+        });
+        let wanted = self.wanted_heaps(
+            constant_reads || root_uavs || root_srvs && crate::pipeline::host::bounded_root_srvs(),
+        );
         self.set_host_heaps(list, wanted);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -1031,6 +1041,30 @@ impl State {
                             .find(|b| b.0 == u.slot)
                             .ok_or("missing root UAV bias")?
                             .1;
+                        continue;
+                    }
+                    if matches!(
+                        u.root,
+                        PACKED_ADDRESS_SRV | SCALAR_ADDRESS_SRV | VECTOR_ADDRESS_SRV
+                    ) {
+                        let words = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                            Some(Root::Constants(words)) => words.as_slice(),
+                            _ => &[],
+                        };
+                        let dword = u.dword as usize;
+                        let address = words.get(dword).and_then(|&lo| match u.root {
+                            PACKED_ADDRESS_SRV => Some(u64::from(lo) << 8),
+                            _ => words.get(dword + 1).map(|&hi| {
+                                (u64::from(hi) << 32)
+                                    | u64::from(if u.root == SCALAR_ADDRESS_SRV {
+                                        lo & !3
+                                    } else {
+                                        lo
+                                    })
+                            }),
+                        });
+                        values[u.index as usize] =
+                            self.root_srv_slot(list, address.filter(|&a| a != 0))?.1;
                         continue;
                     }
                     values[u.index as usize] = match fresh {
