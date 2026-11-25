@@ -383,6 +383,8 @@ uint vertex_id(uint at, uint base) {
     uint pos = index_bias + at * index_bytes;
     uint word = indices[pos >> 2u];
     uint index = index_bytes == 4u ? word : (word >> ((pos & 2u) * 8u)) & 0xffffu;
+    // Les listes de rectangles du titre utilisent la coupure désactivée.
+    // Tous les indices participent au triplet, y compris ceux à bits tous à un.
     uint id = index + base;
     if (asint(base) >= 0 && id < index) return 0xffffffffu;
     return id;
@@ -2012,7 +2014,14 @@ mod tests {
             .collect();
         primitive::expand_rects(&triplet, &mut expected, STRIDE, &elements);
         for (format, bytes) in [(57, 2usize), (42, 4)] {
-            let raw: Vec<u8> = [99u32, 99, 3, 1, 2]
+            // R16 : 0xffff devient le sommet 2 après application de la base.
+            // R32 : le triplet hors limites reste dégénéré, le suivant reste aligné.
+            let (raw_indices, base) = if bytes == 2 {
+                ([99u32, 99, 9, 0, 0, 0xffff, 0xfffd, 0xfffe], -65533i32)
+            } else {
+                ([99u32, 99, 1, u32::MAX, 2, 3, 1, 2], -1i32)
+            };
+            let raw: Vec<u8> = raw_indices
                 .into_iter()
                 .flat_map(|i| i.to_le_bytes().into_iter().take(bytes))
                 .collect();
@@ -2022,7 +2031,7 @@ mod tests {
                 size: (raw.len() - bytes) as u32,
                 format,
             };
-            let record = [3u32, 2, 1, (-1i32) as u32, 7];
+            let record = [6u32, 2, 1, base as u32, 7];
             let words: Vec<u8> = record.iter().flat_map(|w| w.to_le_bytes()).collect();
             let (args, shadow) = title_bytes(256, &words);
             let records = if bytes == 2 {
@@ -2044,9 +2053,11 @@ mod tests {
                 &mut Default::default(),
             )
             .expect("expanded");
-            let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
-            assert_eq!(left.records, [[6, 2, 0, 7]]);
-            assert_eq!(left.vertices.unwrap()[0], expected);
+            let left = run_and_read(&list, &mut held, 1, &[(0, 12 * STRIDE)]);
+            assert_eq!(left.records, [[12, 2, 0, 7]]);
+            let expanded = left.vertices.unwrap();
+            assert_eq!(expanded[0][..6 * STRIDE], vec![0; 6 * STRIDE]);
+            assert_eq!(expanded[0][6 * STRIDE..], expected);
             done(&mut held);
         }
         host.drain();
