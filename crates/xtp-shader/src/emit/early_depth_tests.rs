@@ -1,8 +1,15 @@
 use crate::dxbc::{self, Container, FourCC};
+use crate::emit::container::{SigElement, signature};
 use crate::emit::{HostShader, translate_program};
 use crate::native::{HwStage, NativeProgram, StageIo};
 
 fn pixel(db_shader_control: u32) -> HostShader {
+    let words = [
+        0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+        0xF800_180F,
+        0,           // exp mrt0, v0, v0, v0, v0 done vm
+        0xBF81_0000, // s_endpgm
+    ];
     let native = NativeProgram {
         stage: HwStage::Ps,
         wave64: false,
@@ -17,9 +24,21 @@ fn pixel(db_shader_control: u32) -> HostShader {
             db_shader_control,
             patches: vec![],
         },
-        code: 0xBF81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let bytes = dxbc::build(&[]);
+    let target = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    };
+    let bytes = dxbc::build(&[(FourCC::OSG1, &signature(&[target], false))]);
     translate_program(&Container::parse(&bytes).unwrap(), &native).unwrap()
 }
 
