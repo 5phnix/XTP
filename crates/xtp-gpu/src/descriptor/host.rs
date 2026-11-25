@@ -2078,11 +2078,12 @@ impl HostHeap {
         // record stays the same, so the slot is made again when the host
         // texture changes. Resolved before the lock, since making the
         // resource can wait.
-        let placed = match &view {
+        let (placed, building) = match &view {
             Some(v @ View::Placed(_, resource, _)) if for_draw && resource[0] != 1 => {
-                Some(placed_texture(v))
+                let (made, building) = placed_texture_or_building(v);
+                (Some(made), building)
             }
-            _ => None,
+            _ => (None, false),
         };
         // A texture object's host copy is there for the GPU only once it is
         // resident, which may be after the title wrote its views: the slot,
@@ -2156,7 +2157,17 @@ impl HostHeap {
             return Ok(None);
         };
         let mut old = None;
-        if stale(&made) {
+        // No host texture for a placed view now. While another thread is
+        // still making it, a slot already made for this record over a
+        // texture keeps it: a mirror racing the maker would otherwise leave
+        // the slot null until it is made again. With no mapped page or a
+        // failed creation, the slot follows the memory and is made null.
+        let pending = matches!(placed, Some(None));
+        let holds = |made: &Made| {
+            made.keys[index as usize] == key
+                && made.textures.get(&index).is_some_and(|&(_, r)| r != 0)
+        };
+        if stale(&made) && !(pending && building && holds(&made)) {
             let view = placed.as_ref().and_then(Option::as_ref).unwrap_or(&view);
             let later = !for_draw && view.is_buffer();
             made.keys[index as usize] = if later { 0 } else { key };
@@ -2174,7 +2185,7 @@ impl HostHeap {
                 _ => made.textures.remove(&index),
             };
             let mut viewed = None;
-            let kept = if later {
+            let kept = if later || pending {
                 None
             } else {
                 let wanted = (self.strides.is_some() || picking).then_some(&mut viewed);
@@ -4234,21 +4245,33 @@ fn copy_range(view: &View) -> Option<(u64, u64)> {
 /// mirrored as shader views are, and their writes stay in the host copy
 /// that later views of that memory share (`alias`).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
+    placed_texture_or_building(view).0
+}
+
+/// [`placed_texture`], and whether there is none only because another
+/// thread is still making the resource for that memory.
+pub(crate) fn placed_texture_or_building(view: &View) -> (Option<View>, bool) {
+    use crate::resource::PlacedLookup;
     const BUFFER: u32 = 1;
     let &View::Placed(unordered, ref resource, ref desc) = view else {
-        return None;
+        return (None, false);
     };
     if resource[0] == BUFFER {
-        return None;
+        return (None, false);
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)? as usize;
+    let texture = match crate::resource::texture_lookup(address, resource) {
+        PlacedLookup::Ready(r) => r as usize,
+        PlacedLookup::Building => return (None, true),
+        PlacedLookup::Absent => return (None, false),
+    };
     let desc = desc[..10].try_into().ok();
-    Some(if unordered {
+    let made = if unordered {
         View::Unordered(texture, 0, desc)
     } else {
         View::Shader(texture, desc)
-    })
+    };
+    (Some(made), false)
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -5166,6 +5189,108 @@ mod tests {
         drop(heap);
         crate::resource::memory_remapped(address as usize, KIB_64 as usize);
         drop(std::mem::ManuallyDrop::into_inner(memory));
+    }
+
+    /// A slot made over a placed view's texture keeps it when another
+    /// mirror finds no texture there because a thread is still making one:
+    /// it does not write a null view over the good one.
+    #[test]
+    fn a_placed_slot_keeps_its_view_while_another_is_made() {
+        use crate::resource::tests_support::{target, while_placed_building};
+        let test = "descriptor::host::tests::a_placed_slot_keeps_its_view_while_another_is_made";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        const KIB_64: u64 = 1 << 16;
+        let memory =
+            std::mem::ManuallyDrop::new(crate::resource::Memory::zeroed(KIB_64, KIB_64).unwrap());
+        let address = memory.address();
+        let drawn = target(16, 16, 28);
+        // SAFETY: a description is 56 bytes, 14 words.
+        let mut resource: [u32; 14] = unsafe { std::mem::transmute_copy(&drawn) };
+        resource[12] = 0;
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let heap = crate::descriptor::TestHeap::views(4);
+        let host = crate::descriptor::heap(heap.0).host().expect("a host heap");
+        let handle = crate::descriptor::heap(heap.0).start + 32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &view, handle);
+        let kept = |h: &HostHeap| {
+            h.kept.lock().unwrap_or_else(|e| e.into_inner())[1]
+                .as_ref()
+                .map(|t| t.as_raw() as usize)
+        };
+        assert!(matches!(
+            host.mirror(1, handle, true),
+            Some(View::Shader(..))
+        ));
+        let made = kept(host);
+        assert!(made.is_some(), "the slot views the placed texture");
+        while_placed_building(address, &resource, || {
+            host.mirror(1, handle, true);
+        });
+        assert_eq!(kept(host), made, "the slot kept its view");
+        drop(heap);
+        crate::resource::memory_remapped(address as usize, KIB_64 as usize);
+        drop(std::mem::ManuallyDrop::into_inner(memory));
+    }
+
+    /// A slot made over a placed view's texture follows its memory when the
+    /// memory is unmapped: the next mirror finds no texture there, and no
+    /// thread making one, so the slot is made null.
+    #[test]
+    fn a_placed_slot_follows_its_memory_when_unmapped() {
+        use crate::resource::tests_support::target;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let test = "descriptor::host::tests::a_placed_slot_follows_its_memory_when_unmapped";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        const KIB_64: usize = 1 << 16;
+        // SAFETY: reserve and commit an OS-selected 64 KiB range.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                KIB_64,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null());
+        let address = base as u64;
+        let drawn = target(16, 16, 28);
+        // SAFETY: a description is 56 bytes, 14 words.
+        let mut resource: [u32; 14] = unsafe { std::mem::transmute_copy(&drawn) };
+        resource[12] = 0;
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let heap = crate::descriptor::TestHeap::views(4);
+        let host = crate::descriptor::heap(heap.0).host().expect("a host heap");
+        let handle = crate::descriptor::heap(heap.0).start + 32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &view, handle);
+        let kept = |h: &HostHeap| {
+            h.kept.lock().unwrap_or_else(|e| e.into_inner())[1]
+                .as_ref()
+                .map(|t| t.as_raw() as usize)
+        };
+        assert!(matches!(
+            host.mirror(1, handle, true),
+            Some(View::Shader(..))
+        ));
+        assert!(kept(host).is_some(), "the slot views the placed texture");
+        // SAFETY: the range was committed above and nothing else uses it.
+        assert_ne!(unsafe { VirtualFree(base, KIB_64, MEM_DECOMMIT) }, 0);
+        crate::resource::memory_remapped(address as usize, KIB_64);
+        host.mirror(1, handle, true);
+        assert_eq!(kept(host), None, "the slot no longer shows unmapped memory");
+        drop(heap);
+        // SAFETY: release the reservation once no view is placed in it.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
     /// An unordered access view of a texture the title placed itself is
