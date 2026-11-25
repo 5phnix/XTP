@@ -669,8 +669,11 @@ Per title structure address, as VIctory #702 keys them (section 11):
   or either limit is reached, allocation is refused and logged. An unreferenced result at a reused title
   address can be rebuilt in place if it is large enough. Scratch is reused
   per list. Consecutive builds in a batch share their intervening UAV
-  barrier. Releasing a title buffer or remapping loose title memory retires
-  its address mappings.
+  barrier. A title prebuild query supplies the guest span. A compact copy
+  conservatively uses the source guest span when the title's compacted
+  byte count is unavailable. New writes retire overlapping mappings,
+  including in-progress builds. Releasing a title buffer or remapping
+  loose memory retires its mappings as well.
 - **Lookup at dispatch.** `xtp_gpu::rt::host_tlas(list, title_tlas)` checks the
   producer and retains the TLAS and its BLAS for that recording. Use it directly, or `descriptor_tlas` with the live title
   descriptor handle. Resolve each descriptor independently, including

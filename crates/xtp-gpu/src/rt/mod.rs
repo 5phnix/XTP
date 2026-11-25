@@ -252,6 +252,7 @@ type WeakSlot = std::sync::Weak<Mutex<Option<Structure>>>;
 type Candidates = Arc<BTreeMap<u64, Slot>>;
 
 struct BuildSlot {
+    known_extent: bool,
     generation: u64,
     slot: Slot,
     overwritten: Vec<Slot>,
@@ -305,7 +306,7 @@ impl Registry {
         self.waiting.insert(
             address,
             (
-                crate::shadow::buffer_owner(address).map(|o| o.0),
+                crate::shadow::buffer_owner(address, 1).map(|o| o.0),
                 Arc::downgrade(&slot),
             ),
         );
@@ -360,10 +361,9 @@ impl Registry {
     }
 
     fn begin(&mut self, start: u64, bytes: Option<u64>) -> (BuildSlot, Option<Arc<ResultBuffer>>) {
-        let owner = crate::shadow::buffer_owner(start);
+        let owner = crate::shadow::buffer_owner(start, bytes.unwrap_or(1));
         let end = match (bytes.filter(|&n| n > 0), owner) {
-            (Some(n), Some((_, end))) => start.saturating_add(n).min(end),
-            (Some(n), None) => start.saturating_add(n),
+            (Some(n), _) => start.saturating_add(n),
             (None, Some((_, end))) => end,
             (None, None) => start.saturating_add(1),
         };
@@ -387,6 +387,8 @@ impl Registry {
         );
         (
             BuildSlot {
+                known_extent: start != 0
+                    && bytes.map_or(owner.is_some(), |n| n > 0 && start.checked_add(n).is_some()),
                 generation: self.generation,
                 slot,
                 overwritten,
@@ -493,7 +495,7 @@ unsafe fn build_one(
     let dst = desc.DestAccelerationStructureData;
     let (generation, reuse) = registry().begin(dst, title_bytes);
     let built = (|| {
-        if dst == 0 {
+        if !generation.known_extent {
             return None;
         }
         // The title supplies full geometry on refits. Rebuilding it also handles
@@ -623,7 +625,7 @@ impl Builder {
             (source, generation)
         };
         let copied = (|| {
-            if dst == 0 {
+            if !generation.known_extent {
                 return None;
             }
             let source = source?;

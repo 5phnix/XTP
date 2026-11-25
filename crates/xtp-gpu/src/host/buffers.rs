@@ -124,7 +124,6 @@ impl Ranges {
 }
 
 struct Heap {
-    _rt: Option<RtReservation>,
     id: u64,
     heap: ID3D12Heap,
     size: u64,
@@ -132,6 +131,7 @@ struct Heap {
     /// Per [`ALIGN`] unit: whether a buffer had it (so it may hold old
     /// bytes; a new heap is zeroed).
     used: Vec<bool>,
+    rt_reservation: Option<RtReservation>,
 }
 
 #[derive(Default)]
@@ -186,7 +186,7 @@ impl State {
         let id = self.next_id;
         self.next_id += 1;
         self.heaps.push(Heap {
-            _rt: None,
+            rt_reservation: None,
             id,
             heap,
             size,
@@ -345,7 +345,7 @@ pub(crate) fn rt_buffer(
             room
         } else {
             s.add(heap, bytes);
-            s.heaps.last_mut()?._rt = Some(charge);
+            s.heaps.last_mut()?.rt_reservation = Some(charge);
             s.take(len)?
         }
     };
@@ -599,15 +599,12 @@ impl Pool {
     /// Gives a buffer's range back (its resource is gone).
     fn give(&self, heap: u64, offset: u64, len: u64) {
         let mut s = self.lock();
-        if let Some(h) = s.heaps.iter_mut().find(|h| h.id == heap) {
+        if let Some(i) = s.heaps.iter().position(|h| h.id == heap) {
+            let h = &mut s.heaps[i];
             h.free.give(offset, len);
-        }
-        if let Some(i) = s
-            .heaps
-            .iter()
-            .position(|h| h.id == heap && h._rt.is_some() && h.free.free == h.size)
-        {
-            s.heaps.swap_remove(i);
+            if h.rt_reservation.is_some() && h.free.free == h.size {
+                s.heaps.swap_remove(i);
+            }
         }
         // Room for a waiting thread, or an empty heap to release.
         self.changed.notify_all();

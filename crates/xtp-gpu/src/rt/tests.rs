@@ -220,6 +220,8 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
     // SAFETY: the title list and all CPU arrays are live for each call. The recording
     // retains every GPU input, including both generations after their title resources go.
     unsafe {
+        // The TLAS is recorded before its BLAS address has a registry entry.
+        assert!(Builder.build(list.this(), &tlas_desc(first.address())));
         let producer = TitleList::new();
         let mut original = blas_input(&geometry);
         original.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
@@ -256,7 +258,6 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0
         ));
         assert!(host_tlas(list.this(), cloned.address()).is_none());
-        assert!(Builder.build(list.this(), &tlas_desc(first.address())));
         let mut updated = blas_input(&changed);
         updated.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE
             | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(1 << 24);
@@ -298,7 +299,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             Some(a)
         );
         let released = first.address();
-        drop((blas, cloned, first, second));
+        drop((blas, first, second));
         assert_eq!(host_tlas(list.this(), released), None);
         trace(host, &list, Scene::Address(a), &output);
         trace(host, &list, Scene::Address(b), &after_refit);
@@ -339,12 +340,16 @@ fn rt_owner_survives_more_than_64_intervening_buffers() {
         crate::shadow::register(i + 1, base + 2 * i as u64, 1);
     }
     assert_eq!(
-        crate::shadow::buffer_owner(base + 255),
+        crate::shadow::buffer_owner(base + 255, 1),
         Some((1, base + 1024))
     );
     assert_eq!(
-        crate::shadow::buffer_owner(base + 200),
+        crate::shadow::buffer_owner(base + 200, 1),
         Some((101, base + 201))
+    );
+    assert_eq!(
+        crate::shadow::buffer_owner(base + 200, 16),
+        Some((1, base + 1024))
     );
     registry().begin(base + 255, Some(128));
     crate::shadow::unregister(1, base);

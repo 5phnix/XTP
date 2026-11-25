@@ -4469,7 +4469,8 @@ impl BufferTable {
         self.entries.insert(key, Entry { end, shadow: None });
     }
 
-    fn owner(&self, address: u64) -> Option<(usize, u64)> {
+    fn owner(&self, address: u64, bytes: u64) -> Option<(usize, u64)> {
+        let required = address.checked_add(bytes.max(1))?;
         self.classes
             .iter()
             .filter_map(|(&class, group)| {
@@ -4478,7 +4479,7 @@ impl BufferTable {
                 group
                     .range((first, 0)..=(address, usize::MAX))
                     .rev()
-                    .find(|(_, end)| **end > address)
+                    .find(|(_, end)| **end >= required)
             })
             .max_by_key(|(key, _)| *key)
             .map(|(key, &end)| (key.1, end))
@@ -4584,9 +4585,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(made)
 }
 
-/// The innermost title resource containing this address.
-pub(crate) fn buffer_owner(address: u64) -> Option<(usize, u64)> {
-    buffers().owner(address)
+/// The innermost title resource containing the entire range.
+pub(crate) fn buffer_owner(address: u64, bytes: u64) -> Option<(usize, u64)> {
+    buffers().owner(address, bytes)
 }
 
 /// The title buffers holding `address`, innermost first (the one [`find`]

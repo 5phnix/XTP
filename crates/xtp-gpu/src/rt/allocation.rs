@@ -50,8 +50,17 @@ impl ResultBuffer {
         } else {
             len.checked_next_multiple_of(65536)?
         };
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
         let (resource, reservation) =
             RtReservation::allocate(rec.device, size, || committed_result(rec.device, size))?;
+        if let Some(started) = started {
+            tracing::debug!(
+                bytes = size,
+                state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0,
+                us = started.elapsed().as_micros() as u64,
+                "host DXR buffer allocation"
+            );
+        }
         let mut free = Ranges::new(size);
         let offset = free.take(len)?;
         let page = Arc::new(Page {
