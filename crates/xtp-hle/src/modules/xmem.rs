@@ -1687,10 +1687,13 @@ pub(crate) mod ledger {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
-        // The memory API set for `VirtualAlloc` and `VirtualFree` alone;
-        // its other functions are not here, so they bind to the host's.
+        // Les autres fonctions de cet ensemble restent fournies par Windows.
         dlls: &["xmem.dll", "api-ms-win-core-memory-*"],
         exports: vec![
+            HleExport {
+                name: "VirtualProtect",
+                address: xtp_gpu::title_virtual_protect as *const () as usize,
+            },
             HleExport {
                 name: "VirtualAlloc",
                 address: title_virtual_alloc as *const () as usize,
@@ -2117,6 +2120,110 @@ mod tests {
         assert_eq!(unsafe { ((pool + 8) as *const u8).read_volatile() }, 2);
         assert!(map_alias(heap as u64, 0, PAGE as u64));
         assert_eq!(XMemMapPhysicalPages(pool_at, 1, std::ptr::null()), pool_at);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn pending_copy_back_through_title_imports() {
+        use std::io::{Read, Seek};
+        use std::os::windows::io::{AsRawHandle, AsRawSocket};
+
+        const CHILD: &str = "XTP_TEST_PENDING_IMPORTS";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "modules::xmem::tests::pending_copy_back_through_title_imports",
+                    "--exact",
+                ])
+                .env(CHILD, "1")
+                .env("XTP_READMAP", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        xtp_gpu::configure_copy_back(None);
+        let pages = allocate(1);
+        let at = reserve(1);
+        let alias = reserve(1);
+        assert_eq!(XMemMapPhysicalPages(at, 1, pages.as_ptr()), at);
+        assert!(map_alias(alias as u64, at as u64, PAGE as u64));
+        let publish = |writer, value| {
+            assert_eq!(
+                xtp_gpu::publish_copy_back_for_test(at as usize, &mut vec![value; PAGE], writer),
+                Some(0)
+            );
+            assert_eq!(
+                query(alias).host.Protect,
+                windows_sys::Win32::System::Memory::PAGE_NOACCESS
+            );
+        };
+
+        publish(1, 0x5a);
+        let mut file = tempfile::tempfile().unwrap();
+        let mut n = 0;
+        assert_ne!(
+            crate::modules::files::WriteFile(
+                file.as_raw_handle(),
+                alias.cast(),
+                4,
+                &mut n,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(n, 4);
+        file.rewind().unwrap();
+        let mut bytes = [0; 4];
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [0x5a; 4]);
+
+        publish(6, 0x64);
+        crate::modules::files::check_fwrite_from(alias.cast(), PAGE, 0x64);
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        publish(7, 0x83);
+        assert_eq!(
+            crate::modules::net::send(client.as_raw_socket() as usize, alias.cast(), 4, 0),
+            4
+        );
+        server.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [0x83; 4]);
+
+        publish(2, 0xc1);
+        // SAFETY: les deux vues désignent la même page du titre.
+        unsafe { alias.cast::<u8>().write_volatile(0x75) };
+        assert_eq!(&page_bytes(pages[0])[..4], &[0x75, 0xc1, 0xc1, 0xc1]);
+
+        publish(4, 0x33);
+        let mut old = 0;
+        // SAFETY: deux vues du test et une sortie valide pour la protection précédente.
+        unsafe {
+            let ro = windows_sys::Win32::System::Memory::PAGE_READONLY;
+            assert_ne!(xtp_gpu::title_virtual_protect(alias, 4096, ro, &mut old), 0);
+            assert_eq!(old, PAGE_READWRITE);
+            assert_eq!(alias.cast::<u8>().read_volatile(), 0x33);
+            copy_asks(at as usize, 1);
+            assert_eq!(query(alias).host.Protect, ro);
+            assert_eq!(
+                xtp_gpu::publish_copy_back_for_test(at as usize, &mut [0x45], 5),
+                None
+            );
+            assert_ne!(
+                xtp_gpu::title_virtual_protect(alias, PAGE, PAGE_READWRITE, &mut old),
+                0
+            );
+            assert_eq!(old, ro);
+            alias.cast::<u8>().write_volatile(0x58);
+        }
+        assert_eq!(page_bytes(pages[0])[0], 0x58);
+        publish(3, 0x92);
+        assert!(map_alias(alias as u64, 0, PAGE as u64));
+        assert_eq!(query(alias).host.State, MEM_RESERVE);
+        assert_eq!(&page_bytes(pages[0])[..4], &[0x92; 4]);
+        assert_eq!(XMemMapPhysicalPages(at, 1, std::ptr::null()), at);
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 

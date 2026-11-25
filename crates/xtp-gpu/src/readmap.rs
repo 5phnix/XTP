@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::ops::Range;
 use std::path::PathBuf;
+#[cfg(feature = "diagnostics")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::watch::PAGE;
@@ -41,11 +43,8 @@ static MAP: OnceLock<Mutex<Map>> = OnceLock::new();
 /// Called with the original executable's digest and its local cache file.
 /// Learning in memory also works if the cache is unavailable.
 pub fn configure_copy_back(path: Option<PathBuf>) {
-    // Opt-in (`XTP_READMAP=1`) until the title's own WriteFile/fwrite of a
-    // pending page is handled: those kernel reads don't fault, so they would
-    // fail with ERROR_NOACCESS (Claude review of bdc9263, 2026-11-25). Unit
-    // tests turn it on through this call.
-    if !cfg!(test) && std::env::var("XTP_READMAP").as_deref() != Ok("1") {
+    // XTP_READMAP=0 permet de comparer la copie immédiate sur la même scène.
+    if !cfg!(test) && std::env::var("XTP_READMAP").as_deref() == Ok("0") {
         return;
     }
     // The census installs independent one-shot guards on the same pages.
@@ -87,7 +86,8 @@ pub(super) fn eager(key: Key) -> bool {
 
 fn learn(key: Key) {
     if let Some(map) = MAP.get() {
-        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+        // Un indice perdu sera réappris. Le gestionnaire ne doit jamais attendre le cache.
+        let Ok(mut map) = map.try_lock() else { return };
         if map.seen.insert(key) && map.path.is_some() {
             map.pending.push(key);
         }
@@ -131,6 +131,12 @@ pub fn save_copy_back_map() {
     }
 }
 
+// Une page froide occupe 64 Kio. À saturation, les nouvelles pages vont
+// directement dans la vue permanente. Les pages déjà en attente restent fusionnables.
+pub(super) const MAX_PAGES: usize = (64 << 20) / PAGE;
+#[cfg(feature = "diagnostics")]
+pub(crate) static PENDING_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 struct Page {
     // The completed submission's result. Neither GPU reuse nor destruction
     // of its shadow can change this memory.
@@ -140,20 +146,21 @@ struct Page {
 }
 
 /// All addresses here are 64 KiB block numbers. Access only under GUARDS.
-#[derive(Default)]
 pub(super) struct Owners {
+    limit: usize,
     pages: BTreeMap<usize, Page>,
     by_view: BTreeMap<usize, usize>,
-    restored: BTreeSet<usize>,
+    known_views: BTreeSet<usize>,
     pins: Vec<Range<usize>>,
 }
 
 impl Owners {
-    pub(super) const fn new() -> Self {
+    pub(super) const fn new(limit: usize) -> Self {
         Self {
+            limit,
             pages: BTreeMap::new(),
             by_view: BTreeMap::new(),
-            restored: BTreeSet::new(),
+            known_views: BTreeSet::new(),
             pins: Vec::new(),
         }
     }
@@ -178,8 +185,7 @@ impl Owners {
     /// A racing reader may have restored our view after the failed system
     /// call. Retry it under the pin in that case too.
     pub(super) fn may_have_faulted(&self, views: Range<usize>) -> bool {
-        self.by_view.range(views.clone()).next().is_some()
-            || self.restored.range(views).next().is_some()
+        self.known_views.range(views).next().is_some()
     }
 
     pub(super) fn unpin(&mut self, range: Range<usize>) {
@@ -188,41 +194,46 @@ impl Owners {
     }
 
     pub(super) fn forget(&mut self, range: Range<usize>) {
-        let gone: Vec<_> = self.restored.range(range).copied().collect();
+        let gone: Vec<_> = self.known_views.range(range).copied().collect();
         for page in gone {
-            self.restored.remove(&page);
+            self.known_views.remove(&page);
+            crate::watch::remember_read_view(page, false);
         }
     }
 
-    fn release(&mut self, physical: usize, learned: bool) {
+    fn release(&mut self, physical: usize, learned: bool) -> bool {
         let Some(page) = self.pages.remove(&physical) else {
-            return;
+            return false;
         };
         // SAFETY: xmem pins before removing or adding a mapping and before
         // writing through its permanent view. All title views are NOACCESS.
         unsafe {
             std::ptr::copy_nonoverlapping(page.bytes.as_ptr(), (physical * PAGE) as *mut u8, PAGE)
         };
+        #[cfg(feature = "diagnostics")]
+        PENDING_BYTES.store(self.pages.len() * PAGE, Ordering::Relaxed);
         if learned {
             for key in page.keys {
                 learn(key);
             }
         }
+        let mut restored = true;
         for view in page.views {
             self.by_view.remove(&view);
-            self.restored.insert(view);
-            // A mapped page cannot disappear while xmem waits for GUARDS.
-            assert!(crate::watch::set_protection(
+            // Une vue que Windows refuse de rouvrir tombe sur le rapporteur
+            // de panne. Les octets ont déjà été rendus aux autres vues.
+            restored &= crate::watch::set_protection(
                 view..view + 1,
-                windows_sys::Win32::System::Memory::PAGE_READONLY
-            ));
+                windows_sys::Win32::System::Memory::PAGE_READONLY,
+            );
+            crate::watch::set_pending_view(view, false);
         }
+        restored
     }
 
     pub(super) fn touch(&mut self, view: usize, learned: bool) -> bool {
         if let Some(&owner) = self.by_view.get(&view) {
-            self.release(owner, learned);
-            true
+            self.release(owner, learned)
         } else {
             false
         }
@@ -234,7 +245,7 @@ impl Owners {
     }
 
     pub(super) fn restored(&self, view: usize) -> bool {
-        self.restored.contains(&view)
+        self.known_views.contains(&view)
     }
 
     pub(super) fn pinned(&self, physical: usize, views: &[usize]) -> bool {
@@ -254,7 +265,12 @@ impl Owners {
         gpu: &mut [u8],
         before: Option<&[u8]>,
     ) -> Option<usize> {
-        let eager = eager(key);
+        let full = self.pages.len() >= self.limit && !self.pages.contains_key(&physical);
+        #[cfg(feature = "diagnostics")]
+        if full {
+            crate::copystat::add(crate::copystat::C::CapacityCopies, 1);
+        }
+        let eager = full || eager(key);
         if eager {
             self.release(physical, false);
         }
@@ -269,12 +285,15 @@ impl Owners {
             if let std::collections::btree_map::Entry::Vacant(entry) = self.pages.entry(physical) {
                 use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY};
                 for (i, &v) in views.iter().enumerate() {
+                    if self.known_views.insert(v) {
+                        crate::watch::remember_read_view(v, true);
+                    }
+                    crate::watch::set_pending_view(v, true);
                     if !crate::watch::set_protection(v..v + 1, PAGE_NOACCESS) {
+                        crate::watch::set_pending_view(v, false);
                         for &previous in &views[..i] {
-                            assert!(crate::watch::set_protection(
-                                previous..previous + 1,
-                                PAGE_READONLY
-                            ));
+                            crate::watch::set_protection(previous..previous + 1, PAGE_READONLY);
+                            crate::watch::set_pending_view(previous, false);
                         }
                         return None;
                     }
@@ -290,7 +309,9 @@ impl Owners {
                     keys: BTreeSet::new(),
                 });
             }
-            let page = self.pages.get_mut(&physical).unwrap();
+            #[cfg(feature = "diagnostics")]
+            PENDING_BYTES.store(self.pages.len() * PAGE, Ordering::Relaxed);
+            let page = self.pages.get_mut(&physical)?;
             page.keys.insert(key);
             &mut page.bytes[offset..offset + gpu.len()]
         };

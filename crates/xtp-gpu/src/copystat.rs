@@ -125,6 +125,7 @@ pub(crate) enum C {
     KernelReadPages,
     KernelReadNs,
     DeferredBytes,
+    CapacityCopies,
     BackScanNs,
     Count,
 }
@@ -257,6 +258,8 @@ pub(crate) fn log(frames: f64) {
     if crate::readmap::enabled() {
         tracing::info!(
             frames = frames as u64,
+            pending_bytes = crate::readmap::PENDING_BYTES.load(Relaxed),
+            capacity_copies = (c[C::CapacityCopies as usize] * frames).round() as u64,
             read_faults = (c[C::ReadFaults as usize] * frames).round() as u64,
             write_faults = (c[C::WriteFaults as usize] * frames).round() as u64,
             handler_us = (c[C::ReadFaultNs as usize] * frames / 1e3).round() as u64,
