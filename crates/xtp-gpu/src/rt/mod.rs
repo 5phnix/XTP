@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 mod instances;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod probe;
 
 pub(crate) use instances::BlasMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -341,6 +343,25 @@ pub unsafe fn build(title_list: *const Object, desc: &Build) -> bool {
         }
     })();
     registry().replace(dst, built)
+}
+
+/// Rebuilds a rehydrated title entry and optionally samples its inputs on the GPU.
+///
+/// # Safety
+/// The title list and CPU arrays obey the same contract as `build`.
+pub unsafe fn rehydrate(list: *const Object, desc: &Build) -> bool {
+    // SAFETY: the caller supplies the same live inputs required by build.
+    let recorded = unsafe { build(list, desc) };
+    #[cfg(feature = "diagnostics")]
+    if probe::enabled() {
+        let sampled = recorded
+            && crate::list::host_list(list).is_some_and(|list| {
+                // SAFETY: the CPU descriptions remain borrowed for this entire rehydration call.
+                unsafe { probe::record(list, desc).is_some() }
+            });
+        tracing::info!(recorded, sampled, "rehydrated geometry validation");
+    }
+    recorded
 }
 
 /// Mirrors a clone across title builders.

@@ -870,6 +870,8 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 #[derive(Clone, Default)]
 struct Recorded {
     #[cfg(feature = "diagnostics")]
+    rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
+    #[cfg(feature = "diagnostics")]
     dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
     #[cfg(feature = "diagnostics")]
@@ -1050,6 +1052,8 @@ impl Drop for DynamicLease {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    #[cfg(feature = "diagnostics")]
+    rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
     #[cfg(feature = "diagnostics")]
     dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     /// What the list's draws read and its dispatches wrote, in recorded
@@ -1436,6 +1440,10 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        for sample in p.recorded.iter().flat_map(|r| r.rt_samples.iter()) {
+            sample.report();
+        }
         // `XTP_MESH_STATS`: what the draws read, against title memory.
         #[cfg(feature = "diagnostics")]
         crate::meshstat::submitting(runs, batch.submission);
@@ -2416,7 +2424,11 @@ impl HostList {
             let deferred = self.deferred();
             (deferred.dispatch_samples.clone(), deferred.meshes.clone())
         };
+        #[cfg(feature = "diagnostics")]
+        let rt_samples = self.deferred().rt_samples.clone();
         Recorded {
+            #[cfg(feature = "diagnostics")]
+            rt_samples,
             #[cfg(feature = "diagnostics")]
             dispatch_samples,
             pipelines: self
@@ -2429,6 +2441,11 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             meshes,
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn rt_sample(&self, sample: crate::rt::probe::Sample) {
+        std::sync::Arc::make_mut(&mut self.deferred().rt_samples).push(sample);
     }
 
     #[cfg(feature = "diagnostics")]

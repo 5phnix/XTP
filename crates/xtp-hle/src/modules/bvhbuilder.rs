@@ -347,7 +347,7 @@ extern "system" fn rehydrate(
         for i in 0..count {
             // SAFETY: the original call accepted this list and array of count descriptions.
             recorded +=
-                u32::from(unsafe { xtp_gpu::rt::build(list.cast(), &*descs.add(i as usize)) });
+                u32::from(unsafe { xtp_gpu::rt::rehydrate(list.cast(), &*descs.add(i as usize)) });
         }
         debug!(
             count,
