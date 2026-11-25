@@ -230,7 +230,11 @@ impl Drop for Upload {
     }
 }
 
-/// Calls of [`release_staging`] so far: the clock of [`Staging::recorded`].
+/// Calls of [`release_staging`] so far (a pass each): the clock of
+/// [`Staging::recorded`]. Tests sweep at later times of it rather than
+/// advance it: advanced by them, every other test's texture looked idle to
+/// that test's own passes, which released its buffers inside their timed
+/// windows.
 static SWEEPS: AtomicU64 = AtomicU64::new(0);
 
 /// Staging buffers released so far: count and bytes.
@@ -712,7 +716,8 @@ fn refresh_room(share: u64, made: u64, limit: u64, staged: u64) -> u64 {
 #[cfg(test)]
 pub(crate) fn release_staging_now(resource: This) -> bool {
     let key = resource as usize;
-    release_staging_of(0, usize::MAX, |r| r == key).0 == 1
+    let now = SWEEPS.load(Ordering::Relaxed);
+    release_staging_of(now, 0, usize::MAX, |r| r == key).0 == 1
 }
 
 /// Whether `resource` has a staging buffer over title memory at `address`:
@@ -766,22 +771,22 @@ pub(crate) fn release_staging(idle: u64, looks: usize) -> (u64, u64) {
         .clone();
     #[cfg(not(test))]
     let alone: [usize; 0] = [];
-    release_staging_of(idle, looks, |r| !alone.contains(&r))
+    let now = SWEEPS.fetch_add(1, Ordering::Relaxed) + 1;
+    release_staging_of(now, idle, looks, |r| !alone.contains(&r))
 }
 
 /// The textures tests here sweep themselves (`tests::SweptAlone`): the
 /// passes of other tests, whose sweeps go over every texture, leave them
 /// as they are, so that a test tells what its own sweeps release, and
-/// when. Before, such a pass could release a test's buffer first (every
-/// texture looks idle once the tests' own sweeps advanced [`SWEEPS`]).
+/// when. Before, such a pass could release a test's buffer first (once
+/// passes elsewhere had advanced [`SWEEPS`] past its idle time).
 #[cfg(test)]
 static SWEPT_ALONE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-/// [`release_staging`] for the resources `of` takes (tests: other tests'
-/// textures are in the same map).
-fn release_staging_of(idle: u64, looks: usize, of: impl Fn(usize) -> bool) -> (u64, u64) {
+/// [`release_staging`] at time `now` of [`SWEEPS`], for the resources `of`
+/// takes (tests: other tests' textures are in the same map).
+fn release_staging_of(now: u64, idle: u64, looks: usize, of: impl Fn(usize) -> bool) -> (u64, u64) {
     use std::ops::Bound::{Excluded, Unbounded};
-    let now = SWEEPS.fetch_add(1, Ordering::Relaxed) + 1;
     let mut gone = Vec::new();
     {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -3161,17 +3166,17 @@ mod tests {
         let (resource, texture) = texture_4x4(0x11);
         let _alone = SweptAlone::new(resource);
         let key = resource as usize;
-        // Other tests' textures are in the same map: only this one goes.
-        let sweep = || release_staging_of(IDLE, usize::MAX, |r| r == key);
-        // Sweeps until it goes: the buffers and bytes released.
-        let sweep_out = || {
-            let mut released = (0, 0);
-            for _ in 0..=IDLE {
-                let (n, b) = sweep();
-                released = (released.0 + n, released.1 + b);
-            }
-            released
+        // Other tests' textures are in the same map: only this one goes. A
+        // sweep `later` passes on from now (without moving the passes'
+        // clock, which other tests' passes read).
+        let sweep_at = |later: u64| {
+            let now = SWEEPS.load(Ordering::Relaxed) + later;
+            release_staging_of(now, IDLE, usize::MAX, |r| r == key)
         };
+        // The next pass's sweep; one past the idle time: the buffers and
+        // bytes released.
+        let sweep = || sweep_at(1);
+        let sweep_out = || sweep_at(IDLE + 1);
         let state = || {
             let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
             map.as_ref().unwrap().get(&key).unwrap().clone()
