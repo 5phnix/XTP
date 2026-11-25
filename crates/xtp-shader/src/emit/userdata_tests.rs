@@ -276,3 +276,100 @@ fn phi_merges_reloads_only_for_the_same_spilled_descriptor() {
     code[9] = 0xFA00_0008;
     assert!(track(&native(&code, layout())).is_err());
 }
+
+/// Ported from fxceless's VIctory fork #646 (head 170c24269) by mynzjerko.
+/// Une barrière sépare le comptage d'EXEC de l'écriture dans la vue racine.
+#[cfg(windows)]
+#[test]
+fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
+    use super::host::{Dispatch, Host, Root, View};
+    let words = [
+        PTR.as_slice(),
+        &[
+            0xF404_0201,
+            0xFA00_0000, // s[8:9] reçoit l'adresse de l'UAV.
+            0xBE8A_03C1,
+            0xBE8B_03FF,
+            0x3101_4FAC,
+            0xBE86_107E, // s6 reçoit la population d'EXEC.
+            0xBF8A_0000,
+            0x3402_0082,
+            0x7E04_0206,
+            0xE070_1000,
+            0x8002_0201,
+            END,
+        ],
+    ]
+    .concat();
+    let mut n = native(&words, vec![param(RootType::Descriptor, 16, 2, 3)]);
+    n.wave64 = true;
+    n.io = StageIo::Cs(ComputeIo {
+        rsrc2: 4 << 1,
+        threads: [64, 1, 1],
+    });
+    n.used.push(UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 16,
+        slot: 3,
+    });
+    let bytes = crate::dxbc::build(&[]);
+    let c = Container::parse(&bytes).unwrap();
+    let Ok(host) = Host::new(true) else { return };
+    for lanes in [32, 64] {
+        let target = super::Target {
+            lanes_min: lanes,
+            lanes_max: lanes,
+            stride_table: false,
+        };
+        let mut cs = super::translate_program_for(&c, &n, target).unwrap();
+        assert_eq!(cs.root_uavs, [3]);
+        if let Ok(mut validator) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            validator.validate(&mut cs.dxil).unwrap();
+        }
+        if !host.target().runs(lanes) {
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        for (limit, count) in [(45, 45), (1, 1), (0, 64)] {
+            let mut ud = vec![0; cs.user_data_dwords() as usize];
+            for word in &cs.user_data {
+                ud[word.index as usize] = match word.root {
+                    super::DISPATCH_THREADS => limit,
+                    super::ROOT_UAV_BIAS => 12,
+                    _ => panic!("unexpected binding {word:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::Table {
+                                    sampler: false,
+                                    index: 0,
+                                },
+                            ),
+                        ],
+                        views: &[View::RawUav(68)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let mut expected = vec![0; 68];
+            expected[3..3 + count].fill(count as u32);
+            assert_eq!(out[0], expected, "wave {lanes}, limit {limit}");
+        }
+    }
+}

@@ -325,6 +325,7 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
+        let mut ranges = Vec::new();
         let mut views: Vec<(u8, i32)> = stages
             .iter()
             .flat_map(|(s, _)| {
@@ -347,6 +348,28 @@ impl Host {
         views.sort_unstable();
         views.dedup();
         for (slot, kind) in views {
+            if kind == D3D12_ROOT_PARAMETER_TYPE_UAV.0 {
+                ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    NumDescriptors: 1,
+                    BaseShaderRegister: u32::from(slot),
+                    RegisterSpace: super::ROOT_CBV_SPACE,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                        | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                    OffsetInDescriptorsFromTableStart: 0,
+                }));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: &**ranges.last().unwrap(),
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+                continue;
+            }
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE(kind),
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {

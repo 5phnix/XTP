@@ -1488,14 +1488,18 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
         if flags & threads != 0 && flags & PARTIAL_GROUPS != 0 {
             warn_once!(
                 flags = format_args!("{flags:#x}"),
-                "DispatchX with partial groups: the host runs the last group of each dimension \
-                 whole, threads the console would not run"
+                "DispatchX with partial groups: the host rounds the group counts up; spilled compute shaders mask the final lanes"
             );
         }
         let groups = dispatch_x_groups([x, y, z], flags, threads, group);
         note_dispatch_x(pipeline, host, ([x, y, z], flags), group, groups);
-        let [x, y, z] = groups;
-        state::dispatch(this, x, y, z);
+        let limits = if flags & threads != 0 {
+            [x, y, z]
+        } else {
+            [0; 3]
+        };
+        count_dispatch();
+        with_state(this, |list, s| s.dispatch(list, groups, limits));
     }
     #[cfg(not(windows))]
     {
@@ -1901,7 +1905,7 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, [x, y, z], [0; 3]));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.

@@ -266,6 +266,7 @@ struct Lower<'a> {
     group_base_row: Option<V>,
     host_words: Vec<(UserData, V)>,
     host_rows: Vec<V>,
+    partial_active: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
@@ -772,6 +773,7 @@ impl<'a> Lower<'a> {
             group_base_row: None,
             host_words: Vec::new(),
             host_rows: Vec::new(),
+            partial_active: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -916,6 +918,9 @@ impl<'a> Lower<'a> {
         // original steps, including FP16 operations and their rounding.
         if !self.s.m.paired_lanes() {
             self.find_sections();
+        }
+        if !self.x.res.spill_loads.is_empty() {
+            self.dispatch_threads();
         }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {

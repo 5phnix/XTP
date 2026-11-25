@@ -293,7 +293,7 @@ impl<'a> Lower<'a> {
             return Err(name);
         }
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
@@ -312,6 +312,7 @@ impl<'a> Lower<'a> {
             Some("cmpswap") => Some(u32::MAX),
             Some(_) => return Err(name),
         };
+        let halfword = matches!(name, "buffer_load_ushort" | "buffer_store_short");
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
@@ -320,7 +321,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || halfword => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -351,6 +352,12 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
+        if halfword
+            && !(built.is_some()
+                && used.is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav)))
+        {
+            return Err(name);
+        }
         let add_tid = built.is_some_and(|(d, _)| d.add_tid_enable);
         let index = if add_tid {
             let lane = self.buffer_lane();
@@ -360,10 +367,11 @@ impl<'a> Lower<'a> {
         };
         let raw = !typed
             && !used.is_some_and(|r| r.kind == ResourceType::Cbv)
-            && (built.is_some()
-                && (crate::emit::raw_structured()
-                    || add_tid
-                    || used.is_some_and(|u| u.kind == ResourceType::Uav))
+            && (halfword
+                || built.is_some()
+                    && (crate::emit::raw_structured()
+                        || add_tid
+                        || used.is_some_and(|u| u.kind == ResourceType::Uav))
                 || self.through_table(index, used, src)?
                 || (index.is_some() && crate::emit::raw_structured()));
         let mut within = self.s.m.i32(u32::from(*offset));
@@ -468,6 +476,28 @@ impl<'a> Lower<'a> {
                 },
             })
         };
+        if halfword {
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err(name);
+            };
+            let source = if store {
+                Some(self.vgprs(inst, data.as_ref().unwrap(), 1)?[0])
+            } else {
+                None
+            };
+            let view = raw_view(self)?;
+            let RawView::Built { handle, .. } = view else {
+                unreachable!()
+            };
+            let (byte, valid) = self.raw_coordinate(view, address, 2);
+            let enabled = guard.map_or(valid, |g| self.s.m.bin(self.cur, Bin::And, g, valid));
+            let xs =
+                self.guarded_values(Some(enabled), |l| Ok(l.raw_halfword(handle, byte, source)))?;
+            if !store {
+                self.write(inst, Reg::V(reg), xs[0], guard);
+            }
+            return Ok(());
+        }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
@@ -876,6 +906,56 @@ impl<'a> Lower<'a> {
         (byte, self.s.m.bin(c, Bin::And, valid, fits))
     }
 
+    /// Demi-mot du constructeur, y compris à cheval sur deux dwords.
+    /// D'après Marvisak/VIctory#1572 (head 0c16661) by iurysf et
+    /// fxceless's VIctory fork (4e17478) pour les écritures par masque.
+    fn raw_halfword(&mut self, h: V, byte: V, source: Option<V>) -> Vec<V> {
+        let c = self.cur;
+        let mask = self.s.m.i32(0xff);
+        let three = self.s.m.i32(3);
+        let aligned = self.s.m.i32(!3);
+        let mut result = self.s.m.i32(0);
+        for k in 0..2 {
+            let delta = self.s.m.i32(k);
+            let addr = self.s.m.bin(c, Bin::Add, byte, delta);
+            let word = self.s.m.bin(c, Bin::And, addr, aligned);
+            let within = self.s.m.bin(c, Bin::And, addr, three);
+            let shift = self.s.m.bin(c, Bin::Shl, within, three);
+            let field = self.s.m.i32(k * 8);
+            if let Some(value) = source {
+                let bits = self.s.m.bin(c, Bin::LShr, value, field);
+                let bits = self.s.m.bin(c, Bin::And, bits, mask);
+                let set = self.s.m.bin(c, Bin::Shl, bits, shift);
+                let changed = self.s.m.bin(c, Bin::Shl, mask, shift);
+                let ones = self.s.m.i32(u32::MAX);
+                let keep = self.s.m.bin(c, Bin::Xor, changed, ones);
+                let u = self.s.m.undef(self.s.t.i32);
+                for (op, bits) in [(1, keep), (2, set)] {
+                    let op = self.s.m.i32(op);
+                    self.s.op(
+                        c,
+                        "atomicBinOp.i32",
+                        Attr::NoUnwind,
+                        self.s.t.i32,
+                        78,
+                        &[h, op, word, u, u, bits],
+                    );
+                }
+            } else {
+                let bits = self.raw_dword(h, word);
+                let bits = self.s.m.bin(c, Bin::LShr, bits, shift);
+                let bits = self.s.m.bin(c, Bin::And, bits, mask);
+                let bits = self.s.m.bin(c, Bin::Shl, bits, field);
+                result = self.s.m.bin(c, Bin::Or, result, bits);
+            }
+        }
+        if source.is_some() {
+            Vec::new()
+        } else {
+            vec![result]
+        }
+    }
+
     fn raw_store_dword(&mut self, h: V, byte: V, value: V) {
         let undef = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(1);
@@ -1018,7 +1098,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&(b, i))
             .ok_or("an untracked global address")?;
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };

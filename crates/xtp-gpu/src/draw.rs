@@ -821,7 +821,7 @@ impl State {
             }
             .into());
         }
-        self.bind(list, p, false)?;
+        self.bind(list, p, false, [0; 3])?;
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -938,6 +938,7 @@ impl State {
         list: &HostList,
         p: &HostPipeline,
         compute: bool,
+        limits: [u32; 3],
     ) -> Result<(), &'static str> {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
@@ -1018,6 +1019,12 @@ impl State {
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    if u.root == xtp_shader::emit::DISPATCH_THREADS {
+                        values[u.index as usize] = *limits
+                            .get(u.dword as usize)
+                            .ok_or("invalid DispatchX axis")?;
+                        continue;
+                    }
                     if u.root == xtp_shader::emit::ROOT_UAV_BIAS {
                         values[u.index as usize] = biases
                             .iter()
@@ -1697,7 +1704,7 @@ impl State {
 
     /// Runs a dispatch on the host; the first that runs after dropped ones
     /// starts with a barrier ([`State::dispatch_dropped`]).
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, [x, y, z]: [u32; 3], limits: [u32; 3]) {
         #[cfg(feature = "diagnostics")]
         crate::indirect::note_direct(list, self.pipeline, [x, y, z]);
         #[cfg(feature = "diagnostics")]
@@ -1721,7 +1728,7 @@ impl State {
             self.dispatch_dropped("a graphics pipeline bound".into());
             return;
         }
-        if let Err(why) = self.bind(list, p, true) {
+        if let Err(why) = self.bind(list, p, true, limits) {
             self.dispatch_dropped(why.into());
             return;
         }
@@ -2401,7 +2408,7 @@ impl State {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true).map_err(Unready::from),
+                Some(p) if p.compute => self.bind(list, p, true, [0; 3]).map_err(Unready::from),
                 Some(_) => Err("a graphics pipeline bound".into()),
                 None => Err(Unready::NoPipeline),
             },

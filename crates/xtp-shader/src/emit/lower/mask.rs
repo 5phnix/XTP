@@ -121,7 +121,7 @@ impl<'a> Lower<'a> {
                 }
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
-                let bit = bit?;
+                let bit = self.with_partial(at, bit?);
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
