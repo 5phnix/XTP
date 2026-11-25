@@ -281,6 +281,8 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// UAV racine lus ou écrits par le programme, au registre u du même numéro.
+    pub root_uavs: Vec<u8>,
     /// Whether the shader reads the host's runtime stride table (`t0` in
     /// [`STRIDE_SPACE`], a [`StrideEntry`] per view-heap slot): only when
     /// translated for a [`Target`] that has one.
@@ -328,6 +330,15 @@ pub const RUN_TIME_READS: u8 = 1;
 /// [`HostShader::run_time_buffers`]: unordered access views through slots
 /// picked at run time (they may be written).
 pub const RUN_TIME_WRITES: u8 = 2;
+
+/// Octets entre le début aligné de la vue brute et l'adresse de l'UAV racine.
+pub const ROOT_UAV_BIAS: RootType = RootType::Other(0x103);
+/// Limite de chaque axe d'un DispatchX exprimé en threads, zéro pour un axe entier.
+pub const DISPATCH_THREADS: RootType = RootType::Other(0x104);
+/// Indices de SRV calculés à partir des constantes racine du dispatch.
+pub const PACKED_ADDRESS_SRV: RootType = RootType::Other(0x105);
+pub const SCALAR_ADDRESS_SRV: RootType = RootType::Other(0x106);
+pub const VECTOR_ADDRESS_SRV: RootType = RootType::Other(0x107);
 
 impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a
@@ -704,6 +715,7 @@ pub fn emit_for(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
         stride_table: l.stride_table,
         run_time_buffers: l.run_time_buffers,
     })
@@ -992,6 +1004,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             stride_table: false,
             run_time_buffers: 0,
         };
@@ -1005,6 +1018,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
                 stride_table: false,
                 run_time_buffers: 0,
             })

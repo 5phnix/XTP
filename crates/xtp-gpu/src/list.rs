@@ -1482,10 +1482,9 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// - So the flags are taken as that register, and bit 5
 ///   ([`USE_THREAD_DIMENSIONS`]) makes the counts threads. Without bit 1
 ///   the command processor runs whole groups, the last one rounded up (radv
-///   dispatches rays that way and lets its shaders check their bounds):
-///   what the host runs too, so no thread needs masking. A dispatch with
-///   bit 1 is logged ([`PARTIAL_GROUPS`]): there the host runs threads the
-///   console would not.
+///   dispatches rays that way and lets its shaders check their bounds).
+///   Pour le constructeur, les tailles en threads sont aussi transmises au
+///   shader : il masque les lanes de queue, comme dans le fork (#646).
 ///
 /// `XTP_DISPATCH_X_THREADS` sets other bits (`0` for none: every count is
 /// a group count, as before).
@@ -1493,20 +1492,29 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
     {
         let pipeline = kept_pipeline(this);
-        let host = crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
+        // Une image en attente ignore aussi la conversion des dimensions.
+        let host = if crate::pipeline::builder_held(pipeline) {
+            None
+        } else {
+            crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute)
+        };
         let group = host.and_then(console_group);
         let threads = thread_count_flags();
         if flags & threads != 0 && flags & PARTIAL_GROUPS != 0 {
             warn_once!(
                 flags = format_args!("{flags:#x}"),
-                "DispatchX with partial groups: the host runs the last group of each dimension \
-                 whole, threads the console would not run"
+                "DispatchX with partial groups: the host rounds the group counts up; spilled compute shaders mask the final lanes"
             );
         }
         let groups = dispatch_x_groups([x, y, z], flags, threads, group);
         note_dispatch_x(pipeline, host, ([x, y, z], flags), group, groups);
-        let [x, y, z] = groups;
-        state::dispatch(this, x, y, z);
+        let limits = if flags & threads != 0 {
+            [x, y, z]
+        } else {
+            [0; 3]
+        };
+        count_dispatch();
+        with_state(this, |list, s| s.dispatch(list, groups, limits));
     }
     #[cfg(not(windows))]
     {
@@ -1999,7 +2007,7 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, [x, y, z], [0; 3]));
     }
     /// Le GPU hôte exécute la grille XYZ sur un axe, celui que lit MeshGroup.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {

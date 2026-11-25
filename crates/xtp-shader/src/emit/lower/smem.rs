@@ -43,6 +43,15 @@ impl<'a> Lower<'a> {
         if self.x.res.spill_loads.binary_search(&site).is_ok() {
             return Ok(());
         }
+        if let Some(&read) = self.x.res.constant_reads.get(&site) {
+            let h = self.constant_read_handle(read, true);
+            for (k, &(reg, _)) in inst.writes.iter().enumerate() {
+                let at = self.s.m.i32(read.offset + 4 * k as u32);
+                let x = self.raw_words(h, at, 1)[0];
+                self.write(inst, reg, x, None);
+            }
+            return Ok(());
+        }
         let Fields::Smem {
             data,
             offset,

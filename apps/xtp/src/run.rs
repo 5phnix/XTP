@@ -213,6 +213,7 @@ pub fn run(
     println!("console        {}", xtp_hle::console::current().name());
     let dlls = xtp_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
+        register_builder(name, title_dir)?;
         println!("title dll      {name} at {:#x}", dll.base());
         xtp_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
@@ -333,6 +334,24 @@ fn watch(base: usize, size: usize) {
     });
 }
 
+#[cfg(windows)]
+fn register_builder(name: &str, dir: &Path) -> Result<()> {
+    if name.eq_ignore_ascii_case("XboxBvhBuilder.dll") {
+        let path = dir.join(name);
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        // Le relevé et le chemin jeu parcourent les mêmes conteneurs validés.
+        let containers = crate::shader::sources(&bytes).into_iter().filter_map(|s| {
+            let crate::shader::Source::Raw { data, .. } = s else {
+                return None;
+            };
+            let size = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+            Some(&data[..size])
+        });
+        xtp_gpu::pipeline::register_builder(containers)?;
+    }
+    Ok(())
+}
+
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &xtp_hle::HostPolicy, dll: &str) -> bool {
@@ -385,6 +404,7 @@ impl LateDlls {
                     dlls: &new,
                 };
                 for (name, dll) in &new {
+                    register_builder(name, &self.title_dir)?;
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",
                         dll.base()

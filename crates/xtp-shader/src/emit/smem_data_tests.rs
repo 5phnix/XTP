@@ -82,6 +82,7 @@ fn build(words: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
         stride_table: lowered.stride_table,
         run_time_buffers: lowered.run_time_buffers,
     };

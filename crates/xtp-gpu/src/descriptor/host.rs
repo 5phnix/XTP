@@ -1040,6 +1040,12 @@ impl HostHeap {
         self.keep(index, Some(buffer.clone()));
     }
 
+    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, window: RawWindow) {
+        raw_view(buffer, window, true, self.cpu(index));
+        self.forget_view(index);
+        self.keep(index, Some(buffer.clone()));
+    }
+
     /// Makes slot `index` a raw buffer view that reads zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
         null_buffer_view(self.cpu(index));

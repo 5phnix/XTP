@@ -186,6 +186,8 @@ pub(crate) struct State {
     /// address, host copy, 0 for a view in place or [`State::writes`] + 1
     /// for a copy of the list's own) → slot.
     root_srv_slots: std::collections::HashMap<(usize, u64, usize, u64), u32>,
+    /// Une vue brute par segment de tampon et par tas pour cet enregistrement.
+    root_uav_slots: std::collections::HashMap<(usize, usize, u64, u64), u32>,
     /// Root CBVs copied on the GPU in this list: (host copy, address,
     /// [`State::writes`]) → host address.
     cbv_copies: std::collections::HashMap<(usize, u64, u64), u64>,
@@ -243,7 +245,7 @@ const CBV_SPAN: u64 = 1 << 16;
 /// The bytes of a root SRV not on 16 bytes of its host copy that are
 /// copied for its view: what was brought up to date for root SRVs before
 /// they were bounded (the view has no size of its own).
-const MISALIGNED_SPAN: u64 = 1 << 20;
+const MISALIGNED_SPAN: u64 = xtp_shader::resource::MISALIGNED_SRV_BYTES as u64;
 
 /// Bytes of the list's own memory per chunk, past which nothing is placed:
 /// [`CBV_SPAN`] more follow, so a root CBV copied there never reads past
@@ -983,7 +985,7 @@ impl State {
         if let Some(saved) = &mut self.incomplete_targets {
             saved.rebind(list, self.pipeline);
         }
-        self.bind(list, p, false)?;
+        self.bind(list, p, false, [0; 3])?;
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1065,11 +1067,10 @@ impl State {
     /// which are bound as tables in a view heap; the console needs no heap
     /// for root views. Once the list has XTP's heap, it keeps it until the
     /// title binds a view heap.
-    fn wanted_heaps(&self, root_srvs: bool) -> [usize; 2] {
+    fn wanted_heaps(&self, tabled: bool) -> [usize; 2] {
         let mut wanted = self.heaps;
         let title_views =
             wanted[0] != 0 && crate::descriptor::heap(wanted[0] as This).host().is_some();
-        let tabled = root_srvs && crate::pipeline::host::bounded_root_srvs();
         if !title_views && (tabled || self.host_heaps[0] == crate::descriptor::OWN_VIEW_HEAP) {
             wanted[0] = crate::descriptor::OWN_VIEW_HEAP;
         }
@@ -1138,12 +1139,25 @@ impl State {
         list: &HostList,
         p: &HostPipeline,
         compute: bool,
+        limits: [u32; 3],
     ) -> Result<(), &'static str> {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
-        let wanted = self.wanted_heaps(root_srvs);
+        let root_uavs = p.stages.iter().any(|s| !s.root_uavs.is_empty());
+        use xtp_shader::emit::{PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV};
+        let constant_reads = p.stages.iter().any(|s| {
+            s.translated().host.user_data.iter().any(|u| {
+                matches!(
+                    u.root,
+                    PACKED_ADDRESS_SRV | SCALAR_ADDRESS_SRV | VECTOR_ADDRESS_SRV
+                )
+            })
+        });
+        let wanted = self.wanted_heaps(
+            constant_reads || root_uavs || root_srvs && crate::pipeline::host::bounded_root_srvs(),
+        );
         self.set_host_heaps(list, wanted);
         self.bind_pipeline(list, p, compute);
         let picked = p
@@ -1174,12 +1188,67 @@ impl State {
                 }
                 return Err("no dynamic slots for its tables");
             }
+            let mut biases = Vec::new();
+            for &(slot, param) in &stage.root_uavs {
+                let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                else {
+                    return Err("a root UAV has no bound address");
+                };
+                let (handle, bias) = self.root_uav(list, address)?;
+                biases.push((slot, bias));
+                // SAFETY: le tas actif conserve cette vue pendant la soumission.
+                unsafe {
+                    if compute {
+                        self.compute_root(list, param, ComputeRoot::Table(handle));
+                    } else {
+                        l.SetGraphicsRootDescriptorTable(param, handle);
+                    }
+                }
+            }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    if u.root == xtp_shader::emit::DISPATCH_THREADS {
+                        values[u.index as usize] = *limits
+                            .get(u.dword as usize)
+                            .ok_or("invalid DispatchX axis")?;
+                        continue;
+                    }
+                    if u.root == xtp_shader::emit::ROOT_UAV_BIAS {
+                        values[u.index as usize] = biases
+                            .iter()
+                            .find(|b| b.0 == u.slot)
+                            .ok_or("missing root UAV bias")?
+                            .1;
+                        continue;
+                    }
+                    if matches!(
+                        u.root,
+                        PACKED_ADDRESS_SRV | SCALAR_ADDRESS_SRV | VECTOR_ADDRESS_SRV
+                    ) {
+                        let words = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                            Some(Root::Constants(words)) => words.as_slice(),
+                            _ => &[],
+                        };
+                        let dword = u.dword as usize;
+                        let address = words.get(dword).and_then(|&lo| match u.root {
+                            PACKED_ADDRESS_SRV => Some(u64::from(lo) << 8),
+                            _ => words.get(dword + 1).map(|&hi| {
+                                (u64::from(hi) << 32)
+                                    | u64::from(if u.root == SCALAR_ADDRESS_SRV {
+                                        lo & !3
+                                    } else {
+                                        lo
+                                    })
+                            }),
+                        });
+                        values[u.index as usize] =
+                            self.root_srv_slot(list, address.filter(|&a| a != 0))?.1;
+                        continue;
+                    }
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
@@ -1644,6 +1713,47 @@ impl State {
         Ok(())
     }
 
+    /// Ported from Marvisak/VIctory#1077 (head 873548f) by DuarttBR.
+    /// Le décalage est celui de la vue liée, y compris pour un compteur
+    /// situé à 4, 8 ou 12 octets du début aligné.
+    fn root_uav(
+        &mut self,
+        list: &HostList,
+        address: u64,
+    ) -> Result<(D3D12_GPU_DESCRIPTOR_HANDLE, u32), &'static str> {
+        let heap = self.host_heaps[0];
+        let host = host_heap(heap).ok_or("a root UAV without a view heap")?;
+        let copy = crate::shadow::find(address, 4).ok_or("a root UAV outside a title buffer")?;
+        // SAFETY: la copie possède la ressource.
+        let flags = unsafe { copy.buffer.GetDesc() }.Flags;
+        if !flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+            return Err("a root UAV on a buffer without unordered access");
+        }
+        let window =
+            xtp_shader::emit::RawWindow::covering(copy.offset(address), copy.left(address) & !3)
+                .ok_or("a root UAV off a dword")?;
+        let key = (
+            heap,
+            copy.buffer.as_raw() as usize,
+            window.first,
+            u64::from(window.dwords),
+        );
+        let slot = match self.root_uav_slots.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                let slot = host.dynamic(1).ok_or("no dynamic slot for a root UAV")?;
+                self.recording.range(list, heap, slot, 1);
+                host.raw_uav_at(slot, &copy.buffer, window);
+                self.root_uav_slots.insert(key, slot);
+                slot
+            }
+        };
+        let bytes = u64::from(window.elements(0)) * 4;
+        copy.refresh(list, address, bytes);
+        copy.gpu_writes(list, address, bytes);
+        Ok((host.gpu_handle(slot), window.bias))
+    }
+
     /// The slot, in the view heap set on the host list (the title's, or
     /// XTP's own: [`State::wanted_heaps`]), of a root SRV's one-view table:
     /// a raw view from `address` to the end of its buffer's host copy, the
@@ -1810,7 +1920,11 @@ impl State {
 
     /// Runs a dispatch on the host; the first that runs after dropped ones
     /// starts with a barrier ([`State::dispatch_dropped`]).
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, [x, y, z]: [u32; 3], limits: [u32; 3]) {
+        if crate::pipeline::builder_held(self.pipeline as This) {
+            self.dispatch_dropped("BVH builder held".into());
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         crate::indirect::note_direct(list, self.pipeline, [x, y, z]);
         #[cfg(feature = "diagnostics")]
@@ -1834,7 +1948,7 @@ impl State {
             self.dispatch_dropped("a graphics pipeline bound".into());
             return;
         }
-        if let Err(why) = self.bind(list, p, true) {
+        if let Err(why) = self.bind(list, p, true, limits) {
             self.dispatch_dropped(why.into());
             return;
         }
@@ -2462,6 +2576,9 @@ impl State {
             false
         };
         // Skip before the argument clamp can mutate the indirect buffer.
+        if kind == DISPATCH && crate::pipeline::builder_held(self.pipeline as This) {
+            return fail("BVH builder held".into());
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return fail(Unready::NoPipeline);
@@ -2596,7 +2713,7 @@ impl State {
         let compute = kind == DISPATCH;
         self.pending_compute = Some(Vec::new());
         let ready = if compute {
-            self.bind(list, p, true).map_err(Unready::from)
+            self.bind(list, p, true, [0; 3]).map_err(Unready::from)
         } else {
             self.prepare_for(list, kind == INDEXED, kind == MESH)
         };
@@ -4435,8 +4552,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         let list = TitleList::new();
         let mut state = State::default();
         assert!(!state.dropped_dispatch);
-        state.dispatch(list.host(), 1, 1, 1);
-        state.dispatch(list.host(), 1, 1, 1);
+        state.dispatch(list.host(), [1; 3], [0; 3]);
+        state.dispatch(list.host(), [1; 3], [0; 3]);
         assert!(state.dropped_dispatch, "marked");
         state.reset(std::ptr::null());
         assert!(!state.dropped_dispatch, "gone with the reset");
@@ -4862,6 +4979,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                     static_samplers: vec![],
                     root_cbvs: vec![],
                     root_srvs: vec![],
+                    root_uavs: vec![],
                     stride_table: false,
                     run_time_buffers: 0,
                 },

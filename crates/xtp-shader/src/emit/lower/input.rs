@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{Lower, Stop, Val, Why, packed_half, packed_partners};
 use crate::emit::UserData;
-use crate::emit::bitcode::{Attr, Bin, Cast, V};
+use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::container::SigElement;
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, Operand};
@@ -531,6 +531,85 @@ impl<'a> Lower<'a> {
             &[h, row],
         );
         Val::I32(self.s.m.extract(entry, r, index % 4))
+    }
+
+    /// Ported from fxceless's VIctory fork #646 (head 170c24269) by mynzjerko,
+    /// après VICTORY_THREAD_DIMS de Yorivel (2521646b8).
+    /// Les threads de queue participent aux barrières. Les effets et les
+    /// votes utilisent ce prédicat, y compris dans les groupes fractionnés.
+    pub(super) fn dispatch_threads(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        let e = self.s.entry;
+        for (axis, dim) in cs
+            .threads
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, dim)| dim > 1)
+        {
+            let limit = self.host_word(crate::emit::DISPATCH_THREADS, 0, axis as u32);
+            let group = self.group_id(axis as u8);
+            let Val::I32(thread) = self.input(Input::ThreadIdInGroup(axis as u8)) else {
+                unreachable!()
+            };
+            let zero = self.s.m.i32(0);
+            let size = self.s.m.i32(dim);
+            let whole = self.s.m.bin(e, Bin::UDiv, limit, size);
+            let tail = self.s.m.bin(e, Bin::URem, limit, size);
+            let full_group = self.s.m.cmp(e, pred::IULT, group, whole);
+            let last_group = self.s.m.cmp(e, pred::EQ, group, whole);
+            let in_tail = self.s.m.cmp(e, pred::IULT, thread, tail);
+            let in_tail = self.s.m.bin(e, Bin::And, last_group, in_tail);
+            let enabled = self.s.m.bin(e, Bin::Or, full_group, in_tail);
+            let unlimited = self.s.m.cmp(e, pred::EQ, limit, zero);
+            let enabled = self.s.m.bin(e, Bin::Or, unlimited, enabled);
+            self.partial_active = Some(self.with_partial(e, enabled));
+        }
+    }
+
+    pub(super) fn with_partial(&mut self, at: usize, bit: V) -> V {
+        self.partial_active
+            .map_or(bit, |active| self.s.m.bin(at, Bin::And, active, bit))
+    }
+
+    /// Les dwords fournis par l'hôte suivent les arguments du titre.
+    pub(super) fn host_word(&mut self, root: RootType, slot: u8, dword: u32) -> V {
+        if let Some((_, v)) = self
+            .host_words
+            .iter()
+            .find(|(u, _)| (u.root, u.slot, u.dword) == (root, slot, dword))
+        {
+            return *v;
+        }
+        let index = self.host_words.len() as u32;
+        if index.is_multiple_of(4) {
+            self.host_rows.push(self.s.m.pending_i32());
+        }
+        let row = self.host_rows[index as usize / 4];
+        let h = *self
+            .user_data
+            .get_or_insert_with(|| self.s.user_data_handle());
+        let e = self.s.entry;
+        let values = self.s.op(
+            e,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[h, row],
+        );
+        let v = self.s.m.extract(e, values, index % 4);
+        self.host_words.push((
+            UserData {
+                index,
+                slot,
+                root,
+                dword,
+            },
+            v,
+        ));
+        v
     }
 
     pub(super) fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {

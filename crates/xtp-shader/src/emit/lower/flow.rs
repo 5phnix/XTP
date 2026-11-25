@@ -1116,7 +1116,16 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
-                    let _ = self.lazy_barycentric(arg);
+                    // Une constante déportée peut servir uniquement sur cette
+                    // arête. Sa lecture à l'entrée domine tous les prédécesseurs.
+                    if !self.x.res.spill_loads.is_empty()
+                        && let Some(&(param, dword)) = self.params.get(&arg)
+                    {
+                        let val = self.user(param, dword);
+                        self.vals.insert(arg, val);
+                    } else {
+                        let _ = self.lazy_barycentric(arg);
+                    }
                 }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,

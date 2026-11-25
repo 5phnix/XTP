@@ -41,6 +41,24 @@ impl<'a> Lower<'a> {
                     Some(v) => Some(self.i32_of(v)?),
                     None => None,
                 };
+                let x = if self
+                    .used_kind(src)
+                    .is_some_and(|u| u.kind == ResourceType::Uav)
+                {
+                    let bias = self.host_word(
+                        crate::emit::ROOT_UAV_BIAS,
+                        self.x.native.layout[address.param].slot,
+                        0,
+                    );
+                    Some(x.map_or(bias, |v| {
+                        let mut valid = self.s.m.bool(true);
+                        let sum = self.raw_add(v, bias, &mut valid);
+                        let max = self.s.m.i32(u32::MAX);
+                        self.s.m.select(self.cur, valid, sum, max)
+                    }))
+                } else {
+                    x
+                };
                 Ok((address.offset, x))
             }
             _ => Ok((0, None)),
@@ -197,21 +215,18 @@ impl<'a> Lower<'a> {
                     .layout
                     .get(address.param)
                     .ok_or("a descriptor built around a table in the code")?;
-                let kind = self
-                    .x
-                    .native
-                    .used
-                    .iter()
-                    .find(|u| u.user_data == rp.user_data)
-                    .map(|u| u.kind);
+                let kind = self.used_kind(src).map(|u| u.kind);
                 match (rp.root, kind, props.0) {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
-                        Ok(self.s.root_srv_handle(rp.slot))
+                        Ok(self.s.root_raw_handle(rp.slot, false))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    (RootType::Descriptor, Some(ResourceType::Uav), 0x100b) => {
+                        Ok(self.s.root_raw_handle(rp.slot, true))
+                    }
+                    _ => Err("a typed or incompatible root view"),
                 }
             }
             Source::Phi { block, args } => {
