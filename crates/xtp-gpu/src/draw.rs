@@ -1450,6 +1450,15 @@ impl State {
                     }
                 }
             }
+            // XTP_DIAG_DIR_LIGHT: a directional light colour of ours written
+            // into the light record the deferred lighting reads, before the
+            // op (`frameprobe::dir_light`); before the probe, which then
+            // shows it.
+            #[cfg(feature = "diagnostics")]
+            if crate::frameprobe::dir_light_on() {
+                let tables = self.probe_tables(&t.used, &made, compute);
+                crate::frameprobe::dir_light(list, &tables);
+            }
             // XTP_FRAME_PROBE: what the stage reads through its tables, and
             // the host copies' bytes just before the op (`frameprobe`).
             #[cfg(feature = "diagnostics")]
