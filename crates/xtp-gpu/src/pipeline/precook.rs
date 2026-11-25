@@ -166,22 +166,27 @@ pub fn cache() -> Result<Cache, String> {
             library: 0,
         });
     };
+    Ok(Cache {
+        recorded: digest_in(dir)?,
+        library: super::library::file_bytes().unwrap_or(0),
+    })
+}
+
+/// The BLAKE3 of the file of kept descriptions in `dir` now, in
+/// hexadecimal; `none` without one.
+fn digest_in(dir: &std::path::Path) -> Result<String, String> {
     let path = dir.join(super::record::FILE);
-    let recorded = match std::fs::File::open(&path) {
+    match std::fs::File::open(&path) {
         Ok(file) => {
             let mut hasher = blake3::Hasher::new();
             hasher
                 .update_reader(file)
                 .map_err(|e| format!("reading {}: {e}", path.display()))?;
-            hasher.finalize().to_hex().to_string()
+            Ok(hasher.finalize().to_hex().to_string())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "none".into(),
-        Err(e) => return Err(format!("reading {}: {e}", path.display())),
-    };
-    Ok(Cache {
-        recorded,
-        library: super::library::file_bytes().unwrap_or(0),
-    })
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("none".into()),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
 }
 
 /// Makes the library a new generation (see the module): to be asked
@@ -204,9 +209,18 @@ pub struct Recorded {
     /// The file's size, and where it is (none without a pipeline cache).
     pub bytes: u64,
     pub path: Option<std::path::PathBuf>,
+    /// The BLAKE3 of the file as read, in hexadecimal (`none` without
+    /// one): what [`replay`] makes is this file's, whatever a session
+    /// appends to it meanwhile, so that a note says this one.
+    pub digest: String,
     /// The file was rewritten first, past its bound: its size before, and
     /// the descriptions that went.
     pub compacted: Option<(u64, usize)>,
+    /// The file was of an earlier version, started again: its size.
+    pub earlier: Option<u64>,
+    /// The file is past its bound but was not rewritten: another process
+    /// (a session) has it open.
+    pub not_compacted: bool,
 }
 
 /// A kept pipeline as the session made it: its shaders, and its graphics
@@ -237,45 +251,64 @@ impl Recorded {
 pub fn recorded() -> Result<Recorded, String> {
     match super::library::dir() {
         Some(dir) => recorded_in(dir, super::record::COMPACT_AT, super::record::COMPACT_TO),
-        None => Ok(Recorded {
+        None => Ok(Recorded::none()),
+    }
+}
+
+impl Recorded {
+    /// No descriptions, from no file.
+    fn none() -> Recorded {
+        Recorded {
             pipelines: Vec::new(),
             damaged: 0,
             missing: 0,
             repeated: 0,
             bytes: 0,
             path: None,
+            digest: "none".into(),
             compacted: None,
-        }),
+            earlier: None,
+            not_compacted: false,
+        }
     }
 }
 
 /// [`recorded`] of the file in `dir`, rewritten first down to `to` bytes
-/// if it is larger than `at`.
+/// if it is larger than `at` (or started again if it is of an earlier
+/// version), unless another process has it open.
 fn recorded_in(dir: &std::path::Path, at: u64, to: u64) -> Result<Recorded, String> {
-    let mut out = Recorded {
-        pipelines: Vec::new(),
-        damaged: 0,
-        missing: 0,
-        repeated: 0,
-        bytes: 0,
-        path: None,
-        compacted: None,
-    };
+    let mut out = Recorded::none();
     let mut file = super::record::read(dir)?;
-    if file.bytes > at {
-        let c = super::record::compact(dir, to)?;
-        tracing::info!(
-            before = c.before,
-            after = c.after,
-            kept = c.kept,
-            dropped = c.dropped,
-            "recorded pipelines: rewritten"
-        );
-        out.compacted = Some((c.before, c.dropped));
+    if file.bytes > at || file.earlier {
+        match super::record::compact(dir, to)? {
+            Some(c) => {
+                tracing::info!(
+                    before = c.before,
+                    after = c.after,
+                    kept = c.kept,
+                    dropped = c.dropped,
+                    earlier = c.earlier,
+                    "recorded pipelines: rewritten"
+                );
+                if c.earlier {
+                    out.earlier = Some(c.before);
+                } else {
+                    out.compacted = Some((c.before, c.dropped));
+                }
+            }
+            None => {
+                tracing::info!(
+                    bytes = file.bytes,
+                    "recorded pipelines: not rewritten, another process has the file open"
+                );
+                out.not_compacted = true;
+            }
+        }
         file = super::record::read(dir)?;
     }
     out.path = Some(dir.join(super::record::FILE));
     out.bytes = file.bytes;
+    out.digest = file.digest.clone();
     out.damaged = file.damaged;
     let mut seen = HashSet::new();
     for kept in &file.pipelines {
@@ -471,6 +504,35 @@ pub(in crate::pipeline) mod tests {
         assert_eq!((r.compacted, r.len()), (Some((before, 0)), 1));
         let r = recorded_in(dir.path(), 0, 0).unwrap();
         assert_eq!((r.compacted, r.len()), (Some((before, 1)), 0));
+    }
+
+    /// The descriptions made again are those of the file as read: its
+    /// digest is that file's, not the one a session appends to meanwhile
+    /// (the note says what was made, and the next precook makes the rest).
+    #[test]
+    fn the_digest_is_the_files_as_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(super::super::record::FILE);
+        let none = recorded_in(dir.path(), u64::MAX, u64::MAX).unwrap();
+        assert_eq!((none.len(), none.digest.as_str()), (0, "none"));
+        let stream = super::super::record::stream_of(&[(14, words(&[3]))]);
+        let keep = |pixel: &[u8]| {
+            let shaders = vec![
+                super::super::shader("vertex", b"precook digest: vertex"),
+                super::super::shader("pixel", pixel),
+            ];
+            assert!(super::super::record::keep_in(dir.path(), &shaders, &stream));
+        };
+        keep(b"precook digest: pixel a");
+        let read = recorded_in(dir.path(), u64::MAX, u64::MAX).unwrap();
+        let digest = blake3::hash(&std::fs::read(&path).unwrap())
+            .to_hex()
+            .to_string();
+        assert_eq!((read.len(), read.digest.as_str()), (1, digest.as_str()));
+        // A session appends after the read.
+        keep(b"precook digest: pixel b");
+        assert_eq!(read.digest, digest, "the file as read");
+        assert_ne!(digest_in(dir.path()).unwrap(), digest, "the file now");
     }
 
     /// A graphics pipeline a session kept is made again into the library

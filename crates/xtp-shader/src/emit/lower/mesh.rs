@@ -105,6 +105,18 @@ impl<'a> Lower<'a> {
     // program's count are culled and vertices past it unused; this costs
     // the host the unused vertex and primitive slots. Pass the program's own
     // counts if that shows in frame time.
+    // shortcut: D3D12 limits a mesh shader's outputs to 32 KiB (vertex
+    // scalars × maximum vertices plus primitive scalars × maximum
+    // primitives, 4 bytes each), which `dxil.dll` checks and the host's
+    // driver does not. 53 of BTP 6's mesh programs (character skin and
+    // transform programs, groups of 128 lanes, 128 vertices, 65 to 71
+    // scalars a vertex) are declared past it, 33,280 to 36,352 bytes. The
+    // maxima are the group's lanes, one vertex each, so they cannot shrink;
+    // 25 to 34 of those scalars are 16-bit values, which declared two per
+    // dword would fit, the pixel programs that read them unpacking them
+    // (both stages' signatures change together). They are translated, not
+    // refused: what they draw is right on the drivers that take them.
+    // `xtp shader-survey` counts them (its `mesh outputs` line).
     pub(super) fn mesh_prologue(&mut self, mesh: crate::emit::shader::Mesh) -> Result<(), Why> {
         let threads = self.s.threads.expect("mesh")[0];
         if mesh.topology != 2 {

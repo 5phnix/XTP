@@ -32,15 +32,29 @@
 //! console reads 0: clamping needs the pixel and compute programs to clamp
 //! their outputs to such targets (a shader translation change). Unordered
 //! access views cannot remap alpha: a typed load of such a texture reads
-//! the stored alpha. Typed buffer views of a replaced format are replaced
-//! too, with the stand-in's element size.
+//! the stored alpha.
+//!
+//! Typed buffer views keep the title's element size ([`buffer_format`]):
+//! their bytes are the title's, never converted, so a stand-in's wider
+//! elements would read other bytes. A buffer view in a format of the table
+//! is made in the title's own format where the host has it for buffers;
+//! where it does not (the console's own numbers, and formats the host lacks
+//! for buffers) the view is made null, and counted for the frame log.
+//!
+//! A view of a typed texture in another format of the texture's family
+//! keeps the view's format where D3D12 casts it ([`castable`], [`view_cast`]:
+//! sRGB and linear, UINT and UNORM, and so on); views D3D12 does not cast
+//! take the texture's own. Each such pair is counted for the frame log
+//! ([`note_view_cast`]), render targets with them.
 
 /// `D3D12_FORMAT_SUPPORT1` bits.
 pub(crate) mod uses {
+    pub(crate) const BUFFER: u32 = 0x1;
     pub(crate) const VERTEX_BUFFER: u32 = 0x2;
     pub(crate) const TEXTURE_1D: u32 = 0x10;
     pub(crate) const TEXTURE_2D: u32 = 0x20;
     pub(crate) const TEXTURE_3D: u32 = 0x40;
+    pub(crate) const SHADER_LOAD: u32 = 0x100;
     pub(crate) const SHADER_SAMPLE: u32 = 0x200;
     pub(crate) const RENDER_TARGET: u32 = 0x4000;
     pub(crate) const BLENDABLE: u32 = 0x8000;
@@ -400,6 +414,181 @@ pub(crate) fn conversion(title: u32, host: u32) -> Option<Option<Convert>> {
     }
 }
 
+/// How a typed format's channels read, for D3D12's casting rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reads {
+    Float,
+    /// UNORM, sRGB included.
+    Unorm,
+    Snorm,
+    Uint,
+    Sint,
+}
+
+/// How the channels of typed color format `format` read; `None` for a
+/// typeless format, depth and stencil ones (D3D12 lists casts of them among
+/// its known failures), BC6H, and formats outside the families.
+fn reads(format: u32) -> Option<Reads> {
+    Some(match format {
+        2 | 6 | 10 | 16 | 34 | 41 | 54 => Reads::Float,
+        11 | 24 | 28 | 29 | 35 | 49 | 56 | 61 | 65 | 71 | 72 | 74 | 75 | 77 | 78 | 80 | 83 | 87
+        | 88 | 91 | 93 | 98 | 99 => Reads::Unorm,
+        13 | 31 | 37 | 51 | 58 | 63 | 81 | 84 => Reads::Snorm,
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => Reads::Uint,
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => Reads::Sint,
+        _ => return None,
+    })
+}
+
+/// Whether D3D12 lets a view in format `view` read or write a resource
+/// created in typed format `own` (host formats), where the host casts
+/// fully typed formats ([`Caps::fully_typed_casting`]): another format of
+/// the same family, unless one of the two is a float format and the other
+/// not, or one is UNORM and the other SNORM (D3D12's relaxed casting rules,
+/// DirectX-Specs "RelaxedCasting"). Depth and stencil formats, BC6H and
+/// typeless formats are left out ([`reads`]).
+pub(crate) fn castable(own: u32, view: u32) -> bool {
+    if own == view {
+        return true;
+    }
+    let (Some(a), Some(b)) = (reads(own), reads(view)) else {
+        return false;
+    };
+    super::family(own) == super::family(view)
+        && (a == Reads::Float) == (b == Reads::Float)
+        && !matches!(
+            (a, b),
+            (Reads::Unorm, Reads::Snorm) | (Reads::Snorm, Reads::Unorm)
+        )
+}
+
+/// Whether host views of typed textures cast at all (`XTP_VIEW_CAST=0`
+/// gives every such view the texture's format, as before, to compare).
+fn casts_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XTP_VIEW_CAST").map_or(true, |v| v != "0");
+        if !on {
+            tracing::warn!(
+                "XTP_VIEW_CAST=0: views of typed textures in another format of their family take the texture's format"
+            );
+        }
+        on
+    })
+}
+
+/// Whether a shader view (an unordered access one if `unordered`) in host
+/// format `view` of a host texture in typed format `own` keeps its format:
+/// D3D12 casts it ([`castable`]) on this host, which can read (or write)
+/// that format through such a view.
+pub(crate) fn view_cast(own: u32, view: u32, unordered: bool) -> bool {
+    view_cast_with(&HostCaps, own, view, unordered) && casts_on()
+}
+
+/// [`view_cast`] on a device that can do `caps`.
+fn view_cast_with(caps: &impl Caps, own: u32, view: u32, unordered: bool) -> bool {
+    let needs = if unordered {
+        uses::TYPED_UNORDERED_ACCESS
+    } else {
+        uses::SHADER_LOAD
+    };
+    own == view
+        || castable(own, view) && caps.fully_typed_casting() && caps.support1(view) & needs != 0
+}
+
+/// The host format of a typed buffer view (an unordered access one if
+/// `unordered`) of title format `title`: the same number but for a format
+/// of [`TABLE`], which keeps the title's element size (a buffer's bytes are
+/// the title's: a stand-in's wider elements would read other bytes). Such
+/// a format is the title's own where the host has it for buffer views;
+/// else the typeless format of the title's element size, of which the host
+/// makes no typed view (the slot reads zeros), counted for the frame log.
+pub(crate) fn buffer_format(title: u32, unordered: bool) -> u32 {
+    buffer_format_with(&HostCaps, title, unordered)
+}
+
+/// [`buffer_format`] on a device that can do `caps`.
+fn buffer_format_with(caps: &impl Caps, title: u32, unordered: bool) -> u32 {
+    let Some(e) = entry(title) else {
+        return super::pc_vertex_format(title);
+    };
+    let needs = if unordered {
+        uses::BUFFER | uses::TYPED_UNORDERED_ACCESS
+    } else {
+        uses::BUFFER
+    };
+    if e.on_pc && caps.support1(title) & needs == needs {
+        return title;
+    }
+    note_buffer_without_format(title, unordered);
+    match super::element(title).map(|(bytes, _)| bytes) {
+        Some(1) => 60,
+        Some(2) => 53,
+        Some(8) => 15,
+        _ => 39,
+    }
+}
+
+/// What a view in another format of its texture's family is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ViewUse {
+    /// A shader resource view.
+    Shader,
+    /// An unordered access view.
+    Unordered,
+    /// A render target view.
+    Target,
+    /// A format the title lists as castable when it creates the resource.
+    Listed,
+}
+
+/// Counts a view in host format `view` of a host texture in typed format
+/// `own` (another format of its family), and whether it keeps its own
+/// format (`cast`: the host casts it; for a target or a listed castable
+/// format, whether the host can view the texture so at all). The first of
+/// each kind is logged.
+pub(crate) fn note_view_cast(own: u32, view: u32, how: ViewUse, cast: bool) {
+    let first = {
+        let mut counts = counts();
+        let n = counts.casts.entry((how, own, view, cast)).or_default();
+        *n += 1;
+        *n == 1
+    };
+    if first {
+        tracing::info!(
+            ?how,
+            texture = own,
+            view,
+            cast,
+            "a view in another format of its texture's family (first of its kind)"
+        );
+    }
+}
+
+/// Counts a shader view of a whole typeless host copy that the title made
+/// without a description, made in format `read` (it was null before).
+pub(crate) fn note_whole_view(read: u32) {
+    *counts().wholes.entry(read).or_default() += 1;
+}
+
+/// Counts a typed buffer view in title format `title` the host has no
+/// buffer format for ([`buffer_format`]); the first of each is logged.
+fn note_buffer_without_format(title: u32, unordered: bool) {
+    let first = {
+        let mut counts = counts();
+        let n = counts.buffers.entry((title, unordered)).or_default();
+        *n += 1;
+        *n == 1
+    };
+    if first {
+        tracing::warn!(
+            format = title,
+            unordered,
+            "a typed buffer view in a title format the host has no buffer format for: null"
+        );
+    }
+}
+
 /// What a device can do with formats.
 pub(crate) trait Caps {
     /// `D3D12_FORMAT_SUPPORT1` of `format` (0: none).
@@ -407,6 +596,14 @@ pub(crate) trait Caps {
 
     /// Whether `count` samples of `format` exist (1: always).
     fn samples(&self, format: u32, count: u32) -> bool;
+
+    /// Whether views of a typed resource may name another format of its
+    /// family (`CastingFullyTypedFormatSupported`, D3D12 options 3; the
+    /// runtime reports it for every driver since Windows 10 1703), within
+    /// the rules of [`castable`].
+    fn fully_typed_casting(&self) -> bool {
+        false
+    }
 
     /// The choice for a format of [`TABLE`]; `None` for the others.
     fn choice(&self, format: u32) -> Option<Choice> {
@@ -478,6 +675,23 @@ impl Caps for HostCaps {
         let at = TABLE.iter().position(|e| e.title == format)?;
         Some(choices()[at])
     }
+
+    fn fully_typed_casting(&self) -> bool {
+        #[cfg(windows)]
+        {
+            static CASTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *CASTING.get_or_init(|| {
+                let casting = crate::host::host().is_some_and(|h| h.device.fully_typed_casting());
+                tracing::info!(
+                    casting,
+                    "host casts views of typed resources within a family"
+                );
+                casting
+            })
+        }
+        #[cfg(not(windows))]
+        false
+    }
 }
 
 /// The highest format number asked about.
@@ -528,6 +742,20 @@ impl Caps for windows::Win32::Graphics::Direct3D12::ID3D12Device {
             )
         };
         asked.is_ok() && data.NumQualityLevels > 0
+    }
+
+    fn fully_typed_casting(&self) -> bool {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let mut data = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // SAFETY: the query writes its own structure of the given size.
+        let asked = unsafe {
+            self.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut data).cast(),
+                size_of_val(&data) as u32,
+            )
+        };
+        asked.is_ok() && data.CastingFullyTypedFormatSupported.as_bool()
     }
 }
 
@@ -592,15 +820,26 @@ pub(crate) fn refusal(support: Support, dimension: u32, flags: u32) -> Option<&'
 }
 
 /// Textures refused before the driver, and made in a stand-in, since the
-/// start, by reason (for the frame log).
+/// start, by reason; views in another format of their texture's family,
+/// and typed buffer views without a host format (for the frame log).
 static COUNTS: std::sync::Mutex<Counts> = std::sync::Mutex::new(Counts {
     refused: std::collections::BTreeMap::new(),
     stood_in: std::collections::BTreeMap::new(),
+    casts: std::collections::BTreeMap::new(),
+    buffers: std::collections::BTreeMap::new(),
+    wholes: std::collections::BTreeMap::new(),
 });
 
 struct Counts {
     refused: std::collections::BTreeMap<String, u64>,
     stood_in: std::collections::BTreeMap<(u32, u32), u64>,
+    /// By use, texture format, view format and whether it kept its own.
+    casts: std::collections::BTreeMap<(ViewUse, u32, u32, bool), u64>,
+    /// By title format and whether unordered access.
+    buffers: std::collections::BTreeMap<(u32, bool), u64>,
+    /// Whole views of typeless host copies made without a description, by
+    /// the format they read.
+    wholes: std::collections::BTreeMap<u32, u64>,
 }
 
 fn counts() -> std::sync::MutexGuard<'static, Counts> {
@@ -648,7 +887,13 @@ pub(crate) fn report() -> Option<String> {
     use std::sync::atomic::Ordering::Relaxed;
     let [live, bytes, extra, pooled, pooled_bytes] = [0, 1, 2, 3, 4].map(|i| LIVE[i].load(Relaxed));
     let counts = counts();
-    if counts.refused.is_empty() && counts.stood_in.is_empty() && live == 0 {
+    if counts.refused.is_empty()
+        && counts.stood_in.is_empty()
+        && counts.casts.is_empty()
+        && counts.buffers.is_empty()
+        && counts.wholes.is_empty()
+        && live == 0
+    {
         return None;
     }
     #[cfg(windows)]
@@ -677,11 +922,44 @@ pub(crate) fn report() -> Option<String> {
         .iter()
         .map(|(why, n)| format!("{n} {why}"))
         .collect();
+    let casts: Vec<String> = counts
+        .casts
+        .iter()
+        .map(|(&(how, own, view, cast), n)| {
+            let what = match (how, cast) {
+                (_, true) => "cast",
+                (ViewUse::Target | ViewUse::Listed, false) => "not castable",
+                (_, false) => "as the texture's",
+            };
+            let how = match how {
+                ViewUse::Shader => "srv",
+                ViewUse::Unordered => "uav",
+                ViewUse::Target => "rtv",
+                ViewUse::Listed => "listed",
+            };
+            format!("{n} {how} of {own} as {view} {what}")
+        })
+        .collect();
+    let buffers: Vec<String> = counts
+        .buffers
+        .iter()
+        .map(|(&(title, unordered), n)| {
+            format!("{n} {} of {title}", if unordered { "uav" } else { "srv" })
+        })
+        .collect();
+    let wholes: Vec<String> = counts
+        .wholes
+        .iter()
+        .map(|(read, n)| format!("{n} as {read}"))
+        .collect();
     Some(format!(
-        "host textures: {live} alive, {} MiB{pool}; so far: stand-in formats [{}], refused [{}]",
+        "host textures: {live} alive, {} MiB{pool}; so far: stand-in formats [{}], refused [{}], views in another format of their texture's family [{}], typed buffer views without a host format (null) [{}], typeless copies viewed whole without a description [{}]",
         bytes >> 20,
         stood_in.join(", "),
-        refused.join("; ")
+        refused.join("; "),
+        casts.join(", "),
+        buffers.join(", "),
+        wholes.join(", ")
     ))
 }
 
@@ -749,6 +1027,8 @@ mod tests {
     fn use_bits_are_d3d12s() {
         use windows::Win32::Graphics::Direct3D12::*;
         for (ours, theirs) in [
+            (uses::BUFFER, D3D12_FORMAT_SUPPORT1_BUFFER),
+            (uses::SHADER_LOAD, D3D12_FORMAT_SUPPORT1_SHADER_LOAD),
             (uses::VERTEX_BUFFER, D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER),
             (uses::TEXTURE_1D, D3D12_FORMAT_SUPPORT1_TEXTURE1D),
             (uses::TEXTURE_2D, D3D12_FORMAT_SUPPORT1_TEXTURE2D),
@@ -1005,8 +1285,129 @@ mod tests {
     fn the_report_counts_by_reason() {
         note_stand_in(86, 28);
         note_refused("format 191 flags 0x1: console format 191 has no host format".into());
+        note_view_cast(28, 29, ViewUse::Shader, true);
+        note_view_cast(28, 29, ViewUse::Shader, true);
+        note_view_cast(41, 42, ViewUse::Unordered, false);
+        note_view_cast(41, 42, ViewUse::Target, false);
+        note_buffer_without_format(190, false);
         let report = report().unwrap();
         assert!(report.contains("of 86 as 28"), "{report}");
         assert!(report.contains("console format 191"), "{report}");
+        assert!(report.contains("srv of 28 as 29 cast"), "{report}");
+        assert!(
+            report.contains("uav of 41 as 42 as the texture's"),
+            "{report}"
+        );
+        assert!(report.contains("rtv of 41 as 42 not castable"), "{report}");
+        assert!(report.contains("srv of 190"), "{report}");
+    }
+
+    /// D3D12's relaxed casting rules: any two formats of a family, but
+    /// float with non-float and UNORM with SNORM; depth, BC6H and typeless
+    /// formats are left out.
+    #[test]
+    fn views_cast_within_a_family_as_d3d12_allows() {
+        for (own, view) in [
+            (28, 29), // RGBA8 UNORM, sRGB
+            (29, 28),
+            (28, 30), // UNORM as UINT
+            (30, 32), // UINT as SINT
+            (31, 32), // SNORM as SINT
+            (87, 91), // BGRA8 UNORM, sRGB
+            (88, 93), // BGRX8 UNORM, sRGB
+            (71, 72), // BC1 UNORM, sRGB
+            (98, 99), // BC7 UNORM, sRGB
+            (24, 25), // RGB10A2 UNORM as UINT
+            (11, 12), // RGBA16 UNORM as UINT
+            (42, 43), // R32 UINT as SINT
+            (56, 57), // R16 UNORM as UINT
+            (61, 65), // R8 UNORM as A8
+        ] {
+            assert!(castable(own, view), "{own} as {view}");
+        }
+        for (own, view) in [
+            (28, 31), // UNORM as SNORM
+            (80, 81), // BC4 UNORM as SNORM
+            (41, 42), // R32 FLOAT as UINT
+            (42, 41),
+            (10, 11), // RGBA16 FLOAT as UNORM
+            (54, 56), // R16 FLOAT as UNORM
+            (87, 88), // two families
+            (28, 87),
+            (41, 40), // R32 FLOAT as depth
+            (45, 46), // depth with stencil
+            (95, 96), // BC6H
+            (27, 28), // typeless
+        ] {
+            assert!(!castable(own, view), "{own} as {view}");
+        }
+    }
+
+    /// A host that casts, and has the uses asked for: RGBA8 sRGB views of
+    /// UNORM keep their format, R32 UINT views of FLOAT do not; a host that
+    /// does not cast keeps none.
+    #[test]
+    fn views_keep_their_format_where_the_host_casts() {
+        struct Host(bool);
+        impl Caps for Host {
+            fn support1(&self, format: u32) -> u32 {
+                match format {
+                    // No typed unordered access in sRGB.
+                    29 => uses::SHADER_LOAD,
+                    _ => uses::SHADER_LOAD | uses::TYPED_UNORDERED_ACCESS,
+                }
+            }
+            fn samples(&self, _: u32, count: u32) -> bool {
+                count <= 1
+            }
+            fn fully_typed_casting(&self) -> bool {
+                self.0
+            }
+        }
+        let casts = Host(true);
+        assert!(view_cast_with(&casts, 28, 29, false));
+        assert!(view_cast_with(&casts, 29, 28, false));
+        assert!(view_cast_with(&casts, 28, 30, true));
+        assert!(!view_cast_with(&casts, 28, 29, true), "no sRGB writes");
+        assert!(!view_cast_with(&casts, 41, 42, false));
+        assert!(view_cast_with(&casts, 41, 41, true), "its own format");
+        let old = Host(false);
+        assert!(!view_cast_with(&old, 28, 29, false));
+        assert!(view_cast_with(&old, 28, 28, false));
+    }
+
+    /// Typed buffer views keep the title's element size: the title's own
+    /// format where the host has it for buffers, else a typeless format of
+    /// the same size (no view); other formats are as before.
+    #[test]
+    fn typed_buffer_views_keep_the_titles_element_size() {
+        struct Host;
+        impl Caps for Host {
+            fn support1(&self, format: u32) -> u32 {
+                use uses::*;
+                match format {
+                    85 => BUFFER | TEXTURE_2D | SHADER_SAMPLE,
+                    86 => BUFFER | TYPED_UNORDERED_ACCESS | TEXTURE_2D,
+                    115 => TEXTURE_2D | SHADER_SAMPLE,
+                    _ => CONSOLE_USES | BUFFER,
+                }
+            }
+            fn samples(&self, _: u32, count: u32) -> bool {
+                count <= 1
+            }
+        }
+        assert_eq!(buffer_format_with(&Host, 85, false), 85);
+        assert_eq!(buffer_format_with(&Host, 85, true), 53, "no typed writes");
+        assert_eq!(buffer_format_with(&Host, 86, true), 86);
+        assert_eq!(buffer_format_with(&Host, 115, false), 53);
+        // The console's own numbers: none on the host, whatever it says.
+        assert_eq!(buffer_format_with(&Host, 189, false), 39);
+        assert_eq!(buffer_format_with(&Host, 190, false), 60);
+        // Formats outside the table, as before.
+        assert_eq!(buffer_format_with(&Host, 28, false), 28);
+        assert_eq!(buffer_format_with(&Host, 118, false), 45);
+        for format in [53, 39, 60] {
+            assert_eq!(super::super::family(format), format, "{format} is typeless");
+        }
     }
 }

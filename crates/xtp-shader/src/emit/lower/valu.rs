@@ -4,6 +4,7 @@
 //! an untracked mask).
 
 use super::mask::{LANE_MASK, MaskData};
+use super::uniform::Level;
 use super::{Lower, UNTRACKED_SELECT, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
@@ -775,6 +776,21 @@ impl<'a> Lower<'a> {
                 // The same in every lane of the console wave (`uniform.rs`):
                 // the lane's own value is the first lane's, whatever waves
                 // the host forms.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
+            "v_readfirstlane_b32"
+                if self.mesh_halves()
+                    && self
+                        .uniform
+                        .as_ref()
+                        .is_some_and(|u| u.control(self.cur_ir) != Level::Group)
+                    && self.uniform_test_first_lane(inst, self.cur_ir) =>
+            {
+                // The first-lane read of a test for a value the whole wave
+                // holds, where lanes of the group reach it differently (no
+                // exchange runs there): each lane's own value, exact per lane
+                // (`mask.rs`).
                 let a = s(self, 0)?;
                 int(self, a)
             }
