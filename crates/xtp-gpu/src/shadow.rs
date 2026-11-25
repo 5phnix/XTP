@@ -4048,9 +4048,9 @@ mod tests {
     fn a_full_refresh_takes_every_copy_whole_but_what_gpu_work_writes() {
         const CHILD: &str = "XTP_SHADOW_TEST_FULL_REFRESH";
         let test = "shadow::tests::a_full_refresh_takes_every_copy_whole_but_what_gpu_work_writes";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         if std::env::var_os(CHILD).is_none() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([test, "--exact", "--nocapture", "--test-threads=1"])
@@ -4108,9 +4108,10 @@ mod tests {
     #[test]
     fn the_cards_passes_are_made() {
         let test = "shadow::tests::the_cards_passes_are_made";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if let Err(e) = CardWork::new(host) {
             panic!("{e}");
         }

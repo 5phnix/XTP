@@ -721,9 +721,10 @@ mod tests {
             D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
         };
         let test = "device::tests::the_hosts_children_hand_out_newer_device_levels";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         // SAFETY: plain calls on the host device and its fence.
         unsafe {
             let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();

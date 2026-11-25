@@ -3061,9 +3061,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         use crate::resource::tests_support::{committed, sampled, target};
         use crate::testgpu::{TitleBuffer, TitleList};
         let test = "draw::tests::textures_of_slots_picked_at_run_time_are_made_and_kept_up_to_date";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if crate::descriptor::host::heap_textures_budget().is_none() {
             return;
         }
@@ -3223,7 +3224,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         list.run();
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         crate::object::slot::<Release>(object, 0x10)(object);
@@ -3253,9 +3253,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         const N: u32 = 2048;
         const STEP: u64 = 1 << 16;
         let test = "draw::tests::heap_texture_costs";
-        if crate::testgpu::device(test).is_none()
-            || crate::descriptor::host::heap_textures_budget().is_none()
-        {
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        if crate::descriptor::host::heap_textures_budget().is_none() {
             return;
         }
         // SAFETY: a fresh reservation of our own.

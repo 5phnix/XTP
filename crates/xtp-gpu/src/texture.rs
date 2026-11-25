@@ -2073,9 +2073,10 @@ mod tests {
     #[test]
     fn a_look_before_an_upload_tells_written_memory() {
         let test = "texture::tests::a_look_before_an_upload_tells_written_memory";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || verify_guards() || !predication() {
             return;
         }
@@ -2113,7 +2114,6 @@ mod tests {
         // One the host copied into keeps the host's contents.
         host_written(plain);
         assert_eq!(memory_change(plain), Change::No);
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         for r in [resource, plain] {
@@ -2133,9 +2133,10 @@ mod tests {
     #[ignore = "benchmark"]
     fn memory_change_costs() {
         let test = "texture::tests::memory_change_costs";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || verify_guards() {
             return;
         }
@@ -2305,9 +2306,10 @@ mod tests {
     #[test]
     fn late_mips_and_other_slices_are_found_changed() {
         let test = "texture::tests::late_mips_and_other_slices_are_found_changed";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !guards() || verify_guards() || !predication() {
             return;
         }
@@ -2357,7 +2359,6 @@ mod tests {
             crate::watch::title_memory_remapped(view, LEN);
             let _ = other;
         }
-        assert_eq!(host.log_messages(), None);
     }
 
     /// Texture writes follow submission order, not recording order
@@ -2387,9 +2388,10 @@ mod tests {
     fn texture_writes_follow_submission_order() {
         use crate::testgpu::TitleList;
         let test = "texture::tests::texture_writes_follow_submission_order";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let (background, a, b) = (0x1111_1111u32, 0xaaaa_aaaa, 0xbbbb_bbbb);
         let (block_a, block_b) = (block_of(a), block_of(b));
         let mut wrong = Vec::new();

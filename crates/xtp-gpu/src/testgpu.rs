@@ -116,10 +116,20 @@ impl std::ops::Deref for Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        let errors = layer_errors();
         if std::thread::panicking() {
+            // Taken all the same, so they cannot fail the next test; shown,
+            // since they may explain this one's failure.
+            if !errors.is_empty() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "the D3D12 debug layer also reported {} error(s):\n{}",
+                    errors.len(),
+                    errors.join("\n")
+                );
+            }
             return;
         }
-        let errors = layer_errors();
         if !errors.is_empty() {
             panic!(
                 "the D3D12 debug layer reported {} error(s):\n{}",
@@ -161,7 +171,12 @@ fn is_test_thread(thread: &str) -> bool {
 /// Whether tests run one at a time (`RUST_TEST_THREADS=1`): then errors of
 /// another test's thread are that test's, left without a guard.
 fn serial() -> bool {
+    let args: Vec<String> = std::env::args().collect();
     std::env::var("RUST_TEST_THREADS").as_deref() == Ok("1")
+        || args.iter().any(|a| a == "--test-threads=1")
+        || args
+            .windows(2)
+            .any(|w| w[0] == "--test-threads" && w[1] == "1")
 }
 
 /// Takes the errors this thread raised, those raised on threads that are
@@ -672,9 +687,12 @@ mod tests {
         }
     }
 
-    /// GPU tests keep their device guard until they end: none writes
-    /// `device(..).is_none()`, which drops it at once and so escapes the
-    /// debug layer's check (`let Some(_gpu) = device(..) else { .. };`).
+    /// GPU tests keep their device guard until they end. No call of
+    /// `device(..)` (or `isolated_device(..)`) is followed by `.is_none()`
+    /// or bound to `_` (`let _ =`, `let Some(_) =`), which drops the guard at
+    /// once and so escapes the debug layer's check; write
+    /// `let Some(_gpu) = device(..) else { .. };`. Calls span lines as
+    /// rustfmt wraps them; comment lines are skipped.
     #[test]
     fn gpu_tests_keep_their_device_guard() {
         fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -687,20 +705,80 @@ mod tests {
                 }
             }
         }
+        /// The calls of `code` that drop the guard at once, by line.
+        fn dropped(code: &str) -> Vec<usize> {
+            let needle = ["dev", "ice("].concat();
+            let ident = |c: char| c.is_alphanumeric() || c == '_' || c == ':';
+            let mut lines = Vec::new();
+            for (at, _) in code.match_indices(&needle) {
+                let before = &code[..at];
+                let start = before.rfind(|c: char| !ident(c)).map_or(0, |p| p + 1);
+                let callee = &code[start..at + needle.len() - 1];
+                let ours = callee == "device"
+                    || callee.ends_with("::device")
+                    || callee.ends_with("isolated_device");
+                let lead = before[..start].trim_end();
+                if !ours || lead.ends_with("fn") {
+                    continue;
+                }
+                let mut depth = 0;
+                let mut end = None;
+                for (i, c) in code[at + needle.len() - 1..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(at + needle.len() - 1 + i + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else { continue };
+                let after = code[end..].trim_start();
+                if after.starts_with(".is_none()")
+                    || lead.ends_with("let _ =")
+                    || lead.ends_with("let Some(_) =")
+                {
+                    lines.push(before.lines().count());
+                }
+            }
+            lines
+        }
+        // The scan itself: what it must find, and what it must leave.
+        let call = ["dev", "ice"].concat();
+        let wrapped = format!("    if crate::testgpu::{call}(test)\n        .is_none()\n");
+        assert_eq!(dropped(&wrapped).len(), 1, "{wrapped}");
+        assert_eq!(dropped(&format!("let _ = {call}(test);")).len(), 1);
+        assert_eq!(
+            dropped(&format!("let Some(_) = {call}(test) else {{ return }};")).len(),
+            1
+        );
+        assert!(dropped(&format!("let Some(_gpu) = {call}(test) else {{ return }};")).is_empty());
+        assert!(dropped(&format!("let mut found = {call}();")).is_empty());
+
         let mut files = Vec::new();
         sources(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut files,
         );
-        let dropped = [".is_", "none()"].concat();
         let mut found = Vec::new();
         for file in &files {
             let text = std::fs::read_to_string(file).unwrap();
-            for (n, line) in text.lines().enumerate() {
-                let code = !line.trim_start().starts_with("//");
-                if code && line.contains("device(") && line.contains(&dropped) {
-                    found.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
-                }
+            let code: Vec<&str> = text
+                .lines()
+                .map(|l| {
+                    if l.trim_start().starts_with("//") {
+                        ""
+                    } else {
+                        l
+                    }
+                })
+                .collect();
+            for n in dropped(&code.join("\n")) {
+                found.push(format!("{}:{}", file.display(), n));
             }
         }
         assert!(files.len() > 50, "found {} sources", files.len());

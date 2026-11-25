@@ -891,9 +891,10 @@ mod tests {
     /// (`shadow::cards`; the limits are read once per process).
     fn with_cards(test: &str, body: impl FnOnce(&'static crate::host::Host)) {
         const CHILD: &str = "XTP_TEST_CARD_BUFFERS";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if std::env::var_os(CHILD).is_some() {
             body(host);
             return;
@@ -937,6 +938,8 @@ mod tests {
         use crate::testgpu::{Kernel, Pass, TitleBuffer, pattern};
         let test = "host::buffers::tests::a_shader_write_to_a_copy_on_the_card_goes_back";
         with_cards(test, |host| {
+            // The GPU copy within one buffer (`shadow::copy`).
+            crate::testgpu::known_layer_errors(&[538], "#45");
             let kernel = Kernel::new(host);
             let big = TitleBuffer::new(2 << 20);
             big.set_words(|i| 0x7e00_0000 + i as u32);
