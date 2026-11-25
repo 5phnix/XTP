@@ -7,7 +7,7 @@ use windows::core::s;
 /// resources share one immutable lifetime across TLAS builds, copies and dispatches.
 pub(crate) struct BlasMap {
     upload: ID3D12Resource,
-    generations: Vec<Arc<ID3D12Resource>>,
+    generations: Vec<(u64, Arc<ID3D12Resource>, Arc<Producer>)>,
 }
 
 impl BlasMap {
@@ -23,12 +23,44 @@ impl BlasMap {
                     .add(i)
                     .write([title, s.result.GetGPUVirtualAddress()])
             };
-            generations.push(s.result.clone());
+            generations.push((title, s.result.clone(), s.producer.clone()));
         }
         Some(Self {
             upload,
             generations,
         })
+    }
+
+    /// A producer on another list may be submitted after this recording, or
+    /// abandoned. Resolve those rows in queue order without exposing unbuilt AS memory.
+    fn for_list(self: &Arc<Self>, list: &HostList) -> Option<u64> {
+        let recording = list.rt_recording();
+        if self
+            .generations
+            .iter()
+            .all(|(_, _, p)| p.available(&recording))
+        {
+            // SAFETY: the TLAS recording retains this immutable upload through execution.
+            return Some(unsafe { self.upload.GetGPUVirtualAddress() });
+        }
+        let (gpu, data) = list.scratch(16 * self.generations.len() as u64)?;
+        let mapped = data as usize;
+        let map = self.clone();
+        list.defer_host((0, 0), move || {
+            for (i, (title, resource, producer)) in map.generations.iter().enumerate() {
+                // SAFETY: one aligned row per entry in this recording's private upload.
+                // List replay waits for its prior execution before rewriting these rows.
+                unsafe {
+                    let address = if producer.submitted.load(Ordering::Acquire) {
+                        resource.GetGPUVirtualAddress()
+                    } else {
+                        0
+                    };
+                    (mapped as *mut [u64; 2]).add(i).write([*title, address]);
+                }
+            }
+        });
+        Some(gpu)
     }
 }
 
@@ -93,6 +125,7 @@ pub(super) fn rewrite(
     let src = range(rec.list, address, bytes, 16)?;
     let dst = buffer(rec.device, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
     let pass = pipeline(rec.device)?;
+    let mapping = map.for_list(rec.list)?;
     rec.list.keep(&dst);
     rec.list.keep_rt_map(map);
     let groups = count.div_ceil(64);
@@ -106,8 +139,7 @@ pub(super) fn rewrite(
         rec.commands.SetPipelineState(&pass.pso);
         rec.commands
             .SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
-        rec.commands
-            .SetComputeRootShaderResourceView(1, map.upload.GetGPUVirtualAddress());
+        rec.commands.SetComputeRootShaderResourceView(1, mapping);
         rec.commands.SetComputeRootUnorderedAccessView(2, src);
         rec.commands.SetComputeRootUnorderedAccessView(3, gpu);
         rec.commands

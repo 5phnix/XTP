@@ -7,7 +7,7 @@ mod instances;
 pub(crate) mod probe;
 
 pub(crate) use instances::BlasMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -166,6 +166,7 @@ impl<'a> Recorder<'a> {
             self.commands.ResourceBarrier(&[uav_barrier()]);
         }
         Some(Structure {
+            producer: Producer::recorded(self.list),
             result,
             instances: None,
             compacted_size: postbuild.map(|(_, size)| size),
@@ -213,14 +214,40 @@ impl<'a> Recorder<'a> {
             self.commands.ResourceBarrier(&[uav_barrier()]);
         }
         Some(Structure {
+            producer: Producer::recorded(self.list),
             result: dest,
             ..source.clone()
         })
     }
 }
 
+struct Producer {
+    recording: Arc<()>,
+    submitted: AtomicBool,
+}
+
+impl Producer {
+    fn recorded(list: &HostList) -> Arc<Self> {
+        let producer = Arc::new(Self {
+            recording: list.rt_recording(),
+            submitted: AtomicBool::new(false),
+        });
+        let mark = producer.clone();
+        // Host submissions are serialized. Deferred steps run in list order before ExecuteCommandLists.
+        list.defer_host((0, 0), move || {
+            mark.submitted.store(true, Ordering::Release)
+        });
+        producer
+    }
+
+    fn available(&self, recording: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.recording, recording) || self.submitted.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 struct Structure {
+    producer: Arc<Producer>,
     result: Arc<ID3D12Resource>,
     // Only TLAS generations refer to a snapshot of the BLAS address space.
     instances: Option<Arc<BlasMap>>,
@@ -309,6 +336,9 @@ pub unsafe fn host_tlas_for_list(list: *const Object, title_tlas: u64) -> Option
     let table = registry();
     let entry = table.structures.get(&title_tlas)?;
     entry.instances.as_ref()?;
+    if !entry.producer.available(&list.rt_recording()) {
+        return None;
+    }
     entry.retain(list);
     // SAFETY: the list owns this resource until the GPU has finished the recording.
     Some(unsafe { entry.result.GetGPUVirtualAddress() })
@@ -404,6 +434,9 @@ pub unsafe fn copy(list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
         }
         let source = registry().structures.get(&src)?.clone();
         let recorder = Recorder::new(crate::list::host_list(list)?)?;
+        if !source.producer.available(&recorder.list.rt_recording()) {
+            return None;
+        }
         source.retain(recorder.list);
         recorder.copy_structure(
             &source,

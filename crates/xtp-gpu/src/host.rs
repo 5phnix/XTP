@@ -1073,6 +1073,7 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Immutable BLAS generations referenced by TLAS builds and traces on this recording.
     rt_maps: Vec<std::sync::Arc<crate::rt::BlasMap>>,
+    rt_recording: Option<std::sync::Arc<()>>,
     rt_size_page: crate::rt::compaction::SizePage,
     rt_results: Vec<std::sync::Arc<ID3D12Resource>>,
     /// Dynamic descriptor slots leased by this recording.
@@ -2706,6 +2707,13 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn rt_recording(&self) -> std::sync::Arc<()> {
+        self.deferred()
+            .rt_recording
+            .get_or_insert_with(Default::default)
+            .clone()
     }
 
     pub(crate) fn rt_compacted_size(&self) -> Option<(u64, crate::rt::compaction::CompactedSize)> {
