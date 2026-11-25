@@ -27,6 +27,9 @@
 //!   [`SHOWN`] bytes, and from the first non-zero byte when that lies
 //!   further. A frame's read-back holds 48 MiB (`XTP_FRAME_PROBE_MIB`, up
 //!   to 512; [`budget`]).
+//! - for a constant view: its bytes the same three ways, all of them shown
+//!   up to [`SHOWN_CONSTANTS`] (a lighting program's light colours,
+//!   directions and feature switches are there; docs/analysis/lighting-terms.md);
 //! - for a texture view: the host texture's size (depth or layers too) and
 //!   the title address of its memory, which tells two views of one texture.
 //!
@@ -42,6 +45,20 @@
 //! R9G9B9E5 view), and each UAV write at the same address.
 //! Each decode command counts the submissions in which its predicate
 //! allowed the conversion to run.
+//!
+//! **`XTP_DIAG_DIR_LIGHT=<r>,<g>,<b>[,<scale>][/<r>,<g>,<b>[,<scale>]...]`**
+//! (off by default; any frame, listed or not) gives the deferred lighting
+//! a directional light colour of ours, to show what the image looks like
+//! with one (docs/analysis/lighting-terms.md §4.3: the title's is 0). Just
+//! before each op whose stage reads the light record (`s1+0`, 340 bytes)
+//! and the light scale buffer (`s0+232`, 384 bytes), the record's colour
+//! (bytes 300 to 311) and the scale (byte 84, 1 when not given) are written
+//! into their host copies on the GPU, at that place in the list ([`dir_light`]).
+//! Title memory is not written: the next submission's refresh, or the
+//! scale's writer, puts the title's values back. Several colours take turns,
+//! [`dir_light_frames`] frames each (`XTP_DIAG_DIR_LIGHT_FRAMES`, 4 by
+//! default), in the order given, from frame 0; the log says which colour
+//! each frame recorded with.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -60,6 +77,9 @@ use crate::object::This;
 const OPS: usize = 96;
 /// Bytes of a snapshot shown as words.
 const SHOWN: usize = 512;
+/// Bytes of a constant view's snapshot shown as words: all of a constant
+/// buffer the size the title's lighting reads (3,424 bytes).
+const SHOWN_CONSTANTS: usize = 4096;
 /// Bytes shown from a snapshot's first non-zero byte, when it lies past
 /// the first [`SHOWN`].
 const SHOWN_AT_FIRST: usize = 128;
@@ -143,9 +163,14 @@ fn words(bytes: &[u8]) -> String {
 
 impl Snapshot {
     fn text(&self, len: u64) -> String {
+        self.text_shown(len, SHOWN)
+    }
+
+    /// As [`Snapshot::text`], with the first `shown` bytes as words.
+    fn text_shown(&self, len: u64, shown: usize) -> String {
         let b = &self.bytes;
         let nz = b.iter().filter(|&&x| x != 0).count();
-        let more = if b.len() > SHOWN { " …" } else { "" };
+        let more = if b.len() > shown { " …" } else { "" };
         let mut out = format!(
             "non-zero {nz} of {} bytes{}",
             b.len(),
@@ -160,9 +185,9 @@ impl Snapshot {
         if let (Some(first), Some(last)) = (first, last) {
             let _ = write!(out, ", from +{first:#x} to +{last:#x}");
         }
-        let _ = write!(out, " [{}{more}]", words(&b[..b.len().min(SHOWN)]));
+        let _ = write!(out, " [{}{more}]", words(&b[..b.len().min(shown)]));
         // The first non-zero bytes, where the words above do not reach.
-        if let Some(first) = first.filter(|&f| f >= SHOWN) {
+        if let Some(first) = first.filter(|&f| f >= shown) {
             let at = first & !15;
             let end = (at + SHOWN_AT_FIRST).min(b.len());
             let _ = write!(out, "; at +{at:#x}: [{}]", words(&b[at..end]));
@@ -176,6 +201,8 @@ struct Read {
     text: String,
     /// The buffer range it views: title address and bytes.
     range: Option<(u64, u64)>,
+    /// Bytes of its snapshots shown as words.
+    shown: usize,
     at_record: Option<Snapshot>,
     at_submit: Option<Snapshot>,
     /// Where the host copy's bytes are in the read-back buffer, or why
@@ -250,6 +277,172 @@ fn parse(text: &str) -> Vec<String> {
         .map(|h| h.trim().to_ascii_lowercase())
         .filter(|h| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()))
         .collect()
+}
+
+/// The light record among a lighting stage's tables (table, dword offset,
+/// view bytes), and where its colour is (docs/analysis/lighting-terms.md
+/// §4.3).
+const RECORD: (u8, u32, u64) = (1, 0, 340);
+const RECORD_COLOUR: u64 = 300;
+/// The light scale buffer among the same tables, and where the scale is.
+const SCALE: (u8, u32, u64) = (0, 232, 384);
+const SCALE_AT: u64 = 84;
+
+/// One `XTP_DIAG_DIR_LIGHT` colour.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DirLight {
+    colour: [f32; 3],
+    scale: f32,
+}
+
+/// `XTP_DIAG_DIR_LIGHT`'s colours: none unless every one is three or four
+/// finite numbers of 0 or more.
+fn parse_dir_light(text: &str) -> Vec<DirLight> {
+    text.split('/')
+        .map(|one| {
+            let v: Vec<f32> = one
+                .split(',')
+                .map(|t| t.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .ok()?;
+            let (colour, scale) = match *v.as_slice() {
+                [r, g, b] => ([r, g, b], 1.0),
+                [r, g, b, s] => ([r, g, b], s),
+                _ => return None,
+            };
+            let fine = |x: f32| x.is_finite() && x >= 0.0;
+            (colour.into_iter().all(fine) && fine(scale)).then_some(DirLight { colour, scale })
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+/// Frames each `XTP_DIAG_DIR_LIGHT` colour lasts: `XTP_DIAG_DIR_LIGHT_FRAMES`,
+/// 4 by default.
+fn dir_light_frames() -> u64 {
+    static FRAMES: OnceLock<u64> = OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        sized(
+            std::env::var("XTP_DIAG_DIR_LIGHT_FRAMES").ok().as_deref(),
+            4,
+            1 << 20,
+            1,
+        )
+    })
+}
+
+fn dir_lights() -> &'static [DirLight] {
+    static LIGHTS: OnceLock<Vec<DirLight>> = OnceLock::new();
+    LIGHTS.get_or_init(|| {
+        let Ok(text) = std::env::var("XTP_DIAG_DIR_LIGHT") else {
+            return Vec::new();
+        };
+        let lights = parse_dir_light(&text);
+        if lights.is_empty() {
+            tracing::warn!(
+                text,
+                "XTP_DIAG_DIR_LIGHT is not <r>,<g>,<b>[,<scale>][/...] of finite numbers of 0 or more: off"
+            );
+        } else {
+            tracing::warn!(
+                ?lights,
+                frames = dir_light_frames(),
+                "XTP_DIAG_DIR_LIGHT: the deferred lighting gets a directional light colour of ours"
+            );
+        }
+        lights
+    })
+}
+
+/// Whether `XTP_DIAG_DIR_LIGHT` is on.
+pub(crate) fn dir_light_on() -> bool {
+    !dir_lights().is_empty()
+}
+
+/// The colour of `lights` frame `frame` records with, each lasting `frames`
+/// frames in turn.
+fn dir_light_for(lights: &[DirLight], frames: u64, frame: u64) -> Option<DirLight> {
+    let n = lights.len() as u64;
+    (n > 0).then(|| lights[((frame / frames.max(1)) % n) as usize])
+}
+
+/// `draw::State::bind` with `XTP_DIAG_DIR_LIGHT` on, for a stage about to
+/// be recorded in `list` with `tables`: if the stage reads the light record
+/// and the light scale buffer, this frame's colour and scale are written
+/// into their host copies here in the list, before the op.
+pub(crate) fn dir_light(list: &HostList, tables: &[Table]) {
+    let frame = crate::queue::presented() + 1;
+    let Some(light) = dir_light_for(dir_lights(), dir_light_frames(), frame) else {
+        return;
+    };
+    let at = |(slot, offset, len): (u8, u32, u64)| {
+        tables
+            .iter()
+            .find(|t| t.slot == slot && t.offset_dwords == offset)
+            .and_then(|t| crate::descriptor::view(t.handle))
+            .and_then(|v| span_of(&v))
+            .filter(|&(_, n)| n == len)
+            .map(|(address, _)| address)
+    };
+    let (Some(record), Some(scale)) = (at(RECORD), at(SCALE)) else {
+        return;
+    };
+    let [r, g, b] = light.colour;
+    let colour = write_words(
+        list,
+        record + RECORD_COLOUR,
+        &[r.to_bits(), g.to_bits(), b.to_bits()],
+    );
+    let scaled = write_words(list, scale + SCALE_AT, &[light.scale.to_bits()]);
+    // Once a frame in the log.
+    static LOGGED: AtomicU64 = AtomicU64::new(u64::MAX);
+    if LOGGED.swap(frame, Ordering::Relaxed) != frame {
+        tracing::info!(
+            frame,
+            ?light,
+            record = format_args!("{record:#x}"),
+            scale = format_args!("{scale:#x}"),
+            colour,
+            scaled,
+            "XTP_DIAG_DIR_LIGHT: directional light written for the lighting"
+        );
+    }
+}
+
+/// `words` written at title `address` in its host copy, on the GPU at this
+/// place in `list`; title memory is left as it is. False where the address
+/// has no host copy.
+fn write_words(list: &HostList, address: u64, words: &[u32]) -> bool {
+    use windows::core::Interface as _;
+    let Some(s) = crate::shadow::existing(address, 4 * words.len() as u64) else {
+        return false;
+    };
+    let Ok(list2) = list.list.cast::<ID3D12GraphicsCommandList2>() else {
+        return false;
+    };
+    let gpu = s.gpu(address);
+    let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words
+        .iter()
+        .zip(0u64..)
+        .map(|(&value, i)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+            Dest: gpu + 4 * i,
+            Value: value,
+        })
+        .collect();
+    let (common, dest) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    list.keep(&s.buffer);
+    // SAFETY: an open list; the host copy, which the list keeps, and
+    // destinations inside it. Host copies are taken as common, as
+    // [`copy`] and `shadow::write` take them.
+    unsafe {
+        list2.ResourceBarrier(&[
+            crate::host::uav_barrier(),
+            crate::host::transition(&s.buffer, common, dest),
+        ]);
+        list2.WriteBufferImmediate(params.len() as u32, params.as_ptr(), None);
+        list2.ResourceBarrier(&[crate::host::transition(&s.buffer, dest, common)]);
+    }
+    true
 }
 
 /// The frame being recorded, if the probe runs and lists it.
@@ -365,6 +558,7 @@ pub(crate) fn arguments(list: &HostList, address: u64, len: u64) {
         op.reads.push(Read {
             text,
             range: Some((address, len)),
+            shown: SHOWN,
             at_record,
             at_submit: None,
             gpu,
@@ -459,22 +653,31 @@ fn read(t: &Table) -> (Read, Option<CopyFrom>) {
             snapshot(address, 64).map_or_else(|| "not readable".to_owned(), |s| s.text(64))
         );
     }
-    let span = view
-        .as_ref()
-        .and_then(crate::descriptor::host::buffer_range)
-        .filter(|&(_, len)| len > 0);
+    let span = view.as_ref().and_then(span_of).filter(|&(_, len)| len > 0);
     let (at_record, from, gpu) = match span {
         Some((address, len)) => range(&mut text, address, len),
         None => (None, None, Err("not a buffer view")),
     };
+    let constant = matches!(view, Some(crate::descriptor::View::Constant(..)));
     let r = Read {
         text,
         range: span,
+        shown: if constant { SHOWN_CONSTANTS } else { SHOWN },
         at_record,
         at_submit: None,
         gpu,
     };
     (r, from)
+}
+
+/// The title memory a view reads as bytes: a buffer view's range, or a
+/// constant view's (the light parameters and feature switches a lighting
+/// program reads are there).
+fn span_of(view: &crate::descriptor::View) -> Option<(u64, u64)> {
+    match *view {
+        crate::descriptor::View::Constant(address, size) => Some((address, u64::from(size))),
+        ref v => crate::descriptor::host::buffer_range(v),
+    }
 }
 
 /// A view in a few words.
@@ -858,7 +1061,7 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
             let _ = writeln!(
                 out,
                 "      at record: {}",
-                record.map_or_else(|| "not readable".to_owned(), |s| s.text(len))
+                record.map_or_else(|| "not readable".to_owned(), |s| s.text_shown(len, r.shown))
             );
             let submit = r.at_submit.as_ref();
             let same = |a: Option<&Snapshot>, b: Option<&Snapshot>| {
@@ -870,7 +1073,7 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
                 match submit {
                     None => "not taken".to_owned(),
                     Some(_) if same(submit, record) => "as at record".to_owned(),
-                    Some(s) => s.text(len),
+                    Some(s) => s.text_shown(len, r.shown),
                 }
             );
             let ran = op.submission.is_some();
@@ -894,7 +1097,10 @@ fn report(f: &Frame, gpu: Option<&[u8]>) -> String {
                         let differ = submit.map_or(0, |t| {
                             t.bytes.iter().zip(&s.bytes).filter(|(a, b)| a != b).count()
                         });
-                        format!("{} ({differ} bytes differ from submit)", s.text(len))
+                        format!(
+                            "{} ({differ} bytes differ from submit)",
+                            s.text_shown(len, r.shown)
+                        )
                     }
                 }
             );
@@ -1010,6 +1216,77 @@ mod tests {
             &shown[..4],
             ["00000000", "00000000", "00000000", "01000007"]
         );
+    }
+
+    /// A constant view is read over its whole size, and shown in full up to
+    /// [`SHOWN_CONSTANTS`] bytes.
+    #[test]
+    fn constant_views_are_read_and_shown_whole() {
+        let view = crate::descriptor::View::Constant(0x9_9276_ed80, 3424);
+        assert_eq!(span_of(&view), Some((0x9_9276_ed80, 3424)));
+        let mut bytes = vec![0u8; 3424];
+        bytes[3420] = 1;
+        let s = Snapshot { bytes };
+        let words_shown = |t: &str| {
+            t.split_once(" [")
+                .unwrap()
+                .1
+                .split(']')
+                .next()
+                .unwrap()
+                .split(' ')
+                .filter(|w| w.len() == 8)
+                .count()
+        };
+        assert_eq!(words_shown(&s.text_shown(3424, SHOWN_CONSTANTS)), 3424 / 4);
+        assert_eq!(words_shown(&s.text(3424)), SHOWN / 4);
+    }
+
+    #[test]
+    fn dir_light_colours_parse() {
+        let one = |r, g, b, scale| DirLight {
+            colour: [r, g, b],
+            scale,
+        };
+        assert_eq!(
+            parse_dir_light("0.1,0.12,0.2"),
+            vec![one(0.1, 0.12, 0.2, 1.0)]
+        );
+        assert_eq!(
+            parse_dir_light(" 1, 1.2 ,2 ,0.5/0,0,0"),
+            vec![one(1.0, 1.2, 2.0, 0.5), one(0.0, 0.0, 0.0, 1.0)]
+        );
+        // One bad colour turns the switch off.
+        for bad in [
+            "",
+            "1,2",
+            "1,2,3,4,5",
+            "1,x,3",
+            "1,2,3/-1,0,0",
+            "inf,0,0",
+            "1,2,3,NaN",
+        ] {
+            assert!(parse_dir_light(bad).is_empty(), "{bad}");
+        }
+    }
+
+    /// Colours take turns, `frames` frames each, from frame 0.
+    #[test]
+    fn dir_light_colours_take_turns() {
+        let lights: Vec<DirLight> = (0..3)
+            .map(|i| DirLight {
+                colour: [i as f32; 3],
+                scale: 1.0,
+            })
+            .collect();
+        let at = |frame| dir_light_for(&lights, 4, frame).unwrap().colour[0];
+        let seen: Vec<f32> = [0, 3, 4, 7, 8, 11, 12].into_iter().map(at).collect();
+        assert_eq!(seen, [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 0.0]);
+        // Captures 4 frames apart see each colour in turn.
+        let captured: Vec<f32> = [617, 621, 625].into_iter().map(at).collect();
+        assert_eq!(captured, [1.0, 2.0, 0.0]);
+        assert_eq!(dir_light_for(&[], 4, 7), None);
+        assert_eq!(dir_light_for(&lights, 0, 2).unwrap().colour[0], 2.0);
     }
 
     #[test]
