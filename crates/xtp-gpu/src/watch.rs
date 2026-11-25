@@ -277,13 +277,44 @@ impl Drop for GuardLock {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+static GUARD_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_guard_wait() -> std::time::Duration {
+    std::time::Duration::from_nanos(GUARD_WAIT_NS.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(feature = "diagnostics")]
+fn record_guard_wait(started: std::time::Instant) {
+    if !crate::host::preparation::active() {
+        GUARD_WAIT_NS.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+fn lock_guards() -> std::sync::MutexGuard<'static, Guards> {
+    #[cfg(feature = "diagnostics")]
+    let started = match GUARDS.try_lock() {
+        Ok(g) => return g,
+        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => std::time::Instant::now(),
+    };
+    let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    record_guard_wait(started);
+    g
+}
+
 fn guards() -> GuardLock {
-    GuardLock::new(GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+    GuardLock::new(lock_guards())
 }
 
 /// Un appel noyau ou un remappage doit trouver la protection effective.
 fn settled(range: Range<usize>) -> GuardLock {
-    let lock = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    let lock = lock_guards();
     GuardLock::new(
         REOPENED
             .wait_while(lock, |g| g.opening.range(range.clone()).next().is_some())
@@ -1015,7 +1046,10 @@ fn resolve_read_fault(at: usize, learn: bool) -> bool {
         Ok(lock) => GuardLock::new(lock),
         Err(std::sync::TryLockError::Poisoned(_)) => return false,
         Err(std::sync::TryLockError::WouldBlock) => {
-            return retry_contended(&READ_FAULTS, block) || !HOLDING.get() && readable_now(at);
+            let retry = retry_contended(&READ_FAULTS, block) || !HOLDING.get() && readable_now(at);
+            #[cfg(feature = "diagnostics")]
+            record_guard_wait(started);
+            return retry;
         }
     };
     if g.owners.touch(block, learn) {
@@ -1245,7 +1279,10 @@ pub(super) fn write_fault(at: usize, learn: bool) -> bool {
         Ok(lock) => GuardLock::new(lock),
         Err(std::sync::TryLockError::Poisoned(_)) => return false,
         Err(std::sync::TryLockError::WouldBlock) => {
-            return retry_contended(&WRITE_FAULTS, block) || !HOLDING.get() && writable(at);
+            let retry = retry_contended(&WRITE_FAULTS, block) || !HOLDING.get() && writable(at);
+            #[cfg(feature = "diagnostics")]
+            record_guard_wait(started);
+            return retry;
         }
     };
     #[cfg(feature = "diagnostics")]

@@ -3232,6 +3232,8 @@ impl Meter {
             .map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let preparation = preparation::take();
         let per_frame_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / frames;
+        #[cfg(feature = "diagnostics")]
+        let guard_wait_ms = per_frame_ms(crate::watch::take_guard_wait());
         let cpu = per_frame_ms(preparation.total);
         let [
             copy_ms,
@@ -3309,6 +3311,10 @@ impl Meter {
             );
             tracing::info!("snapshots per frame: {snapshot_ms:.3} ms");
             tracing::info!("guards and write watch per frame: {watch_ms:.3} ms");
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(
+                "GUARDS contention outside preparation per frame: {guard_wait_ms:.3} ms"
+            );
             let merged = work.merged_fills as f64 / frames;
             tracing::info!("fills per frame: {fill_ms:.3} ms, {fill_mb:.2} MB, {merged:.2} merged");
             let steps = work.steps.iter().sum::<u64>() as f64 / frames;
