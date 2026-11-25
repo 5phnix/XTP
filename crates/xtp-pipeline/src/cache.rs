@@ -1213,6 +1213,64 @@ mod tests {
         assert_eq!(conv.runs.load(Ordering::Relaxed), 3);
     }
 
+    /// A session lost on the PC (2026-11-25, `stall-lightsrc-9`, a branch
+    /// older than the index): the title's start waited over 5 minutes in
+    /// the cache's open, which opened every entry file (`CreateFileW` per
+    /// entry, cold). An open opens no entry file now: with every entry
+    /// held open by another handle that shares it with no one, so that any
+    /// open of one fails, an open from the index and one from a listing
+    /// both count every entry and its bytes.
+    #[cfg(windows)]
+    #[test]
+    fn opening_opens_no_entry_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let conv = upper(1);
+        let inputs = [b"one".as_slice(), b"two", b"three", b"four"];
+        let paths: Vec<PathBuf> = {
+            let cache = Cache::open(&root).unwrap();
+            for input in inputs {
+                cache.get_or_convert(&conv, input).unwrap();
+            }
+            inputs
+                .iter()
+                .map(|input| cache.path_for(&CacheKey::new(&conv, input)))
+                .collect()
+        };
+        let held: Vec<fs::File> = paths
+            .iter()
+            .map(|path| {
+                fs::File::options()
+                    .read(true)
+                    .share_mode(0)
+                    .open(path)
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            fs::File::open(&paths[0]).is_err(),
+            "an entry held this way cannot be opened"
+        );
+        let counted = |cache: &Cache| (cache.stats().entries, cache.stats().bytes);
+        {
+            let cache = Cache::open(&root).unwrap();
+            assert_eq!(cache.opened(), Opened::Index);
+            assert_eq!(counted(&cache), (4, 3 + 3 + 5 + 4));
+        }
+        fs::remove_file(root.join(disk::INDEX_FILE)).unwrap();
+        {
+            let cache = Cache::open(&root).unwrap();
+            assert_eq!(cache.opened(), Opened::Scan, "listed");
+            assert_eq!(counted(&cache), (4, 3 + 3 + 5 + 4));
+        }
+        drop(held);
+        let cache = Cache::open(&root).unwrap();
+        assert_eq!(cache.opened(), Opened::Index, "the listing was written");
+        assert_eq!(&*cache.get_or_convert(&conv, b"three").unwrap(), b"THREE");
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 4, "nothing made again");
+    }
+
     /// The index's records round-trip, and a changed byte is damage.
     #[test]
     fn index_records_round_trip_and_reject_damage() {
