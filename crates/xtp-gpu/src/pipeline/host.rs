@@ -49,6 +49,7 @@ impl PipelineCaps for crate::resource::format::HostCaps {
 
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
+#[derive(Clone)]
 pub(crate) struct GraphicsState {
     blend: D3D12_BLEND_DESC,
     sample_mask: u32,
@@ -57,7 +58,7 @@ pub(crate) struct GraphicsState {
     depth_bounds: bool,
     /// Input elements, their names pointing into `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-    names: Vec<CString>,
+    names: Arc<[CString]>,
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
@@ -110,7 +111,7 @@ impl Default for GraphicsState {
             },
             depth_bounds: false,
             inputs: Vec::new(),
-            names: Vec::new(),
+            names: Arc::default(),
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
             targets: D3D12_RT_FORMAT_ARRAY::default(),
@@ -125,6 +126,33 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    pub(super) fn typed_slots(&self) -> u8 {
+        self.targets
+            .RTFormats
+            .iter()
+            .take(self.targets.NumRenderTargets as usize)
+            .enumerate()
+            .fold(0, |mask, (slot, f)| {
+                mask | (u8::from(*f != DXGI_FORMAT_UNKNOWN) << slot)
+            })
+    }
+
+    pub(crate) fn without_targets(&self, missing: u8) -> Self {
+        // Les pointeurs des éléments restent valides grâce aux noms partagés.
+        let mut state = self.clone();
+        for (slot, f) in state.targets.RTFormats.iter_mut().enumerate() {
+            if missing & (1 << slot) != 0 {
+                *f = DXGI_FORMAT_UNKNOWN;
+            }
+        }
+        state
+    }
+
+    pub(super) fn null_view(&self, slot: usize) -> Option<(DXGI_FORMAT, bool)> {
+        let format = *self.targets.RTFormats.get(slot)?;
+        Some((format, self.samples.Count > 1))
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -178,7 +206,7 @@ impl GraphicsState {
                         .collect();
                     self.inputs = elements
                         .iter()
-                        .zip(&self.names)
+                        .zip(self.names.iter())
                         .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
                             SemanticName: PCSTR(name.as_ptr().cast()),
                             Format: DXGI_FORMAT(
@@ -227,7 +255,7 @@ impl GraphicsState {
         let inputs: Vec<String> = self
             .inputs
             .iter()
-            .zip(&self.names)
+            .zip(self.names.iter())
             .map(|(e, name)| {
                 format!(
                     "{name:?} {} {} {} {} {} {}",
@@ -1572,6 +1600,21 @@ mod tests {
     /// size, so their container adds nothing to what decides. For every
     /// switch, target and host; and there is none for other stages and
     /// wave32 programs, which only their translation can refuse.
+    #[test]
+    fn missing_output_keeps_multisampling_and_other_formats() {
+        let mut state = GraphicsState::default();
+        state.samples.Count = 4;
+        state.targets.NumRenderTargets = 2;
+        state.targets.RTFormats[..2].copy_from_slice(&[DXGI_FORMAT(10), DXGI_FORMAT(28)]);
+        assert_eq!(state.null_view(0), Some((DXGI_FORMAT(10), true)));
+        let variant = state.without_targets(1);
+        assert_eq!(variant.samples.Count, 4);
+        assert_eq!(
+            variant.targets.RTFormats[..2],
+            [DXGI_FORMAT_UNKNOWN, DXGI_FORMAT(28)]
+        );
+    }
+
     #[test]
     fn mesh_refusals_before_and_after_translation_agree() {
         for (target, target_64) in [((32, 32), false), ((4, 4), false), ((32, 64), true)] {
