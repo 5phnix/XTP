@@ -128,6 +128,9 @@ impl<'a> Lower<'a> {
                     l.i32_of(v)
                 }
                 Some(op) if h == 0 => l.operand(inst, op),
+                Some(Operand::Literal(x)) if name == "s_ashr_i64" => {
+                    Ok(l.s.m.i32((*x as i32 >> 31) as u32))
+                }
                 Some(Operand::Const(k)) => {
                     let x = crate::resource::inline(*k).ok_or("a special operand")?;
                     Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))

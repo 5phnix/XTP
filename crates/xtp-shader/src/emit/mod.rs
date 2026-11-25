@@ -100,6 +100,8 @@ mod lightloop_tests;
 #[cfg(all(test, windows))]
 mod limits_tests;
 #[cfg(all(test, windows))]
+mod literal64_tests;
+#[cfg(all(test, windows))]
 mod loop_limit_tests;
 #[cfg(all(test, windows))]
 mod mask_tests;
