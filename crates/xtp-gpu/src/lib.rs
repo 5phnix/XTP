@@ -49,7 +49,9 @@ mod readmap;
 #[cfg(windows)]
 pub use readmap::{configure_copy_back, save_copy_back_map};
 #[cfg(windows)]
-pub use watch::{CopyBackPin, pin_copy_back, pin_title_read, set_copy_back_lookup};
+pub use watch::{
+    CopyBackPin, pin_copy_back, pin_title_read, set_copy_back_lookup, title_virtual_protect,
+};
 #[cfg(all(windows, feature = "readmap-test"))]
 #[doc(hidden)]
 pub fn publish_copy_back_for_test(at: usize, bytes: &mut [u8], writer: u64) -> Option<usize> {

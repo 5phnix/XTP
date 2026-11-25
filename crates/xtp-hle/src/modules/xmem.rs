@@ -1687,10 +1687,13 @@ pub(crate) mod ledger {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
-        // The memory API set for `VirtualAlloc` and `VirtualFree` alone;
-        // its other functions are not here, so they bind to the host's.
+        // Les autres fonctions de cet ensemble restent fournies par Windows.
         dlls: &["xmem.dll", "api-ms-win-core-memory-*"],
         exports: vec![
+            HleExport {
+                name: "VirtualProtect",
+                address: xtp_gpu::title_virtual_protect as *const () as usize,
+            },
             HleExport {
                 name: "VirtualAlloc",
                 address: title_virtual_alloc as *const () as usize,
@@ -2180,6 +2183,28 @@ mod tests {
         unsafe { alias.cast::<u8>().write_volatile(0x75) };
         assert_eq!(&page_bytes(pages[0])[..4], &[0x75, 0xc1, 0xc1, 0xc1]);
 
+        publish(4, 0x33);
+        let mut old = 0;
+        // SAFETY: deux vues du test et une sortie valide pour la protection précédente.
+        unsafe {
+            let ro = windows_sys::Win32::System::Memory::PAGE_READONLY;
+            assert_ne!(xtp_gpu::title_virtual_protect(alias, 4096, ro, &mut old), 0);
+            assert_eq!(old, PAGE_READWRITE);
+            assert_eq!(alias.cast::<u8>().read_volatile(), 0x33);
+            copy_asks(at as usize, 1);
+            assert_eq!(query(alias).host.Protect, ro);
+            assert_eq!(
+                xtp_gpu::publish_copy_back_for_test(at as usize, &mut [0x45], 5),
+                None
+            );
+            assert_ne!(
+                xtp_gpu::title_virtual_protect(alias, PAGE, PAGE_READWRITE, &mut old),
+                0
+            );
+            assert_eq!(old, ro);
+            alias.cast::<u8>().write_volatile(0x58);
+        }
+        assert_eq!(page_bytes(pages[0])[0], 0x58);
         publish(3, 0x92);
         assert!(map_alias(alias as u64, 0, PAGE as u64));
         assert_eq!(query(alias).host.State, MEM_RESERVE);

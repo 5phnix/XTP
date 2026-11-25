@@ -381,6 +381,13 @@ fn protect_other_views(g: &mut Guards, from: usize, to: usize) {
     // (`kernel_writing`): its page's views are opened again, as when one
     // cannot be.
     let mut failed = Vec::new();
+    others.retain(|other| {
+        if g.unguardable.contains(other) {
+            failed.push(*other);
+            return false;
+        }
+        true
+    });
     if let (Some(&low), Some(&high)) = (others.first(), others.last()) {
         let flying = flying(low..high + 1);
         others.retain(|&other| {
@@ -797,7 +804,10 @@ pub(super) fn publish(
     let mut views = Vec::new();
     let physical = lookup(block * PAGE, &mut views)? / PAGE;
     views.iter_mut().for_each(|v| *v /= PAGE);
-    if !views.contains(&block) || g.owners.pinned(physical, &views) {
+    if !views.contains(&block)
+        || views.iter().any(|v| g.unguardable.contains(v))
+        || g.owners.pinned(physical, &views)
+    {
         return None;
     }
     if !g.protected.contains(&block) {
@@ -915,6 +925,40 @@ pub fn copy_asks(start: usize, end: usize) -> Option<Vec<usize>> {
             .map(|(page, _)| page)
             .collect(),
     )
+}
+
+/// Applique la protection demandée par le titre après restitution de la page.
+/// Le verrou empêche une publication entre cette restitution et VirtualProtect.
+///
+/// # Safety
+/// Les arguments suivent le contrat de VirtualProtect.
+pub unsafe extern "system" fn title_virtual_protect(
+    address: *const std::ffi::c_void,
+    len: usize,
+    protection: u32,
+    previous: *mut u32,
+) -> i32 {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let mut g = guards();
+    let range = blocks(address as usize, len);
+    if len != 0 {
+        open(&mut g, range.clone(), false);
+    }
+    // SAFETY: paramètres de l'appel original, transmis à Windows.
+    let ok = unsafe { VirtualProtect(address, len, protection, previous) };
+    if ok != 0 && view(address as usize) {
+        if protection != PAGE_READWRITE {
+            // Une seule sous-page de 4 Kio suffit à interdire une garde de 64 Kio.
+            g.unguardable.extend(range);
+        } else {
+            let first = (address as usize).div_ceil(BLOCK);
+            let end = (address as usize).saturating_add(len) / BLOCK;
+            for block in first..end {
+                g.unguardable.remove(&block);
+            }
+        }
+    }
+    ok
 }
 
 /// Title memory `[at, at + len)` changed: the runtime mapped or unmapped a
