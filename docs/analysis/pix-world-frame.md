@@ -385,3 +385,192 @@ image.
 - PIX's replay, if the person turns on Windows Developer Mode: the captures
   above replay as they are, with per-draw depth and inputs (`xtp-pix walk
   --accessed --inputs --depth-diff`).
+
+## 11. The black at its source, in two live sessions
+
+Task imgsrc (8724fde2), 2026-11-25, on the person's PC (RTX 4080 SUPER,
+Series S mode). Two world sessions of this task's branch (`main` f74e985
+plus the probe below, diagnostics build): `imgsrc-1` (07:58) and
+`imgsrc-2` (08:07), each through `E:\tools\stall-probe\queue-session.ps1`
+with `XTP_TEXTURE_POOL=1`, `XTP_CAPTURE_WORLD=2000:60:4:1`,
+`XTP_PASS_DUMP=0`, `XTP_FRAME_PROBE` and `XTP_PASS_INPUTS` (the lighting
+pixel `1cd9bc634417a981` in the first, the lighting compute
+`34fb51b8a0312e82` in the second). Their files stay in
+`E:\xtp-data\pix\imgsrc-1\` and `imgsrc-2\`; the title's logs in
+`E:\xtp-data\cache\play\20261125-065811\` and `20261125-070757\`.
+
+### 11.1 The probe
+
+`XTP_FRAME_PROBE=<program>[,…]` (`crates/xtp-gpu/src/frameprobe.rs`,
+diagnostics builds) writes `probe-<n>.txt` beside the pass dump for each
+listed frame. For every op of a listed program, and every descriptor its
+stage reads through a table:
+
+- the table's byte offset as the title gave it (its user data), the title
+  slot, whether it lies past the 737,856 slots the host heap mirrors, and
+  the host slot the shader reads instead when `draw.rs` makes the table
+  afresh in dynamic slots;
+- the view the title wrote there, and for a mirrored slot the view the
+  host slot was made from;
+- for a buffer view: the memory there (private, or a mapped view of
+  physical pages, and at how many other addresses its 64 KiB page shows),
+  the host copy it resolves to, and its bytes three times: title memory
+  when the op is recorded, title memory when its list is submitted (what
+  the refresh copies), and the host copy on the GPU just before the op (a
+  copy recorded in the list where the op stands);
+- for a small texture the title placed (the 1×1 ones): its first texels in
+  title memory.
+
+Each frame also gets the order of the R9G9B9E5 decodings against their
+writers (upstream watch item 360, §11.4). The title records a frame's lists
+while the frame before is presented, so the probe reports a frame once
+every list it probed has run; `probe-<n>` holds the ops whose lists the
+pass dump reports as `passes-<n+1>` (same op counts).
+
+### 11.2 Albedo: `COLOR2` is read as the title writes it
+
+**Heap index.** The mesh `db4835a364449a45` reads `COLOR2`'s word through
+`(u9 + 128) >> 5`, that is title slot `u9 / 32 + 4` (its table's entry
+`s1+32`; the index word it uses comes from `s1+64`, `(u9 + 256) >> 5`).
+
+| Frame | Draws of the mesh | `s1+32` past the mirror | Table made afresh |
+|---|---|---|---|
+| 805 (world-1) | 34 | 0 | (not probed) |
+| 806 (world-1) | 38 | 32 | (not probed) |
+| 673 (imgsrc-1) | 9 | 1 | 9 |
+| 676 (imgsrc-1) | 39 | 13 | 39 |
+| 660 (imgsrc-2) | 9 | 9 | 9 |
+| 663 (imgsrc-2) | 41 | 30 | 41 |
+
+Every probed draw's `u9` table is made afresh in dynamic slots (it holds
+constant buffer views, `s1+88`, which `draw.rs` `State::tables` always
+makes afresh, and a table reaching past the mirror is made afresh too),
+and the shader gets the new offset as `u9` (host slots 761,680 to
+945,562). So the draws past the mirror do not read null descriptors
+there, and §7's line saying so does not hold for table reads: watch item
+355 (VIctory #2121) does not explain `COLOR2`. It still matters for slots
+shaders compute without a table.
+
+**The view and the copy.** `s1+32` is a placed buffer view (the title's
+"view of memory at an address") of a mapped view of physical pages: for
+example 64 bytes at `0x3e15bac0` (a page shown at no other address) or 768
+bytes at `0x735fa5a40` (a pool whose pages show at two other addresses).
+XTP reads it from the host copy of the title buffer holding that address.
+In `imgsrc-2` every probed draw ran and was read back: for all 59 draws of
+frames 660 to 663, the GPU's bytes before the draw equal title memory at
+submission, which equals title memory at recording. The CPU fills these
+buffers (they change from frame to frame), and the host copy is up to
+date.
+
+**The bytes.** Each 64-byte element is an instance record: a 3×4 matrix,
+1.0, the word `COLOR2` decodes (offset 52), 1.0, a packed word. The word
+holds real colours with alpha 255 on some draws (`ff070e14`, `ff165b44`,
+`ff2e567a`, `ff415f7f`, `ff182d41`), `00ffffff` (white, alpha 0) on the
+characters' draws, and `0n000000` (n from 0 to 3) on most instanced draws
+of frames 663 and 676: the "0 or 1" words flowfix inferred are what the
+title writes there.
+
+**`COLOR2` does not darken the albedo.** In the pixel `09eb0a73df63b87d`
+(PSO 19145) the albedo is `saturate(T) × lerp(B, C × COLOR2.rgb, k ×
+COLOR2.a)`: a texture `T`, a base `B` and a colour `C` made from textures,
+and `COLOR2` as a tint weighted by its own alpha. With `COLOR2` = (0, 0,
+0, n/255) or (1, 1, 1, 0) the tint's weight is about 0, and the albedo is
+about `saturate(T) × B`.
+
+**What `T` and `B` read: textures picked by index.** Their handles come
+from words of raw buffers (`RawBufferLoad`, then `CreateHandleFromHeap`):
+textures the shader picks by index, which the pass of `descriptor/host.rs`
+over such textures uploads, a placed one's slot staying null until then.
+In both sessions, from the moment the world loads (06:58:37 and 07:08:22
+UTC) to the end, that pass's staging memory sits at its cap
+(`staging_mib=1023` of `PASS_STAGING`, 1 GiB), 14,000 to 19,000 slots wait
+for their first upload with 3.7 to 4.0 GB of textures left, and about
+13,000 are served (the 5-second "textures shaders pick by index" lines of
+the run logs). A material whose `T` or `B` is among the waiting slots
+reads 0: that is the lead for the black albedo, to be confirmed by an A/B
+on that cap (§11.5).
+
+### 11.3 Lighting: the light it is given is 0 at its writer
+
+**What `1cd9bc634417a981` computes** (PSO 20525's pixel, read in its
+DXIL): `RGB = e × (D × albedo + S)`, alpha its luminance, where `e` is
+word 1 of the 16-byte exposure buffer (`s0+168`: 0.79 to 0.85, not 0),
+`albedo` the G-buffer's `s0+584`, and the diffuse light `D = L × (1 + k) +
+X` with `L = e0 × k' × texel(s0+1008)`: `s0+1008` is one of the two
+R9G9B9E5 views (`0x97bf50000` in world-1, `0x97b110000` in imgsrc-1). `S`
+(the additive term) reads the other one, `s0+456`, and `X` the light loop
+(tile lists, probes, shadow inputs).
+
+**Its inputs, just before it** (imgsrc-1, pass P618 of `passes-675`; its
+output is 0.2 % non-zero, at most 0.0014, while the albedo is non-zero on
+12 %):
+
+| Slot | What | Non-zero | Values |
+|---|---|---|---|
+| `s0+584` | albedo RGBA8 | 12.0 % | max 0.80 |
+| `s0+1008` | R9G9B9E5 view (RGBA16F stand-in), the diffuse light | 0 % | RGB 0 |
+| `s0+456` | R9G9B9E5 view, the other light | 100 % (alpha) | RGB at most 0.008 |
+| `s0+168` | exposure buffer | | [1.27, 0.79, 8, 0.125] |
+| `s1+80` | 160×90×13 R32_UINT, tile light lists | 0 % | 0 in every slice |
+| `s0+968` | 7680×90 R32_UINT | 100 % | all `0xffffffff` |
+| `s0+1160` | 2048×1824 R8_UINT | 0 % | 0 |
+| `s1+56`, `s1+48`, `s1+64` | 10×6 R32_UINT, R8_UINT, R8 | 60 %, 100 %, 0 % | up to 3, 1, 0 |
+| `s0+760`, `s0+1280`, `s0+808` | 1280×720 R8, R8, RGBA8 | 0 % | 0 |
+| `s0+928`, `s0+1248` | 384×384 RGBA16F probes | 100 % | means 0.002 and 0.13–0.16 |
+| `s0+936` | 256×256 RGBA16F | 58 % | ±12,280, 16 texels NaN or infinite |
+| `s0+664`, `s0+1312`, `s0+488` | the 1×1 textures | 100 % | (0, 0, 0, 1) |
+
+**The input that zeroes it: `s0+1008`, 0 from its writer on.** Its memory
+is an R32_UINT texture that the compute `34fb51b8a0312e82` (160×180
+groups, P604 of `passes-675`, P567 of `passes-662`) writes with eight
+others: there, every texel is 0 (0 too in its twin; 2.4 to 6.3 % of the
+third R32 output non-zero). That compute accumulates light over frames: it
+reads its own history through four R9G9B9E5 views (all 0, or at most
+0.009) and two 1280×720 R11G11B10 textures of the frame (`s1+24`,
+`s1+88`), which are **0 on every texel**. Those two are written by P564,
+the indirect dispatches `2dc364df5d3278b8` (28,800 groups: its record
+holds `0x7080` once the classification `bad01f53f53248e5` has counted) and
+`940c2635dc1312f4` (0 groups); they write 0. Among their inputs, the
+2048×120 R9G9B9E5 view at `0x17bf40000` is the output of the computes
+`8cb27ccf2d50c606` (3,680 groups, P556) and `17e736204a05a105` (P559),
+which write 0 too. The local lights are missing as well: the tile lists
+the lighting loops over hold no light in any tile.
+
+**The 1×1 textures are black in title memory**: `00 00 00 ff` at
+`0x957000000` and `0x957010000`, as the title wrote them, not an upload
+that went missing.
+
+### 11.4 The R9G9B9E5 decodings run before their writers (watch item 360)
+
+`resource::decode_now` records a stand-in's decoding at the frame's first
+read of the view and runs it in a list of XTP's own at the start of the
+next title submission. In imgsrc-1's frame 674, the R9G9B9E5 view at
+`0x97d8e0000` is first read in a list submitted in submission 3276,
+recorded when 3,272 had been made: its decoding runs at the start of
+submission 3273, while its writer (`dce085c07b9414b6`, R32_UINT) and its
+readers (the lighting among them) run in submission 3276. The same holds
+for `0x97d520000` (written by `34fb51b8a0312e82` and `71883e40620a567a`,
+decoded at 3273, all of them in 3276) and for the 2048×120 and 1280×720
+pairs of frames 675 and 676. So the stand-ins show the frame before's
+light, and the compute pairs that write one texture while reading the
+other (§11.3) read last frame's half. It is a real lag, but not the black:
+the textures behind them are written 0 in the same frame.
+
+### 11.5 What to fix, and where
+
+- **The light chain's zero** (§11.3): the computes writing the 2048×120
+  light data (`8cb27ccf2d50c606`, `17e736204a05a105`, `6bb493a39685ddcc`)
+  and the per-pixel lighting `2dc364df5d3278b8` write 0 although their
+  dispatches run. Next: their inputs just before them
+  (`XTP_PASS_INPUTS=8cb27ccf2d50c606`, then `2dc364df5d3278b8`, and
+  `XTP_FRAME_PROBE` on the same programs for their buffers: light
+  descriptions, counts), down to the first input that is 0 or the first
+  program whose translation loses the value.
+- **Decode in the reading list** (§11.4, `resource.rs`): run the
+  R9G9B9E5 decoding in the list that reads the view, after its writer, as
+  the copy path of `alias_copy` already does (VIctory #1868's in-list
+  pack), instead of once a frame before the next submission.
+- **Textures picked by index** (§11.2, `descriptor/host.rs`): an A/B on
+  `PASS_STAGING` (1 GiB, held for each texture's life) in one session: the
+  waiting slots, and the G-buffer's albedo (non-zero share and mean) with
+  the cap raised or the staging released after each upload.
