@@ -200,14 +200,10 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             ..
         }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
         Err(ShaderError::Unsupported {
-            what: why @ ("the first half of an interpolation" | "a hardware SGPR input"),
+            what: "the first half of an interpolation" | "a hardware SGPR input",
             ..
         }) if parts.native.stage == HwStage::Ps => {
-            let mut io = if why == "the first half of an interpolation" {
-                crate::io::raise_inputs(parts.p, parts.native, true)?
-            } else {
-                parts.io.clone()
-            };
+            let mut io = crate::io::raise_inputs(parts.p, parts.native, true)?;
             io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
             lower_program(
                 &Parts {

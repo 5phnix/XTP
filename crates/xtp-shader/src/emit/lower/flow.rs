@@ -1114,6 +1114,11 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
+                    (Some(Val::Missing(super::mask::LANE_MASK)), false)
+                        if self.unused_pixel_sgpr(phi.reg, q, b) =>
+                    {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }

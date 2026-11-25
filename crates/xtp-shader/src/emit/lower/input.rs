@@ -2,7 +2,7 @@
 //! interpolation (`v_interp_*`). Backlog P1 (packed 16-bit pixel inputs),
 //! P2 (exact interpolation), S3 (hardware SGPR inputs).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{Lower, Stop, Val, Why, packed_half, packed_partners};
 use crate::emit::UserData;
@@ -14,6 +14,7 @@ use crate::io::{Barycentric, Input, Interp};
 use crate::ir::{Inst, Reg, Value};
 use crate::native::{PsInput, RootType, StageIo};
 use crate::resource::Site;
+use crate::structure::{Atom, Bool, LaneExit};
 
 /// The second rows of pixel inputs packing two 16-bit rows per dword, by
 /// first row: the vertex outputs' rule ([`super::export::half_outputs`]),
@@ -84,6 +85,91 @@ enum Eval {
 }
 
 impl<'a> Lower<'a> {
+    /// A temporary SGPR can hold a wave mask on one edge and pixel data
+    /// on another. Follow the former edge until the SGPR is overwritten:
+    /// only substitute padding when no instruction can observe its bits.
+    pub(super) fn unused_pixel_sgpr(&self, reg: Reg, pred: usize, join: usize) -> bool {
+        if !self.s.pixel || self.x.io.initialized_sgprs.is_none() || !matches!(reg, Reg::S(0..=105))
+        {
+            return false;
+        }
+        let mut work = vec![(pred, join)];
+        let mut seen = HashSet::new();
+        'edge: while let Some((pred, b)) = work.pop() {
+            if !seen.insert((pred, b)) {
+                continue;
+            }
+            let block = &self.x.p.blocks[b];
+            for i in &block.insts {
+                if i.read(reg).is_some() {
+                    return false;
+                }
+                if i.write(reg).is_some() {
+                    continue 'edge;
+                }
+            }
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = self.x.st.exits[b]
+                && let Some(t) = self.pixel_edge_condition(b, pred, when)
+            {
+                work.push((b, if t { taken } else { not_taken }));
+            } else {
+                work.extend(block.exit.successors().into_iter().map(|to| (b, to)));
+            }
+        }
+        true
+    }
+
+    /// A flag VGPR set on each predecessor is often tested at the join
+    /// before reading the associated data. Evaluate a plain equality test
+    /// with this edge's incoming constants; either successor stays possible
+    /// if the test (or its negation) is not known.
+    fn pixel_edge_condition(&self, b: usize, pred: usize, when: Bool) -> Option<bool> {
+        let (Atom::Lane(v), no, yes) = self.x.st.bools.node(when)? else {
+            return None;
+        };
+        let block = &self.x.p.blocks[b];
+        let cmp = block
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        if cmp.name() != "v_cmp_eq_u32"
+            || cmp.machine.encoding != crate::gfx10::Encoding::Vopc
+            || cmp.machine.words.len() != 1
+        {
+            return None;
+        }
+        let Fields::Valu(alu) = &cmp.fields else {
+            return None;
+        };
+        let word = |op| match op {
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Vector { reg, .. } => {
+                let mut v = cmp.read(Reg::V(reg))?;
+                if let Some(phi) = block.phis.iter().find(|p| p.value == v) {
+                    v = phi.args[block.preds.iter().position(|&p| p == pred)?];
+                }
+                let Val::I32(x) = self.vals.get(&v)? else {
+                    return None;
+                };
+                self.s.m.int_value(*x).map(|k| k as u32)
+            }
+            _ => None,
+        };
+        match if word(alu.src[0])? == word(alu.src[1])? {
+            yes
+        } else {
+            no
+        } {
+            Bool::TRUE => Some(true),
+            Bool::FALSE => Some(false),
+            _ => None,
+        }
+    }
+
     /// Values of the program's input registers.
     pub(super) fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
