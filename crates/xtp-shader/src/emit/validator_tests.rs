@@ -453,3 +453,45 @@ fn a_console_row_of_a_flat_channel_and_others_validates() {
     });
     validates("the console pixel program", &out.dxil);
 }
+
+/// A vertex shader writing one dword to a raw UAV of the view heap, as the
+/// emitter makes it for a console vertex program's buffer store, with
+/// ShaderFlags `extra` besides those the shader collects.
+fn vertex_writing_a_heap_uav(extra: u64) -> Vec<u8> {
+    let mut s = Shader::new(false);
+    let b = s.entry;
+    let index = s.m.i32(0);
+    let h = s.heap_handle(b, index, false, false, (11 | 0x1000, 0));
+    let iu = s.m.undef(s.t.i32);
+    let (zero, mask, align) = (s.m.i32(0), s.m.i8(1), s.m.i32(4));
+    let args = [h, zero, iu, zero, iu, iu, iu, mask, align];
+    let void = s.t.void;
+    s.op(b, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+    s.flags |= extra;
+    let mut pos = position();
+    pos.usage = 0xf;
+    for col in 0..4u8 {
+        let zero = s.m.f32(0);
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), zero];
+        s.op(b, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
+    }
+    s.outputs = vec![pos];
+    s.m.terminate(b, Term::Ret);
+    s.finish()
+}
+
+/// VIctory #1977 sets ShaderFlags bit 16 (UAVs at every stage, SFI0 0x4)
+/// for vertex and geometry programs that write the UAVs its instrumentation
+/// binds by register. The emitter binds no UAV by register: a vertex
+/// program writes through the view heap, and for such a UAV dxil.dll counts
+/// the heap and nothing else. It takes the module as the emitter declares
+/// it, and refuses it with bit 16 ("Flags must match usage"): the change
+/// does not apply here.
+#[test]
+fn a_vertex_shader_writing_a_heap_uav_declares_no_uavs_at_every_stage() {
+    validates("a heap UAV store", &vertex_writing_a_heap_uav(0));
+    if let Some(r) = verdict("with bit 16", &vertex_writing_a_heap_uav(1 << 16)) {
+        let e = r.expect_err("dxil.dll took bit 16 for a heap UAV");
+        assert!(e.contains("Flags must match usage"), "{e}");
+    }
+}
