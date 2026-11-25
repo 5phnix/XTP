@@ -14,19 +14,21 @@ runtime logs them). Times are UTC unless marked local. Logs are under
   the System log ("Error occurred on GPUID"), the first one at the moment
   the GPU stops answering, and never event 13. The PC's DRED report (task
   ec5a7ada, session `rt2a4-dred`) has no page fault (§3).
-- **Where the PC's GPU stopped.** In a host acceleration-structure build of
-  XTP's own `rt::Builder` (list 0 of 26 in flight, command 310 of 638,
-  `BUILDRAYTRACINGACCELERATIONSTRUCTURE`), not in a title dispatch. Its
-  commands 311 to 626 carried no marker, so the report could not name the
-  build; task ec5a7ada adds markers to the host RT commands (§3).
+- **Where the GPU stopped, on both machines.** In a host
+  acceleration-structure build of XTP's own `rt::Builder`, not in a title
+  dispatch: on the PC list 0 of 26 in flight, command 310 of 638; on the
+  L4 list 0 of 19, command 184 of 394, both
+  `BUILDRAYTRACINGACCELERATIONSTRUCTURE`. DRED 1.2 gives the L4's device
+  state: hung. The host RT commands carried no marker, so neither report
+  names the build; task ec5a7ada adds markers to them (§3, §4).
 - **DRED in XTP was already there** (`XTP_D3D12_DRED=1`, diagnostics
   builds). This task adds DRED 1.2 to its report (`dred.rs`, §2): the
   device state, each stopped list's last finished and first unfinished
   command with the text of the marker before it, and the address ranges of
   the allocations at a page fault.
 - **DRED is slow on the L4**, about five times: the loss comes 24 to 41
-  frames into the world, and a 420 s session with DRED reaches about 20
-  (§4).
+  frames into the world, which takes a DRED session about 15 minutes of
+  world there (§4).
 
 ## 2. Device-removed data in XTP
 
@@ -34,9 +36,11 @@ runtime logs them). Times are UTC unless marked local. Logs are under
 
 - before the host device is made, `host::create` turns on DRED's automatic
   breadcrumbs and page-fault data (`ID3D12DeviceRemovedExtendedDataSettings`),
-  and `dred::enable` turns on breadcrumb contexts
-  (`ID3D12DeviceRemovedExtendedDataSettings1`): the runtime then keeps the
-  text of each marker with its breadcrumb;
+  and `dred::enable` again through `ID3D12DeviceRemovedExtendedDataSettings1`;
+  with `XTP_D3D12_DRED=contexts` it also turns on breadcrumb contexts, with
+  which the runtime keeps the text of each marker with its breadcrumb.
+  They are off otherwise: on the L4 they added about 3 s to a world frame
+  and came back empty (session `dred-12-long`, §4);
 - XTP names its host objects (`host::name`) and sets a marker before each
   draw, dispatch and copy it records (`HostList::note_op`): the operation,
   the pipeline and the hashes of its programs, the user data, root views
@@ -53,9 +57,12 @@ What `dred::report` adds:
 | Allocations at a page fault | `GetPageFaultAllocationOutput2`, each node's object | name, kind, host address range of a buffer and where the fault lies in it |
 | Lists | `GetAutoBreadcrumbsOutput1` | how many lists finished, were not started, and for each list that stopped part way its last finished and first unfinished commands, each with the marker before it |
 
-With no list stopped part way (DRED's counts may lag the GPU, xcl#1592),
-it names the last command of the last finished list and the first command
-of the first list not started.
+The marker texts come from DRED's breadcrumb contexts when it kept any,
+and otherwise from our notes, the k-th note for the k-th marker command
+(the way `Host::removal_data` pairs them); the report says which. With no
+list stopped part way (DRED's counts may lag the GPU, xcl#1592), it names
+the last command of the last finished list and the first command of the
+first list not started.
 
 `Host::removal_data` keeps its own part: the faulting address and the
 allocation names there, the title memory copies and descriptor heaps near
@@ -107,13 +114,39 @@ ec5a7ada's builder verdict; world 32 s after the start, removal 14:01:38):
 | cxstrideon2-table | 5018dd4 | off | 13:21:02, frame 2919 | about 24 (last logged 2943) | yes, 13:21:37 |
 | cxstrideon2-both (`XTP_RUN_TIME_VIEWS=1`) | 5018dd4 | off | 13:26:04, frame 2352 | about 25–30 | no; the run ended in a CPU fault in title code at 13:29 |
 | dred-760ec60-a | 760ec60 | on | 13:46:26, frame 3052 | about 20 (15–18 s a frame) | no, stopped at 420 s |
-| dred-12-b | this branch | on, with contexts | 13:54:09, frame 2421 | about 15 (16–24 s a frame) | no, stopped at 420 s |
+| dred-12-b | this branch (1b24311) | on, with contexts | 13:54:09, frame 2421 | about 15 (16–24 s a frame) | no, stopped at 420 s |
+| dred-12-long | this branch (1b24311) | on, with contexts | 14:01:26, frame 2567 | about 50 (about 20 s a frame) | **yes**, removed 14:18:14 |
 
 Without DRED the L4 runs the world at 0.3 fps (3.5 s a frame); with it,
-0.1 fps, and 0.05 fps with breadcrumb contexts. Both the time spent
+0.1 fps, and about 0.05 fps with breadcrumb contexts. Both the time spent
 preparing submissions and the time outside them grow by about 7 s a frame.
 The loss follows the number of frames in the world (24 to 41), not the
-clock, so a DRED session on the L4 needs about 12 minutes of world.
+clock, so a DRED session on the L4 needs about 15 minutes of world.
+
+`dred-12-long`'s report (`E:\xtp-data\cloud-runs\20261125-145217-game`,
+line 15101 of `run.log`):
+
+- `DRED: device hung (a command did not finish in time)`; page fault VA 0;
+  NVIDIA's event 153 in the System log, as on the PC;
+- 458 lists in DRED's output, 431 finished, 26 not started; one stopped
+  part way: list 0 of the 19 in flight, after 184 of its 394 commands. The
+  last finished is command 183, a resource barrier; the first unfinished
+  is command 184, `BUILDRAYTRACINGACCELERATIONSTRUCTURE`;
+- commands 185 to 383 carry no marker (host RT commands); the next marked
+  ones are dispatches of 969c1cef8b783b39 (5, 4 and 1 groups) at 385, 388
+  and 390;
+- by the order of the list's 41 notes, 37 of them come before command 184,
+  the last of which is a dispatch of 3cf39f4495b908d0 (4 groups) after a
+  0x20-byte root view copy. That program reads four buffers through its
+  table (42,991,392 bytes at title 0x2ec40010, 1 MiB, 182 MB at title
+  0x276c0000, 48 KiB) and writes a 12 MiB one;
+- the breadcrumb contexts were on, and none came back: the report then
+  said "no marker before it" for commands that 37 markers precede. Hence
+  the pairing by order (§2).
+
+The PC and the L4 lose the device the same way: list 0, a host build
+without a marker, then dispatches of 969c1cef8b783b39. On the L4 the build
+had the constant buffer view cap (760ec60); on the PC it did not.
 
 ## 5. Checked
 
