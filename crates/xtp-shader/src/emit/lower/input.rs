@@ -2,7 +2,7 @@
 //! interpolation (`v_interp_*`). Backlog P1 (packed 16-bit pixel inputs),
 //! P2 (exact interpolation), S3 (hardware SGPR inputs).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{Lower, Stop, Val, Why, packed_half, packed_partners};
 use crate::emit::UserData;
@@ -14,6 +14,7 @@ use crate::io::{Barycentric, Input, Interp};
 use crate::ir::{Inst, Reg, Value};
 use crate::native::{PsInput, RootType, StageIo};
 use crate::resource::Site;
+use crate::structure::{Atom, Bool, LaneExit};
 
 /// The second rows of pixel inputs packing two 16-bit rows per dword, by
 /// first row: the vertex outputs' rule ([`super::export::half_outputs`]),
@@ -84,6 +85,91 @@ enum Eval {
 }
 
 impl<'a> Lower<'a> {
+    /// A temporary SGPR can hold a wave mask on one edge and pixel data
+    /// on another. Follow the former edge until the SGPR is overwritten:
+    /// only substitute padding when no instruction can observe its bits.
+    pub(super) fn unused_pixel_sgpr(&self, reg: Reg, pred: usize, join: usize) -> bool {
+        if !self.s.pixel || self.x.io.initialized_sgprs.is_none() || !matches!(reg, Reg::S(0..=105))
+        {
+            return false;
+        }
+        let mut work = vec![(pred, join)];
+        let mut seen = HashSet::new();
+        'edge: while let Some((pred, b)) = work.pop() {
+            if !seen.insert((pred, b)) {
+                continue;
+            }
+            let block = &self.x.p.blocks[b];
+            for i in &block.insts {
+                if i.read(reg).is_some() {
+                    return false;
+                }
+                if i.write(reg).is_some() {
+                    continue 'edge;
+                }
+            }
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = self.x.st.exits[b]
+                && let Some(t) = self.pixel_edge_condition(b, pred, when)
+            {
+                work.push((b, if t { taken } else { not_taken }));
+            } else {
+                work.extend(block.exit.successors().into_iter().map(|to| (b, to)));
+            }
+        }
+        true
+    }
+
+    /// A flag VGPR set on each predecessor is often tested at the join
+    /// before reading the associated data. Evaluate a plain equality test
+    /// with this edge's incoming constants; either successor stays possible
+    /// if the test (or its negation) is not known.
+    fn pixel_edge_condition(&self, b: usize, pred: usize, when: Bool) -> Option<bool> {
+        let (Atom::Lane(v), no, yes) = self.x.st.bools.node(when)? else {
+            return None;
+        };
+        let block = &self.x.p.blocks[b];
+        let cmp = block
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        if cmp.name() != "v_cmp_eq_u32"
+            || cmp.machine.encoding != crate::gfx10::Encoding::Vopc
+            || cmp.machine.words.len() != 1
+        {
+            return None;
+        }
+        let Fields::Valu(alu) = &cmp.fields else {
+            return None;
+        };
+        let word = |op| match op {
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Vector { reg, .. } => {
+                let mut v = cmp.read(Reg::V(reg))?;
+                if let Some(phi) = block.phis.iter().find(|p| p.value == v) {
+                    v = phi.args[block.preds.iter().position(|&p| p == pred)?];
+                }
+                let Val::I32(x) = self.vals.get(&v)? else {
+                    return None;
+                };
+                self.s.m.int_value(*x).map(|k| k as u32)
+            }
+            _ => None,
+        };
+        match if word(alu.src[0])? == word(alu.src[1])? {
+            yes
+        } else {
+            no
+        } {
+            Bool::TRUE => Some(true),
+            Bool::FALSE => Some(false),
+            _ => None,
+        }
+    }
+
     /// Values of the program's input registers.
     pub(super) fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
@@ -141,10 +227,12 @@ impl<'a> Lower<'a> {
                 return Val::I32(self.flat_thread_id(c));
             }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return Val::I32(self.group_id(c)),
+            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
-                let g = self.group_id(0);
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
                 let n = self.s.m.i32(self.x.mesh_stride);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Mul, g, n));
             }
@@ -839,6 +927,7 @@ mod tests {
         let io = StageIo::Ps {
             inputs: vec![entry(0, 0, true), entry(3, 3, true), entry(5, 6, true)],
             input_addr: 0,
+            rsrc2: 0,
             db_shader_control: 0,
             patches: vec![],
         };
@@ -889,6 +978,7 @@ mod tests {
         let ps = |inputs| StageIo::Ps {
             inputs,
             input_addr: 0,
+            rsrc2: 0,
             db_shader_control: 0,
             patches: vec![],
         };
@@ -986,6 +1076,7 @@ mod tests {
                 }],
                 // PERSP_CENTER: i and j in v0 and v1.
                 input_addr: 1 << 1,
+                rsrc2: 0,
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -1063,318 +1154,5 @@ mod tests {
         // With the second row named, it is padding.
         packed_read(2, 1).unwrap();
         packed_read(3, 1).unwrap();
-    }
-
-    /// Pixel programs reading I and J as values, or interpolating with
-    /// computed ones (VIctory #453's tests).
-    mod barycentrics {
-        use crate::dxbc::{self, Container, FourCC};
-        use crate::emit::container::{self, SigElement};
-        use crate::emit::validator::Validator;
-        use crate::emit::{HostShader, emit, signature};
-        use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
-        use crate::{ShaderError, io, ir, resource, structure};
-
-        /// `SPI_PS_INPUT_ADDR` bits: PERSP_CENTER, PERSP_CENTROID,
-        /// LINEAR_CENTER.
-        const PERSP_CENTER: u32 = 1 << 1;
-        const PERSP_CENTROID: u32 = 1 << 2;
-        const LINEAR_CENTER: u32 = 1 << 5;
-        const S_ENDPGM: u32 = 0xBF81_0000;
-
-        /// `exp mrt0, v<r>, v<r>, v<r>, v<r> done vm`.
-        fn exp_mrt0(r: u32) -> [u32; 2] {
-            [0xF800_180F, r * 0x0101_0101]
-        }
-
-        /// VOP2 `v_add_f32 v<dst>, v<a>, v<b>`.
-        fn v_add_f32(dst: u32, a: u32, b: u32) -> u32 {
-            3 << 25 | dst << 17 | b << 9 | (256 + a)
-        }
-
-        fn element(name: &str, kind: u8, row: u32) -> SigElement {
-            SigElement {
-                name: name.into(),
-                index: 0,
-                kind,
-                comp: 9,
-                interp: 0,
-                row: Some(row),
-                col: 0,
-                cols: 4,
-                usage: 0,
-                half: false,
-            }
-        }
-
-        /// Translates a pixel program with the input VGPRs `input_addr`
-        /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
-        fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
-            let native = NativeProgram {
-                stage: HwStage::Ps,
-                wave64: false,
-                float_mode: 0,
-                vgprs: 8,
-                layout: vec![],
-                used: vec![],
-                io: StageIo::Ps {
-                    inputs: vec![PsInput {
-                        usage: Usage::Generic,
-                        row: 0,
-                        mask: 0b1111,
-                        attr: 0,
-                        flat: false,
-                        fp16: false,
-                        pack2: false,
-                        row2: 0,
-                    }],
-                    input_addr,
-                    db_shader_control: 0,
-                    patches: vec![],
-                },
-                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-            };
-            let mut target = element("SV_Target", 16, 0);
-            target.usage = 15;
-            let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
-            let osg1 = container::signature(&[target], false);
-            let bytes = dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
-            let c = Container::parse(&bytes).unwrap();
-            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-            let st = structure::structure(&p)?;
-            let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-            let io = io::raise(&p, &native)?;
-            emit(&c, &native, &p, &st, &io, &res)
-        }
-
-        /// The translation's `SFI0` features and `ISG1` rows.
-        fn parts(shader: &HostShader) -> (u64, Vec<SigElement>) {
-            let c = Container::parse(&shader.dxil).unwrap();
-            let sfi0 = c.part(FourCC::SFI0).unwrap().data.try_into().unwrap();
-            (
-                u64::from_le_bytes(sfi0),
-                signature(c.part(FourCC::ISG1).unwrap().data).unwrap(),
-            )
-        }
-
-        fn validate(shader: &HostShader) {
-            if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
-                v.validate(&mut shader.dxil.clone()).unwrap();
-            }
-        }
-
-        /// The `PSV0` interpolation mode of TEXCOORD0 (row 0, x-w, float).
-        fn texcoord_mode(shader: &HostShader) -> u8 {
-            let c = Container::parse(&shader.dxil).unwrap();
-            let psv = c.part(FourCC::PSV0).unwrap().data;
-            let row = [1, 0, 0x44, 0, 3];
-            let at = psv.windows(5).position(|w| w == row).unwrap();
-            psv[at + 5]
-        }
-
-        /// `v_mov_b32 v<dst>, v<src>`.
-        fn v_mov_b32(dst: u32, src: u32) -> u32 {
-            0x7E00_0200 | dst << 17 | (256 + src)
-        }
-
-        /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
-        /// plain floats: they are channels y and z of `SV_Barycentrics`, the
-        /// weights of vertices 1 and 2. I alone reads y, J alone z (the sum
-        /// of both would read the same with the two swapped).
-        #[test]
-        fn barycentrics_read_as_values_are_sv_barycentrics() {
-            let [e0, e1] = exp_mrt0(2);
-            for (value, read) in [
-                (v_mov_b32(2, 0), 0b010),
-                (v_mov_b32(2, 1), 0b100),
-                (v_add_f32(2, 0, 1), 0b110),
-            ] {
-                let words = [value, e0, e1, S_ENDPGM];
-                let shader = pixel(&words, PERSP_CENTER).unwrap();
-                let (features, inputs) = parts(&shader);
-                assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
-                let bary: Vec<_> = inputs.iter().filter(|e| e.kind == 28).collect();
-                assert_eq!(bary.len(), 1, "{inputs:?}");
-                assert_eq!((bary[0].index, bary[0].col, bary[0].cols), (0, 0, 3));
-                // Not packed: the validator wants packing location -1.
-                assert_eq!(bary[0].row, None);
-                // The channels read: the element's read mask.
-                let k = inputs.iter().position(|e| e.kind == 28).unwrap();
-                let isg1 = Container::parse(&shader.dxil).unwrap();
-                let isg1 = isg1.part(FourCC::ISG1).unwrap().data;
-                assert_eq!(isg1[8 + 32 * k + 25], read, "{inputs:?}");
-                validate(&shader);
-            }
-        }
-
-        /// Two kinds of barycentrics read directly: one element per mode.
-        #[test]
-        fn two_barycentric_modes_get_two_elements() {
-            // v0-v1 perspective i, j; v2-v3 linear i, j.
-            let [e0, e1] = exp_mrt0(4);
-            let words = [v_add_f32(4, 0, 3), e0, e1, S_ENDPGM];
-            let shader = pixel(&words, PERSP_CENTER | LINEAR_CENTER).unwrap();
-            let (_, inputs) = parts(&shader);
-            let mut indices: Vec<u32> = inputs
-                .iter()
-                .filter(|e| e.kind == 28)
-                .map(|e| e.index)
-                .collect();
-            indices.sort();
-            assert_eq!(indices, [0, 1], "{inputs:?}");
-            validate(&shader);
-        }
-
-        /// Center and centroid perspective I/J both read as values: DXIL
-        /// allows one perspective `SV_Barycentrics` element (the validator:
-        /// "There can only be up to two input attributes of SV_Barycentrics
-        /// with different perspective interpolation mode"), so the program
-        /// is refused rather than given two, or center weights for centroid
-        /// ones.
-        #[test]
-        fn center_and_centroid_barycentrics_are_refused() {
-            // v0-v1 perspective center i, j; v2-v3 perspective centroid i, j.
-            let [e0, e1] = exp_mrt0(4);
-            let words = [v_add_f32(4, 0, 3), e0, e1, S_ENDPGM];
-            match pixel(&words, PERSP_CENTER | PERSP_CENTROID) {
-                Err(ShaderError::Unsupported { what, .. }) => {
-                    assert!(what.contains("two perspective modes"), "{what}")
-                }
-                Err(e) => panic!("{e:?}"),
-                Ok(shader) => panic!("translated: {:?}", parts(&shader).1),
-            }
-            // Centroid alone (v2, v3) still translates, with one element.
-            let words = [v_add_f32(4, 2, 3), e0, e1, S_ENDPGM];
-            let shader = pixel(&words, PERSP_CENTER | PERSP_CENTROID).unwrap();
-            let (_, inputs) = parts(&shader);
-            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
-            validate(&shader);
-        }
-
-        /// I and J only fed to `v_interp_*` stay host interpolation: no
-        /// barycentrics are declared.
-        #[test]
-        fn interpolation_alone_declares_no_barycentrics() {
-            let [e0, e1] = exp_mrt0(2);
-            let words = [
-                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
-                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
-                e0,
-                e1,
-                S_ENDPGM,
-            ];
-            let shader = pixel(&words, PERSP_CENTER).unwrap();
-            let (features, inputs) = parts(&shader);
-            assert_eq!(features & 0x2_0000, 0);
-            assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
-            validate(&shader);
-        }
-
-        /// Both: the attribute is interpolated and J is used as a value.
-        #[test]
-        fn interpolation_and_a_barycentric_value_together() {
-            let [e0, e1] = exp_mrt0(3);
-            let words = [
-                0xC808_0000,        // v_interp_p1_f32 v2, v0, attr0.x
-                0xC809_0001,        // v_interp_p2_f32 v2, v1, attr0.x
-                v_add_f32(3, 2, 1), // v3 = attribute + j
-                e0,
-                e1,
-                S_ENDPGM,
-            ];
-            let shader = pixel(&words, PERSP_CENTER).unwrap();
-            let (features, inputs) = parts(&shader);
-            assert_ne!(features & 0x2_0000, 0);
-            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
-            validate(&shader);
-        }
-
-        /// An interpolation whose i is computed (`v_mul_f32 v3, 0.5, v0`)
-        /// reads the attribute's vertices: TEXCOORD0 becomes constant, read
-        /// with `attributeAtVertex`; i and j are `SV_Barycentrics` values.
-        #[test]
-        fn computed_barycentrics_read_the_vertices() {
-            let [e0, e1] = exp_mrt0(2);
-            let words = [
-                0x1006_00F0, // v_mul_f32 v3, 0.5, v0
-                0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
-                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
-                e0,
-                e1,
-                S_ENDPGM,
-            ];
-            let shader = pixel(&words, PERSP_CENTER).unwrap();
-            let (features, inputs) = parts(&shader);
-            assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
-            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
-            assert_eq!(texcoord_mode(&shader), 1);
-            validate(&shader);
-        }
-
-        /// Weights from constants alone: the vertices, no `SV_Barycentrics`.
-        #[test]
-        fn constant_weights_need_no_barycentrics() {
-            let [e0, e1] = exp_mrt0(2);
-            let words = [
-                0x7E06_02F0, // v_mov_b32 v3, 0.5
-                0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
-                0xC809_0003, // v_interp_p2_f32 v2, v3, attr0.x
-                e0,
-                e1,
-                S_ENDPGM,
-            ];
-            let shader = pixel(&words, PERSP_CENTER).unwrap();
-            let (features, inputs) = parts(&shader);
-            assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
-            assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
-            assert_eq!(texcoord_mode(&shader), 1);
-            validate(&shader);
-        }
-
-        /// The same attribute interpolated with the loaded i and j and with
-        /// a computed j: both from its vertices, the first weighed with
-        /// `SV_Barycentrics`.
-        #[test]
-        fn computed_and_loaded_barycentrics_on_one_attribute() {
-            let [e0, e1] = exp_mrt0(2);
-            let words = [
-                0xC810_0100, // v_interp_p1_f32 v4, v0, attr0.y
-                0xC811_0101, // v_interp_p2_f32 v4, v1, attr0.y
-                0x1006_02F0, // v_mul_f32 v3, 0.5, v1
-                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
-                0xC809_0003, // v_interp_p2_f32 v2, v3, attr0.x
-                v_add_f32(2, 2, 4),
-                e0,
-                e1,
-                S_ENDPGM,
-            ];
-            let shader = pixel(&words, PERSP_CENTER).unwrap();
-            let (_, inputs) = parts(&shader);
-            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
-            assert_eq!(texcoord_mode(&shader), 1);
-            validate(&shader);
-        }
-
-        /// P10 of an attribute the program interpolates is P1 - P0.
-        #[test]
-        fn p10_of_an_interpolated_attribute() {
-            let [e0, e1] = exp_mrt0(2);
-            let words = [
-                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
-                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
-                0xC812_0000, // v_interp_mov_f32 v4, p10, attr0.x
-                v_add_f32(2, 2, 4),
-                e0,
-                e1,
-                S_ENDPGM,
-            ];
-            let shader = pixel(&words, PERSP_CENTER).unwrap();
-            assert_eq!(texcoord_mode(&shader), 1);
-            validate(&shader);
-            // Alone, what the hardware holds is not known.
-            let [e0, e1] = exp_mrt0(4);
-            let words = [0xC812_0000, e0, e1, S_ENDPGM];
-            assert!(pixel(&words, PERSP_CENTER).is_err());
-        }
     }
 }

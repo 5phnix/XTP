@@ -1045,7 +1045,7 @@ mod tests {
 
         /// Other tests submit to the same host and can release held lists or
         /// finish pending write-backs. Give this test its own host and queues.
-        fn isolated_device(test: &str) -> Option<&'static crate::host::Host> {
+        fn isolated_device(test: &str) -> Option<crate::testgpu::Gpu> {
             const CHILD: &str = "XTP_TEST_ISOLATED_QUEUE";
             if std::env::var(CHILD).as_deref() == Ok(test) {
                 return device(test);
@@ -1114,7 +1114,8 @@ mod tests {
         #[test]
         fn a_compute_list_behind_a_fence_sees_what_the_graphics_list_signalling_it_wrote() {
             let test = "queue::tests::waits::a_compute_list_behind_a_fence_sees_what_the_graphics_list_signalling_it_wrote";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let (scratch, depth, read) = (
                 TitleBuffer::new(256),
@@ -1147,7 +1148,8 @@ mod tests {
         #[test]
         fn a_wait_for_a_value_already_reached_runs_the_next_list_at_once() {
             let test = "queue::tests::waits::a_wait_for_a_value_already_reached_runs_the_next_list_at_once";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let (scratch, out) = (TitleBuffer::new(256), TitleBuffer::new(256));
             let (graphics, compute, fence) = (new_queue(0), new_queue(2), new_fence());
@@ -1172,9 +1174,10 @@ mod tests {
         #[test]
         fn a_queue_waiting_for_a_cpu_signal_runs_on_without_another_call() {
             let test = "queue::tests::waits::a_queue_waiting_for_a_cpu_signal_runs_on_without_another_call";
-            let Some(host) = isolated_device(test) else {
+            let Some(gpu) = isolated_device(test) else {
                 return;
             };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let (data, read) = (TitleBuffer::new(256), TitleBuffer::new(256));
             // A host copy, as if a draw had read the buffer before.
@@ -1215,7 +1218,8 @@ mod tests {
                 [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
             );
             let test = "queue::tests::waits::a_held_list_the_title_resets_runs_first";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let (scratch, out) = (TitleBuffer::new(256), TitleBuffer::new(256));
             let (compute, fence) = (new_queue(2), new_fence());
@@ -1242,7 +1246,8 @@ mod tests {
         #[test]
         fn a_present_runs_what_its_queue_holds() {
             let test = "queue::tests::waits::a_present_runs_what_its_queue_holds";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let (scratch, out) = (TitleBuffer::new(256), TitleBuffer::new(256));
             let (graphics, fence) = (new_queue(0), new_fence());
@@ -1310,9 +1315,10 @@ mod tests {
         #[test]
         fn a_page_mapping_waits_only_for_the_submissions_touching_its_pages() {
             let test = "queue::tests::waits::a_page_mapping_waits_only_for_the_submissions_touching_its_pages";
-            let Some(host) = isolated_device(test) else {
+            let Some(gpu) = isolated_device(test) else {
                 return;
             };
+            let host = gpu.host();
             host.finish_on_caller();
             crate::resource::use_page_mapper(note_mapping);
             let kernel = Kernel::new(host);

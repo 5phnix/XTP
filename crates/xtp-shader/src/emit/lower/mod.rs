@@ -64,6 +64,7 @@ mod compare;
 mod descriptor;
 mod export;
 mod flow;
+pub(super) mod geometry;
 mod image;
 mod input;
 mod integer;
@@ -122,7 +123,6 @@ pub(crate) struct Lowered {
     /// picks at run time ([`super::RUN_TIME_READS`], [`super::RUN_TIME_WRITES`]).
     pub run_time_buffers: u8,
     pub user_data: Vec<UserData>,
-    pub group_base: Option<u32>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
@@ -143,6 +143,7 @@ pub(crate) struct Lowered {
     pub scalar_guards: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
     pub p: &'a Program,
@@ -199,6 +200,20 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             what: UNTRACKED_SELECT,
             ..
         }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
+        Err(ShaderError::Unsupported {
+            what: "the first half of an interpolation" | "a hardware SGPR input",
+            ..
+        }) if parts.native.stage == HwStage::Ps => {
+            let mut io = crate::io::raise_inputs(parts.p, parts.native, true)?;
+            io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
+            lower_program(
+                &Parts {
+                    io: &io,
+                    ..parts.clone()
+                },
+                false,
+            )
+        }
         result => result,
     }
 }
@@ -246,7 +261,6 @@ struct Lower<'a> {
     emitted_double_count: bool,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
-    group_base_row: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
@@ -446,30 +460,6 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    /// Identifiant du titre. La base XYZ partage le bloc de constantes du programme.
-    fn group_id(&mut self, component: u8) -> V {
-        let Val::I32(id) = self.compute_id("groupId.i32", 94, component) else {
-            unreachable!()
-        };
-        let row = *self
-            .group_base_row
-            .get_or_insert_with(|| self.s.m.pending_i32());
-        let handle = *self
-            .user_data
-            .get_or_insert_with(|| self.s.user_data_handle());
-        let entry = self.s.entry;
-        let values = self.s.op(
-            entry,
-            "cbufferLoadLegacy.i32",
-            Attr::ReadOnly,
-            self.s.t.cbuf_ret,
-            59,
-            &[handle, row],
-        );
-        let offset = self.s.m.extract(entry, values, u32::from(component));
-        self.s.m.bin(entry, super::bitcode::Bin::Add, id, offset)
-    }
-
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
@@ -479,6 +469,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.ordered_uavs = x.native.io.pops();
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -749,7 +740,6 @@ impl<'a> Lower<'a> {
             emitted_double_count: false,
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
-            group_base_row: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -944,14 +934,6 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
-        let group_base = self.group_base_row.map(|row| {
-            // La rangée suivante reste libre même si des constantes du titre sont déportées.
-            let offset = self.s.user_data.next_multiple_of(4);
-            let actual = self.s.m.i32(offset / 4);
-            self.s.m.replace_const(row, actual);
-            self.s.user_data = offset + 3;
-            offset
-        });
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -959,7 +941,6 @@ impl<'a> Lower<'a> {
         let stride_table = self.s.stride_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
-            group_base,
             flow: match (self.console_cf, self.split) {
                 (false, false) => "per lane",
                 (false, true) if self.group_reads => {

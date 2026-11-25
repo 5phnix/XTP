@@ -425,6 +425,7 @@ fn a_console_row_of_a_flat_channel_and_others_validates() {
         io: StageIo::Ps {
             inputs: vec![input(0), input(1)],
             input_addr: 0,
+            rsrc2: 0,
             db_shader_control: 0,
             patches: vec![],
         },

@@ -276,14 +276,6 @@ impl Module {
         let t = self.int(32);
         self.int_const(t, i64::from(v as i32))
     }
-    /// Une constante réservée à un opérande dont la valeur sera fixée à la fin.
-    pub fn pending_i32(&mut self) -> V {
-        let ty = self.int(32);
-        let index = self.consts.len() as u32;
-        self.consts.push((ty, Const::Int(0)));
-        V::Const(index)
-    }
-
     pub fn i8(&mut self, v: u8) -> V {
         let t = self.int(8);
         self.int_const(t, i64::from(v as i8))

@@ -90,6 +90,42 @@ jobs:
       # No game files here: tests that need them skip (CONTRIBUTING.md, Tests).
       - run: cargo test --workspace --locked
 
+  # The GPU tests again, on WARP under the D3D12 debug layer: a test fails on
+  # the errors the layer raises on its thread (crates/xtp-gpu/src/testgpu.rs).
+  # One test at a time (RUST_TEST_THREADS=1), so errors of our own threads,
+  # and of a test that kept no device guard, are reported. The layer comes
+  # with Graphics Tools. Not yet a required check of the ruleset.
+  gpu-debug-layer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Graphics Tools (the D3D12 debug layer)
+        shell: pwsh
+        run: |
+          if (Test-Path "$env:WINDIR\System32\d3d12SDKLayers.dll") {
+            "the D3D12 debug layer is installed"
+          } else {
+            Measure-Command {
+              Add-WindowsCapability -Online -Name Tools.Graphics.DirectX~~~~0.0.1.0 | Out-Host
+            } | ForEach-Object { "installed in $([int]$_.TotalSeconds) s" }
+          }
+      - name: GPU tests under the D3D12 debug layer
+        env:
+          XTP_TEST_ADAPTER: warp
+          XTP_D3D12_DEBUG: "1"
+          XTP_REQUIRE_GPU: "1"
+          RUST_TEST_THREADS: "1"
+        run: cargo test -p xtp-gpu --features diagnostics --locked
+
   policy:
     runs-on: ubuntu-latest
     timeout-minutes: 15

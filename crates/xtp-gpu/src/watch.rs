@@ -1258,9 +1258,9 @@ pub(crate) mod tests {
     #[test]
     fn a_host_copy_through_one_view_takes_writes_through_another() {
         let test = "watch::tests::a_host_copy_through_one_view_takes_writes_through_another";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let _serial = serial();
         let section = section(1);
         let (a, b) = (view_of(section, 1), view_of(section, 1));

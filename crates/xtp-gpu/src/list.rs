@@ -115,6 +115,8 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    bounds_set: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -230,6 +232,8 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         uploads: Default::default(),
+        #[cfg(all(windows, feature = "diagnostics"))]
+        bounds_set: Default::default(),
         #[cfg(windows)]
         host: crate::host::host().and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
@@ -320,6 +324,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     uploads.clear();
     drop(uploads);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    // SAFETY: le titre réinitialise une de nos listes.
+    unsafe { &(*this.cast::<List>()).bounds_set }
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     #[cfg(windows)]
     keep_pipeline(this, pipeline);
     #[cfg(windows)]
@@ -520,7 +528,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(src, false, false);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
+            crate::texture::gpu_write(list, dst, true);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -632,7 +640,7 @@ extern "system" fn copy_texture_region(
         }
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(dst.resource);
+        crate::texture::gpu_write(list, dst.resource, false);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -718,7 +726,7 @@ extern "system" fn resolve(
         list.twin_use(src, false, false);
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
+        crate::texture::gpu_write(list, dst, false);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -1047,7 +1055,7 @@ fn clear_uav(
                 list.twin_use(texture, true, true);
                 list.twins_written();
                 ensure_state(list, texture, UNORDERED_ACCESS);
-                crate::texture::host_written(texture);
+                crate::texture::gpu_write(list, texture, false);
             }
             let rects: &[RECT] = if count > 0 && !rects.is_null() {
                 // SAFETY: the title passes `count` rectangles, laid out as the host's.
@@ -1371,7 +1379,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         ensure_state(list, color, NON_PIXEL_SHADER_RESOURCE);
         ensure_state(list, output, UNORDERED_ACCESS);
-        crate::texture::host_written(output);
+        crate::texture::gpu_write(list, output, false);
         #[cfg(feature = "diagnostics")]
         {
             crate::capture::note_target(output);
@@ -1720,10 +1728,31 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     at
 }
 
-/// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
-/// arguments, nothing returned.
+/// Ignore les signatures racines (fournies par nos pipelines) et les
+/// indications d'ordre de profondeur et de fréquence d'ombrage.
 extern "system" fn ignored_state(_: This) {}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static BOUNDED_LISTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: une liste du titre. Chaque enregistrement compte une seule fois.
+        if !unsafe { &(*this.cast::<List>()).bounds_set }.swap(true, Relaxed) {
+            BOUNDED_LISTS.fetch_add(1, Relaxed);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this).and_then(|l| l.bounds_list.as_ref()) {
+        // SAFETY: liste ouverte sur un périphérique qui accepte les bornes.
+        unsafe { list.OMSetDepthBounds(min, max) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, min, max);
+}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
@@ -1878,7 +1907,11 @@ mod state {
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        with_state(this, |list, s| s.dispatch_mesh(list, [x, y, z]));
+        if y * z != 1 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+        }
+        with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1896,7 +1929,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, [x, 1, 1]));
+        with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -2151,7 +2184,7 @@ const METHODS: [(usize, *const ()); 54] = [
     (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220 DB_DEPTH_BOUNDS_MIN/MAX
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -2297,7 +2330,8 @@ mod tests {
         #[test]
         fn buffer_copies_run_between_dispatches_in_list_order() {
             let test = "list::tests::gpu::buffer_copies_run_between_dispatches_in_list_order";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let [a, b, c] = [(); 3].map(|()| TitleBuffer::new(256));
             a.set_words(|i| 0xdead_0000 + i as u32);
@@ -2324,8 +2358,10 @@ mod tests {
         /// source were read whole first.
         #[test]
         fn resource_and_memory_copies_run_on_the_gpu() {
+            crate::testgpu::known_layer_errors(&[538], "#45");
             let test = "list::tests::gpu::resource_and_memory_copies_run_on_the_gpu";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let (d, e) = (TitleBuffer::new(512), TitleBuffer::new(512));
             let at = d.address();
@@ -2349,9 +2385,9 @@ mod tests {
         #[test]
         fn copies_without_host_copies_stay_on_the_cpu() {
             let test = "list::tests::gpu::copies_without_host_copies_stay_on_the_cpu";
-            if device(test).is_none() {
+            let Some(_gpu) = device(test) else {
                 return;
-            }
+            };
             let (a, b) = (TitleBuffer::new(256), TitleBuffer::new(256));
             a.set_words(|i| 3 * i as u32);
             let list = TitleList::new();
@@ -2367,7 +2403,8 @@ mod tests {
         #[test]
         fn memory_writes_reach_later_commands_of_the_list() {
             let test = "list::tests::gpu::memory_writes_reach_later_commands_of_the_list";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let kernel = Kernel::new(host);
             let (w, c) = (TitleBuffer::new(256), TitleBuffer::new(256));
             w.set_words(|_| 0x1111_1111);
@@ -2486,7 +2523,8 @@ mod tests {
         #[test]
         fn the_fidelityfx_upscale_is_bilinear_jittered_and_stays_in_its_regions() {
             let test = "list::tests::gpu::the_fidelityfx_upscale_is_bilinear_jittered_and_stays_in_its_regions";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let (color, plain, jittered) = (texture(8, 2), texture(16, 6), texture(16, 6));
             let list = TitleList::new();
             for (i, red) in [0u8, 64, 128, 192].into_iter().enumerate() {
@@ -2564,7 +2602,8 @@ mod tests {
         #[test]
         fn uav_clears_of_a_texture_go_through_host_views() {
             let test = "list::tests::gpu::uav_clears_of_a_texture_go_through_host_views";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let image = texture(4, 4);
             let heap = crate::descriptor::TestHeap::views(4);
             let mut cpu = [0u64; 4];
@@ -2607,9 +2646,9 @@ mod tests {
         #[test]
         fn uav_clears_of_a_buffer_reach_title_memory() {
             let test = "list::tests::gpu::uav_clears_of_a_buffer_reach_title_memory";
-            if device(test).is_none() {
+            let Some(_gpu) = device(test) else {
                 return;
-            }
+            };
             const R32_UINT: u32 = 42;
             const R32_TYPELESS: u32 = 39;
             const BUFFER: u32 = 1;
@@ -2667,9 +2706,9 @@ mod tests {
         #[test]
         fn uav_clears_of_typed_buffers_write_the_documented_bits() {
             let test = "list::tests::gpu::uav_clears_of_typed_buffers_write_the_documented_bits";
-            if device(test).is_none() {
+            let Some(_gpu) = device(test) else {
                 return;
-            }
+            };
             const BUFFER: u32 = 1;
             // (view format, values, the word each of the 4 elements holds)
             let uint: [(u32, [u32; 4], u32); 7] = [
@@ -2919,7 +2958,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         #[test]
         fn dispatch_x_runs_thread_counts_as_whole_groups() {
             let test = "list::tests::dispatch_x_gpu::dispatch_x_runs_thread_counts_as_whole_groups";
-            let Some(host) = device(test) else { return };
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
             let (root, pso) = counting(host);
             let group = Some([8, 4, 1]);
             // Counts, flags, then the threads run and the extent they cover.

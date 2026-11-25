@@ -85,7 +85,8 @@ fn ptr(at: &u64) -> *mut u8 {
 fn submissions_finish_in_order_after_their_gpu_work() {
     let test = "host::submissions::submissions_finish_in_order_after_their_gpu_work";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let words: [&'static u64; 3] = [(); 3].map(|()| &*Box::leak(Box::new(0u64)));
     let lists: Vec<HostList> = (0..3).map(|_| host.new_list().unwrap()).collect();
     let seen: std::sync::Arc<Mutex<Vec<[u64; 3]>>> = std::sync::Arc::default();
@@ -152,7 +153,8 @@ fn words_at(at: usize) -> Vec<u32> {
 fn shader_writes_are_written_back_after_the_gpu_work() {
     let test = "host::submissions::shader_writes_are_written_back_after_the_gpu_work";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let kernel = Kernel::new(host);
     // On pages of their own (the title writes `out` before the first runs).
     let window = watched(4 << 20);
@@ -191,7 +193,8 @@ fn a_refresh_of_memory_the_title_wrote_waits_for_the_shaders_writing_it() {
     let test =
         "host::submissions::a_refresh_of_memory_the_title_wrote_waits_for_the_shaders_writing_it";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let kernel = Kernel::new(host);
     let window = watched(4 << 20);
     let (scratch, out, copy) = (window, window + (1 << 16), window + (2 << 16));
@@ -237,7 +240,8 @@ fn a_refresh_of_memory_the_title_wrote_waits_for_the_shaders_writing_it() {
 fn a_gpu_copy_over_what_earlier_shaders_write_waits_for_them() {
     let test = "host::submissions::a_gpu_copy_over_what_earlier_shaders_write_waits_for_them";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let kernel = Kernel::new(host);
     let [scratch, out, source] = [(); 3].map(|()| TitleBuffer::new(256));
     source.set_words(|i| 0x7700_0000 + i as u32);
@@ -282,7 +286,8 @@ fn three_submissions_on_one_shadow_compare_with_their_own_snapshots() {
     let test =
         "host::submissions::three_submissions_on_one_shadow_compare_with_their_own_snapshots";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let kernel = Kernel::new(host);
     // One host copy (the window's), each range on a page of its own; all
     // zeros at first.
@@ -347,7 +352,8 @@ impl Shared {
 fn a_list_reset_while_it_runs_records_into_fresh_memory() {
     let test = "host::submissions::a_list_reset_while_it_runs_records_into_fresh_memory";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let list = host.new_list().unwrap();
     let (first, second) = (Box::new(0u64), Box::new(0u64));
     // Records a copy of 256 bytes of `fill` from the list's scratch memory
@@ -417,7 +423,8 @@ fn dynamic_descriptors_stay_leased_until_the_submission_finishes() {
     use crate::object::{S_OK, This, guid, slot};
     let test = "host::submissions::dynamic_descriptors_stay_leased_until_the_submission_finishes";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     #[repr(C)]
     struct ExtendedHeapDesc {
         /// Views, 8 of them, shader visible, no node mask.
@@ -473,7 +480,8 @@ fn dynamic_descriptors_stay_leased_until_the_submission_finishes() {
 fn a_step_reading_what_an_earlier_submission_writes_sees_it() {
     let test = "host::submissions::a_step_reading_what_an_earlier_submission_writes_sees_it";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
     let label = Box::new(0u64);
     first.defer_write(ptr(&label), Written::Value(0x1234_5678_9abc), 8);
@@ -512,7 +520,8 @@ fn title_fences_are_signalled_after_the_work_before_them() {
     use crate::object::{HRESULT, S_OK, This, slot};
     let test = "host::submissions::title_fences_are_signalled_after_the_work_before_them";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let null = std::ptr::null();
     let mut fence: This = null;
     let fence_iid = &crate::fence::FENCE_IIDS[0];
@@ -576,7 +585,8 @@ impl Drop for EventForTest {
 fn a_synchronous_submission_is_finished_when_it_returns() {
     let test = "host::submissions::a_synchronous_submission_is_finished_when_it_returns";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let kernel = Kernel::new(host);
     let (scratch, out) = (TitleBuffer::new(256), TitleBuffer::new(256));
     let list = host.new_list().unwrap();
@@ -607,7 +617,8 @@ fn a_panic_on_the_completion_thread_ends_the_run() {
             eprintln!("failure reported: {text}");
             std::process::exit(REPORTED)
         });
-        let host = device(test).expect("a device, as in the parent");
+        let gpu = device(test).expect("a device, as in the parent");
+        let host = gpu.host();
         let label: &'static u64 = Box::leak(Box::new(0u64));
         let list = host.new_list().unwrap();
         list.defer_write(ptr(label), Written::Value(1), 8);
@@ -624,9 +635,9 @@ fn a_panic_on_the_completion_thread_ends_the_run() {
         std::process::exit(1);
     }
     let _serial = serial();
-    if device(test).is_none() {
+    let Some(_gpu) = device(test) else {
         return;
-    }
+    };
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([test, "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
@@ -650,7 +661,8 @@ fn a_panic_on_the_completion_thread_ends_the_run() {
 fn a_reset_leaves_a_running_submission_its_recording() {
     let test = "host::submissions::a_reset_leaves_a_running_submission_its_recording";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let list = host.new_list().unwrap();
     list.used_pipeline("first");
     list.close();
@@ -714,7 +726,8 @@ fn waits_for_the_gate(gate: &mut Gate, f: impl FnOnce() + Send) -> bool {
 fn a_frame_runs_on_past_its_present_until_the_next_flip() {
     let test = "host::submissions::a_frame_runs_on_past_its_present_until_the_next_flip";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let label: &'static u64 = Box::leak(Box::new(0u64));
     let mut gate = Gate::close(host);
     let (work, present) = frame_in_flight(host, label);
@@ -734,7 +747,8 @@ fn a_frame_runs_on_past_its_present_until_the_next_flip() {
 fn without_frames_in_flight_a_present_finishes_every_submission() {
     let test = "host::submissions::without_frames_in_flight_a_present_finishes_every_submission";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let label: &'static u64 = Box::leak(Box::new(0u64));
     let (work, present) = (host.new_list().unwrap(), host.new_list().unwrap());
     work.defer_write(ptr(label), Written::Value(1), 8);
@@ -757,7 +771,8 @@ fn without_frames_in_flight_a_present_finishes_every_submission() {
 fn a_flip_wait_ends_once_the_frame_presented_last_has_finished() {
     let test = "host::submissions::a_flip_wait_ends_once_the_frame_presented_last_has_finished";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let label: &'static u64 = Box::leak(Box::new(0u64));
     let mut gate = Gate::close(host);
     let (_work, _present) = frame_in_flight(host, label);
@@ -786,7 +801,8 @@ fn the_title_waits_for_its_fence_and_finds_what_the_frame_in_flight_wrote() {
     let test =
         "host::submissions::the_title_waits_for_its_fence_and_finds_what_the_frame_in_flight_wrote";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let kernel = Kernel::new(host);
     let window = watched(4 << 20);
     let (scratch, out) = (window, window + (1 << 16));
@@ -837,7 +853,8 @@ fn the_title_waits_for_its_fence_and_finds_what_the_frame_in_flight_wrote() {
 fn the_next_frame_leaves_what_the_frame_in_flight_writes() {
     let test = "host::submissions::the_next_frame_leaves_what_the_frame_in_flight_writes";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let kernel = Kernel::new(host);
     let window = watched(4 << 20);
     let (scratch, out, copy) = (window, window + (1 << 16), window + (2 << 16));
@@ -880,7 +897,8 @@ fn the_next_frame_leaves_what_the_frame_in_flight_writes() {
 fn a_list_of_ours_waits_for_its_submission_when_reset() {
     let test = "host::submissions::a_list_of_ours_waits_for_its_submission_when_reset";
     let _serial = serial();
-    let Some(host) = device(test) else { return };
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
     let label: &'static u64 = Box::leak(Box::new(0u64));
     let list = host.new_list().unwrap();
     list.defer_write(ptr(label), Written::Value(1), 8);
