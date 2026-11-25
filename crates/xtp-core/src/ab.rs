@@ -48,6 +48,7 @@ pub const SWITCHES: &[&str] = &[
     "XTP_RT_STANDIN",
     "XTP_RT_PATH",
     "XTP_PLANE_NOW",
+    "XTP_HEAP_SYNC",
 ];
 
 /// Switches read once, when shaders are translated or pipelines made,

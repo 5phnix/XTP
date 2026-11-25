@@ -1448,6 +1448,11 @@ impl Host {
         if batch.submission.is_multiple_of(32) {
             crate::readmap::save_copy_back_map();
         }
+        // Records the title copied into its placed descriptor heaps as
+        // bytes, before the lists' own work at submission (their sweeps).
+        if title {
+            crate::descriptor::sync_heaps();
+        }
         for list in runs {
             list.submitting();
             list.run_deferred(&mut batch);
@@ -3430,6 +3435,7 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let [cbv_copies, cbv_hits] = crate::draw::take_cbv_copies().map(|n| n as f64 / frames);
         let indirect = crate::list::take_indirect() as f64 / frames;
+        let heap_sync = crate::descriptor::take_synced(frames);
         // The title's threads spend `cpu` and `waited` in submissions; the
         // GPU and the copying back run beside them for the rest.
         let outside_ms = outside(ms, cpu + waited);
@@ -3518,6 +3524,7 @@ impl Meter {
                  {words:.1} GPU word, {textures:.1} texture), {steps_ms:.3} ms in remaining step work, \
                  {other_ms:.3} ms in other preparation"
             );
+            heap_sync.log();
             #[cfg(feature = "diagnostics")]
             crate::indirect::log_counts();
             #[cfg(feature = "diagnostics")]
