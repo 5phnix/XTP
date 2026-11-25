@@ -90,6 +90,9 @@ struct Port {
     mode: Mode,
     tasks: Mutex<VecDeque<Task>>,
     ready: Condvar,
+    /// The threads that run this port's tasks: those that dispatched a
+    /// manual port, or a serialized port's worker.
+    dispatchers: Mutex<Vec<std::thread::ThreadId>>,
 }
 
 impl Port {
@@ -98,12 +101,14 @@ impl Port {
             mode,
             tasks: Mutex::default(),
             ready: Condvar::new(),
+            dispatchers: Mutex::default(),
         });
         if mode == Mode::Serialized {
             // The worker ends once it holds the last reference (every queue
             // using the port is closed) and nothing is left to run.
             let worker = port.clone();
             std::thread::spawn(move || {
+                worker.dispatched_here();
                 loop {
                     match worker.take(1000, || false) {
                         Some(task) => task.run(false),
@@ -144,6 +149,28 @@ impl Port {
                 .0
         };
         tasks.pop_front()
+    }
+
+    /// Notes the current thread as one that runs this port's tasks.
+    fn dispatched_here(&self) {
+        let me = std::thread::current().id();
+        let mut dispatchers = lock(&self.dispatchers);
+        if !dispatchers.contains(&me) {
+            dispatchers.push(me);
+        }
+    }
+
+    /// Whether the current thread runs this port's tasks.
+    fn runs_here(&self) -> bool {
+        lock(&self.dispatchers).contains(&std::thread::current().id())
+    }
+
+    /// Takes the queued task with this context out of the queue, unless a
+    /// dispatcher (or termination) took it first.
+    fn remove(&self, context: usize) -> Option<Task> {
+        let mut tasks = lock(&self.tasks);
+        let index = tasks.iter().position(|t| t.context == context)?;
+        tasks.remove(index)
     }
 }
 
@@ -347,6 +374,7 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     if port.mode != Mode::Manual {
         return false;
     }
+    port.dispatched_here();
     match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
         Some(task) => {
             task.run(false);
@@ -470,7 +498,19 @@ const OP_CLEANUP: u32 = 4;
 #[derive(Default)]
 struct Completion {
     result: Option<HRESULT>,
+    /// Waiters may return: the result is published and the completion
+    /// routine, if the title set one, has returned.
     done: bool,
+    /// The completion routine's task while it waits in a manual or
+    /// serialized port (the port and the task's context), for a waiter on a
+    /// thread that runs that port's tasks to run it instead of deadlocking.
+    queued: Option<(Arc<Port>, usize)>,
+}
+
+/// A queued completion routine: the call it ends and the title's block.
+struct Routine {
+    call: Arc<Call>,
+    block: usize,
 }
 
 /// Active until cleanup or result retrieval. Completion state outlives the
@@ -484,20 +524,53 @@ struct Call {
 }
 
 impl Call {
+    /// Waits until the call is done: its result published and its
+    /// completion routine returned. If that routine is queued in a port
+    /// whose tasks this thread runs, this thread runs it, as its next
+    /// dispatch would have, instead of waiting for itself.
     fn wait(&self) -> HRESULT {
-        let done = lock(&self.done);
-        let done = self
-            .finished
-            .wait_while(done, |d| !d.done)
-            .unwrap_or_else(|e| e.into_inner());
-        done.result.unwrap()
+        let mut done = lock(&self.done);
+        loop {
+            if done.done {
+                return done.result.unwrap();
+            }
+            if let Some((port, context)) = done.queued.take_if(|(port, _)| port.runs_here()) {
+                drop(done);
+                if let Some(task) = port.remove(context) {
+                    task.run(false);
+                }
+                done = lock(&self.done);
+                continue;
+            }
+            done = self.finished.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
     }
 
-    /// Records the result (the first one wins), wakes waiters and queues
-    /// the completion routine on the block's completion port. A call that
-    /// is over already is left alone, and so is `block`: the title may have
-    /// freed it, or begun another call on it, since.
-    fn complete(&self, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+    /// Lets waiters return, once the result is published and the
+    /// completion routine, if any, has returned.
+    fn finish(self: &Arc<Self>, block: *mut AsyncBlock) {
+        let mut registry = lock(&REGISTRY);
+        if registry
+            .routines
+            .get(&(block as usize))
+            .is_some_and(|c| Arc::ptr_eq(c, self))
+        {
+            registry.routines.remove(&(block as usize));
+        }
+        drop(registry);
+        let mut done = lock(&self.done);
+        done.done = true;
+        done.queued = None;
+        self.finished.notify_all();
+    }
+
+    /// Records the result (the first one wins), publishes it and queues the
+    /// completion routine on the block's completion port. Waiters return
+    /// once that routine has returned (at once without one), as the public
+    /// API documents. A call that is over already is left alone, and so is
+    /// `block`: the title may have freed it, or begun another call on it,
+    /// since.
+    fn complete(self: &Arc<Self>, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
         if result == E_PENDING {
             return;
         }
@@ -507,13 +580,22 @@ impl Call {
         }
         done.result = Some(result);
         drop(done);
-        extern "system" fn routine(block: *mut c_void, _canceled: bool) {
-            let block = block.cast::<AsyncBlock>();
-            // SAFETY: the title keeps the block until its completion
-            // routine has run.
-            if let Some(routine) = unsafe { (*block).callback } {
-                routine(block);
+        // Runs even when canceled (the queue was terminated): the title
+        // frees what the call used in its completion routine.
+        extern "system" fn routine(context: *mut c_void, _canceled: bool) {
+            // SAFETY: boxed in `complete`; a queued task runs once.
+            let routine = unsafe { Box::from_raw(context.cast::<Routine>()) };
+            let block = routine.block as *mut AsyncBlock;
+            {
+                let _marker = Marker::enter(&ROUTINES, Arc::as_ptr(&routine.call) as usize);
+                // SAFETY: the title keeps the block until its completion
+                // routine has run.
+                if let Some(callback) = unsafe { (*block).callback } {
+                    callback(block);
+                }
             }
+            // The routine has returned; the block may be gone.
+            routine.call.finish(block);
         }
         // Read before publishing: once the status is set, the title may free
         // the block.
@@ -542,27 +624,41 @@ impl Call {
             && registry
                 .completing
                 .get(&(block as usize))
-                .is_some_and(|c| std::ptr::eq(c.as_ref(), self))
+                .is_some_and(|c| Arc::ptr_eq(c, self))
         {
             registry.completing.remove(&(block as usize));
         }
+        if callback.is_none() {
+            drop(registry);
+            self.finish(block);
+            return;
+        }
+        // Waiters arriving before the routine returns still find the call.
+        registry.routines.insert(block as usize, self.clone());
         drop(registry);
-        let mut done = lock(&self.done);
-        done.done = true;
-        self.finished.notify_all();
-        drop(done);
-        if callback.is_some() {
-            let task = Task::new(block.cast(), routine);
-            match queue(handle) {
-                Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
-                _ => task.run(true),
+        let context = Box::into_raw(Box::new(Routine {
+            call: self.clone(),
+            block: block as usize,
+        }));
+        let task = Task::new(context.cast(), routine);
+        match queue(handle) {
+            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {
+                let port = &queue.ports[COMPLETION as usize];
+                if matches!(port.mode, Mode::Manual | Mode::Serialized) {
+                    let mut done = lock(&self.done);
+                    // Unless a dispatcher has run it already.
+                    if !done.done {
+                        done.queued = Some((port.clone(), task.context));
+                        self.finished.notify_all();
+                    }
+                }
             }
+            _ => task.run(true),
         }
     }
 
     fn cleanup(&self, block: *mut AsyncBlock) {
-        let _ = CLEANING.try_with(|blocks| blocks.borrow_mut().push(block as usize));
-        let _marker = CleanupMarker;
+        let _marker = Marker::enter(&CLEANING, block as usize);
         self.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
 
@@ -589,6 +685,10 @@ struct Registry {
     /// Wait-only entries: providers are inaccessible and begin is refused
     /// until cleanup and publication finish. Both maps share one lock.
     completing: HashMap<usize, Arc<Call>>,
+    /// Calls whose completion routine is queued or running, so that status
+    /// waiters can still wait for it to return. Begin is not refused: the
+    /// routine may begin the next call on its block.
+    routines: HashMap<usize, Arc<Call>>,
 }
 impl Registry {
     fn remove_active(&mut self, block: *mut AsyncBlock, expected: &Call) -> Option<Arc<Call>> {
@@ -604,16 +704,34 @@ impl Registry {
     }
 }
 static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(Default::default);
+type Marks = std::cell::RefCell<Vec<usize>>;
 thread_local! {
-    static CLEANING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The blocks whose cleanup runs on this thread.
+    static CLEANING: Marks = const { std::cell::RefCell::new(Vec::new()) };
+    /// The calls whose completion routine runs on this thread.
+    static ROUTINES: Marks = const { std::cell::RefCell::new(Vec::new()) };
 }
-struct CleanupMarker;
-impl Drop for CleanupMarker {
+/// Marks a value on one of the lists above while it is in scope.
+struct Marker(&'static std::thread::LocalKey<Marks>);
+impl Marker {
+    fn enter(marks: &'static std::thread::LocalKey<Marks>, value: usize) -> Marker {
+        let _ = marks.try_with(|m| m.borrow_mut().push(value));
+        Marker(marks)
+    }
+}
+impl Drop for Marker {
     fn drop(&mut self) {
-        let _ = CLEANING.try_with(|blocks| {
-            blocks.borrow_mut().pop();
+        let _ = self.0.try_with(|m| {
+            m.borrow_mut().pop();
         });
     }
+}
+/// Whether `value` is marked on this thread; true once the thread's
+/// locals are gone, so callers fall back to not waiting.
+fn marked(marks: &'static std::thread::LocalKey<Marks>, value: usize) -> bool {
+    marks
+        .try_with(|m| m.borrow().contains(&value))
+        .unwrap_or(true)
 }
 
 fn call(block: *mut AsyncBlock) -> Option<Arc<Call>> {
@@ -626,6 +744,7 @@ fn waiting_call(block: *mut AsyncBlock) -> Option<Arc<Call>> {
         .active
         .get(&(block as usize))
         .or_else(|| registry.completing.get(&(block as usize)))
+        .or_else(|| registry.routines.get(&(block as usize)))
         .cloned()
 }
 
@@ -732,29 +851,36 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     }
 }
 
-/// A blocking query stays with one call and waits through cleanup. Cleanup
-/// must not wait, directly or indirectly through a join, lock or event, on
-/// a thread blocking with `wait = true` on the same block: the API cannot
-/// infer this dependency, which is a provider bug. Such threads must use
-/// `wait = false`. A reentrant query of a block undergoing cleanup on this
-/// thread returns its current status instead, including in nested cleanup.
+/// A blocking query stays with one call and waits through cleanup and, if
+/// the title set a completion routine, until that routine has returned (as
+/// the public API documents, and libHttpClient's implementation does).
+///
+/// Cleanup must not wait, directly or indirectly through a join, lock or
+/// event, on a thread blocking with `wait = true` on the same block: the
+/// API cannot infer this dependency, which is a provider bug. Such threads
+/// must use `wait = false`. A reentrant query of a block undergoing cleanup
+/// on this thread returns its current status instead, including in nested
+/// cleanup; so does a query from the call's own completion routine.
+///
+/// The GDK's waiter simply blocks, so one on the thread that dispatches the
+/// completion port waits forever. Here, a waiter on a thread that runs the
+/// completion port's tasks (it has dispatched that manual port, or is that
+/// serialized port's worker) runs the call's queued completion routine
+/// itself, out of turn, as its next dispatch would have. Other waiters
+/// wait, so the routine still runs on a thread the title dispatches with;
+/// a wait on a manual port no thread has dispatched yet waits for the
+/// first dispatch.
 pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    // After TLS destruction, cleanup tracking is unavailable: avoid a
-    // potentially reentrant wait and return the current status instead.
-    if wait
-        && CLEANING
-            .try_with(|blocks| blocks.borrow().contains(&(block as usize)))
-            .unwrap_or(true)
-    {
+    if !wait || marked(&CLEANING, block as usize) {
         return status(block);
     }
-    if wait && let Some(call) = waiting_call(block) {
-        return call.wait();
+    match waiting_call(block) {
+        Some(call) if !marked(&ROUTINES, Arc::as_ptr(&call) as usize) => call.wait(),
+        _ => status(block),
     }
-    status(block)
 }
 
 pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
@@ -1560,13 +1686,15 @@ mod tests {
             ),
             S_OK
         );
+        // A wait returns only after the completion routine, which runs when
+        // the port is dispatched.
+        assert_eq!(COMPLETED.load(Ordering::SeqCst), 0, "completion is manual");
+        assert!(XTaskQueueDispatch(q, COMPLETION, INFINITE));
+        assert_eq!(COMPLETED.load(Ordering::SeqCst), 1);
         assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
         let mut size = 0;
         assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
         assert_eq!(size, 8);
-        assert_eq!(COMPLETED.load(Ordering::SeqCst), 0, "completion is manual");
-        assert!(XTaskQueueDispatch(q, COMPLETION, INFINITE));
-        assert_eq!(COMPLETED.load(Ordering::SeqCst), 1);
 
         let mut value = 0u64;
         let mut small = 0u32;
@@ -1867,7 +1995,11 @@ mod tests {
         // made just after the first one's cleanup, where a state freed then
         // would have been, and the first worker wrote after that.)
         go_second.send(()).unwrap();
+        // This thread dispatches the completion port, so its wait runs the
+        // second completion routine instead of waiting for itself.
         assert_eq!(XAsyncGetStatus(block, true), S_OK);
+        assert_eq!(COMPLETED.load(Ordering::SeqCst), 2);
+        assert!(!XTaskQueueDispatch(q, COMPLETION, 0), "it ran once");
         let mut size = 0;
         assert_eq!(XAsyncGetResultSize(block, &mut size), S_OK);
         assert_eq!(size, 6);
@@ -1875,9 +2007,193 @@ mod tests {
         let buffer = out.as_mut_ptr().cast();
         assert_eq!(XAsyncGetResult(block, second, 6, buffer, &mut used), S_OK);
         assert_eq!((&out, used), (b"second", 6));
-        assert!(XTaskQueueDispatch(q, COMPLETION, 5_000));
-        assert_eq!(COMPLETED.load(Ordering::SeqCst), 2);
         assert!(call(block).is_none(), "the call ends with its result");
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A waiter arriving while the completion routine runs returns only
+    /// after it has returned, even though the call was cleaned up already.
+    #[test]
+    fn a_status_wait_returns_after_the_completion_routine() {
+        if !bounded_child("a_status_wait_returns_after_the_completion_routine") {
+            return;
+        }
+        use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
+        struct Gate {
+            entered: Mutex<Sender<()>>,
+            release: Mutex<Receiver<()>>,
+        }
+        static ROUTINE_DONE: AtomicBool = AtomicBool::new(false);
+        extern "system" fn routine(block: *mut AsyncBlock) {
+            // SAFETY: the test leaks the gate behind the block's context.
+            let gate = unsafe { &*(*block).context.cast::<Gate>() };
+            lock(&gate.entered).send(()).unwrap();
+            let _ = lock(&gate.release).recv_timeout(Duration::from_secs(10));
+            ROUTINE_DONE.store(true, Ordering::SeqCst);
+        }
+        let (entered, routine_entered) = channel();
+        let (release, released) = channel();
+        let gate: &Gate = Box::leak(Box::new(Gate {
+            entered: Mutex::new(entered),
+            release: Mutex::new(released),
+        }));
+        let mut q = std::ptr::null();
+        // Work and completion on the thread pool.
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: (gate as *const Gate).cast_mut().cast(),
+            callback: Some(routine),
+            internal: [0; 4],
+        }));
+        // No result data: the call is cleaned up as it completes.
+        assert_eq!(finished(block, std::ptr::null(), S_OK), S_OK);
+        routine_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the routine ran");
+        assert_eq!(XAsyncGetStatus(block, false), S_OK, "published");
+        let retained = waiting_call(block).expect("waiters still find the call");
+        let baseline = Arc::strong_count(&retained);
+        let address = block as usize;
+        let (sent, received) = sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let hr = XAsyncGetStatus(address as *mut AsyncBlock, true);
+            sent.send((hr, ROUTINE_DONE.load(Ordering::SeqCst)))
+                .unwrap();
+        });
+        // The waiter holds the call (or, wrongly, has returned already)
+        // before the routine may return.
+        while Arc::strong_count(&retained) == baseline && !waiter.is_finished() {
+            std::thread::yield_now();
+        }
+        release.send(()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (S_OK, true),
+            "the waiter returned before the routine had"
+        );
+        waiter.join().unwrap();
+        assert!(waiting_call(block).is_none());
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A waiter on the thread that dispatches the manual completion port
+    /// runs the routine itself, once, instead of waiting for itself.
+    #[test]
+    fn a_waiter_that_dispatches_the_completion_port_runs_its_routine() {
+        if !bounded_child("a_waiter_that_dispatches_the_completion_port_runs_its_routine") {
+            return;
+        }
+        static RAN_ON: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+        extern "system" fn routine(_: *mut AsyncBlock) {
+            *lock(&RAN_ON) = Some(std::thread::current().id());
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
+        assert!(!XTaskQueueDispatch(q, COMPLETION, 0), "nothing queued yet");
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(routine),
+            internal: [0; 4],
+        }));
+        let identity = 0x43 as *const c_void;
+        let begun = XAsyncBegin(
+            block,
+            7 as *mut c_void,
+            identity,
+            std::ptr::null(),
+            Some(provider),
+        );
+        assert_eq!(begun, S_OK);
+        assert_eq!(XAsyncGetStatus(block, true), S_OK);
+        assert_eq!(*lock(&RAN_ON), Some(std::thread::current().id()));
+        assert!(!XTaskQueueDispatch(q, COMPLETION, 0), "it ran once");
+        let mut value = 0u64;
+        let out = (&mut value as *mut u64).cast();
+        assert_eq!(
+            XAsyncGetResult(block, identity, 8, out, std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(value, 7);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// The completion routine's own wait on its call returns its status.
+    #[test]
+    fn a_completion_routine_may_wait_on_its_own_call() {
+        if !bounded_child("a_completion_routine_may_wait_on_its_own_call") {
+            return;
+        }
+        static OWN: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn routine(block: *mut AsyncBlock) {
+            OWN.store(XAsyncGetStatus(block, true) as u32, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(routine),
+            internal: [0; 4],
+        }));
+        let identity = 0x44 as *const c_void;
+        let begun = XAsyncBegin(
+            block,
+            9 as *mut c_void,
+            identity,
+            std::ptr::null(),
+            Some(provider),
+        );
+        assert_eq!(begun, S_OK);
+        // Result data keeps the call active through the routine.
+        assert_eq!(XAsyncGetStatus(block, true), S_OK);
+        assert_eq!(OWN.load(Ordering::SeqCst), S_OK as u32);
+        let mut value = 0u64;
+        let out = (&mut value as *mut u64).cast();
+        assert_eq!(
+            XAsyncGetResult(block, identity, 8, out, std::ptr::null_mut()),
+            S_OK
+        );
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A task on a serialized port may wait on a call whose completion
+    /// routine is queued behind it on that port: the worker runs it.
+    #[test]
+    fn a_serialized_task_may_wait_on_a_call_completing_behind_it() {
+        if !bounded_child("a_serialized_task_may_wait_on_a_call_completing_behind_it") {
+            return;
+        }
+        static INNER_RAN: AtomicBool = AtomicBool::new(false);
+        // 0 running, 1 as expected, 2 not.
+        static OUTER: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn inner(_: *mut AsyncBlock) {
+            INNER_RAN.store(true, Ordering::SeqCst);
+        }
+        extern "system" fn outer(context: *mut c_void, _: bool) {
+            let block = context.cast::<AsyncBlock>();
+            let begun = finished(block, std::ptr::null(), S_OK);
+            let hr = XAsyncGetStatus(block, true);
+            let ok = begun == S_OK && hr == S_OK && INNER_RAN.load(Ordering::SeqCst);
+            OUTER.store(if ok { 1 } else { 2 }, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        // Completion serialized on one worker.
+        assert_eq!(XTaskQueueCreate(1, 2, &mut q), S_OK);
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(inner),
+            internal: [0; 4],
+        }));
+        let submitted =
+            XTaskQueueSubmitDelayedCallback(q, COMPLETION, 0, block.cast(), Some(outer));
+        assert_eq!(submitted, S_OK);
+        while OUTER.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        assert_eq!(OUTER.load(Ordering::SeqCst), 1);
         XTaskQueueCloseHandle(q);
     }
 
