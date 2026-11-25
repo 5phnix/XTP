@@ -4,6 +4,11 @@
 //! slots here are the ones BTP 6 calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
+//! A queue hands what the title enqueued to the workers on `Submit`, or on
+//! its own once half of it is enqueued, unless the title disabled that
+//! (BTP 6 does, on every queue: it writes page lists after enqueueing their
+//! requests).
+//!
 //! Submitted requests of every queue run on one pool of workers, as the
 //! console's hardware runs them: in parallel, started in queue order,
 //! queues served by weighted round robin over their priorities (about 10x
@@ -18,7 +23,8 @@
 //! Every 5 s a debug line sums up what the workers did: requests, bytes,
 //! and their time split by stage (read, inflate, BCPack, destination,
 //! completion), with the address-space changes physical pages cost meanwhile
-//! (xmem's views mapped and unmapped, commits). Page destinations are copied
+//! (xmem's views mapped and unmapped, commits); an info line follows when
+//! something went wrong or could have (`Faults`). Page destinations are copied
 //! into xmem's permanent views of their allocations, and each worker keeps
 //! its buffers across requests (docs/analysis/formats.md, F2 to F4).
 #![allow(non_snake_case)]
@@ -28,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -178,16 +184,24 @@ extern "system" fn create_status_array(
     put(out, array)
 }
 
-/// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field BTP 6 sets to 1.
+/// The queue's description, `DSTORAGE_QUEUE_DESC1` (the GDK's
+/// `CreateQueue1`): as in 2020 (source type, capacity, priority, name),
+/// plus the queue's options. BTP 6 sets `AUTO_SUBMIT_DISABLED` on all 17 of
+/// its queues (4,159 entries each), and submits batches of up to 3,677
+/// commands while the world loads, past the 2,079 at which they would
+/// otherwise submit themselves.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
     priority: i8,
     name: *const c_char,
-    unknown: u64,
+    options: u64,
 }
+
+/// Queue option bit 0, `AutoSubmitDisabled`: the queue never submits on its
+/// own, only on `Submit`. The other bits are reserved (zero).
+const AUTO_SUBMIT_DISABLED: u64 = 1;
 
 extern "system" fn create_queue(
     _: Factory,
@@ -200,22 +214,30 @@ extern "system" fn create_queue(
         return E_INVALIDARG;
     };
     let name = text(desc.name);
+    let auto_submit = desc.options & AUTO_SUBMIT_DISABLED == 0;
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
         priority = desc.priority,
         name,
-        unknown = desc.unknown,
+        options = format_args!("{:#x}", desc.options),
+        auto_submit,
         iid = iid_text(iid),
         "dstorage: queue"
     );
+    if desc.options & !AUTO_SUBMIT_DISABLED != 0 {
+        tracing::warn!(
+            options = format_args!("{:#x}", desc.options),
+            "dstorage: reserved queue options set; ignored"
+        );
+    }
     let Some(scheduler) = scheduler() else {
         return E_OUTOFMEMORY;
     };
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
+    let lane = Lane::new(desc.priority, desc.capacity, auto_submit);
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
@@ -390,10 +412,46 @@ const STAGES: usize = 5;
 /// Time per stage.
 type Spent = [Duration; STAGES];
 
+/// What went wrong, or could have, since the last 5 s line: page
+/// destinations' reads that a queue submitted on its own (before the
+/// title's `Submit`, so maybe before it wrote their page lists), page lists
+/// the title rewrote after the read took them (seen when the read finishes,
+/// before it completes: a lower bound), page lists naming a page xmem does
+/// not know (or that the host failed to commit), and failed requests.
+struct Faults {
+    auto_submitted: AtomicU64,
+    stale: AtomicU64,
+    invalid: AtomicU64,
+    failed: AtomicU64,
+}
+
+static FAULTS: Faults = Faults {
+    auto_submitted: AtomicU64::new(0),
+    stale: AtomicU64::new(0),
+    invalid: AtomicU64::new(0),
+    failed: AtomicU64::new(0),
+};
+
+impl Faults {
+    /// The counts, reset.
+    fn take(&self) -> [u64; 4] {
+        [
+            &self.auto_submitted,
+            &self.stale,
+            &self.invalid,
+            &self.failed,
+        ]
+        .map(|n| n.swap(0, Ordering::Relaxed))
+    }
+}
+
 /// A queue's requests in the scheduler.
 struct Lane {
     class: usize,
     capacity: usize,
+    /// Submits on its own once half of it is enqueued (unless the title
+    /// set `AUTO_SUBMIT_DISABLED`).
+    auto_submit: bool,
     /// Bytes started, for round robin among the lanes of a class.
     clock: u64,
     /// Enqueued, not yet submitted.
@@ -558,6 +616,16 @@ impl Lanes {
                 waiting,
                 "dstorage: last {seconds:.1} s"
             );
+            let [auto_submitted, stale, invalid, failed] = FAULTS.take();
+            if auto_submitted + stale + invalid + failed > 0 {
+                tracing::info!(
+                    auto_submitted_page_reads = auto_submitted,
+                    stale_page_lists = stale,
+                    invalid_page_lists = invalid,
+                    failed_requests = failed,
+                    "dstorage: faults in the last {seconds:.1} s"
+                );
+            }
             if mesh_stats() {
                 let mut d = destinations();
                 tracing::info!("{}", d.line(seconds));
@@ -606,6 +674,12 @@ impl Lanes {
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
         self.staged -= job.staging;
+        if job.read.stale() {
+            FAULTS.stale.fetch_add(1, Ordering::Relaxed);
+        }
+        if result.is_err() {
+            FAULTS.failed.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
@@ -648,10 +722,11 @@ impl Lanes {
 }
 
 impl Lane {
-    fn new(priority: i8, capacity: u16) -> Lane {
+    fn new(priority: i8, capacity: u16, auto_submit: bool) -> Lane {
         Lane {
             class: priority.clamp(-1, 1).wrapping_add(1) as usize,
             capacity: usize::from(capacity),
+            auto_submit,
             clock: 0,
             unsubmitted: Vec::new(),
             reads: VecDeque::new(),
@@ -798,6 +873,20 @@ impl Read {
         }
         &self.pages
     }
+
+    /// Whether the title's array no longer holds the page numbers the
+    /// request took when it ran: the title wrote its list after the read
+    /// had begun. Asked before the request completes.
+    fn stale(&self) -> bool {
+        if self.pages.is_empty() {
+            return false;
+        }
+        // SAFETY: as in `pages`; the request has not completed yet.
+        let now = unsafe {
+            std::slice::from_raw_parts(self.request.destination.cast::<usize>(), self.pages.len())
+        };
+        *now != *self.pages
+    }
 }
 
 /// The page numbers a page destination's bytes reach, from where in the
@@ -854,7 +943,10 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 }
 
 /// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// submits on its own once half of it is enqueued, as the console does,
+/// unless the title disabled that. A full queue that does not submit itself
+/// waits for `Submit` from another thread, as the console's does (the GDK's
+/// `DSTORAGE_QUEUE_OPTIONS`).
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -862,6 +954,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     let mut lanes = scheduler.lock();
+    let mut stalled = false;
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
             return; // closed: dropped (a status releases its array)
@@ -869,6 +962,13 @@ fn queue(this: QueueRef, command: Command) {
         // One slot stays free, as the console's count of empty slots says.
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
+        }
+        if !lane.auto_submit && !stalled && lane.unsubmitted.len() == lane.entries() {
+            stalled = true;
+            tracing::warn!(
+                capacity = lane.capacity,
+                "dstorage: enqueue on a full queue that does not submit itself: waiting for Submit"
+            );
         }
         lanes = scheduler
             .finished
@@ -879,7 +979,15 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if lane.auto_submit && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+        let pages = lane
+            .unsubmitted
+            .iter()
+            .filter(|c| matches!(c, Command::Read(r) if r.request.options & PAGE_DESTINATION != 0))
+            .count();
+        FAULTS
+            .auto_submitted
+            .fetch_add(pages as u64, Ordering::Relaxed);
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -1212,6 +1320,7 @@ impl Destination<'_> {
             self.written(Form::Scattered, n);
             Ok(())
         } else {
+            FAULTS.invalid.fetch_add(1, Ordering::Relaxed);
             Err(E_INVALIDARG)
         }
     }
@@ -1462,15 +1571,21 @@ mod tests {
         array
     }
 
+    /// A queue that submits itself at half capacity: some tests enqueue
+    /// more than a queue holds before they submit.
     fn new_queue(source_type: u64) -> *mut c_void {
+        queue_with(source_type, 0x80, 0, 0)
+    }
+
+    fn queue_with(source_type: u64, capacity: u16, priority: i8, options: u64) -> *mut c_void {
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type,
-            capacity: 0x80,
-            priority: 0,
+            capacity,
+            priority,
             name: c"test".as_ptr(),
-            unknown: 1,
+            options,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -1549,7 +1664,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source), 0x20);
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueDesc, options), 0x18);
     }
 
     #[test]
@@ -1642,23 +1757,133 @@ mod tests {
     #[test]
     fn half_a_queue_submits_itself() {
         let (_dir, file) = file_with(&pattern(64));
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
-        let desc = QueueDesc {
-            source_type: 0,
-            capacity: 4,
-            priority: 1,
-            name: c"small".as_ptr(),
-            unknown: 1,
-        };
-        let mut queue = std::ptr::null_mut();
-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let queue = queue_with(0, 4, 1, 0);
         let array = status_array(1);
         let mut out = [0u8; 16];
         enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
         enqueue_status(queue, array, 0); // the second of four: no submit needed
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, pattern(64)[8..24]);
+    }
+
+    /// The commands a queue holds that it has not submitted.
+    fn unsubmitted(queue: *mut c_void) -> usize {
+        // SAFETY: a queue we created and still hold.
+        let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+        scheduler().unwrap().lock().lanes[&id].unsubmitted.len()
+    }
+
+    /// A queue created with `AUTO_SUBMIT_DISABLED` (as BTP 6 creates all
+    /// of its queues) runs nothing before `Submit`, however full it gets.
+    #[test]
+    fn a_queue_with_auto_submit_disabled_never_submits_itself() {
+        let contents = pattern(64);
+        let (_dir, file) = file_with(&contents);
+        let queue = queue_with(0, 4, 1, AUTO_SUBMIT_DISABLED);
+        let array = status_array(1);
+        let mut outs = [[0u8; 16]; 2];
+        let [first, second] = outs.each_mut().map(|o| o.as_mut_ptr().cast());
+        enqueue(queue, &request(0, first, 16, file, 8, 16));
+        enqueue_status(queue, array, 0); // half: an automatic queue submits here
+        enqueue(queue, &request(0, second, 16, file, 24, 16)); // full
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(unsubmitted(queue), 3);
+        assert_eq!(result(array, 0), E_PENDING);
+        assert_eq!(outs, [[0; 16]; 2], "nothing ran");
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(outs[0], contents[8..24]);
+        void(queue, 0x40); // the second read: completes or is dropped
+    }
+
+    /// An enqueue on a full queue that does not submit itself waits until
+    /// another thread submits, as the GDK documents for the option.
+    #[test]
+    fn a_full_queue_with_auto_submit_disabled_waits_for_submit() {
+        let contents = pattern(64);
+        let (_dir, file) = file_with(&contents);
+        let queue = queue_with(0, 4, 0, AUTO_SUBMIT_DISABLED);
+        let array = status_array(1);
+        let mut outs = [[0u8; 16]; 4];
+        let at = outs.each_mut().map(|o| o.as_mut_ptr() as usize);
+        let file = file as usize;
+        let read = move |k: usize| {
+            let (to, from) = (at[k] as *mut c_void, file as *const c_void);
+            request(0, to, 16, from, 16 * k as u64, 16)
+        };
+        for k in 0..3 {
+            enqueue(queue, &read(k));
+        }
+        let queue_at = queue as usize;
+        let enqueued = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                enqueue(queue_at as *mut c_void, &read(3));
+                enqueued.store(true, Ordering::Release);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!enqueued.load(Ordering::Acquire), "the queue was full");
+            void(queue, 0x30);
+        });
+        assert_eq!(unsubmitted(queue), 1, "the fourth, enqueued after Submit");
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        let expected: Vec<&[u8]> = contents.chunks(16).collect();
+        assert!(outs.iter().zip(expected).all(|(o, e)| o == e));
+        void(queue, 0x40);
+    }
+
+    /// BTP 6 enqueues a request into pages, then writes the request's page
+    /// list, then submits. A queue that disabled automatic submission must
+    /// not run it in between, even past half its capacity: the request
+    /// lands in the pages the title wrote, not in those its array held.
+    #[test]
+    fn a_page_list_written_before_submit_is_the_one_read() {
+        let (old, new) = (allocate(1), allocate(1));
+        let plain = pattern(100);
+        let queue = queue_with(1, 4, 0, AUTO_SUBMIT_DISABLED);
+        let array = status_array(1);
+        let mut list = [old[0]]; // what the array's last use left
+        let entries = list.as_mut_ptr();
+        let options = PAGE_DESTINATION | MEMORY_SOURCE;
+        let r = request(options, entries.cast(), 100, plain.as_ptr().cast(), 0, 100);
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0); // half: an automatic queue submits here
+        // An automatic queue's read would have taken the old page by now.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(result(array, 0), E_PENDING);
+        // SAFETY: our array, which the request reads only once submitted.
+        unsafe { entries.write(new[0]) };
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(page_bytes(&new)[..100], plain);
+        assert!(page_bytes(&old).iter().all(|&b| b == 0), "the old page");
+        void(queue, 0x40);
+        free(&old);
+        free(&new);
+    }
+
+    /// A page list rewritten after its read took it counts as stale.
+    #[test]
+    fn a_page_list_rewritten_after_the_read_is_stale() {
+        let mut list = [5usize, 6];
+        let entries = list.as_mut_ptr();
+        let source = std::ptr::dangling::<c_void>(); // never read here
+        let options = PAGE_DESTINATION | MEMORY_SOURCE;
+        let mut r = request(options, entries.cast(), PAGE, source, 0, 8);
+        r.page_offset = 10; // two pages
+        let mut read = Read::new(r);
+        assert!(!read.stale(), "not run yet");
+        assert_eq!(read.pages(), [5, 6]);
+        assert!(!read.stale());
+        // SAFETY: our array.
+        unsafe { entries.add(1).write(7) };
+        assert!(read.stale());
+        // Destinations at an address have no list.
+        let mut plain = Read::new(request(0, entries.cast(), 8, source, 0, 8));
+        assert!(plain.pages().is_empty());
+        assert!(!plain.stale());
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
@@ -1692,9 +1917,9 @@ mod tests {
     #[test]
     fn priorities_share_by_bytes_about_tenfold() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 4096));
-        l.lanes.insert(1, Lane::new(1, 4096));
-        l.lanes.insert(2, Lane::new(2, 4096)); // real-time: as high
+        l.lanes.insert(0, Lane::new(0, 4096, true));
+        l.lanes.insert(1, Lane::new(1, 4096, true));
+        l.lanes.insert(2, Lane::new(2, 4096, true)); // real-time: as high
         for _ in 0..400 {
             for id in 0..3 {
                 read(&mut l, id, 0, 4096);
@@ -1716,7 +1941,7 @@ mod tests {
     #[test]
     fn staging_bounds_compressed_bytes_in_flight() {
         let mut l = lanes(100);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64, true));
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, 0, 1000); // raw: straight to its destination
@@ -1738,7 +1963,7 @@ mod tests {
     #[test]
     fn a_status_waits_for_every_earlier_read() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64, true));
         let array = status_array(2).cast::<Instance<StatusArray>>();
         let status = |index| {
             add_ref_instance(array);
