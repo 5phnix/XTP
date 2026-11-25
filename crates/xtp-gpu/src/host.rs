@@ -1836,10 +1836,10 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host RTV, valid until recorded. A null resource needs a typed description.
     pub(crate) fn rtv(
         &self,
-        resource: &ID3D12Resource,
+        resource: impl windows::core::Param<ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
@@ -2993,6 +2993,8 @@ impl Meter {
         let meshes = crate::meshstat::take();
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::list::cuts::log();
             #[cfg(feature = "diagnostics")]
             tracing::info!(
                 pipelines = crate::pipeline::host::BOUNDED_PIPELINES.load(Ordering::Relaxed),

@@ -424,6 +424,8 @@ impl RtvRecord {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         let mut words = if self.described != 0 {
             self.desc
+        } else if self.resource.is_null() {
+            return None;
         } else {
             [
                 crate::resource::view_format(self.resource)?,
