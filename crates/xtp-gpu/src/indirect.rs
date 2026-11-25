@@ -634,9 +634,11 @@ mod tests {
     /// Le compte GPU exclut la dernière ligne. Une dimension corrompue ne déborde pas.
     #[test]
     fn mesh_pieces_share_the_original_budget() {
-        let Some(host) = device("indirect::tests::mesh_pieces_share_the_original_budget") else {
+        let test = "indirect::tests::mesh_pieces_share_the_original_budget";
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let list = host.new_list().unwrap();
         let (args, data) = host.shared_buffer(16 * 18).unwrap();
         let (out, written) = host.shared_buffer(16 + 24 * 64).unwrap();

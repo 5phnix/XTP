@@ -3,7 +3,6 @@
 use super::HostPipeline;
 use crate::indirect::{self, Expanded};
 use crate::pipeline::{Shader, Translated};
-use crate::testgpu::device;
 use std::sync::{Arc, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
@@ -56,10 +55,11 @@ fn counting(axis: usize) -> HostPipeline {
 
 #[test]
 fn every_group_runs_once_with_its_guest_id() {
-    let Some(host) = device("indirect_dispatch_tests::every_group_runs_once_with_its_guest_id")
-    else {
+    let test = "pipeline::host::indirect_dispatch_tests::every_group_runs_once_with_its_guest_id";
+    let Some(gpu) = crate::testgpu::device(test) else {
         return;
     };
+    let host = gpu.host();
     for (axis, n) in [(0, 70000u32), (1, 65536), (2, (1 << 20) + 1)] {
         let p = counting(axis);
         let base = p
