@@ -17,6 +17,10 @@ use xtp_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SP
 use super::{Shader, Translated};
 use crate::host::host;
 
+#[cfg(feature = "diagnostics")]
+pub(crate) static BOUNDED_PIPELINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 trait PipelineCaps: crate::resource::format::Caps {
     fn logic_op(&self, format: DXGI_FORMAT) -> bool;
 }
@@ -141,6 +145,10 @@ impl GraphicsState {
                     // pipeline uses the plain description); bring it back
                     // with a stream if a title enables it.
                     let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
+                    #[cfg(feature = "diagnostics")]
+                    if d.DepthBoundsTestEnable.as_bool() {
+                        BOUNDED_PIPELINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     self.depth = D3D12_DEPTH_STENCIL_DESC {
                         DepthEnable: d.DepthEnable,
                         DepthWriteMask: d.DepthWriteMask,

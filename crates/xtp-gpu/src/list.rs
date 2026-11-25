@@ -115,6 +115,8 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    bounds_set: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -230,6 +232,8 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         uploads: Default::default(),
+        #[cfg(all(windows, feature = "diagnostics"))]
+        bounds_set: Default::default(),
         #[cfg(windows)]
         host: crate::host::host().and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
@@ -320,6 +324,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     uploads.clear();
     drop(uploads);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    // SAFETY: le titre réinitialise une de nos listes.
+    unsafe { &(*this.cast::<List>()).bounds_set }.store(false, std::sync::atomic::Ordering::Relaxed);
     #[cfg(windows)]
     keep_pipeline(this, pipeline);
     #[cfg(windows)]
@@ -1725,6 +1732,21 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static BOUNDED_LISTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+extern "system" fn depth_bounds(_this: This, _min: f32, _max: f32) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: une liste du titre. Chaque enregistrement compte une seule fois.
+        if !unsafe { &(*_this.cast::<List>()).bounds_set }.swap(true, Relaxed) {
+            BOUNDED_LISTS.fetch_add(1, Relaxed);
+        }
+    }
+}
+
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
@@ -2155,7 +2177,7 @@ const METHODS: [(usize, *const ()); 54] = [
     (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220 DB_DEPTH_BOUNDS_MIN/MAX
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits

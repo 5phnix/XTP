@@ -2902,6 +2902,12 @@ impl Meter {
             .take(frames, 8);
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(
+                pipelines = crate::pipeline::host::BOUNDED_PIPELINES.load(Ordering::Relaxed),
+                lists = crate::list::BOUNDED_LISTS.load(Ordering::Relaxed),
+                "title depth bounds"
+            );
             tracing::info!(
                 "{ab}{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
