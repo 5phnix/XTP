@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::frames::{after, before, strip_colours};
+
 /// The title's executable in its folder.
 const TITLE: &str = "game_scarlett_master.exe";
 /// Where the autopilot logs from.
@@ -343,7 +345,19 @@ fn alive(pid: u32) -> bool {
 
 /// One title at a time on a machine.
 fn refuse_a_second_title() -> Result<()> {
-    let running = tasks("IMAGENAME eq xtp.exe");
+    // Only an xtp.exe with a window is a title: offline `xtp translate` or
+    // `shader-info` runs by other workers have none and must not block a
+    // session (2026-11-25: they did).
+    let running = if cfg!(windows) {
+        Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq xtp.exe", "/FI", "WINDOWTITLE ne N/A"])
+            .args(["/NH", "/FO", "CSV"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     ensure!(
         !running.to_ascii_lowercase().contains("\"xtp.exe\""),
         "an xtp.exe is already running; close it first (one title at a time)"
@@ -457,41 +471,6 @@ fn pump(
             line.clear();
         }
     })
-}
-
-/// Without ANSI escape sequences (`ESC [ ... letter`).
-fn strip_colours(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if chars.next() == Some('[') {
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// The number written just before `label` (`30.0 fps`).
-fn before(line: &str, label: &str) -> Option<f64> {
-    let head = &line[..line.find(label)?];
-    head.rsplit(|c: char| c.is_whitespace() || c == '(')
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// The number written just after `label` (`dropped 12`).
-fn after(line: &str, label: &str) -> Option<f64> {
-    let tail = &line[line.find(label)? + label.len()..];
-    tail.split_whitespace().next()?.parse().ok()
 }
 
 /// Reads one figure of a frame-rate line.

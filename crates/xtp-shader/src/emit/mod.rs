@@ -96,6 +96,7 @@ mod mesh_tests;
 pub(crate) mod lower;
 #[cfg(all(test, windows))]
 mod raw_tests;
+pub mod rect_gs;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
@@ -1174,14 +1175,12 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the console flow cannot run it (its waves need not
-        // branch alike), so each lane takes its own path in two 32-lane
-        // halves and the lane read at lane 5 goes through group-shared
-        // memory (`lower::lanes::group_reads_meet`).
+        // A constant lane in this group can use its existing LDS exchange.
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
         assert_eq!(emit_for(&two, NVIDIA).unwrap().wave_size(), Some(32));
-        // At a lane the code computes (s1), still not.
+        // A computed lane needs both register sets. Keep a partial last
+        // wave as a negative control.
         let computed = [
             0xD760_0000,
             0x0000_0300, // v_readlane_b32 s0, v0, s1
@@ -1189,12 +1188,13 @@ mod tests {
             0xBF81_0000, // s_endpgm
         ];
         assert_eq!(
-            emit_for(&compute_of(&computed, true, 128), NVIDIA),
+            emit_for(&compute_of(&computed, true, 96), NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
                 what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
             })
         );
+        assert!(emit_for(&compute_of(&computed, true, 128), NVIDIA).is_ok());
         // The same code in waves of 32 runs on either.
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());
@@ -1250,11 +1250,7 @@ mod tests {
         }
     }
 
-    /// On every hardware adapter with a supported wave path: a wave64 program
-    /// that reads other lanes translates in groups of one console wave (natively
-    /// or in the console flow) and the adapter takes it; in groups of two it
-    /// translates exactly when the adapter runs 64-lane waves. An adapter with
-    /// neither 64- nor 32-lane waves correctly refuses the one-wave program.
+    /// Groups of one or two waves can read a console lane on either host.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -1279,14 +1275,9 @@ mod tests {
             };
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            match emit_for(&compute_of(&words, true, 128), target) {
-                Ok(cs) => {
-                    assert!(target.runs(64), "{name}");
-                    host.compute_pipeline(&cs)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                }
-                Err(_) => assert!(!target.runs(64), "{name}"),
-            }
+            let two = emit_for(&compute_of(&words, true, 128), target).unwrap();
+            host.compute_pipeline(&two)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 

@@ -5,6 +5,18 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
+// GFX10 sampler bounds are unsigned 4.8. The signed 14-bit bias has the
+// same eight fractional bits. AMD PAL truncates both when packing a sampler.
+const LOD_SCALE: f32 = 256.0;
+const LOD_MAX: f32 = 4095.0 / LOD_SCALE;
+
+fn fixed_lod(value: f32, min: f32, max: f32) -> f32 {
+    if value.is_nan() {
+        return 0.0;
+    }
+    (value.clamp(min, max) * LOD_SCALE).trunc() / LOD_SCALE
+}
+
 /// The fields both forms share.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Fields {
@@ -47,12 +59,20 @@ impl Fields {
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
+        let min_lod = fixed_lod(self.min_lod, 0.0, LOD_MAX);
+        let max_lod = if self.mip == 0 {
+            // Without a mip filter, pin sampling to the minimum level.
+            min_lod
+        } else {
+            fixed_lod(self.max_lod, 0.0, LOD_MAX).max(min_lod)
+        };
+        let bias = fixed_lod(self.bias, -32.0, 8191.0 / LOD_SCALE);
         D3D12_SAMPLER_DESC {
             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
             AddressU: D3D12_TEXTURE_ADDRESS_MODE(self.address[0] as i32),
             AddressV: D3D12_TEXTURE_ADDRESS_MODE(self.address[1] as i32),
             AddressW: D3D12_TEXTURE_ADDRESS_MODE(self.address[2] as i32),
-            MipLODBias: self.bias,
+            MipLODBias: bias.clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX),
             MaxAnisotropy: if aniso {
                 self.anisotropy.clamp(1, 16)
             } else {
@@ -60,13 +80,8 @@ impl Fields {
             },
             ComparisonFunc: D3D12_COMPARISON_FUNC(self.compare.max(1) as i32),
             BorderColor: self.border,
-            MinLOD: self.min_lod,
-            // Without a mip filter the console samples mip 0 only.
-            MaxLOD: if self.mip == 0 {
-                self.min_lod
-            } else {
-                self.max_lod
-            },
+            MinLOD: min_lod,
+            MaxLOD: max_lod,
         }
     }
 }
@@ -108,12 +123,64 @@ mod tests {
         let d = console(&w);
         assert_eq!(d.Filter.0, 0x5, "min point, mag and mip linear");
         assert_eq!(d.AddressW, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        assert_eq!(d.MaxLOD, 1000.0);
+        assert_eq!(d.MaxLOD, 4095.0 / 256.0);
         // A less-or-equal test makes a comparison sampler; never does not.
         w[16] = 4;
         assert_eq!(console(&w).Filter.0, 0x85);
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
+    }
+
+    fn sampler_lods(mip: u32, min: f32, max: f32, bias: f32) -> (f32, f32, f32) {
+        let mut words = [0; 27];
+        words[3] = mip;
+        words[9..12].copy_from_slice(&[min.to_bits(), max.to_bits(), bias.to_bits()]);
+        let d = console(&words);
+        (d.MinLOD, d.MaxLOD, d.MipLODBias)
+    }
+
+    #[test]
+    fn lod_bounds_stay_ordered_with_and_without_mips() {
+        assert_eq!(sampler_lods(2, f32::NAN, 5.0, f32::NAN), (0.0, 5.0, 0.0));
+        assert_eq!(sampler_lods(1, 3.5, f32::NAN, 0.0), (3.5, 3.5, 0.0));
+        assert_eq!(sampler_lods(2, 3.5, 1.0, 0.0), (3.5, 3.5, 0.0));
+        assert_eq!(sampler_lods(0, 3.5, 8.0, 0.0), (3.5, 3.5, 0.0));
+        assert_eq!(sampler_lods(0, f32::NAN, 8.0, 0.0), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn lod_bounds_match_unsigned_fixed_point() {
+        let step = 1.0 / 256.0;
+        let last = 16.0 - step;
+        assert_eq!(sampler_lods(2, 0.0, last, 0.0), (0.0, last, 0.0));
+        assert_eq!(sampler_lods(2, -1.0, 16.0, 0.0), (0.0, last, 0.0));
+        assert_eq!(sampler_lods(0, f32::INFINITY, 0.0, 0.0), (last, last, 0.0));
+        assert_eq!(
+            sampler_lods(2, f32::NEG_INFINITY, f32::INFINITY, 0.0),
+            (0.0, last, 0.0)
+        );
+        assert_eq!(
+            sampler_lods(2, 1.75 * step, last - 0.25 * step, 0.0),
+            (step, last - step, 0.0)
+        );
+    }
+
+    #[test]
+    fn signed_fixed_point_bias_respects_host_limits() {
+        let step = 1.0 / 256.0;
+        for (input, expected) in [
+            (1.75 * step, step),
+            (-1.75 * step, -step),
+            (-16.0, -16.0),
+            (16.0 - 3.0 * step, 16.0 - 3.0 * step),
+            (16.0 - 2.0 * step, D3D12_MIP_LOD_BIAS_MAX),
+            (-32.0, D3D12_MIP_LOD_BIAS_MIN),
+            (32.0 - step, D3D12_MIP_LOD_BIAS_MAX),
+            (f32::NEG_INFINITY, D3D12_MIP_LOD_BIAS_MIN),
+            (f32::INFINITY, D3D12_MIP_LOD_BIAS_MAX),
+        ] {
+            assert_eq!(sampler_lods(2, 0.0, 0.0, input).2, expected, "{input}");
+        }
     }
 }

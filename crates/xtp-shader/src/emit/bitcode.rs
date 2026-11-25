@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 pub(crate) mod census;
 pub(crate) mod opt;
+mod paired;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -211,6 +212,7 @@ pub(crate) struct Module {
     globals: Vec<Global>,
     funcs: Vec<Func>,
     func_ids: HashMap<String, u32>,
+    paired: Option<Box<paired::Halves>>,
     insts: Vec<Inst>,
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
@@ -384,7 +386,7 @@ impl Module {
         }
     }
 
-    fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+    fn push_one(&mut self, block: usize, ty: Ty, op: Op) -> V {
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
@@ -425,7 +427,7 @@ impl Module {
         self.push(block, ret, Op::Call(i, args))
     }
     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
-    pub fn phi(&mut self, block: usize, ty: Ty) -> V {
+    fn phi_one(&mut self, block: usize, ty: Ty) -> V {
         let i = self.insts.len() as u32;
         self.insts.push(Inst {
             ty,
@@ -468,7 +470,7 @@ impl Module {
         self.extract(block, r, 0)
     }
 
-    pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
+    fn set_phi_one(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
