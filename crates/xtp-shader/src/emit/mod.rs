@@ -341,6 +341,8 @@ pub const DISPATCH_THREADS: RootType = RootType::Other(0x104);
 pub const PACKED_ADDRESS_SRV: RootType = RootType::Other(0x105);
 pub const SCALAR_ADDRESS_SRV: RootType = RootType::Other(0x106);
 pub const VECTOR_ADDRESS_SRV: RootType = RootType::Other(0x107);
+/// Slot d'une SRV brute alignée, suivi en bits 0..3 du décalage de la base du titre.
+pub const INDEXED_ADDRESS_SRV: RootType = RootType::Other(0x108);
 
 impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a

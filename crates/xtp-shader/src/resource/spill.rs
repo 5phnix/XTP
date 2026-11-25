@@ -122,6 +122,14 @@ impl Tracer<'_> {
         let (Term::Value(low), Term::Value(high)) = (lo, hi) else {
             return None;
         };
+        // Le constructeur BVH lit une entrée de tableau dont la position
+        // dépend d'une lecture GPU. Seule la base de ce tableau est liée par l'hôte.
+        if inst.name() == "global_load_dword"
+            && offset == 0
+            && let Some(read) = self.indexed_constant_read(low, high)
+        {
+            return Some(read);
+        }
         let (param, dword, packed, field) = if let Some((p, w)) = self.param_value(low) {
             if self.param_value(high) != Some((p, w + 1)) {
                 return None;
@@ -167,8 +175,46 @@ impl Tracer<'_> {
                 dword,
                 packed,
                 offset,
+                index: None,
             },
         )
+    }
+
+    fn indexed_constant_read(&self, low: Value, high: Value) -> Option<super::ConstantRead> {
+        let (add, operands) = self.sop2(low, &["s_add_u32"])?;
+        let (carry, upper) = self.sop2(high, &["s_addc_u32"])?;
+        let ((Term::Value(hi), Term::Const(0)) | (Term::Const(0), Term::Value(hi))) =
+            (upper[0], upper[1])
+        else {
+            return None;
+        };
+        // Une autre écriture de SCC changerait l'adresse à la frontière de 4 Gio.
+        if carry.read(Reg::Scc)? != add.write(Reg::Scc)? {
+            return None;
+        }
+        let (param, high_word) = self.param_value(hi)?;
+        let dword = high_word.checked_sub(1)?;
+        let root = self.layout.get(param)?;
+        if root.root != crate::native::RootType::Constants {
+            return None;
+        }
+        let [Term::Value(a), Term::Value(b)] = operands else {
+            return None;
+        };
+        let index = if self.param_value(a) == Some((param, dword)) {
+            b
+        } else if self.param_value(b) == Some((param, dword)) {
+            a
+        } else {
+            return None;
+        };
+        Some(super::ConstantRead {
+            slot: root.slot,
+            dword,
+            packed: false,
+            offset: 0,
+            index: Some(index),
+        })
     }
 
     pub(super) fn param_value(&self, v: Value) -> Option<(usize, u32)> {

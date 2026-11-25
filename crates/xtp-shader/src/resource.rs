@@ -132,6 +132,8 @@ pub struct ConstantRead {
     pub dword: u32,
     pub packed: bool,
     pub offset: u32,
+    /// Déplacement non signé ajouté à la paire de constantes avec retenue.
+    pub index: Option<Value>,
 }
 
 /// Taille maximale de la copie d'une SRV racine mal alignée sur l'hôte.

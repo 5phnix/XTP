@@ -1146,12 +1146,17 @@ impl State {
         // set after them.
         let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
         let root_uavs = p.stages.iter().any(|s| !s.root_uavs.is_empty());
-        use xtp_shader::emit::{PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV};
+        use xtp_shader::emit::{
+            INDEXED_ADDRESS_SRV, PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV,
+        };
         let constant_reads = p.stages.iter().any(|s| {
             s.translated().host.user_data.iter().any(|u| {
                 matches!(
                     u.root,
-                    PACKED_ADDRESS_SRV | SCALAR_ADDRESS_SRV | VECTOR_ADDRESS_SRV
+                    INDEXED_ADDRESS_SRV
+                        | PACKED_ADDRESS_SRV
+                        | SCALAR_ADDRESS_SRV
+                        | VECTOR_ADDRESS_SRV
                 )
             })
         });
@@ -1236,7 +1241,10 @@ impl State {
                     }
                     if matches!(
                         u.root,
-                        PACKED_ADDRESS_SRV | SCALAR_ADDRESS_SRV | VECTOR_ADDRESS_SRV
+                        INDEXED_ADDRESS_SRV
+                            | PACKED_ADDRESS_SRV
+                            | SCALAR_ADDRESS_SRV
+                            | VECTOR_ADDRESS_SRV
                     ) {
                         let words = match self.roots_ref(compute).get(usize::from(u.slot)) {
                             Some(Root::Constants(words)) => words.as_slice(),
@@ -1254,8 +1262,11 @@ impl State {
                                     })
                             }),
                         });
-                        values[u.index as usize] =
-                            self.root_srv_slot(list, address.filter(|&a| a != 0))?.1;
+                        values[u.index as usize] = if u.root == INDEXED_ADDRESS_SRV {
+                            self.indexed_address_srv(list, address)?
+                        } else {
+                            self.root_srv_slot(list, address.filter(|&a| a != 0))?.1
+                        };
                         continue;
                     }
                     values[u.index as usize] = match fresh {
@@ -1761,6 +1772,34 @@ impl State {
         copy.refresh(list, address, bytes);
         copy.gpu_writes(list, address, bytes);
         Ok((host.gpu_handle(slot), window.bias))
+    }
+
+    /// Lie la copie qui contient la base. Le shader conserve l'index GPU et
+    /// l'identité du tampon, même pour une base décalée dans la copie.
+    fn indexed_address_srv(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+    ) -> Result<u32, &'static str> {
+        let (a, copy) = address
+            .filter(|&a| a != 0)
+            .and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)))
+            .ok_or("an indexed BVH buffer without a host copy")?;
+        let heap = self.host_heaps[0];
+        let host = host_heap(heap).ok_or("an indexed BVH buffer without a view heap")?;
+        let offset = copy.offset(a);
+        let bias = offset % 16;
+        let len = copy.left(a);
+        let span = len
+            .checked_add(bias)
+            .filter(|&n| n <= u64::from(xtp_shader::emit::RawWindow::MAX_DWORDS) * 4)
+            .ok_or("an indexed BVH buffer too large for a raw view")?;
+        let slot = host
+            .shared_raw(&copy, offset - bias, span)
+            .ok_or("no shared slot for an indexed BVH buffer")?;
+        self.recording.shared(list, heap, slot);
+        copy.refresh(list, a, len);
+        Ok((slot << 4) | bias as u32)
     }
 
     /// The slot, in the view heap set on the host list (the title's, or

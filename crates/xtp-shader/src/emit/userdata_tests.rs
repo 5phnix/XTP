@@ -347,6 +347,95 @@ fn reads_a_packed_address_and_an_adjacent_pair_from_spilled_constants() {
     assert_eq!(out[0], [3, 8]);
 }
 
+#[cfg(windows)]
+#[test]
+fn indexed_spilled_buffer_uses_the_matching_carry_and_gpu_offset() {
+    use super::host::{Dispatch, Host, Root, Stride, View};
+    let mut words = PTR.to_vec();
+    words.extend([
+        0xF404_0201,
+        0xFA00_0000, // s[8:9] : UAV de sortie
+        0xF408_0101,
+        0xFA00_0008, // s[4:7] : base basse, haute, index, réserve
+        0x8000_0604, // s0 = s4 + s6
+        0x8201_8005, // s1 = s5 + retenue de l'addition basse
+        0x7E02_0200,
+        0x7E04_0201, // v[1:2] = s[0:1]
+        0xDC30_8000,
+        0x037D_0001, // v3 = dword à cette adresse
+        0xBE8A_03C1,
+        0xBE8B_03FF,
+        0x3101_4FAC,
+        0xE070_0000,
+        0x8002_0300,
+        END, // écrire v3 dans l'UAV
+    ]);
+    let program = |w: &[u32]| {
+        let mut n = root_uav_program(w, [1; 3], false);
+        n.layout.push(param(RootType::Constants, 18, 4, 6));
+        n
+    };
+    let n = program(&words);
+    assert!(
+        track(&n)
+            .unwrap()
+            .constant_reads
+            .values()
+            .any(|r| r.index.is_some())
+    );
+    let mut wrong_high = words.clone();
+    wrong_high[8] = 0x8201_8007; // le mot haut appartient à une autre paire
+    assert!(track(&program(&wrong_high)).is_err());
+    words.insert(8, 0xBF06_8004); // SCC est réécrit entre les deux additions
+    assert!(track(&program(&words)).is_err());
+
+    let bytes = crate::dxbc::build(&[]);
+    let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
+    let Ok(host) = Host::new(false) else {
+        assert!(std::env::var_os("XTP_REQUIRE_GPU").is_none());
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&cs).unwrap();
+    for (bias, index, expected) in [(0, 4, 0x77665544), (3, 2, 0x88776655), (4, u32::MAX, 0)] {
+        let mut ud = vec![0; cs.user_data_dwords() as usize];
+        for u in &cs.user_data {
+            ud[u.index as usize] = match (u.root, u.dword) {
+                (super::INDEXED_ADDRESS_SRV, 0) => 1 << 4 | bias,
+                (RootType::Constants, 2) => index,
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::Table {
+                                sampler: false,
+                                index: 0,
+                            },
+                        ),
+                    ],
+                    groups: [1; 3],
+                    samplers: &[],
+                    views: &[
+                        View::RawUav(1),
+                        View::Buffer {
+                            data: &[0x33221100, 0x77665544, 0xBBAA9988],
+                            stride: Stride::Raw,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(out[0], [expected], "bias={bias}, index={index}");
+    }
+}
+
 #[test]
 fn phi_merges_reloads_only_for_the_same_spilled_descriptor() {
     let mut code = [
