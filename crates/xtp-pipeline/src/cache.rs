@@ -115,8 +115,8 @@ impl Cache {
     /// Indexes existing entries and prunes oldest publications first. Concurrent
     /// opens of the same root must agree on its limit. Zero disables disk storage.
     ///
-    /// The entries are read from the index file at the root
-    /// ([`disk::INDEX_FILE`]): one file, where looking at each entry took
+    /// The entries are read from the index file at the root (`index`):
+    /// one file, where looking at each entry took
     /// minutes for a cache of 157,805 (2026-11-25: sessions killed at 300 s
     /// before the title drew). Without one, or with a damaged one, the
     /// folder's entries are listed (their sizes and times, no file opened)
