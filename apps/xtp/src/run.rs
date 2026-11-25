@@ -341,7 +341,7 @@ fn register_builder(name: &str, dir: &Path) -> Result<()> {
     if name.eq_ignore_ascii_case("XboxBvhBuilder.dll") {
         let path = dir.join(name);
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        // Le relevé et le chemin jeu parcourent les mêmes conteneurs validés.
+        // The survey and the game path walk the same validated containers.
         let containers = crate::shader::sources(&bytes).into_iter().filter_map(|s| {
             let crate::shader::Source::Raw { data, .. } = s else {
                 return None;
