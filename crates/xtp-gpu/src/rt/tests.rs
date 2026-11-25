@@ -8,14 +8,14 @@ fn geometry(vertices: &TitleBuffer, indices: &TitleBuffer) -> Geometry {
         Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
             Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
                 Transform3x4: 0,
-                IndexFormat: DXGI_FORMAT_R16_TYPELESS,
-                VertexFormat: DXGI_FORMAT_R32G32_FLOAT,
+                IndexFormat: DXGI_FORMAT_R16_UINT,
+                VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
                 IndexCount: 3,
                 VertexCount: 3,
                 IndexBuffer: indices.address(),
                 VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
                     StartAddress: vertices.address(),
-                    StrideInBytes: 8,
+                    StrideInBytes: 12,
                 },
             },
         },
@@ -52,7 +52,7 @@ fn tlas_desc(dst: u64, instances: &TitleBuffer) -> Build {
 
 /// The triangle (-1, -1), (0, 1), (1, -1) at z = 0: the ray of thread 0
 /// of `ray_test.hlsl` hits it at two units, the ray of thread 1 misses.
-const POSITIONS: [f32; 6] = [-1., -1., 0., 1., 1., -1.];
+const POSITIONS: [f32; 9] = [-1., -1., 0., 0., 1., 0., 1., -1., 0.];
 /// What `ray_test.hlsl` writes when thread 0's ray hits at two units.
 fn hit() -> [u32; 4] {
     [1, 2.0f32.to_bits(), 0, 0]
@@ -110,7 +110,7 @@ struct World {
 
 impl World {
     fn new() -> World {
-        let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+        let (vertices, indices) = (TitleBuffer::new(36), TitleBuffer::new(8));
         vertices.set_words(|i| POSITIONS[i].to_bits());
         indices.set_words(|i| [1 << 16, 2][i]);
         let blas = TitleBuffer::new(1024);
@@ -171,6 +171,8 @@ enum Scene {
     Address(u64),
     /// A title descriptor slot, bound in submission order.
     Descriptor(u64),
+    /// The same, dispatched with the host list alone, as draws do.
+    HostDescriptor(u64),
     /// The same, with the root signature a host pipeline makes for a
     /// RayQuery splice: the TLAS at t240 among bounded root SRVs.
     Spliced(u64),
@@ -311,6 +313,13 @@ fn trace_program(
             Scene::Descriptor(handle) | Scene::Spliced(handle) => assert!(
                 dispatch_descriptor_tlas(title_list.this(), handle, &root, param, [1, 1, 1])
             ),
+            Scene::HostDescriptor(handle) => assert!(dispatch_descriptor_tlas_in(
+                list,
+                handle,
+                &root,
+                param,
+                [1, 1, 1]
+            )),
             Scene::Indirect(..) => assert!(dispatch_indirect_tlas(
                 title_list.this(),
                 prepared.as_ref().unwrap(),
@@ -330,25 +339,50 @@ fn rt_triangle_translation_requires_the_whole_input_range() {
         return;
     };
     let list = TitleList::new();
-    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(6));
+    let (vertices, indices) = (TitleBuffer::new(36), TitleBuffer::new(6));
     let mut geometry = geometry(&vertices, &indices);
     // SAFETY: the test owns the descriptor and all referenced buffers.
     unsafe {
         let (translated, jobs) = triangles(list.host(), &blas_input(&geometry)).unwrap();
         let t = translated[0].Anonymous.Triangles;
-        assert_eq!(t.IndexFormat, DXGI_FORMAT_R16_UINT);
-        // Set when the GPU check of the indices is recorded (`indices`).
-        assert_eq!(t.IndexBuffer, 0);
-        let host = indices.shadow().gpu(indices.address());
-        let job = &jobs[0];
-        assert_eq!((job.geometry, job.count, job.vertices), (0, 3, 3));
+        // Set when the pass that makes them is recorded (`indices`).
+        assert_eq!((t.VertexBuffer.StartAddress, t.IndexBuffer), (0, 0));
+        let [made_vertices, made_indices] = &jobs[..] else {
+            panic!("{} jobs", jobs.len());
+        };
         assert_eq!(
-            (job.source + u64::from(job.offset), job.wide),
-            (host, false)
+            (
+                made_vertices.input,
+                made_vertices.kind,
+                made_vertices.count,
+                made_vertices.source
+            ),
+            (
+                indices::Input::Vertices {
+                    format: DXGI_FORMAT_R32G32B32_FLOAT,
+                    stride: 12,
+                    skew: 0
+                },
+                indices::Kind::Words,
+                9,
+                vertices.shadow().gpu(vertices.address())
+            )
         );
         assert_eq!(
-            t.VertexBuffer.StartAddress,
-            vertices.shadow().gpu(vertices.address())
+            (
+                made_indices.input,
+                made_indices.kind,
+                made_indices.count,
+                made_indices.vertices,
+                made_indices.source
+            ),
+            (
+                indices::Input::Indices,
+                indices::Kind::Narrow,
+                3,
+                3,
+                indices.shadow().gpu(indices.address())
+            )
         );
         geometry.Anonymous.Triangles.IndexCount = 4;
         assert!(triangles(list.host(), &blas_input(&geometry)).is_none());
@@ -366,7 +400,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
     };
     let host = gpu.host();
     let list = TitleList::new();
-    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+    let (vertices, indices) = (TitleBuffer::new(36), TitleBuffer::new(8));
     vertices.set_words(|i| POSITIONS[i].to_bits());
     indices.set_words(|i| [1 << 16, 2][i]);
     let output = TitleBuffer::new(16);
@@ -412,8 +446,8 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         assert_eq!(missed.words(), MISSES);
     }
 
-    let displaced = TitleBuffer::new(24);
-    displaced.set_words(|i| (POSITIONS[i] + if i % 2 == 0 { 4. } else { 0. }).to_bits());
+    let displaced = TitleBuffer::new(36);
+    displaced.set_words(|i| (POSITIONS[i] + if i % 3 == 0 { 4. } else { 0. }).to_bits());
     let changed = self::geometry(&displaced, &indices);
     let after_refit = TitleBuffer::new(16);
     after_refit.set_words(|_| u32::MAX);
@@ -887,37 +921,71 @@ fn rt_spares_serve_later_generations_once_free() {
     assert!(table.spares.is_empty());
 }
 
+/// The ranges of title memory released so far ([`release_buffer`]).
+static RELEASED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Notes a release of title memory `[start, end)`.
+pub(super) fn released(start: u64, end: u64) {
+    RELEASED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((start, end));
+}
+
+/// The releases of title memory so far whose range holds `at`. Another
+/// test's report of a remap of all title memory (`watch`'s tests report
+/// one over the whole address space) retires every structure and spare of
+/// the registry, whichever test made them.
+fn releases_over(at: u64) -> usize {
+    (RELEASED.lock().unwrap_or_else(|e| e.into_inner()).iter())
+        .filter(|&&(start, end)| (start..end).contains(&at))
+        .count()
+}
+
 /// A TLAS rebuilt every frame at one title address alternates between two
 /// results instead of allocating one a frame: the last generation stays in
 /// its slot until the next is submitted, the one before is free again.
-/// The reused result traces as the last build.
+/// The reused result traces as the last build. A try that a release of
+/// the TLAS's memory cut into, which retired its generations, runs again.
 #[test]
 fn rt_tlas_rebuilds_reuse_a_result_nothing_holds() {
     let test = "rt_tlas_rebuilds_reuse_a_result_nothing_holds";
     let Some((gpu, rays)) = dxr(test) else {
         return;
     };
-    let world = World::new();
-    let tlas = world.tlas.address();
-    let first = registry().structures[&tlas].result.gpu();
-    let rebuilt: Vec<u64> = (0..4)
-        .map(|_| {
-            let list = TitleList::new();
-            // SAFETY: the title list and the instance buffer are live.
-            unsafe { assert!(Builder.build(list.this(), &tlas_desc(tlas, &world._inputs[2]))) };
-            list.run();
-            registry().structures[&tlas].result.gpu()
+    let (first, rebuilt, traced) = (0..5)
+        .find_map(|_| {
+            let world = World::new();
+            let tlas = world.tlas.address();
+            let releases = releases_over(tlas);
+            let generation = || registry().structures.get(&tlas).map(|s| s.result.gpu());
+            let first = generation()?;
+            let rebuilt = (0..4)
+                .map(|_| {
+                    let list = TitleList::new();
+                    // SAFETY: the title list and the instance buffer are live.
+                    unsafe {
+                        assert!(Builder.build(list.this(), &tlas_desc(tlas, &world._inputs[2])))
+                    };
+                    list.run();
+                    generation()
+                })
+                .collect::<Option<Vec<u64>>>()?;
+            let traced = rays.then(|| {
+                let slot = Descriptor::new(tlas);
+                let list = TitleList::new();
+                let out = unwritten();
+                trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
+                list.run();
+                out.words()
+            });
+            (releases_over(tlas) == releases).then_some((first, rebuilt, traced))
         })
-        .collect();
+        .expect("five tries, each cut into by a release of all title memory");
     assert_ne!(rebuilt[0], first, "the first generation is still published");
     assert_eq!(rebuilt, [rebuilt[0], first, rebuilt[0], first]);
-    if rays {
-        let slot = Descriptor::new(tlas);
-        let list = TitleList::new();
-        let out = unwritten();
-        trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
-        list.run();
-        assert_eq!(out.words(), hit());
+    if let Some(traced) = traced {
+        assert_eq!(traced, hit());
     }
 }
 
@@ -1039,7 +1107,7 @@ fn rt_invalid_blas_inputs_are_refused_before_their_build() {
         return;
     };
     let list = TitleList::new();
-    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+    let (vertices, indices) = (TitleBuffer::new(36), TitleBuffer::new(8));
     vertices.set_words(|i| POSITIONS[i].to_bits());
     let translate = |g: &Geometry| {
         // SAFETY: the test owns the descriptor and the buffers it names.
@@ -1062,6 +1130,12 @@ fn rt_invalid_blas_inputs_are_refused_before_their_build() {
     let mut overlapping = valid;
     overlapping.Anonymous.Triangles.VertexBuffer.StrideInBytes = 4;
     assert!(!translate(&overlapping), "a stride shorter than a vertex");
+    let mut past = valid;
+    past.Anonymous.Triangles.VertexBuffer.StrideInBytes = 0x1_000c;
+    assert!(!translate(&past), "a stride past the builder's 16 bits");
+    let mut flagged = valid;
+    flagged.Anonymous.Triangles.VertexBuffer.StrideInBytes = 0x800c;
+    assert!(translate(&flagged), "bit 15 is a flag, the stride 12");
     let mut unindexed = valid;
     // SAFETY: the test's own triangle description.
     unsafe {
@@ -1113,7 +1187,7 @@ fn rt_builds_off_keeps_the_empty_tlas_and_traces_miss() {
         return;
     };
     let _off = BuildsOff::new();
-    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+    let (vertices, indices) = (TitleBuffer::new(36), TitleBuffer::new(8));
     vertices.set_words(|i| POSITIONS[i].to_bits());
     indices.set_words(|i| [1 << 16, 2][i]);
     let (blas, tlas, copy) = (
@@ -1348,7 +1422,7 @@ fn rt_a_tlas_of_no_instance_leaves_the_next_build_its_barrier() {
     let Some(_gpu) = dxr(test) else {
         return;
     };
-    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+    let (vertices, indices) = (TitleBuffer::new(36), TitleBuffer::new(8));
     vertices.set_words(|i| POSITIONS[i].to_bits());
     indices.set_words(|i| [1 << 16, 2][i]);
     let geometry = geometry(&vertices, &indices);
@@ -1451,7 +1525,7 @@ fn rt_indices_are_checked_as_the_build_reads_them() {
     if !rays {
         return;
     }
-    let vertices = TitleBuffer::new(24);
+    let vertices = TitleBuffer::new(36);
     vertices.set_words(|i| POSITIONS[i].to_bits());
     // 16-bit indices 0, 1, 2, and 0, 1, 3 (past the three vertices).
     let (valid, invalid) = ([1 << 16, 2], [1 << 16, 3]);
@@ -1501,4 +1575,438 @@ fn rt_indices_are_checked_as_the_build_reads_them() {
         tracing.run();
         assert_eq!(out.words(), if hits { hit() } else { MISSES }, "{case}");
     }
+}
+
+/// Three triangles side by side along x, each in a plane of its own, as
+/// `ray_console.hlsl`'s rays read them: (−5, 0, 1), (4, 0, 1), (4, 8, 9) in
+/// z = 1 + y; (15, 0, 2), (24, 0, 2), (24, 8, 6) in z = 2 + y / 2; (35, 0,
+/// 3), (44, 0, 3), (44, 8, 19) in z = 3 + 2y. A wrong vertex moves a hit or
+/// turns it into a miss.
+const MESH: [[f32; 3]; 9] = [
+    [-5., 0., 1.],
+    [4., 0., 1.],
+    [4., 8., 9.],
+    [15., 0., 2.],
+    [24., 0., 2.],
+    [24., 8., 6.],
+    [35., 0., 3.],
+    [44., 0., 3.],
+    [44., 8., 19.],
+];
+
+/// What each of `ray_console.hlsl`'s rays reads of [`MESH`]: its distance
+/// (from z = −10, at its (x, y)) and the triangle hit, or a miss.
+const MESH_READ: [Option<(f32, u32)>; 8] = [
+    Some((12., 0)),
+    Some((12.5, 1)),
+    Some((15., 2)),
+    Some((18., 0)),
+    Some((27., 2)),
+    None,
+    None,
+    None,
+];
+
+/// Every ray a miss.
+const ALL_MISS: [Option<(f32, u32)>; 8] = [None; 8];
+
+/// A title buffer of `len` bytes (a multiple of 4) holding `bytes` from
+/// its byte `at`, zeros elsewhere.
+fn title_bytes(len: usize, at: usize, bytes: &[u8]) -> TitleBuffer {
+    let mut all = vec![0u8; len];
+    all[at..at + bytes.len()].copy_from_slice(bytes);
+    let buffer = TitleBuffer::new(len);
+    buffer.set_words(|i| u32::from_le_bytes(all[4 * i..4 * i + 4].try_into().unwrap()));
+    buffer
+}
+
+/// [`MESH`]'s vertices as `R32G32B32_FLOAT`, at the start of a title buffer.
+fn mesh_floats() -> TitleBuffer {
+    let bytes: Vec<u8> = MESH
+        .iter()
+        .flatten()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    title_bytes(bytes.len().next_multiple_of(16), 0, &bytes)
+}
+
+/// [`MESH`]'s indices as the console builder packs them: three meshlets,
+/// which start at vertex entries 0, 5 and `third` (65,538 reaches past 16
+/// bits, as bit 14 of the meshlet's first word); triangle 0 takes corners
+/// (0, 1, 2) of meshlet 0, triangle 1 corners (2, 0, 1) of meshlet 1,
+/// triangle 2 corners (1, 2, 0) of meshlet 2; one unused triangle word
+/// after them, and bits above the meshlet count in the header. Every other
+/// entry names no vertex (0xFFFF), and with `valid` false these too.
+fn packed_mesh(third: u32, valid: bool) -> Vec<u8> {
+    let at = third as usize;
+    let mut entries = vec![0xffffu16; at + 3];
+    if valid {
+        entries[..3].copy_from_slice(&[0, 1, 2]);
+        entries[5..8].copy_from_slice(&[4, 5, 3]);
+        entries[at..].copy_from_slice(&[8, 6, 7]);
+    }
+    console::pack::indices(
+        &[0, 5, third],
+        &[(0, [0, 1, 2]), (1, [2, 0, 1]), (2, [1, 2, 0])],
+        1,
+        &entries,
+        5,
+    )
+}
+
+/// The origins and scales of quantized [`MESH`]es' headers: the first
+/// coordinate (24 bits) reaches past 16 bits, the second (24) past its
+/// first byte, the third (16) is small.
+const ORIGIN: [f32; 3] = [-524_288., -32_768., -20.];
+const SCALE: [f32; 3] = [0.5, 0.25, 1.];
+
+/// [`MESH`]'s vertices quantized under axis order `axes`, `8 + pad` bytes
+/// apart, their header at byte `at` of a title buffer: the buffer and the
+/// first vertex's address.
+fn quantized_mesh(axes: u32, pad: usize, at: usize) -> (TitleBuffer, u64) {
+    let mut bytes = console::pack::header(ORIGIN, axes, SCALE);
+    for &position in &MESH {
+        let [a, b, c] = console::pack::quantize(position, axes, ORIGIN, SCALE);
+        bytes.extend(console::pack::vertex(a, b, c, pad));
+    }
+    let buffer = title_bytes((at + bytes.len()).next_multiple_of(16), at, &bytes);
+    let first = buffer.address() + at as u64 + console::QUANTIZED_HEADER;
+    (buffer, first)
+}
+
+/// A geometry of [`MESH`]'s nine vertices at `vertex`, in `vertex_format`,
+/// `stride` apart, and nine indices at `index`, in `index_format`.
+fn mesh_geometry(
+    (vertex, vertex_format, stride): (u64, DXGI_FORMAT, u64),
+    (index, index_format): (u64, DXGI_FORMAT),
+) -> Geometry {
+    Geometry {
+        Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+        Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+            Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                Transform3x4: 0,
+                IndexFormat: index_format,
+                VertexFormat: vertex_format,
+                IndexCount: 9,
+                VertexCount: 9,
+                IndexBuffer: index,
+                VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                    StartAddress: vertex,
+                    StrideInBytes: stride,
+                },
+            },
+        },
+    }
+}
+
+/// How a test hands a BLAS to the host: the title's build or rehydration.
+#[derive(Clone, Copy, Debug)]
+enum Made {
+    Built,
+    Rehydrated,
+}
+
+/// A BLAS of `geometry` made as `made`, and a TLAS of it, recorded after
+/// `before` in one list and submitted; then `ray_console.hlsl`'s rays
+/// traced: what each read (hit, distance, front face, triangle).
+fn console_rays(
+    gpu: &crate::testgpu::Gpu,
+    program: &[u8],
+    geometry: &Geometry,
+    made: Made,
+    before: impl FnOnce(&TitleList),
+) -> Vec<[u32; 4]> {
+    let (blas, tlas) = (TitleBuffer::new(1024), TitleBuffer::new(1024));
+    let instances = instances_of(&[blas.address()]);
+    let list = TitleList::new();
+    before(&list);
+    let build = Build {
+        DestAccelerationStructureData: blas.address(),
+        Inputs: blas_input(geometry),
+        ..Default::default()
+    };
+    // SAFETY: the title list and every range the descriptions name are live.
+    unsafe {
+        let recorded = match made {
+            Made::Built => Builder.build(list.this(), &build),
+            Made::Rehydrated => rehydrate(list.this(), &build),
+        };
+        assert!(recorded, "the BLAS ({made:?}) is recorded");
+        assert!(Builder.build(list.this(), &tlas_desc(tlas.address(), &instances)));
+    }
+    list.run();
+    let slot = Descriptor::new(tlas.address());
+    let output = TitleBuffer::new(128);
+    output.set_words(|_| 77);
+    let tracing = TitleList::new();
+    trace_program(
+        gpu.host(),
+        &tracing,
+        Scene::Descriptor(slot.handle()),
+        &output,
+        program,
+    );
+    tracing.run();
+    let words = output.words();
+    words.chunks(4).map(|w| [w[0], w[1], w[2], w[3]]).collect()
+}
+
+/// Checks what the rays read against `want`: each hit at its distance
+/// (within 1e-3) on its triangle, each miss a miss.
+fn assert_rays(case: &str, read: &[[u32; 4]], want: &[Option<(f32, u32)>; 8]) {
+    for (ray, (got, want)) in read.iter().zip(want).enumerate() {
+        match want {
+            Some((t, triangle)) => {
+                assert_eq!(
+                    got[0], 1,
+                    "{case}: ray {ray} read {got:?}, wanted {t} on {triangle}"
+                );
+                let at = f32::from_bits(got[1]);
+                assert!(
+                    (at - t).abs() < 1e-3,
+                    "{case}: ray {ray} hit at {at}, not {t}"
+                );
+                assert_eq!(got[3], *triangle, "{case}: ray {ray}'s triangle");
+            }
+            None => assert_eq!(got[0], 0, "{case}: ray {ray} read {got:?}, wanted a miss"),
+        }
+    }
+}
+
+/// For each ray that hit in `a`: whether its triangle faced it as in `b`.
+fn same_faces(a: &[[u32; 4]], b: &[[u32; 4]]) -> Vec<bool> {
+    (a.iter().zip(b))
+        .filter(|(a, _)| a[0] == 1)
+        .map(|(a, b)| a[2] == b[2])
+        .collect()
+}
+
+/// The console builder's meshlet-packed indices (`R16_TYPELESS`, see
+/// `console`): a BLAS of them builds the triangles their meshlets name,
+/// hit where the triangles of the same vertices indexed plainly are, a
+/// meshlet past entry 65,535 included; with the stride's bit 15, each
+/// triangle is turned, as the plain indices with their first and third
+/// swapped. Read as 16-bit indices (the path before), the same bytes name
+/// vertices past the mesh's, and the build takes no triangle. The index
+/// buffers start 4 or 6 bytes past a 16-byte boundary (Codex review
+/// dcc6e70a, P1-2).
+#[test]
+fn rt_meshlet_packed_indices_build_the_triangles_they_name() {
+    let test = "rt_meshlet_packed_indices_build_the_triangles_they_name";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let program = compiled("ray_console.hlsl", &[]);
+    let vertices = mesh_floats();
+    let floats = (vertices.address(), DXGI_FORMAT_R32G32B32_FLOAT, 12);
+    let turned_floats = (floats.0, floats.1, 12 | 0x8000);
+    let packed = packed_mesh(65_538, true);
+    let packed = title_bytes((4 + packed.len()).next_multiple_of(16), 4, &packed);
+    let packed_at = packed.address() + 4;
+    let plain = |order: [u16; 9]| {
+        let bytes: Vec<u8> = order.iter().flat_map(|i| i.to_le_bytes()).collect();
+        title_bytes(32, 6, &bytes)
+    };
+    let (ahead, turned) = (
+        plain([0, 1, 2, 3, 4, 5, 6, 7, 8]),
+        plain([2, 1, 0, 5, 4, 3, 8, 7, 6]),
+    );
+    let rays_of = |geometry: Geometry| console_rays(&gpu, &program, &geometry, Made::Built, |_| {});
+    let reference = rays_of(mesh_geometry(
+        floats,
+        (ahead.address() + 6, DXGI_FORMAT_R16_UINT),
+    ));
+    assert_rays("plain indices", &reference, &MESH_READ);
+    let decoded = rays_of(mesh_geometry(floats, (packed_at, DXGI_FORMAT_R16_TYPELESS)));
+    assert_rays("meshlet-packed indices", &decoded, &MESH_READ);
+    assert_eq!(decoded, reference, "the same hits, faces and triangles");
+    let turned_reference = rays_of(mesh_geometry(
+        floats,
+        (turned.address() + 6, DXGI_FORMAT_R16_UINT),
+    ));
+    let turned_decoded = rays_of(mesh_geometry(
+        turned_floats,
+        (packed_at, DXGI_FORMAT_R16_TYPELESS),
+    ));
+    assert_rays("turned by bit 15", &turned_decoded, &MESH_READ);
+    assert_eq!(turned_decoded, turned_reference, "as the swapped corners");
+    assert!(
+        same_faces(&decoded, &turned_decoded)
+            .iter()
+            .all(|same| !same),
+        "bit 15 turns every triangle: {decoded:?} {turned_decoded:?}"
+    );
+    let before = rays_of(mesh_geometry(floats, (packed_at, DXGI_FORMAT_R16_UINT)));
+    assert_rays("read as 16-bit indices", &before, &ALL_MISS);
+}
+
+/// The console builder's quantized vertices (`R32G32_FLOAT`, see
+/// `console`): under each axis order, a BLAS of them builds [`MESH`]'s
+/// triangles, hit at their distances, from the fixed-point coordinates,
+/// the header's origins and scales (past 16 bits in the 24-bit ones) and
+/// a 16-byte stride. Their headers start 0, 4 and 8 bytes past a 16-byte
+/// boundary and their 16-bit indices 2 (Codex review dcc6e70a, P1-2).
+#[test]
+fn rt_quantized_vertices_build_their_positions() {
+    let test = "rt_quantized_vertices_build_their_positions";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let program = compiled("ray_console.hlsl", &[]);
+    let order: Vec<u8> = (0..9u16).flat_map(|i| i.to_le_bytes()).collect();
+    let indices = title_bytes(32, 2, &order);
+    for (axes, at) in [(0, 0), (1, 4), (2, 8)] {
+        let (_vertices, first) = quantized_mesh(axes, 8, at);
+        let geometry = mesh_geometry(
+            (first, DXGI_FORMAT_R32G32_FLOAT, 16),
+            (indices.address() + 2, DXGI_FORMAT_R16_UINT),
+        );
+        let read = console_rays(&gpu, &program, &geometry, Made::Built, |_| {});
+        assert_rays(&format!("axis order {axes}"), &read, &MESH_READ);
+    }
+}
+
+/// A title-like geometry: quantized vertices 8 bytes apart and
+/// meshlet-packed indices, the stride's bit 15 set or not, as the title's
+/// (0x8008 and 8), built and rehydrated alike: [`MESH`]'s triangles, the
+/// turned ones facing the other way.
+#[test]
+fn rt_title_like_geometry_builds_and_rehydrates_faithfully() {
+    let test = "rt_title_like_geometry_builds_and_rehydrates_faithfully";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let program = compiled("ray_console.hlsl", &[]);
+    let (_vertices, first) = quantized_mesh(2, 0, 0);
+    let packed = packed_mesh(13, true);
+    let packed = title_bytes(packed.len().next_multiple_of(16), 0, &packed);
+    for made in [Made::Built, Made::Rehydrated] {
+        let geometry = |stride| {
+            mesh_geometry(
+                (first, DXGI_FORMAT_R32G32_FLOAT, stride),
+                (packed.address(), DXGI_FORMAT_R16_TYPELESS),
+            )
+        };
+        let ahead = console_rays(&gpu, &program, &geometry(8), made, |_| {});
+        assert_rays(&format!("{made:?}, stride 8"), &ahead, &MESH_READ);
+        let turned = console_rays(&gpu, &program, &geometry(0x8008), made, |_| {});
+        assert_rays(&format!("{made:?}, stride 0x8008"), &turned, &MESH_READ);
+        assert!(
+            same_faces(&ahead, &turned).iter().all(|same| !same),
+            "{made:?}: bit 15 turns every triangle"
+        );
+    }
+}
+
+/// Inputs a title shader wrote in the same submission, before the build,
+/// are read as it left them (Codex review dcc6e70a, P1-1: the shader's
+/// write promotes the title's copy to the unordered access state, which
+/// the pass reads it in): meshlet-packed indices that name no vertex in
+/// title memory but valid ones once a title pass has copied them over
+/// build the mesh, and the reverse builds nothing.
+#[test]
+fn rt_inputs_a_title_shader_wrote_are_read_as_it_left_them() {
+    let test = "rt_inputs_a_title_shader_wrote_are_read_as_it_left_them";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let program = compiled("ray_console.hlsl", &[]);
+    let kernel = Kernel::new(gpu.host());
+    let vertices = mesh_floats();
+    let len = crate::testgpu::KERNEL_BYTES as usize;
+    let (valid, invalid) = (packed_mesh(10, true), packed_mesh(10, false));
+    assert!(valid.len() <= len);
+    let cases = [
+        ("made valid by a title shader", &invalid, &valid, &MESH_READ),
+        (
+            "made invalid by a title shader",
+            &valid,
+            &invalid,
+            &ALL_MISS,
+        ),
+    ];
+    for (case, in_memory, written, want) in cases {
+        let indices = title_bytes(len, 0, in_memory);
+        let patch = title_bytes(len, 0, written);
+        let geometry = mesh_geometry(
+            (vertices.address(), DXGI_FORMAT_R32G32B32_FLOAT, 12),
+            (indices.address(), DXGI_FORMAT_R16_TYPELESS),
+        );
+        let read = console_rays(&gpu, &program, &geometry, Made::Built, |list| {
+            kernel.dispatch(list.host(), Pass::Copy, patch.address(), indices.address());
+        });
+        assert_rays(case, &read, want);
+    }
+}
+
+/// The pass reads each window through a view whose base is 16-byte
+/// aligned, the window's offset in it given apart (Codex review dcc6e70a,
+/// P1-2).
+#[test]
+fn rt_input_views_are_16_byte_aligned() {
+    for source in [0x7e57_0000u64, 0x7e57_0002, 0x7e57_0004, 0x7e57_000e] {
+        let (base, offset) = indices::view(source);
+        assert_eq!(base % 16, 0);
+        assert_eq!(base + u64::from(offset), source);
+        assert!(offset < 16);
+    }
+}
+
+/// A trace dispatched with its host list alone, as draws dispatch it (task
+/// ac895e39), takes the TLAS published at its place in submission order:
+/// one that another list builds and submits after the trace is recorded,
+/// and before it is submitted.
+#[test]
+fn rt_a_trace_by_its_host_list_takes_the_tlas_submitted_before_it() {
+    let test = "rt_a_trace_by_its_host_list_takes_the_tlas_submitted_before_it";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let (vertices, indices) = (TitleBuffer::new(36), TitleBuffer::new(8));
+    vertices.set_words(|i| POSITIONS[i].to_bits());
+    indices.set_words(|i| [1 << 16, 2][i]);
+    let (blas, tlas) = (TitleBuffer::new(1024), TitleBuffer::new(1024));
+    let instances = instances_of(&[blas.address()]);
+    let slot = Descriptor::new(tlas.address());
+    let out = unwritten();
+    let tracing = TitleList::new();
+    trace(
+        gpu.host(),
+        &tracing,
+        Scene::HostDescriptor(slot.handle()),
+        &out,
+    );
+    let producer = TitleList::new();
+    let geometry = geometry(&vertices, &indices);
+    // SAFETY: the title list and every buffer the descriptions name are live.
+    unsafe {
+        assert!(Builder.build(
+            producer.this(),
+            &Build {
+                DestAccelerationStructureData: blas.address(),
+                Inputs: blas_input(&geometry),
+                ..Default::default()
+            }
+        ));
+        assert!(Builder.build(producer.this(), &tlas_desc(tlas.address(), &instances)));
+    }
+    producer.run();
+    tracing.run();
+    assert_eq!(out.words(), hit(), "the TLAS submitted before the trace");
 }
