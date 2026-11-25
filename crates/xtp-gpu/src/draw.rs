@@ -742,6 +742,12 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// The pipeline the title set (tests).
+    #[cfg(test)]
+    pub(crate) fn pipeline(&self) -> This {
+        self.pipeline as This
+    }
+
     /// Work of XTP's own bound its heaps, root signature and pipeline on
     /// the host list (`crate::list`'s upscale and UAV clears): the next draw
     /// or dispatch binds the title's again.

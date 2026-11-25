@@ -122,7 +122,8 @@ struct List {
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
     /// The pipeline the title set last (`SetPipelineState`, or the one its
-    /// reset passed): the program whose thread group `DispatchX` reads.
+    /// creation or reset passed): the program whose thread group
+    /// `DispatchX` reads.
     #[cfg(windows)]
     pipeline: std::sync::atomic::AtomicUsize,
 }
@@ -179,11 +180,11 @@ pub(crate) extern "system" fn create_list(
     _nodes: u32,
     kind: u32,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    new_list(kind, allocator, iid, out)
+    new_list(kind, allocator, pipeline, iid, out)
 }
 
 /// The console's list creation: type, flags, node mask and barrier batch
@@ -201,7 +202,7 @@ pub(crate) extern "system" fn create_list_x(
     _: This,
     desc: *const ListDesc,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -210,10 +211,19 @@ pub(crate) extern "system" fn create_list_x(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "console command list");
-    new_list(desc.kind, allocator, iid, out)
+    new_list(desc.kind, allocator, pipeline, iid, out)
 }
 
-fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// A list of `kind`, open, with `pipeline` (null: none) set as
+/// `SetPipelineState` sets one: D3D12's initial pipeline state, which
+/// draws and dispatches recorded before the title sets another use.
+fn new_list(
+    kind: u32,
+    allocator: This,
+    pipeline: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -243,11 +253,19 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
             }
         }),
         #[cfg(windows)]
-        state: Default::default(),
+        state: {
+            let mut state = crate::draw::State::default();
+            state.set_pipeline(pipeline);
+            std::sync::Mutex::new(state)
+        },
         #[cfg(windows)]
-        pipeline: Default::default(),
+        pipeline: std::sync::atomic::AtomicUsize::new(pipeline as usize),
     });
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    let made = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    if made == S_OK {
+        crate::pipeline::bound(pipeline);
+    }
+    made
 }
 
 /// Keeps `pipeline` as the one the title set last on `this` (see
@@ -335,8 +353,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = this;
     S_OK
 }
 
@@ -2584,6 +2603,123 @@ mod tests {
             assert_eq!(got[..3], written, "the dispatch reads the written words");
             assert_eq!(got[3..], [0x1111_1111; 61]);
             assert_eq!(w.words()[..3], written);
+        }
+
+        /// A list created with a pipeline has it set, as `SetPipelineState`
+        /// sets one, whichever creation method the title calls: its draw
+        /// state and `DispatchX` use it until the title sets another, and
+        /// its first bind is logged. A list created without one has none.
+        /// Before, the creation's pipeline was dropped.
+        #[test]
+        fn lists_bind_the_initial_pipeline_on_creation() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use tracing::{Event, Metadata, Subscriber, span};
+
+            /// Counts the pipelines' "first bind" lines.
+            struct FirstBinds(Arc<AtomicUsize>);
+            impl Subscriber for FirstBinds {
+                fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                    let fields = metadata.fields();
+                    metadata.is_event()
+                        && metadata.target() == "xtp_gpu::pipeline"
+                        && ["pipeline", "frame", "hash"]
+                            .iter()
+                            .all(|f| fields.field(f).is_some())
+                }
+                fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                    span::Id::from_u64(1)
+                }
+                fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+                fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+                fn event(&self, event: &Event<'_>) {
+                    if self.enabled(event.metadata()) {
+                        self.0.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                fn enter(&self, _: &span::Id) {}
+                fn exit(&self, _: &span::Id) {}
+            }
+
+            /// A compute pipeline description as the title passes one.
+            #[repr(C)]
+            struct ComputeDesc {
+                root: This,
+                code: *const u8,
+                size: usize,
+            }
+
+            let test = "list::tests::gpu::lists_bind_the_initial_pipeline_on_creation";
+            let Some(_gpu) = device(test) else { return };
+            let null = std::ptr::null();
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let desc = ListDesc {
+                kind: 0,
+                flags: 0,
+                nodes: 0,
+                barrier_batch: 0,
+            };
+            // Bytes of this test's own (shaders are shared by their bytes),
+            // which nothing translates: the list only names the pipeline.
+            let bytes = [0xa5, 0xb6, 0xc7, 0x46];
+            let compute = ComputeDesc {
+                root: null,
+                code: bytes.as_ptr(),
+                size: bytes.len(),
+            };
+            let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            // What the list's draw state holds (an address no pipeline has
+            // until it has been read).
+            let drawn = |list: This| {
+                let mut pipeline = std::ptr::without_provenance(1);
+                with_state(list, |_, s| pipeline = s.pipeline());
+                pipeline
+            };
+            let binds = Arc::new(AtomicUsize::new(0));
+            let counting = tracing::Dispatch::new(FirstBinds(binds.clone()));
+            tracing::dispatcher::with_default(&counting, || {
+                for console in [false, true] {
+                    let create = |pipeline, out| {
+                        if console {
+                            create_list_x(null, &desc, allocator, pipeline, &LIST_IIDS[1], out)
+                        } else {
+                            create_list(null, 0, 0, allocator, pipeline, &LIST_IIDS[1], out)
+                        }
+                    };
+                    let mut pipeline = null;
+                    assert_eq!(
+                        crate::pipeline::create_compute(
+                            null,
+                            (&raw const compute).cast(),
+                            &PAGEABLE_IIDS[0],
+                            &mut pipeline,
+                        ),
+                        S_OK
+                    );
+                    let before = binds.load(Ordering::Relaxed);
+                    let mut list = null;
+                    assert_eq!(create(null, &mut list), S_OK);
+                    assert_eq!((drawn(list), kept_pipeline(list)), (null, null));
+                    assert_eq!(binds.load(Ordering::Relaxed), before);
+                    assert_eq!(release(list), 0);
+
+                    assert_eq!(create(pipeline, &mut list), S_OK);
+                    assert_eq!(
+                        drawn(list),
+                        pipeline,
+                        "the draw state's (console {console})"
+                    );
+                    assert_eq!(kept_pipeline(list), pipeline, "DispatchX's");
+                    assert_eq!(binds.load(Ordering::Relaxed), before + 1, "its first bind");
+                    assert_eq!(release(list), 0);
+                    assert_eq!(release(pipeline), 0);
+                }
+            });
+            assert_eq!(release(allocator), 0);
         }
 
         /// A title resource description (`D3D12_RESOURCE_DESC`), as the
