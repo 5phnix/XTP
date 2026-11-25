@@ -83,7 +83,8 @@ const HEAVY: usize = 1;
 const POOL_NAMES: [&str; 2] = ["cheap", "heavy"];
 
 /// What identifies a title pipeline of `shaders` and `graphics` across
-/// runs: its early key, and the key its description is kept under.
+/// runs: its early key (its description is kept under a key of its own,
+/// `super::record`'s).
 pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
     let mut key = blake3::Hasher::new();
     for s in shaders {
@@ -164,7 +165,7 @@ impl Pending {
             // or not (a translator that refuses its shaders today may take
             // them tomorrow). Compute pipelines are the pack's.
             if let (Some(stream), false) = (&self.stream, self.compute()) {
-                super::record::made(&self.key, &self.shaders, stream);
+                super::record::made(&self.shaders, stream);
             }
         }
         first
@@ -1209,9 +1210,9 @@ mod tests {
     #[test]
     fn a_cheap_pipeline_does_not_wait_behind_a_heavy_one() {
         let test = "pipeline::make::tests::a_cheap_pipeline_does_not_wait_behind_a_heavy_one";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let pipeline = |extra, salt, held| {
             let (shader, release) = compute(extra, salt, held);
             (Arc::new(Pending::new(vec![shader], None, None)), release)

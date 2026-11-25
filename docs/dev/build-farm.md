@@ -11,9 +11,11 @@ explains how the farm works, what it costs, how its daily budget cap works,
 how to set up your own farm in your own Google Cloud project, and how to use
 it day to day.
 
-The farm VMs hold **source code only**. They never receive game files: only
-what git tracks, plus the uncommitted files git does not ignore, goes to
-them (see [Security](#security)).
+The farm VMs hold **source code**, plus one file of your own copy of the
+title: the shader pack `shaders.rpf`, which `Copy-FarmPack.ps1` puts on
+their disks for [shader surveys](#shader-surveys). Nothing else of the
+title goes there: builds send only what git tracks, plus the uncommitted
+files git does not ignore (see [Security](#security)).
 
 ## How it works
 
@@ -183,6 +185,91 @@ Things to know:
 - The first build of a new slot is a cold build (a few minutes); later ones
   are incremental.
 
+## Shader surveys
+
+`xtp shader-survey` and `xtp translate --validate` over the pack need no
+GPU, only cores and the Windows SDK's `dxil.dll`: they run on the farm, in
+parallel, and the L4 stays free for game sessions.
+
+```powershell
+# from any worktree; -Rev: a commit, a branch or HEAD (default)
+powershell -NoProfile -ExecutionPolicy Bypass -File <XTP>\tools\buildfarm\Invoke-FarmSurvey.ps1 -Rev main -Args 'shader-survey --host-lanes 32-32 --json'
+powershell -NoProfile -ExecutionPolicy Bypass -File <XTP>\tools\buildfarm\Invoke-FarmSurvey.ps1 -Rev HEAD -Args 'shader-survey --validate --host-lanes 32-32 --json'
+powershell -NoProfile -ExecutionPolicy Bypass -File <XTP>\tools\buildfarm\Invoke-FarmSurvey.ps1 -Args 'translate --validate --pipelines --host-lanes 32-32'
+```
+
+- It builds `xtp` at that commit (`cargo run --release -p xtp --locked`,
+  as on the L4) in a farm slot, and runs it there with your arguments and
+  the VM's pack, `C:\farm\pack\shaders.rpf`, added at the end (or where
+  `{pack}` stands).
+- `--json` with no file after it: the survey's JSON comes back as
+  `survey.json`. (`translate` has no `--json`: its output is the log.) On
+  the VM it is written to `C:\farm\tmp`, outside the slot (xtp refuses to
+  write game-derived data inside a source tree), and deleted once fetched.
+- Results: `<surveyDir>\<name>\` (by default `farm-surveys` next to the
+  farm's state folder; on the maintainer's PC
+  `E:\xtp-data\farm-surveys\<name>\`): `survey.log` (xtp's output, the
+  totals), `farm.log` (the build, the farm's messages, xtp's stderr; written
+  as it runs), `survey.json`, `meta.json` (commit, arguments, VM, slot, exit
+  code, time). The command prints the totals and the folder at the end.
+  `-Name` names the folder (default `<date-time>-<commit>-<command>`).
+- `-Rev` takes a commit only, never your uncommitted changes; `-WithChanges`
+  sends the worktree as it is (with `-Rev HEAD`), as cargo-remote does.
+- Several at once, from any worktrees: each survey takes an idle running VM,
+  else starts a stopped one if the daily budget allows it, else shares the
+  least loaded one (in another slot). Surveys share their slots (key
+  `farm-survey`), so the release build is incremental after the first one
+  on each slot.
+- Time limit: `surveyMinutes` (90) for the build and the run, `-Minutes`
+  for one survey.
+- Exit code: xtp's; 75 the farm cannot take it now. There is no fallback
+  to the PC: surveys never run there.
+- `XTP_*` variables without a local path go along (`XTP_PAIRS`, ...).
+- `--pipelines` makes its pipelines on the VM's software adapter (WARP),
+  not on a GPU: compare its pipeline counts with other farm runs.
+
+### The pack on the VMs
+
+`Copy-FarmPack.ps1` copies `shaders.rpf`, and only that object, from the
+game bucket of the cloud configuration (`gs://<bucket>/<gamePrefix>/shaders.rpf`,
+see [cloud-setup.md](cloud-setup.md); `packSource` overrides it) to
+`C:\farm\pack\shaders.rpf` on each VM. Each VM downloads it itself, inside
+Google's network, through a signed URL valid for 15 minutes; the PC sends
+only the command. The copy is checked against the object's size and CRC32C,
+and a VM that already holds that object's generation is left alone, so run
+it again whenever the pack changes in the bucket, or after making a VM:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File <XTP>\tools\buildfarm\Copy-FarmPack.ps1           # every VM (starts stopped ones, budget permitting)
+powershell -NoProfile -ExecutionPolicy Bypass -File <XTP>\tools\buildfarm\Copy-FarmPack.ps1 -Name xtp-farm-3 -Force
+powershell -NoProfile -ExecutionPolicy Bypass -File <XTP>\tools\buildfarm\Copy-FarmPack.ps1 -Status   # the pack and dxil.dll of each running VM
+```
+
+The VMs still have no service account. The URL is signed by a service
+account of the farm's own, `<prefix>-pack` (`packSigner`), which the script
+creates with no project role and two grants only:
+
+- `roles/storage.objectViewer` on the game bucket, with an IAM condition
+  that limits it to the pack's object
+  (`resource.name == "projects/_/buckets/<bucket>/objects/<gamePrefix>/shaders.rpf"`):
+  it can read that one file and nothing else, not even list the bucket;
+- `roles/iam.serviceAccountTokenCreator` on that service account only, for
+  the gcloud account that runs the script, so that it can sign with it.
+
+`New-FarmImage.ps1` removes the pack from the builder before saving its
+disk: images never hold it. `Remove-Farm.ps1` deletes the signer.
+
+**dxil.dll.** The image's Windows SDK (10.0.26100.0) has
+`C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxil.dll`,
+version 1.9.2602.17 (validator 1.9), the one `--validate` loads (the L4's
+surveys load the same SDK folder's). `Copy-FarmPack.ps1 -Status` shows it
+for each VM.
+
+Measured (November 2026, c2d-highcpu-16): the copy takes about 15 s per VM
+(us-central1 bucket to europe-west1/4); `shader-survey --host-lanes 32-32
+--json` of `main` takes 4 minutes on a slot that built xtp before (the
+release build of a fresh slot adds about 80 s).
+
 ## Costs
 
 List prices (Cloud Billing Catalog, November 2026), per VM:
@@ -299,6 +386,10 @@ the cap. Then point the tools at it:
 | `maxRunMinutes` | 30 | longest job, all attempts included (`XTP_FARM_JOB_MINUTES` overrides it) |
 | `maxSendFileMB` | 20 | largest uncommitted file sent |
 | `stateDir`, `tempDir` | the config's folder, `<stateDir>\tmp` | where the ledger, keys and temporary files go |
+| `packSource` | `gs://<bucket>/<gamePrefix>/shaders.rpf` of the cloud configuration | the shader pack's object |
+| `packSigner` | `<prefix>-pack` | service account that signs the pack's download URL |
+| `surveyDir` | `farm-surveys` next to `stateDir` | where shader surveys come back |
+| `surveyMinutes` | 90 | longest shader survey, its build included |
 
 ### 4. Image and VMs
 
@@ -375,6 +466,9 @@ disks, images, Cloud NAT and firewall rule, nothing else.
 | Script | Role |
 |---|---|
 | `Invoke-FarmCargo.ps1` | sync and run (cargo-remote's engine) |
+| `Invoke-FarmSurvey.ps1` | a shader survey of one commit, its output brought back |
+| `Copy-FarmPack.ps1` | the shader pack from the bucket to the VMs; `-Status` |
+| `pack\vm-pack.ps1` | the VM side of `Copy-FarmPack.ps1` (sent each time, not part of the agent) |
 | `New-FarmImage.ps1` | network, keys, prices, first VM, toolchain, image |
 | `New-FarmVm.ps1` | the other VMs from the image |
 | `Start-Farm.ps1`, `Stop-Farm.ps1` | start (budget-checked) or stop VMs |
@@ -398,11 +492,16 @@ time.
 
 ## Security
 
-- **No game files.** Only git content leaves the PC: the commits of the
+- **No game files from the PC.** Only git content leaves the PC: the commits of the
   worktree and its uncommitted changes, minus what `.gitignore` excludes
   (which covers every game data extension; `cargo xtask policy` guards what
   is committed). Variables holding local paths, such as `XTP_GAME_DIR`, are
   not forwarded. Never copy game files to a farm VM by hand.
+- **The shader pack only.** The one exception is `shaders.rpf`, which
+  `Copy-FarmPack.ps1` copies from your private bucket to the VMs' disks
+  (`C:\farm\pack`), and refuses any other object. It never goes into an
+  image, the repository or a slot, and its signer can read nothing else
+  ([The pack on the VMs](#the-pack-on-the-vms)).
 - **No public port.** No external address; SSH only, from IAP's range
   (35.235.240.0/20) through the `xtp-farm-allow-iap-ssh` rule; IAP checks
   your Google identity before any packet reaches the VM.

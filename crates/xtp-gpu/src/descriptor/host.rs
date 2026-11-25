@@ -61,6 +61,10 @@ pub(crate) struct HostHeap {
     /// a draw last read it through a table
     /// ([`HostHeap::texture_slot_tabled`]).
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// View heaps: passes over the textures picked by index taken in a
+    /// frame that had one already (frames that do not advance), each a
+    /// frame more on the queue's clock ([`HostHeap::clock`]).
+    passes_on: AtomicU64,
 }
 
 /// Slots past the dynamic ones in a view heap with a runtime stride table,
@@ -300,9 +304,10 @@ struct Viewed {
 struct Made {
     /// The record (view index and generation; 0 when not made).
     keys: Vec<u64>,
-    /// For a texture the title placed itself, the host texture the slot
-    /// views (see [`HostHeap::mirror`]).
-    placed: HashMap<u32, usize>,
+    /// For a texture view, the host texture the slot views (0: none, the
+    /// slot is null) and, for a texture the title placed itself, the
+    /// resource made for its memory (see [`HostHeap::mirror`]).
+    textures: HashMap<u32, (usize, usize)>,
     /// Title slots whose buffer view waits for a draw (made null when the
     /// title wrote it), each once: [`HostHeap::picked_spans`] makes them.
     waiting: Vec<u32>,
@@ -575,7 +580,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(Made {
                 keys: vec![0; count as usize],
-                placed: HashMap::new(),
+                textures: HashMap::new(),
                 waiting: Vec::new(),
                 queued: vec![false; if sampler { 0 } else { count as usize }],
                 buffers: HashMap::new(),
@@ -595,6 +600,7 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            passes_on: AtomicU64::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1060,6 +1066,13 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// shortcut: the slot is written at once, though lists submitted before
+    /// may still read it on the GPU (D3D12 asks that a descriptor in use
+    /// stay as it is). A title that rewrites a slot does as much on the
+    /// console; a slot made again because its host texture changed (made
+    /// resident, replaced: #643) is not the title's doing, and such lists
+    /// may read the view before or after (both of the same kind: a null
+    /// view is made in the title's dimension).
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -1096,17 +1109,30 @@ impl HostHeap {
             }
             _ => None,
         };
-        let texture = placed.as_ref().map(|p| match p {
-            Some(View::Shader(r, _)) => crate::resource::host_resource(*r as crate::object::This)
-                .map_or(0, |t| t.as_raw() as usize),
-            _ => 0,
-        });
+        // A texture object's host copy is there for the GPU only once it is
+        // resident, which may be after the title wrote its views: the slot,
+        // null until then, is made again once there is one (another host
+        // copy, the same).
+        let host_of =
+            |r: usize| host_copy_of(r as crate::object::This).map_or(0, |t| t.as_raw() as usize);
+        let texture = match (&placed, &view) {
+            (Some(p), _) => Some(match p {
+                Some(View::Shader(r, _)) => (host_of(*r), *r),
+                _ => (0, 0),
+            }),
+            (None, Some(View::Shader(r, _) | View::Unordered(r, _, _)))
+                if crate::resource::buffer_bytes(*r as crate::object::This).is_none() =>
+            {
+                Some((host_of(*r), 0))
+            }
+            _ => None,
+        };
         // Whether the slot is to be made again: another record, or another
         // host texture. The host texture held by the slot cannot be
         // another's (`kept` holds it), so the same address is the same one.
         let stale = |made: &Made| {
             made.keys[index as usize] != key
-                || texture.is_some_and(|t| made.placed.get(&index).copied() != Some(t))
+                || texture.is_some_and(|t| made.textures.get(&index).copied() != Some(t))
         };
         // A buffer view's host copy, a resource (which can wait in the
         // kernel, on video memory), is made before the lock too when the
@@ -1127,7 +1153,7 @@ impl HostHeap {
             let mut old = None;
             if made.keys[index as usize] != 0 {
                 made.keys[index as usize] = 0;
-                made.placed.remove(&index);
+                made.textures.remove(&index);
                 if self.sampler {
                     self.null_sampler(index);
                 } else {
@@ -1161,8 +1187,8 @@ impl HostHeap {
                 made.waiting.push(index);
             }
             match texture {
-                Some(t) if !later => made.placed.insert(index, t),
-                _ => made.placed.remove(&index),
+                Some(t) if !later => made.textures.insert(index, t),
+                _ => made.textures.remove(&index),
             };
             let mut viewed = None;
             let kept = if later {
@@ -1190,6 +1216,17 @@ impl HostHeap {
         drop(made);
         drop(old);
         Some(placed.flatten().unwrap_or(view))
+    }
+
+    /// The resource made for the memory of the texture the title placed
+    /// itself that slot `index` was last made from for a draw, if it is
+    /// one: an address only, which may have been released since.
+    pub(crate) fn placed_resource(&self, index: u32) -> Option<usize> {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.textures
+            .get(&index)
+            .map(|&(_, resource)| resource)
+            .filter(|&r| r != 0)
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1643,8 +1680,15 @@ impl HostHeap {
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
-/// ([`HostHeap::texture_slot_tabled`]).
+/// ([`HostHeap::texture_slot_tabled`]): the title's writes of it wait for
+/// such a draw ([`TABLED_GRACE`]).
 const TABLED_FRAMES: u64 = 240;
+
+/// Frames for which passes leave a served slot a draw read through a table
+/// to such draws, which bring it up to date: this one and the one before.
+/// Not [`TABLED_FRAMES`]: a title that stops reading a slot through tables
+/// to pick it by index would see the image it had for 240 frames.
+const TABLED_CHECKS: u64 = 1;
 
 /// Frames a texture view the title writes into a table's slot waits in the
 /// [`TextureQueue`] for the draw that reads it, before a pass takes it for
@@ -1704,14 +1748,61 @@ pub(crate) const PASS_STAGING: u64 = 1 << 30;
 /// a 16 GB card shared with the desktop's programs has, and the video
 /// memory manager's evictions at each submission's preparation took the
 /// frame to 1-11 s on the GPU. Those past it wait for room (the title's
-/// own textures and targets come first).
+/// own textures and targets come first). Checked per texture, with its
+/// bytes: one 64 MiB texture does not pass because 1 MiB is left.
 pub(crate) const PASS_VIDEO_SHARE: u64 = 85;
 
-/// Whether a pass may make host textures, by the process's local video
-/// memory `(budget, usage)` (`crate::dxgi::video_memory`; `None`, unknown:
-/// yes).
-pub(crate) fn room_for_textures(memory: Option<(u64, u64)>) -> bool {
-    memory.is_none_or(|(budget, usage)| usage < budget / 100 * PASS_VIDEO_SHARE)
+/// The bytes of host textures a pass may make, by the process's local
+/// video memory `(budget, usage)` (`crate::dxgi::video_memory`, asked once
+/// a pass): up to [`PASS_VIDEO_SHARE`] of the budget (`None`, unknown: no
+/// limit).
+pub(crate) fn video_room(memory: Option<(u64, u64)>) -> u64 {
+    memory.map_or(u64::MAX, |(budget, usage)| {
+        (budget / 100 * PASS_VIDEO_SHARE).saturating_sub(usage)
+    })
+}
+
+/// The bytes of staging buffers a pass may make for its next texture, with
+/// `staged` bytes of them there are and `spent` of its `budget` spent by
+/// the pass so far: within [`PASS_STAGING`] and the budget; the first of a
+/// pass may take more than the budget (it would never fit otherwise).
+pub(crate) fn staging_room(staged: u64, spent: u64, budget: u64) -> u64 {
+    let pass = if spent == 0 {
+        u64::MAX
+    } else {
+        budget.saturating_sub(spent)
+    };
+    PASS_STAGING.saturating_sub(staged).min(pass)
+}
+
+/// Makes the staging buffer of `resource` (host copy `texture`) for an
+/// upload by a pass over the textures shaders pick by index (`draw.rs`
+/// `heap_textures`) if it has none, within the room left
+/// ([`staging_room`]: `spent` bytes of the pass's `budget` so far, counted
+/// here): what came of it. Staging memory too full for it counts the pass
+/// as full in `counts` (logged once).
+pub(crate) fn stage_for_pass(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+    budget: u64,
+    spent: &mut u64,
+    counts: &mut PassCounts,
+) -> crate::texture::Staged {
+    use crate::texture::Staged;
+    let staged = crate::texture::staged_total();
+    let made = crate::texture::stage(resource, texture, staging_room(staged, *spent, budget));
+    match made {
+        Staged::Ready(bytes) => *spent += bytes,
+        Staged::NoRoom(bytes) if bytes > PASS_STAGING.saturating_sub(staged) => {
+            counts.full = 1;
+            once!(
+                mib = staged >> 20,
+                "textures shaders pick by index: staging memory full, the rest wait"
+            );
+        }
+        _ => {}
+    }
+    made
 }
 
 /// The bytes a frame's pass stages for first uploads of textures shaders
@@ -2029,12 +2120,14 @@ pub(crate) static PASS_LATER: AtomicU64 = AtomicU64::new(0);
 /// What a pass over the textures shaders pick by index works on (`draw.rs`
 /// `heap_textures`), from [`HostHeap::texture_pass`].
 pub(crate) struct TexturePass {
+    /// The queue's clock ([`HostHeap::clock`]).
     pub(crate) frame: u64,
     /// Slots due for their first upload, with their write numbers, in the
     /// order to serve them.
     pub(crate) due: Vec<(u32, u64)>,
-    /// Served slots to check for changes, in turn; those tables read
-    /// lately are left out (their draws check them).
+    /// Served slots to check for changes, in turn; those tables read in
+    /// the last [`TABLED_CHECKS`] frames are left out (their draws check
+    /// them).
     pub(crate) served: Vec<u32>,
     /// Frames at most between two looks at a slot with nothing to upload:
     /// those in about four seconds, between 16 and 256 (a title streams by
@@ -2061,10 +2154,11 @@ pub(crate) struct PassCounts {
     pub(crate) changed: u64,
     pub(crate) hashed: u64,
     /// Due slots left for later passes by the budgets (bytes, time,
-    /// staging memory, video memory).
+    /// staging memory, video memory), each checked with its texture's
+    /// bytes.
     pub(crate) left: u64,
-    /// 1 if the pass made no first upload for want of room: staging memory
-    /// past [`PASS_STAGING`], or video memory past [`PASS_VIDEO_SHARE`].
+    /// 1 if the pass left a texture for want of room: staging memory past
+    /// [`PASS_STAGING`], or video memory past [`PASS_VIDEO_SHARE`].
     pub(crate) full: u64,
     /// Microseconds the pass took.
     pub(crate) us: u64,
@@ -2114,12 +2208,21 @@ impl HostHeap {
         self.queue_slot(index, held, pass_frame());
     }
 
-    /// [`HostHeap::queue_texture`] in `frame`, for a slot that now holds
-    /// `held` (the record, and whether it is placed) or no texture the
-    /// title fills. A slot tables read lately waits [`TABLED_GRACE`]
-    /// frames for their draw.
+    /// The queue's clock at the title's frame `frame`: that frame, and one
+    /// more for each pass taken in a frame that had one already (where
+    /// frames do not advance, [`PASS_AGAIN`] after the last pass), so that
+    /// waits counted in frames end there too.
+    fn clock(&self, frame: u64) -> u64 {
+        frame + self.passes_on.load(Ordering::Relaxed)
+    }
+
+    /// [`HostHeap::queue_texture`] in the title's frame `frame`, for a slot
+    /// that now holds `held` (the record, and whether it is placed) or no
+    /// texture the title fills. A slot tables read lately waits
+    /// [`TABLED_GRACE`] frames for their draw.
     fn queue_slot(&self, index: u32, held: Option<(u64, bool)>, frame: u64) {
-        let lately = self.tabled_lately(index, frame);
+        let frame = self.clock(frame);
+        let lately = self.tabled_within(index, frame, TABLED_FRAMES);
         let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match held {
             Some((key, placed)) => {
@@ -2135,19 +2238,19 @@ impl HostHeap {
     /// A draw read title slot `index` through a table, and brings what it
     /// views up to date (`draw.rs` `readable`): for [`TABLED_FRAMES`]
     /// frames the title's writes of the slot wait [`TABLED_GRACE`] frames
-    /// for such a draw, and passes leave it to them. A slot that waited for
-    /// a pass is served from now on: a shader may pick it by index all the
-    /// same once tables no longer read it.
+    /// for such a draw, and for [`TABLED_CHECKS`] passes leave it to them.
+    /// A slot that waited for a pass is served from now on: a shader may
+    /// pick it by index all the same once tables no longer read it.
     pub(crate) fn texture_slot_tabled(&self, index: u32) {
         self.tabled_in(index, pass_frame());
     }
 
-    /// [`HostHeap::texture_slot_tabled`] in `frame`.
+    /// [`HostHeap::texture_slot_tabled`] in the title's frame `frame`.
     fn tabled_in(&self, index: u32, frame: u64) {
         let Some(stamp) = self.tabled.get(index as usize) else {
             return;
         };
-        let now = stamp_of(frame);
+        let now = stamp_of(self.clock(frame));
         // Once per slot and frame: tables are read by every draw.
         if stamp.load(Ordering::Relaxed) == now {
             return;
@@ -2164,13 +2267,13 @@ impl HostHeap {
     }
 
     /// Whether a draw read title slot `index` through a table within the
-    /// last [`TABLED_FRAMES`] frames before `frame`.
-    fn tabled_lately(&self, index: u32, frame: u64) -> bool {
+    /// last `frames` frames before `clock` ([`HostHeap::clock`]).
+    fn tabled_within(&self, index: u32, clock: u64, frames: u64) -> bool {
         let stamp = self
             .tabled
             .get(index as usize)
             .map_or(0, |s| s.load(Ordering::Relaxed));
-        stamp != 0 && u64::from(stamp_of(frame).wrapping_sub(stamp)) <= TABLED_FRAMES
+        stamp != 0 && u64::from(stamp_of(clock).wrapping_sub(stamp)) <= frames
     }
 
     /// The work of a pass over the textures shaders pick from this heap by
@@ -2180,18 +2283,25 @@ impl HostHeap {
         self.texture_pass_at(pass_frame(), std::time::Instant::now())
     }
 
-    /// [`HostHeap::texture_pass`] at `frame` and `now`.
+    /// [`HostHeap::texture_pass`] at the title's frame `frame` and `now`.
     fn texture_pass_at(&self, frame: u64, now: std::time::Instant) -> Option<TexturePass> {
         if self.sampler || self.tabled.is_empty() {
             return None;
         }
         let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let again = q.pass.is_some_and(|(last, _)| last == frame);
         let since = q.pass_due(frame, now)?;
-        let due = q.due(frame, PASS_SLOTS);
-        let served = q.next_served(PASS_SLOTS, |index| self.tabled_lately(index, frame));
+        if again {
+            self.passes_on.fetch_add(1, Ordering::Relaxed);
+        }
+        let clock = self.clock(frame);
+        let due = q.due(clock, PASS_SLOTS);
+        let served = q.next_served(PASS_SLOTS, |index| {
+            self.tabled_within(index, clock, TABLED_CHECKS)
+        });
         let most = (4000 / since.as_millis().max(1)).clamp(16, 256) as u64;
         Some(TexturePass {
-            frame,
+            frame: clock,
             due,
             served,
             most,
@@ -2798,6 +2908,26 @@ pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<
     make(view, at).flatten()
 }
 
+/// The host copy of title texture `r` the GPU may use now
+/// ([`crate::resource::host_resource`]: none until it is resident). In
+/// tests, none for the resource a test holds back as not resident yet
+/// ([`NOT_RESIDENT`]): residency comes when the driver says, which a test
+/// cannot wait before.
+fn host_copy_of<'a>(r: crate::object::This) -> Option<&'a ID3D12Resource> {
+    #[cfg(test)]
+    if !r.is_null() && NOT_RESIDENT.with(std::cell::Cell::get) == r as usize {
+        return None;
+    }
+    crate::resource::host_resource(r)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The resource whose host copy a test on this thread holds back as not
+    /// resident yet ([`host_copy_of`]).
+    static NOT_RESIDENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2833,7 +2963,7 @@ fn make_with(
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            if let Some(texture) = host_copy_of(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
@@ -2858,7 +2988,7 @@ fn make_with(
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some(texture) = crate::resource::host_resource(resource) else {
+            let Some(texture) = host_copy_of(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at, viewed)
@@ -3142,9 +3272,9 @@ mod tests {
     fn views_off_their_elements_give_the_table_their_bytes() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::views_off_their_elements_give_the_table_their_bytes";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let buffer = TitleBuffer::new(1 << 16);
         let copy = buffer.shadow();
@@ -3386,20 +3516,139 @@ mod tests {
         }
     }
 
-    /// Passes make host textures below 85 % of the local video memory
-    /// budget only (heaptex-A: 13.3 GB resident on a 16 GB card shared with
-    /// the desktop, 1-11 s a frame on the GPU); unknown, they may.
+    /// Passes make host textures within 85 % of the local video memory
+    /// budget (heaptex-A: 13.3 GB resident on a 16 GB card shared with the
+    /// desktop, 1-11 s a frame on the GPU), each with its bytes: a 64 MiB
+    /// texture does not pass with 1 MiB left. Unknown, any. Staging
+    /// buffers within the staging limit and what is left of the pass's
+    /// bytes, but for the first of a pass, which may take more than they.
     #[test]
-    fn passes_make_textures_below_a_share_of_the_video_budget() {
+    fn passes_make_textures_and_staging_buffers_within_their_room() {
         const GB: u64 = 1 << 30;
-        assert!(room_for_textures(None));
-        assert!(room_for_textures(Some((14 * GB, 10 * GB))));
-        assert!(
-            !room_for_textures(Some((14 * GB, 12 * GB))),
+        const MIB: u64 = 1 << 20;
+        assert_eq!(video_room(None), u64::MAX);
+        assert_eq!(
+            video_room(Some((14 * GB, 10 * GB))),
+            14 * GB / 100 * 85 - 10 * GB,
             "85 %: 11.9 GB"
         );
-        assert!(!room_for_textures(Some((14 * GB, 15 * GB))));
-        assert!(!room_for_textures(Some((0, 0))), "no budget at all");
+        assert_eq!(video_room(Some((14 * GB, 12 * GB))), 0);
+        assert_eq!(video_room(Some((0, 0))), 0, "no budget at all");
+        let left = video_room(Some((100 * MIB, 84 * MIB)));
+        assert_eq!(left, MIB);
+        assert!(64 * MIB > left, "a 64 MiB texture waits");
+        assert_eq!(staging_room(0, 0, 64 * MIB), PASS_STAGING, "the first");
+        assert_eq!(staging_room(0, 60 * MIB, 64 * MIB), 4 * MIB);
+        assert_eq!(staging_room(0, 64 * MIB, 64 * MIB), 0);
+        assert_eq!(staging_room(PASS_STAGING - MIB, 0, 64 * MIB), MIB);
+        assert_eq!(staging_room(PASS_STAGING + MIB, 0, 64 * MIB), 0);
+    }
+
+    /// Where frames do not advance (a title that does not wait for them), a
+    /// pass taken a while after the last counts a frame more on the queue's
+    /// clock: a slot with nothing to upload is looked at again, and a
+    /// table's slot written is due once its grace frames have passed, though
+    /// the title's frame stays the same. Before, both waited for good.
+    #[test]
+    fn waits_end_where_frames_do_not_advance() {
+        use std::time::Instant;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let frame = 7;
+        let due = |pass: &TexturePass| pass.due.iter().map(|d| d.0).collect::<Vec<_>>();
+        let mut at = Instant::now();
+        heap.queue_slot(1, Some((1, false)), frame);
+        let pass = heap.texture_pass_at(frame, at).expect("a pass");
+        assert_eq!(due(&pass), [1]);
+        heap.texture_slot_later(1, pass.due[0].1, &pass);
+        assert!(heap.texture_pass_at(frame, at).is_none(), "one a frame");
+        at += PASS_AGAIN;
+        let pass = heap.texture_pass_at(frame, at).expect("a pass");
+        assert_eq!(due(&pass), [1], "looked at again");
+        // A slot a draw reads through a table, written: due after its grace
+        // frames, counted in passes.
+        heap.tabled_in(2, frame);
+        heap.queue_slot(2, Some((2, false)), frame);
+        for n in 1..=TABLED_GRACE {
+            at += PASS_AGAIN;
+            let pass = heap.texture_pass_at(frame, at).expect("a pass");
+            assert_eq!(due(&pass).contains(&2), n == TABLED_GRACE, "pass {n}");
+        }
+    }
+
+    /// A served slot a draw read through a table is left to such draws for
+    /// that frame and the next only: once the title stops reading it through
+    /// tables (to pick it by index), passes check it from the frame after,
+    /// not 240 frames later with the image it had.
+    #[test]
+    fn served_slots_tables_stopped_reading_are_checked() {
+        use std::time::Instant;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let frame = 50;
+        heap.queue_slot(4, Some((4, false)), frame);
+        heap.tabled_in(4, frame);
+        assert_eq!(heap.texture_queue().served_slots(), [4]);
+        let served = |f: u64| {
+            heap.texture_pass_at(f, Instant::now())
+                .expect("a pass")
+                .served
+        };
+        assert!(served(frame).is_empty(), "read through a table this frame");
+        assert!(served(frame + 1).is_empty(), "and the frame before");
+        assert_eq!(served(frame + 2), [4], "then the passes check it");
+    }
+
+    /// A slot the title wrote a texture object's view into before its host
+    /// copy was resident is null, and made over that copy once it is: the
+    /// record it holds is the same, only the host copy tells. Before, it
+    /// stayed null for good (the record was what it was made from).
+    #[test]
+    fn texture_object_slots_are_made_once_their_copy_is_resident() {
+        use crate::resource::tests_support::{committed, sampled};
+        let test =
+            "descriptor::host::tests::texture_object_slots_are_made_once_their_copy_is_resident";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let object = committed(&sampled(16, 16, 28));
+        let started = std::time::Instant::now();
+        while crate::resource::host_resource(object).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never resident");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let copy = crate::resource::host_resource(object).map(|t| t.as_raw() as usize);
+        // Not resident yet when the title writes the view.
+        NOT_RESIDENT.with(|held| held.set(object as usize));
+        let heap = crate::descriptor::TestHeap::views(4);
+        let title = crate::descriptor::heap(heap.0);
+        let host = title.host().expect("a host heap");
+        let handle = title.start + 2 * 32;
+        // Format, 2D, the default mapping, then (from word 4) the first mip
+        // and the count.
+        let texture_2d = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_srv(std::ptr::null(), object, &texture_2d, handle);
+        let kept = |h: &HostHeap| {
+            h.kept.lock().unwrap_or_else(|e| e.into_inner())[2]
+                .as_ref()
+                .map(|t| t.as_raw() as usize)
+        };
+        assert_eq!(kept(host), None, "null while not resident");
+        assert!(matches!(
+            host.mirror(2, handle, true),
+            Some(View::Shader(..))
+        ));
+        assert_eq!(kept(host), None, "still not resident");
+        NOT_RESIDENT.with(|held| held.set(0));
+        host.mirror(2, handle, true);
+        assert_eq!(kept(host), copy, "made over its host copy");
+        host.mirror(2, handle, true);
+        assert_eq!(kept(host), copy);
+        drop(heap);
+        type Release = extern "system" fn(crate::object::This) -> u32;
+        crate::object::slot::<Release>(object, 0x10)(object);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
@@ -3479,9 +3728,9 @@ mod tests {
         use crate::testgpu::TitleBuffer;
         let test =
             "descriptor::host::tests::shared_views_are_made_once_and_make_room_when_slots_run_out";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new(false, 4).expect("a host view heap");
         let buffer = TitleBuffer::new(1 << 16);
         let copy = buffer.shadow();
@@ -3523,9 +3772,9 @@ mod tests {
     fn buffer_slots_get_their_host_copy_made_first() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::buffer_slots_get_their_host_copy_made_first";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = crate::descriptor::TestHeap::views(4);
         let host = crate::descriptor::heap(heap.0).host().expect("a host heap");
         let buffer = TitleBuffer::new(1 << 16);
@@ -3561,9 +3810,9 @@ mod tests {
         use crate::object::{S_OK, This, guid, slot};
         use crate::resource::tests_support::target;
         let test = "descriptor::host::tests::placed_texture_slots_follow_their_replacement";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         const KIB_64: u64 = 1 << 16;
         // Freed only once nothing is placed in it any more (a failing
         // assertion leaks it rather than leave textures over freed memory).
@@ -3679,9 +3928,9 @@ mod tests {
     fn stride_table_entries_follow_the_views() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::stride_table_entries_follow_the_views";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let none = HostHeap::new(false, 8).expect("a host view heap");
         assert!(heap.stride_table().is_some() && none.stride_table().is_none());
@@ -3731,9 +3980,9 @@ mod tests {
     fn raw_views_a_list_in_flight_may_read_are_kept_until_it_has_run() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::raw_views_a_list_in_flight_may_read_are_kept_until_it_has_run";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let buffer = TitleBuffer::new(1 << 12);
         let pool = heap.alias_base();
@@ -3767,9 +4016,9 @@ mod tests {
     fn buffer_views_are_cut_to_their_host_copy() {
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::buffer_views_are_cut_to_their_host_copy";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let buffer = TitleBuffer::new(1 << 16);
         let copy = buffer.shadow();
@@ -3952,11 +4201,13 @@ mod tests {
     /// load at 4 and the store at 8 are past the element: 0, dropped).
     #[test]
     fn a_translated_program_reads_and_writes_through_the_heaps_table() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::{TitleBuffer, TitleList};
         let test = "descriptor::host::tests::a_translated_program_reads_and_writes_through_the_heaps_table";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
         let cs = unknown_stride_program();
         let (root, pso) = table_pipeline(&host.device, &cs);
@@ -4039,9 +4290,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
         let test = "descriptor::host::tests::root_srv_views_read_zeros_past_their_end";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let heap = HostHeap::new(false, 4).expect("a host view heap");
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call.

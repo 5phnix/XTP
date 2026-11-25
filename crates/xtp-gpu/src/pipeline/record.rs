@@ -13,12 +13,18 @@
 //!   containers and the subobjects of the title's stream as the title gave
 //!   them, in its order. A subobject without a pointer is kept byte for
 //!   byte, the input layout with its semantic names; the root signature is
-//!   ours (the translations' bindings define it) and the stream output,
-//!   cached blob and view instancing subobjects are not taken in. The
-//!   precook gives them to `host::GraphicsState::read` again, so that the
-//!   state, its description, the host pipeline's name in the library and
-//!   the pipeline's early key are the session's, as this build reads them
-//!   (the depth bounds too, once `read` takes them in).
+//!   ours (the translations' bindings define it) and the cached blob is the
+//!   driver's. A stream that cannot be kept whole is not kept at all: one
+//!   with a subobject of unknown size (the rest of the stream is not read),
+//!   a stream output with declarations or view instancing with views, which
+//!   point at data that is not taken in. The precook gives the subobjects to
+//!   `host::GraphicsState::read` again, so that the state, its description,
+//!   the host pipeline's name in the library and the pipeline's early key
+//!   are the session's, as this build reads them.
+//! - Kept once per description, by its own key: the BLAKE3 of its shaders'
+//!   containers and its stream as kept. Two descriptions that this build
+//!   reads as one state are both kept, since a later build may tell them
+//!   apart; the precook makes each state once.
 //! - Not kept per translator: a description is the title's, the same for
 //!   every translator, and a file per translator would be empty exactly
 //!   when the precook needs it, after a change. The precook skips what no
@@ -26,24 +32,36 @@
 //! - Compute pipelines are not kept: the precook makes every compute
 //!   program of the pack from its container alone.
 //! - The file, [`FILE`]: versioned ([`MAGIC`]) and append-only, a list of
-//!   entries: a container, by its BLAKE3, or a pipeline, by its early key,
-//!   each once. An entry is written whole by one call and carries its
-//!   length and the start of its digest. The part of an entry a run left
-//!   when it ended while writing is cut off before the next entry; an entry
-//!   that does not read back (its digest) is skipped by the precook. The
-//!   file stops growing at [`MAX_BYTES`]. Workers write it, never the
-//!   title's threads.
+//!   entries: a container, by its BLAKE3, or a pipeline, by its key, each
+//!   once. An entry is written whole by one call and carries its length and
+//!   the start of its digest. Workers write it, never the title's threads,
+//!   with the file locked against other processes for each write, at its
+//!   end as it is then: a session first takes in what another one appended
+//!   meanwhile. An entry that does not read back (its digest) is skipped,
+//!   and a pipeline whose containers do not is kept again when a session
+//!   makes it; the part of an entry a run left when it ended while writing
+//!   is cut off. (The first version of the file kept the early key where
+//!   the key now is: nothing reads it, the key is the entry's own.)
+//! - Room: the file stops growing at [`MAX_BYTES`]. Past [`COMPACT_AT`],
+//!   `xtp precook`, which runs alone, rewrites it ([`compact`]): entries
+//!   that do not read back, repeats and containers no pipeline uses go, and
+//!   then the oldest pipelines until it is under [`COMPACT_TO`]. A pipeline
+//!   that goes is kept again when a session makes it.
+//! - A file that cannot be opened (its folder, say) is tried again
+//!   [`RETRY`] later; a file of another version is left as it is.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_INPUT_CLASSIFICATION, D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC,
+    D3D12_STREAM_OUTPUT_DESC, D3D12_VIEW_INSTANCING_DESC,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::PCSTR;
@@ -59,6 +77,14 @@ const MAGIC: &[u8; 8] = b"XTPREC\x00\x01";
 /// The file stops growing at this size (a session's pipelines take a few
 /// megabytes, their containers some ten).
 const MAX_BYTES: u64 = 1 << 30;
+/// The precook rewrites a file past this size, down to [`COMPACT_TO`].
+pub(crate) const COMPACT_AT: u64 = MAX_BYTES / 4 * 3;
+pub(crate) const COMPACT_TO: u64 = MAX_BYTES / 2;
+/// A file that could not be opened is tried again this much later.
+const RETRY: Duration = Duration::from_secs(30);
+/// An entry's payload is at most this long (a container takes a few
+/// hundred KiB at most); a longer one is damage.
+const MAX_ENTRY: u64 = 64 << 20;
 
 /// Entry tags: a shader container, a pipeline.
 const CONTAINER: u8 = b'S';
@@ -81,8 +107,12 @@ const STAGES: [&str; 8] = [
     "mesh",
 ];
 
-/// The input layout's subobject type (its elements are behind a pointer).
+/// Subobject types with pointers that are checked rather than kept: the
+/// input layout (its elements are kept apart), the stream output and view
+/// instancing (a stream is kept only when they hold nothing).
+const STREAM_OUTPUT: u32 = 7;
 const INPUT_LAYOUT: u32 = 12;
+const VIEW_INSTANCING: u32 = 22;
 
 /// Whether a subobject of `kind` is kept byte for byte: of a known size
 /// (`super::subobject`) and without pointers. Root signature (0), shaders
@@ -120,44 +150,88 @@ impl Capture {
     /// # Safety
     /// `at` points at a whole subobject of type `kind` and `size` bytes.
     pub(crate) unsafe fn take(&mut self, kind: u32, at: *const u8, size: usize) {
-        if kind == INPUT_LAYOUT {
-            // SAFETY: an input layout subobject holds its description at +8.
-            let layout = unsafe { at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned() };
-            if layout.pInputElementDescs.is_null() {
-                // `GraphicsState::read` takes nothing in either.
-                return;
-            }
-            // SAFETY: the title passes this many elements.
-            let elements = unsafe {
-                std::slice::from_raw_parts(layout.pInputElementDescs, layout.NumElements as usize)
-            };
-            let mut data = (elements.len() as u32).to_le_bytes().to_vec();
-            for e in elements {
-                // SAFETY: each element names its semantic with a C string.
-                let name = unsafe { CStr::from_ptr(e.SemanticName.0.cast()) }.to_bytes();
-                let Ok(len) = u16::try_from(name.len()) else {
-                    self.whole = false;
+        match kind {
+            INPUT_LAYOUT => {
+                // SAFETY: an input layout subobject holds its description
+                // at +8.
+                let layout =
+                    unsafe { at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned() };
+                if layout.pInputElementDescs.is_null() {
+                    // `GraphicsState::read` takes nothing in either.
                     return;
+                }
+                // SAFETY: the title passes this many elements.
+                let elements = unsafe {
+                    std::slice::from_raw_parts(
+                        layout.pInputElementDescs,
+                        layout.NumElements as usize,
+                    )
                 };
-                data.extend(len.to_le_bytes());
-                data.extend(name);
-                for v in [
-                    e.SemanticIndex,
-                    e.Format.0 as u32,
-                    e.InputSlot,
-                    e.AlignedByteOffset,
-                    e.InputSlotClass.0 as u32,
-                    e.InstanceDataStepRate,
-                ] {
-                    data.extend(v.to_le_bytes());
+                let mut data = (elements.len() as u32).to_le_bytes().to_vec();
+                for e in elements {
+                    // SAFETY: each element names its semantic with a C
+                    // string.
+                    let name = unsafe { CStr::from_ptr(e.SemanticName.0.cast()) }.to_bytes();
+                    let Ok(len) = u16::try_from(name.len()) else {
+                        self.whole = false;
+                        return;
+                    };
+                    data.extend(len.to_le_bytes());
+                    data.extend(name);
+                    for v in [
+                        e.SemanticIndex,
+                        e.Format.0 as u32,
+                        e.InputSlot,
+                        e.AlignedByteOffset,
+                        e.InputSlotClass.0 as u32,
+                        e.InstanceDataStepRate,
+                    ] {
+                        data.extend(v.to_le_bytes());
+                    }
+                }
+                self.push(kind, &data);
+            }
+            STREAM_OUTPUT => {
+                // SAFETY: a stream output subobject holds its description
+                // at +8.
+                let so = unsafe {
+                    at.add(8)
+                        .cast::<D3D12_STREAM_OUTPUT_DESC>()
+                        .read_unaligned()
+                };
+                if so.NumEntries != 0 || so.NumStrides != 0 {
+                    // Its declarations are not taken in.
+                    self.whole = false;
                 }
             }
-            self.push(kind, &data);
-        } else if as_is(kind) && size > 4 {
-            // SAFETY: the subobject's data follows its type, `size` in all.
-            let data = unsafe { std::slice::from_raw_parts(at.add(4), size - 4) };
-            self.push(kind, data);
+            VIEW_INSTANCING => {
+                // SAFETY: a view instancing subobject holds its description
+                // at +8.
+                let views = unsafe {
+                    at.add(8)
+                        .cast::<D3D12_VIEW_INSTANCING_DESC>()
+                        .read_unaligned()
+                };
+                if views.ViewInstanceCount != 0 {
+                    self.whole = false;
+                }
+            }
+            _ if as_is(kind) && size > 4 => {
+                // SAFETY: the subobject's data follows its type, `size` in
+                // all.
+                let data = unsafe { std::slice::from_raw_parts(at.add(4), size - 4) };
+                self.push(kind, data);
+            }
+            // The root signature (ours), the shaders (kept apart), the
+            // cached blob (the driver's).
+            _ => {}
         }
+    }
+
+    /// The stream holds a subobject of unknown size, and the rest of it is
+    /// not read: it cannot be kept.
+    pub(crate) fn unknown(&mut self) {
+        self.whole = false;
     }
 
     fn push(&mut self, kind: u32, data: &[u8]) {
@@ -301,181 +375,385 @@ fn entry(tag: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A pipeline's key as kept: its early key's 32 hexadecimal digits.
-fn key_bytes(key: &str) -> Option<[u8; 16]> {
-    let mut out = [0u8; 16];
-    if key.len() != 32 {
-        return None;
-    }
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(key.get(2 * i..2 * i + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
+/// A pipeline's shaders as its entry lists them: stage number, container
+/// BLAKE3.
+type Listed = Vec<(u8, [u8; 32])>;
 
-/// A pipeline entry's payload: its key, its shaders (stage number and
-/// container BLAKE3 each), then its stream.
-fn pipeline_payload(key: &[u8; 16], shaders: &[(u8, [u8; 32])], stream: &Stream) -> Vec<u8> {
-    let mut out = key.to_vec();
-    out.push(shaders.len() as u8);
+/// What a pipeline entry holds after its key: its shaders (their count,
+/// then stage number and container BLAKE3 each), then its stream.
+fn body(shaders: &[(u8, [u8; 32])], stream: &[u8]) -> Vec<u8> {
+    let mut out = vec![shaders.len() as u8];
     for (stage, hash) in shaders {
         out.push(*stage);
         out.extend(hash);
     }
-    out.extend(&*stream.0);
+    out.extend(stream);
     out
 }
 
-/// The session's file, open for appending, and what it holds.
+/// The shaders a pipeline entry's `body` lists, and its stream.
+fn read_body(body: &[u8]) -> Option<(Listed, &[u8])> {
+    let mut r = Reader(body);
+    let n = r.u8()?;
+    let shaders = (0..n)
+        .map(|_| {
+            let stage = r.u8()?;
+            (usize::from(stage) < STAGES.len()).then_some(())?;
+            Some((stage, r.array::<32>()?))
+        })
+        .collect::<Option<Listed>>()?;
+    Some((shaders, r.0))
+}
+
+/// A description's key: the start of its entry body's BLAKE3.
+fn key_of(body: &[u8]) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&blake3::hash(body).as_bytes()[..16]);
+    key
+}
+
+/// A pipeline entry's payload: its key, then its body.
+fn pipeline_payload(key: &[u8; 16], body: &[u8]) -> Vec<u8> {
+    let mut out = key.to_vec();
+    out.extend(body);
+    out
+}
+
+/// What became of a description to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    Written,
+    /// The file holds it already.
+    Held,
+    /// The file is full ([`MAX_BYTES`]).
+    Full,
+}
+
+/// The lock of one file across processes: a named mutex, by the file's
+/// full path (a lock on the file itself would be `File::lock`, newer than
+/// this workspace's Rust). A process that ends holding it leaves it
+/// abandoned, which the next one takes.
+struct Lock(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: a kernel handle, usable from any thread; each hold takes and
+// releases the mutex on one thread ([`Lock::hold`]).
+unsafe impl Send for Lock {}
+
+impl Lock {
+    /// The lock of the file at `path`, which exists.
+    fn of(path: &Path) -> std::io::Result<Lock> {
+        let full = std::fs::canonicalize(path)?;
+        let digest = blake3::hash(full.to_string_lossy().to_lowercase().as_bytes());
+        let name: Vec<u16> = format!("Local\\xtp-recorded-pipelines-{}", &digest.to_hex()[..32])
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: a NUL-terminated name; no security attributes.
+        let handle = unsafe {
+            windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, name.as_ptr())
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Lock(handle))
+    }
+
+    /// Waits for the lock, held until the guard drops (on this thread).
+    fn hold(&self) -> std::io::Result<Held> {
+        use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+        // SAFETY: our live mutex handle.
+        match unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(
+                self.0,
+                windows_sys::Win32::System::Threading::INFINITE,
+            )
+        } {
+            // Abandoned: a process ended holding it, maybe in the middle of
+            // a write, which the next look cuts off.
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Held(self.0)),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // SAFETY: our handle, closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// A held [`Lock`], released when dropped. It must not outlive its lock,
+/// nor leave its thread.
+struct Held(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // SAFETY: the mutex this thread holds.
+        unsafe { windows_sys::Win32::System::Threading::ReleaseMutex(self.0) };
+    }
+}
+
+/// A process's view of the file, open for writing, and what it holds.
 struct Writer {
     file: File,
-    path: PathBuf,
+    lock: Lock,
+    /// The end of what it has taken in: other processes may have written
+    /// past it (zero before the first look).
     end: u64,
     containers: HashSet<[u8; 32]>,
     pipelines: HashSet<[u8; 16]>,
-    /// Nothing more is written (a write failed, or the file is full).
-    stopped: bool,
+    /// Nothing more is written: the file is full.
+    full: bool,
 }
 
 impl Writer {
-    /// The file at `path`, made if there is none, with the part of an
-    /// entry a run left at its end cut off.
+    /// The file at `path`, made with its folder if there is none, with what
+    /// it holds taken in.
     fn open(path: &Path) -> std::io::Result<Writer> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)?;
-        let len = file.metadata()?.len();
         let mut writer = Writer {
             file,
-            path: path.to_owned(),
-            end: MAGIC.len() as u64,
+            lock: Lock::of(path)?,
+            end: 0,
             containers: HashSet::new(),
             pipelines: HashSet::new(),
-            stopped: false,
+            full: false,
         };
-        let mut magic = [0u8; MAGIC.len()];
-        let head = len.min(MAGIC.len() as u64) as usize;
-        writer.file.read_exact(&mut magic[..head])?;
-        if magic[..head] != MAGIC[..head] {
-            return Err(std::io::Error::other(
-                "another format (another version of XTP): nothing is kept in it",
-            ));
+        writer.locked(Writer::catch_up)?;
+        Ok(writer)
+    }
+
+    /// Runs `work` with the file locked against other processes.
+    fn locked<T>(
+        &mut self,
+        work: impl FnOnce(&mut Writer) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let held = self.lock.hold()?;
+        let done = work(self);
+        drop(held);
+        done
+    }
+
+    /// Takes in what the file holds past [`Writer::end`] (all of it the
+    /// first time, or once it was rewritten), its file locked: the entries
+    /// that read back, and the part of an entry a run left at the end cut
+    /// off.
+    fn catch_up(&mut self) -> std::io::Result<()> {
+        let len = self.file.metadata()?.len();
+        if self.end == 0 || len < self.end {
+            self.containers.clear();
+            self.pipelines.clear();
+            let mut magic = [0u8; MAGIC.len()];
+            let head = len.min(MAGIC.len() as u64) as usize;
+            self.file.seek(SeekFrom::Start(0))?;
+            self.file.read_exact(&mut magic[..head])?;
+            if magic[..head] != MAGIC[..head] {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "another format (another version of XTP): nothing is kept in it",
+                ));
+            }
+            self.end = MAGIC.len() as u64;
+            if head < MAGIC.len() {
+                // New, or its magic cut short.
+                self.file.set_len(0)?;
+                self.file.seek(SeekFrom::Start(0))?;
+                self.file.write_all(MAGIC)?;
+                return Ok(());
+            }
         }
-        if head < MAGIC.len() {
-            // New, or its magic cut short.
-            writer.file.set_len(0)?;
-            writer.file.seek(SeekFrom::Start(0))?;
-            writer.file.write_all(MAGIC)?;
-            return Ok(writer);
+        if len == self.end {
+            return Ok(());
         }
-        let mut reader = BufReader::new(&writer.file);
-        let mut at = MAGIC.len() as u64;
+        self.file.seek(SeekFrom::Start(self.end))?;
+        let mut reader = BufReader::new(&self.file);
+        let mut at = self.end;
+        let mut payload = Vec::new();
+        let mut taken = Vec::new();
         while at + HEAD as u64 <= len {
             let mut head = [0u8; HEAD];
             reader.read_exact(&mut head)?;
-            let n = u64::from(u32::from_le_bytes(
-                head[1..5].try_into().unwrap_or_default(),
-            ));
+            let n = u64::from(u32::from_le_bytes([head[1], head[2], head[3], head[4]]));
             let end = at + HEAD as u64 + n;
-            if end > len {
+            if end > len || n > MAX_ENTRY || !matches!(head[0], CONTAINER | PIPELINE) {
                 break;
             }
-            match head[0] {
-                CONTAINER if n >= 32 => {
-                    let mut hash = [0u8; 32];
-                    reader.read_exact(&mut hash)?;
-                    writer.containers.insert(hash);
-                    reader.seek_relative(n as i64 - 32)?;
-                }
-                PIPELINE if n >= 16 => {
-                    let mut key = [0u8; 16];
-                    reader.read_exact(&mut key)?;
-                    writer.pipelines.insert(key);
-                    reader.seek_relative(n as i64 - 16)?;
-                }
-                _ => break,
+            payload.resize(n as usize, 0);
+            reader.read_exact(&mut payload)?;
+            if blake3::hash(&payload).as_bytes()[..CHECK] == head[1 + 4..] {
+                taken.push((head[0], std::mem::take(&mut payload)));
             }
             at = end;
         }
         drop(reader);
+        for (tag, payload) in taken {
+            self.take_in(tag, &payload);
+        }
         if at < len {
             tracing::info!(
                 bytes = len - at,
-                path = %path.display(),
                 "recorded pipelines: the end of an entry left unfinished is cut off"
             );
-            writer.file.set_len(at)?;
+            self.file.set_len(at)?;
         }
-        writer.file.seek(SeekFrom::Start(at))?;
-        writer.end = at;
-        Ok(writer)
+        self.end = at;
+        Ok(())
     }
 
-    /// Appends the entries in `bytes`, or stops writing if that fails or
-    /// the file would pass [`MAX_BYTES`]: whether they were written.
-    fn append(&mut self, bytes: &[u8]) -> bool {
-        if self.stopped {
-            return false;
+    /// Takes in an entry that reads back: a container, or a pipeline whose
+    /// containers the file holds (one whose containers do not read back is
+    /// kept again, with them).
+    fn take_in(&mut self, tag: u8, payload: &[u8]) {
+        match tag {
+            CONTAINER => {
+                if let Some(hash) = payload.get(..32).and_then(|h| h.try_into().ok()) {
+                    self.containers.insert(hash);
+                }
+            }
+            _ => {
+                if let Some(body) = payload.get(16..)
+                    && let Some((shaders, _)) = read_body(body)
+                    && shaders.iter().all(|(_, h)| self.containers.contains(h))
+                {
+                    self.pipelines.insert(key_of(body));
+                }
+            }
         }
-        if self.end + bytes.len() as u64 > MAX_BYTES {
-            tracing::warn!(
-                path = %self.path.display(),
-                bytes = self.end,
-                "recorded pipelines: the file is full; no more pipelines are kept"
-            );
-            self.stopped = true;
-            return false;
+    }
+
+    /// Keeps the description of key `key` and entry body `body`, of
+    /// `shaders` (`listed` as the body lists them), after those of its
+    /// containers the file does not hold.
+    fn keep(
+        &mut self,
+        key: [u8; 16],
+        shaders: &[Arc<Shader>],
+        listed: &[(u8, [u8; 32])],
+        body: &[u8],
+    ) -> std::io::Result<Keep> {
+        if self.full {
+            return Ok(Keep::Full);
         }
-        match self.file.write_all(bytes) {
-            Ok(()) => {
-                self.end += bytes.len() as u64;
-                true
+        if self.pipelines.contains(&key) {
+            return Ok(Keep::Held);
+        }
+        self.locked(|w| {
+            // What other processes wrote meanwhile, and the end they left.
+            w.catch_up()?;
+            if w.pipelines.contains(&key) {
+                return Ok(Keep::Held);
+            }
+            // Its containers first: a pipeline entry is only read back with
+            // them.
+            let mut bytes = Vec::new();
+            let mut new = Vec::new();
+            for ((_, hash), s) in listed.iter().zip(shaders) {
+                if !w.containers.contains(hash) && !new.contains(hash) {
+                    let mut payload = hash.to_vec();
+                    payload.extend(&s.container);
+                    bytes.extend(entry(CONTAINER, &payload));
+                    new.push(*hash);
+                }
+            }
+            bytes.extend(entry(PIPELINE, &pipeline_payload(&key, body)));
+            if w.end + bytes.len() as u64 > MAX_BYTES {
+                tracing::warn!(
+                    bytes = w.end,
+                    "recorded pipelines: the file is full; no more pipelines are kept until \
+                     `xtp precook` makes room"
+                );
+                w.full = true;
+                return Ok(Keep::Full);
+            }
+            w.file.seek(SeekFrom::Start(w.end))?;
+            w.file.write_all(&bytes)?;
+            w.end += bytes.len() as u64;
+            w.containers.extend(new);
+            w.pipelines.insert(key);
+            Ok(Keep::Written)
+        })
+    }
+}
+
+/// The session's file: open, not yet (or tried again from `retry` on), or
+/// of another version.
+enum Slot {
+    Closed { retry: Option<Instant> },
+    Open(Writer),
+    Refused,
+}
+
+static WRITER: Mutex<Slot> = Mutex::new(Slot::Closed { retry: None });
+
+/// Runs `work` on the session's file, opened (again) if need be; `None`
+/// without a pipeline cache folder, if the file cannot be opened now, or if
+/// `work` fails, which closes it (it is opened again [`RETRY`] later, and
+/// what a failed write left is cut off then).
+fn with_writer<T>(work: impl FnOnce(&mut Writer) -> std::io::Result<T>) -> Option<T> {
+    let path = super::library::dir()?.join(FILE);
+    let mut slot = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Slot::Closed { retry } = &*slot {
+        if retry.is_some_and(|t| Instant::now() < t) {
+            return None;
+        }
+        *slot = match Writer::open(&path) {
+            Ok(w) => {
+                tracing::info!(
+                    pipelines = w.pipelines.len(),
+                    containers = w.containers.len(),
+                    bytes = w.end,
+                    "recorded pipelines: kept so far"
+                );
+                Slot::Open(w)
+            }
+            Err(e) if e.kind() == ErrorKind::InvalidData => {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "recorded pipelines: this run's pipelines are not kept"
+                );
+                Slot::Refused
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    path = %self.path.display(),
-                    "recorded pipelines: not written; no more pipelines are kept"
+                    path = %path.display(),
+                    retry_s = RETRY.as_secs(),
+                    "recorded pipelines: no file yet; tried again later"
                 );
-                // The next run cuts off what this one left half written.
-                self.stopped = true;
-                false
+                Slot::Closed {
+                    retry: Some(Instant::now() + RETRY),
+                }
             }
+        };
+    }
+    let Slot::Open(w) = &mut *slot else {
+        return None;
+    };
+    match work(w) {
+        Ok(done) => Some(done),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                retry_s = RETRY.as_secs(),
+                "recorded pipelines: not written; the file is opened again later"
+            );
+            *slot = Slot::Closed {
+                retry: Some(Instant::now() + RETRY),
+            };
+            None
         }
     }
-}
-
-/// The session's file, opened on first use; `None` without a pipeline
-/// cache folder, or if it cannot be.
-fn writer() -> Option<&'static Mutex<Writer>> {
-    static WRITER: OnceLock<Option<Mutex<Writer>>> = OnceLock::new();
-    WRITER
-        .get_or_init(|| {
-            let path = super::library::dir()?.join(FILE);
-            match Writer::open(&path) {
-                Ok(w) => {
-                    tracing::info!(
-                        pipelines = w.pipelines.len(),
-                        containers = w.containers.len(),
-                        bytes = w.end,
-                        "recorded pipelines: kept so far"
-                    );
-                    Some(Mutex::new(w))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        path = %path.display(),
-                        "recorded pipelines: no file; this run's pipelines are not kept"
-                    );
-                    None
-                }
-            }
-        })
-        .as_ref()
 }
 
 /// Pipelines kept since the start.
@@ -488,7 +766,7 @@ pub(crate) fn kept() -> u64 {
 
 /// `shaders` as a pipeline entry lists them: stage number, container
 /// BLAKE3; `None` for a stage the file has no number for.
-fn listed(shaders: &[Arc<Shader>]) -> Option<Vec<(u8, [u8; 32])>> {
+fn listed(shaders: &[Arc<Shader>]) -> Option<Listed> {
     shaders
         .iter()
         .map(|s| {
@@ -498,62 +776,17 @@ fn listed(shaders: &[Arc<Shader>]) -> Option<Vec<(u8, [u8; 32])>> {
         .collect()
 }
 
-impl Writer {
-    /// Keeps the pipeline of early key `key`, of `shaders` (`listed` as
-    /// [`listed`] lists them) and `stream`, unless it is kept already,
-    /// after those of its containers that are not: whether it was written
-    /// now.
-    fn keep(
-        &mut self,
-        key: [u8; 16],
-        shaders: &[Arc<Shader>],
-        listed: &[(u8, [u8; 32])],
-        stream: &Stream,
-    ) -> bool {
-        if self.pipelines.contains(&key) {
-            return false;
-        }
-        // Its containers first: a pipeline entry is only read back with
-        // them.
-        let mut bytes = Vec::new();
-        let mut new = Vec::new();
-        for ((_, hash), s) in listed.iter().zip(shaders) {
-            if !self.containers.contains(hash) && !new.contains(hash) {
-                let mut payload = hash.to_vec();
-                payload.extend(&s.container);
-                bytes.extend(entry(CONTAINER, &payload));
-                new.push(*hash);
-            }
-        }
-        bytes.extend(entry(PIPELINE, &pipeline_payload(&key, listed, stream)));
-        if !self.append(&bytes) {
-            return false;
-        }
-        self.containers.extend(new);
-        self.pipelines.insert(key);
-        true
-    }
-}
-
-/// A title pipeline with the graphics state `stream` was made, or tried:
-/// its description is kept, under its early `key`, unless it is already,
-/// with those of its shaders' containers that are not.
-pub(crate) fn made(key: &str, shaders: &[Arc<Shader>], stream: &Stream) {
-    let Some(key) = key_bytes(key) else {
-        return;
-    };
-    let Some(writer) = writer() else {
-        return;
-    };
-    let lock = || writer.lock().unwrap_or_else(|e| e.into_inner());
-    if lock().pipelines.contains(&key) {
-        return;
-    }
+/// A title pipeline of `shaders` with the graphics state `stream` was
+/// made, or tried: its description is kept unless it is already, with
+/// those of its shaders' containers that are not.
+pub(crate) fn made(shaders: &[Arc<Shader>], stream: &Stream) {
     // Hashed outside the lock: a container takes up to some 100 KiB.
     let Some(listed) = listed(shaders) else {
         return;
     };
-    if lock().keep(key, shaders, &listed, stream) {
+    let body = body(&listed, &stream.0);
+    let key = key_of(&body);
+    if with_writer(|w| w.keep(key, shaders, &listed, &body)) == Some(Keep::Written) {
         KEPT.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -564,9 +797,22 @@ pub(crate) struct Kept {
     pub(crate) stream: Stream,
 }
 
+impl Kept {
+    /// Its entry body, as written ([`body`]).
+    fn body(&self) -> Option<Vec<u8>> {
+        let listed = self
+            .shaders
+            .iter()
+            .map(|(stage, hash)| Some((STAGES.iter().position(|s| s == stage)? as u8, *hash)))
+            .collect::<Option<Listed>>()?;
+        Some(body(&listed, &self.stream.0))
+    }
+}
+
 /// What the file holds, as the precook reads it.
 #[derive(Default)]
 pub(crate) struct Contents {
+    /// In the file's order: the oldest first.
     pub(crate) pipelines: Vec<Kept>,
     containers: HashMap<[u8; 32], Vec<u8>>,
     /// Entries that do not read back (their digest, or what they hold).
@@ -587,7 +833,7 @@ pub(crate) fn read(dir: &Path) -> Result<Contents, String> {
     let path = dir.join(FILE);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Contents::default()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Contents::default()),
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
     parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))
@@ -625,7 +871,7 @@ fn parse(bytes: &[u8]) -> Result<Contents, String> {
                 }
                 None => out.damaged += 1,
             },
-            PIPELINE => match pipeline(&mut p) {
+            PIPELINE => match pipeline(payload) {
                 Some(kept) => out.pipelines.push(kept),
                 None => out.damaged += 1,
             },
@@ -640,29 +886,120 @@ fn parse(bytes: &[u8]) -> Result<Contents, String> {
 }
 
 /// A pipeline entry's payload ([`pipeline_payload`]).
-fn pipeline(p: &mut Reader<'_>) -> Option<Kept> {
-    let _key = p.array::<16>()?;
-    let n = p.u8()?;
-    let shaders = (0..n)
-        .map(|_| Some((*STAGES.get(usize::from(p.u8()?))?, p.array::<32>()?)))
-        .collect::<Option<Vec<_>>>()?;
+fn pipeline(payload: &[u8]) -> Option<Kept> {
+    let (shaders, stream) = read_body(payload.get(16..)?)?;
     Some(Kept {
-        shaders,
-        stream: Stream(p.0.into()),
+        shaders: shaders
+            .into_iter()
+            .map(|(stage, hash)| (STAGES[usize::from(stage)], hash))
+            .collect(),
+        stream: Stream(stream.into()),
+    })
+}
+
+/// What a rewrite of the file did ([`compact`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Compacted {
+    /// The file's size before and after.
+    pub(crate) before: u64,
+    pub(crate) after: u64,
+    /// Descriptions kept, and those that went: repeats, those whose
+    /// containers did not read back, then the oldest for room.
+    pub(crate) kept: usize,
+    pub(crate) dropped: usize,
+}
+
+/// Rewrites the file in `dir` with what reads back in it, each description
+/// once with the containers it uses, newest first until it would pass `to`
+/// bytes (the oldest go), in the file's order. Only `xtp precook` does, and
+/// alone: a session's open file would go on with the file it opened.
+pub(crate) fn compact(dir: &Path, to: u64) -> Result<Compacted, String> {
+    let path = dir.join(FILE);
+    let failed = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(failed)?;
+    let lock = Lock::of(&path).map_err(failed)?;
+    let held = lock.hold().map_err(failed)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(failed)?;
+    let contents = parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Newest first, each description once, while there is room.
+    let mut chosen = Vec::new();
+    let mut keys = HashSet::new();
+    let mut used = HashSet::new();
+    let mut size = MAGIC.len() as u64;
+    for p in contents.pipelines.iter().rev() {
+        let Some(body) = p.body() else {
+            continue;
+        };
+        if !p
+            .shaders
+            .iter()
+            .all(|(_, h)| contents.containers.contains_key(h))
+            || !keys.insert(key_of(&body))
+        {
+            continue;
+        }
+        let new: Vec<&[u8; 32]> = p
+            .shaders
+            .iter()
+            .map(|(_, h)| h)
+            .filter(|h| !used.contains(*h))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let cost = (HEAD + 16 + body.len()) as u64
+            + new
+                .iter()
+                .map(|h| (HEAD + 32 + contents.containers[*h].len()) as u64)
+                .sum::<u64>();
+        if size + cost > to {
+            break;
+        }
+        size += cost;
+        used.extend(new.into_iter().copied());
+        chosen.push((p, body));
+    }
+    chosen.reverse();
+    let mut out = MAGIC.to_vec();
+    let mut written = HashSet::new();
+    for (p, body) in &chosen {
+        for (_, hash) in &p.shaders {
+            if written.insert(*hash) {
+                let mut payload = hash.to_vec();
+                payload.extend(&contents.containers[hash]);
+                out.extend(entry(CONTAINER, &payload));
+            }
+        }
+        out.extend(entry(PIPELINE, &pipeline_payload(&key_of(body), body)));
+    }
+    let tmp = path.with_extension("tmp");
+    drop(file);
+    std::fs::write(&tmp, &out)
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(failed)?;
+    drop(held);
+    Ok(Compacted {
+        before: bytes.len() as u64,
+        after: out.len() as u64,
+        kept: chosen.len(),
+        dropped: contents.pipelines.len() - chosen.len(),
     })
 }
 
 /// For tests: keeps a pipeline in the file in `dir` as a session's worker
 /// does ([`made`]): whether it was written.
 #[cfg(test)]
-pub(crate) fn keep_in(dir: &Path, key: &str, shaders: &[Arc<Shader>], stream: &Stream) -> bool {
+pub(crate) fn keep_in(dir: &Path, shaders: &[Arc<Shader>], stream: &Stream) -> bool {
     let mut w = Writer::open(&dir.join(FILE)).expect("the file");
-    w.keep(
-        key_bytes(key).expect("a key"),
-        shaders,
-        &listed(shaders).expect("known stages"),
-        stream,
-    )
+    let listed = listed(shaders).expect("known stages");
+    let body = body(&listed, &stream.0);
+    w.keep(key_of(&body), shaders, &listed, &body)
+        .expect("written")
+        == Keep::Written
 }
 
 /// For tests: the stream of `subobjects`, each its type and the data after
@@ -850,50 +1187,101 @@ mod tests {
         assert!(Capture::new().finish().unwrap().state().is_some());
     }
 
+    /// A stream is kept only whole: not with a subobject of unknown size
+    /// (the rest is not read), a stream output that declares outputs or
+    /// view instancing with views; empty ones are their defaults.
     #[test]
-    fn keys_are_kept_as_bytes() {
-        let key = "00112233445566778899aabbccddeeff";
-        assert_eq!(
-            key_bytes(key),
-            Some([
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-                0xee, 0xff
-            ])
+    fn streams_that_cannot_be_kept_whole_are_not_kept() {
+        let taken = |kind: u32, sub: &[u8]| {
+            let mut c = Capture::new();
+            // SAFETY: a whole subobject of `sub.len()` bytes.
+            unsafe { c.take(kind, sub.as_ptr(), sub.len()) };
+            c.finish()
+        };
+        let mut so = [0u8; 40];
+        so[..4].copy_from_slice(&STREAM_OUTPUT.to_le_bytes());
+        assert_eq!(taken(STREAM_OUTPUT, &so), Some(Stream(Box::new([]))));
+        so[16] = 2; // two declarations
+        assert_eq!(taken(STREAM_OUTPUT, &so), None);
+        let mut views = [0u8; 32];
+        views[..4].copy_from_slice(&VIEW_INSTANCING.to_le_bytes());
+        assert!(taken(VIEW_INSTANCING, &views).is_some());
+        views[8] = 2; // two views
+        assert_eq!(taken(VIEW_INSTANCING, &views), None);
+        let mut c = Capture::new();
+        c.push(9, &[0xff; 4]);
+        c.unknown();
+        assert!(c.finish().is_none());
+
+        // The title's stream with a console subobject the device does not
+        // size: made, not kept.
+        let mut title = title_stream(3);
+        words(&mut title.bytes, 0x2a8, &[30, 0]);
+        let p = create(&title);
+        assert!(p.host.graphics.is_some());
+        assert!(p.host.stream.is_none(), "not kept: its end was not read");
+    }
+
+    /// A description's key is its own: the same shaders and stream give the
+    /// same key, any other byte another.
+    #[test]
+    fn keys_are_the_descriptions_own() {
+        let shaders = [(0u8, [1u8; 32]), (1, [2; 32])];
+        let a = body(&shaders, &[9, 4, 0, 1, 2, 3, 4]);
+        assert_eq!(key_of(&a), key_of(&a.clone()));
+        assert_ne!(key_of(&a), key_of(&body(&shaders, &[9, 4, 0, 1, 2, 3, 5])));
+        assert_ne!(
+            key_of(&a),
+            key_of(&body(&shaders[..1], &[9, 4, 0, 1, 2, 3, 4]))
         );
-        assert_eq!(key_bytes("0011"), None);
-        assert_eq!(key_bytes(&"zz".repeat(16)), None);
+        assert_eq!(
+            read_body(&a),
+            Some((shaders.to_vec(), &[9u8, 4, 0, 1, 2, 3, 4][..]))
+        );
+        assert_eq!(read_body(&[1, 8]), None, "no stage 8");
     }
 
     fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         super::super::shader(stage, bytes)
     }
 
-    /// What a session keeps, a precook reads back: each pipeline once (by
-    /// its key, also across runs), each container once, in a file a run
-    /// left half written as well; another version's file is left alone.
+    /// `w` keeps `shaders` with `stream` as a session's worker does.
+    fn keep(w: &mut Writer, shaders: &[Arc<Shader>], stream: &Stream) -> Keep {
+        let listed = listed(shaders).unwrap();
+        let body = body(&listed, &stream.0);
+        w.keep(key_of(&body), shaders, &listed, &body).unwrap()
+    }
+
+    /// The stream of `title`'s pipeline.
+    fn kept_stream(title: &TitleStream) -> Stream {
+        create(title).host.stream.clone().unwrap()
+    }
+
+    /// What a session keeps, a precook reads back: each description once
+    /// (by its key, also across runs), each container once, in a file a
+    /// run left half written as well; another version's file is left
+    /// alone.
     #[test]
     fn pipelines_are_kept_once_and_read_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE);
-        let title = title_stream(7);
-        let stream = {
-            let p = create(&title);
-            p.host.stream.clone().unwrap()
-        };
+        let stream = kept_stream(&title_stream(7));
         let (vs, ps) = (
             shader("vertex", b"record vs"),
             shader("pixel", b"record ps"),
         );
         let ps2 = shader("pixel", b"record ps 2");
-        let keep = |w: &mut Writer, n: u8, shaders: &[Arc<Shader>]| {
-            let key = key_bytes(&format!("{n:02x}").repeat(16)).unwrap();
-            w.keep(key, shaders, &listed(shaders).unwrap(), &stream)
-        };
         {
             let mut w = Writer::open(&path).unwrap();
-            assert!(keep(&mut w, 1, &[vs.clone(), ps.clone()]));
-            assert!(!keep(&mut w, 1, &[vs.clone(), ps.clone()]), "kept once");
-            assert!(keep(&mut w, 2, &[vs.clone(), ps2.clone()]));
+            assert_eq!(
+                keep(&mut w, &[vs.clone(), ps.clone()], &stream),
+                Keep::Written
+            );
+            assert_eq!(keep(&mut w, &[vs.clone(), ps.clone()], &stream), Keep::Held);
+            assert_eq!(
+                keep(&mut w, &[vs.clone(), ps2.clone()], &stream),
+                Keep::Written
+            );
         }
         let read = super::read(dir.path()).unwrap();
         assert_eq!((read.pipelines.len(), read.damaged), (2, 0));
@@ -906,7 +1294,7 @@ mod tests {
         // A run that ended while writing: its half entry is cut off when
         // the next run opens the file, which knows what it holds.
         let whole = std::fs::metadata(&path).unwrap().len();
-        let mut half = entry(PIPELINE, &pipeline_payload(&[9; 16], &[], &stream));
+        let mut half = entry(PIPELINE, &pipeline_payload(&[9; 16], &body(&[], &stream.0)));
         half.truncate(half.len() / 2);
         OpenOptions::new()
             .append(true)
@@ -920,11 +1308,15 @@ mod tests {
             assert_eq!(w.end, whole, "cut off");
             assert_eq!(std::fs::metadata(&path).unwrap().len(), whole);
             assert_eq!((w.pipelines.len(), w.containers.len()), (2, 3));
-            assert!(
-                !keep(&mut w, 2, &[vs.clone(), ps2.clone()]),
+            assert_eq!(
+                keep(&mut w, &[vs.clone(), ps2.clone()], &stream),
+                Keep::Held,
                 "kept by the run before"
             );
-            assert!(keep(&mut w, 3, std::slice::from_ref(&ps2)));
+            assert_eq!(
+                keep(&mut w, std::slice::from_ref(&ps2), &stream),
+                Keep::Written
+            );
         }
         let read = super::read(dir.path()).unwrap();
         assert_eq!((read.pipelines.len(), read.damaged), (3, 0));
@@ -939,7 +1331,10 @@ mod tests {
 
         // Another version's file.
         std::fs::write(&path, b"XTPREC\x00\x02 and more").unwrap();
-        assert!(Writer::open(&path).is_err());
+        assert_eq!(
+            Writer::open(&path).err().map(|e| e.kind()),
+            Some(ErrorKind::InvalidData)
+        );
         assert!(super::read(dir.path()).is_err());
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -949,5 +1344,160 @@ mod tests {
         // No file: nothing kept.
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(super::read(empty.path()).unwrap().pipelines.len(), 0);
+    }
+
+    /// The first session of a fresh cache makes the folder the file goes
+    /// in: its first pipelines are kept.
+    #[test]
+    fn a_fresh_cache_gets_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("cache").join("pipelines");
+        let mut w = Writer::open(&folder.join(FILE)).unwrap();
+        let stream = kept_stream(&title_stream(8));
+        let shaders = [shader("vertex", b"fresh vs"), shader("pixel", b"fresh ps")];
+        assert_eq!(keep(&mut w, &shaders, &stream), Keep::Written);
+        assert_eq!(super::read(&folder).unwrap().pipelines.len(), 1);
+    }
+
+    /// Two descriptions this build reads as one state (they differ in a
+    /// node mask, which it does not read) are both kept: a later build may
+    /// tell them apart.
+    #[test]
+    fn variants_this_build_reads_as_one_are_both_kept() {
+        let title = title_stream(9);
+        let stream = kept_stream(&title);
+        let mut bytes = stream.0.to_vec();
+        bytes.extend([18, 4, 0, 1, 0, 0, 0]); // node mask 1
+        let other = Stream(bytes.into_boxed_slice());
+        assert_eq!(
+            other.state().unwrap().describe(),
+            stream.state().unwrap().describe(),
+            "one state for this build"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Writer::open(&dir.path().join(FILE)).unwrap();
+        let shaders = [
+            shader("vertex", b"variant vs"),
+            shader("pixel", b"variant ps"),
+        ];
+        assert_eq!(keep(&mut w, &shaders, &stream), Keep::Written);
+        assert_eq!(keep(&mut w, &shaders, &other), Keep::Written);
+        let read = super::read(dir.path()).unwrap();
+        assert_eq!(read.pipelines.len(), 2);
+        assert_eq!(read.pipelines[1].stream, other);
+    }
+
+    /// Two processes keeping pipelines in one file: each writes at the end
+    /// the other left, and knows what the other kept.
+    #[test]
+    fn processes_sharing_the_file_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let stream = kept_stream(&title_stream(10));
+        let shaders: Vec<_> = (0..3u8)
+            .map(|i| [shader("vertex", b"shared vs"), shader("pixel", &[b'p', i])])
+            .collect();
+        let mut a = Writer::open(&path).unwrap();
+        let mut b = Writer::open(&path).unwrap();
+        assert_eq!(keep(&mut a, &shaders[0], &stream), Keep::Written);
+        assert_eq!(keep(&mut b, &shaders[1], &stream), Keep::Written);
+        assert_eq!(keep(&mut a, &shaders[2], &stream), Keep::Written);
+        assert_eq!(keep(&mut b, &shaders[0], &stream), Keep::Held, "a's");
+        assert_eq!(keep(&mut b, &shaders[2], &stream), Keep::Held, "a's too");
+        let read = super::read(dir.path()).unwrap();
+        assert_eq!((read.pipelines.len(), read.damaged), (3, 0));
+        assert_eq!(read.containers.len(), 4, "the vertex shader once");
+    }
+
+    /// A pipeline whose container does not read back any more is kept
+    /// again, with it, when a session makes it.
+    #[test]
+    fn a_pipeline_whose_container_is_damaged_is_kept_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let stream = kept_stream(&title_stream(11));
+        let shaders = [
+            shader("vertex", b"damaged vs"),
+            shader("pixel", b"damaged ps"),
+        ];
+        assert_eq!(
+            keep(&mut Writer::open(&path).unwrap(), &shaders, &stream),
+            Keep::Written
+        );
+        // The first container's last byte.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = MAGIC.len() + HEAD + 32 + b"damaged vs".len() - 1;
+        bytes[at] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let mut w = Writer::open(&path).unwrap();
+        assert_eq!((w.pipelines.len(), w.containers.len()), (0, 1));
+        assert_eq!(keep(&mut w, &shaders, &stream), Keep::Written);
+        let read = super::read(dir.path()).unwrap();
+        assert_eq!((read.pipelines.len(), read.damaged), (2, 1));
+        assert!(
+            read.pipelines[1]
+                .shaders
+                .iter()
+                .all(|(_, h)| read.container(h).is_some())
+        );
+    }
+
+    /// A rewrite keeps each description that reads back once, newest first
+    /// within its room, with the containers they use; a session's file
+    /// opened after it knows what it holds.
+    #[test]
+    fn a_rewrite_keeps_the_newest_within_its_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let stream = kept_stream(&title_stream(12));
+        let pixel = |i: u8| shader("pixel", &[i; 1000]);
+        let vs = shader("vertex", b"rewrite vs");
+        {
+            let mut w = Writer::open(&path).unwrap();
+            for i in 0..4 {
+                assert_eq!(
+                    keep(&mut w, &[vs.clone(), pixel(i)], &stream),
+                    Keep::Written
+                );
+            }
+        }
+        // A repeat, as a former build's key kept it.
+        let listed = listed(&[vs.clone(), pixel(3)]).unwrap();
+        let repeat = entry(
+            PIPELINE,
+            &pipeline_payload(&[7; 16], &body(&listed, &stream.0)),
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&repeat)
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        // Room for about two.
+        let c = compact(dir.path(), 4000).unwrap();
+        assert_eq!((c.before, c.kept, c.dropped), (before, 2, 3));
+        assert_eq!(c.after, std::fs::metadata(&path).unwrap().len());
+        let read = super::read(dir.path()).unwrap();
+        assert_eq!((read.pipelines.len(), read.damaged), (2, 0));
+        assert_eq!(
+            read.containers.len(),
+            3,
+            "the vertex shader and two pixel ones"
+        );
+        let first = read.pipelines[0].shaders[1].1;
+        assert_eq!(
+            read.container(&first),
+            Some(&[2u8; 1000][..]),
+            "the oldest kept"
+        );
+        let mut w = Writer::open(&path).unwrap();
+        assert_eq!(w.pipelines.len(), 2);
+        assert_eq!(keep(&mut w, &[vs.clone(), pixel(3)], &stream), Keep::Held);
+        assert_eq!(
+            keep(&mut w, &[vs.clone(), pixel(0)], &stream),
+            Keep::Written,
+            "went"
+        );
     }
 }

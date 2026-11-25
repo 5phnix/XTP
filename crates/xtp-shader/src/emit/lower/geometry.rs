@@ -43,18 +43,20 @@
 //!   and column of vertex `k` ([`read_vertex`]).
 //! * A GS write to dword `d` of vertex `n` is kept until vertex `n` is
 //!   emitted, which stores the vertex's outputs then calls `emitStream`
-//!   ([`Vertices`]); a cut is `cutStream`, GS_DONE nothing.
+//!   ([`Vertices`]); a cut is `cutStream`. GS_DONE alone is nothing; it may
+//!   also carry a last emit or cut, which is lowered as one.
 //!
 //! The vertex an emit completes is the number of emits before it, which
-//! must be the same on every path. No write may come after its vertex's
-//! emit, and on the paths to an emit each dword of its vertex may be
-//! written once at most, by an instruction on every one of them (so a
-//! vertex can be written and emitted on either side of a branch): the copy
-//! shader reads the ring once the program is done, D3D12 the outputs at
-//! each emit, and these rules make the two the same. Programs that break
-//! them are refused, as are emits on other streams than 0: none of the
-//! title's programs writes one, so the ring layout of streams 1 to 3 is
-//! not known.
+//! must be the same on every path; and every emit and cut must run under
+//! the same lane mask, since the console counts a lane's vertices by the
+//! emits it is in EXEC for. No write may come after its vertex's emit, and
+//! on the paths to an emit each dword of its vertex may be written once at
+//! most, by an instruction on every one of them (so a vertex can be
+//! written and emitted on either side of a branch): the copy shader reads
+//! the ring once the program is done, D3D12 the outputs at each emit, and
+//! these rules make the two the same. Programs that break them are
+//! refused, as are emits on other streams than 0: none of the title's
+//! programs writes one, so the ring layout of streams 1 to 3 is not known.
 
 #![cfg_attr(
     not(all(test, windows)),
@@ -88,6 +90,11 @@ pub(crate) const MESSAGE: Why = "a message a geometry shader does not send";
 pub(crate) const PATH: Why = "a geometry shader emit whose vertex depends on the path";
 pub(crate) const AFTER_DONE: Why = "a geometry shader message after GS_DONE";
 pub(crate) const TOO_MANY: Why = "a geometry shader emitting more vertices than its maximum";
+/// Emits and cuts under different lane masks: a lane outside one emit's
+/// mask counts its vertices from there on one fewer than the plan, which
+/// numbers them per path.
+pub(crate) const MASKED: Why =
+    "a geometry shader emit or cut under another lane mask than its others";
 pub(crate) const LATE: Why = "a geometry shader output written after its vertex is emitted";
 pub(crate) const TWICE: Why =
     "a geometry shader output written twice on the paths to its vertex's emit";
@@ -856,14 +863,29 @@ impl GsShape {
 }
 
 /// A geometry shader's message, with the vertex an emit completes.
+///
+/// GS_DONE carries an operation as GS does (its bits 4-5, the stream in
+/// 8-9): with one, the wave's last message is that emit or cut, then the
+/// end (`done`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Message {
-    /// GS EMIT of vertex `vertex` on stream 0; with `cut`, GS EMIT_CUT.
-    Emit { vertex: u32, cut: bool },
-    /// GS CUT: the strip ends.
-    Cut,
-    /// GS_DONE.
+    /// GS EMIT of vertex `vertex` on stream 0; with `cut`, GS EMIT_CUT;
+    /// with `done`, sent as GS_DONE's operation.
+    Emit { vertex: u32, cut: bool, done: bool },
+    /// GS CUT: the strip ends; with `done`, sent as GS_DONE's operation.
+    Cut { done: bool },
+    /// GS_DONE with no operation.
     Done,
+}
+
+impl Message {
+    /// Whether the program sends nothing after this message.
+    pub(crate) fn done(self) -> bool {
+        match self {
+            Message::Emit { done, .. } | Message::Cut { done } => done,
+            Message::Done => true,
+        }
+    }
 }
 
 /// The message `inst` sends, before vertices are numbered (`vertex` 0).
@@ -878,23 +900,67 @@ fn message(inst: &Inst) -> Option<Result<Message, Why>> {
     if name == "s_sendmsghalt" {
         return Some(Err(MESSAGE));
     }
-    Some(match imm & 0xF {
-        MSG_GS if imm >> 8 & 3 != 0 => Err(STREAM),
-        MSG_GS => match imm >> 4 & 3 {
-            1 => Ok(Message::Cut),
-            2 => Ok(Message::Emit {
-                vertex: 0,
-                cut: false,
-            }),
-            3 => Ok(Message::Emit {
-                vertex: 0,
-                cut: true,
-            }),
-            _ => Err(MESSAGE),
-        },
-        MSG_GS_DONE => Ok(Message::Done),
-        _ => Err(MESSAGE),
+    let (id, op, stream) = (imm & 0xF, imm >> 4 & 3, imm >> 8 & 3);
+    if id != MSG_GS && id != MSG_GS_DONE {
+        return Some(Err(MESSAGE));
+    }
+    let done = id == MSG_GS_DONE;
+    Some(match op {
+        // GS with no operation, or GS_DONE alone naming a stream: no
+        // compiler sends them (LLVM's sendmsg rules).
+        0 if done && stream == 0 => Ok(Message::Done),
+        0 => Err(MESSAGE),
+        _ if stream != 0 => Err(STREAM),
+        1 => Ok(Message::Cut { done }),
+        _ => Ok(Message::Emit {
+            vertex: 0,
+            cut: op == 3,
+            done,
+        }),
     })
+}
+
+/// The value `reg` holds when the instruction at `site` runs: the last one
+/// before it in its block to read or write `reg` says it, else the block's
+/// phi of `reg`, else what every predecessor holds at its end (the same
+/// value, phis being placed where two differ), back to the entry's input
+/// (`None` for an entry value the program never reads; also for a block
+/// no path reaches).
+fn live_at(p: &Program, reg: Reg, site: Site) -> Option<Value> {
+    let mut seen = HashSet::new();
+    let mut work = vec![site];
+    while let Some((b, i)) = work.pop() {
+        let block = &p.blocks[b];
+        let before = block.insts[..i].iter().rev();
+        if let Some(v) = before
+            .filter_map(|x| x.write(reg).or_else(|| x.read(reg)))
+            .next()
+        {
+            return Some(v);
+        }
+        if let Some(phi) = block.phis.iter().find(|ph| ph.reg == reg) {
+            return Some(phi.value);
+        }
+        if b == 0 {
+            return p.inputs.iter().find(|r| r.0 == reg).map(|r| r.1);
+        }
+        for &q in &block.preds {
+            if seen.insert(q) {
+                work.push((q, p.blocks[q].insts.len()));
+            }
+        }
+    }
+    None
+}
+
+/// The lane mask (EXEC) at `site`: its low dword, and in a wave64 program
+/// its high one.
+fn exec_at(p: &Program, site: Site) -> (Option<Value>, Option<Value>) {
+    let hi = p
+        .wave64
+        .then(|| live_at(p, Reg::S(EXEC + 1), site))
+        .flatten();
+    (live_at(p, Reg::S(EXEC), site), hi)
 }
 
 /// A geometry shader's ring accesses and messages.
@@ -1106,17 +1172,15 @@ pub(crate) fn gs_plan(p: &Program, shape: &GsShape) -> Result<GsPlan, Why> {
             if done {
                 return Err(AFTER_DONE);
             }
-            match &mut sent[k].1 {
-                Message::Emit { vertex, .. } => {
-                    if count >= shape.max_vertices {
-                        return Err(TOO_MANY);
-                    }
-                    *vertex = count;
-                    count += 1;
+            let m = &mut sent[k].1;
+            if let Message::Emit { vertex, .. } = m {
+                if count >= shape.max_vertices {
+                    return Err(TOO_MANY);
                 }
-                Message::Cut => {}
-                Message::Done => done = true,
+                *vertex = count;
+                count += 1;
             }
+            done = m.done();
         }
         exit[b] = Some((count, done));
     }
@@ -1125,6 +1189,21 @@ pub(crate) fn gs_plan(p: &Program, shape: &GsShape) -> Result<GsPlan, Why> {
             if index[s] <= index[b] && exit[b] != entry[s] {
                 return Err(PATH);
             }
+        }
+    }
+    // Every emit and cut under one lane mask: the console counts a lane's
+    // vertices by the emits it is in EXEC for, the numbering above by the
+    // path. GS_DONE alone emits nothing a lane counts.
+    let mut mask = None;
+    for &(site, m) in &sent {
+        if m == Message::Done || index[site.0] == usize::MAX {
+            continue;
+        }
+        let here = exec_at(p, site);
+        match mask {
+            None => mask = Some(here),
+            Some(m) if m != here => return Err(MASKED),
+            Some(_) => {}
         }
     }
 
@@ -1197,11 +1276,7 @@ pub(crate) fn gs_plan(p: &Program, shape: &GsShape) -> Result<GsPlan, Why> {
 /// value of a VGPR it writes).
 fn sources(fields: &Fields) -> Vec<Reg> {
     let mut out = Vec::new();
-    let mut add = |op: &Operand| match *op {
-        Operand::Scalar { code, dwords } => out.extend((0..dwords).map(|i| Reg::S(code + i))),
-        Operand::Vector { reg, dwords } => out.extend((0..dwords).map(|i| Reg::V(reg + i))),
-        _ => {}
-    };
+    let mut add = |op: &Operand| operand_regs(op, &mut out);
     match fields {
         Fields::Sop { src, .. } => src.iter().for_each(&mut add),
         Fields::Valu(v) => v.src.iter().for_each(&mut add),
@@ -1236,6 +1311,27 @@ fn sources(fields: &Fields) -> Vec<Reg> {
         Fields::Exp { src, .. } => src.iter().flatten().for_each(&mut add),
         Fields::Vintrp { src, attr, .. } => [src, attr].into_iter().for_each(&mut add),
         Fields::Sopp { .. } => {}
+    }
+    out
+}
+
+/// The register dwords operand `op` names, added to `out`.
+fn operand_regs(op: &Operand, out: &mut Vec<Reg>) {
+    match *op {
+        Operand::Scalar { code, dwords } => out.extend((0..dwords).map(|i| Reg::S(code + i))),
+        Operand::Vector { reg, dwords } => out.extend((0..dwords).map(|i| Reg::V(reg + i))),
+        _ => {}
+    }
+}
+
+/// The registers a ring access or a message reads besides the value its
+/// use names (its address, or M0): an LDS write's data.
+fn data_regs(fields: &Fields) -> Vec<Reg> {
+    let mut out = Vec::new();
+    if let Fields::Ds { data, .. } = fields {
+        for op in data {
+            operand_regs(op, &mut out);
+        }
     }
     out
 }
@@ -1285,7 +1381,18 @@ fn address_only(p: &Program, uses: &[(Site, Value)]) -> BTreeSet<Site> {
             }
         }
     }
-    let allowed: HashSet<(Site, Value)> = uses.iter().copied().collect();
+    // A use excuses its consumer's read of the value only when the consumer
+    // reads it as nothing else: an LDS write may also store its own
+    // address, which then must be computed.
+    let allowed: HashSet<(Site, Value)> = uses
+        .iter()
+        .copied()
+        .filter(|&(site, v)| {
+            let x = inst(site);
+            let data = data_regs(&x.fields);
+            !x.reads.iter().any(|&(r, w)| w == v && data.contains(&r))
+        })
+        .collect();
     let consumers: HashSet<Site> = uses.iter().map(|u| u.0).collect();
     let mut slice: BTreeSet<Site> = BTreeSet::new();
     let mut work: Vec<Value> = uses.iter().map(|u| u.1).collect();
