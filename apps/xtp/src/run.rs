@@ -159,7 +159,13 @@ pub fn run(
     let original = std::fs::read(&exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = xtp_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match xtp_game::identify(&hash) {
+    let build = xtp_game::identify(&hash);
+    if execute {
+        xtp_hle::modules::xmem::reserve_low_va_from_env(
+            build.map_or(0, |build| build.low_va_reserve_mib),
+        );
+    }
+    match build {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
