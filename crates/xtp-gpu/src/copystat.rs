@@ -112,8 +112,15 @@ pub(crate) enum C {
     /// title memory while the write tracking had them current: missed
     /// writes.
     FullRefreshMissed,
+    /// Of `BackCompared` (copies in system memory): bytes in windows of
+    /// loose memory, in title buffers under 1 MiB, under the card's least
+    /// size, and of that size or more (past the card's budget).
+    BackComparedLoose,
+    BackComparedSmall,
+    BackComparedMid,
+    BackComparedBig,
 }
-const COUNTERS: usize = 56;
+const COUNTERS: usize = 60;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -239,6 +246,15 @@ pub(crate) fn log(frames: f64) {
             mb(c[C::FullRefreshBytes as usize]),
             ms(c[C::FullRefreshUs as usize]),
             mb(c[C::FullRefreshMissed as usize]),
+        );
+    }
+    if c[C::BackCompared as usize] > 0.0 {
+        tracing::info!(
+            "copy-back compared in system memory per frame, by copy: loose windows {:.1} MB,              buffers under 1 MiB {:.1} MB, under the card's least size {:.1} MB, past the              card's budget {:.1} MB",
+            mb(c[C::BackComparedLoose as usize]),
+            mb(c[C::BackComparedSmall as usize]),
+            mb(c[C::BackComparedMid as usize]),
+            mb(c[C::BackComparedBig as usize]),
         );
     }
     if let Some(cards) = crate::shadow::card_summary() {

@@ -630,7 +630,22 @@ impl Shadow {
                 at = end;
             }
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+            {
+                use crate::copystat::{C, add};
+                add(C::BackCompared, (to - from) as u64);
+                // By kind of copy, to tell which would gain from the card:
+                // windows of loose memory, then title buffers by size.
+                let kind = if self.start.is_multiple_of(WINDOW) && self.len.is_multiple_of(WINDOW) {
+                    C::BackComparedLoose
+                } else if self.len < 1 << 20 {
+                    C::BackComparedSmall
+                } else if self.len < card_limits().0 {
+                    C::BackComparedMid
+                } else {
+                    C::BackComparedBig
+                };
+                add(kind, (to - from) as u64);
+            }
             // Pages now equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh). The
