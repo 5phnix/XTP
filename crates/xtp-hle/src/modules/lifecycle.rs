@@ -239,9 +239,43 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
 /// of the process it replaces.
 const RELAUNCHED_FROM: &str = "XTP_RELAUNCHED_FROM";
 
+/// Set in the environment of a process restarted after a crash so a second
+/// crash does not loop indefinitely.
+const CRASH_RESTARTED: &str = "XTP_CRASH_RESTARTED";
+
+/// Command-line arguments recorded by `XLaunchRestartOnCrash`.
+static RESTART_ON_CRASH: Mutex<Option<Vec<std::ffi::OsString>>> = Mutex::new(None);
+
+/// Records the arguments to relaunch with if the process hits an unhandled
+/// crash (`XLaunchRestartOnCrash`).
+pub(crate) fn set_restart_on_crash(args: Vec<std::ffi::OsString>) {
+    *RESTART_ON_CRASH.lock().unwrap_or_else(|e| e.into_inner()) = Some(args);
+}
+
+/// Crash-reporter hook (`xtp_loader::on_crash`): if `XLaunchRestartOnCrash`
+/// recorded arguments and this process was not already restarted from a crash,
+/// spawns a replacement process once with [`CRASH_RESTARTED`] set.
+pub fn relaunch_on_crash() {
+    if std::env::var_os(CRASH_RESTARTED).is_some() {
+        tracing::info!("skipping crash restart: already restarted once");
+        return;
+    }
+    let Ok(mut guard) = RESTART_ON_CRASH.try_lock() else {
+        return;
+    };
+    let Some(args) = guard.take() else {
+        return;
+    };
+    relaunch_with_env(args, Some((CRASH_RESTARTED, "1")));
+}
+
 /// Starts `xtp` again with `args` (after the title has suspended); the
 /// new process waits until this one has ended.
 pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
+    relaunch_with_env(args, None);
+}
+
+fn relaunch_with_env(args: Vec<std::ffi::OsString>, extra_env: Option<(&str, &str)>) {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
     let mut me: HANDLE = std::ptr::null_mut();
     // SAFETY: an inheritable duplicate of our own process handle.
@@ -261,6 +295,9 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
         command.args(&args);
         if duplicated {
             command.env(RELAUNCHED_FROM, (me as usize).to_string());
+        }
+        if let Some((k, v)) = extra_env {
+            command.env(k, v);
         }
         command.spawn()
     });

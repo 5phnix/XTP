@@ -55,8 +55,8 @@ pub use census::Census;
 pub use crash::save_on_crash;
 #[cfg(windows)]
 pub use crash::{
-    locate, log_crash, log_crashes_to, note_title_output, read_memory as read_title_memory,
-    report_crashes, report_unhandled,
+    locate, log_crash, log_crashes_to, note_title_output, on_crash,
+    read_memory as read_title_memory, report_crashes, report_unhandled,
 };
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};

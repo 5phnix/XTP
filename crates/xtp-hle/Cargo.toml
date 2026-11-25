@@ -69,3 +69,7 @@ diagnostics = [
 
 [lints]
 workspace = true
+
+[[test]]
+name = "restart_on_crash"
+harness = false

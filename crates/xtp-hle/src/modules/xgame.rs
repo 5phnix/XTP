@@ -93,6 +93,25 @@ extern "system" fn launch_new_game(
     }
 }
 
+const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
+
+/// Records `args` so the crash reporter relaunches the title once if an
+/// unhandled crash occurs (`XLaunchRestartOnCrash` in `XGame.h`).
+extern "system" fn launch_restart_on_crash(_: This, args: *const c_char, reserved: u32) -> HRESULT {
+    if reserved != 0 {
+        return E_INVALIDARG;
+    }
+    let args = text(args).unwrap_or_default();
+    tracing::info!(args, "XLaunchRestartOnCrash");
+    let current = runtime::main_image()
+        .and_then(runtime::image_path)
+        .unwrap_or_default();
+    let ours: Vec<_> = std::env::args_os().skip(1).collect();
+    let command = relaunch_args(ours, current.as_os_str(), "", &args);
+    super::lifecycle::set_restart_on_crash(command);
+    S_OK
+}
+
 /// Our own arguments for the relaunch: the title's executable replaced by
 /// `exe`, earlier title arguments dropped, `args` after `--`.
 fn relaunch_args(
@@ -161,12 +180,13 @@ extern "system" fn write_event(
     S_OK
 }
 
-static TITLE_VTABLE: Methods<5> = Methods([
+static TITLE_VTABLE: Methods<6> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    title_id as *const (),        // 0x18
-    launch_new_game as *const (), // 0x20
+    title_id as *const (),                // 0x18
+    launch_new_game as *const (),         // 0x20
+    launch_restart_on_crash as *const (), // 0x28
 ]);
 
 static FEATURES_VTABLE: Methods<4> = Methods([

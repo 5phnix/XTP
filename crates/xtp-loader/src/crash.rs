@@ -55,6 +55,31 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// Optional callback invoked once after an unhandled crash is reported
+/// (used by `XLaunchRestartOnCrash`). Stored in an atomic pointer so crash
+/// handling never blocks on a mutex.
+static ON_CRASH: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Registers a callback to run once after an unhandled crash has been
+/// reported (before the process terminates).
+pub fn on_crash(hook: fn()) {
+    ON_CRASH.store(hook as *mut (), Ordering::Release);
+}
+
+fn run_on_crash() {
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if FIRED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let ptr = ON_CRASH.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        // SAFETY: `on_crash` only stores valid `fn()` pointers.
+        let hook: fn() = unsafe { std::mem::transmute(ptr) };
+        hook();
+    }
+}
+
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
@@ -596,6 +621,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+    run_on_crash();
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),
