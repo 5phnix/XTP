@@ -187,7 +187,9 @@ extern "system" fn create_status_array(
 /// The queue's description, `DSTORAGE_QUEUE_DESC1` (the GDK's
 /// `CreateQueue1`): as in 2020 (source type, capacity, priority, name),
 /// plus the queue's options. BTP 6 sets `AUTO_SUBMIT_DISABLED` on all 17 of
-/// its queues.
+/// its queues (4,159 entries each), and submits batches of up to 3,677
+/// commands while the world loads, past the 2,079 at which they would
+/// otherwise submit themselves.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
