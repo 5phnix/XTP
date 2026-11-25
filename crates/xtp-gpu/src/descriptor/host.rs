@@ -971,6 +971,50 @@ struct Slots {
     peak: u32,
 }
 
+/// Terminal allocation failures since the last frame boundary.
+#[cfg(feature = "diagnostics")]
+static FRAME_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_frame_failures(frame: u64) {
+    let failures = FRAME_FAILURES.swap(0, Ordering::Relaxed);
+    if failures != 0 || frame.is_multiple_of(60) {
+        tracing::info!(
+            frame,
+            failures,
+            "dynamic descriptor allocation failures this frame"
+        );
+    }
+}
+
+impl Slots {
+    fn failure(&self, requested: usize, capacity: u32) {
+        #[cfg(feature = "diagnostics")]
+        FRAME_FAILURES.fetch_add(1, Ordering::Relaxed);
+        static FAILED: AtomicU64 = AtomicU64::new(0);
+        let failed = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+        if failed.is_power_of_two() {
+            let largest_free_run = self
+                .taken
+                .split(|&taken| taken)
+                .map(<[_]>::len)
+                .max()
+                .unwrap_or(0);
+            tracing::warn!(
+                requested,
+                free = capacity - self.used,
+                largest_free_run,
+                cursor = self.next,
+                used = self.used,
+                peak = self.peak,
+                of = capacity,
+                failed,
+                "no free dynamic descriptor slots: a table or view is not made"
+            );
+        }
+    }
+}
+
 /// Slots per chunk the shared views take at once.
 pub(crate) const SHARED_CHUNK: u32 = 256;
 
@@ -1351,7 +1395,7 @@ impl HostHeap {
         if let Some(first) = self.take(n) {
             return Some(first);
         }
-        if self.sampler || n == 0 || n > self.dynamic {
+        if self.sampler || n == 0 {
             return None;
         }
         {
@@ -1361,28 +1405,16 @@ impl HostHeap {
                 self.evict(&mut shared, idle);
             }
         }
-        let first = self.take(n);
-        if first.is_none() {
-            static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let failed = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if failed.is_power_of_two() {
-                let (used, peak) = self.dynamic_use();
-                tracing::warn!(
-                    n,
-                    used,
-                    peak,
-                    of = self.dynamic,
-                    failed,
-                    "no free dynamic descriptor slots: a table or view is not made"
-                );
-            }
-        }
-        first
+        self.try_take(n, true)
     }
 
-    /// [`HostHeap::dynamic`] without taking shared views' slots back.
+    /// An allocation attempt before reclaiming idle shared views.
     fn take(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
+        self.try_take(n, false)
+    }
+
+    fn try_take(&self, n: u32, final_attempt: bool) -> Option<u32> {
+        if self.sampler || n == 0 {
             return None;
         }
         let mut guard = self.slots.lock().unwrap_or_else(|e| e.into_inner());
@@ -1405,7 +1437,12 @@ impl HostHeap {
                 break;
             }
         }
-        let first = found?;
+        let Some(first) = found else {
+            if final_attempt {
+                s.failure(n, self.dynamic);
+            }
+            return None;
+        };
         s.taken[first..first + n].fill(true);
         s.next = ((first + n) % self.dynamic as usize) as u32;
         s.used += n as u32;
@@ -1425,6 +1462,7 @@ impl HostHeap {
     }
 
     /// The dynamic slots taken now, and the most ever taken at once.
+    #[cfg(test)]
     pub(crate) fn dynamic_use(&self) -> (u32, u32) {
         let s = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         (s.used, s.peak)
@@ -1490,12 +1528,12 @@ impl HostHeap {
             entry.holders += 1;
             return Some(slot);
         }
-        let slot = match self.shared_slot(s) {
+        let slot = match self.shared_slot(s, false) {
             Some(slot) => slot,
             None => {
                 let idle = s.idle;
                 self.evict(s, idle);
-                self.shared_slot(s)?
+                self.shared_slot(s, true)?
             }
         };
         self.raw_at(slot, &copy.buffer, offset, len);
@@ -1514,11 +1552,11 @@ impl HostHeap {
 
     /// A free slot of the shared views' chunks, taking a new chunk if
     /// they have none.
-    fn shared_slot(&self, s: &mut Shared) -> Option<u32> {
+    fn shared_slot(&self, s: &mut Shared, final_attempt: bool) -> Option<u32> {
         if let Some(slot) = s.chunks.iter_mut().find_map(|(_, free)| free.pop()) {
             return Some(slot);
         }
-        let first = self.take(SHARED_CHUNK)?;
+        let first = self.try_take(SHARED_CHUNK, final_attempt)?;
         // Handed out from the chunk's start.
         s.chunks
             .push((first, (first + 1..first + SHARED_CHUNK).rev().collect()));
