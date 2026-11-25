@@ -568,6 +568,8 @@ pub(crate) extern "system" fn create_stream(
                 at,
                 "pipeline subobject of unknown size; the rest is ignored"
             );
+            #[cfg(windows)]
+            kept.unknown();
             break;
         };
         if let Some(stage) = stage {
