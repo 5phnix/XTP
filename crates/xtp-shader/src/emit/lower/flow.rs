@@ -1406,10 +1406,13 @@ impl<'a> Lower<'a> {
             for value in [false, true] {
                 let mut known = path.known.to_vec();
                 known.push((atom, value));
-                let (t, f) = self.outcomes(b, &Path {
-                    known: &known,
-                    ..*path
-                });
+                let (t, f) = self.outcomes(
+                    b,
+                    &Path {
+                        known: &known,
+                        ..*path
+                    },
+                );
                 if !(if holds { t } else { f }) {
                     out.push((atom, !value));
                     break;
@@ -1564,10 +1567,12 @@ impl<'a> Lower<'a> {
         {
             x = phi.args[block.preds.iter().position(|&q| q == from)?];
         }
-        Some(match path.joined.get(&x).copied().or_else(|| self.word_of(x)) {
-            Some(k) => Op::Word(k),
-            None => Op::Value(x),
-        })
+        Some(
+            match path.joined.get(&x).copied().or_else(|| self.word_of(x)) {
+                Some(k) => Op::Word(k),
+                None => Op::Value(x),
+            },
+        )
     }
 
     /// The DXIL constant an IR value is, as a dword.

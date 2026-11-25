@@ -9,8 +9,8 @@ use super::host::{Dispatch, Draw, Host, Root, Stride, View};
 use super::{HostShader, Target, lower, validator};
 use crate::ShaderError;
 use crate::native::{
-    ComputeIo, HwStage, MeshIo, NativeProgram, PsInput, ResourceType, RootParam, RootType,
-    StageIo, Usage, UsedResource, VsOutput,
+    ComputeIo, HwStage, MeshIo, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo,
+    Usage, UsedResource, VsOutput,
 };
 use crate::{io, ir, resource, structure};
 
@@ -415,7 +415,12 @@ fn pixel(words: &[u32]) -> Result<(), &'static str> {
             super::container::signature(&[element("SV_Target", 16, 0, 15)], false),
         ),
     ]);
-    translate(&crate::Container::parse(&bytes).unwrap(), &native, Target::ANY).map(|_| ())
+    translate(
+        &crate::Container::parse(&bytes).unwrap(),
+        &native,
+        Target::ANY,
+    )
+    .map(|_| ())
 }
 
 const MASK_AS_DATA: &str = "a lane mask read as data";
