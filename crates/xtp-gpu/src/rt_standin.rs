@@ -8,17 +8,16 @@
 //! dispatches are dropped (no host pipeline) and what they write keeps
 //! whatever was there. [`PROGRAMS`] names the thirteen by hash and role;
 //! `State::rt_dropped` (`draw.rs`) hands each dropped dispatch of one of
-//! them here with the views its program's own resource list names for
-//! unordered access, as the title's tables hold them at the dispatch.
+//! them here with the work it would have run and, when the stand-in asks,
+//! the views its program's own resource list names for unordered access,
+//! as the title's tables (those in the bound heaps) hold them at the
+//! dispatch.
 //!
-//! **Measurement** (every build): the first time a program is dropped with
-//! an output, the output is logged ("rt: dropped trace"): a texture's size
-//! and format, a buffer's range. Every [`REPORT_EVERY`] frames, and in
+//! **Counts** (every build): every [`REPORT_EVERY`] frames, and in
 //! diagnostics builds for each frame `XTP_CAPTURE_FRAMES` or
-//! `XTP_CAPTURE_WORLD` lists, one line gives the frame's drops by role and
-//! whether the stand-in ran. In diagnostics builds each drop is also an op
-//! of the pass dump (`XTP_PASS_DUMP`), so the dump shows where in the frame
-//! each trace would have run and what it would have written.
+//! `XTP_CAPTURE_WORLD` lists, one line gives the frame's drops by role,
+//! whether the stand-in ran and the A/B arm the frame ran in. With the
+//! stand-in off that is all a drop costs: two atomic additions.
 //!
 //! **Stand-in** (`XTP_RT_STANDIN`, every build): `1` clears what a dropped
 //! trace would have written to its "every ray missed" value ([`Fill`]),
@@ -26,7 +25,17 @@
 //! run (`xtp_core::ab`). Which output gets what is [`default_fill`],
 //! replaced output by output with `XTP_RT_STANDIN_FILL` ([`parse_fills`]).
 //! A clear is recorded where the dispatch would have run, through XTP's
-//! own view heap, as the title's UAV clears are (`list::clear_uav`).
+//! own view heap, as the title's UAV clears are (`list::clear_uav`), and
+//! only if the dispatch would have run a group ([`Work`]): a direct one
+//! with no zero count, an indirect one under a GPU predicate on the
+//! count of its commands that run a group, as the host's rewrite of its
+//! arguments leaves it. A texture the title placed in memory itself is
+//! cleared through the resource made for that memory, which its shader
+//! views read. With the stand-in on, the first time a program is dropped
+//! with an output, the output is logged ("rt: dropped trace"): a texture's
+//! size and format, a buffer's range; in diagnostics builds each drop is
+//! also an op of the pass dump (`XTP_PASS_DUMP`), so the dump shows where
+//! in the frame each trace would have run and what it would have written.
 //!
 //! shortcut: a stand-in, not ray tracing, until the trace programs
 //! translate. A clear writes the whole view, where the trace may write part
@@ -328,21 +337,30 @@ pub(crate) const REPORT_EVERY: u64 = 256;
 /// Outputs logged at most (first drops).
 const LOGGED_AT_MOST: usize = 256;
 
-/// The frame being counted, and its drops (by role), clears and clears the
-/// host refused.
+/// The frame being counted, the A/B arm it ran in (`ab::Arm::of`'s index,
+/// taken at its first drop), and its drops (by role), clears and clears
+/// the host refused.
 struct Counts {
     frame: AtomicU64,
+    arm: AtomicU64,
     drops: [AtomicU64; 7],
     cleared: AtomicU64,
     failed: AtomicU64,
 }
 
-static COUNTS: Counts = Counts {
-    frame: AtomicU64::new(u64::MAX),
-    drops: [const { AtomicU64::new(0) }; 7],
-    cleared: AtomicU64::new(0),
-    failed: AtomicU64::new(0),
-};
+impl Counts {
+    const fn new() -> Self {
+        Counts {
+            frame: AtomicU64::new(u64::MAX),
+            arm: AtomicU64::new(0),
+            drops: [const { AtomicU64::new(0) }; 7],
+            cleared: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+        }
+    }
+}
+
+static COUNTS: Counts = Counts::new();
 
 /// An output logged: (program, output, what it is bound to).
 type Logged = (&'static str, u32, String);
@@ -350,19 +368,72 @@ type Logged = (&'static str, u32, String);
 /// The outputs logged so far.
 static LOGGED: Mutex<Option<HashSet<Logged>>> = Mutex::new(None);
 
-/// A dispatch of `program` dropped in `list`, with what its outputs are
-/// bound to ([`Program::writes`]' order): counted, its outputs logged the
-/// first time, and with the stand-in on, cleared to their fills. True if
-/// the list's descriptor heaps changed (the caller's state must set the
-/// title's again).
-pub(crate) fn dropped(list: &HostList, program: &Program, bound: &[Bound]) -> bool {
+/// How much work a dropped dispatch would have run.
+pub(crate) enum Work {
+    /// A direct dispatch's thread group counts.
+    Groups([u32; 3]),
+    /// An indirect one, as the host's rewrite of its arguments left it
+    /// (`indirect::rewrite`): the `u32` count of its commands that run a
+    /// group, at `offset` of the buffer, in the unordered access state.
+    /// Known on the GPU only: the clears run under a predicate on it.
+    /// `None` when there is no such count.
+    Commands(Option<(ID3D12Resource, u64)>),
+}
+
+/// Whether a dispatch that would have run `work` may have written
+/// anything: a direct one with no zero group count; an indirect one with
+/// a command count (whether it is 0 is the GPU's to say).
+fn may_write(work: &Work) -> bool {
+    match work {
+        Work::Groups(groups) => !groups.contains(&0),
+        Work::Commands(count) => count.is_some(),
+    }
+}
+
+/// Whether the stand-in runs for the frame being prepared. With it off,
+/// a dropped trace is only counted ([`dropped`]): its outputs are neither
+/// resolved, described, logged nor cleared.
+pub(crate) fn active() -> bool {
+    STANDIN.get()
+}
+
+/// A dispatch of `program` dropped in `list`, which would have run `work`:
+/// counted; with the stand-in on ([`active`]), and if it would have run a
+/// group, its outputs (`bound` gives what they are bound to, in
+/// [`Program::writes`]' order) logged the first time and cleared to their
+/// fills. True if the list's descriptor heaps changed (the caller's state
+/// must set the title's again).
+pub(crate) fn dropped(
+    list: &HostList,
+    program: &Program,
+    work: Work,
+    bound: impl FnOnce() -> Vec<Bound>,
+) -> bool {
     let frame = crate::queue::presented() + 1;
-    count(frame, program.role);
-    let on = STANDIN.get();
+    count(frame, program.role, ab::current());
+    if !active() {
+        return false;
+    }
+    if !may_write(&work) {
+        return false;
+    }
+    let commands = match work {
+        Work::Groups(_) | Work::Commands(None) => None,
+        Work::Commands(Some(count)) => Some(count),
+    };
+    // The predicate word holding the command count, made at the first
+    // clear.
+    let mut predicate = None;
     let mut heaps = false;
-    for (n, b) in bound.iter().enumerate() {
+    for (n, b) in bound().into_iter().enumerate() {
         let n = n as u32;
-        let what = describe(b);
+        // A placed texture is cleared through its memory's resource; one
+        // without a host copy yet stays as it is, and its clear fails.
+        let b = match b {
+            Bound::View(view) => Bound::View(host_view(view.clone()).unwrap_or(view)),
+            other => other,
+        };
+        let what = describe(&b);
         note_first(program, n, &what);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -372,18 +443,28 @@ pub(crate) fn dropped(list: &HostList, program: &Program, bound: &[Bound]) -> bo
                 program.hash
             )
         });
-        if !on {
-            continue;
-        }
-        let Bound::View(view) = b else {
+        let Bound::View(view) = &b else {
             continue;
         };
-        let texture = texture_of(view).is_some();
+        let texture = texture_of(view).is_some() || placed_texture(view);
         let fill = fill_for(&RULES, program.hash, program.role, n, texture);
         if fill == Fill::Keep {
             continue;
         }
-        match clear(list, view, fill) {
+        let cleared = match &commands {
+            None => clear(list, view, fill, None),
+            Some((buffer, offset)) => {
+                if predicate.is_none() {
+                    predicate = Some(predicate_word(list, buffer, *offset));
+                }
+                match &predicate {
+                    Some(Ok(word)) => clear(list, view, fill, Some(*word)),
+                    Some(Err(why)) => Err(*why),
+                    None => Err("no predicate"),
+                }
+            }
+        };
+        match cleared {
             Ok(()) => {
                 heaps = true;
                 COUNTS.cleared.fetch_add(1, Ordering::Relaxed);
@@ -404,32 +485,71 @@ pub(crate) fn dropped(list: &HostList, program: &Program, bound: &[Bound]) -> bo
             }
         }
     }
+    if let Some(Ok((words, _))) = predicate {
+        end_predicate(list, words);
+    }
     heaps
 }
 
-/// Counts a drop of `role` in `frame`; the first drop of a frame reports
-/// the frame before, when it is due ([`due`]).
-fn count(frame: u64, role: Role) {
-    let last = COUNTS.frame.swap(frame, Ordering::Relaxed);
-    if last != frame && last != u64::MAX {
-        let drops: Vec<u64> = COUNTS
-            .drops
-            .iter()
-            .map(|d| d.swap(0, Ordering::Relaxed))
-            .collect();
-        let cleared = COUNTS.cleared.swap(0, Ordering::Relaxed);
-        if due(last) {
-            tracing::info!(
-                frame = last,
-                drops = %report(&drops),
-                cleared,
-                standin = STANDIN.get(),
-                arm = %ab::current(),
-                "rt: dropped traces in a frame"
-            );
+/// The arm's index for [`Counts::arm`].
+fn arm_index(arm: ab::Arm) -> u64 {
+    u64::from(arm.on())
+}
+
+/// A frame's counts, once the next frame's first drop ended it.
+#[derive(Debug, PartialEq)]
+struct Ended {
+    frame: u64,
+    /// The arm the frame ran in.
+    arm: ab::Arm,
+    drops: Vec<u64>,
+    cleared: u64,
+}
+
+impl Counts {
+    /// Counts a drop of `role` in `frame`, prepared in A/B arm `arm`. The
+    /// first drop of a frame ends the frame before: its counts, with the
+    /// arm taken at its own first drop (the arm changes at the present
+    /// that ends a phase, before the next frame's first drop).
+    fn count(&self, frame: u64, role: Role, arm: ab::Arm) -> Option<Ended> {
+        let last = self.frame.swap(frame, Ordering::Relaxed);
+        let mut ended = None;
+        if last != frame {
+            let last_arm = ab::Arm::of(self.arm.swap(arm_index(arm), Ordering::Relaxed));
+            if last != u64::MAX {
+                ended = Some(Ended {
+                    frame: last,
+                    arm: last_arm,
+                    drops: self
+                        .drops
+                        .iter()
+                        .map(|d| d.swap(0, Ordering::Relaxed))
+                        .collect(),
+                    cleared: self.cleared.swap(0, Ordering::Relaxed),
+                });
+            }
         }
+        self.drops[role.index()].fetch_add(1, Ordering::Relaxed);
+        ended
     }
-    COUNTS.drops[role.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Counts a drop of `role` in `frame`, prepared in A/B arm `arm`, and
+/// reports the frame it ends when that one is due ([`due`]).
+fn count(frame: u64, role: Role, arm: ab::Arm) {
+    let Some(ended) = COUNTS.count(frame, role, arm) else {
+        return;
+    };
+    if due(ended.frame) {
+        tracing::info!(
+            frame = ended.frame,
+            drops = %report(&ended.drops),
+            cleared = ended.cleared,
+            standin = STANDIN.at(ended.arm),
+            arm = %ended.arm,
+            "rt: dropped traces in a frame"
+        );
+    }
 }
 
 /// Whether frame `frame`'s drops are reported: every [`REPORT_EVERY`]
@@ -473,6 +593,34 @@ fn note_first(program: &Program, n: u32, what: &str) {
             "rt: dropped trace, output"
         );
     }
+}
+
+/// The view a clear of `view` writes through: a texture the title placed
+/// in memory itself is viewed through the resource made for that memory
+/// (`resource::texture_at`, which shader views of it read too, as
+/// `descriptor::host::placed_texture` makes them); other views as they
+/// are. `None` for a placed texture without a host copy yet.
+fn host_view(view: View) -> Option<View> {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Placed(true, resource, desc) if resource[0] != BUFFER => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let texture = crate::resource::texture_at(address, &resource)?;
+            Some(View::Unordered(
+                texture as usize,
+                0,
+                desc[..10].try_into().ok(),
+            ))
+        }
+        other => Some(other),
+    }
+}
+
+/// Whether `view` is unordered access to a texture the title placed in
+/// memory itself (one [`host_view`] found no host copy for).
+fn placed_texture(view: &View) -> bool {
+    const BUFFER: u32 = 1;
+    matches!(view, View::Placed(true, resource, _) if resource[0] != BUFFER)
 }
 
 /// A texture view's host texture: (title resource, host resource).
@@ -575,11 +723,143 @@ fn slots() -> Option<&'static Mutex<Slots>> {
     .as_ref()
 }
 
+/// Predicate words (8 bytes each, the upper four always 0) that hold an
+/// indirect dispatch's command count while its clears are recorded:
+/// handed out in turn, a word is written again only [`WORDS`] dropped
+/// indirect traces later, long after the list that read it ran.
+struct Words {
+    buffer: ID3D12Resource,
+    next: AtomicU64,
+}
+
+const WORDS: u64 = 4096;
+
+/// The predicate words, made on first use (zeroed, in the common state,
+/// to which each use returns them); `None` without a host GPU.
+fn words() -> Option<&'static Words> {
+    static MADE: std::sync::OnceLock<Option<Words>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let host = crate::host::host()?;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: WORDS * 8,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer; a default heap's committed
+        // memory starts zeroed.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        }
+        .inspect_err(|e| tracing::warn!(error = %e, "rt stand-in: no predicate words"))
+        .ok()?;
+        let buffer = buffer?;
+        crate::host::name(&buffer, || "rt stand-in predicates".into());
+        Some(Words {
+            buffer,
+            next: AtomicU64::new(0),
+        })
+    })
+    .as_ref()
+}
+
+/// Records in `list` the copy of the `u32` command count at `offset` of
+/// `count` (in the unordered access state, which it is left in) into a
+/// predicate word, left in the predication state: the clears that follow
+/// run under it, so they run only if the count is not 0. Ends with
+/// [`end_predicate`].
+fn predicate_word(
+    list: &HostList,
+    count: &ID3D12Resource,
+    offset: u64,
+) -> Result<(&'static ID3D12Resource, u64), &'static str> {
+    use crate::host::transition;
+    if !offset.is_multiple_of(4) {
+        return Err("a command count not 4-byte aligned");
+    }
+    let words = words().ok_or("no predicate words")?;
+    let at = words.next.fetch_add(1, Ordering::Relaxed) % WORDS * 8;
+    list.keep(&words.buffer);
+    list.keep(count);
+    // SAFETY: an open list; both buffers are live and held by the list, in
+    // the states the barriers name (the count as the rewrite left it, the
+    // words as every use leaves them).
+    unsafe {
+        list.list.ResourceBarrier(&[
+            transition(
+                count,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ),
+            transition(
+                &words.buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+        ]);
+        list.list
+            .CopyBufferRegion(&words.buffer, at, count, offset, 4);
+        list.list.ResourceBarrier(&[
+            transition(
+                count,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+            transition(
+                &words.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PREDICATION,
+            ),
+        ]);
+    }
+    Ok((&words.buffer, at))
+}
+
+/// Returns the predicate words to the common state after the clears that
+/// [`predicate_word`] prepared.
+fn end_predicate(list: &HostList, words: &ID3D12Resource) {
+    // SAFETY: an open list; the words are in the predication state since
+    // `predicate_word`.
+    unsafe {
+        list.list.ResourceBarrier(&[crate::host::transition(
+            words,
+            D3D12_RESOURCE_STATE_PREDICATION,
+            D3D12_RESOURCE_STATE_COMMON,
+        )])
+    };
+}
+
 /// Clears `view` to `fill` in `list`, where the dropped dispatch would have
 /// run: a texture's host copy, or a buffer range's host copy (which goes
-/// back to title memory after the submission, as shader writes do). Sets
-/// XTP's own view heap on the list. Why not if it cannot.
-fn clear(list: &HostList, view: &View, fill: Fill) -> Result<(), &'static str> {
+/// back to title memory after the submission, as shader writes do). Under
+/// `predicate` (a word and its offset, [`predicate_word`]), the clear
+/// itself runs only if the word is not 0. Sets XTP's own view heap on the
+/// list. Why not if it cannot.
+fn clear(
+    list: &HostList,
+    view: &View,
+    fill: Fill,
+    predicate: Option<(&ID3D12Resource, u64)>,
+) -> Result<(), &'static str> {
     const UNORDERED_ACCESS: u32 = 0x8;
     let words: Option<&[u32]> = match view {
         View::Unordered(_, _, desc) => desc.as_ref().map(|d| &d[..]),
@@ -636,6 +916,12 @@ fn clear(list: &HostList, view: &View, fill: Fill) -> Result<(), &'static str> {
         // The clear is an unordered write: after the work before it that
         // wrote the same memory, and before the work after it.
         list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        // Only the clear is predicated: the copies that bring a buffer's
+        // host copy up to date above run whatever the count.
+        if let Some((words, at)) = predicate {
+            list.list
+                .SetPredication(words, at, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        }
         match fill {
             Fill::Uint(v) => {
                 // Drivers differ on values wider than their channels: the
@@ -654,6 +940,10 @@ fn clear(list: &HostList, view: &View, fill: Fill) -> Result<(), &'static str> {
                 .list
                 .ClearUnorderedAccessViewFloat(gpu, at, &target, &v, &[]),
             Fill::Keep => {}
+        }
+        if predicate.is_some() {
+            list.list
+                .SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         }
         list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
     }
@@ -762,6 +1052,54 @@ mod tests {
             fill_for(&rules, "a1b20bc47e3c9597", Role::SunShadow, 0, true),
             Fill::Float([1.0; 4])
         );
+    }
+
+    #[test]
+    fn rt_standin_ends_each_frame_with_its_own_arm() {
+        use ab::Arm;
+        let counts = Counts::new();
+        // The first drop ever ends no frame.
+        assert_eq!(counts.count(10, Role::ProbeGather, Arm::A), None);
+        assert_eq!(counts.count(10, Role::ProbeGather, Arm::A), None);
+        counts.cleared.fetch_add(1, Ordering::Relaxed);
+        // The phase changed at the present after frame 10: frame 10 is
+        // reported in A, the arm it ran in, not B.
+        let ended = counts.count(11, Role::Particles, Arm::B).unwrap();
+        assert_eq!(ended.frame, 10);
+        assert_eq!(ended.arm, Arm::A);
+        assert_eq!(ended.drops[Role::ProbeGather.index()], 2);
+        assert_eq!(ended.drops.iter().sum::<u64>(), 2);
+        assert_eq!(ended.cleared, 1);
+        let ended = counts.count(12, Role::ProbeGather, Arm::B).unwrap();
+        assert_eq!((ended.frame, ended.arm), (11, Arm::B));
+        assert_eq!(ended.drops[Role::Particles.index()], 1);
+        assert_eq!(ended.cleared, 0);
+    }
+
+    #[test]
+    fn rt_standin_clears_only_for_work_that_may_write() {
+        assert!(may_write(&Work::Groups([1, 1, 1])));
+        assert!(may_write(&Work::Groups([160, 90, 1])));
+        for empty in [[0, 1, 1], [4, 0, 1], [4, 4, 0]] {
+            assert!(!may_write(&Work::Groups(empty)), "{empty:?}");
+        }
+        assert!(!may_write(&Work::Commands(None)));
+    }
+
+    #[test]
+    fn rt_standin_knows_placed_textures_from_placed_buffers() {
+        let resource = |dimension| {
+            let mut r = [0u32; 14];
+            r[0] = dimension;
+            r
+        };
+        assert!(placed_texture(&View::Placed(true, resource(3), [0; 16])));
+        assert!(!placed_texture(&View::Placed(true, resource(1), [0; 16])));
+        assert!(!placed_texture(&View::Placed(false, resource(3), [0; 16])));
+        assert!(!placed_texture(&View::Unordered(0, 0, None)));
+        // Buffers and other views go through as they are.
+        let buffer = View::Placed(true, resource(1), [0; 16]);
+        assert!(matches!(host_view(buffer), Some(View::Placed(true, r, _)) if r[0] == 1));
     }
 
     #[test]
