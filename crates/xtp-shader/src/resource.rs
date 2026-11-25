@@ -18,6 +18,8 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+#[cfg(test)]
+mod guarded_address_tests;
 mod spill;
 mod uniform;
 
@@ -260,7 +262,7 @@ fn trace(mut t: Tracer<'_>) -> Result<Resources, ShaderError> {
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address = t.smem_address(site, base, *offset, soffset).map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -1069,7 +1071,7 @@ impl<'a> Tracer<'a> {
 
     fn smem_address(
         &self,
-        inst: &Inst,
+        site: Site,
         base: &Operand,
         offset: i32,
         soffset: &Operand,
@@ -1077,6 +1079,7 @@ impl<'a> Tracer<'a> {
         let Operand::Scalar { code, .. } = *base else {
             return Err("an address not in SGPRs");
         };
+        let inst = self.inst(site);
         let word = |k| Some(self.origin(inst.read(Reg::S(code + k))?));
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
@@ -1089,7 +1092,16 @@ impl<'a> Tracer<'a> {
             return Err("an offset from a root parameter");
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
-        self.address(lo, hi, extra)
+        // An arm may set the upper SGPR only for waves that reach this load.
+        // Validate the word written on that edge against the base as usual.
+        let high_on_edge = || {
+            let Term::Value(v) = hi else { return None };
+            let (block, index) = self.phis[v.0 as usize]?;
+            let mut known = vec![(self.lanes?.reach[site.0], true)];
+            let (edge, _) = self.only_edge(block, &mut known)?;
+            Some(self.origin(self.p.blocks[block].phis[index].args[edge]))
+        };
+        self.address(lo, high_on_edge().unwrap_or(hi), extra)
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
@@ -1456,7 +1468,7 @@ impl<'a> Tracer<'a> {
                 entry(base)
                     && entry(soffset)
                     && self
-                        .smem_address(inst, base, *offset, soffset)
+                        .smem_address(*load, base, *offset, soffset)
                         .is_ok_and(|a| a.dynamic.is_none())
             }
             _ => false,
@@ -1839,7 +1851,7 @@ impl<'a> Tracer<'a> {
             else {
                 return None;
             };
-            self.smem_address(inst, base, *offset, soffset).ok()
+            self.smem_address(site, base, *offset, soffset).ok()
         };
         let a = address(*loads.first()?)?;
         if a.param == CODE || a.dynamic.is_some() || loads.iter().any(|&l| address(l) != Some(a)) {
