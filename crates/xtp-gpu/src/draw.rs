@@ -1992,6 +1992,9 @@ impl State {
                     last = before;
                     break;
                 }
+                // Past what a pass of its own could make now: `NotNow`, left
+                // for its next turn, the textures after it go on
+                // (`texture::Refreshes::stage`).
                 Some(staged) => staged,
                 None => stage_for_pass(resource, texture, budget, &mut spent, &mut counts),
             };
@@ -5235,6 +5238,90 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(texels_4x4(host, small), vec![0x2222_2222; 16]);
         assert_eq!(host.log_messages(), None);
         drop(list);
+        drop(heap);
+        release(big);
+        release(small);
+    }
+
+    /// A served texture no pass could stage again (4 MiB, past a 1 MiB
+    /// staging limit and the refreshes' share of a 1 MiB pass: a table read
+    /// uploaded it, then its staging buffer was released) is left for its
+    /// next turn when it changes, and the checks go on past it: a changed
+    /// texture after it is refreshed, pass after pass, while the big one
+    /// keeps the texels it had. Before, it stopped the checks and the next
+    /// pass started with it again, so the textures after it stayed stale for
+    /// good (Codex's review of db37732, 3). In a child process whose passes
+    /// stage 1 MiB within a 1 MiB staging limit (`XTP_HEAP_TEXTURES`,
+    /// `XTP_PASS_STAGING`, read once).
+    #[test]
+    fn a_texture_no_pass_can_stage_again_leaves_the_next_ones_their_refresh() {
+        use crate::testgpu::TitleList;
+        const CHILD: &str = "XTP_TEST_SMALL_STAGING";
+        let test =
+            "draw::tests::a_texture_no_pass_can_stage_again_leaves_the_next_ones_their_refresh";
+        if std::env::var_os(CHILD).is_none() {
+            let Some(_gpu) = crate::testgpu::device(test) else {
+                return;
+            };
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("XTP_HEAP_TEXTURES", "1")
+                .env("XTP_PASS_STAGING", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "the child: {stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        assert_eq!(crate::descriptor::host::pass_staging(), 1 << 20);
+        let heap = crate::descriptor::TestHeap::views(4);
+        let views = crate::descriptor::heap(heap.0).host().expect("a host heap");
+        // The small one by a pass; the big one, 4 MiB of RGBA8 in the slot
+        // before it, by a table read (no pass stages it).
+        let small = filled_texture(heap.0, 2, 4, 4, 0x11);
+        let list = TitleList::new();
+        assert_eq!(pass_in(heap.0, &list).uploaded, 1);
+        list.run();
+        drop(list);
+        let big = filled_texture(heap.0, 1, 64, 16384, 0x55);
+        let list = TitleList::new();
+        let texture = crate::resource::host_resource(big).expect("resident");
+        assert!(crate::texture::upload(list.host(), big, texture));
+        views.texture_slot_tabled(1);
+        list.run();
+        drop(list);
+        assert_eq!(views.texture_queue().served_slots(), [1, 2]);
+        assert_eq!(texels_4x4(host, big), vec![0x5555_5555; 16]);
+        assert!(crate::texture::release_staging_now(big));
+        assert!(crate::texture::release_staging_now(small));
+        // Frames on, no table reads it: the passes check both, the big one
+        // first. A pass checks within `PASS_CHECKING` (1 ms), one at least:
+        // on a loaded machine the small one may wait for the next pass.
+        crate::descriptor::host::PASS_LATER.fetch_add(2, Ordering::Relaxed);
+        fill_texture(big, 0x66);
+        for byte in [0x22u8, 0x33] {
+            fill_texture(small, byte);
+            let want = vec![u32::from_ne_bytes([byte; 4]); 16];
+            let mut passes = 0;
+            while texels_4x4(host, small) != want {
+                passes += 1;
+                assert!(passes <= 3, "still stale after {passes} passes");
+                let list = TitleList::new();
+                pass_in(heap.0, &list);
+                list.run();
+            }
+            assert_eq!(texels_4x4(host, big), vec![0x5555_5555; 16], "as it was");
+        }
+        assert_eq!(host.log_messages(), None);
         drop(heap);
         release(big);
         release(small);

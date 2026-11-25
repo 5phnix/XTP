@@ -1452,6 +1452,12 @@ impl Host {
             list.submitting();
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            // Copies of textures the title wrote after the list read them,
+            // found by its steps (`texture::late_copies`): before its
+            // prelude, from the states the lists before leave.
+            if let Some(late) = crate::texture::late_copies(list) {
+                lists.push(Some(late));
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
