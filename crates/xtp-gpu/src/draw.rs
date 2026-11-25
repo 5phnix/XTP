@@ -261,6 +261,10 @@ impl Drop for State {
 /// translator declares 64 KiB).
 const CBV_SPAN: u64 = 1 << 16;
 
+/// Bytes of each root CBV [`State::dump_at_submission`] logs.
+#[cfg(feature = "diagnostics")]
+const DUMPED_CBV_BYTES: u64 = 384;
+
 /// The way this CBV is filled and the last list write affecting its bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CbvInput {
@@ -753,6 +757,45 @@ fn note_root_srv(address: u64, copy: &crate::shadow::Shadow) {
             left,
             buffer = format_args!("{start:#x}+{len:#x}"),
             "a root SRV near its buffer's end: reads past it return zeros"
+        );
+    }
+}
+
+/// Logs a root SRV's one-view table (Watch 443, VIctory #1671): the bytes
+/// it views from `address` against those its host copy holds from there,
+/// to the end of the title buffer or of the 4 MiB window copy of memory
+/// outside every buffer. A table that stops before its copy's end is cut
+/// (counted at info): a shader reading past the cut reads zeros where the
+/// console reads the buffer. Past a window's end the title's memory goes
+/// on as well. Each table at debug level.
+fn note_root_srv_extent(address: u64, copy: &crate::shadow::Shadow, viewed: u64) {
+    let left = copy.left(address);
+    let start = address - copy.offset(address);
+    let len = copy.offset(address) + left;
+    if viewed < left {
+        counted!(
+            info,
+            address = format_args!("{address:#x}"),
+            viewed,
+            left,
+            copy = format_args!("{start:#x}+{len:#x}"),
+            "a root SRV's one-view table stops before its host copy's end: reads past it \
+             return zeros"
+        );
+    }
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let window = crate::shadow::holders(address).is_empty();
+        tracing::debug!(
+            address = format_args!("{address:#x}"),
+            viewed,
+            left,
+            copy = format_args!("{start:#x}+{len:#x}"),
+            holds = if window {
+                "a 4 MiB window"
+            } else {
+                "a title buffer"
+            },
+            "a root SRV's one-view table"
         );
     }
 }
@@ -2284,6 +2327,7 @@ impl State {
             return Ok((host, slot));
         }
         note_root_srv(a, &s);
+        note_root_srv_extent(a, &s, bytes);
         let slot = if in_place {
             let slot = host.shared_raw(&s, offset, bytes);
             if let Some(slot) = slot {
@@ -2484,6 +2528,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.dump_at_submission(list, None);
         let _timed = crate::timestamps::command(list, crate::timestamps::What::Dispatch, Some(p));
         // SAFETY: an open list with everything set; the barrier names no
         // resource.
@@ -2586,6 +2632,108 @@ impl State {
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         text
+    }
+
+    /// Diagnostics (`XTP_DUMP_DISPATCH_INPUTS=<program hash>,...`, each
+    /// the start of a program's hash): for each dispatch of a matching
+    /// program, logs at its list's submission what title memory holds
+    /// then: the first [`DUMPED_CBV_BYTES`] bytes of each root CBV, and the
+    /// 12 bytes of group counts an indirect one reads at `arguments` (what
+    /// the CPU left there: a GPU writer runs after the submission). With
+    /// `XTP_D3D12_DRED`, the device-removed report names the dispatches in
+    /// flight by the same program and root addresses ([`State::op_text`]).
+    #[cfg(feature = "diagnostics")]
+    fn dump_at_submission(&self, list: &HostList, arguments: Option<u64>) {
+        static PROGRAMS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let programs = PROGRAMS.get_or_init(|| {
+            std::env::var("XTP_DUMP_DISPATCH_INPUTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        });
+        if programs.is_empty() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        for stage in &p.stages {
+            let program = stage.shader.hash.to_string();
+            if !programs.iter().any(|w| program.starts_with(w.as_str())) {
+                continue;
+            }
+            let mut reads: Vec<(String, u64, u64)> = Vec::new();
+            for &(slot, _) in &stage.root_cbvs {
+                if let Some(&Root::View(address)) = self.roots_ref(true).get(usize::from(slot)) {
+                    reads.push((format!("root CBV s{slot}"), address, DUMPED_CBV_BYTES));
+                }
+            }
+            // CBVs in descriptor tables: the bytes their views name.
+            let t = stage.translated();
+            for u in t.used.iter().filter(|u| u.kind == ResourceType::Cbv) {
+                if u.root != RootType::Table {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot))
+                else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(View::Constant(address, size)) = crate::descriptor::view(handle) {
+                    let what = format!("table CBV s{}+{}", u.slot, u.table_offset_dwords);
+                    let bytes = u64::from(size).clamp(4, DUMPED_CBV_BYTES);
+                    reads.push((what, address, bytes));
+                }
+            }
+            if let Some(at) = arguments {
+                reads.push(("indirect group counts".into(), at, 12));
+            }
+            // Inline constants: the user data the program reads, as set now.
+            let user_data: Vec<String> = t
+                .host
+                .user_data
+                .iter()
+                .map(|u| {
+                    let v = self.user_value(true, u.slot, u.root, u.dword);
+                    format!("u{}={v:#x}", u.index)
+                })
+                .collect();
+            tracing::info!(
+                program,
+                list = format_args!("{:#x}", list.list.as_raw() as usize),
+                user_data = user_data.join(" "),
+                "a dispatch's user data at its recording"
+            );
+            let host_list = list.list.as_raw() as usize;
+            list.defer_host((0, 0), move || {
+                for (what, address, len) in &reads {
+                    // Read through the kernel: unmapped pages read as zeros.
+                    let mut bytes = vec![0u8; *len as usize];
+                    crate::host::copy_mapped(
+                        bytes.as_mut_ptr(),
+                        *address as *const u8,
+                        bytes.len(),
+                        false,
+                    );
+                    let (words, _) = bytes.as_chunks::<4>();
+                    let words = words
+                        .iter()
+                        .map(|&w| format!("{:08x}", u32::from_le_bytes(w)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tracing::info!(
+                        program,
+                        list = format_args!("{host_list:#x}"),
+                        what,
+                        address = format_args!("{address:#x}"),
+                        words,
+                        "a dispatch's input at its submission"
+                    );
+                }
+            });
+        }
     }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
@@ -3402,6 +3550,10 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.dump_at_submission(list, Some(arguments));
+        }
         let _timed = crate::timestamps::command(
             list,
             crate::timestamps::What::Indirect(kind),
@@ -5561,6 +5713,76 @@ void main(uint3 id : SV_DispatchThreadID) {
             table(&mut state, l, Some(out.address() + 4))
         });
         assert_eq!(got, bounded(1, 63));
+    }
+
+    /// A root SRV's one-view table in place views the rest of its buffer,
+    /// not 4 MiB of it (Watch 443, VIctory #1671): a shader reading 6 MiB
+    /// past the SRV reads the buffer there, as on the console.
+    #[test]
+    fn root_srv_tables_read_past_4_mib() {
+        const FAR: usize = 6 << 20;
+        let test = "draw::tests::root_srv_tables_read_past_4_mib";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let near = Reader::new(host, ReaderView::TableSrv);
+        let source = format!(
+            "ByteAddressBuffer src : register(t0, space1);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(128, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    dst.Store(id.x * 4, src.Load({FAR} + id.x * 4));
+}}"
+        );
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("far root view test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the test kernel compiles");
+        let code = code.expect("compiled code");
+        // SAFETY: the code and the root signature (the near reader's: the
+        // same views) live through the call.
+        let pso = unsafe {
+            host.device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&near.root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.GetBufferPointer(),
+                        BytecodeLength: code.GetBufferSize(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let far = Reader {
+            root: near.root.clone(),
+            pso,
+        };
+        let heap = TestHeap::views(16);
+        let src = TitleBuffer::new(8 << 20);
+        src.set_words(pattern);
+        let list = TitleList::new();
+        let mut state = state(heap.0);
+        let got = far.read(&list, |l| {
+            heaps(&mut state, l);
+            table(&mut state, l, Some(src.address() + 16))
+        });
+        let want: Vec<u32> = (0..WORDS).map(|i| pattern(4 + FAR / 4 + i)).collect();
+        assert_eq!(got, want);
     }
 
     /// A list binds XTP's own heap in each slot the title binds no hosted

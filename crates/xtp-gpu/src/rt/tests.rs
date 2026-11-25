@@ -1,5 +1,5 @@
 use super::*;
-use crate::testgpu::{TitleBuffer, TitleList};
+use crate::testgpu::{Kernel, Pass, TitleBuffer, TitleList};
 
 fn geometry(vertices: &TitleBuffer, indices: &TitleBuffer) -> Geometry {
     Geometry {
@@ -424,6 +424,12 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             registry().structures[&compacted.address()].result.bytes,
             registry_source_capacity
         );
+        // The title packs the next compacted structure right after it.
+        assert_eq!(
+            registry().ranges[&compacted.address()].end,
+            compacted.address() + 1,
+            "a compacted copy claims its first byte"
+        );
         assert!(Builder.copy(
             cloning.this(),
             cloned.address(),
@@ -594,6 +600,9 @@ fn rt_missing_tlas_writes_every_ray_as_a_miss() {
         (unwritten(), unwritten(), unwritten(), unwritten());
     let empty = Descriptor::new(nothing.address());
     let wrong = Descriptor::new(blas);
+    // A descriptor the decoder reads as no view at all.
+    let blank = Box::new(Descriptor([0; 4]));
+    let (blank_direct, blank_indirect) = (unwritten(), unwritten());
     let args = TitleBuffer::new(12);
     args.set_words(|_| 1);
     let list = TitleList::new();
@@ -606,10 +615,158 @@ fn rt_missing_tlas_writes_every_ray_as_a_miss() {
         &indirect,
     );
     trace(host, &list, Scene::Descriptor(wrong.handle()), &not_a_tlas);
+    trace(
+        host,
+        &list,
+        Scene::Descriptor(blank.handle()),
+        &blank_direct,
+    );
+    trace(
+        host,
+        &list,
+        Scene::Indirect(blank.handle(), args.address(), None),
+        &blank_indirect,
+    );
     list.run();
-    for out in [&direct, &spliced, &indirect, &not_a_tlas] {
+    for out in [
+        &direct,
+        &spliced,
+        &indirect,
+        &not_a_tlas,
+        &blank_direct,
+        &blank_indirect,
+    ] {
         assert_eq!(out.words(), MISSES, "the program ran and wrote its misses");
     }
+}
+
+/// Instance records naming each BLAS of `blas`, with an identity transform
+/// and mask 0xff.
+fn instances_of(blas: &[u64]) -> TitleBuffer {
+    let records = TitleBuffer::new(64 * blas.len());
+    records.set_words(|i| match i % 16 {
+        0 | 5 | 10 => 1f32.to_bits(),
+        12 => 0xff00_0000,
+        14 => blas[i / 16] as u32,
+        15 => (blas[i / 16] >> 32) as u32,
+        _ => 0,
+    });
+    records
+}
+
+/// A title TLAS of no instance, or of an instance of a BLAS the host does
+/// not have, makes every ray miss (WARP divided by zero building the first
+/// and faulted on the null BLAS of the second); the other instances of a
+/// TLAS keep their place and are hit.
+#[test]
+fn rt_tlas_of_no_instance_or_of_unknown_blas_misses() {
+    let test = "rt_tlas_of_no_instance_or_of_unknown_blas_misses";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    let world = World::new();
+    let nothing = TitleBuffer::new(1024);
+    let unknown = instances_of(&[nothing.address()]);
+    let mixed = instances_of(&[nothing.address(), world.blas.address()]);
+    let tlas: [TitleBuffer; 3] = std::array::from_fn(|_| TitleBuffer::new(1024));
+    let producer = TitleList::new();
+    // SAFETY: the title list and the instance buffers are live.
+    unsafe {
+        let mut none = tlas_desc(tlas[0].address(), &unknown);
+        none.Inputs.NumDescs = 0;
+        assert!(Builder.build(producer.this(), &none));
+        assert!(Builder.build(producer.this(), &tlas_desc(tlas[1].address(), &unknown)));
+        let mut two = tlas_desc(tlas[2].address(), &mixed);
+        two.Inputs.NumDescs = 2;
+        assert!(Builder.build(producer.this(), &two));
+    }
+    producer.run();
+    let held = |at: &TitleBuffer| registry().structures[&at.address()].holds.is_some();
+    assert!(tlas.iter().all(held), "each TLAS keeps its stand-in BLAS");
+    if !rays {
+        return;
+    }
+    let slots = tlas.each_ref().map(|t| Descriptor::new(t.address()));
+    let outs: [TitleBuffer; 3] = std::array::from_fn(|_| unwritten());
+    let list = TitleList::new();
+    for (slot, out) in slots.iter().zip(&outs) {
+        trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), out);
+    }
+    list.run();
+    assert_eq!(outs[0].words(), MISSES, "no instance");
+    assert_eq!(outs[1].words(), MISSES, "an unknown BLAS");
+    assert_eq!(outs[2].words(), hit(), "the known instance after it");
+}
+
+/// A trace recorded before the title releases its TLAS's buffer, and
+/// submitted after, misses: the release empties the slot the trace binds
+/// at submission (the old TLAS stayed alive in it and was hit).
+#[test]
+fn rt_a_tlas_released_before_its_trace_is_submitted_misses() {
+    let test = "rt_a_tlas_released_before_its_trace_is_submitted_misses";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let World {
+        tlas,
+        blas,
+        _inputs,
+    } = World::new();
+    let slot = Descriptor::new(tlas.address());
+    let (released, kept) = (unwritten(), unwritten());
+    let list = TitleList::new();
+    trace(
+        gpu.host(),
+        &list,
+        Scene::Descriptor(slot.handle()),
+        &released,
+    );
+    drop(tlas);
+    list.run();
+    assert_eq!(released.words(), MISSES);
+    // The same scene, not released, is hit.
+    let world = World::new();
+    let slot = Descriptor::new(world.tlas.address());
+    let list = TitleList::new();
+    trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &kept);
+    list.run();
+    assert_eq!(kept.words(), hit());
+    drop(blas);
+}
+
+/// An indirect trace whose groups a title shader wrote through a UAV
+/// earlier in its list: the arguments' buffer is then in the UAV state by
+/// promotion, which the preparation must not name as common (the D3D12
+/// debug layer, `XTP_D3D12_DEBUG=1`, fails the test on a wrong state).
+#[test]
+fn rt_indirect_trace_takes_groups_a_shader_wrote_in_its_list() {
+    let test = "rt_indirect_trace_takes_groups_a_shader_wrote_in_its_list";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let host = gpu.host();
+    let world = World::new();
+    let slot = Descriptor::new(world.tlas.address());
+    let kernel = Kernel::new(host);
+    let (written, args) = (TitleBuffer::new(256), TitleBuffer::new(256));
+    written.set_words(|i| u32::from(i < 3));
+    let list = TitleList::new();
+    kernel.dispatch(list.host(), Pass::Copy, written.address(), args.address());
+    let out = unwritten();
+    trace(
+        host,
+        &list,
+        Scene::Indirect(slot.handle(), args.address(), None),
+        &out,
+    );
+    list.run();
+    assert_eq!(out.words(), hit());
 }
 
 #[test]
@@ -620,7 +777,7 @@ fn rt_retirement_cancels_overlapping_publications_and_keeps_adjacent_ranges() {
         table.begin(base + offset, Some(256));
     }
     let old = table.ranges[&(base + 256)].generation;
-    let (new, _) = table.begin(base + 128, Some(384));
+    let new = table.begin(base + 128, Some(384));
     assert!(!table.finish(base + 256, old, None));
     assert_eq!(
         table.ranges.keys().copied().collect::<Vec<_>>(),
@@ -656,4 +813,229 @@ fn rt_owner_survives_more_than_64_intervening_buffers() {
     for i in 1..=100 {
         crate::shadow::unregister(i + 1, base + 2 * i as u64);
     }
+}
+
+/// A spare serves a later generation at its title address once nothing
+/// else holds it, if it fits without wasting over half of it; an address
+/// keeps [`SPARES`] of them, for [`SPARE_FRAMES`] frames.
+#[test]
+fn rt_spares_serve_later_generations_once_free() {
+    let test = "rt_spares_serve_later_generations_once_free";
+    let Some(_gpu) = dxr(test) else {
+        return;
+    };
+    let list = TitleList::new();
+    let rec = Recorder::new(list.host()).expect("a DXR recorder");
+    let mut table = Registry::default();
+    let (free, held) = (
+        ResultBuffer::new(&rec, 4096).unwrap(),
+        ResultBuffer::new(&rec, 4096).unwrap(),
+    );
+    let gpu = free.gpu();
+    // A recording or a slot still holds this one.
+    let holder = held.clone();
+    table.keep_spare(0x100, held);
+    table.keep_spare(0x100, free);
+    assert!(table.take_spare(0x200, 4096).is_none(), "another address");
+    assert!(table.take_spare(0x100, 4097).is_none(), "too small");
+    assert!(table.take_spare(0x100, 2047).is_none(), "over twice as big");
+    let taken = table.take_spare(0x100, 2048).expect("the free one");
+    assert_eq!(taken.gpu(), gpu);
+    assert!(table.take_spare(0x100, 4096).is_none(), "the other is held");
+    drop(holder);
+    assert!(table.take_spare(0x100, 4096).is_some(), "free once let go");
+    assert!(table.spares.is_empty());
+    for _ in 0..SPARES + 2 {
+        table.keep_spare(0x100, ResultBuffer::new(&rec, 256).unwrap());
+    }
+    assert_eq!(table.spares[&0x100].len(), SPARES);
+    let frame = table.aged;
+    table.age_spares(frame + SPARE_FRAMES);
+    assert_eq!(table.spares[&0x100].len(), SPARES, "still recent");
+    table.age_spares(frame + SPARE_FRAMES + 1);
+    assert!(table.spares.is_empty(), "given back");
+    // Memory the title releases or builds over drops its spares.
+    table.keep_spare(0x300, ResultBuffer::new(&rec, 256).unwrap());
+    table.retire(0x2c0, 0x340, None);
+    assert!(table.spares.is_empty());
+}
+
+/// A TLAS rebuilt every frame at one title address alternates between two
+/// results instead of allocating one a frame: the last generation stays in
+/// its slot until the next is submitted, the one before is free again.
+/// The reused result traces as the last build.
+#[test]
+fn rt_tlas_rebuilds_reuse_a_result_nothing_holds() {
+    let test = "rt_tlas_rebuilds_reuse_a_result_nothing_holds";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    let world = World::new();
+    let tlas = world.tlas.address();
+    let first = registry().structures[&tlas].result.gpu();
+    let rebuilt: Vec<u64> = (0..4)
+        .map(|_| {
+            let list = TitleList::new();
+            // SAFETY: the title list and the instance buffer are live.
+            unsafe { assert!(Builder.build(list.this(), &tlas_desc(tlas, &world._inputs[2]))) };
+            list.run();
+            registry().structures[&tlas].result.gpu()
+        })
+        .collect();
+    assert_ne!(rebuilt[0], first, "the first generation is still published");
+    assert_eq!(rebuilt, [rebuilt[0], first, rebuilt[0], first]);
+    if rays {
+        let slot = Descriptor::new(tlas);
+        let list = TitleList::new();
+        let out = unwritten();
+        trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
+        list.run();
+        assert_eq!(out.words(), hit());
+    }
+}
+
+/// A compacted copy, or a copy of a structure whose build was refused (no
+/// title extent), claims its first byte only: the structures the title
+/// packed after it in the buffer stay.
+#[test]
+fn rt_copies_without_a_known_extent_claim_their_first_byte() {
+    let test = "rt_copies_without_a_known_extent_claim_their_first_byte";
+    let Some(_gpu) = crate::testgpu::device(test) else {
+        return;
+    };
+    let packed = TitleBuffer::new(4096);
+    let nothing = TitleBuffer::new(256);
+    let base = packed.address();
+    {
+        let mut table = registry();
+        table.begin(base + 1024, Some(512));
+        table.begin(base + 2048, Some(512));
+    }
+    let list = TitleList::new();
+    for (dst, mode) in [
+        (
+            base,
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT,
+        ),
+        (
+            base + 512,
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE,
+        ),
+    ] {
+        // SAFETY: a live title list; no structure at the source.
+        assert!(!unsafe { Builder.copy(list.this(), dst, nothing.address(), mode.0) });
+        let table = registry();
+        assert!(
+            table.ranges.contains_key(&(base + 1024)) && table.ranges.contains_key(&(base + 2048)),
+            "the packed structures after {dst:#x} stay"
+        );
+    }
+}
+
+/// The title's release of a buffer empties the slots of its structures: a
+/// TLAS or a trace recorded before finds nothing there.
+#[test]
+fn rt_released_buffers_empty_their_slots() {
+    let test = "rt_released_buffers_empty_their_slots";
+    let Some(_gpu) = dxr(test) else {
+        return;
+    };
+    let World {
+        tlas,
+        blas,
+        _inputs,
+    } = World::new();
+    let slots = {
+        let table = registry();
+        [&tlas, &blas].map(|b| table.ranges[&b.address()].slot.clone())
+    };
+    let published = |s: &Slot| s.lock().unwrap().is_some();
+    assert!(slots.iter().all(published));
+    drop((tlas, blas));
+    assert!(!slots.iter().any(published), "emptied by the release");
+}
+
+/// A TLAS build takes the BLAS in the slot current as it reaches the
+/// queue, and the one in the slot it recorded only where the current one
+/// is empty.
+#[test]
+fn rt_current_slots_win_over_recorded_ones() {
+    let test = "rt_current_slots_win_over_recorded_ones";
+    let Some(_gpu) = dxr(test) else {
+        return;
+    };
+    let world = World::new();
+    let second = TitleBuffer::new(1024);
+    let producer = TitleList::new();
+    let geometry = geometry(&world._inputs[0], &world._inputs[1]);
+    // SAFETY: the title list and the CPU arrays are live.
+    unsafe {
+        assert!(Builder.build(
+            producer.this(),
+            &Build {
+                DestAccelerationStructureData: second.address(),
+                Inputs: blas_input(&geometry),
+                ..Default::default()
+            }
+        ));
+    }
+    producer.run();
+    let (old, new) = {
+        let table = registry();
+        let at = |b: &TitleBuffer| table.structures[&b.address()].clone();
+        (at(&world.blas), at(&second))
+    };
+    let at = 0x5157_0000_0000;
+    let slot = |s: Option<&Structure>| -> Candidates {
+        Arc::new(BTreeMap::from([(at, Arc::new(Mutex::new(s.cloned())))]))
+    };
+    let chosen = |recorded: &Candidates, current: &Candidates| {
+        instances::UploadMap::resolve(recorded, current).map(|m| m.generations[0].1.gpu())
+    };
+    let recorded = slot(Some(&old));
+    assert_eq!(chosen(&recorded, &slot(Some(&new))), Some(new.result.gpu()));
+    assert_eq!(chosen(&recorded, &slot(None)), Some(old.result.gpu()));
+    assert_eq!(
+        chosen(&recorded, &Candidates::default()),
+        Some(old.result.gpu())
+    );
+    assert_eq!(chosen(&slot(None), &slot(None)), None);
+}
+
+/// A BLAS input DXR cannot build from is refused before its build is
+/// recorded: an index past the vertices, a count that is no whole number
+/// of triangles, a stride shorter than a vertex.
+#[test]
+fn rt_invalid_blas_inputs_are_refused_before_their_build() {
+    let test = "rt_invalid_blas_inputs_are_refused_before_their_build";
+    let Some(_gpu) = crate::testgpu::device(test) else {
+        return;
+    };
+    let list = TitleList::new();
+    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+    vertices.set_words(|i| POSITIONS[i].to_bits());
+    let translate = |g: &Geometry| {
+        // SAFETY: the test owns the descriptor and the buffers it names.
+        unsafe { triangles(list.host(), &blas_input(g)) }.is_some()
+    };
+    let valid = geometry(&vertices, &indices);
+    indices.set_words(|i| [1 << 16, 2][i]);
+    assert!(translate(&valid));
+    // Index 3 of three vertices.
+    indices.set_words(|i| [1 << 16, 3][i]);
+    assert!(!translate(&valid), "an index past the vertices");
+    indices.set_words(|i| [1 << 16, 2][i]);
+    let mut two = valid;
+    two.Anonymous.Triangles.IndexCount = 2;
+    assert!(!translate(&two), "no whole triangle");
+    let mut overlapping = valid;
+    overlapping.Anonymous.Triangles.VertexBuffer.StrideInBytes = 4;
+    assert!(!translate(&overlapping), "a stride shorter than a vertex");
+    let mut unindexed = valid;
+    // SAFETY: the test's own triangle description.
+    unsafe {
+        let t = &mut unindexed.Anonymous.Triangles;
+        (t.IndexFormat, t.IndexCount, t.IndexBuffer) = (DXGI_FORMAT_UNKNOWN, 0, 0);
+    }
+    assert!(translate(&unindexed), "three vertices without indices");
 }
