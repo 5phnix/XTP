@@ -784,13 +784,32 @@ pub(super) fn publish(
     let block = at / PAGE;
     let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut g = guards();
-    if !g.protected.contains(&block) {
-        return None;
-    }
     let mut views = Vec::new();
     let physical = lookup(block * PAGE, &mut views)? / PAGE;
     views.iter_mut().for_each(|v| *v /= PAGE);
-    if !views.contains(&block) || views.iter().any(|v| !g.protected.contains(v)) {
+    if !views.contains(&block) || g.owners.pinned(physical, &views) {
+        return None;
+    }
+    if !g.protected.contains(&block) {
+        // A write-only GPU destination may never have been refreshed. Start
+        // watching it now. A pending kernel write keeps every alias open.
+        if views
+            .iter()
+            .any(|&v| !g.protected.contains(&v) && !writable_range(v * PAGE, PAGE))
+            || FLYING.load(SeqCst) != 0 && views.iter().any(|&v| !flying(v..v + 1).is_empty())
+        {
+            return None;
+        }
+        install();
+        protect(&mut g, block, block + 1);
+        // A newly guarded view may already have changed since another
+        // shadow used it. The next asking must report it even if publication
+        // below falls back. The journal stamp covers successful publication.
+        for view in &views {
+            g.clean.remove(view);
+        }
+    }
+    if views.iter().any(|v| !g.protected.contains(v)) {
         return None;
     }
     let written = g
@@ -800,6 +819,7 @@ pub(super) fn publish(
     let now = journal.asked;
     for view in views {
         journal.written.insert(view, now);
+        g.clean.insert(view);
     }
     Some((written, now))
 }
@@ -1007,6 +1027,10 @@ fn install() {
 
 /// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
+    writable_range(at, 1)
+}
+
+fn writable_range(at: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
     };
@@ -1014,7 +1038,10 @@ fn writable(at: usize) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect == PAGE_READWRITE
+        && info.RegionSize - (at - info.BaseAddress as usize) >= len
 }
 
 #[cfg(test)]

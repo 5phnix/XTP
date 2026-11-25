@@ -4388,7 +4388,9 @@ mod tests {
             crate::watch::tests::with_physical_views(|at, alias, private| {
                 register(1, at as u64, (4 * PAGE) as u64);
                 let s = find(at as u64, (4 * PAGE) as u64).unwrap();
-                s.update(at, 4 * PAGE);
+                // The fourth page is a write-only GPU destination. It never
+                // went through an ordinary refresh or its write guard.
+                s.update(at, 3 * PAGE);
                 let publish = |address, byte| {
                     let id = submission();
                     s.writing_by(id, address, PAGE, 123);

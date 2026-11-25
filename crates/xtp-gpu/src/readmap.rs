@@ -233,6 +233,12 @@ impl Owners {
         self.restored.contains(&view)
     }
 
+    pub(super) fn pinned(&self, physical: usize, views: &[usize]) -> bool {
+        self.pins
+            .iter()
+            .any(|pin| pin.contains(&physical) || views.iter().any(|view| pin.contains(view)))
+    }
+
     /// All title views are already write-guarded. A writer (including one
     /// racing the completion) therefore waits until this merge finishes.
     pub(super) fn publish(
@@ -244,13 +250,6 @@ impl Owners {
         gpu: &mut [u8],
         before: Option<&[u8]>,
     ) -> Option<usize> {
-        if self
-            .pins
-            .iter()
-            .any(|pin| pin.contains(&physical) || views.iter().any(|v| pin.contains(v)))
-        {
-            return None;
-        }
         let eager = eager(key);
         if eager {
             self.release(physical, false);
