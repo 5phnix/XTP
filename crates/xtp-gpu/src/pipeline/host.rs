@@ -1256,13 +1256,8 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            #[repr(C)]
-            struct MeshStages(Sub<D3D12_SHADER_BYTECODE>, Sub<D3D12_SHADER_BYTECODE>);
-            let stages = MeshStages(
-                Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0)),
-                Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, code(1)),
-            );
-            // SAFETY: deux sous-objets alignés, les shaders restent vivants pendant l'appel.
+            let stages = MeshStages::new(code(0), code(1), &translations[0].host.dxil);
+            // SAFETY: trois sous-objets alignés, les shaders restent vivants pendant l'appel.
             let made = unsafe { stream_pipeline(host, &root, g, stages, &name) };
             let pso = match made {
                 Ok(pso) => pso,
@@ -1451,33 +1446,31 @@ impl HostPipeline {
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
+/// A pipeline as a subobject stream: its root signature, its `stages`,
+/// and the graphics state the mesh and depth-bounds pipelines share.
+#[repr(C)]
+struct Stream<S> {
+    root: Sub<*mut std::ffi::c_void>,
+    stages: S,
+    blend: Sub<D3D12_BLEND_DESC>,
+    mask: Sub<u32>,
+    raster: Sub<D3D12_RASTERIZER_DESC>,
+    depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
+    targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+    dsv: Sub<DXGI_FORMAT>,
+    samples: Sub<DXGI_SAMPLE_DESC>,
+}
+
 /// Portage de victory-fork#82 de Kaivyyy (c96b4f2, GPL-3.0).
 /// Les pipelines de maillage et de sommets partagent l’état de rastérisation.
-///
-/// # Safety
-/// `stages` doit contenir une suite de sous-objets D3D12 alignés dont les
-/// pointeurs restent valides jusqu'à la création ou au chargement du pipeline.
-unsafe fn stream_pipeline<S>(
+fn stream_of<S>(
     host: &crate::host::Host,
     root: &ID3D12RootSignature,
     g: &GraphicsState,
     stages: S,
-    name: &str,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> Stream<S> {
     use windows::core::Interface;
-    #[repr(C)]
-    struct Stream<S> {
-        root: Sub<*mut std::ffi::c_void>,
-        stages: S,
-        blend: Sub<D3D12_BLEND_DESC>,
-        mask: Sub<u32>,
-        raster: Sub<D3D12_RASTERIZER_DESC>,
-        depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
-        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
-        dsv: Sub<DXGI_FORMAT>,
-        samples: Sub<DXGI_SAMPLE_DESC>,
-    }
-    let mut stream = Stream {
+    Stream {
         root: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
             root.as_raw(),
@@ -1512,11 +1505,85 @@ unsafe fn stream_pipeline<S>(
             g.depth_format,
         ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-    };
-    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
-        SizeInBytes: size_of_val(&stream),
-        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
-    };
+    }
+}
+
+impl<S> Stream<S> {
+    /// The description of this stream, which must stay in place while it
+    /// is used.
+    fn desc(&mut self) -> D3D12_PIPELINE_STATE_STREAM_DESC {
+        D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: size_of::<Self>(),
+            pPipelineStateSubobjectStream: std::ptr::from_mut(self).cast(),
+        }
+    }
+}
+
+/// A mesh pipeline's stages: its mesh and pixel programs, and the
+/// primitive topology its mesh program outputs. D3D12 keeps that topology
+/// in the pipeline it makes from a stream without one, so that a load from
+/// the library with the stream without it did not match the entry (D3D12
+/// message 972, then 970 at the store under the same name): every mesh
+/// pipeline was compiled again in every session (on the L4, 2026-11-25,
+/// about as many made as mesh pipelines drawn, before and after 5943ac5).
+#[repr(C)]
+struct MeshStages(
+    Sub<D3D12_SHADER_BYTECODE>,
+    Sub<D3D12_SHADER_BYTECODE>,
+    Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+);
+
+impl MeshStages {
+    /// The mesh program `ms`, whose translation is `ms_dxil`, and the pixel
+    /// program `ps`.
+    fn new(ms: D3D12_SHADER_BYTECODE, ps: D3D12_SHADER_BYTECODE, ms_dxil: &[u8]) -> MeshStages {
+        MeshStages(
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+            Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                mesh_topology(ms_dxil),
+            ),
+        )
+    }
+}
+
+/// The primitive topology the mesh program in the DXIL container `dxil`
+/// outputs: its `PSV0` runtime information's `MeshOutputTopology` (1 lines,
+/// 2 triangles, at byte 27 of the runtime information, after its size), as
+/// the translator writes it (`xtp-shader` `emit/container.rs`). Undefined
+/// if the container does not say.
+fn mesh_topology(dxil: &[u8]) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
+    use xtp_shader::{Container, FourCC};
+    let topology = Container::parse(dxil).ok().and_then(|c| {
+        let psv = c.part(FourCC::PSV0)?.data;
+        let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?);
+        (size >= 28).then_some(())?;
+        psv.get(4 + 27).copied()
+    });
+    match topology {
+        Some(1) => D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+        Some(2) => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        _ => D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
+    }
+}
+
+/// The pipeline of `stages` with the state of `g`, as a stream
+/// ([`stream_of`]), from the library under `name`.
+///
+/// # Safety
+/// `stages` doit contenir une suite de sous-objets D3D12 alignés dont les
+/// pointeurs restent valides jusqu'à la création ou au chargement du pipeline.
+unsafe fn stream_pipeline<S>(
+    host: &crate::host::Host,
+    root: &ID3D12RootSignature,
+    g: &GraphicsState,
+    stages: S,
+    name: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
+    use windows::core::Interface;
+    let mut stream = stream_of(host, root, g, stages);
+    let desc = stream.desc();
     let device = host.device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
         name,
@@ -2937,6 +3004,394 @@ mod tests {
         let live = counted();
         assert_eq!(live[0].wrapping_sub(after[0]), 10, "slot {}", slots[0]);
         assert_eq!(live[1..], after[1..], "slots {slots:?}");
+    }
+
+    /// Where the parent's library file is, for [`library_child`].
+    const LIBRARY_CHILD: &str = "XTP_LIBRARY_CHILD";
+
+    /// A translated console mesh program: three corners from the lane
+    /// number (`xtp-shader` `emit/mesh_tests.rs`' triangle program), their
+    /// position exported, then triangle (0, 1, 2); none on a host without
+    /// mesh shaders.
+    fn triangle_mesh(host: &crate::host::Host) -> Option<xtp_shader::emit::HostShader> {
+        use xtp_shader::native::{MeshIo, NativeProgram, StageIo};
+        if !host.mesh_shaders() {
+            return None;
+        }
+        let words: [u32; 19] = [
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0xF800_08CF,
+            0x0706_0504, // exp pos0, v4, v5, v6, v7 done
+            0x7E12_02FF,
+            1 << 10 | 2 << 20, // v_mov_b32 v9, triangle (0, 1, 2)
+            0xF800_0941,
+            0x0000_0009, // exp prim, v9 done
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: xtp_shader::HwStage::Ms,
+            wave64: false,
+            float_mode: 0,
+            vgprs: 16,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ms(MeshIo {
+                outputs: Vec::new(),
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        // Its output signature: SV_Position, a float4 in row 0.
+        let mut osg1 = Vec::new();
+        for v in [1u32, 8, 0, 40, 0, 1, 3, 0] {
+            osg1.extend(v.to_le_bytes());
+        }
+        osg1.extend([0xf, 0, 0, 0, 0, 0, 0, 0]);
+        osg1.extend(b"SV_Position\0");
+        let container = xtp_shader::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![xtp_shader::Part {
+                fourcc: xtp_shader::FourCC::OSG1,
+                offset: 0,
+                data: &osg1,
+            }],
+        };
+        let target = crate::device::host_target();
+        let ms = xtp_shader::emit::translate_program_for(&container, &native, target)
+            .map_err(|(_, e)| e.to_string())
+            .expect("the mesh program translates");
+        Some(ms)
+    }
+
+    /// Three pipelines of the same state, each as a session describes it:
+    /// a vertex one as a classic description, the same as a subobject
+    /// stream ([`stream_of`], as the depth-bounds ones), and a mesh one
+    /// ([`MeshStages`], where the host has mesh shaders). `f` gets their
+    /// descriptions, each pointing at live data.
+    fn with_descs<R>(
+        host: &crate::host::Host,
+        f: impl FnOnce(
+            &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+            &D3D12_PIPELINE_STATE_STREAM_DESC,
+            Option<&D3D12_PIPELINE_STATE_STREAM_DESC>,
+        ) -> R,
+    ) -> R {
+        use windows::core::s;
+        let vs = compiled(
+            xtp_shader::HwStage::Vs,
+            "float4 main(uint id : SV_VertexID) : SV_Position { return float4(id, 0, 0, 1); }",
+            s!("vs_5_1"),
+        );
+        let ps = compiled(
+            xtp_shader::HwStage::Ps,
+            "float4 main() : SV_Target { return float4(0.25, 0.5, 0.75, 1); }",
+            s!("ps_5_1"),
+        );
+        let (root, _) = root_signature(&host.device, &[], &[], false).unwrap();
+        let g = state(&[28], 0);
+        let code = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: dxil.as_ptr().cast(),
+            BytecodeLength: dxil.len(),
+        };
+        let classic = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            VS: code(&vs.host.dxil),
+            PS: code(&ps.host.dxil),
+            BlendState: g.blend,
+            SampleMask: g.sample_mask,
+            RasterizerState: g.rasterizer,
+            DepthStencilState: g.depth,
+            IBStripCutValue: g.strip_cut,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: g.targets.NumRenderTargets,
+            RTVFormats: g.targets.RTFormats,
+            DSVFormat: g.depth_format,
+            SampleDesc: g.samples,
+            ..Default::default()
+        };
+        #[repr(C)]
+        struct VertexStages(
+            Sub<D3D12_SHADER_BYTECODE>,
+            Sub<D3D12_SHADER_BYTECODE>,
+            Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+        );
+        let vertex = VertexStages(
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, classic.VS),
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, classic.PS),
+            Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ),
+        );
+        let mut streamed = stream_of(host, &root, &g, vertex);
+        // The mesh pipeline, with the root signature a session makes for
+        // its translation.
+        let ms = triangle_mesh(host);
+        let mesh_root = ms.as_ref().map(|ms| {
+            let shader = title_shader(
+                "mesh",
+                "library test mesh",
+                Some(Translated {
+                    host: ms.clone(),
+                    used: Vec::new(),
+                    wave64: false,
+                }),
+            );
+            HostPipeline::new(&[shader], Some(&g))
+                .expect("a mesh pipeline")
+                .root
+        });
+        let mut meshed = ms.as_ref().zip(mesh_root.as_ref()).map(|(ms, root)| {
+            let stages =
+                MeshStages::new(code(&ms.dxil), D3D12_SHADER_BYTECODE::default(), &ms.dxil);
+            stream_of(host, root, &g, stages)
+        });
+        let meshed = meshed.as_mut().map(Stream::desc);
+        f(&classic, &streamed.desc(), meshed.as_ref())
+    }
+
+    /// What loads, in a library of `blob`, of [`with_descs`]' three
+    /// pipelines stored under the names "classic", "stream" and "mesh".
+    fn loads(host: &crate::host::Host, blob: &[u8]) -> String {
+        use windows::core::{HSTRING, Interface, PCWSTR};
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        // SAFETY: `blob` outlives the library, dropped first.
+        let library: ID3D12PipelineLibrary1 = unsafe {
+            device
+                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(blob)
+                .unwrap()
+                .cast()
+                .unwrap()
+        };
+        let said = |r: windows::core::Result<ID3D12PipelineState>| match r {
+            Ok(_) => "ok".to_owned(),
+            Err(e) => format!("{:?}", e.code()),
+        };
+        let name = |name: &str| HSTRING::from(name);
+        let (classic, streamed, meshed) = with_descs(host, |classic, streamed, meshed| {
+            // SAFETY: a live library; the descriptions point at live data.
+            unsafe {
+                (
+                    library.LoadGraphicsPipeline(PCWSTR(name("classic").as_ptr()), classic),
+                    library.LoadPipeline(PCWSTR(name("stream").as_ptr()), streamed),
+                    meshed.map(|m| library.LoadPipeline(PCWSTR(name("mesh").as_ptr()), m)),
+                )
+            }
+        });
+        let meshed = meshed.map_or_else(|| "none".to_owned(), said);
+        format!(
+            "classic={} stream={} mesh={meshed}",
+            said(classic),
+            said(streamed)
+        )
+    }
+
+    /// The child of [`pipelines_load_from_the_library_file`]: run by it
+    /// alone, it loads the parent's library file and writes what loads.
+    #[test]
+    #[ignore = "run by pipelines_load_from_the_library_file"]
+    fn library_child() {
+        let Some(dir) = std::env::var_os(LIBRARY_CHILD).map(std::path::PathBuf::from) else {
+            return;
+        };
+        let Some(gpu) = crate::testgpu::device("pipeline::host::tests::library_child") else {
+            return;
+        };
+        let blob = std::fs::read(dir.join("library.bin")).unwrap();
+        let said = loads(gpu.host(), &blob);
+        std::fs::write(dir.join("loads.txt"), said).unwrap();
+    }
+
+    /// The pipelines a session stores load from the library file, in it
+    /// and in the next process: a classic description, a subobject stream,
+    /// and a mesh one. The mesh stream had no primitive topology; D3D12
+    /// keeps the one its program outputs in the pipeline it makes, so the
+    /// stream without it did not load what it had stored (D3D12 message
+    /// 972, then 970 at the store under the same name: on the L4, every
+    /// mesh pipeline compiled again in every session). The stream without
+    /// it is checked to fail here too, so that this test tells the cause.
+    #[test]
+    fn pipelines_load_from_the_library_file() {
+        use windows::core::{HSTRING, Interface, PCWSTR};
+        let test = "pipeline::host::tests::pipelines_load_from_the_library_file";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let device2 = host.device.cast::<ID3D12Device2>().unwrap();
+        // SAFETY: an empty library, which keeps no pointer to the slice.
+        let library: ID3D12PipelineLibrary1 = unsafe {
+            device
+                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(&[])
+                .unwrap()
+                .cast()
+                .unwrap()
+        };
+        let name = |name: &str| HSTRING::from(name);
+        let mesh = with_descs(host, |classic, streamed, meshed| {
+            // SAFETY: live descriptions, a live library.
+            unsafe {
+                let made: ID3D12PipelineState =
+                    host.device.CreateGraphicsPipelineState(classic).unwrap();
+                library
+                    .StorePipeline(PCWSTR(name("classic").as_ptr()), &made)
+                    .unwrap();
+                let made: ID3D12PipelineState = device2.CreatePipelineState(streamed).unwrap();
+                library
+                    .StorePipeline(PCWSTR(name("stream").as_ptr()), &made)
+                    .unwrap();
+                if let Some(m) = meshed {
+                    let made: ID3D12PipelineState = device2.CreatePipelineState(m).unwrap();
+                    library
+                        .StorePipeline(PCWSTR(name("mesh").as_ptr()), &made)
+                        .unwrap();
+                }
+            }
+            meshed.is_some()
+        });
+        let all = if mesh {
+            "classic=ok stream=ok mesh=ok"
+        } else {
+            eprintln!("no mesh shaders on this host: the mesh pipeline is not checked");
+            "classic=ok stream=ok mesh=none"
+        };
+        // SAFETY: a live library; the buffer is its serialised size.
+        let blob = unsafe {
+            let mut blob = vec![0u8; library.GetSerializedSize()];
+            library.Serialize(&mut blob).unwrap();
+            blob
+        };
+        assert_eq!(loads(host, &blob), all, "this process");
+
+        // The mesh stream as it was, without its topology, does not load
+        // the entry: the cause, not only the cure.
+        if let Some(ms) = triangle_mesh(host) {
+            #[repr(C)]
+            struct Before(Sub<D3D12_SHADER_BYTECODE>, Sub<D3D12_SHADER_BYTECODE>);
+            with_descs(host, |_, _, meshed| {
+                let meshed = meshed.expect("a mesh pipeline");
+                // SAFETY: the stream description was made by `with_descs`
+                // from a `Stream<MeshStages>`, alive meanwhile.
+                let now = unsafe {
+                    &*meshed
+                        .pPipelineStateSubobjectStream
+                        .cast::<Stream<MeshStages>>()
+                };
+                let mut before = Stream {
+                    root: Sub(now.root.0, now.root.1),
+                    stages: Before(
+                        Sub(now.stages.0.0, now.stages.0.1),
+                        Sub(now.stages.1.0, now.stages.1.1),
+                    ),
+                    blend: Sub(now.blend.0, now.blend.1),
+                    mask: Sub(now.mask.0, now.mask.1),
+                    raster: Sub(now.raster.0, now.raster.1),
+                    depth: Sub(now.depth.0, now.depth.1),
+                    targets: Sub(now.targets.0, now.targets.1),
+                    dsv: Sub(now.dsv.0, now.dsv.1),
+                    samples: Sub(now.samples.0, now.samples.1),
+                };
+                assert_eq!(
+                    mesh_topology(&ms.dxil),
+                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+                );
+                let desc = before.desc();
+                let refused = crate::testgpu::expect_layer_errors(|| {
+                    // SAFETY: a live library; the stream points at live data.
+                    unsafe {
+                        library.LoadPipeline::<_, ID3D12PipelineState>(
+                            PCWSTR(name("mesh").as_ptr()),
+                            &desc,
+                        )
+                    }
+                });
+                assert!(refused.is_err(), "the stream without its topology");
+            });
+        }
+
+        // The next process, from the file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("library.bin"), &blob).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "pipeline::host::tests::library_child",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(LIBRARY_CHILD, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let Ok(said) = std::fs::read_to_string(dir.path().join("loads.txt")) else {
+            eprintln!(
+                "the child had no device: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        };
+        assert_eq!(said, all, "the next process");
+    }
+
+    /// A mesh program's topology is its `PSV0`'s: lines, triangles, or
+    /// undefined without one.
+    #[test]
+    fn mesh_topologies_are_read_from_the_container() {
+        let with = |topology: u8| {
+            let mut psv = 48u32.to_le_bytes().to_vec();
+            let mut info = [0u8; 48];
+            info[27] = topology;
+            psv.extend(info);
+            // A DXBC container of that part alone.
+            let header = 0x20 + 4;
+            let mut out = b"DXBC".to_vec();
+            out.extend([0; 16]);
+            out.extend(1u16.to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+            out.extend(((header + 8 + psv.len()) as u32).to_le_bytes());
+            out.extend(1u32.to_le_bytes());
+            out.extend((header as u32).to_le_bytes());
+            out.extend(b"PSV0");
+            out.extend((psv.len() as u32).to_le_bytes());
+            out.extend(psv);
+            out
+        };
+        assert_eq!(mesh_topology(&with(1)), D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
+        assert_eq!(
+            mesh_topology(&with(2)),
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+        );
+        assert_eq!(
+            mesh_topology(&with(0)),
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED
+        );
+        assert_eq!(
+            mesh_topology(b"not a container"),
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED
+        );
     }
 }
 
