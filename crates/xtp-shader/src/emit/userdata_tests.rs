@@ -384,7 +384,7 @@ fn indexed_spilled_buffer_uses_the_matching_carry_and_gpu_offset() {
             .any(|r| r.index.is_some())
     );
     let mut wrong_high = words.clone();
-    wrong_high[8] = 0x8201_8007; // le mot haut appartient à une autre paire
+    wrong_high[8] = 0x8201_8009; // paire UAV dont le mot bas est absent de la somme
     assert!(track(&program(&wrong_high)).is_err());
     words.insert(8, 0xBF06_8004); // SCC est réécrit entre les deux additions
     assert!(track(&program(&words)).is_err());
