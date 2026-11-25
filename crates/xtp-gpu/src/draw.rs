@@ -450,11 +450,7 @@ impl Own {
     fn upload_fill(&mut self, list: &HostList, address: u64, len: u64) -> Option<u64> {
         let (i, at) = self.place(false, list, len)?;
         let c = &self.upload[i];
-        list.defer_fill(
-            (c.data + at as usize) as *mut u8,
-            address as *const u8,
-            len as usize,
-        );
+        list.defer_fill_at(c.data, at as usize, address as usize, len as usize);
         Some(c.gpu + at)
     }
 }
@@ -2316,11 +2312,10 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let Some(gpu) = list.scratch_fill(address, u64::from(size)) else {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {

@@ -521,6 +521,65 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fills_merge_only_across_contiguous_bytes_of_one_upload() {
+        let Some(gpu) =
+            crate::testgpu::device("fills_merge_only_across_contiguous_bytes_of_one_upload")
+        else {
+            return;
+        };
+        let list = gpu.host().new_list().unwrap();
+        let mut source = [0u8; 10];
+        let mut upload = [0xffu8; 10];
+        let src = source.as_ptr() as usize;
+        let dst = upload.as_mut_ptr() as usize;
+        list.defer_fill_at(dst, 0, src, 2);
+        list.defer_fill_at(dst, 2, src + 2, 2);
+        // Deux mappages qui se touchent, puis un trou dans la source.
+        list.defer_fill_at(dst + 4, 0, src + 4, 1);
+        list.defer_fill_at(dst + 4, 1, src + 6, 1);
+        // Un trou dans la destination, puis une opération intercalée.
+        list.defer_fill_at(dst + 4, 3, src + 7, 1);
+        list.defer_host((0, 0), || {});
+        list.defer_fill_at(dst + 4, 4, src + 8, 2);
+        assert!(matches!(
+            list.deferred().copies.as_slice(),
+            [
+                Step::Fill(_, _, 4),
+                Step::Fill(_, _, 1),
+                Step::Fill(_, _, 1),
+                Step::Fill(_, _, 1),
+                Step::Host(..),
+                Step::Fill(_, _, 2),
+            ]
+        ));
+        source.copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        list.run_deferred(&mut Batch::default());
+        assert_eq!(upload, [0, 1, 2, 3, 4, 6, 0xff, 7, 8, 9]);
+    }
+
+    #[test]
+    fn refreshes_merge_overlaps_and_neighbours_until_a_write() {
+        let Some(gpu) =
+            crate::testgpu::device("refreshes_merge_overlaps_and_neighbours_until_a_write")
+        else {
+            return;
+        };
+        let list = gpu.host().new_list().unwrap();
+        let buffer = crate::testgpu::TitleBuffer::new(256);
+        let shadow = buffer.shadow();
+        let base = buffer.address() as usize;
+        for (offset, len) in [(8, 8), (4, 4), (12, 8), (10, 2), (24, 4), (8, 8)] {
+            list.defer_refresh(&shadow, base + offset, len);
+        }
+        list.defer((base + 24, 4), (0, 0), || {});
+        list.defer_refresh(&shadow, base + 24, 4);
+        assert!(matches!(list.deferred().copies.as_slice(), [
+            Step::Refresh(_, a, 16), Step::Refresh(_, b, 4),
+            Step::Run(..), Step::Refresh(_, c, 4),
+        ] if *a == base + 4 && *b == base + 24 && *c == *b));
+    }
+
     #[cfg(feature = "diagnostics")]
     #[test]
     fn recorded_preserves_both_diagnostic_samples_without_deadlock() {
@@ -2345,9 +2404,23 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        self.defer_fill_at(dst as usize, 0, src as usize, len);
+    }
+
+    /// `base` est le début du tampon mappé. Deux tampons distincts peuvent
+    /// se suivre en mémoire sans constituer une seule destination valide.
+    pub(crate) fn defer_fill_at(&self, base: usize, offset: usize, src: usize, len: usize) {
+        let dst = base + offset;
+        let mut deferred = self.deferred();
+        if let Some(Step::Fill(prev_dst, prev_src, bytes)) = deferred.copies.last_mut()
+            && *prev_dst >= base
+            && prev_dst.checked_add(*bytes) == Some(dst)
+            && prev_src.checked_add(*bytes) == Some(src)
+        {
+            *bytes += len;
+            return;
+        }
+        deferred.copies.push(Step::Fill(dst, src, len));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2362,6 +2435,16 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
+            if let Some(Step::Refresh(previous, from, bytes)) = deferred.copies.last_mut()
+                && std::sync::Arc::ptr_eq(previous, shadow)
+                && address <= *from + *bytes
+                && *from <= address + len
+            {
+                let end = (*from + *bytes).max(address + len);
+                *from = (*from).min(address);
+                *bytes = end - *from;
+                return;
+            }
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -2448,6 +2531,19 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        let (gpu, base, offset) = self.scratch_region(len)?;
+        Some((gpu, (base + offset) as *mut u8))
+    }
+
+    /// Réserve la destination et enregistre son remplissage à la soumission.
+    pub(crate) fn scratch_fill(&self, src: u64, len: u64) -> Option<u64> {
+        let (gpu, base, offset) = self.scratch_region(len)?;
+        self.defer_fill_at(base, offset, src as usize, len as usize);
+        Some(gpu)
+    }
+
+    /// Adresse GPU de la réservation, base CPU du tampon et décalage dans celui-ci.
+    fn scratch_region(&self, len: u64) -> Option<(u64, usize, usize)> {
         let host = host()?;
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
@@ -2456,7 +2552,7 @@ impl HostList {
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            return Some((gpu, data as usize, 0));
         }
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
@@ -2485,7 +2581,7 @@ impl HostList {
         let (_, data, gpu) = s.chunks[s.current];
         let at = s.used;
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some((gpu + at, data, at as usize))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
