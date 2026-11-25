@@ -50,8 +50,17 @@ repository. Times are local (UTC+1) unless a log line says otherwise.
   the lighting rectangles, the sky compute and the sky dome draws alike.
   With stride's run-time views switched on (`XTP_RUN_TIME_VIEWS=1`), the
   world's first frame never completes (§6.2, stride's task).
-- **Suite (§8).** The open question, the lead (the sky's view LUTs), the
-  scene colour's writers, what is set aside and the exact commands.
+- **Suite (§8).** The open question, the leads (the sky's view LUTs; the
+  exposure buffer read through a raw handle on a structured view on NVIDIA,
+  watch item 190; a refused first writer, item 191), the scene colour's
+  writers, what is set aside and the exact commands.
+- **The refused first writer translates (§9, task present).**
+  `2da4beb386509b77`, a colour pyramid whose full-resolution level is the
+  1280×720 R11G11B10_FLOAT target of item 191, was dropped every frame:
+  first for a sampler the console compiler set in an arm under the
+  starting EXEC (ported from fxceless's fork), then for lane reads of the
+  other 32-lane half in a group of four console waves (a form of XTP's
+  own). It now translates, validates and gets a pipeline on the RTX 4080.
 - **The 3D world on screen, unlit (§6.2, worldlight-18).**
   `XTP_PRESENT_TARGET=1280x720:f28@f0c91b4d2578f5bf` shows the material
   resolve's RGBA8 G-buffer target in the window: the game's street moving.
@@ -466,11 +475,37 @@ of them is the zero texture, the sky's light is multiplied or replaced by
    as its writer gets the previous frame's texels. One frame late, not 0,
    but a transient texture the frame reuses may hold anything by then.
 
-### 8.4 Already set aside
+### 8.4 Two more leads (watch pass 12, items 190 and 191)
 
-- Exposure: the 16-byte exposure buffer is written every frame and is not
-  0 ([1.57, 0.636, 8, 0.125] in worldlight-3, [12.07, 0.083, 8, 0.125] in
-  -16 as the auto-exposure pushes up against a black scene) (§4.3).
+- **Item 190: a raw handle on a structured view, on NVIDIA.** There, a
+  raw access through a structured view reads element `byte / 4 × stride`
+  instead of the byte asked for. Read through such a view, byte 4 of the
+  16-byte exposure buffer lands past its end and reads 0, and a scene
+  colour multiplied by it is 0. This fits §8.1's "input they share": the
+  sky (`348e1e8c414c7eca`, `Srv s0+16`), the lighting rectangles
+  (`1cd9bc634417a981`, `Srv s0+168`), the volume apply
+  (`577248728544d74b`, `Srv s0+48`) and the sky dome (`3ae25b11290cadde`,
+  `Srv s0+16`) all read a 16-byte buffer, the exposure buffer
+  (`buffer Some((<address>, 16))` in their op texts). §4.3 checked the
+  buffer's bytes ([1.57, 0.636, 8, 0.125]), not what the shaders read from
+  it. stride's task carries the fix (the fork's `raw_window`, VIctory
+  #1762) and tests it in its second session. To check it here: a session
+  with that fix, then the scene colour after P403 (sky) in the pass view.
+- **Item 191: `2da4beb386509b77` is refused** ("a descriptor neither
+  loaded nor built"). It is the first writer of a 1280×720
+  R11G11B10_FLOAT target (host format 26; worldlight-15's frame 1349 has
+  two such targets): a pass that should fill an input is dropped. Find
+  it with `grep 2da4beb386509b77` in the run's log (the refusal) and in
+  the pass view's `DROPPED` lines, then see which scene colour writer
+  reads that target. **Translated since (§9).**
+
+### 8.5 Already set aside
+
+- Exposure, as bytes: the 16-byte exposure buffer is written every frame
+  and its bytes are not 0 ([1.57, 0.636, 8, 0.125] in worldlight-3, [12.07,
+  0.083, 8, 0.125] in -16 as the auto-exposure pushes up against a black
+  scene) (§4.3). What the shaders read from it is not checked: item 190
+  (§8.4) reopens it.
 - Dropped scene colour writers: none of the sky, volume and last passes is
   dropped; the lighting rectangles all ran (232/232, 235/235, 172/172,
   11/11) (§4.3, §8.2).
@@ -492,7 +527,7 @@ of them is the zero texture, the sky's light is multiplied or replaced by
 - smemraw's branch (de9f4f3): no GPU removal in seven sessions with
   `XTP_D3D12_DRED=1`.
 
-### 8.5 How the sessions were run
+### 8.6 How the sessions were run
 
 The integration build: a local branch merging this branch, smemraw's
 (de9f4f3), stride's (a8f280b) and mesh-fix's (44931a5) on `main` afc81fc
@@ -537,3 +572,190 @@ sed -n '/== Outputs, pass by pass/,/== Ops/p' $f | awk -v c="$c" '$1==c{f=1;prin
 grep "^P403 L" $f
 awk -v P=P403 '/^== Ops/{o=1} o && $1==P{p=1; next} o && p && /^P[0-9]+ /{exit} o && p' $f | grep -o '"[0-9a-f]* \(Srv\|Uav\|Cbv\) [^"]*"' | sort -u
 ```
+
+## 9. The refused first writer: `2da4beb386509b77` (task present, 179cd4fc)
+
+2026-11-25, offline first, then a session. Item 191 of the watch (§8.4):
+on the person's PC and on the reporter's, the first writer of a 1280×720
+R11G11B10_FLOAT target was refused ("a descriptor neither loaded nor
+built", `GFX10 code at 0x4d0`), so its dispatches were dropped every frame.
+
+### 9.1 Finding the program
+
+- The runtime names a program by the first 16 hex digits of the BLAKE3 of
+  the container the title creates (`xtp-gpu` `pipeline.rs`, `shader`).
+  `shaders.rpf` holds the containers deflate-packed in SGD5 records
+  (`xtp-game` `sgd5.rs`), so the record was found by unpacking every record
+  of the size the log gives (`first bind … size=4920`: seven of them) and
+  hashing each: record `@0xbdf7769`, kind 0x32. The script (BLAKE3's
+  reference and a raw inflate) and the container stay outside the
+  repository.
+- `xtp shader-info --disasm <folder>`, then `xtp translate --list
+  --validate --pipelines --host-lanes 32-32 <folder>` on that folder alone:
+  one program, a few seconds, no survey.
+
+### 9.2 What it does
+
+A compute program, wave64, in groups of 16×16 threads (four console
+waves; v0's even bits are x, its odd bits y). Each thread reads 2×2 texels
+of a colour texture (three `image_gather4_lz`, one per channel) and a
+depth-like texture at levels 0 to 4 (`image_sample_l`), weights texels by
+their Rec. 709 luminance (0.2125, 0.7154, 0.0721) and by a depth test, and
+writes six levels of a colour pyramid: 2×2 texels at full resolution (the
+1280×720 R11G11B10_FLOAT target), then one texel per 2×2, 4×4 and 8×8
+threads (quad DPP and `ds_swizzle` sums inside each 32-lane half), per
+8×8 block (lanes 0 and 32 of a console wave added up: five
+`v_readlane_b32 …, 32`) and per group (LDS between the group's four
+console waves, after its one `s_barrier`).
+
+### 9.3 First blocker: a sampler set in an arm under the starting EXEC
+
+At 0x4d0, `image_sample_l v15, [v7,v8,v22], s[4:11], s[0:3]`: the
+resource is loaded from the table, the sampler s[0:3] is four constants
+(0x92, 0x00c00000, `s_brev_b32 40` = 0x14000000, 0). The console compiler
+set them inside the arm 0x4a0–0x4cc, `s_and_saveexec_b64 s[20:21], s[40:41]`
+and `s_cbranch_execz`, where s[40:41] is the copy of EXEC the program took
+first. The edge that skips the arm joins in what s[0:3] held before: two
+lane masks and a saved EXEC. Hence the refusal. No lane takes that edge:
+each lane's bit of the copy of the starting EXEC is set, so the wave skips
+the arm only when none of those lanes is left.
+
+The fix (`resource.rs`, ported from fxceless's VIctory fork, commit
+578d459): when an edge of a join holds no descriptor and the lanes' paths
+(`Structured`) leave one edge the lanes that read the descriptor can have
+taken, the descriptor is that edge's source, if lowering can name it in
+any block (`only_edge`, `anywhere`). Changed from the fork: the edge's
+conditions are known while its dwords are traced, and a load's base must
+come from the entry through moves (an addition in the arm would not
+dominate the access). Tests: `resource::tests::a_sampler_built_under_the_starting_exec_is_its_constants`
+and `an_image_loaded_under_the_starting_exec_is_its_load`, each with its
+refused control (a per-lane guard; a base moved in the arm).
+
+Survey (`--host-lanes 32-32`, cloud L4, 578d62a before, 89a9aa9 after):
+24,432 programs translated before and after, the same output hash
+(`e5337437…`): no translation changes, none lost. The three programs
+refused as "neither loaded nor built" move on to their next blocker;
+`2da4beb386509b77`'s is the second blocker below.
+
+### 9.4 Second blocker: lane reads in a group of four console waves
+
+With its descriptors traced, the program stopped at "console wave64 lanes
+in a group of more than 64 threads on a host without 64-lane waves": its
+five `v_readlane_b32 …, 32` read the upper 32-lane half, and XTP ran such
+programs only in the console flow, for one console wave per group. The
+console flow branches each console wave by its own ballots, so in a group
+of several waves the halves' exchanges would not meet at one barrier
+(`docs/wave64-on-wave32.md`, "Groups of several console waves").
+
+The form (`emit/lower/lanes.rs`, XTP's own): the program runs in the two
+32-lane halves of the split form, each lane on its own path (DPP and
+`ds_swizzle` stay inside a half there), and a `v_readlane_b32` at a lane
+fixed in the code goes through group-shared memory: every thread writes
+its value at its console thread's place, the group meets, each thread
+reads its console wave's lane, the group meets again. Only for groups of
+more than 64 threads (smaller ones keep their form), and only where
+`group_reads_meet` holds:
+- no loop;
+- the blocks with barriers (`s_barrier`, lane reads) follow one another by
+  dominance, so the barriers a lane passes are a prefix of one sequence,
+  and a lane that skips one passes no barrier after it and ends (in this
+  program, lanes out of bounds end at 0x0ec);
+- every LDS write and later read, and read and later write, have an
+  `s_barrier` between them on every path (the console runs a wave's 64
+  lanes in step, so its compiler may leave out the barrier between lanes
+  of one wave, which are two host waves here);
+- no lane mask read as a number, no `v_readfirstlane`, `v_mbcnt`,
+  `v_writelane` or permute, no whole-wave section.
+
+Provenance: neither xcl's exchange forms nor the fork's (6a2d9f9:
+`wave_base`, `exchange_pair`, exchanges only in blocks every lane runs,
+which the early exit at 0x0ec rules out for this program).
+
+Tests: `emit::lower::lanes::tests` (a loop, a lane read in an arm some
+lanes skip, LDS read after a write without a barrier, a read then a write:
+refused; two writes then a barrier then a read, and an early exit:
+accepted); `emit::split_tests::lane_reads_cross_halves_in_groups_of_several_console_waves`
+(hardware, cloud L4: 128 and 256 threads, a read of LDS another wave
+wrote before an `s_barrier`, a console wave that ends first); its
+translation and validation run everywhere in
+`every_hardware_case_translates_and_validates_without_a_device`. Two
+expectations changed from refused to translated, each keeping the refusal
+for a lane the code computes.
+
+`2da4beb386509b77` on the RTX 4080 (32-32): translated, validated by
+dxil.dll, pipeline created. On the cloud L4 (32-lane waves) the 41
+hardware tests of `split_tests` pass, the new one included, with no GPU
+reset.
+
+### 9.5 Survey, before and after
+
+`xtp shader-survey --host-lanes 32-32 --json` on the cloud L4, main
+54ab53d against bacfcc6 (main with §9.3 and §9.4): 24,432 then 24,433
+programs translated of 26,698. The two JSON files differ in three program
+lines and the totals:
+- `2da4beb386509b77`'s record: "a descriptor neither loaded nor built",
+  then translated;
+- the two other programs refused as "neither loaded nor built" move on to
+  their next blocker: "an address with an untracked high half" (the fork
+  follows such a high half through `only_edge` too, its `live`; not
+  ported) and "a lane mask read as data".
+No translation that existed changes or is lost. The form of §9.4 takes
+only programs that stopped at "console wave64 lanes in a group of more
+than 64 threads" before; the 43 others of that bucket fail one of its
+conditions (not looked at one by one).
+
+### 9.6 Session present-1 (00:46, Series S)
+
+Build bacfcc6 (main 54ab53d with §9.3 and §9.4), `-Limit 150 -Measure 40`,
+`XTP_RAW_STRUCTURED=1` (stride's fix for item 190) and
+`XTP_SKIP_PIPELINES=577248728544d74b`, with which the scene is lit since
+stride-3e, stride's other switches at 0, `XTP_PASS_DUMP=0`,
+`XTP_CAPTURE_WORLD=2000:60:3:10`. It ran twice (two launchers of mine
+started; the same build and switches): frames 677, 687, 697 (run
+`20261124-234706`) and 683, 693, 703 (`20261124-234824`), in
+`E:\xtp-data\runs\present-1`. Gameplay after 27 s, 4.3 fps (median), 2,406
+draws and 521 dropped a frame.
+
+- **`2da4beb386509b77` runs**: translated at its first bind (6 ms), a host
+  pipeline made; in frame 677 it is P638 (list 70, a 40×23 dispatch).
+  The 1280×720 R11G11B10_FLOAT target it writes holds light after it (90.6 %
+  of the texels, largest 15.9, mean 0.08), and so do its 640×360 levels;
+  both were 0 while it was refused. It is the colour pyramid the
+  transparent materials of P643 read (refraction), not the depth of field.
+- **The scene colour is lit before the post-processing**: 90.6 % of the
+  texels, largest 15.9, mean 0.080, after the forward passes (P643, P646).
+- **The presented image** (the person, in the window): cars, poles, wires
+  and the street are visible, better than stride's vitrine-2, but the whole
+  image is very blurred, like a maximal depth of field, and dark.
+- **Why it is blurred, from the pass view**: the depth of field. P673
+  (`30ee260ef303ac7b` + `f987c56098b9faff`) makes its 640×360 RGBA16F layer
+  with the circle of confusion in alpha: mean 2.66 for a largest 2.91
+  (frame 677), 2.64 for 3.31 (693), over 91.7 % of the texels, so nearly the
+  largest blur nearly everywhere. Then the blur (P674 `44fdeb707f882b7d`,
+  P675 `03c01507703d7449`) and the composite onto the 1920×1080 image (P677,
+  `5ec7617b0f7cb43c` + `813a7ead7f09ebd7`, which reads the depth again).
+  The depth it reads, the main 1280×720 D32S8, holds only 11 to 19 % of the
+  screen (poles, wires, some objects): the rest is 0, infinitely far in
+  reverse Z, so the far field's largest circle of confusion covers the
+  street and the buildings. The wires and poles, which are in the depth,
+  are the sharpest things in the image.
+- **Why the depth lacks the street**: the G-buffer's mesh dispatches that
+  draw it are dropped for want of a pipeline (70 of 223 in frame 677's
+  P293; 40 of 227 and 129 of 139 in frame 683; 70 of 149 in 703). Of the
+  run's 28 mesh programs that do not translate, 18 stop at "a scalar
+  memory read as data" (smemraw's class, watch item 147). The street
+  reaches the image through the compute material resolve, never through
+  the depth.
+- Beside it: the temporal pass `731a39171b568298` (P671) writes motion
+  vectors between −76 and −10,000 everywhere and leaves the scene colour's
+  mean at 0.012 (0.080 before it): trails or darkening, not checked.
+- The check, present-2 (00:56, the same build and switches,
+  `XTP_SKIP_PIPELINES=577248728544d74b,f987c56098b9faff`, no pass view):
+  without the depth-of-field layer the world's frames are black (657, 667,
+  677; the loading screen, 512, is not). `f987c56098b9faff` serves P673
+  alone, so the presented colour comes almost wholly through that layer:
+  the composite takes the far field's blurred layer nearly everywhere, as
+  a depth at infinity on most of the screen makes it. Leaving a pass out
+  gives no sharp image; the depth has to be filled (the mesh programs
+  above). The scene colour before the depth of field can be shown with
+  `XTP_PRESENT_TARGET=1280x720:f10@731a39171b568298`.

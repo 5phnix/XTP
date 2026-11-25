@@ -493,7 +493,81 @@ fn console_flow_is_for_one_console_wave_per_group() {
         stride_table: false,
     };
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    // Two console waves: not in the console flow, but each lane on its own
+    // path with the lane read through group-shared memory
+    // (`lane_reads_cross_halves_in_groups_of_several_console_waves`).
+    assert!(emit_for(&program(&body, 128), nvidia).is_ok());
+    // At a lane the code computes (s1, the group id), neither.
+    let computed = [
+        0xD760_0009,
+        0x0000_0300, // v_readlane_b32 s9, v0, s1
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    assert!(emit_for(&program(&computed, 128), nvidia).is_err());
+}
+
+/// Lane reads of the other half in groups of several console waves, as
+/// the title's 16 × 16 downsampling programs make them: each lane on its
+/// own path in two 32-lane halves, the lane read through group-shared
+/// memory between group barriers. Lane t stores what lane 40 of its console
+/// wave holds:
+/// - its own id (two and four console waves per group);
+/// - what it read from LDS, after an `s_barrier`, at the other wave of its
+///   pair (t ^ 64), which that wave wrote before the barrier;
+/// - its own id, where the last console wave of the group ends first (no
+///   thread of it stores: 0).
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn lane_reads_cross_halves_in_groups_of_several_console_waves() {
+    let own = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let lane_40 = |t: u32| (t & !63) + 40;
+    for threads in [128, 256] {
+        program_case("v_readlane 40", &program(&own, threads), lane_40, true);
+    }
+    let lds = [
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xD834_0000,
+        0x0000_0004, // ds_write_b32 v4, v0
+        0xBF8A_0000, // s_barrier
+        0x3A10_00C0, // v_xor_b32 v8, 64, v0
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8
+        0xD8D8_0000,
+        0x0500_0008, // ds_read_b32 v5, v8
+        0xD760_0009,
+        0x0001_5105, // v_readlane_b32 s9, v5, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let mut p = program(&lds, 256);
+    let StageIo::Cs(io) = &mut p.io else {
+        unreachable!()
+    };
+    // 1 KiB: a dword per thread.
+    io.rsrc2 |= 2 << 15;
+    program_case(
+        "LDS of the other wave, then v_readlane 40",
+        &p,
+        |t| lane_40(t) ^ 64,
+        true,
+    );
+    let ended = [
+        0x7D88_00FF,
+        0x0000_00C0, // v_cmp_gt_u32 vcc, 192, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0007, // s_cbranch_execz to the end: the fourth console wave ends
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    program_case(
+        "v_readlane 40 with the last wave ended",
+        &program(&ended, 256),
+        |t| if t < 192 { lane_40(t) } else { 0 },
+        true,
+    );
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in
@@ -1382,6 +1456,7 @@ fn every_hardware_case_translates_and_validates_without_a_device() {
     three_dimensional_groups_keep_the_consoles_lanes();
     masks_read_whole_count_both_halves();
     lane_reads_cross_halves();
+    lane_reads_cross_halves_in_groups_of_several_console_waves();
     exchanges_inside_a_branch_one_half_skips();
     a_branch_on_the_scc_of_saveexec_skips_when_no_lane_is_left();
     a_select_on_a_mask_held_as_a_number_runs_as_the_console();

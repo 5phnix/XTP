@@ -684,6 +684,13 @@ extern "system" fn present(
             forced,
             "queue waits for fences so far (held: no signal made yet got there, so what came next waited; lists: title lists held; forced: waits run past before they were over)"
         );
+        let [mappings, waited, past_writers] = REMAPS.each_ref().map(|n| n.load(Ordering::Relaxed));
+        tracing::info!(
+            mappings,
+            waited,
+            past_writers,
+            "page-mapping copies so far (waited: for submissions in flight touching the pages; past writers: further than the newest one writing them, for one reading them)"
+        );
         #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
@@ -787,13 +794,23 @@ pub(crate) struct PageBatch {
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;
 
+/// Page-mapping copies so far: all, those that waited for submissions in
+/// flight (that touch the pages), and of those, the ones that waited past
+/// the newest submission writing the pages (for one that only reads them).
+static REMAPS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const REMAPPED: usize = 0;
+const REMAP_WAITS: usize = 1;
+const REMAP_READERS: usize = 2;
+
 /// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. BTP 6 streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done once every earlier
-/// submission has finished (what they write goes to the pages mapped when
-/// they were submitted), what the queue holds included.
+/// one constant page or of unmapped pages). Done once the earlier
+/// submissions whose GPU work touches the pages it maps have finished,
+/// what the queue holds included (`Host::settle_remap`): what they write
+/// goes to the pages mapped when they were submitted, and the host copies
+/// they read keep what those pages held. Submissions elsewhere run on.
 ///
 /// shortcut: what the queue holds runs first, waits over or not, instead
 /// of the mapping being held behind it.
@@ -811,20 +828,13 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
-    #[cfg(windows)]
-    if !this.is_null() && holding(this) {
-        release_held(None);
-        release_held(Some(Force::Queue(this as usize, "it maps pages")));
-    }
-    let _ = this;
-    #[cfg(windows)]
-    if let Some(host) = crate::host::made() {
-        host.drain();
-    }
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // The mappings to make: `times` runs of `bytes` from `at` on, one after
+    // the other, each of the pages at `source` (0 unmaps).
+    let mut maps: Vec<(u64, u64, u64, u32)> = Vec::new();
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -837,15 +847,38 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
+            match r.kind {
+                0 if inside(r.count) => maps.push((at, source, len, 1)),
+                1 if inside(1) => maps.push((at, source, PAGE, r.count)),
+                2 => maps.push((at, 0, len, 1)),
+                3 => {}
+                _ => ok = false,
+            }
             at += len;
         }
+    }
+    #[cfg(windows)]
+    if !this.is_null() && holding(this) {
+        release_held(None);
+        release_held(Some(Force::Queue(this as usize, "it maps pages")));
+    }
+    let _ = this;
+    REMAPS[REMAPPED].fetch_add(1, Ordering::Relaxed);
+    #[cfg(windows)]
+    if let Some(host) = crate::host::made() {
+        let pages = maps
+            .iter()
+            .map(|&(at, _, bytes, times)| (at as usize, (at + bytes * u64::from(times)) as usize));
+        let (waited, readers) = host.settle_remap(pages.collect());
+        if waited {
+            REMAPS[REMAP_WAITS].fetch_add(1, Ordering::Relaxed);
+        }
+        if readers {
+            REMAPS[REMAP_READERS].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    for (at, source, bytes, times) in maps {
+        ok &= (0..u64::from(times)).all(|k| map(at + k * bytes, source, bytes));
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1187,6 +1220,91 @@ mod tests {
             host.drain();
             assert_eq!(out.words(), filled());
             release_all(&[graphics, fence]);
+        }
+
+        /// Where the test's page mapper mapped, and the first 64 words there
+        /// just before (what the old pages held).
+        static MAPPED: Mutex<Vec<(u64, Vec<u32>)>> = Mutex::new(Vec::new());
+
+        /// The runtime's page mapper as the tests see it: notes the mapping,
+        /// then shows the new pages at `to` (zeros for an unmapping, else
+        /// the source's bytes), so that a write-back made after it would
+        /// land on them.
+        fn note_mapping(to: u64, from: u64, len: u64) -> bool {
+            // SAFETY: the tests' own memory, `len` bytes at each address.
+            unsafe {
+                let old = (0..64).map(|i| (to as *const u32).add(i).read_volatile());
+                lock(&MAPPED).push((to, old.collect()));
+                if from == 0 {
+                    std::ptr::write_bytes(to as *mut u8, 0, len as usize);
+                } else {
+                    std::ptr::copy(from as *const u8, to as *mut u8, len as usize);
+                }
+            }
+            true
+        }
+
+        /// What the old pages at `at` held when a mapping replaced them.
+        fn mapped(at: u64) -> Option<Vec<u32>> {
+            let mapped = lock(&MAPPED);
+            mapped.iter().find(|m| m.0 == at).map(|m| m.1.clone())
+        }
+
+        /// A page-mapping copy on `queue` that unmaps the page at `at`.
+        fn unmap_page(queue: This, at: u64) -> HRESULT {
+            let range = PageRange {
+                kind: 2,
+                start: 0,
+                count: 1,
+            };
+            let batch = PageBatch {
+                destination: at,
+                count: 1,
+                ranges: &range,
+            };
+            copy_page_mappings(queue, 1, &batch, 0, 0, 0)
+        }
+
+        /// A page mapping waits for the submission in flight whose shaders
+        /// write the old pages, which get what they wrote (the new pages
+        /// nothing); a mapping elsewhere does not wait for it.
+        #[test]
+        fn a_page_mapping_waits_only_for_the_submissions_touching_its_pages() {
+            let test = "queue::tests::waits::a_page_mapping_waits_only_for_the_submissions_touching_its_pages";
+            let Some(host) = device(test) else { return };
+            crate::resource::use_page_mapper(note_mapping);
+            let kernel = Kernel::new(host);
+            // A page each: buffers are 64 KiB aligned.
+            let [scratch, old, elsewhere] = [(); 3].map(|()| TitleBuffer::new(PAGE as usize));
+            let queue = new_queue(0);
+            let writer = TitleList::new();
+            kernel.dispatch(writer.host(), Pass::Fill, scratch.address(), old.address());
+            let open = host.hold_queue();
+            submit(queue, &writer);
+            assert_eq!(unmap_page(queue, elsewhere.address()), S_OK);
+            assert!(mapped(elsewhere.address()).is_some(), "mapped at once");
+            assert!(writer.host().running(), "the writer not waited for");
+            assert!(old.words().iter().all(|&w| w == 0), "nothing written back");
+            let (q, at) = (queue as usize, old.address());
+            let (done, returned) = std::sync::mpsc::channel();
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    let _ = done.send(unmap_page(q as This, at));
+                });
+                let waited = returned.recv_timeout(std::time::Duration::from_millis(300));
+                assert!(waited.is_err(), "the mapping waits for the writer");
+                assert_eq!(mapped(at), None);
+                open();
+                assert_eq!(returned.recv().unwrap(), S_OK);
+            });
+            assert_eq!(
+                mapped(at),
+                Some(filled()),
+                "the old pages got what it wrote"
+            );
+            assert!(old.words().iter().all(|&w| w == 0), "the new pages nothing");
+            assert!(!writer.host().running());
+            release_all(&[queue]);
         }
     }
 
