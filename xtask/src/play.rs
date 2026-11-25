@@ -34,6 +34,8 @@ const STOPS: &str = "the script stops here";
 const FRAME_RATE: &str = "xtp_gpu::host";
 /// Cuts the intro movie (crates/xtp-game/src/intro.rs).
 const SKIP_INTRO: &str = "XTP_SKIP_INTRO";
+/// Keeps the title's own watchdog from ending it (crates/xtp-game/src/watchdog.rs).
+const WATCHDOG_HOOK: &str = "XTP_WATCHDOG_HOOK";
 
 pub struct Options {
     /// Seconds of gameplay before the title is ended.
@@ -129,6 +131,19 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
         // keeps it; an XTP_SKIP_INTRO already set is left as it is.
         println!("play: intro movie cut (XTP_PLAY_INTRO=1 keeps it)");
         command.env(SKIP_INTRO, "1");
+    }
+    if hooks_watchdog(
+        options.measure.is_some(),
+        std::env::var_os(WATCHDOG_HOOK).is_some(),
+        std::env::var_os("XTP_PLAY_WATCHDOG").is_some(),
+    ) {
+        // The title ends itself after about 30 s without a finished frame,
+        // which a console never takes but our world frames still can, and
+        // more so under slow diagnostics (docs/analysis/title-crashes.md).
+        // XTP_PLAY_WATCHDOG keeps the title's watchdog armed; an
+        // XTP_WATCHDOG_HOOK already set is left as it is.
+        println!("play: title watchdog hooked (XTP_PLAY_WATCHDOG=1 keeps it armed)");
+        command.env(WATCHDOG_HOOK, "1");
     }
     let mut child = command
         .stdin(Stdio::null())
@@ -256,6 +271,13 @@ fn with_exit(script: &str, measure: Option<u64>) -> String {
 /// `XTP_PLAY_INTRO`.
 fn skips_intro(measured: bool, already_set: bool, keep_intro: bool) -> bool {
     measured && !already_set && !keep_intro
+}
+
+/// Whether a run hooks the title's watchdog: measured runs do, unless the
+/// caller set `XTP_WATCHDOG_HOOK` itself (left as it is) or asked for the
+/// title's own watchdog with `XTP_PLAY_WATCHDOG`.
+fn hooks_watchdog(measured: bool, already_set: bool, keep_watchdog: bool) -> bool {
+    measured && !already_set && !keep_watchdog
 }
 
 /// `YYYYMMDD-HHMMSS`, UTC.
@@ -552,6 +574,23 @@ mod tests {
         assert!(
             !skips_intro(true, false, true),
             "XTP_PLAY_INTRO keeps the movie"
+        );
+    }
+
+    #[test]
+    fn measured_runs_hook_the_title_watchdog_unless_told_otherwise() {
+        assert!(hooks_watchdog(true, false, false));
+        assert!(
+            !hooks_watchdog(false, false, false),
+            "a run for the player keeps the title's watchdog"
+        );
+        assert!(
+            !hooks_watchdog(true, true, false),
+            "a caller's own setting stays"
+        );
+        assert!(
+            !hooks_watchdog(true, false, true),
+            "XTP_PLAY_WATCHDOG keeps the title's watchdog armed"
         );
     }
 
