@@ -111,15 +111,17 @@ extern "system" fn release(this: This) -> u32 {
 mod tests {
     use super::*;
     use crate::object::slot;
-    use crate::testgpu::{TitleBuffer, TitleList};
+    use crate::testgpu::{Kernel, Pass, TitleBuffer, TitleList};
 
     #[test]
-    fn empty_draws_resolve_to_zero_in_the_title_buffer() {
-        let test = "query::tests::empty_draws_resolve_to_zero_in_the_title_buffer";
+    fn queries_count_only_work_between_the_marks() {
+        let test = "query::tests::queries_count_only_work_between_the_marks";
         let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
         let host = gpu.host();
+        let kernel = Kernel::new(host);
+        let scratch = TitleBuffer::new(256);
         for (heap_kind, kind, words) in [(0, 0, 2), (0, 1, 2), (2, 3, 22)] {
             let mut heap = std::ptr::null();
             let desc = Desc {
@@ -134,30 +136,45 @@ mod tests {
             let list = TitleList::new();
             let out = TitleBuffer::new(256);
             out.set_words(|_| 0xface);
-            for offset in [0xe0, 0xe8] {
+            let mark = |offset, index| {
                 slot::<extern "system" fn(This, This, u32, u32)>(list.this(), offset)(
                     list.this(),
                     heap,
                     kind,
-                    1,
+                    index,
+                )
+            };
+            mark(0xe0, 0);
+            mark(0xe8, 0);
+            mark(0xe0, 1);
+            if kind == 3 {
+                kernel.dispatch(
+                    list.host(),
+                    Pass::Fill,
+                    scratch.address(),
+                    scratch.address(),
                 );
             }
+            mark(0xe8, 1);
             slot::<extern "system" fn(This, This, u32, u32, u32, This, u64)>(list.this(), 0xf0)(
                 list.this(),
                 heap,
                 kind,
-                1,
-                1,
+                0,
+                2,
                 out.resource(),
                 8,
             );
             release(heap);
             list.run();
             let result = out.words();
-            assert_eq!(&result[2..2 + words], vec![0; words]);
-            assert_eq!((result[1], result[2 + words]), (0xface, 0xface));
+            let mut expected = vec![0; 2 * words];
+            if kind == 3 {
+                expected[words + 20] = 64;
+            } // CSInvocations of the second query.
+            assert_eq!(&result[2..2 + expected.len()], expected);
+            assert_eq!((result[1], result[2 + expected.len()]), (0xface, 0xface));
         }
-        host.drain();
     }
 }
 

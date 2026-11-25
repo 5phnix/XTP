@@ -2519,7 +2519,11 @@ impl State {
             (records, stride, max),
             index,
             counter,
-            self.own.indirect_samples.next(list, self.pipeline),
+            if matches!(records, Records::Title(..)) {
+                self.own.indirect_samples.next(list, self.pipeline)
+            } else {
+                None
+            },
         )?)
     }
 }
@@ -4570,7 +4574,7 @@ float4 ps(V v) : SV_Target { return v.color; }
             }
             painter.bind(list.host());
             State::default().set_targets(list.host(), &handles, 0);
-            // Only slot zero has writes enabled.
+            // SAFETY: a bound graphics pipeline; only slot zero has writes enabled.
             unsafe {
                 list.host().list.DrawInstanced(3, 1, 0, 0);
             }
@@ -4579,7 +4583,9 @@ float4 ps(V v) : SV_Target { return v.color; }
             crate::object::slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
             assert!(
                 image
-                    .chunks_exact(256)
+                    .as_chunks::<256>()
+                    .0
+                    .iter()
                     .all(|row| row[..SIDE as usize * 4].iter().all(|&v| v == 0)),
                 "slot 1 overwritten (typed null: {typed})"
             );
