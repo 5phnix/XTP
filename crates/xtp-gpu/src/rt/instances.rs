@@ -3,68 +3,88 @@ use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::core::s;
 
-/// GPU-produced instances can select any entry. The upload and the corresponding
-/// resources share one immutable lifetime across TLAS builds, copies and dispatches.
-pub(crate) struct BlasMap {
+/// Immutable AS addresses and the GPU upload that names them.
+pub(super) struct UploadMap {
     upload: ID3D12Resource,
-    generations: Vec<(u64, Arc<ID3D12Resource>, Arc<Producer>)>,
+    generations: Vec<(u64, Arc<ResultBuffer>)>,
 }
 
-impl BlasMap {
-    pub(super) fn new(entries: &BTreeMap<u64, Structure>) -> Option<Self> {
-        let blas = entries.iter().filter(|(_, s)| s.instances.is_none());
-        let bytes = u32::try_from(blas.clone().count()).ok()?.checked_mul(16)?;
-        let (upload, data) = crate::host::made()?.upload_buffer(u64::from(bytes.max(16)))?;
-        let mut generations = Vec::with_capacity((bytes / 16) as usize);
-        for (i, (&title, s)) in blas.enumerate() {
-            // SAFETY: the mapped upload holds one aligned pair per entry. Both resources are live.
+impl UploadMap {
+    fn resolve(recorded: &Candidates, current: &Candidates) -> Option<Arc<Self>> {
+        // Recorded slots survive title release. Include producers first recorded
+        // on other threads after the TLAS, if they have reached the queue.
+        let mut entries = BTreeMap::new();
+        for (address, slot) in recorded
+            .iter()
+            .chain(current.iter().filter(|(a, _)| !recorded.contains_key(a)))
+        {
+            let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = slot.as_ref().filter(|s| s.instances.is_none()) {
+                entries.insert(*address, s.result.clone());
+            }
+        }
+        let generations: Vec<_> = entries.into_iter().collect();
+        static LAST: Mutex<std::sync::Weak<UploadMap>> = Mutex::new(std::sync::Weak::new());
+        let cached = LAST.lock().unwrap_or_else(|e| e.into_inner()).upgrade();
+        if let Some(cached) = cached
+            && cached.generations.len() == generations.len()
+            && cached
+                .generations
+                .iter()
+                .zip(&generations)
+                .all(|((a, r), (b, s))| a == b && Arc::ptr_eq(r, s))
+        {
+            return Some(cached);
+        }
+        let count = u32::try_from(generations.len()).ok()?;
+        let bytes = count.checked_add(1)?.checked_mul(16)?;
+        if count == 0 {
+            return None;
+        }
+        let (upload, data) = crate::host::made()?.upload_buffer(bytes.into())?;
+        // SAFETY: the upload starts with a 16-byte header, followed by count rows.
+        unsafe {
+            data.cast::<u32>().write(count);
+        }
+        for (i, (title, result)) in generations.iter().enumerate() {
+            // SAFETY: one aligned row per entry in the mapped upload.
             unsafe {
                 data.cast::<[u64; 2]>()
-                    .add(i)
-                    .write([title, s.result.GetGPUVirtualAddress()])
-            };
-            generations.push((title, s.result.clone(), s.producer.clone()));
+                    .add(i + 1)
+                    .write([*title, result.gpu()]);
+            }
         }
-        Some(Self {
+        let map = Arc::new(Self {
             upload,
             generations,
-        })
+        });
+        *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&map);
+        Some(map)
+    }
+}
+
+/// BLAS referenced by the latest execution of this TLAS generation. Each
+/// consuming list takes its own execution-time pin, including TLAS copies.
+#[derive(Default)]
+pub(super) struct BlasMap(Mutex<Option<Arc<UploadMap>>>);
+
+impl BlasMap {
+    pub(super) fn current(&self) -> Option<Arc<UploadMap>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// A producer on another list may be submitted after this recording, or
-    /// abandoned. Resolve those rows in queue order without exposing unbuilt AS memory.
-    fn for_list(self: &Arc<Self>, list: &HostList) -> Option<u64> {
-        let recording = list.rt_recording();
-        if self
-            .generations
-            .iter()
-            .all(|(_, _, p)| p.available(&recording))
-        {
-            // SAFETY: the TLAS recording retains this immutable upload through execution.
-            return Some(unsafe { self.upload.GetGPUVirtualAddress() });
-        }
-        let (gpu, data) = list.scratch(16 * self.generations.len() as u64)?;
-        let mapped = data as usize;
-        let map = self.clone();
+    pub(super) fn capture(self: &Arc<Self>, list: &HostList) -> Arc<Self> {
+        let captured = Arc::new(Self::default());
+        let (dst, src) = (captured.clone(), self.clone());
         list.defer_host((0, 0), move || {
-            for (i, (title, resource, producer)) in map.generations.iter().enumerate() {
-                // SAFETY: one aligned row per entry in this recording's private upload.
-                // List replay waits for its prior execution before rewriting these rows.
-                unsafe {
-                    let address = if producer.submitted.load(Ordering::Acquire) {
-                        resource.GetGPUVirtualAddress()
-                    } else {
-                        0
-                    };
-                    (mapped as *mut [u64; 2]).add(i).write([*title, address]);
-                }
-            }
+            *dst.0.lock().unwrap_or_else(|e| e.into_inner()) = src.current()
         });
-        Some(gpu)
+        captured
     }
 }
 
 struct Rewrite {
+    signature: ID3D12CommandSignature,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
 }
@@ -75,7 +95,22 @@ fn pipeline(device: &ID3D12Device5) -> Option<&'static Rewrite> {
 }
 
 fn make_pipeline(device: &ID3D12Device5) -> Option<Rewrite> {
-    let source = include_bytes!("instances.hlsl");
+    let (root, pso) = compute_pass(device, include_bytes!("instances.hlsl"), s!("rt_instances"))?;
+    let signature = dispatch::signature(&root, 1, 20)?;
+    Some(Rewrite {
+        root,
+        pso,
+        signature,
+    })
+}
+
+/// A compute pass of ours: `source`, HLSL with its root signature, compiled
+/// as `name` for shader model 5.1.
+pub(super) fn compute_pass(
+    device: &ID3D12Device5,
+    source: &[u8],
+    name: windows::core::PCSTR,
+) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors = None;
     // SAFETY: the compiler reads this static source and writes the two local blob pointers.
@@ -83,7 +118,7 @@ fn make_pipeline(device: &ID3D12Device5) -> Option<Rewrite> {
         D3DCompile(
             source.as_ptr().cast(),
             source.len(),
-            s!("rt_instances"),
+            name,
             None,
             None,
             s!("main"),
@@ -100,7 +135,7 @@ fn make_pipeline(device: &ID3D12Device5) -> Option<Rewrite> {
             let bytes = unsafe {
                 std::slice::from_raw_parts(errors.GetBufferPointer().cast(), errors.GetBufferSize())
             };
-            tracing::warn!(%error, "instance rewrite shader: {}", String::from_utf8_lossy(bytes));
+            tracing::warn!(%error, "host DXR pass shader: {}", String::from_utf8_lossy(bytes));
         }
         return None;
     }
@@ -121,7 +156,7 @@ fn make_pipeline(device: &ID3D12Device5) -> Option<Rewrite> {
                 ..Default::default()
             })
             .ok()?;
-        Some(Rewrite { root, pso })
+        Some((root, pso))
     }
 }
 
@@ -129,8 +164,7 @@ pub(super) fn rewrite(
     rec: &Recorder<'_>,
     title_list: *const Object,
     inputs: &Inputs,
-    map: &Arc<BlasMap>,
-) -> Option<Inputs> {
+) -> Option<(Inputs, Arc<BlasMap>)> {
     let count = inputs.NumDescs;
     if inputs.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY
         || count > D3D12_RAYTRACING_MAX_INSTANCES_PER_TOP_LEVEL_ACCELERATION_STRUCTURE
@@ -139,8 +173,9 @@ pub(super) fn rewrite(
     }
     let mut translated = *inputs;
     translated.Anonymous.InstanceDescs = 0;
+    let map = Arc::new(BlasMap::default());
     if count == 0 {
-        return Some(translated);
+        return Some((translated, map));
     }
     let bytes = u64::from(count) * 64;
     // SAFETY: the caller selected TOP_LEVEL, whose active union member is the instance GPU address.
@@ -148,11 +183,37 @@ pub(super) fn rewrite(
     let src = input_range(rec.list, address, bytes, 16)?;
     let dst = buffer(rec, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
     let pass = pipeline(rec.device)?;
-    let mapping = map.for_list(rec.list)?;
-    rec.list.keep(&dst);
-    rec.list.keep_rt_map(map);
+    let (args, data) = rec.list.upload(crate::host::made()?, 20)?;
+    let mapped = data as usize;
     let groups = count.div_ceil(64);
-    let constants = [count, map.generations.len() as u32];
+    // A valid empty table still runs the rewrite and nulls every missing BLAS.
+    let (empty, header) = rec.list.scratch(16)?;
+    // SAFETY: this recording owns the aligned, 16-byte empty table header.
+    unsafe {
+        header.cast::<u32>().write(0);
+    }
+    let recorded = registry().blas_candidates();
+    let destination = map.clone();
+    rec.list.defer_host((0, 0), move || {
+        let current = registry().blas_candidates();
+        let chosen = UploadMap::resolve(&recorded, &current);
+        let gpu = chosen.as_ref().map_or(empty, |m| {
+            // SAFETY: the map holds this immutable upload.
+            unsafe { m.upload.GetGPUVirtualAddress() }
+        });
+        // SAFETY: the upload contains one root SRV followed by a dispatch argument.
+        unsafe {
+            (mapped as *mut [u32; 5]).write([
+                gpu as u32,
+                (gpu >> 32) as u32,
+                groups.min(65535),
+                groups.div_ceil(65535),
+                1,
+            ]);
+        }
+        *destination.0.lock().unwrap_or_else(|e| e.into_inner()) = chosen;
+    });
+    rec.list.keep(&dst);
     // SAFETY: each root view covers the shader's checked range. The recording retains its
     // inputs and output, and the transition orders rewrite stores before the DXR build.
     unsafe {
@@ -167,14 +228,12 @@ pub(super) fn rewrite(
         ]);
         rec.commands.SetComputeRootSignature(&pass.root);
         rec.commands.SetPipelineState(&pass.pso);
-        rec.commands
-            .SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
-        rec.commands.SetComputeRootShaderResourceView(1, mapping);
+        rec.commands.SetComputeRoot32BitConstant(0, count, 0);
         rec.commands
             .SetComputeRootUnorderedAccessView(2, src.gpu(address));
         rec.commands.SetComputeRootUnorderedAccessView(3, gpu);
         rec.commands
-            .Dispatch(groups.min(65535), groups.div_ceil(65535), 1);
+            .ExecuteIndirect(&pass.signature, 1, &args, 0, None, 0);
         rec.commands.ResourceBarrier(&[
             crate::host::transition(
                 &src.buffer,
@@ -190,5 +249,5 @@ pub(super) fn rewrite(
         translated.Anonymous.InstanceDescs = gpu;
     }
     crate::list::forget_host_bindings(title_list);
-    Some(translated)
+    Some((translated, map))
 }

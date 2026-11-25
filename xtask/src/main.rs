@@ -6,6 +6,7 @@ mod gfx10_corpus;
 mod play;
 mod policy;
 mod pr_check;
+mod replay;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -111,6 +112,20 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
+    /// Build the diagnostics xtp, replay a recording of the title's GPU
+    /// work (`xtp run --record`) and print each frame's numbers beside the
+    /// previous replay's (docs/analysis/frame-replay.md).
+    Replay {
+        /// The recording's folder.
+        dir: PathBuf,
+        /// Run the diagnostics build as it is, without cargo build.
+        #[arg(long)]
+        no_build: bool,
+        /// Passed on to `xtp replay`: --frames, --loop, --poke, --pokes-file,
+        /// --stat, --session-gpu-pages.
+        #[arg(last = true)]
+        pass: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -176,6 +191,18 @@ fn main() -> Result<()> {
             out_dir,
             full,
         } => gfx10_corpus::run(&root, llvm_dir.as_deref(), out_dir.as_deref(), full),
+        Cmd::Replay {
+            dir,
+            no_build,
+            pass,
+        } => replay::run(
+            &root,
+            &replay::Options {
+                dir,
+                no_build,
+                pass,
+            },
+        ),
     }
 }
 

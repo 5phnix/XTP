@@ -1,21 +1,21 @@
 // The table is sorted by the full unsigned 64-bit title address, low word first in memory.
-cbuffer Counts : register(b0) { uint instances; uint mappings; }
+cbuffer Counts : register(b0) { uint instances; }
 ByteAddressBuffer table : register(t0);
 RWByteAddressBuffer source : register(u0);
 RWByteAddressBuffer destination : register(u1);
 
-[RootSignature("RootConstants(num32BitConstants=2,b0), SRV(t0), UAV(u0), UAV(u1)")]
+[RootSignature("RootConstants(num32BitConstants=1,b0), SRV(t0), UAV(u0), UAV(u1)")]
 [numthreads(64, 1, 1)]
 void main(uint3 thread : SV_DispatchThreadID) {
     uint instance = thread.x + thread.y * (65535 * 64);
     if (instance >= instances) return;
     uint at = instance * 64;
     uint2 address = source.Load2(at + 56);
-    uint lo = 0, hi = mappings;
+    uint lo = 0, hi = table.Load(0);
     uint2 mapped = 0;
     while (lo < hi) {
         uint mid = lo + (hi - lo) / 2;
-        uint4 row = table.Load4(mid * 16);
+        uint4 row = table.Load4((mid + 1) * 16);
         if (all(row.xy == address)) {
             mapped = row.zw;
             break;
