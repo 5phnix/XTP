@@ -115,10 +115,10 @@ particle collision are under [probe and traced lighting][traced-lighting].
 
 | Hash | Stage | Role | Evidence | Confidence |
 |---|---|---|---|---|
-| `a1b20bc47e3c9597` | Compute | Traces sun-shadow visibility beyond the shadow cascades. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | high |
-| `e8c962358d862e3f` | Compute | Traces sun-shadow visibility beyond the shadow cascades. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | high |
-| `17829ac71aab4e8d` | Compute | Traces sun-shadow visibility beyond the shadow cascades. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | high |
-| `afeea48bbb9913ad` | Compute | Traces sun-shadow visibility beyond the shadow cascades. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | high |
+| `a1b20bc47e3c9597` | Compute | Traces sun-shadow visibility beyond the shadow cascades. Not dispatched in frame 707; consumer open. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | medium |
+| `e8c962358d862e3f` | Compute | Traces sun-shadow visibility beyond the shadow cascades. Not dispatched in frame 707; consumer open. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | medium |
+| `17829ac71aab4e8d` | Compute | Traces sun-shadow visibility beyond the shadow cascades. Not dispatched in frame 707; consumer open. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | medium |
+| `afeea48bbb9913ad` | Compute | Traces sun-shadow visibility beyond the shadow cascades. Not dispatched in frame 707; consumer open. | [DXR §4.1][dxr41], [Ray tracing §2][rt2] | medium |
 | `5f13c9550dc4ab39` | Compute | Traces irradiance-cache shadows when far-field tracing is disabled. | [Fallback §3][rtf3], code | high |
 | `e22a5d3d6857a2f5` | Compute | Clears the local-light shadow-mask counters before indirect dispatch arguments are built. | [Ray tracing §§2, 4][rt4] | high |
 
@@ -186,8 +186,11 @@ The title's instance-transform and skinning helpers are listed with the
 
 ### Stand-in and fallback paths
 
-XTP's [miss stand-in][rt1] fills outputs for dropped traces under the
-original dispatch hashes. The voxel and fallback variants below have
+XTP's [miss stand-in][rt1] is opt-in (`XTP_RT_STANDIN`, off by default).
+When it is on, it fills outputs for dropped traces under the original
+dispatch hashes. By default it clears only their texture outputs, to
+"every ray missed"; buffer outputs are filled only as
+`XTP_RT_STANDIN_FILL` says. The voxel and fallback variants below have
 their own hashes. The [fallback A/B][rtf82] observed the primary-probe
 and transparent-probe fallback dispatches and [measured their
 outputs][rtf83]. The irradiance cache skips its gather and shadow
