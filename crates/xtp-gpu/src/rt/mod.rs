@@ -81,6 +81,59 @@ fn buffer(rec: &Recorder<'_>, bytes: u64, state: D3D12_RESOURCE_STATES) -> Optio
     None
 }
 
+/// What a host DXR build builds, for the device-removed report's markers:
+/// a TLAS's instances, or a BLAS's geometries, triangles and largest
+/// vertex count and stride.
+///
+/// # Safety
+/// The active layout supplies NumDescs readable CPU descriptors or pointers to them.
+#[cfg(feature = "diagnostics")]
+unsafe fn describe(inputs: &Inputs) -> String {
+    let flags = inputs.Flags.0;
+    if inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL {
+        // SAFETY: TOP_LEVEL selects the instance address.
+        let at = unsafe { inputs.Anonymous.InstanceDescs };
+        return format!(
+            "TLAS of {} instances at {at:#x}, flags {flags:#x}",
+            inputs.NumDescs
+        );
+    }
+    let (mut triangles, mut vertices, mut stride) = (0u64, 0u32, 0u64);
+    for i in 0..inputs.NumDescs as usize {
+        // SAFETY: the caller's descriptions, in their layout.
+        let g = unsafe {
+            match inputs.DescsLayout {
+                D3D12_ELEMENTS_LAYOUT_ARRAY if !inputs.Anonymous.pGeometryDescs.is_null() => {
+                    inputs.Anonymous.pGeometryDescs.add(i).as_ref()
+                }
+                D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS
+                    if !inputs.Anonymous.ppGeometryDescs.is_null() =>
+                {
+                    (*inputs.Anonymous.ppGeometryDescs.add(i)).as_ref()
+                }
+                _ => None,
+            }
+        };
+        let Some(g) = g.filter(|g| g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) else {
+            continue;
+        };
+        // SAFETY: the type selects Triangles.
+        let t = unsafe { &g.Anonymous.Triangles };
+        let points = if t.IndexCount != 0 {
+            t.IndexCount
+        } else {
+            t.VertexCount
+        };
+        triangles += u64::from(points / 3);
+        vertices = vertices.max(t.VertexCount);
+        stride = stride.max(t.VertexBuffer.StrideInBytes);
+    }
+    format!(
+        "BLAS of {} geometries, {triangles} triangles, up to {vertices} vertices of stride          {stride}, flags {flags:#x}",
+        inputs.NumDescs
+    )
+}
+
 fn width(buffer: &ID3D12Resource) -> u64 {
     // SAFETY: the borrowed COM resource is live for this synchronous descriptor query.
     unsafe { buffer.GetDesc().Width }
@@ -92,8 +145,29 @@ struct Recorder<'a> {
     list: &'a HostList,
 }
 
+/// Whether the host records DXR work: the title's acceleration structure
+/// builds, copies and rehydrations, the empty TLAS and the trace commands.
+/// `XTP_RT_BUILDS=0` turns it all off, a diagnostic for sessions that do
+/// not test ray tracing: the title's structures are then refused, and
+/// traces that need a TLAS are dropped. Default: on.
+fn builds_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XTP_RT_BUILDS").map_or(true, |v| v.trim() != "0");
+        if !on {
+            tracing::warn!(
+                "XTP_RT_BUILDS=0: no host DXR work is recorded (the title's acceleration                  structures are refused, traces that need a TLAS are dropped)"
+            );
+        }
+        on
+    })
+}
+
 impl<'a> Recorder<'a> {
     fn new(list: &'a HostList) -> Option<Self> {
+        if !builds_on() {
+            return None;
+        }
         Some(Self {
             device: device(crate::host::made()?)?,
             commands: list.list.cast().ok()?,
@@ -149,6 +223,18 @@ impl<'a> Recorder<'a> {
             .then(|| compaction::request(self.list))
             .flatten();
         self.list.keep_rt_result(&result);
+        #[cfg(feature = "diagnostics")]
+        self.list.note_op(|| {
+            // SAFETY: the caller owns the geometry descriptions for this call.
+            let what = unsafe { describe(inputs) };
+            let at = at.map_or_else(|| "none".into(), |at| format!("{at:#x}"));
+            format!(
+                "host DXR build {what}, title address {at}, result {} at {:#x}, scratch {}",
+                sizes.ResultDataMaxSizeInBytes,
+                result.gpu(),
+                sizes.ScratchDataSizeInBytes
+            )
+        });
         // SAFETY: all GPU ranges are owned by this recording. The global barriers order prior
         // geometry writers, scratch reuse on the host queue and subsequent reads of the result.
         unsafe {
@@ -197,6 +283,15 @@ impl<'a> Recorder<'a> {
         let bytes = capacity;
         let dest = self.result(Some(at), bytes)?;
         self.list.keep_rt_result(&dest);
+        #[cfg(feature = "diagnostics")]
+        self.list.note_op(|| {
+            format!(
+                "host DXR copy mode {} of {:#x} to {:#x}, title address {at:#x}, {bytes} bytes",
+                mode.0,
+                source.result.gpu(),
+                dest.gpu()
+            )
+        });
         // SAFETY: independent AS resources in the required state, retained through execution.
         unsafe {
             self.commands.CopyRaytracingAccelerationStructure(
@@ -735,7 +830,7 @@ unsafe fn build_one(
     title_bytes: Option<u64>,
 ) -> bool {
     let dst = desc.DestAccelerationStructureData;
-    if dst == 0 {
+    if dst == 0 || !builds_on() {
         return false;
     }
     let generation = registry().begin(dst, title_bytes);
@@ -915,7 +1010,7 @@ impl Builder {
     /// # Safety
     /// `list` is a live title list.
     pub unsafe fn copy(&self, list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
-        if dst == 0 {
+        if dst == 0 || !builds_on() {
             return false;
         }
         let mode = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode);
@@ -1026,15 +1121,71 @@ fn readable(mut address: u64, end: u64) -> bool {
     true
 }
 
+/// Logs a title BLAS input refused before its build is recorded (counted;
+/// at powers of two): the BLAS build is refused with it.
+fn invalid<T>(geometry: usize, why: std::fmt::Arguments<'_>) -> Option<T> {
+    static INVALID: AtomicU64 = AtomicU64::new(0);
+    let invalid = INVALID.fetch_add(1, Ordering::Relaxed) + 1;
+    if invalid.is_power_of_two() {
+        tracing::warn!(
+            geometry,
+            invalid,
+            "host DXR BLAS input refused before its build is recorded: {why}"
+        );
+    }
+    None
+}
+
+/// The largest of the `count` indices of `size` bytes at title `address`,
+/// as title memory holds them now, read through the kernel (unmapped pages
+/// read as zeros, guarded ones raise nothing).
+fn largest_index(address: u64, count: u64, size: u64) -> u32 {
+    let Some(len) = count
+        .checked_mul(size)
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return u32::MAX;
+    };
+    let mut bytes = vec![0u8; len];
+    crate::host::copy_mapped(bytes.as_mut_ptr(), address as *const u8, len, false);
+    if size == 2 {
+        let (indices, _) = bytes.as_chunks::<2>();
+        indices
+            .iter()
+            .map(|&i| u32::from(u16::from_le_bytes(i)))
+            .max()
+            .unwrap_or(0)
+    } else {
+        let (indices, _) = bytes.as_chunks::<4>();
+        indices
+            .iter()
+            .map(|&i| u32::from_le_bytes(i))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 /// Translates indexed or non-indexed triangle descriptions to host addresses.
+/// Each input is checked first, and a BLAS with an invalid one is refused
+/// with a log ([`invalid`]): a geometry that is not triangles or has an
+/// unknown format, a vertex stride shorter than a vertex, a vertex or index
+/// count that is no whole number of triangles, vertices, indices or a
+/// transform outside title memory or misaligned, an index past the
+/// vertices (as title memory holds them when the build is recorded), or
+/// more geometries or triangles than DXR allows.
 ///
 /// # Safety
 /// The active layout supplies NumDescs readable CPU descriptors or pointers to them.
 unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
+    let count = inputs.NumDescs;
+    if count > D3D12_RAYTRACING_MAX_GEOMETRIES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE {
+        return invalid(0, format_args!("{count} geometries"));
+    }
     let mut geometries = Vec::new();
-    for i in 0..inputs.NumDescs as usize {
+    let mut total = 0u64;
+    for i in 0..count as usize {
         // SAFETY: the caller provides NumDescs CPU descriptions in the selected layout.
-        let mut g = unsafe {
+        let g = unsafe {
             let p = match inputs.DescsLayout {
                 D3D12_ELEMENTS_LAYOUT_ARRAY if !inputs.Anonymous.pGeometryDescs.is_null() => {
                     inputs.Anonymous.pGeometryDescs.add(i)
@@ -1044,12 +1195,18 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
                 {
                     *inputs.Anonymous.ppGeometryDescs.add(i)
                 }
-                _ => return None,
+                _ => return invalid(i, format_args!("no geometry descriptions")),
             };
-            *p.as_ref()?
+            p.as_ref().copied()
+        };
+        let Some(mut g) = g else {
+            return invalid(i, format_args!("a null geometry description"));
         };
         if g.Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES {
-            return None;
+            return invalid(
+                i,
+                format_args!("geometry type {} (triangles only)", g.Type.0),
+            );
         }
         // SAFETY: the geometry type selects Triangles in our own copy.
         let t = unsafe { &mut g.Anonymous.Triangles };
@@ -1058,16 +1215,30 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
             DXGI_FORMAT_R32G32_FLOAT => (8, 4),
             DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (8, 2),
             DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_SNORM => (4, 2),
-            _ => return None,
+            format => return invalid(i, format_args!("vertex format {}", format.0)),
         };
         let stride = t.VertexBuffer.StrideInBytes;
-        if stride > u32::MAX.into() || !stride.is_multiple_of(alignment) {
-            return None;
+        if stride < width || stride > u32::MAX.into() || !stride.is_multiple_of(alignment) {
+            return invalid(
+                i,
+                format_args!("vertex stride {stride} for vertices of {width} bytes"),
+            );
         }
-        let bytes = u64::from(t.VertexCount.checked_sub(1)?)
-            .checked_mul(stride)?
-            .checked_add(width)?;
-        t.VertexBuffer.StartAddress = range(list, t.VertexBuffer.StartAddress, bytes, alignment)?;
+        let vertices = t.VertexCount;
+        let Some(bytes) = vertices
+            .checked_sub(1)
+            .and_then(|last| u64::from(last).checked_mul(stride)?.checked_add(width))
+        else {
+            return invalid(i, format_args!("no vertex"));
+        };
+        let start = t.VertexBuffer.StartAddress;
+        let Some(host) = range(list, start, bytes, alignment) else {
+            return invalid(
+                i,
+                format_args!("vertices {start:#x}+{bytes:#x} outside title memory or misaligned"),
+            );
+        };
+        t.VertexBuffer.StartAddress = host;
         if t.IndexFormat == DXGI_FORMAT_R16_TYPELESS {
             t.IndexFormat = DXGI_FORMAT_R16_UINT;
         }
@@ -1075,20 +1246,56 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
             DXGI_FORMAT_UNKNOWN if t.IndexCount == 0 && t.IndexBuffer == 0 => 0,
             DXGI_FORMAT_R16_UINT => 2,
             DXGI_FORMAT_R32_UINT => 4,
-            _ => return None,
+            format => {
+                return invalid(
+                    i,
+                    format_args!("index format {} with {} indices", format.0, t.IndexCount),
+                );
+            }
         };
+        let points = if index_size == 0 {
+            vertices
+        } else {
+            t.IndexCount
+        };
+        if points == 0 || points % 3 != 0 {
+            return invalid(
+                i,
+                format_args!("{points} vertices or indices: no whole triangles"),
+            );
+        }
+        total += u64::from(points / 3);
         if index_size != 0 {
-            t.IndexBuffer = range(
-                list,
-                t.IndexBuffer,
-                u64::from(t.IndexCount) * index_size,
-                index_size,
-            )?;
+            let (at, n) = (t.IndexBuffer, u64::from(t.IndexCount));
+            let Some(host) = range(list, at, n * index_size, index_size) else {
+                return invalid(
+                    i,
+                    format_args!("{n} indices at {at:#x} outside title memory or misaligned"),
+                );
+            };
+            let largest = largest_index(at, n, index_size);
+            if largest >= vertices {
+                return invalid(
+                    i,
+                    format_args!("index {largest} at {at:#x} past its {vertices} vertices"),
+                );
+            }
+            t.IndexBuffer = host;
         }
         if t.Transform3x4 != 0 {
-            t.Transform3x4 = range(list, t.Transform3x4, 48, 16)?;
+            let at = t.Transform3x4;
+            let Some(host) = range(list, at, 48, 16) else {
+                return invalid(
+                    i,
+                    format_args!("a transform at {at:#x} outside title memory or misaligned"),
+                );
+            };
+            t.Transform3x4 = host;
         }
         geometries.push(g);
+    }
+    if total > u64::from(D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE) {
+        return invalid(0, format_args!("{total} triangles"));
     }
     Some(geometries)
 }

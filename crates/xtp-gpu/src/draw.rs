@@ -261,6 +261,10 @@ impl Drop for State {
 /// translator declares 64 KiB).
 const CBV_SPAN: u64 = 1 << 16;
 
+/// Bytes of each root CBV [`State::dump_at_submission`] logs.
+#[cfg(feature = "diagnostics")]
+const DUMPED_CBV_BYTES: u64 = 384;
+
 /// The way this CBV is filled and the last list write affecting its bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CbvInput {
@@ -2460,6 +2464,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.dump_at_submission(list, None);
         let _timed = crate::timestamps::command(list, crate::timestamps::What::Dispatch, Some(p));
         // SAFETY: an open list with everything set; the barrier names no
         // resource.
@@ -2562,6 +2568,108 @@ impl State {
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         text
+    }
+
+    /// Diagnostics (`XTP_DUMP_DISPATCH_INPUTS=<program hash>,...`, each
+    /// the start of a program's hash): for each dispatch of a matching
+    /// program, logs at its list's submission what title memory holds
+    /// then: the first [`DUMPED_CBV_BYTES`] bytes of each root CBV, and the
+    /// 12 bytes of group counts an indirect one reads at `arguments` (what
+    /// the CPU left there: a GPU writer runs after the submission). With
+    /// `XTP_D3D12_DRED`, the device-removed report names the dispatches in
+    /// flight by the same program and root addresses ([`State::op_text`]).
+    #[cfg(feature = "diagnostics")]
+    fn dump_at_submission(&self, list: &HostList, arguments: Option<u64>) {
+        static PROGRAMS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let programs = PROGRAMS.get_or_init(|| {
+            std::env::var("XTP_DUMP_DISPATCH_INPUTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        });
+        if programs.is_empty() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        for stage in &p.stages {
+            let program = stage.shader.hash.to_string();
+            if !programs.iter().any(|w| program.starts_with(w.as_str())) {
+                continue;
+            }
+            let mut reads: Vec<(String, u64, u64)> = Vec::new();
+            for &(slot, _) in &stage.root_cbvs {
+                if let Some(&Root::View(address)) = self.roots_ref(true).get(usize::from(slot)) {
+                    reads.push((format!("root CBV s{slot}"), address, DUMPED_CBV_BYTES));
+                }
+            }
+            // CBVs in descriptor tables: the bytes their views name.
+            let t = stage.translated();
+            for u in t.used.iter().filter(|u| u.kind == ResourceType::Cbv) {
+                if u.root != RootType::Table {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot))
+                else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(View::Constant(address, size)) = crate::descriptor::view(handle) {
+                    let what = format!("table CBV s{}+{}", u.slot, u.table_offset_dwords);
+                    let bytes = u64::from(size).clamp(4, DUMPED_CBV_BYTES);
+                    reads.push((what, address, bytes));
+                }
+            }
+            if let Some(at) = arguments {
+                reads.push(("indirect group counts".into(), at, 12));
+            }
+            // Inline constants: the user data the program reads, as set now.
+            let user_data: Vec<String> = t
+                .host
+                .user_data
+                .iter()
+                .map(|u| {
+                    let v = self.user_value(true, u.slot, u.root, u.dword);
+                    format!("u{}={v:#x}", u.index)
+                })
+                .collect();
+            tracing::info!(
+                program,
+                list = format_args!("{:#x}", list.list.as_raw() as usize),
+                user_data = user_data.join(" "),
+                "a dispatch's user data at its recording"
+            );
+            let host_list = list.list.as_raw() as usize;
+            list.defer_host((0, 0), move || {
+                for (what, address, len) in &reads {
+                    // Read through the kernel: unmapped pages read as zeros.
+                    let mut bytes = vec![0u8; *len as usize];
+                    crate::host::copy_mapped(
+                        bytes.as_mut_ptr(),
+                        *address as *const u8,
+                        bytes.len(),
+                        false,
+                    );
+                    let (words, _) = bytes.as_chunks::<4>();
+                    let words = words
+                        .iter()
+                        .map(|&w| format!("{:08x}", u32::from_le_bytes(w)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tracing::info!(
+                        program,
+                        list = format_args!("{host_list:#x}"),
+                        what,
+                        address = format_args!("{address:#x}"),
+                        words,
+                        "a dispatch's input at its submission"
+                    );
+                }
+            });
+        }
     }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
@@ -3371,6 +3479,10 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.dump_at_submission(list, Some(arguments));
+        }
         let _timed = crate::timestamps::command(
             list,
             crate::timestamps::What::Indirect(kind),

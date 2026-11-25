@@ -289,6 +289,12 @@ fn compose(
     ));
     let gpu = args.gpu(arguments);
     let shape = [records, stride, u32::from(counter.is_some())];
+    #[cfg(feature = "diagnostics")]
+    rec.list.note_op(|| {
+        format!(
+            "host DXR trace commands: {records} records of {stride} bytes at title address              {arguments:#x}, count at {count:#x?}, TLAS at title address {address:#x}"
+        )
+    });
     // SAFETY: each root view covers the shader's checked range. The global
     // barrier orders the title's GPU writers of the arguments before the
     // pass; the recording retains its inputs and output.

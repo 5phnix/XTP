@@ -1001,3 +1001,41 @@ fn rt_current_slots_win_over_recorded_ones() {
     );
     assert_eq!(chosen(&slot(None), &slot(None)), None);
 }
+
+/// A BLAS input DXR cannot build from is refused before its build is
+/// recorded: an index past the vertices, a count that is no whole number
+/// of triangles, a stride shorter than a vertex.
+#[test]
+fn rt_invalid_blas_inputs_are_refused_before_their_build() {
+    let test = "rt_invalid_blas_inputs_are_refused_before_their_build";
+    let Some(_gpu) = crate::testgpu::device(test) else {
+        return;
+    };
+    let list = TitleList::new();
+    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+    vertices.set_words(|i| POSITIONS[i].to_bits());
+    let translate = |g: &Geometry| {
+        // SAFETY: the test owns the descriptor and the buffers it names.
+        unsafe { triangles(list.host(), &blas_input(g)) }.is_some()
+    };
+    let valid = geometry(&vertices, &indices);
+    indices.set_words(|i| [1 << 16, 2][i]);
+    assert!(translate(&valid));
+    // Index 3 of three vertices.
+    indices.set_words(|i| [1 << 16, 3][i]);
+    assert!(!translate(&valid), "an index past the vertices");
+    indices.set_words(|i| [1 << 16, 2][i]);
+    let mut two = valid;
+    two.Anonymous.Triangles.IndexCount = 2;
+    assert!(!translate(&two), "no whole triangle");
+    let mut overlapping = valid;
+    overlapping.Anonymous.Triangles.VertexBuffer.StrideInBytes = 4;
+    assert!(!translate(&overlapping), "a stride shorter than a vertex");
+    let mut unindexed = valid;
+    // SAFETY: the test's own triangle description.
+    unsafe {
+        let t = &mut unindexed.Anonymous.Triangles;
+        (t.IndexFormat, t.IndexCount, t.IndexBuffer) = (DXGI_FORMAT_UNKNOWN, 0, 0);
+    }
+    assert!(translate(&unindexed), "three vertices without indices");
+}

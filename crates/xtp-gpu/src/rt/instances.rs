@@ -223,6 +223,10 @@ pub(super) fn rewrite(
         *destination.0.lock().unwrap_or_else(|e| e.into_inner()) = chosen;
     });
     rec.list.keep(&dst);
+    #[cfg(feature = "diagnostics")]
+    rec.list.note_op(|| {
+        format!("host DXR instance rewrite of {count} instances at title address {address:#x}")
+    });
     let constants = [count, stand_in as u32, (stand_in >> 32) as u32];
     // SAFETY: each root view covers the shader's checked range. The recording retains its
     // inputs and output, and the transition orders rewrite stores before the DXR build.
