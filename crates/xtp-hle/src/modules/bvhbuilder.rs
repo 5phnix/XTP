@@ -193,6 +193,8 @@ impl Call {
                         flags,
                         vertex_format = t.VertexFormat.0,
                         index_format = t.IndexFormat.0,
+                        vertex_address = t.VertexBuffer.StartAddress,
+                        index_address = t.IndexBuffer,
                         vertices = t.VertexCount,
                         indices = t.IndexCount,
                         stride = t.VertexBuffer.StrideInBytes,

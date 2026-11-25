@@ -188,7 +188,10 @@ impl<'a> Recorder<'a> {
                 if measured == 0 {
                     capacity
                 } else {
-                    measured.checked_next_multiple_of(256)?.min(capacity)
+                    if measured > capacity {
+                        return None;
+                    }
+                    measured
                 }
             }
             _ => return None,

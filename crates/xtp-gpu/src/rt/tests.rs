@@ -211,7 +211,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         ));
         assert_eq!(
             width(&registry().structures[&compacted.address()].result),
-            bytes.next_multiple_of(256)
+            bytes
         );
         assert!(copy(
             list.this(),
