@@ -375,14 +375,18 @@ shows the title calls them.
 ### R10. Relaunch and restart on crash, live — S (restart-on-crash done; live relaunch untested)
 - **Goal:** confirm `XLaunchNewGame` (wait for the old process, start again
   with the arguments) on the real title. `XLaunchRestartOnCrash` (record the
-  arguments; the crash reporter relaunches once) is done.
-- **Files:** `crates/xtp-hle/src/modules/xgame.rs`, `modules/lifecycle.rs`,
-  `apps/xtp/src/run.rs` (relaunch path).
+  arguments; relaunch once on a fatal unhandled SEH exception) is done.
+  The title's filter can resume execution. Under `--autopilot`, an armed
+  restart is logged and skipped. After a successful spawn, the crashing
+  process exits with code 1 and the replacement waits for it to exit.
+- **Files:** `crates/xtp-hle/src/modules/{xgame,lifecycle,kernel}.rs`,
+  `crates/xtp-loader/src/crash.rs`, `apps/xtp/src/run.rs`.
 - **xcl ref:** `hle/xgameruntime/api.rs` `XLaunchNewGame`,
   `XLaunchRestartOnCrash`.
 - **Acceptance:** a child-process test (pattern of the save crash test):
   a probe calling restart-on-crash then faulting is started a second time
-  with the recorded arguments, and only once.
+  with the recorded arguments, and only once. The probe also covers a title
+  filter resuming execution and an unattended run keeping its original exit.
 - **Depends on:** —
 
 ### R7. Closed captions and high contrast — S (done)
@@ -510,7 +514,7 @@ shows the title calls them.
 | 8 | A1 Opus check | S | — |
 | 9 | I2 mouse as right stick | M | I1 |
 | 10 | R5 message/error dialogs (done) | M | (R1) |
-| 11 | R10 relaunch, restart on crash | S | — |
+| 11 | R10 relaunch, restart on crash | S | Restart tested; live relaunch pending |
 | 12 | R7 closed captions, high contrast (done) | S | — |
 | 13 | R6 speech synthesis (done) | M | — |
 | 14 | I3 trigger rumble | M | — |

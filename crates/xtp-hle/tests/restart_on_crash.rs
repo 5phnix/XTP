@@ -1,172 +1,228 @@
-//! Child-process test for `XLaunchRestartOnCrash` (issue #11 / R10):
-//! a probe registers restart-on-crash arguments, triggers an unhandled fault,
-//! is automatically relaunched with the recorded arguments after waiting for
-//! the crashing process to exit, and does not relaunch a third time when it
-//! faults again.
+//! Isolated child-process probes for crash restart, the title's unhandled
+//! exception filter, and unattended runs.
 #![cfg(windows)]
 
-use std::ffi::{CString, c_char};
+use std::ffi::{c_char, c_void};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
 
-use xtp_hle::modules::{lifecycle, xgame, xgameruntime};
+use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, RaiseException,
+    SEM_NOGPFAULTERRORBOX, SetErrorMode,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, EVENT_MODIFY_STATE, GetExitCodeProcess, OpenEventW, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    SYNCHRONIZATION_SYNCHRONIZE, SetEvent, TerminateProcess, WaitForSingleObject,
+};
+use xtp_hle::modules::{kernel, lifecycle, xgame, xgameruntime};
 
-const PROBE_LOG_ENV: &str = "XTP_RESTART_PROBE_LOG";
+const PROBE_DIR_ENV: &str = "XTP_RESTART_PROBE_DIR";
+const RECOVERABLE_EXCEPTION: u32 = 0xE042_4700;
+const STATUS_ACCESS_VIOLATION: u32 = EXCEPTION_ACCESS_VIOLATION as u32;
+const TIMEOUT_MS: u32 = 10_000;
+static LOG: OnceLock<PathBuf> = OnceLock::new();
 
 fn main() {
-    if let Some(log_path) = std::env::var_os(PROBE_LOG_ENV) {
-        run_child(PathBuf::from(log_path));
+    if let Some(dir) = std::env::var_os(PROBE_DIR_ENV) {
+        run_child(Path::new(&dir));
     } else {
-        run_parent();
+        run_parent("default", &[]);
+        run_parent(
+            "title-filter",
+            &["filter resumed", "execution resumed", "filter searched"],
+        );
+        run_parent("autopilot", &[]);
     }
 }
 
-fn run_parent() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let log_path = dir.path().join("runs.log");
-
-    let exe = std::env::current_exe().expect("test binary path");
-    let status = Command::new(&exe)
-        .arg("--probe-mode")
-        .env(PROBE_LOG_ENV, &log_path)
+fn run_parent(mode: &str, filter_log: &[&str]) {
+    let dir = tempfile::tempdir().expect("probe directory");
+    let dir = dir.path();
+    let ready = event(dir, "ready", true);
+    let proceed = event(dir, "proceed", true);
+    let child = Command::new(std::env::current_exe().expect("test binary path"))
+        .arg(mode)
+        .env(PROBE_DIR_ENV, dir)
         .env_remove("XTP_CRASH_RESTARTED")
         .env_remove("XTP_RELAUNCHED_FROM")
-        .status()
-        .expect("spawn initial child");
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "initial child should terminate with exit code 1 after spawning its replacement"
-    );
+        .spawn()
+        .expect("spawn initial probe");
 
-    // Wait for the restarted grandchild to start and log its PID.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut grandchild_pid = None;
-    while Instant::now() < deadline {
-        if let Ok(text) = std::fs::read_to_string(&log_path) {
-            let lines: Vec<&str> = text.lines().collect();
-            if lines.len() >= 2 {
-                grandchild_pid = lines[1]
-                    .strip_prefix("pid=")
-                    .and_then(|rest| rest.split_whitespace().next())
-                    .and_then(|s| s.parse::<u32>().ok());
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    // Deterministically wait for the restarted grandchild to fault and exit,
-    // killing it if the wait times out. Asserting its exit code is
-    // STATUS_ACCESS_VIOLATION (0xC0000005) proves it did not take the
-    // crash-restart path (which exits with 1) and therefore spawned no third
-    // process.
-    let pid = grandchild_pid.expect("restarted grandchild never logged its PID");
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
-        };
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        // SAFETY: opening the grandchild PID to wait, query exit code, or kill
-        // on timeout.
-        let handle = unsafe {
+    let status = wait_for_exit(child.as_raw_handle(), "initial probe");
+    if mode == "autopilot" {
+        assert_eq!(status, STATUS_ACCESS_VIOLATION, "autopilot's original exit");
+        assert!(!dir.join("replacement.pid").exists());
+    } else {
+        assert_eq!(status, 1, "crash-restart exit for {mode}");
+        // The replacement publishes its PID and waits before it can fault.
+        // Hold its process handle before allowing it to proceed.
+        wait_for_event(&ready, "replacement PID");
+        let pid = std::fs::read_to_string(dir.join("replacement.pid"))
+            .expect("read replacement PID")
+            .parse()
+            .expect("parse replacement PID");
+        // SAFETY: the waiting replacement published this PID.
+        let process = unsafe {
             OpenProcess(
                 PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
                 0,
                 pid,
             )
         };
-        if !handle.is_null() {
-            // SAFETY: valid process handle returned by `OpenProcess`.
-            let wait = unsafe { WaitForSingleObject(handle, 10_000) };
-            if wait != WAIT_OBJECT_0 {
-                // SAFETY: terminating a timed-out test grandchild.
-                unsafe {
-                    TerminateProcess(handle, 1);
-                    CloseHandle(handle);
-                }
-                panic!("restarted grandchild (pid={pid}) did not exit within 10 s");
-            }
-            let mut exit_code = 0u32;
-            // SAFETY: querying exit code of the exited grandchild handle.
-            let got = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
-            // SAFETY: closing the handle from `OpenProcess`.
-            unsafe { CloseHandle(handle) };
-            assert_ne!(got, 0, "GetExitCodeProcess failed");
-            assert_eq!(
-                exit_code, STATUS_ACCESS_VIOLATION,
-                "grandchild should exit with STATUS_ACCESS_VIOLATION (not relaunch again), got {exit_code:#x}"
-            );
-        }
+        let process = own_handle(process, "open replacement process");
+        signal(&proceed);
+        assert_eq!(
+            wait_for_exit(process.as_raw_handle(), "replacement probe"),
+            STATUS_ACCESS_VIOLATION,
+            "the replacement must exit with the exception code instead of spawning again"
+        );
     }
 
-    let final_text = std::fs::read_to_string(&log_path).expect("read probe log");
-    let final_lines: Vec<&str> = final_text.lines().collect();
-
-    assert_eq!(
-        final_lines.len(),
-        2,
-        "expected exactly 2 runs (initial + 1 restart), got {final_lines:?}"
-    );
-    assert!(
-        final_lines[0].contains("--probe-mode") && !final_lines[0].contains("-recover"),
-        "unexpected run 1 args: {}",
-        final_lines[0]
-    );
-    assert!(
-        final_lines[1].contains("--probe-mode") && final_lines[1].contains("-- -recover -slot=3"),
-        "run 2 did not receive recorded restart arguments: {}",
-        final_lines[1]
-    );
-    println!("test restart_on_crash ... ok");
+    let log = std::fs::read_to_string(dir.join("runs.log")).expect("read probe log");
+    let mut expected = vec![mode];
+    expected.extend_from_slice(filter_log);
+    let replacement_args = format!("{mode} -- -recover -slot=3");
+    if mode != "autopilot" {
+        expected.push(&replacement_args);
+    }
+    assert_eq!(log.lines().collect::<Vec<_>>(), expected);
 }
 
-fn run_child(log_path: PathBuf) {
+fn own_handle(handle: RawHandle, operation: &str) -> OwnedHandle {
+    assert!(
+        !handle.is_null(),
+        "{operation}: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the successful Win32 call returned a new handle to close.
+    unsafe { OwnedHandle::from_raw_handle(handle) }
+}
+
+fn event(dir: &Path, name: &str, create: bool) -> OwnedHandle {
+    let name = format!(
+        "Local\\xtp-restart-{}-{name}",
+        dir.file_name().unwrap().to_string_lossy()
+    );
+    let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    // SAFETY: the event name is NUL-terminated. Only the parent creates the
+    // events, and each signal wakes one waiter.
+    let handle = unsafe {
+        if create {
+            CreateEventW(std::ptr::null(), 0, 0, name.as_ptr())
+        } else {
+            OpenEventW(
+                EVENT_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE,
+                0,
+                name.as_ptr(),
+            )
+        }
+    };
+    own_handle(handle, "open probe event")
+}
+
+fn signal(event: &OwnedHandle) {
+    // SAFETY: the event handle is live and allows signalling.
+    assert_ne!(unsafe { SetEvent(event.as_raw_handle()) }, 0);
+}
+
+fn wait_for_event(event: &OwnedHandle, what: &str) {
+    // SAFETY: the event handle is live and allows waiting.
+    let wait = unsafe { WaitForSingleObject(event.as_raw_handle(), TIMEOUT_MS) };
+    assert_eq!(wait, WAIT_OBJECT_0, "waiting for {what}");
+}
+
+fn wait_for_exit(process: RawHandle, what: &str) -> u32 {
+    // SAFETY: callers hold a live process handle with wait, query and
+    // terminate rights throughout this call.
+    unsafe {
+        let wait = WaitForSingleObject(process, TIMEOUT_MS);
+        if wait != WAIT_OBJECT_0 {
+            TerminateProcess(process, 1);
+            WaitForSingleObject(process, TIMEOUT_MS);
+            panic!("waiting for {what} to exit: {wait:#x}");
+        }
+        let mut code = 0;
+        assert_ne!(GetExitCodeProcess(process, &mut code), 0);
+        code
+    }
+}
+
+fn log(line: &str) {
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(LOG.get().expect("probe log path"))
+        .expect("open probe log");
+    writeln!(log, "{line}").expect("write probe log");
+}
+
+extern "system" fn title_filter(info: *const c_void) -> i32 {
+    // SAFETY: Windows supplies the active exception pointers to the filter.
+    let code = unsafe { (*(*info.cast::<EXCEPTION_POINTERS>()).ExceptionRecord).ExceptionCode };
+    if code as u32 == RECOVERABLE_EXCEPTION {
+        log("filter resumed");
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        log("filter searched");
+        EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
+fn run_child(dir: &Path) {
     lifecycle::wait_for_previous();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .expect("open probe log");
-        writeln!(f, "pid={} args={}", std::process::id(), args.join(" ")).expect("write probe log");
-        let _ = f.flush();
+    // SAFETY: this probe process can suppress dialogs for its own fault.
+    unsafe { SetErrorMode(SEM_NOGPFAULTERRORBOX) };
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    LOG.set(dir.join("runs.log")).expect("set probe log path");
+    log(&args.join(" "));
+
+    let replacement = args.iter().any(|arg| arg == "--");
+    if replacement {
+        let ready = event(dir, "ready", false);
+        let proceed = event(dir, "proceed", false);
+        std::fs::write(dir.join("replacement.pid"), std::process::id().to_string())
+            .expect("publish replacement PID");
+        signal(&ready);
+        wait_for_event(&proceed, "parent to open the replacement process");
     }
 
     xtp_loader::report_crashes();
-    xtp_loader::on_crash(lifecycle::relaunch_on_crash);
+    lifecycle::install_crash_restart(args[0] == "autopilot");
 
-    // Call XLaunchRestartOnCrash through TITLE_OBJECT vtable slot 0x28.
     let obj = &xgame::TITLE_OBJECT;
     type RestartOnCrash = extern "system" fn(
         *const xgameruntime::Object,
         *const c_char,
         u32,
     ) -> xgameruntime::HRESULT;
-    // SAFETY: `TITLE_OBJECT`'s first word is its vtable; slot 5 (offset 0x28)
-    // is `launch_restart_on_crash`.
+    // SAFETY: `TITLE_OBJECT` starts with its vtable; slot 5 implements
+    // `XLaunchRestartOnCrash` with this signature.
     let restart: RestartOnCrash = unsafe {
-        let vtable = *(obj as *const xgameruntime::Object as *const *const *const ());
+        let vtable = *std::ptr::from_ref(obj).cast::<*const *const ()>();
         std::mem::transmute(*vtable.add(5))
     };
+    assert!(restart(obj, std::ptr::null(), 1) < 0);
+    assert_eq!(
+        restart(obj, c"-recover -slot=3".as_ptr(), 0),
+        xgameruntime::S_OK
+    );
 
-    let bad_hr = restart(obj, std::ptr::null(), 1);
-    assert!(bad_hr < 0, "non-zero reserved must fail");
-
-    let recorded = CString::new("-recover -slot=3").unwrap();
-    let hr = restart(obj, recorded.as_ptr(), 0);
-    assert_eq!(hr, xgameruntime::S_OK);
-
-    // Deliberately trigger an unhandled access violation so `report_unhandled`
-    // invokes the registered crash-restart hook.
-    // SAFETY: intentional null write in an isolated child probe process.
-    unsafe {
-        std::ptr::write_volatile(std::ptr::null_mut::<u32>(), 0xdead_beef);
+    if !replacement && args[0] == "title-filter" {
+        kernel::SetUnhandledExceptionFilter(title_filter as *const () as usize);
+        // SAFETY: a continuable test exception with no arguments. The title
+        // filter resumes it without editing the processor context.
+        unsafe { RaiseException(RECOVERABLE_EXCEPTION, 0, 0, std::ptr::null()) };
+        log("execution resumed");
     }
+
+    // SAFETY: a synthetic access violation in this isolated probe. Its two
+    // arguments describe a write to address zero.
+    unsafe { RaiseException(STATUS_ACCESS_VIOLATION, 0, 2, [1, 0].as_ptr()) };
+    panic!("the access violation returned");
 }

@@ -55,19 +55,20 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Optional callback invoked once after an unhandled crash is reported
-/// (used by `XLaunchRestartOnCrash`). Stored in an atomic pointer so crash
-/// handling never blocks on a mutex.
+/// Optional callback for a fatal unhandled exception. The atomic pointer
+/// lets the exception filter take the callback without locking.
 static ON_CRASH: std::sync::atomic::AtomicPtr<()> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-/// Registers a callback to run once after an unhandled crash has been
-/// reported (before the process terminates).
+/// Registers a callback to run once, after reporting a fatal unhandled
+/// exception and giving the title's filter a chance to resume execution.
 pub fn on_crash(hook: fn()) {
     ON_CRASH.store(hook as *mut (), Ordering::Release);
 }
 
-fn run_on_crash() {
+/// Runs the callback from a top-level exception filter after reporting the
+/// exception, when no title filter resumes execution.
+pub fn run_on_crash() {
     static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if FIRED.swap(true, Ordering::SeqCst) {
         return;
@@ -162,6 +163,7 @@ pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         unsafe { report_unhandled(info) };
+        run_on_crash();
         EXCEPTION_CONTINUE_SEARCH
     }
     static INSTALL: std::sync::Once = std::sync::Once::new();
@@ -613,15 +615,14 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     EXCEPTION_CONTINUE_SEARCH
 }
 
-/// For an unhandled-exception filter: reports the exception that is about
-/// to end the process, and appends it to the crash log.
+/// Reports an exception from a top-level filter and appends it to the crash
+/// log. The title's filter may still resume execution.
 ///
 /// # Safety
 /// `info` comes from the system, for an exception being dispatched.
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
-    run_on_crash();
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),

@@ -258,23 +258,34 @@ pub(crate) fn set_restart_on_crash(args: Vec<std::ffi::OsString>) {
     *RESTART_ON_CRASH.lock().unwrap_or_else(|e| e.into_inner()) = Some(args);
 }
 
-/// Crash-reporter hook (`xtp_loader::on_crash`): if `XLaunchRestartOnCrash`
-/// recorded arguments and this process was not already restarted from a crash,
-/// spawns a replacement process once with [`CRASH_RESTARTED`] set and ends
-/// this process immediately so the two instances never overlap.
-pub fn relaunch_on_crash() {
+/// Installs the hook for fatal unhandled exceptions. Autopilot logs a skip
+/// if the title armed a restart, so its harness can observe the original exit.
+pub fn install_crash_restart(autopilot: bool) {
+    xtp_loader::on_crash(if autopilot {
+        || relaunch_on_crash(true)
+    } else {
+        || relaunch_on_crash(false)
+    });
+}
+
+fn relaunch_on_crash(autopilot: bool) {
+    let Some(args) = RESTART_ON_CRASH
+        .try_lock()
+        .ok()
+        .and_then(|mut args| args.take())
+    else {
+        return;
+    };
+    if autopilot {
+        tracing::info!("skipping crash restart: autopilot is enabled");
+        return;
+    }
     if ALREADY_CRASH_RESTARTED.load(Ordering::Relaxed)
         || std::env::var_os(CRASH_RESTARTED).is_some()
     {
         tracing::info!("skipping crash restart: already restarted once");
         return;
     }
-    let Ok(mut guard) = RESTART_ON_CRASH.try_lock() else {
-        return;
-    };
-    let Some(args) = guard.take() else {
-        return;
-    };
     if relaunch_with_env(args, Some((CRASH_RESTARTED, "1"))) {
         // Terminate directly from the crash filter without running normal
         // shutdown hooks (saving the pipeline cache or releasing input could
