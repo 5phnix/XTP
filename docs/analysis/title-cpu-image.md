@@ -350,8 +350,10 @@ image. Limits:
   - the full analysis (`analyze-job.ps1`): project `D:\re\proj\title`,
     4 threads, Java heap 12 GB, so that the heap plus a ~24 GB game session
     stay under the VM's 64 GB minus 4 GB (Samuel). It is bound by its
-    database's I/O: one thread at about 35 %, 0.7 GB in use. It was still
-    in its entry-point disassembly when this page was written;
+    database's I/O: one thread at about 30 %, 0.7 to 1 GB in use. After
+    two hours it was still in its entry-point disassembly of the
+    executable's ~300 000 functions. It was stopped before delivery, so
+    that no process stays on the VM; `analyze-job.ps1` starts it again;
   - targeted queries (`q-job.ps1`, `ReaQuery.java`): a project imported
     **without analysis** (2 min). The script makes the function at each
     `.pdata` entry and decompiles it: 30 functions in 26 s. That gave
@@ -380,8 +382,10 @@ E:\xtp-data\re\py\Scripts\python.exe -I E:\xtp-data\re\scripts\sgd5_names.py <pa
 E:\xtp-data\re\py\Scripts\python.exe -I E:\xtp-data\re\scripts\passes_named.py <passes-N.txt> E:\xtp-data\re\out\shader-names.tsv "<regex>" --outputs
 # static queries (commands in a file: str, refs, func, dis, callers)
 E:\xtp-data\re\py\Scripts\python.exe -I E:\xtp-data\re\scripts\exe_scan.py <exe> <commands> <out>
-# VM: targeted decompilation (commands in D:\re\scripts\q-cmds.txt: decomp, refs, callers, str, bytes, ptrs)
-tools\cloud\invoke-vm.ps1 -Command "Start-ScheduledTask -TaskName rea-q-job"
+# VM: targeted decompilation (commands in D:\re\scripts\q-cmds.txt: decomp, refs, callers, str, bytes, ptrs);
+# vm-start-q.ps1 registers the scheduled task rea-q-job and starts it, vm-stop-re.ps1 stops and removes it
+tools\cloud\invoke-vm.ps1 -File E:\xtp-data\re\scripts\vm-start-q.ps1
+E:\xtp-data\re\scripts\vm-xfer.ps1 -Get D:\re\out\q-out.txt -To E:\xtp-data\re\out\vm\q-out.txt
 ```
 
 ### Not done, and why
@@ -393,6 +397,5 @@ tools\cloud\invoke-vm.ps1 -Command "Start-ScheduledTask -TaskName rea-q-job"
   writers only. Which game mode its value 1 stands for is not established.
 - **Q2's per-program census** of which descriptor dwords are read as
   numbers belongs with the tracer (d687ecdb).
-- **The full Ghidra analysis** had not finished when this page was
-  written. It adds data references and switch tables, not the answers
-  above.
+- **The full Ghidra analysis** was stopped unfinished (§5). It would add
+  data references and switch tables, not the answers above.
