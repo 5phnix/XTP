@@ -802,6 +802,47 @@ fn geometry_emits_share_one_lane_mask() {
     assert_eq!(program(&[], true), Err(geometry::MASKED));
 }
 
+/// An emit after a join where one side narrowed EXEC and nothing after the
+/// join reads EXEC (a message reads M0 alone), so no phi joins the two
+/// masks: the emit's mask depends on the path, and it is refused whichever
+/// side narrows it (Codex review of W10's review fixes). When both sides
+/// keep the entry's mask, the emit is numbered.
+#[test]
+fn geometry_emit_after_a_join_without_an_exec_phi() {
+    let saveexec = sop1(S_AND_SAVEEXEC_B64, 40, 42);
+    let other = sop1(S_MOV_B32, 50, int(1));
+    // Vertices 0-2 written and 0-1 emitted under the entry's mask, then a
+    // branch on user data, `taken` on one side and `fallen` on the other,
+    // and vertex 2's emit after the join.
+    let program = |taken: u32, fallen: u32| {
+        let mut code = Code::default();
+        gs_prelude(&mut code, 3 * VERTEX_DWORDS * 4);
+        for (n, k) in [0u8, 1, 2].into_iter().enumerate() {
+            gs_vertex(&mut code, n as u32, k);
+        }
+        code.add([EMIT, EMIT, sopc(S_CMP_EQ_U32, 9, int(0))]);
+        code.branch(S_CBRANCH_SCC1, "taken");
+        code.add([fallen]);
+        code.branch(S_BRANCH, "join");
+        code.label("taken");
+        code.add([taken]);
+        code.label("join");
+        code.add([EMIT, DONE, S_ENDPGM]);
+        let p = code.program();
+        let join = p.blocks.iter().position(|b| b.preds.len() == 2);
+        let join = join.expect("a join");
+        assert!(
+            p.blocks[join].phis.iter().all(|ph| ph.reg != Reg::S(EXEC)),
+            "no phi of EXEC at the join"
+        );
+        geometry::gs_plan(&p, &shape(3))
+    };
+    assert_eq!(program(saveexec, other), Err(geometry::MASKED));
+    assert_eq!(program(other, saveexec), Err(geometry::MASKED));
+    let plan = program(other, other).expect("one mask");
+    assert_eq!(plan.emitted, 3);
+}
+
 /// D3D12's geometry-shader limits, and the codes DXIL gives the shapes.
 #[test]
 fn geometry_shapes_within_d3d12_limits() {

@@ -979,47 +979,67 @@ fn message(inst: &Inst) -> Option<Result<Message, Why>> {
     })
 }
 
-/// The value `reg` holds when the instruction at `site` runs: the last one
-/// before it in its block to read or write `reg` says it, else the block's
-/// phi of `reg`, else what every predecessor holds at its end (the same
-/// value, phis being placed where two differ), back to the entry's input
-/// (`None` for an entry value the program never reads; also for a block
-/// no path reaches).
-fn live_at(p: &Program, reg: Reg, site: Site) -> Option<Value> {
+/// What a register holds when an instruction runs ([`live_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Live {
+    Value(Value),
+    /// The entry's, which the program never reads (no value names it).
+    Entry,
+    /// The paths that reach the instruction bring different values, which
+    /// no phi joins (the IR places phis only where a register is live, and
+    /// a message reads M0 alone), or no path does.
+    Unknown,
+}
+
+/// The value `reg` holds when the instruction at `site` runs: on each path
+/// back from it, the last instruction to read or write `reg`, else the
+/// block's phi of `reg`, else the entry's input. Every path must bring the
+/// same: a join without a phi of `reg` (it is dead there) may bring two.
+fn live_at(p: &Program, reg: Reg, site: Site) -> Live {
+    let mut found = None;
     let mut seen = HashSet::new();
     let mut work = vec![site];
     while let Some((b, i)) = work.pop() {
         let block = &p.blocks[b];
-        let before = block.insts[..i].iter().rev();
-        if let Some(v) = before
-            .filter_map(|x| x.write(reg).or_else(|| x.read(reg)))
-            .next()
-        {
-            return Some(v);
+        let here = block.insts[..i]
+            .iter()
+            .rev()
+            .find_map(|x| x.write(reg).or_else(|| x.read(reg)))
+            .or_else(|| block.phis.iter().find(|ph| ph.reg == reg).map(|ph| ph.value));
+        let reached = match here {
+            Some(v) => Some(Live::Value(v)),
+            None if b == 0 => Some(p.inputs.iter().find(|r| r.0 == reg).map_or(Live::Entry, |r| Live::Value(r.1))),
+            None => None,
+        };
+        if let Some(v) = reached {
+            match found {
+                None => found = Some(v),
+                Some(f) if f != v => return Live::Unknown,
+                Some(_) => {}
+            }
         }
-        if let Some(phi) = block.phis.iter().find(|ph| ph.reg == reg) {
-            return Some(phi.value);
-        }
-        if b == 0 {
-            return p.inputs.iter().find(|r| r.0 == reg).map(|r| r.1);
-        }
-        for &q in &block.preds {
-            if seen.insert(q) {
-                work.push((q, p.blocks[q].insts.len()));
+        // The entry's predecessors (a loop back to the first instruction)
+        // bring their own value too.
+        if here.is_none() {
+            for &q in &block.preds {
+                if seen.insert(q) {
+                    work.push((q, p.blocks[q].insts.len()));
+                }
             }
         }
     }
-    None
+    found.unwrap_or(Live::Unknown)
 }
 
 /// The lane mask (EXEC) at `site`: its low dword, and in a wave64 program
-/// its high one.
-fn exec_at(p: &Program, site: Site) -> (Option<Value>, Option<Value>) {
-    let hi = p
-        .wave64
-        .then(|| live_at(p, Reg::S(EXEC + 1), site))
-        .flatten();
-    (live_at(p, Reg::S(EXEC), site), hi)
+/// its high one; `None` when a path brings another ([`Live::Unknown`]).
+fn exec_at(p: &Program, site: Site) -> Option<(Live, Live)> {
+    let lo = live_at(p, Reg::S(EXEC), site);
+    let hi = match p.wave64 {
+        true => live_at(p, Reg::S(EXEC + 1), site),
+        false => Live::Entry,
+    };
+    (lo != Live::Unknown && hi != Live::Unknown).then_some((lo, hi))
 }
 
 /// Each half of a merged stage first sets EXEC to its own lanes from the
@@ -1398,7 +1418,7 @@ pub(crate) fn gs_plan(p: &Program, shape: &GsShape) -> Result<GsPlan, Why> {
         if m == Message::Done || index[site.0] == usize::MAX {
             continue;
         }
-        let here = exec_at(p, site);
+        let here = exec_at(p, site).ok_or(MASKED)?;
         match mask {
             None => mask = Some(here),
             Some(m) if m != here => return Err(MASKED),
