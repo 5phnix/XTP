@@ -12,7 +12,7 @@
 //!
 //! Ported from Marvisak/VIctory#595 (wbkepler), as `timeline.rs` there.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 use super::Host;
@@ -62,6 +62,8 @@ pub(crate) struct Touches {
     pub(crate) labels: Vec<(usize, usize)>,
     /// What it reads (host copies and textures brought up to date for it).
     pub(crate) reads: Vec<(usize, usize)>,
+    /// Ranges read by GPU copies into CBV memory, keyed by source shadow.
+    pub(crate) cbv_reads: HashMap<usize, Vec<(usize, usize)>>,
     /// Texture staging buffers (by address) its GPU copies read.
     pub(crate) staging: HashSet<usize>,
 }
@@ -75,6 +77,7 @@ struct Entry<W> {
     shaders: Vec<(usize, usize, usize)>,
     copies: Vec<(usize, usize, usize)>,
     reads: Ranges,
+    cbv_reads: HashMap<usize, Ranges>,
     staging: HashSet<usize>,
     /// Title fence signals the title queued after it.
     signals: Vec<Signal>,
@@ -110,6 +113,7 @@ impl<W> Timeline<W> {
             copies,
             labels,
             reads,
+            cbv_reads,
             staging,
         } = touches;
         let writes = shaders
@@ -124,6 +128,10 @@ impl<W> Timeline<W> {
             shaders,
             copies,
             reads: Ranges::new(reads),
+            cbv_reads: cbv_reads
+                .into_iter()
+                .map(|(c, ranges)| (c, Ranges::new(ranges)))
+                .collect(),
             staging,
             signals: Vec::new(),
             work: Some(work),
@@ -238,12 +246,8 @@ impl<W> Timeline<W> {
     /// writes it through this copy counts only if `stale` says the title
     /// wrote some of the overlap since the copy took it. Otherwise the copy
     /// already holds what the refresh would bring, and the GPU's writes
-    /// reach it in queue order.
-    ///
-    /// This check tracks earlier writers. If a queued CBV copy still reads
-    /// this host copy, a later submission's CPU refresh of dirty title
-    /// bytes can reach it before that GPU read. Ordering such refreshes
-    /// would require checking in-flight readers of the dirty range too.
+    /// reach it in queue order. A dirty refresh also waits for queued CBV
+    /// copies still reading the affected bytes of this shadow.
     pub(crate) fn refresh_conflict(
         &self,
         copy: usize,
@@ -257,11 +261,19 @@ impl<W> Timeline<W> {
         let (mut must, mut parts) = (None, Vec::new());
         // Most refreshes touch nothing in flight: the merged ranges say so
         // in a binary search.
-        for e in self
-            .entries()
-            .iter()
-            .filter(|e| e.writes.overlaps(from, to))
-        {
+        for e in self.entries().iter() {
+            if let Some(reads) = e.cbv_reads.get(&copy) {
+                let first = reads.0.partition_point(|&(_, end)| end <= from);
+                parts.extend(
+                    reads.0[first..]
+                        .iter()
+                        .take_while(|&&(a, _)| a < to)
+                        .map(|&(a, b)| (e.value, a.max(from), b.min(to))),
+                );
+            }
+            if !e.writes.overlaps(from, to) {
+                continue;
+            }
             if e.labels.overlaps(from, to) {
                 must = Some(e.value);
             }
@@ -483,6 +495,24 @@ mod tests {
         assert_eq!(t.staging_conflict(0xdead_2000), None);
         t.finish(5, |()| {});
         assert_eq!(t.staging_conflict(staging_a), None);
+    }
+
+    #[test]
+    fn a_dirty_refresh_waits_for_the_cbv_copy_reading_its_shadow() {
+        let t = Timeline::new();
+        let read = |a, b| Touches {
+            cbv_reads: HashMap::from([(1, vec![(a, b)])]),
+            ..Touches::default()
+        };
+        t.push(1, read(10, 20), ());
+        t.push(2, read(20, 30), ());
+        let dirty = |a, b| (a..b).contains(&18);
+        assert_eq!(t.refresh_conflict(1, 15, 25, dirty), Some(1));
+        assert_eq!(t.refresh_conflict(2, 15, 25, dirty), None);
+        assert_eq!(t.refresh_conflict(1, 15, 25, |_, _| false), None);
+        assert_eq!(t.refresh_conflict(1, 20, 25, dirty), None);
+        t.finish(1, |()| {});
+        assert_eq!(t.refresh_conflict(1, 15, 25, dirty), None);
     }
 
     /// A page mapping finds the newest submission whose GPU work touches
