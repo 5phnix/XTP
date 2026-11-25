@@ -3077,13 +3077,23 @@ impl State {
         let mut batches = crate::rectangles::Batches::new(writes);
         let mut first = 0;
         while first < max {
-            let prepared = self.expand_rectangles(
+            let prepared = match self.expand_rectangles(
                 list,
                 inputs,
                 (stride, first..max),
                 arguments,
                 &mut batches,
-            )?;
+            ) {
+                Ok(batch) => batch,
+                Err(why) if first == 0 => return Err(why),
+                Err(why) => {
+                    // Les premiers lots sont déjà dans la liste. Le reste du
+                    // dessin aurait pu contribuer à la requête d’occlusion.
+                    self.occlusion.dropped_draw();
+                    tracing::warn!(first, max, ?why, "dessin de rectangles partiel");
+                    break;
+                }
+            };
             self.host_roots[1] = 0;
             // SAFETY: les passes de calcul ont remplacé le PSO, les racines graphiques restent valides.
             unsafe { list.list.SetPipelineState(&pso) };
@@ -5478,6 +5488,59 @@ float4 ps(V v) : SV_Target { return v.color; }
                 "cell {cell}'s fourth corner"
             );
         }
+    }
+
+    #[test]
+    fn query_rectangle_batches_restore_the_graphics_pipeline() {
+        let _pool = crate::rectangles::POOL_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let test = "draw::tests::query_rectangle_batches_restore_the_graphics_pipeline";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let painter = Painter::new(host, true);
+        let (positions, colors, mut views) = cell_rectangles();
+        // Chaque commande peut produire 12 Mio de sommets. Le budget de 32 Mio
+        // impose deux lots de deux commandes, chacun couvrant deux cellules.
+        let padded = [positions, colors]
+            .into_iter()
+            .zip(&mut views)
+            .map(|(source, view)| {
+                view.size = (1 << 19) * view.stride;
+                let buffer = TitleBuffer::new(view.size as usize);
+                let words = source.words();
+                buffer.set_words(|i| words.get(i).copied().unwrap_or(0));
+                view.address = buffer.address();
+                buffer
+            })
+            .collect::<Vec<_>>();
+        let args = title_records(&std::array::from_fn::<_, 4, _>(|i| [3, 1, i as u32 * 3, 0]));
+        let title = TitleList::new();
+        let list = title.host();
+        let mut state = State::default();
+        state.set_vertex_buffers(0, &views);
+        painter.clear(list);
+        state
+            .rectangles_indirect(
+                list,
+                &painter_inputs(),
+                (16, 4),
+                (Records::Title(&args.shadow(), args.address()), None, None),
+                |_, l| {
+                    painter.bind(l);
+                    Ok(painter.pso.clone())
+                },
+            )
+            .unwrap();
+        let pixels = painter.read(host, &title);
+        for (cell, color) in COLORS.iter().enumerate() {
+            let x = cell as u32 * SIDE / 4;
+            assert_eq!(&pixel(&pixels, x, SIDE - 1), color);
+            assert_eq!(&pixel(&pixels, x + SIDE / 4 - 1, 0), color);
+        }
+        drop(padded);
     }
 
     /// A pipeline without vertex inputs draws each rectangle's first
