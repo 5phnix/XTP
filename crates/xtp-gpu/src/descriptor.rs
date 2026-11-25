@@ -241,6 +241,20 @@ impl Recording {
         self.held.shared.push((heap, slot));
     }
 
+    /// Descriptor leases already held before attempting a bind.
+    pub(crate) fn checkpoint(&self) -> (usize, usize) {
+        (self.held.ranges.len(), self.held.shared.len())
+    }
+
+    /// Only descriptors acquired by a bind that issued no draw or dispatch.
+    /// Copies and other commands already recorded retain their resources.
+    pub(crate) fn reject(&mut self, (ranges, shared): (usize, usize)) {
+        give_back(&mut Held {
+            ranges: self.held.ranges.split_off(ranges),
+            shared: self.held.shared.split_off(shared),
+        });
+    }
+
     /// The state is done with the recording: what it holds goes, now or
     /// once the recording has gone, with `memory`.
     pub(crate) fn finish(&mut self, memory: Box<dyn Send>) {

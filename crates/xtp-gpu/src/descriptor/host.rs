@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -45,8 +45,7 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// The dynamic slots: which are taken (by lists not yet reset, or by
-    /// `shared`), where the search starts, and how many are in use.
+    /// Free ranges between descriptors held by recordings and shared views.
     slots: Mutex<Slots>,
     /// Raw views of host copies that every list naming the same range
     /// shares (root SRVs), in chunks of dynamic slots. Locked before
@@ -54,7 +53,7 @@ pub(crate) struct HostHeap {
     shared: Mutex<Shared>,
     /// A raw view that reads zeros, in a dynamic slot of its own (made on
     /// first use, kept for the heap's life).
-    null_raw: OnceLock<Option<u32>>,
+    null_raw: Mutex<Option<u32>>,
     /// The runtime stride table and the raw views it names, in a view heap
     /// of title slots with `XTP_STRIDE_TABLE=1`
     /// ([`crate::device::stride_table_on`]); shared with [`FENCED`], which
@@ -964,8 +963,9 @@ thread_local! {
 
 /// Dynamic slot bookkeeping.
 struct Slots {
-    next: u32,
-    taken: Vec<bool>,
+    /// Maximal free runs, indexed by start for merging and by length for best fit.
+    by_start: BTreeMap<u32, u32>,
+    by_size: BTreeSet<(u32, u32)>,
     /// Slots taken now, and the most ever taken at once.
     used: u32,
     peak: u32,
@@ -988,23 +988,70 @@ pub(crate) fn log_frame_failures(frame: u64) {
 }
 
 impl Slots {
-    fn failure(&self, requested: usize, capacity: u32) {
+    fn new(capacity: u32) -> Self {
+        let mut slots = Self {
+            by_start: BTreeMap::new(),
+            by_size: BTreeSet::new(),
+            used: 0,
+            peak: 0,
+        };
+        slots.insert_run(0, capacity);
+        slots
+    }
+
+    fn insert_run(&mut self, first: u32, length: u32) {
+        if length > 0 {
+            self.by_start.insert(first, length);
+            self.by_size.insert((length, first));
+        }
+    }
+
+    fn remove_run(&mut self, first: u32, length: u32) {
+        self.by_start.remove(&first);
+        self.by_size.remove(&(length, first));
+    }
+
+    /// Use the smallest sufficient hole, leaving larger tables room.
+    fn reserve(&mut self, n: u32) -> Option<u32> {
+        let &(length, first) = self.by_size.range((n, 0)..).next()?;
+        self.remove_run(first, length);
+        self.insert_run(first + n, length - n);
+        self.used += n;
+        Some(first)
+    }
+
+    /// Merge touching or overlapping free runs. Duplicate or partial releases
+    /// count only the slots that were still held.
+    fn release(&mut self, mut first: u32, mut end: u32) {
+        if first >= end {
+            return;
+        }
+        if let Some((&left, &len)) = self.by_start.range(..first).next_back()
+            && left + len >= first
+        {
+            first = left;
+        }
+        let mut already_free = 0;
+        while let Some((&next, &len)) = self.by_start.range(first..=end).next() {
+            self.remove_run(next, len);
+            already_free += len;
+            end = end.max(next + len);
+        }
+        self.used -= end - first - already_free;
+        self.insert_run(first, end - first);
+    }
+
+    fn failure(&self, requested: u32, capacity: u32) {
         #[cfg(feature = "diagnostics")]
         FRAME_FAILURES.fetch_add(1, Ordering::Relaxed);
         static FAILED: AtomicU64 = AtomicU64::new(0);
         let failed = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
         if failed.is_power_of_two() {
-            let largest_free_run = self
-                .taken
-                .split(|&taken| taken)
-                .map(<[_]>::len)
-                .max()
-                .unwrap_or(0);
+            let largest_free_run = self.by_size.last().map_or(0, |&(len, _)| len);
             tracing::warn!(
                 requested,
                 free = capacity - self.used,
                 largest_free_run,
-                cursor = self.next,
                 used = self.used,
                 peak = self.peak,
                 of = capacity,
@@ -1292,14 +1339,9 @@ impl HostHeap {
                 dirty: Default::default(),
             }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            slots: Mutex::new(Slots {
-                next: 0,
-                taken: vec![false; extra as usize],
-                used: 0,
-                peak: 0,
-            }),
+            slots: Mutex::new(Slots::new(extra)),
             shared: Mutex::default(),
-            null_raw: OnceLock::new(),
+            null_raw: Mutex::new(None),
             strides,
             picked: Mutex::default(),
             textures: Mutex::default(),
@@ -1392,6 +1434,9 @@ impl HostHeap {
     /// [`HostHeap::release`]: the first's index. When none are free, the
     /// shared views no list holds give theirs back first.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        if n > self.dynamic && !self.sampler {
+            return self.try_take(n, true);
+        }
         if let Some(first) = self.take(n) {
             return Some(first);
         }
@@ -1419,33 +1464,12 @@ impl HostHeap {
         }
         let mut guard = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let s = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (s.next as usize..self.dynamic as usize).chain(0..s.next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if s.taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = s.reserve(n) else {
             if final_attempt {
                 s.failure(n, self.dynamic);
             }
             return None;
         };
-        s.taken[first..first + n].fill(true);
-        s.next = ((first + n) % self.dynamic as usize) as u32;
-        s.used += n as u32;
         if s.used > s.peak {
             // Logged at each new eighth of the range.
             let eighth = |v: u32| u64::from(v) * 8 / u64::from(self.dynamic);
@@ -1458,7 +1482,7 @@ impl HostHeap {
             }
             s.peak = s.used;
         }
-        Some(self.count + first as u32)
+        Some(self.count + first)
     }
 
     /// The dynamic slots taken now, and the most ever taken at once.
@@ -1499,12 +1523,7 @@ impl HostHeap {
             let Some(at) = first.checked_sub(self.count) else {
                 continue;
             };
-            let end = (at.saturating_add(n)).min(self.dynamic) as usize;
-            if let Some(slots) = s.taken.get_mut(at as usize..end) {
-                let freed = slots.iter().filter(|&&t| t).count() as u32;
-                slots.fill(false);
-                s.used -= freed;
-            }
+            s.release(at, at.saturating_add(n).min(self.dynamic));
         }
     }
 
@@ -1639,11 +1658,13 @@ impl HostHeap {
     /// A slot holding a raw view that reads zeros, the same for every list
     /// (never given back); `None` if no slot is free.
     pub(crate) fn null_raw(&self) -> Option<u32> {
-        *self.null_raw.get_or_init(|| {
+        let mut cached = self.null_raw.lock().unwrap_or_else(|e| e.into_inner());
+        if cached.is_none() {
             let slot = self.dynamic(1)?;
             self.null_raw_at(slot);
-            Some(slot)
-        })
+            *cached = Some(slot);
+        }
+        *cached
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -4659,6 +4680,31 @@ mod tests {
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
 
+    #[test]
+    fn dynamic_runs_merge_across_the_last_allocation_but_not_the_heap_boundary() {
+        let mut s = Slots::new(16);
+        assert_eq!(s.reserve(6), Some(0));
+        assert_eq!(s.reserve(3), Some(6));
+        s.release(4, 9);
+        assert_eq!(s.reserve(12), Some(4));
+        s.release(0, 2);
+        s.release(14, 16);
+        assert_eq!(s.reserve(3), None);
+        assert_eq!(s.used, 12);
+    }
+
+    #[test]
+    fn dynamic_tables_reuse_small_holes_before_splitting_large_ones() {
+        let mut s = Slots::new(512);
+        assert_eq!(s.reserve(512), Some(0));
+        s.release(0, 258);
+        s.release(300, 480);
+        assert_eq!(s.reserve(179), Some(300));
+        assert_eq!(s.reserve(258), Some(0));
+        assert_eq!(s.reserve(1), Some(479));
+        assert_eq!(s.used, 512);
+    }
+
     /// A capped view heap keeps 2^18 of its slots dynamic and the rest for
     /// the title; small limits keep a title slot and never underflow
     /// (VIctory #1349).
@@ -4707,8 +4753,8 @@ mod tests {
         assert_eq!(heap.dynamic_use(), (0, 16));
         assert_eq!(
             heap.dynamic(16),
-            Some(c + 5),
-            "the search goes on from the last"
+            Some(a),
+            "the merged range starts at the first freed slot"
         );
     }
 
