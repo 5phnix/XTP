@@ -1140,18 +1140,13 @@ impl Staging {
     /// just before the staging buffer is overwritten: an earlier
     /// submission's GPU copy may still read it. The safety net takes its
     /// turn first (counted with the check).
-    pub(crate) fn refresh(&self, before_write: impl FnOnce()) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let started = std::time::Instant::now();
+    pub(crate) fn refresh(&self, before_write: impl FnOnce()) -> usize {
         net_walk();
-        let read = if self.host_owned.load(Ordering::Relaxed) {
+        if self.host_owned.load(Ordering::Relaxed) {
             0
         } else {
             self.refresh_now(before_write)
-        };
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
+        }
     }
 
     /// Returns the bytes of title memory read.

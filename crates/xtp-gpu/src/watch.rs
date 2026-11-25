@@ -138,6 +138,7 @@ impl Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let _watch = crate::host::preparation::Phase::Watch.enter();
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Une vue de section ne peut pas avoir MEM_WRITE_WATCH.
     let known_view = KNOWN_VIEWS.contains(first);

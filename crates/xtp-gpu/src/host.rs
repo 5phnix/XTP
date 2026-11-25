@@ -20,6 +20,7 @@
 
 pub(crate) mod buffers;
 mod frames;
+pub(crate) mod preparation;
 #[cfg(test)]
 pub(crate) mod submissions;
 mod timeline;
@@ -32,6 +33,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use preparation::Phase;
 use timeline::{Timeline, Touches};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -102,19 +104,17 @@ unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
 /// Time spent on submissions since the last frame-rate line, in
-/// microseconds: preparing them on the CPU (title memory copies, texture
-/// detiling), the GPU running them (from each one's submission, or the
+/// microseconds: the GPU running them (from each one's submission, or the
 /// end of the one before, until it was seen done), the title's threads
 /// waiting for them (for the GPU, or for finishing: [`Host::waiting`]),
 /// and of that waiting, the part at frame ends (flip waits and presents:
 /// [`Host::at_frame_end`]).
-static SUBMISSION_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static SUBMISSION_US: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// The parts of [`SUBMISSION_US`].
-const PREPARING_US: usize = 0;
-const GPU_US: usize = 1;
-const WAITED_US: usize = 2;
-const FRAME_END_US: usize = 3;
+const GPU_US: usize = 0;
+const WAITED_US: usize = 1;
+const FRAME_END_US: usize = 2;
 
 /// Where the title's threads waited for submissions: the code that asked
 /// for each wait (the caller of `Host::settle`, `Host::drain` or a step's
@@ -162,15 +162,6 @@ static WAITS: Mutex<Waits> = Mutex::new(Waits(Vec::new()));
 /// written back into title memory (microseconds, bytes written), since the
 /// last frame-rate line.
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-
-/// Of the preparing: title memory copies (microseconds, bytes) and texture
-/// refreshes (microseconds, bytes hashed), since the last frame-rate line.
-pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
@@ -554,7 +545,13 @@ mod tests {
             ]
         ));
         source.copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        list.run_deferred(&mut Batch::default());
+        let mut batch = Batch::default();
+        list.run_deferred(&mut batch);
+        assert_eq!(batch.work.fill_bytes, 9);
+        assert_eq!(batch.work.merged_fills, 1);
+        assert_eq!(batch.work.copy_bytes, 0);
+        assert_eq!(batch.work.steps[preparation::Kind::Fill as usize], 5);
+        assert_eq!(batch.work.steps[preparation::Kind::Host as usize], 1);
         assert_eq!(upload, [0, 1, 2, 3, 4, 6, 0xff, 7, 8, 9]);
     }
 
@@ -1031,6 +1028,8 @@ struct Deferred {
     meshes: std::sync::Arc<Vec<crate::meshstat::Probe>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Fill steps saved at record time, counted each time this list runs.
+    merged_fills: u64,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1354,6 +1353,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         let waited_before = waited_here();
+        let recording = preparation::Recording::start(started, waited_before);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // What has run is finished first. A list whose last submission is
@@ -1415,9 +1415,11 @@ impl Host {
         let (mut pending, touches) = Pending::of(runs, batch.submission);
         // Preparing, without the waits for earlier submissions (counted as
         // waiting).
-        let waited = std::time::Duration::from_micros(waited_here() - waited_before);
-        let preparing = started.elapsed().saturating_sub(waited);
-        SUBMISSION_US[PREPARING_US].fetch_add(preparing.as_micros() as u64, Ordering::Relaxed);
+        let waited_now = waited_here();
+        let waited = std::time::Duration::from_micros(waited_now - waited_before);
+        let now = std::time::Instant::now();
+        let preparing = (now - started).saturating_sub(waited);
+        recording.finish(now, waited_now, preparing, &batch.work);
         pending.title = title.then_some(preparing);
         // Diagnostics: each list on its own, timed and waited for
         // (`XTP_GPU_TIMING`).
@@ -2418,6 +2420,7 @@ impl HostList {
             && prev_src.checked_add(*bytes) == Some(src)
         {
             *bytes += len;
+            deferred.merged_fills += 1;
             return;
         }
         deferred.copies.push(Step::Fill(dst, src, len));
@@ -2670,9 +2673,12 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch<'_>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
+        use preparation::Kind;
+        let _steps = Phase::Steps.enter();
+        let deferred = self.deferred();
+        batch.work.merged_fills += deferred.merged_fills;
+        for step in &deferred.copies {
+            let kind = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -2682,9 +2688,11 @@ impl HostList {
                     batch.settle(src, len, false);
                     batch.settle(dst, len, true);
                     batch.title_written();
+                    let _copy = Phase::Copies.enter();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     moved(Moved::CpuCopy, len);
-                    len
+                    batch.work.copy_bytes += len as u64;
+                    Kind::Copy
                 }
                 &Step::Fill(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -2693,10 +2701,12 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.settle(src, len, false);
+                    let _fill = Phase::Fills.enter();
                     // SAFETY: la liste conserve la destination mappée et indépendante
                     // de la mémoire du titre jusqu’à la fin de la soumission.
                     unsafe { crate::shadow::fill_upload(dst as *mut u8, src, len) };
-                    len
+                    batch.work.fill_bytes += len as u64;
+                    Kind::Fill
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -2709,25 +2719,31 @@ impl HostList {
                     // title wrote it since the copy took it.
                     batch.settle_refresh(shadow, *address, *len);
                     batch.add(shadow, *address, *len);
-                    continue;
+                    Kind::Refresh
                 }
                 Step::Run(work, _, _) | Step::Host(work, _) => {
-                    match *step {
+                    let kind = match *step {
                         Step::Run(_, (to, written), (from, read)) => {
                             batch.settle(from, read, false);
                             batch.settle(to, written, true);
                             batch.title_written();
+                            Kind::Run
                         }
-                        Step::Host(_, (from, read)) => batch.settle(from, read, false),
-                        _ => {}
-                    }
+                        Step::Host(_, (from, read)) => {
+                            batch.settle(from, read, false);
+                            Kind::Host
+                        }
+                        _ => unreachable!(),
+                    };
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
-                    continue;
+                    kind
                 }
                 Step::GpuWrite(shadow, address, len, writer) => {
                     // The range's snapshot is taken from the host copy, which
@@ -2735,8 +2751,9 @@ impl HostList {
                     // the shaders start from the title's data.
                     batch.settle(*address, *len, false);
                     batch.flush();
+                    let _snapshot = (!shadow.carded()).then(|| Phase::Snapshots.enter());
                     shadow.writing_by(batch.submission, *address, *len, *writer);
-                    continue;
+                    Kind::GpuWrite
                 }
                 // The copy reads host copies on the GPU, written back after.
                 // Into a range an earlier submission's shaders write through
@@ -2753,7 +2770,7 @@ impl HostList {
                     batch.flush_before_copy(shadow, *address, *len);
                     shadow.copying(batch.submission, *address, *len);
                     moved(Moved::GpuCopy, *len);
-                    continue;
+                    Kind::GpuCopy
                 }
                 Step::GpuWord(shadow, address, bytes) => {
                     if crate::readmap::enabled() || shadow.carded() {
@@ -2761,19 +2778,20 @@ impl HostList {
                         shadow.invalidate_mirror(*address, *bytes);
                     }
                     moved(Moved::ListWrite, *bytes);
-                    continue;
+                    Kind::GpuWord
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         let (from, to) = staging.range();
                         batch.settle(from, to - from, false);
-                        staging.refresh(|| batch.settle_staging(staging));
+                        let _texture = Phase::Textures.enter();
+                        batch.work.texture_bytes +=
+                            staging.refresh(|| batch.settle_staging(staging)) as u64;
                     }
-                    continue;
+                    Kind::Texture
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            batch.work.steps[kind as usize] += 1;
         }
     }
 }
@@ -2788,6 +2806,7 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch<'a> {
+    work: preparation::Work,
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
@@ -2900,24 +2919,24 @@ impl Batch<'_> {
             std::sync::Arc::ptr_eq(shadow, dst) && *from < end && at < *to
         }) {
             let (shadow, from, to) = self.refreshes.swap_remove(i);
-            Self::refresh(&shadow, from, to);
+            self.work.copy_bytes += Self::refresh(&shadow, from, to) as u64;
         }
     }
 
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
-            Self::refresh(&shadow, from, to);
+            self.work.copy_bytes += Self::refresh(&shadow, from, to) as u64;
         }
     }
 
-    fn refresh(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+    fn refresh(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
+        let _copy = Phase::Copies.enter();
+        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
-        let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
-        PREPARING[0].fetch_add(us, Ordering::Relaxed);
-        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
+        copied
     }
 }
 
@@ -3209,12 +3228,23 @@ impl Meter {
         // Of a frame, ms preparing submissions, the GPU running them, the
         // title's threads waiting for them, and of that the waits at flips
         // and presents.
-        let [cpu, gpu, waited, at_ends] = [PREPARING_US, GPU_US, WAITED_US, FRAME_END_US]
+        let [gpu, waited, at_ends] = [GPU_US, WAITED_US, FRAME_END_US]
             .map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
+        let preparation = preparation::take();
+        let per_frame_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / frames;
+        let cpu = per_frame_ms(preparation.total);
+        let [
+            copy_ms,
+            fill_ms,
+            texture_ms,
+            snapshot_ms,
+            watch_ms,
+            steps_ms,
+            other_ms,
+        ] = preparation.times.map(per_frame_ms);
+        let work = preparation.work;
+        let [copy_mb, fill_mb, texture_mb] = [work.copy_bytes, work.fill_bytes, work.texture_bytes]
+            .map(|bytes| bytes as f64 / 1e6 / frames);
         let [back_ms, back_mb] =
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
@@ -3258,8 +3288,8 @@ impl Meter {
                 "title depth bounds"
             );
             tracing::info!(
-                "{ab}{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
+                "{ab}{fps:.1} fps, {ms:.1} ms/frame ({cpu:.3} preparing: copies {copy_ms:.3} ms \
+                 {copy_mb:.1} MB, textures {texture_ms:.3} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB; {waited:.1} waiting for them \
                  ({at_ends:.1} at flips and presents), {overlap_ms:.1} overlapped; {outside_ms:.1} \
                  outside submissions; frames in flight {ahead}, the longest frame \
@@ -3276,6 +3306,28 @@ impl Meter {
                 longest_gpu = title.longest_gpu_ms,
                 longest_lists = title.longest_lists,
                 making = crate::pipeline::making()
+            );
+            tracing::info!("snapshots per frame: {snapshot_ms:.3} ms");
+            tracing::info!("guards and write watch per frame: {watch_ms:.3} ms");
+            let merged = work.merged_fills as f64 / frames;
+            tracing::info!("fills per frame: {fill_ms:.3} ms, {fill_mb:.2} MB, {merged:.2} merged");
+            let steps = work.steps.iter().sum::<u64>() as f64 / frames;
+            let [
+                copies,
+                fills,
+                refreshes,
+                runs,
+                hosts,
+                writes,
+                gpu_copies,
+                words,
+                textures,
+            ] = work.steps.map(|count| count as f64 / frames);
+            tracing::info!(
+                "steps per frame: {steps:.1} ({copies:.1} copy, {fills:.1} fill, {refreshes:.1} refresh, \
+                 {runs:.1} run, {hosts:.1} host, {writes:.1} GPU write, {gpu_copies:.1} GPU copy, \
+                 {words:.1} GPU word, {textures:.1} texture), {steps_ms:.3} ms in remaining step work, \
+                 {other_ms:.3} ms in other preparation"
             );
             #[cfg(feature = "diagnostics")]
             crate::indirect::log_counts();
