@@ -108,8 +108,8 @@ enum Cmd {
         /// `crates/xtp-shader/tests/data`).
         #[arg(long, value_name = "DIR")]
         out_dir: Option<PathBuf>,
-        /// Keep all unique encodings instead of one per mnemonic, length and selector combination.
-        #[arg(long)]
+        /// Keep all unique encodings. Requires --out-dir <DIR>.
+        #[arg(long, requires = "out_dir")]
         full: bool,
     },
     /// Build the diagnostics xtp, replay a recording of the title's GPU
@@ -279,4 +279,38 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask lives in the workspace")
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_gfx10_corpus_requires_an_output_directory() {
+        let Err(err) = Cli::try_parse_from(["xtask", "gfx10-corpus", "--full"]) else {
+            panic!("--full should require --out-dir");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--out-dir <DIR>"));
+
+        let reduced = Cli::try_parse_from(["xtask", "gfx10-corpus"]).unwrap();
+        assert!(matches!(
+            reduced.command,
+            Cmd::Gfx10Corpus {
+                full: false,
+                out_dir: None,
+                ..
+            }
+        ));
+        let full =
+            Cli::try_parse_from(["xtask", "gfx10-corpus", "--full", "--out-dir", "out"]).unwrap();
+        assert!(matches!(
+            full.command,
+            Cmd::Gfx10Corpus {
+                full: true,
+                out_dir: Some(dir),
+                ..
+            } if dir == Path::new("out")
+        ));
+    }
 }
