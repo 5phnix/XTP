@@ -38,6 +38,18 @@
 //!   before when that has it (loaded there, stored here) and made
 //!   otherwise, and the save replaces the file with the new generation
 //!   alone. What only sessions asked for is made again when one asks.
+//! - One library file per translator ([`current`]): sessions of branches
+//!   whose translators differ alternate on the PC, and one file compacted
+//!   to one translator made the other's pipelines again at every switch
+//!   (some 90,000, 13 to 23 minutes). Each translation key has its own
+//!   generation (`host-pipelines-<id>.bin` and its names file), and a
+//!   process opens only its own: the file it reads into memory is no
+//!   larger than before. A key with no generation yet starts from the
+//!   most recently opened one, its file linked (or copied), so that a
+//!   change that alters few programs still finds every other pipeline by
+//!   name. [`GENERATIONS_FILE`] lists them, most recently opened first;
+//!   past [`GENERATIONS_KEPT`] of them or [`GENERATIONS_BYTES`] of files,
+//!   the least recently opened go (never the current one).
 //! - The names the library holds: D3D12 cannot list them, so every save
 //!   writes them beside the file ([`NAMES_FILE`]), with the file's size and
 //!   BLAKE3, which the next process checks before it trusts them. A library
@@ -61,7 +73,7 @@
 
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
@@ -427,8 +439,342 @@ fn name_lock(name: &str) -> &'static Mutex<()> {
     &NAMES[h % NAMES.len()]
 }
 
+/// The one library file of before generations per translator, and its
+/// names file: taken over by the first generation made ([`seed`]).
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
+
+/// Where a generation's library file and its names file are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Place {
+    library: PathBuf,
+    names: PathBuf,
+}
+
+impl Place {
+    /// The files of generation `id` in `dir`.
+    fn of(dir: &Path, id: &str) -> Place {
+        Place {
+            library: dir.join(format!("host-pipelines-{id}.bin")),
+            names: dir.join(format!("host-pipelines-{id}.names")),
+        }
+    }
+
+    /// The one library file of before generations ([`LIBRARY_FILE`]).
+    fn legacy(dir: &Path) -> Place {
+        Place {
+            library: dir.join(LIBRARY_FILE),
+            names: dir.join(NAMES_FILE),
+        }
+    }
+}
+
+/// The generations of the library, one per translation key, most recently
+/// opened first: one line each, `<id> own`, `<id> compacted <bytes>` or
+/// `<id> from <id>` ([`Lineage`]).
+const GENERATIONS_FILE: &str = "generations.txt";
+const GENERATIONS_FORMAT: &str = "xtp pipeline generations 1";
+/// Generations kept at most, the current one included, and the bytes their
+/// files take at most (the current one is kept whatever its size). A
+/// generation linked from another counts that file's bytes again.
+const GENERATIONS_KEPT: usize = 4;
+const GENERATIONS_BYTES: u64 = 8 << 30;
+/// What a generation is seeded from when it takes over the library file of
+/// before generations ([`LIBRARY_FILE`]).
+pub(crate) const LEGACY: &str = "legacy";
+
+/// A generation of the library: its translation key's, and what it holds
+/// besides that translator's pipelines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Lineage {
+    /// The translation key's first 16 hexadecimal digits ([`generation_id`]).
+    pub(crate) id: String,
+    /// The generation its file started as (linked or copied: it holds that
+    /// translator's pipelines too), [`LEGACY`] for the file of before, and
+    /// not compacted since; `None` for one that started empty or was
+    /// compacted.
+    pub(crate) from: Option<String>,
+    /// Its file's size just after its last compaction, while past the
+    /// precook's bound (`precook::LIBRARY_REBUILD_BYTES`); `None` without
+    /// one, or below the bound then.
+    pub(crate) compacted: Option<u64>,
+}
+
+impl Lineage {
+    /// A generation that starts empty.
+    fn own(id: &str) -> Lineage {
+        Lineage {
+            id: id.to_owned(),
+            from: None,
+            compacted: None,
+        }
+    }
+
+    fn line(&self) -> String {
+        match (&self.from, self.compacted) {
+            (Some(from), _) => format!("{} from {from}", self.id),
+            (None, Some(bytes)) => format!("{} compacted {bytes}", self.id),
+            (None, None) => format!("{} own", self.id),
+        }
+    }
+
+    fn parse(line: &str) -> Option<Lineage> {
+        let mut words = line.split(' ');
+        let id = words.next().filter(|id| is_id(id))?;
+        let mut lineage = Lineage::own(id);
+        match (words.next()?, words.next()) {
+            ("own", None) => {}
+            ("compacted", Some(bytes)) => lineage.compacted = Some(bytes.parse().ok()?),
+            ("from", Some(from)) if from == LEGACY || is_id(from) => {
+                lineage.from = Some(from.to_owned());
+            }
+            _ => return None,
+        }
+        words.next().is_none().then_some(lineage)
+    }
+}
+
+/// Whether `text` is a generation's id: 16 lower-case hexadecimal digits.
+fn is_id(text: &str) -> bool {
+    text.len() == 16 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The generation of this process's translation key: its translator, its
+/// settings and the host's wave sizes (`shader_cache::host_key`). The host
+/// must be made.
+fn generation_id() -> String {
+    crate::shader_cache::host_key()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The generations listed in `dir`, most recently opened first; none if
+/// the list is missing or damaged (the files are then found by
+/// [`settle`]).
+fn read_generations(dir: &Path) -> Vec<Lineage> {
+    let Ok(text) = std::fs::read_to_string(dir.join(GENERATIONS_FILE)) else {
+        return Vec::new();
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(GENERATIONS_FORMAT) {
+        return Vec::new();
+    }
+    let mut list: Vec<Lineage> = Vec::new();
+    for line in lines {
+        match Lineage::parse(line) {
+            Some(g) if !list.iter().any(|h| h.id == g.id) => list.push(g),
+            Some(_) => {}
+            None => return Vec::new(),
+        }
+    }
+    list
+}
+
+fn write_generations(dir: &Path, list: &[Lineage]) -> std::io::Result<()> {
+    let mut text = format!("{GENERATIONS_FORMAT}\n");
+    for g in list {
+        text.push_str(&g.line());
+        text.push('\n');
+    }
+    write_atomically(&dir.join(GENERATIONS_FILE), text.as_bytes())
+}
+
+/// One process at a time changes the list of generations ([`settle`],
+/// [`record_compaction`]); a precook and a session do not run together.
+static GENERATIONS: Mutex<()> = Mutex::new(());
+
+/// What [`settle`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Settled {
+    place: Place,
+    lineage: Lineage,
+    /// The generations that went, least recently opened first.
+    evicted: Vec<String>,
+}
+
+/// Makes generation `id` in `dir` the most recently opened, its file
+/// seeded from the most recently opened other one if it has none
+/// ([`seed`]), and lets the oldest go past `kept` generations or `budget`
+/// bytes of files. Library files of generations the list does not hold
+/// (written by a process whose list was not) count as the oldest.
+fn settle(dir: &Path, id: &str, kept: usize, budget: u64) -> std::io::Result<Settled> {
+    let _one = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::create_dir_all(dir)?;
+    let mut list = read_generations(dir);
+    let mut found: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| {
+            let id = n.strip_prefix("host-pipelines-")?.strip_suffix(".bin")?;
+            is_id(id).then(|| id.to_owned())
+        })
+        .filter(|id| !list.iter().any(|g| g.id == *id))
+        .collect();
+    found.sort_unstable();
+    list.extend(found.iter().map(|id| Lineage::own(id)));
+    let place = Place::of(dir, id);
+    let listed = list.iter().position(|g| g.id == id).map(|i| list.remove(i));
+    let lineage = match listed {
+        Some(lineage) if place.library.exists() => lineage,
+        // Listed, but its file is gone: seeded again.
+        _ => Lineage {
+            from: seed(dir, &place, &list),
+            ..Lineage::own(id)
+        },
+    };
+    list.insert(0, lineage.clone());
+    let evicted = evict(dir, &mut list, kept, budget);
+    write_generations(dir, &list)?;
+    Ok(Settled {
+        place,
+        lineage,
+        evicted,
+    })
+}
+
+/// Starts generation `place` as the most recently opened one of `list`
+/// whose file is there (linked, else copied, with its names file), or as
+/// the library file of before ([`LIBRARY_FILE`], moved). What it started
+/// from: `None` if it starts empty.
+fn seed(dir: &Path, place: &Place, list: &[Lineage]) -> Option<String> {
+    let _ = std::fs::remove_file(&place.names);
+    for g in list {
+        let from = Place::of(dir, &g.id);
+        if !from.library.exists() {
+            continue;
+        }
+        let linked = std::fs::hard_link(&from.library, &place.library)
+            .or_else(|_| std::fs::copy(&from.library, &place.library).map(|_| ()));
+        match linked {
+            Ok(()) => {
+                // The names file says the file's size and BLAKE3: the same
+                // bytes, the same names.
+                let _ = std::fs::copy(&from.names, &place.names);
+                tracing::info!(
+                    from = g.id,
+                    "host pipeline library: a new generation for this translator, from the last one opened"
+                );
+                return Some(g.id.clone());
+            }
+            Err(e) => {
+                tracing::warn!(from = g.id, error = %e, "host pipeline library: a generation not seeded");
+                let _ = std::fs::remove_file(&place.library);
+            }
+        }
+    }
+    let legacy = Place::legacy(dir);
+    if legacy.library.exists() {
+        match std::fs::rename(&legacy.library, &place.library) {
+            Ok(()) => {
+                let _ = std::fs::rename(&legacy.names, &place.names);
+                tracing::info!(
+                    "host pipeline library: the one file of before is this translator's generation now"
+                );
+                return Some(LEGACY.to_owned());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "host pipeline library: the file of before not taken over");
+            }
+        }
+    }
+    None
+}
+
+/// Keeps the first of `list` (the current generation) and those after it
+/// while they are at most `kept` and their files at most `budget` bytes;
+/// the others' files go, and their lines but for a file that could not be
+/// removed. A listed generation without a file goes from the list. The
+/// generations that went.
+fn evict(dir: &Path, list: &mut Vec<Lineage>, kept: usize, budget: u64) -> Vec<String> {
+    let mut evicted = Vec::new();
+    let (mut count, mut total) = (0usize, 0u64);
+    list.retain(|g| {
+        let place = Place::of(dir, &g.id);
+        let bytes = std::fs::metadata(&place.library).map(|m| m.len());
+        let first = count == 0;
+        if first {
+            count += 1;
+            total = bytes.unwrap_or(0);
+            return true;
+        }
+        let Ok(bytes) = bytes else {
+            return false;
+        };
+        if count < kept && total.saturating_add(bytes) <= budget {
+            count += 1;
+            total += bytes;
+            return true;
+        }
+        match std::fs::remove_file(&place.library) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&place.names);
+                tracing::info!(
+                    generation = g.id,
+                    bytes,
+                    "host pipeline library: the least recently opened generation goes"
+                );
+                evicted.push(g.id.clone());
+                false
+            }
+            Err(e) => {
+                tracing::warn!(generation = g.id, error = %e, "host pipeline library: a generation could not go");
+                true
+            }
+        }
+    });
+    evicted
+}
+
+/// Notes that generation `id` in `dir` was compacted into a file of `bytes`
+/// ([`rebuild`]): it holds its translator's pipelines alone, and `bytes` is
+/// its baseline if past `bound`.
+fn record_compaction(dir: &Path, id: &str, bytes: u64, bound: u64) -> std::io::Result<()> {
+    let _one = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut list = read_generations(dir);
+    let compacted = Lineage {
+        compacted: (bytes > bound).then_some(bytes),
+        ..Lineage::own(id)
+    };
+    match list.iter_mut().find(|g| g.id == id) {
+        Some(g) => *g = compacted,
+        None => list.insert(0, compacted),
+    }
+    write_generations(dir, &list)
+}
+
+/// This process's generation of the library: where its files are, and what
+/// it held when settled ([`settle`], on first use: the host must be made).
+/// `None` without a cache folder.
+fn current() -> Option<&'static (Place, Lineage)> {
+    static CURRENT: OnceLock<Option<(Place, Lineage)>> = OnceLock::new();
+    CURRENT
+        .get_or_init(|| {
+            let dir = DIR.get()?;
+            let id = generation_id();
+            match settle(dir, &id, GENERATIONS_KEPT, GENERATIONS_BYTES) {
+                Ok(s) => {
+                    tracing::info!(
+                        generation = s.lineage.id,
+                        from = s.lineage.from.as_deref(),
+                        evicted = ?s.evicted,
+                        "host pipeline library generation"
+                    );
+                    Some((s.place, s.lineage))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "host pipeline library generations not listed");
+                    Some((Place::of(dir, &id), Lineage::own(&id)))
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// This process's generation of the library, as settled ([`current`]);
+/// `None` without a cache folder.
+pub(crate) fn generation() -> Option<Lineage> {
+    current().map(|(_, lineage)| lineage.clone())
+}
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -443,9 +789,12 @@ fn library() -> Option<&'static RwLock<Library>> {
         .get_or_init(|| {
             OPENED.store(true, Ordering::SeqCst);
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
-            let names = read(NAMES_FILE).and_then(|t| String::from_utf8(t).ok());
+            // This translator's generation alone.
+            let place = current().map(|(place, _)| place);
+            let blob = place
+                .and_then(|p| std::fs::read(&p.library).ok())
+                .unwrap_or_default();
+            let names = place.and_then(|p| std::fs::read_to_string(&p.names).ok());
             let library = if REBUILD.load(Ordering::SeqCst) {
                 new_generation(&device, blob, names.as_deref())
             } else {
@@ -467,12 +816,11 @@ pub(crate) fn rebuild() -> bool {
     !OPENED.load(Ordering::SeqCst)
 }
 
-/// The library file's size, if there is one.
+/// The size of this process's generation's library file, if there is one
+/// (settled first: [`current`]).
 pub(crate) fn file_bytes() -> Option<u64> {
-    let dir = DIR.get()?;
-    std::fs::metadata(dir.join(LIBRARY_FILE))
-        .ok()
-        .map(|m| m.len())
+    let (place, _) = current()?;
+    std::fs::metadata(&place.library).ok().map(|m| m.len())
 }
 
 /// The host's library of `bytes`, which must outlive it.
@@ -739,7 +1087,7 @@ pub(crate) enum Saved {
 pub(crate) fn save(now: bool) -> Saved {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let Some(dir) = DIR.get() else {
+    let (Some(dir), Some((place, lineage))) = (DIR.get(), current()) else {
         return Saved::Nothing;
     };
     let Some(library) = library() else {
@@ -756,7 +1104,9 @@ pub(crate) fn save(now: bool) -> Saved {
         }
         *last = Some(std::time::Instant::now());
     }
-    let saved = write_library(library, dir, now, |bytes| {
+    let mut library_bytes = None;
+    let saved = write_library(library, place, now, |bytes| {
+        library_bytes = bytes;
         // Under the save's lock: whether the list changed since the last
         // save that wrote it.
         let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
@@ -798,10 +1148,30 @@ pub(crate) fn save(now: bool) -> Saved {
     if let Saved::Failed(e) = &saved {
         tracing::warn!(error = %e, "host pipeline library not saved");
     }
+    // A new generation written: the list says it holds its translator's
+    // pipelines alone now, and its size.
+    let rebuilt = || {
+        library
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .previous
+            .is_some()
+    };
+    if let (Saved::Written, Some(bytes)) = (&saved, library_bytes)
+        && rebuilt()
+        && let Err(e) = record_compaction(
+            dir,
+            &lineage.id,
+            bytes as u64,
+            super::precook::LIBRARY_REBUILD_BYTES,
+        )
+    {
+        tracing::warn!(error = %e, "host pipeline library generations not listed");
+    }
     saved
 }
 
-/// Writes `library` into `dir` if pipelines were added to it, then runs
+/// Writes `library` into `place` if pipelines were added to it, then runs
 /// `then` with its size (`None`: none written), which says whether it
 /// wrote something too. The pipelines the library holds stop counting as
 /// added once both are done, not before.
@@ -812,7 +1182,7 @@ pub(crate) fn save(now: bool) -> Saved {
 /// for one under way; without, it gives way to it ([`Saved::Nothing`]).
 fn write_library(
     library: &RwLock<Library>,
-    dir: &std::path::Path,
+    place: &Place,
     wait: bool,
     then: impl FnOnce(Option<usize>) -> std::io::Result<bool>,
 ) -> Saved {
@@ -826,10 +1196,12 @@ fn write_library(
             Err(std::sync::TryLockError::WouldBlock) => return Saved::Nothing,
         }
     };
-    let path = dir.join(LIBRARY_FILE);
+    let path = &place.library;
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let serialised = (|| -> std::io::Result<_> {
-        std::fs::create_dir_all(dir)?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let (mapped, added, names) = {
             // Alone: no store between the size and the bytes, nor between
             // the bytes and the names they hold.
@@ -844,7 +1216,7 @@ fn write_library(
                     .then(|| l.names().clone());
                 drop(l);
                 if let Some(names) = names {
-                    write_names(library, dir, &names, None);
+                    write_names(library, place, &names, None);
                 }
                 return Ok(None);
             }
@@ -859,8 +1231,8 @@ fn write_library(
         let file =
             FileId::of(unsafe { std::slice::from_raw_parts(mapped.view.Value.cast(), size) });
         drop(mapped);
-        std::fs::rename(&tmp, &path)?;
-        write_names(library, dir, &names, Some(file));
+        std::fs::rename(&tmp, path)?;
+        write_names(library, place, &names, Some(file));
         Ok(Some((size, added)))
     })();
     let serialised = match serialised {
@@ -884,7 +1256,7 @@ fn write_library(
     }
 }
 
-/// Writes the names file of the library file in `dir`: `names`, held by the
+/// Writes the names file of the library file in `place`: `names`, held by the
 /// file just written (`file`, its identity), or by the file the library was
 /// read from or last saved to (`None`). The names stay to write again if it
 /// fails, or if that file is not known (a library that did not read back),
@@ -892,7 +1264,7 @@ fn write_library(
 /// names file says is always its library file's.
 fn write_names(
     library: &RwLock<Library>,
-    dir: &std::path::Path,
+    place: &Place,
     names: &Names,
     file: Option<FileId>,
 ) {
@@ -907,7 +1279,7 @@ fn write_names(
         *known
     };
     let written =
-        file.map(|file| write_atomically(&dir.join(NAMES_FILE), names.text(&file).as_bytes()));
+        file.map(|file| write_atomically(&place.names, names.text(&file).as_bytes()));
     match written {
         Some(Ok(())) => {}
         Some(Err(e)) => {
