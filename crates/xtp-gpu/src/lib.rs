@@ -72,8 +72,6 @@ mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
-pub mod rt;
-#[cfg(windows)]
 mod rt_standin;
 #[cfg(windows)]
 mod sampler;

@@ -327,12 +327,16 @@ size. There were zero calls to the copy method, including compact copies.
   library asks, by forwarding to the real DLL (a CPU function). The
   title then allocates what it expects. Host sizes are kept apart, in
   host buffers.
-- **Phase 2a keeps the title's builder.** All seven hooks call the original
-  DLL. The host records triangle BLAS builds and clones on the same list.
-  A successful rehydration can record a fresh host build from the original
-  geometry. The title still receives its DLL's prebuild and postbuild sizes.
-  Skipping the original builder would require checking the remaining guest
-  record consumers described in section 6.
+- **The title's builder is not run.** Once the traces are served by host
+  ray queries, nothing reads the console BVH except code after the loops
+  that reads guest records. That case is handled in section 6.
+  - Today the builder is held anyway.
+  - Not running it saves its 85 to 350 dispatches a frame.
+  - It also spares cxr4 the last 22 refusals of its 52 programs.
+
+  The exception is a program whose results need guest node pointers
+  (section 6). None is known; one would bring back the console builder
+  and AnyPS5's walk-based mapping.
 
 ## 4. The trace programs
 
