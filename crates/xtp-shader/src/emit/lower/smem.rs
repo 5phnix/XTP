@@ -1283,6 +1283,11 @@ mod tests {
         #[cfg(windows)]
         {
             use crate::emit::host::{Dispatch, Host, Root, Stride, View};
+            // One GPU test at a time (see `valu_tests::ONE_AT_A_TIME`):
+            // several WARP devices at once end the test process.
+            let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let Ok(host) = Host::new(true) else {
                 eprintln!("no WARP device; skipped");
                 return;
@@ -1353,6 +1358,11 @@ mod tests {
         #[cfg(windows)]
         {
             use crate::emit::host::{Dispatch, Host, Root, View};
+            // One GPU test at a time (see `valu_tests::ONE_AT_A_TIME`):
+            // several WARP devices at once end the test process.
+            let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let Ok(host) = Host::new(true) else {
                 eprintln!("no WARP device; skipped");
                 return;
