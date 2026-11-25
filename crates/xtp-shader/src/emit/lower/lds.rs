@@ -557,7 +557,6 @@ mod tests {
         let n = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
-            float_mode: 0,
             vgprs: 16,
             layout: vec![table(0, 1), table(1, 2)],
             used: vec![used(ResourceType::Srv, 0, 1), used(ResourceType::Uav, 1, 2)],

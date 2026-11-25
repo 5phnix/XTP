@@ -98,8 +98,6 @@ pub(crate) mod lower;
 mod raw_tests;
 pub mod rect_gs;
 mod sampler;
-#[cfg(all(test, windows))]
-mod scalar_gap_tests;
 mod shader;
 #[cfg(all(test, windows))]
 mod smem_data_tests;
@@ -809,7 +807,6 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
-            float_mode: 0,
             vgprs: 2,
             layout: vec![],
             used: vec![],
@@ -870,7 +867,6 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: true,
-            float_mode: 0,
             vgprs: 2,
             layout: vec![],
             used: vec![],
@@ -1007,7 +1003,6 @@ mod tests {
             let native = super::NativeProgram {
                 stage: super::HwStage::Ps,
                 wave64: false,
-                float_mode: 0,
                 vgprs: 4,
                 layout: vec![],
                 used: vec![],
@@ -1079,7 +1074,6 @@ mod tests {
         let native = super::NativeProgram {
             stage: super::HwStage::Ps,
             wave64: false,
-            float_mode: 0,
             vgprs: 4,
             layout: vec![],
             used: vec![],
@@ -1133,7 +1127,6 @@ mod tests {
         crate::NativeProgram {
             stage: crate::HwStage::Cs,
             wave64,
-            float_mode: 0,
             vgprs: 8,
             layout: vec![],
             used: vec![],

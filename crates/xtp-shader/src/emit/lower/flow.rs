@@ -1139,18 +1139,6 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
-                    (Some(Val::Missing(super::mask::LANE_MASK)), false)
-                        if self.x.console_cf
-                            && self.emitted_double_count
-                            && self.read_phis.contains(&phi.value)
-                            && !self.bad.contains_key(&arg)
-                            && (self.x.st.masks.contains_key(&arg)
-                                || self.x.st.highs.contains_key(&arg)) =>
-                    {
-                        // Le vote doit être émis à la définition du masque,
-                        // avant de résoudre les jonctions dont il dépend.
-                        return Err(Stop::Retry(arg, super::mask::LANE_MASK));
-                    }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
