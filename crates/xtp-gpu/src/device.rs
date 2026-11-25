@@ -153,6 +153,10 @@ pub extern "system" fn create(
     if *iid == LEVEL_IIDS[8] {
         NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(hr) = crate::record::hand_out_device(iid, out) {
+        return hr;
+    }
     object::answer(object::DEVICE, iid, Some(device()), out)
 }
 

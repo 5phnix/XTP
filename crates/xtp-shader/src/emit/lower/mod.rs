@@ -433,6 +433,64 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 // still run that long.
 pub(super) const COUNTED_LOOP_LIMIT: u32 = 1 << 20;
 
+/// MODE's f32 denormal field (bits 4-5): bit 4 keeps input denormals, bit
+/// 5 output ones.
+const F32_DENORMALS: u32 = 0x30;
+
+/// The `"fp32-denorm-mode"` of `main` (S11): how the program's f32
+/// operations treat denormals, which DXIL declares once per program. The
+/// program starts with the record's float mode (`native.float_mode`, 0xC0
+/// in every record read so far: f32 denormals flushed, so `"ftz"`), and
+/// `ir::float_modes` has refused a program whose f32 instructions run under
+/// two denormal modes. MODE's f32 field 0 (flush both ways) is `"ftz"`, 3
+/// (keep both) `"preserve"`.
+// shortcut: none (DXIL's "any", as before) where the field keeps only one
+// way (1 or 2: no DXIL mode), and where the program writes the field
+// (`s_denorm_mode`, an `s_setreg*` of MODE over bits 4-5) other than with a
+// constant equal to the entry's: the mode its f32 instructions then run
+// under needs `ir::float_modes`'s flow to say. No program of the pack writes
+// the field (shcuts' count of 606 records, task f3d80097).
+pub(crate) fn fp32_denorm_mode(native: &NativeProgram, p: &Program) -> Option<&'static str> {
+    let entry = u32::from(native.float_mode) & F32_DENORMALS;
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        // What the instruction writes of MODE (none: a value it reads from a
+        // register), and which bits.
+        let (value, mask) = match (inst.name(), &inst.fields) {
+            ("s_denorm_mode", Fields::Sopp { imm }) => (Some(u32::from(*imm) << 4), 0xF0),
+            (
+                "s_setreg_imm32_b32" | "s_setreg_b32",
+                Fields::Sop {
+                    imm: Some(hw), src, ..
+                },
+            ) if hw & 63 == 1 => {
+                let offset = u32::from(hw >> 6 & 31);
+                let width = u32::from(hw >> 11 & 31) + 1;
+                let mask = (u32::MAX >> (32 - width)) << offset;
+                let value = match src.first() {
+                    Some(&Operand::Literal(x)) if inst.name() == "s_setreg_imm32_b32" => {
+                        Some(x << offset & mask)
+                    }
+                    _ => None,
+                };
+                (value, mask)
+            }
+            _ => continue,
+        };
+        if mask & F32_DENORMALS == 0 {
+            continue;
+        }
+        if mask & F32_DENORMALS != F32_DENORMALS || value.is_none_or(|v| v & F32_DENORMALS != entry)
+        {
+            return None;
+        }
+    }
+    match entry >> 4 {
+        0 => Some("ftz"),
+        3 => Some("preserve"),
+        _ => None,
+    }
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
 /// channel of `elements`, none for padding. Channel c of `a` is half c;
@@ -1021,6 +1079,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        self.s.denormals = fp32_denorm_mode(self.x.native, self.x.p);
         if let Some(slot) = self.mesh_primitive {
             self.finish_mesh_indices(slot);
         }

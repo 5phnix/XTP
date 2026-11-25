@@ -1,7 +1,18 @@
 //! Host DXR builds recorded alongside the title's builder commands.
 
+mod allocation;
+mod dispatch;
+pub(crate) use allocation::ResultBuffer;
+pub use dispatch::dispatch_descriptor_tlas;
+pub(crate) mod compaction;
+mod instances;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod probe;
+
+use instances::BlasMap;
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -36,43 +47,41 @@ fn device(host: &Host) -> Option<&'static ID3D12Device5> {
         .as_ref()
 }
 
-fn buffer(
-    device: &ID3D12Device5,
-    bytes: u64,
-    state: D3D12_RESOURCE_STATES,
-) -> Option<ID3D12Resource> {
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: bytes,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        ..Default::default()
-    };
-    let mut resource = None;
-    // SAFETY: one committed, shader-writable buffer with a state matching its use.
-    unsafe {
-        device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            &desc,
-            state,
-            None,
-            &mut resource,
-        )
+fn buffer(rec: &Recorder<'_>, bytes: u64, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
+    let device = rec.device;
+    let started = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+    if let Some(buffer) = crate::host::buffers::rt_buffer(device, bytes, state) {
+        // SAFETY: the recording activates the new placed buffer before its first use.
+        // Earlier recordings have released the lease on any overlapping resource.
+        unsafe {
+            rec.commands.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                        pResourceBefore: std::mem::ManuallyDrop::new(None),
+                        pResourceAfter: std::mem::transmute_copy(&buffer),
+                    }),
+                },
+                ..Default::default()
+            }]);
+        }
+        rec.list.keep(&buffer);
+        if let Some(started) = started {
+            tracing::debug!(
+                bytes,
+                state = state.0,
+                us = started.elapsed().as_micros() as u64,
+                "host DXR buffer allocation"
+            );
+        }
+        return Some(buffer);
     }
-    .ok()?;
-    resource
+    None
+}
+
+fn width(buffer: &ID3D12Resource) -> u64 {
+    // SAFETY: the borrowed COM resource is live for this synchronous descriptor query.
+    unsafe { buffer.GetDesc().Width }
 }
 
 struct Recorder<'a> {
@@ -90,7 +99,12 @@ impl<'a> Recorder<'a> {
         })
     }
 
-    fn build(&self, inputs: &Inputs) -> Option<ID3D12Resource> {
+    fn build(
+        &self,
+        inputs: &Inputs,
+        reuse: Option<Arc<ResultBuffer>>,
+        ordered: bool,
+    ) -> Option<Structure> {
         let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
         // SAFETY: the caller owns all geometry descriptions for this call.
         unsafe {
@@ -100,11 +114,11 @@ impl<'a> Recorder<'a> {
         if sizes.ResultDataMaxSizeInBytes == 0 {
             return None;
         }
-        let result = buffer(
-            self.device,
-            sizes.ResultDataMaxSizeInBytes,
-            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-        )?;
+        // A retired allocation can serve a later generation at the same title address.
+        let result = match reuse {
+            Some(resource) if resource.bytes >= sizes.ResultDataMaxSizeInBytes => resource,
+            _ => ResultBuffer::new(self, sizes.ResultDataMaxSizeInBytes)?,
+        };
         let mut scratch = self
             .list
             .rt_scratch
@@ -113,144 +127,553 @@ impl<'a> Recorder<'a> {
         let bytes = sizes.ScratchDataSizeInBytes;
         let mut scratch_address = 0;
         if bytes != 0 {
-            if scratch.as_ref().is_none_or(|buffer| {
-                // SAFETY: the list holds the scratch resource while GetDesc reads its width.
-                let width = unsafe { buffer.GetDesc().Width };
-                width < bytes
-            }) {
-                *scratch = Some(buffer(
-                    self.device,
-                    bytes,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )?);
+            if scratch.as_ref().is_none_or(|buffer| width(buffer) < bytes) {
+                *scratch = Some(buffer(self, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?);
             }
             let current = scratch.as_ref()?;
             self.list.keep(current);
-            // SAFETY: a live default-heap buffer.
+            // SAFETY: current is a buffer in UAV state of at least the host prebuild scratch size.
+            // The list kept this exact allocation even if its scratch slot is replaced later.
             scratch_address = unsafe { current.GetGPUVirtualAddress() };
         }
-        self.list.keep(&result);
+        let postbuild = inputs
+            .Flags
+            .contains(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION)
+            .then(|| compaction::request(self.list))
+            .flatten();
+        self.list.keep_rt_result(&result);
         // SAFETY: all GPU ranges are owned by this recording. The global barriers order prior
         // geometry writers, scratch reuse on the host queue and subsequent reads of the result.
         unsafe {
-            self.commands.ResourceBarrier(&[uav_barrier()]);
+            if !ordered {
+                self.commands.ResourceBarrier(&[uav_barrier()]);
+            }
             self.commands.BuildRaytracingAccelerationStructure(
                 &Build {
                     Inputs: *inputs,
-                    DestAccelerationStructureData: result.GetGPUVirtualAddress(),
+                    DestAccelerationStructureData: result.gpu(),
                     ScratchAccelerationStructureData: scratch_address,
                     SourceAccelerationStructureData: 0,
                 },
-                None,
+                postbuild
+                    .as_ref()
+                    .map(|(desc, _)| std::slice::from_ref(desc)),
             );
             self.commands.ResourceBarrier(&[uav_barrier()]);
         }
-        Some(result)
+        Some(Structure {
+            producer: Producer::recorded(self.list),
+            result,
+            instances: None,
+            compacted_size: postbuild.map(|(_, size)| size),
+        })
     }
 
-    fn clone_structure(&self, source: &ID3D12Resource) -> Option<ID3D12Resource> {
-        // SAFETY: source is a live AS previously built by this module.
-        let bytes = unsafe { source.GetDesc().Width };
-        let dest = buffer(
-            self.device,
-            bytes,
-            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-        )?;
-        self.list.keep(source);
-        self.list.keep(&dest);
+    fn copy_structure(
+        &self,
+        source: &Structure,
+        mode: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE,
+    ) -> Option<Structure> {
+        let capacity = source.result.bytes;
+        match mode {
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE => {}
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT
+                if source.compacted_size.is_some() => {}
+            _ => return None,
+        }
+        // A replay may rebuild different geometry into the same source.
+        // Its allocation bounds every execution, unlike a prior fence's measurement.
+        let bytes = capacity;
+        let dest = ResultBuffer::new(self, bytes)?;
+        self.list.keep_rt_result(&dest);
         // SAFETY: independent AS resources in the required state, retained through execution.
         unsafe {
             self.commands.CopyRaytracingAccelerationStructure(
-                dest.GetGPUVirtualAddress(),
-                source.GetGPUVirtualAddress(),
-                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE,
+                dest.gpu(),
+                source.result.gpu(),
+                mode,
             );
             self.commands.ResourceBarrier(&[uav_barrier()]);
         }
-        Some(dest)
+        Some(Structure {
+            producer: Producer::recorded(self.list),
+            instances: source.instances.as_ref().map(|map| map.capture(self.list)),
+            result: dest,
+            ..source.clone()
+        })
     }
 }
 
-/// BLAS recorded through a live title builder. Lists retain each generation they reference.
-#[derive(Default)]
-pub struct Builder {
-    blas: Mutex<BTreeMap<u64, ID3D12Resource>>,
+struct Producer {
+    recording: Arc<()>,
+    submitted: AtomicBool,
 }
+
+impl Producer {
+    fn recorded(list: &HostList) -> Arc<Self> {
+        let producer = Arc::new(Self {
+            recording: list.rt_recording(),
+            submitted: AtomicBool::new(false),
+        });
+        let mark = producer.clone();
+        // Host submissions are serialized. Deferred steps run in list order before ExecuteCommandLists.
+        list.defer_host((0, 0), move || {
+            mark.submitted.store(true, Ordering::Release)
+        });
+        producer
+    }
+
+    fn available(&self, recording: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.recording, recording) || self.submitted.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone)]
+struct Structure {
+    producer: Arc<Producer>,
+    result: Arc<ResultBuffer>,
+    // Only TLAS generations refer to a snapshot of the BLAS address space.
+    instances: Option<Arc<BlasMap>>,
+    compacted_size: Option<Arc<AtomicU64>>,
+}
+
+impl Structure {
+    fn retain(&self, list: &HostList) {
+        list.keep_rt_result(&self.result);
+        if let Some(map) = &self.instances {
+            map.capture(list);
+        }
+    }
+}
+
+/// The last structure actually reached in queue order at this title address.
+type Slot = Arc<Mutex<Option<Structure>>>;
+type WeakSlot = std::sync::Weak<Mutex<Option<Structure>>>;
+type Candidates = Arc<BTreeMap<u64, Slot>>;
+
+struct BuildSlot {
+    known_extent: bool,
+    generation: u64,
+    slot: Slot,
+    overwritten: Vec<Slot>,
+}
+
+impl BuildSlot {
+    fn submit(&self, list: &HostList, built: Option<Structure>) {
+        let slot = self.slot.clone();
+        let overwritten = self.overwritten.clone();
+        list.defer_host((0, 0), move || {
+            for old in &overwritten {
+                *old.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = built.clone();
+        });
+    }
+}
+
+struct Destination {
+    slot: Slot,
+    end: u64,
+    owner: Option<usize>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct Registry {
+    structures: BTreeMap<u64, Structure>,
+    // Includes builds still recording, so removal also cancels their publication.
+    ranges: BTreeMap<u64, Destination>,
+    waiting: BTreeMap<u64, (Option<usize>, WeakSlot)>,
+    generation: u64,
+    snapshot: Option<Candidates>,
+}
+
+fn registry() -> std::sync::MutexGuard<'static, Registry> {
+    static TABLE: std::sync::LazyLock<Mutex<Registry>> = std::sync::LazyLock::new(Default::default);
+    TABLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Registry {
+    fn trace_slot(&mut self, address: u64) -> Slot {
+        if let Some(range) = self.ranges.get(&address) {
+            return range.slot.clone();
+        }
+        if let Some(slot) = self.waiting.get(&address).and_then(|(_, w)| w.upgrade()) {
+            return slot;
+        }
+        self.waiting.retain(|_, (_, w)| w.strong_count() != 0);
+        let slot = Slot::default();
+        self.waiting.insert(
+            address,
+            (
+                crate::shadow::buffer_owner(address, 1).map(|o| o.0),
+                Arc::downgrade(&slot),
+            ),
+        );
+        slot
+    }
+
+    fn retire(
+        &mut self,
+        start: u64,
+        end: u64,
+        owner: Option<Option<usize>>,
+    ) -> (Option<Structure>, Vec<Slot>) {
+        if end <= start {
+            return (None, Vec::new());
+        }
+        let waiting: Vec<_> = self
+            .waiting
+            .range(start..end)
+            .filter(|(_, (o, _))| owner.is_none_or(|owner| owner == *o))
+            .map(|(&key, _)| key)
+            .collect();
+        for key in waiting {
+            self.waiting.remove(&key);
+        }
+        let first = self
+            .ranges
+            .range(..start)
+            .next_back()
+            .filter(|(_, r)| r.end > start)
+            .map_or(start, |(&key, _)| key);
+        let keys: Vec<_> = self
+            .ranges
+            .range(first..end)
+            .filter(|(_, r)| owner.is_none_or(|o| o == r.owner))
+            .map(|(&key, _)| key)
+            .collect();
+        let mut previous = None;
+        let mut slots = Vec::new();
+        for key in keys {
+            if let Some(range) = self.ranges.remove(&key) {
+                slots.push(range.slot);
+            }
+            let old = self.structures.remove(&key);
+            if old.as_ref().is_some_and(|s| s.instances.is_none()) {
+                self.snapshot = None;
+            }
+            if key == start {
+                previous = old;
+            }
+        }
+        (previous, slots)
+    }
+
+    fn begin(&mut self, start: u64, bytes: Option<u64>) -> (BuildSlot, Option<Arc<ResultBuffer>>) {
+        let owner = crate::shadow::buffer_owner(start, bytes.unwrap_or(1));
+        let end = match (bytes.filter(|&n| n > 0), owner) {
+            (Some(n), _) => start.saturating_add(n),
+            (None, Some((_, end))) => end,
+            (None, None) => start.saturating_add(1),
+        };
+        let slot = self
+            .ranges
+            .get(&start)
+            .map(|r| r.slot.clone())
+            .or_else(|| self.waiting.remove(&start).and_then(|(_, w)| w.upgrade()))
+            .unwrap_or_default();
+        let (old, mut overwritten) = self.retire(start, end, None);
+        overwritten.retain(|s| !Arc::ptr_eq(s, &slot));
+        self.generation += 1;
+        self.ranges.insert(
+            start,
+            Destination {
+                slot: slot.clone(),
+                end,
+                owner: owner.map(|o| o.0),
+                generation: self.generation,
+            },
+        );
+        (
+            BuildSlot {
+                known_extent: bytes
+                    .map_or(owner.is_some(), |n| n > 0 && start.checked_add(n).is_some()),
+                generation: self.generation,
+                slot,
+                overwritten,
+            },
+            old.map(|s| s.result).filter(|r| Arc::strong_count(r) == 1),
+        )
+    }
+
+    fn finish(&mut self, start: u64, generation: u64, built: Option<Structure>) -> bool {
+        if self
+            .ranges
+            .get(&start)
+            .is_none_or(|r| r.generation != generation)
+        {
+            return false;
+        }
+        let Some(built) = built else {
+            self.ranges.remove(&start);
+            return false;
+        };
+        if built.instances.is_none() {
+            self.snapshot = None;
+        }
+        self.structures.insert(start, built);
+        true
+    }
+
+    fn blas_candidates(&mut self) -> Candidates {
+        self.snapshot
+            .get_or_insert_with(|| {
+                Arc::new(
+                    self.structures
+                        .iter()
+                        .filter(|(_, s)| s.instances.is_none())
+                        .map(|(&addr, _)| (addr, self.ranges[&addr].slot.clone()))
+                        .collect(),
+                )
+            })
+            .clone()
+    }
+}
+
+pub(crate) fn release_buffer(owner: Option<usize>, start: u64, end: u64) {
+    registry().retire(start, end, Some(owner));
+}
+
+/// Resolves and pins the TLAS and its possible BLAS references for this recording.
+///
+/// # Safety
+/// `list` is a live title command list.
+pub unsafe fn host_tlas(list: *const Object, title_tlas: u64) -> Option<u64> {
+    let list = crate::list::host_list(list)?;
+    let entry = registry().structures.get(&title_tlas)?.clone();
+    entry.instances.as_ref()?;
+    if !entry.producer.available(&list.rt_recording()) {
+        return None;
+    }
+    entry.retain(list);
+    // SAFETY: the list owns this resource until the GPU has finished the recording.
+    Some(entry.result.gpu())
+}
+
+/// Compatibility name for the recording-scoped lookup.
+pub use host_tlas as host_tlas_for_list;
+
+/// Resolves one title descriptor slot and retains the TLAS for this dispatch.
+/// Call separately for every slot, including distinct offsets in one descriptor table.
+///
+/// # Safety
+/// `list` is a live title command list and `handle` is a readable title descriptor slot.
+pub unsafe fn descriptor_tlas(list: *const Object, handle: u64) -> Option<u64> {
+    let address = descriptor_address(handle)?;
+    // SAFETY: the caller supplied the live list that records this descriptor's consumer.
+    unsafe { host_tlas_for_list(list, address) }
+}
+
+fn descriptor_address(handle: u64) -> Option<u64> {
+    use crate::descriptor::{View, host::buffer_range, view};
+    let view = view(handle)?;
+    let words = match &view {
+        View::Shader(_, Some(words)) => &words[..],
+        View::Placed(false, _, words) => &words[..],
+        _ => return None,
+    };
+    Some(match D3D12_SRV_DIMENSION(words[1] as i32) {
+        D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE => {
+            u64::from(words[4]) | u64::from(words[5]) << 32
+        }
+        D3D12_SRV_DIMENSION_BUFFER => buffer_range(&view)?.0,
+        _ => return None,
+    })
+}
+
+/// Mirrors a title build and invalidates an older destination on failure.
+///
+/// # Safety
+/// `title_list` is a live title list and the active CPU arrays follow the builder ABI.
+unsafe fn build_one(
+    title_list: *const Object,
+    desc: &Build,
+    ordered: bool,
+    title_bytes: Option<u64>,
+) -> bool {
+    let dst = desc.DestAccelerationStructureData;
+    if dst == 0 {
+        return false;
+    }
+    let (generation, reuse) = registry().begin(dst, title_bytes);
+    let built = (|| {
+        if !generation.known_extent {
+            return None;
+        }
+        // The title supplies full geometry on refits. Rebuilding it also handles
+        // changed index data without relying on DXR's fixed-topology update contract.
+        let mut inputs = desc.Inputs;
+        inputs.Flags &= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY;
+        let list = crate::list::host_list(title_list)?;
+        let recorder = Recorder::new(list)?;
+        let _timing =
+            crate::timestamps::command(list, crate::timestamps::What::RaytracingBuild, None);
+        match inputs.Type {
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL => {
+                // SAFETY: the descriptors are borrowed from this title call only.
+                let geometries = unsafe { triangles(list, &inputs) }?;
+                let inputs = Inputs {
+                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        pGeometryDescs: geometries.as_ptr(),
+                    },
+                    ..inputs
+                };
+                recorder.build(&inputs, reuse, ordered)
+            }
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
+                let (inputs, map) = instances::rewrite(&recorder, title_list, &inputs)?;
+                Some(Structure {
+                    instances: Some(map),
+                    ..recorder.build(&inputs, reuse, ordered || inputs.NumDescs != 0)?
+                })
+            }
+            _ => None,
+        }
+    })();
+    if let Some(list) = crate::list::host_list(title_list) {
+        generation.submit(list, built.clone());
+    }
+    registry().finish(dst, generation.generation, built)
+}
+
+/// Rebuilds a rehydrated title entry and optionally samples its inputs on the GPU.
+///
+/// # Safety
+/// The title list and CPU arrays obey the same contract as `build`.
+pub unsafe fn rehydrate(list: *const Object, desc: &Build) -> bool {
+    // SAFETY: the caller supplies a live list and descriptions.
+    unsafe { rehydrate_sized(list, desc, None) }
+}
+
+/// Rehydrates a structure with the result size supplied by the title builder.
+///
+/// # Safety
+/// The list and CPU arrays obey the same contract as `rehydrate`.
+pub unsafe fn rehydrate_sized(list: *const Object, desc: &Build, title_bytes: Option<u64>) -> bool {
+    // SAFETY: the caller supplies the same live inputs required by build.
+    let recorded = unsafe { build_one(list, desc, false, title_bytes) };
+    #[cfg(feature = "diagnostics")]
+    if probe::enabled() {
+        let sampled = recorded
+            && crate::list::host_list(list).is_some_and(|list| {
+                // SAFETY: the CPU descriptions remain borrowed for this entire rehydration call.
+                unsafe { probe::record(list, desc).is_some() }
+            });
+        tracing::info!(recorded, sampled, "rehydrated geometry validation");
+    }
+    recorded
+}
+
+/// A title builder records into the address space shared by every builder on the host device.
+#[derive(Default)]
+pub struct Builder;
 
 impl Builder {
-    /// Mirrors a new triangle BLAS. A later unsupported build at the same address invalidates it.
+    /// Mirrors a single title build.
     ///
     /// # Safety
-    /// `list` is a live title list, and the active CPU arrays in `desc` follow the builder ABI.
+    /// `list` is a live title command list and the CPU geometry arrays are valid for the call.
     pub unsafe fn build(&self, list: *const Object, desc: &Build) -> bool {
-        let dst = desc.DestAccelerationStructureData;
-        let built = (|| {
-            if dst == 0
-                || desc.Inputs.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL
-                || desc
-                    .Inputs
-                    .Flags
-                    .contains(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
-            {
-                return None;
-            }
-            let list = crate::list::host_list(list)?;
-            let recorder = Recorder::new(list)?;
-            // SAFETY: the descriptors are borrowed from this title call only.
-            let geometries = unsafe { triangles(list, &desc.Inputs) }?;
-            let inputs = Inputs {
-                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                    pGeometryDescs: geometries.as_ptr(),
-                },
-                ..desc.Inputs
-            };
-            recorder.build(&inputs)
-        })();
-        self.replace(dst, built)
+        // SAFETY: the caller supplies the list and geometry arrays.
+        unsafe { build_one(list, desc, false, None) }
     }
 
-    /// Mirrors a clone, or invalidates the destination for another copy mode.
+    /// Records a contiguous batch. The preceding build's final UAV barrier also
+    /// orders scratch reuse and AS dependencies for the following entry.
+    ///
+    /// # Safety
+    /// The list and descriptors obey the single-build contract. No external GPU commands
+    /// may be recorded into the list while iterating the batch.
+    pub unsafe fn build_batch<'a>(
+        &self,
+        list: *const Object,
+        descs: impl Iterator<Item = &'a Build>,
+    ) {
+        // SAFETY: the caller supplies a contiguous recording with live descriptors.
+        unsafe { self.build_batch_sized(list, descs.map(|d| (d, None))) }
+    }
+
+    /// Records a batch using the title builder's destination sizes.
+    ///
+    /// # Safety
+    /// The list and descriptors obey the same contract as `build_batch`.
+    pub unsafe fn build_batch_sized<'a>(
+        &self,
+        list: *const Object,
+        descs: impl Iterator<Item = (&'a Build, Option<u64>)>,
+    ) {
+        let mut ordered = false;
+        for (desc, title_bytes) in descs {
+            // SAFETY: the batch supplies live inputs. Only a completed build leaves a trailing barrier.
+            ordered = unsafe { build_one(list, desc, ordered, title_bytes) };
+        }
+    }
+
+    /// Mirrors a clone or compact copy across title builders.
     ///
     /// # Safety
     /// `list` is a live title list.
     pub unsafe fn copy(&self, list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
+        if dst == 0 {
+            return false;
+        }
+        let (source, generation) = {
+            let mut table = registry();
+            let source = table.structures.get(&src).cloned();
+            let bytes = table.ranges.get(&src).map(|range| range.end - src);
+            let (generation, _) = table.begin(dst, bytes);
+            (source, generation)
+        };
         let copied = (|| {
-            if dst == 0 || mode != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0 {
+            if !generation.known_extent {
                 return None;
             }
-            let source = self
-                .blas
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&src)?
-                .clone();
-            Recorder::new(crate::list::host_list(list)?)?.clone_structure(&source)
+            let source = source?;
+            let recorder = Recorder::new(crate::list::host_list(list)?)?;
+            if !source.producer.available(&recorder.list.rt_recording()) {
+                return None;
+            }
+            source.retain(recorder.list);
+            recorder.copy_structure(
+                &source,
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode),
+            )
         })();
-        self.replace(dst, copied)
-    }
-
-    fn replace(&self, dst: u64, result: Option<ID3D12Resource>) -> bool {
-        let mut table = self.blas.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(resource) = result {
-            table.insert(dst, resource);
-            true
-        } else {
-            table.remove(&dst);
-            false
+        if let Some(list) = crate::list::host_list(list) {
+            generation.submit(list, copied.clone());
         }
+        registry().finish(dst, generation.generation, copied)
     }
 }
 
 fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u64> {
+    Some(input_range(list, address, bytes, alignment)?.gpu(address))
+}
+
+fn input_range(
+    list: &HostList,
+    address: u64,
+    bytes: u64,
+    alignment: u64,
+) -> Option<Arc<crate::shadow::Shadow>> {
     let end = address.checked_add(bytes)?;
-    if address == 0
-        || !address.is_multiple_of(alignment)
-        || bytes == 0
-        || !crate::shadow::holders(address)
-            .iter()
-            .any(|&(base, len)| end <= base + len)
-    {
+    if address == 0 || !address.is_multiple_of(alignment) || bytes == 0 {
+        return None;
+    }
+    let holders = crate::shadow::holders(address);
+    if holders.is_empty() {
+        // The streaming allocator also passes plain title memory. Reject gaps
+        // before asking for the same loose shadow the title's GPU writers use.
+        if !readable(address, end) {
+            return None;
+        }
+    } else if !holders.iter().any(|&(base, len)| end <= base + len) {
         return None;
     }
     let shadow = crate::shadow::find(address, bytes)?;
@@ -259,9 +682,47 @@ fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u6
         return None;
     }
     shadow.refresh(list, address, bytes);
-    Some(gpu)
+    Some(shadow)
 }
 
+fn readable(mut address: u64, end: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        VirtualQuery,
+    };
+    while address < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: VirtualQuery inspects the address without dereferencing it and fills this local.
+        let size = unsafe { VirtualQuery(address as _, &mut info, size_of_val(&info)) };
+        if size == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & PAGE_GUARD != 0
+            || !matches!(
+                info.Protect & 0xff,
+                PAGE_READONLY
+                    | PAGE_READWRITE
+                    | PAGE_WRITECOPY
+                    | PAGE_EXECUTE_READ
+                    | PAGE_EXECUTE_READWRITE
+                    | PAGE_EXECUTE_WRITECOPY
+            )
+        {
+            return false;
+        }
+        let next = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+        if next <= address {
+            return false;
+        }
+        address = next;
+    }
+    true
+}
+
+/// Translates indexed or non-indexed triangle descriptions to host addresses.
+///
+/// # Safety
+/// The active layout supplies NumDescs readable CPU descriptors or pointers to them.
 unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
     let mut geometries = Vec::new();
     for i in 0..inputs.NumDescs as usize {
@@ -288,7 +749,7 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
         let (width, alignment) = match t.VertexFormat {
             DXGI_FORMAT_R32G32B32_FLOAT => (12, 4),
             DXGI_FORMAT_R32G32_FLOAT => (8, 4),
-            DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (6, 2),
+            DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (8, 2),
             DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_SNORM => (4, 2),
             _ => return None,
         };

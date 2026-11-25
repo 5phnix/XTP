@@ -219,9 +219,23 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// The value of `main`'s `"fp32-denorm-mode"` attribute, if it has one
+    /// ([`Module::declare_fp32_denormals`]).
+    fp32_denormals: Option<&'static str>,
 }
 
+/// The attribute group (and attribute list) of `main`'s string attributes,
+/// after the four of [`Attr`].
+const MAIN_ATTRS: u64 = 5;
+
 impl Module {
+    /// Gives `main` the function attribute `"fp32-denorm-mode"="<mode>"`
+    /// (`"ftz"`, `"preserve"` or `"any"`): how the program's f32 operations
+    /// treat denormals, as DXC's `-denorm` declares it.
+    pub fn declare_fp32_denormals(&mut self, mode: &'static str) {
+        self.fp32_denormals = Some(mode);
+    }
+
     /// Renumber the signature IDs in pixel input reads after omitting an
     /// unused element. Each operation takes the element ID after its opcode.
     pub(super) fn remove_pixel_input(&mut self, removed: usize, count: usize) {
@@ -610,7 +624,8 @@ impl Module {
         w.enter(MODULE_BLOCK, 3);
         w.record(1, &[1]); // VERSION: relative value ids
 
-        // Attribute groups 1-4 and one list per group.
+        // Attribute groups 1-4 and one list per group; then `main`'s, a
+        // string attribute (kind 4: key, 0, value, 0), when it has one.
         w.enter(PARAMATTR_GROUP_BLOCK, 3);
         for (id, kinds) in [
             (1, &[18u64, 20][..]),
@@ -624,9 +639,22 @@ impl Module {
             }
             w.record(3, &r);
         }
+        if let Some(mode) = self.fp32_denormals {
+            let mut r = vec![MAIN_ATTRS, 0xFFFF_FFFF, 4];
+            r.extend(chars("fp32-denorm-mode"));
+            r.push(0);
+            r.extend(chars(mode));
+            r.push(0);
+            w.record(3, &r);
+        }
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        let lists = if self.fp32_denormals.is_some() {
+            MAIN_ATTRS
+        } else {
+            4
+        };
+        for id in 1..=lists {
             w.record(2, &[id]);
         }
         w.exit();
@@ -691,7 +719,11 @@ impl Module {
         for f in &self.funcs {
             // [type, cc, isproto, linkage, paramattr, align, section,
             // visibility, gc, unnamed_addr, prologue, dllstorage, comdat, prefix]
-            let attr = f.attr.map_or(0, |a| a as u64);
+            let attr = match f.attr {
+                Some(a) => a as u64,
+                None if f.body && self.fp32_denormals.is_some() => MAIN_ATTRS,
+                None => 0,
+            };
             w.record(
                 8,
                 &[

@@ -11,7 +11,7 @@ it, the XTP task it maps to, and who wrote it.
 - **History:** a blobless clone of `github.com/simnJS/AnyPS5`, branch
   `AnyKyty` (49,975 commits), made in the session's scratchpad for
   attribution only, plus GitHub API reads of `KytyPS5/KytyPS5` and of the
-  person's fork `simnJS/KytyPS5-GTA`.
+  person's KytyPS5 fork (simnJS).
 - **Paths:** below, paths without a prefix are under `core/kyty/graphics/`
   of AnyPS5; `shim/` is `core/libs/prx/libSceAgcDriver/KytyShim/`. Line
   numbers are at `7de61e3451`. Commit hashes are AnyPS5's (10 characters),
@@ -45,7 +45,7 @@ person's, so "portable" applies only to the person's own commits.
 |---|---|---|---|
 | Kyty | the origin of KytyPS5 | InoriRus | MIT (`core/kyty/LICENSES/Kyty-MIT.txt`) |
 | KytyPS5 | the bulk of `core/kyty/`, imported in `e6570df909` (2026-11-17), comments stripped | Nmzik and about a hundred contributors (`KytyPS5/KytyPS5`) | **GPL-2.0-only** (its README says `GPL-2.0-only`) |
-| Fork edits | in the same import: "KytyPS5 fork src/...@40ddebbe" | `40ddebbe` is a commit by TheCruZ, a KytyPS5 contributor, in the person's fork `simnJS/KytyPS5-GTA` | GPL-2.0-only (KytyPS5's) |
+| Fork edits | in the same import: "KytyPS5 fork src/...@40ddebbe" | `40ddebbe` is a commit by TheCruZ, a KytyPS5 contributor, in the person's KytyPS5 fork (simnJS) | GPL-2.0-only (KytyPS5's) |
 | AnyKyty | commits on `core/kyty/` and `shim/` after the import, mostly under `#if defined(ANYPS5_KYTY)` or in new files | the person: 281 commits on `core/kyty/`, 247 on `shim/` | the person's; AnyPS5 is distributed as GPL-2.0 |
 | Contributors | same places | 16 people, 95 commits on `core/kyty/` (14 people, 92 on `shim/`): mjnhbg3, Celegans12, raghav314, Jan Šlégl, Victor, trvxoo-glitch and others | GPL-2.0 (AnyPS5's README: "version 2"; no "or later", no CLA) |
 | shadPS4 | `host_gpu/shaders/fault_buffer_process.comp` | shadPS4 Emulator Project | GPL-2.0-or-later (SPDX header) |

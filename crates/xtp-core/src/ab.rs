@@ -47,6 +47,7 @@ pub const SWITCHES: &[&str] = &[
     "XTP_SNAPSHOT_MIRRORS",
     "XTP_RT_STANDIN",
     "XTP_RT_PATH",
+    "XTP_PLANE_NOW",
 ];
 
 /// Switches read once, when shaders are translated or pipelines made,

@@ -12,7 +12,7 @@ mod alias;
 pub(crate) mod decode;
 pub(crate) mod format;
 #[cfg(windows)]
-mod pool;
+pub(crate) mod pool;
 #[cfg(windows)]
 mod ranges;
 #[cfg(windows)]
@@ -1595,6 +1595,10 @@ fn hand_out_resource(
 /// readable or not (the planes of a present, read at a guessed stride).
 #[cfg(windows)]
 pub(crate) fn is_resource(this: This) -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if crate::record::is_proxy_of(this, RESOURCE_FUNCTIONS.0.as_ptr().cast()) {
+        return true;
+    }
     let mut table = [0u8; 8];
     !this.is_null()
         && crate::host::read_into(this.cast(), &mut table)

@@ -142,7 +142,7 @@ because the local clone is shallow:
 
 | Files | First version | Later authors | In XTP |
 |---|---|---|---|
-| `RayQueryTraversal.cpp/.h`, `ir/RayQuery.h`, `spirvEmitterRayQuery.cpp`, `spirvEmitterBvh.cpp`, `spirvEmitterTrinityBvh.cpp`, `rayTracing.h/.cpp`, `rayTracingSlots.cpp`, `rt_blas_walk.comp`, `rt_tlas_walk.comp`, `rt_common.inc` | the KytyPS5 import `e6570df9` (2026-11-17). Already substantial then: `RayQueryTraversal.cpp` 232 KB, `rayTracingSlots.cpp` 90 KB. Upstream: KytyPS5/KytyPS5 (Nmzik, Senaxx) and the fork simnJS/KytyPS5-GTA (TheCruZ) | simnJS: about 30 commits on `RayQueryTraversal.cpp` (18–19 Nov). mjnhbg3: one commit on `rayTracingSlots.cpp` (`a6e89640`) | **Ideas only** (GPL-2.0-only, third parties). Only the person's own lines in their commits are portable (anyps5.md) |
+| `RayQueryTraversal.cpp/.h`, `ir/RayQuery.h`, `spirvEmitterRayQuery.cpp`, `spirvEmitterBvh.cpp`, `spirvEmitterTrinityBvh.cpp`, `rayTracing.h/.cpp`, `rayTracingSlots.cpp`, `rt_blas_walk.comp`, `rt_tlas_walk.comp`, `rt_common.inc` | the KytyPS5 import `e6570df9` (2026-11-17). Already substantial then: `RayQueryTraversal.cpp` 232 KB, `rayTracingSlots.cpp` 90 KB. Upstream: KytyPS5/KytyPS5 (Nmzik, Senaxx) and simnJS's KytyPS5 fork (commits by TheCruZ) | simnJS: about 30 commits on `RayQueryTraversal.cpp` (18–19 Nov). mjnhbg3: one commit on `rayTracingSlots.cpp` (`a6e89640`) | **Ideas only** (GPL-2.0-only, third parties). Only the person's own lines in their commits are portable (anyps5.md) |
 | `RayQueryResults.cpp/.h`, `RayQuerySource.cpp/.h`, `RayQueryOracle.cpp/.h` | added after the import by simnJS | simnJS only | **The person's**: portable with "Ported from simnJS/AnyPS5 (commit) by simnJS" |
 | `spirvEmitterRayQueryShared.h` | lines 263–310 originate in the KytyPS5 import `e6570df9` | later work by simnJS | Lines 263–310 are **ideas only**. Check provenance per line before porting any other part of this header. |
 | `rayTracingCheck.cpp/.h`, `rayTracingReplay.h` | added by simnJS | simnJS, plus one commit by mjnhbg3 | the person's lines portable, mjnhbg3's ideas only |
@@ -272,7 +272,25 @@ All 8,828 prebuild triangle descriptors used R16_UINT. The host path
 must account for the raw format in the actual build entries. The 160
 rehydration calls described 1,070 BLAS with 1–79 geometries each. This
 capture counted descriptors at CPU call time. GPU-readable vertex/index
-coverage for those 1,070 entries remains unmeasured.
+coverage was measured in a separate run.
+
+**GPU readback, 2026-11-25** (RTX 4080 SUPER, Series S mode, 30 seconds of
+gameplay, `cache/play/20261125-100513/run.log`, commit `af1c58c`).
+Of 1,091 rehydrated BLAS, 1,081 recorded a host build and produced a fenced
+GPU sample. Ten entries failed to record (0.92%). For each completed entry
+the GPU copied the first float2 vertex and the first three 16-bit indices
+of its first geometry from the build's input shadows. All 1,081 index
+samples contained nonzero data. Of the vertex samples, 1,076 contained
+nonzero data and five were zero. These samples establish GPU reads at the
+build site. They cover one geometry per entry and do not validate the
+entire mesh. Enable `XTP_RT_REHYDRATE_PROBE=1` in a diagnostics build
+to repeat the measurement. The session exited with code 0.
+
+An earlier run with a registered-resource-only range check
+(`cache/play/20261125-095844/run.log`) rejected all 1,079 entries. The
+streaming allocator also supplies ordinary title virtual addresses. For
+these, the host checks the protection of every virtual-memory region in
+the range and refreshes the same shadow used by the title's GPU commands.
 
 ### 3.3 Instances, masks, flags
 
@@ -328,7 +346,7 @@ size. There were zero calls to the copy method, including compact copies.
   title then allocates what it expects. Host sizes are kept apart, in
   host buffers.
 - **Phase 2a keeps the title's builder.** All seven hooks call the original
-  DLL. The host records triangle BLAS builds and clones on the same list.
+  DLL. The host records triangle BLAS, TLAS and AS copies on the same list.
   A successful rehydration can record a fresh host build from the original
   geometry. The title still receives its DLL's prebuild and postbuild sizes.
   Skipping the original builder would require checking the remaining guest
@@ -628,38 +646,57 @@ Per title structure address, as VIctory #702 keys them (section 11):
     (`shadow::find`, `refresh`, `gpu`);
   - formats checked against DXR's list.
 
-  For a refit, retain the original build parameters and check update
-  eligibility, including `ALLOW_UPDATE`, unchanged topology and primitive
-  counts. For compaction, give the title its own postbuild size. Query the
-  host compacted size separately, map the title destination to the new
-  host buffer and retain the old resource through its last GPU use.
-  Rehydration can use a full host build when its geometry is available
-  (section 3.2).
-- **TLAS**: built each time the title builds it, from its instance
-  array. Each instance's BLAS address is rewritten to the host BLAS
-  address.
-  - If the array is written by the GPU (section 3.3), a small compute
-    pass rewrites it on the host GPU, after the title's writers in the
-    same list, through a sorted table (title address to host address)
-    uploaded at the build.
-  - If it is written by the CPU, the rewrite is done at submission.
-- **Scratch**: one pooled scratch buffer per list, grown on demand, not
-  one per build.
-- **Lookup at dispatch**: the program's TLAS source gives the title
-  address (section 5.3), which gives the host TLAS. A dispatch whose
-  host TLAS does not exist yet is dropped and logged (`rt: no host
-  TLAS`), as dropped traces are now.
+  A title refit supplies full geometry. The host rebuilds it with the
+  standard build flags and clears `PERFORM_UPDATE`. This supports changes
+  to GPU-written index data without assuming the old topology. Host
+  compaction uses a private postbuild slot, read after the producing
+  submission's fence. A compact copy reserves the source capacity so the
+  destination also fits a replay with different geometry. Each copy publishes
+  a distinct destination and preserves the title DLL's postbuild values.
+- **TLAS.** A compute pass reads the 64-byte instance records on the GPU
+  after preceding writers, preserves their transforms, masks, IDs and
+  flags, and rewrites the BLAS addresses using a sorted table. A missing
+  BLAS becomes a null, inactive instance. At submission the rewrite
+  takes the BLAS generations published by preceding queue commands,
+  including producers recorded after the TLAS. Its private indirect
+  argument selects the immutable upload, which contains the row count.
+  The TLAS retains the selected BLAS generations across address reuse. Every consuming recording pins the TLAS and its table.
+- **Allocation and ordering.** Small AS results share 1 MiB pages in 256-byte slices.
+  Scratch and rewritten instances use separate on-demand heaps. RT backing
+  allocations together may use up to one eighth of the DXGI local budget,
+  capped at 512 MiB. Growth also preserves one sixteenth of the local
+  budget (up to 256 MiB) for other work. If DXGI cannot report a budget
+  or either limit is reached, allocation is refused and logged. A result
+  can be rebuilt in place if unreferenced and large enough. Scratch is reused
+  per list. Consecutive builds in a batch share their intervening UAV
+  barrier. A title prebuild query supplies the guest span. A compact copy
+  conservatively uses the source guest span when the title's compacted
+  byte count is unavailable. New writes retire overlapping mappings,
+  including in-progress builds. Releasing a title buffer or remapping
+  loose memory retires its mappings as well.
+- **Lookup at dispatch.** `xtp_gpu::rt::host_tlas(list, title_tlas)` checks the
+  producer and retains the TLAS and its BLAS for that recording.
+  `descriptor_tlas` accepts the live title descriptor handle. Resolve each descriptor independently, including
+  table 5 at byte offsets +0x60 and +0x80. A cross-list copy or direct
+  binding whose producer has yet to be submitted is unavailable. Use
+  `dispatch_descriptor_tlas` for the trace splice. It records an indirect
+  root SRV and dispatch, resolving the descriptor's title address in
+  submission order. A missing TLAS gives a zero command count. Frame 677
+  of the present-1 session placed BVH work on L26 and lighting traces on
+  L68 and L77 (see refusals.md sections 6.2 and 6.3).
 - **Guest-format records**, only when a proven result reads them (AnyPS5's
   "HLE TLAS" idea): the title's instance records written in its TLAS
   memory from the same instance array.
 
 ## 9. Costs and risks
 
-- **Builds per frame.** Refits of dynamic BLAS and one TLAS rebuild are
-  cheap on RT cores (well under a millisecond for thousands of
-  instances). Rehydration becomes full host builds when the world
-  streams in. Those spikes are spread over frames with priority to what
-  a trace reads, as AnyPS5 queues its slots, and compacted.
+- **Builds per frame.** In a 30-second RTX 4080 SUPER gameplay session
+  (`cache/play/20261125-100816/run.log`, before pooling), 5,565 committed
+  DXR allocations took a median of 316 µs and 3.68 ms at the 95th
+  percentile. The six GPU timestamp intervals containing RT work measured
+  5.65–11.60 ms per frame across 19–36 marked builds per frame. These
+  spans include the input rewrite and barriers. The allocation timer
+  measures CPU wall time on recording threads.
 - **Memory (Series S mode).** The title's own structure memory is title
   memory, and the host never mirrors it while nothing on the host GPU
   reads it. Host structures are extra VRAM: BLAS before compaction are

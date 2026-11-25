@@ -6,6 +6,7 @@ follows it is labelled, checked and routed to a reviewer without anyone
 having to ask.
 
 New to the code? Read [docs/dev/START_HERE.md](docs/dev/START_HERE.md) first.
+No PC that runs the title? See [docs/contributing-without-a-gaming-pc.md](docs/contributing-without-a-gaming-pc.md).
 
 Contents: [the rules](#the-rules) ·
 [writing about titles](#writing-about-titles) ·

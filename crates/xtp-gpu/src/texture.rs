@@ -163,6 +163,32 @@ pub(crate) struct Staging {
     /// A GPU write into its texture was submitted ([`host_owned`]): nothing
     /// is detiled into it any more.
     host_owned: AtomicBool,
+    /// Its host copy's tiles, if it is a reserved texture of the pool
+    /// (`resource::pool::Tiles`): the units its title memory fills are
+    /// mapped as it is detiled ([`Staging::map_units`]).
+    tiles: Option<Weak<crate::resource::pool::Tiles>>,
+    /// The units of `tiles` its title memory filled when they were last
+    /// mapped (by unit; empty: never mapped).
+    wanted: Mutex<Vec<bool>>,
+    /// Some of those are not mapped: left for want of room, or given back
+    /// ([`evict_idle`]). Its host copy does not hold what was detiled then:
+    /// its next upload detiles and copies again, mapping them.
+    incomplete: AtomicBool,
+    /// Its tiles were given back and not mapped again since.
+    evicted: AtomicBool,
+    /// [`SWEEPS`] and [`ASKS`] when a pass last asked about it
+    /// ([`memory_change`]): a texture a shader may pick by index is asked
+    /// about once a lap of the pass's checks.
+    asked: AtomicU64,
+    asked_at: AtomicU64,
+    /// A pass looked at it at least once (its first look tells no lap).
+    looked: AtomicBool,
+    /// The bytes of its host copy (diagnostics: the census).
+    #[cfg(feature = "diagnostics")]
+    host_bytes: u64,
+    /// When it was made, in [`BORN`]'s order (diagnostics: the census).
+    #[cfg(feature = "diagnostics")]
+    born: u64,
     /// Tells it apart in tests from a staging state of another test freed
     /// at the same address (whose copies and hashes the address would
     /// count).
@@ -200,6 +226,10 @@ struct Last {
     asked: u64,
     #[cfg(feature = "diagnostics")]
     checked: Option<u64>,
+    /// The hash of the bytes detiled last (diagnostics: the census counts
+    /// detilings again of the same bytes and of others).
+    #[cfg(feature = "diagnostics")]
+    detiled: Option<blake3::Hash>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -239,6 +269,48 @@ static SWEEPS: AtomicU64 = AtomicU64::new(0);
 
 /// Staging buffers released so far: count and bytes.
 static RELEASED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A pass's looks at served textures so far ([`memory_change`]): the clock
+/// of [`Staging::asked_at`].
+static ASKS: AtomicU64 = AtomicU64::new(0);
+
+/// The most looks between two looks at one texture lately: a lap of the
+/// pass's looks over the slots it serves (several slots may view one
+/// texture, so the textures' count does not bound it). It fades by a
+/// 128th a pass.
+static LAP: AtomicU64 = AtomicU64::new(0);
+
+/// Host copies whose tiles were given back so far ([`evict_idle`]): count
+/// and bytes; and those mapped again after it (made again on demand).
+static EVICTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The resource [`evict_idle`] looked at last.
+static EVICT_CURSOR: Mutex<usize> = Mutex::new(0);
+
+/// Passes without an upload recorded nor a look of a pass after which a
+/// texture's tiles are given back ([`evict_idle`]), by default.
+const EVICT_IDLE: u64 = 120;
+
+/// [`EVICT_IDLE`] or `XTP_TEXTURE_EVICT` (passes; `0`, `off` or `false`:
+/// never).
+fn evict_after() -> Option<u64> {
+    static PASSES: OnceLock<Option<u64>> = OnceLock::new();
+    *PASSES.get_or_init(|| evict_after_of(env("XTP_TEXTURE_EVICT").as_deref()))
+}
+
+fn evict_after_of(value: Option<&str>) -> Option<u64> {
+    match value.map(str::trim) {
+        None => Some(EVICT_IDLE),
+        Some(v) if off(v) => None,
+        Some(v) => Some(v.parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = v,
+                "XTP_TEXTURE_EVICT is not a number of passes: {EVICT_IDLE}"
+            );
+            EVICT_IDLE
+        })),
+    }
+}
 
 /// The resource [`release_staging`] looked at last: the next call goes on
 /// after it.
@@ -306,8 +378,20 @@ pub(crate) fn gpu_write(list: &HostList, resource: This, whole: bool) {
     {
         load_before_write(list, resource, texture);
     }
+    // A reserved host copy gets all its tiles before the write runs (the
+    // title's memory has no say in it any more), and keeps them: its
+    // contents are the host's, never given back.
+    let tiles = crate::resource::host_resource(resource).and_then(crate::resource::pool::tiles_of);
     // After the upload's decision above, in the list's order.
-    list.defer_host((0, 0), move || host_owned(key));
+    list.defer_host((0, 0), move || {
+        if let (Some(tiles), Some(host)) = (&tiles, host()) {
+            let all = vec![true; tiles.units().len()];
+            if tiles.map(host, &all).short > 0 {
+                once!("a GPU write into a reserved texture without room for all its tiles: part of it dropped");
+            }
+        }
+        host_owned(key)
+    });
 }
 
 /// Records the upload of `resource`'s title bytes into its host copy
@@ -416,6 +500,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Ok(staging) = staging(resource, texture) else {
         return false;
     };
+    // Tiles its title memory fills are not mapped (left for want of room,
+    // or given back) and a resident heap has room for them: the check at
+    // submission detiles whatever the memory says, mapping them, and the
+    // copy brings their texels. Without room, it waits (not detiled again
+    // at every submission for nothing).
+    if staging.wants_tiles() {
+        staging.force.store(true, Ordering::Release);
+    }
     // Without a predicate (none left, or predication off) the copy runs.
     let predicate = target
         .as_ref()
@@ -571,11 +663,27 @@ pub(crate) enum Change {
 /// keeps the writes for the check). A texture its guards find clean is the
 /// safety net's to hash, as one a check found clean.
 pub(crate) fn memory_change(resource: This) -> Change {
+    let asks = ASKS.fetch_add(1, Ordering::Relaxed) + 1;
     if gpu_written(resource as usize) {
         return Change::No;
     }
     match state_of(resource) {
-        Some(staging) => staging.change(),
+        Some(staging) => {
+            // Asked about: a shader may pick it, its tiles stay.
+            staging
+                .asked
+                .store(SWEEPS.load(Ordering::Relaxed), Ordering::Relaxed);
+            let before = staging.asked_at.swap(asks, Ordering::Relaxed);
+            if staging.looked.swap(true, Ordering::Relaxed) {
+                LAP.fetch_max(asks.saturating_sub(before), Ordering::Relaxed);
+            }
+            // Tiles given back or left for want of room: made again on
+            // demand, once a resident heap has room for them.
+            if staging.wants_tiles() {
+                return Change::Yes;
+            }
+            staging.change()
+        }
         // Not "clean": nothing was ever uploaded from it.
         None => Change::Yes,
     }
@@ -772,7 +880,90 @@ pub(crate) fn release_staging(idle: u64, looks: usize) -> (u64, u64) {
     #[cfg(not(test))]
     let alone: [usize; 0] = [];
     let now = SWEEPS.fetch_add(1, Ordering::Relaxed) + 1;
-    release_staging_of(now, idle, looks, |r| !alone.contains(&r))
+    let released = release_staging_of(now, idle, looks, |r| !alone.contains(&r));
+    let _ = LAP.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |lap| {
+        Some(lap - lap / 128)
+    });
+    if let Some(after) = evict_after() {
+        evict_idle(now, after, looks, |r| !alone.contains(&r));
+    }
+    #[cfg(feature = "diagnostics")]
+    census::due();
+    released
+}
+
+/// Gives back the tiles of host copies (reserved textures of the pool)
+/// whose texture no list holds and that neither had an upload recorded nor
+/// a pass's look ([`memory_change`]) in the last `idle` passes, nor in two
+/// laps of the pass's looks ([`LAP`]: a texture a shader may pick by index
+/// is looked at once a lap): the title's streaming left them, or they wait in a view
+/// heap's slot no pass serves. Looks at up to `looks` textures from where
+/// the last call stopped, those `of` takes (tests). The texture stays: its
+/// views read zero until its next upload (a draw reading it through a
+/// table, a pass serving its slot) maps its tiles again and copies its
+/// texels in, from title memory. GPU-written textures (whose contents are
+/// the host's) are not in the map. Returns the host copies and the bytes
+/// of tiles given back.
+fn evict_idle(now: u64, idle: u64, looks: usize, of: impl Fn(usize) -> bool) -> (u64, u64) {
+    evict_idle_at(now, ASKS.load(Ordering::Relaxed), idle, looks, of)
+}
+
+/// [`evict_idle`] at time `now` of [`SWEEPS`] and `asks` of [`ASKS`]
+/// (tests: later times than other tests' passes see).
+fn evict_idle_at(
+    now: u64,
+    asks: u64,
+    idle: u64,
+    looks: usize,
+    of: impl Fn(usize) -> bool,
+) -> (u64, u64) {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let Some(host) = host() else {
+        return (0, 0);
+    };
+    let (due, lap) = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_ref() else {
+            return (0, 0);
+        };
+        // Two laps of the looks: the longest seen lately between two looks
+        // at a texture, and at least one a texture.
+        let lap = 2 * LAP.load(Ordering::Relaxed).max(map.len() as u64);
+        let mut cursor = EVICT_CURSOR.lock().unwrap_or_else(|e| e.into_inner());
+        let after = map.range((Excluded(*cursor), Unbounded));
+        let before = map.range(..=*cursor);
+        let mut due = Vec::new();
+        for (&resource, s) in after.chain(before).take(looks.min(map.len())) {
+            *cursor = resource;
+            // Under the map's lock: one held by the map alone is held by no
+            // list (each takes it from the map).
+            if Arc::strong_count(s) == 1
+                && of(resource)
+                && s.idle(now, idle, asks, lap)
+                && s.tiles().is_some_and(|t| t.any())
+            {
+                due.push(s.clone());
+            }
+        }
+        (due, lap)
+    };
+    let mut gone = (0, 0);
+    for s in due {
+        if let Some(bytes) = s.evict(host, now, idle, asks, lap) {
+            gone.0 += 1;
+            gone.1 += bytes;
+        }
+    }
+    EVICTED[0].fetch_add(gone.0, Ordering::Relaxed);
+    EVICTED[1].fetch_add(gone.1, Ordering::Relaxed);
+    gone
+}
+
+/// Host copies whose tiles were given back so far: count and bytes, and
+/// those mapped again after it.
+#[cfg(any(test, feature = "diagnostics"))]
+fn evicted_total() -> [u64; 3] {
+    EVICTED.each_ref().map(|a| a.load(Ordering::Relaxed))
 }
 
 /// The textures tests here sweep themselves (`tests::SweptAlone`): the
@@ -1443,13 +1634,128 @@ impl Staging {
         upload.as_ref().map(|u| u.data)
     }
 
+    /// Its host copy's tiles, if it is a reserved texture that lives.
+    fn tiles(&self) -> Option<Arc<crate::resource::pool::Tiles>> {
+        self.tiles.as_ref()?.upgrade()
+    }
+
+    /// Whether it had neither an upload recorded nor a pass's look in the
+    /// `idle` passes before `now`, nor a look in the `lap` looks before
+    /// `asks`.
+    fn idle(&self, now: u64, idle: u64, asks: u64, lap: u64) -> bool {
+        let since = |at: &AtomicU64| now.saturating_sub(at.load(Ordering::Relaxed));
+        since(&self.recorded) >= idle
+            && since(&self.asked) >= idle
+            && asks.saturating_sub(self.asked_at.load(Ordering::Relaxed)) >= lap
+    }
+
+    /// [`evict_idle`] for this texture, found idle and held by no list:
+    /// gives its tiles back if it still is (under the lock its checks
+    /// take, so that no mapping of a check is queued between). The bytes
+    /// given back.
+    fn evict(
+        self: &Arc<Self>,
+        host: &crate::host::Host,
+        now: u64,
+        idle: u64,
+        asks: u64,
+        lap: u64,
+    ) -> Option<u64> {
+        let _checks = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        // Held by the map and the sweep only: no list took it meanwhile.
+        if Arc::strong_count(self) > 2 || !self.idle(now, idle, asks, lap) {
+            return None;
+        }
+        let tiles = self.tiles()?;
+        let bytes = tiles.mapped();
+        if tiles.evict(host) == 0 {
+            return None;
+        }
+        // Its host copy holds nothing now: its next upload detiles and
+        // copies whatever the memory says, mapping the units its title
+        // memory fills.
+        *self.copied.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.incomplete.store(true, Ordering::Release);
+        self.evicted.store(true, Ordering::Relaxed);
+        self.force.store(true, Ordering::Release);
+        Some(bytes)
+    }
+
+    /// Whether units of its tiles its title memory filled are not mapped
+    /// (left for want of room, or given back) and a resident heap has room
+    /// for them now: its next upload maps them.
+    fn wants_tiles(&self) -> bool {
+        self.incomplete.load(Ordering::Acquire) && self.room()
+    }
+
+    /// Whether a resident heap has room now for the units of its tiles its
+    /// title memory filled that are not mapped.
+    fn room(&self) -> bool {
+        let Some(tiles) = self.tiles() else {
+            return true;
+        };
+        let wanted = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
+        tiles.room_for(&wanted)
+    }
+
+    /// Before a detiling: maps the units of its host copy's tiles whose
+    /// title memory is committed and unmaps the others (the title streamed
+    /// them out, or never in), so that the copy that follows brings the
+    /// texels of those it fills. Units no resident heap has room for are
+    /// left: the texture is incomplete until they are mapped. Before,
+    /// every host copy held memory for its whole mip chain: xcl #258 found
+    /// 1.3 GB of title memory behind 22,000 host textures of 7.9 GB.
+    fn map_units(&self) {
+        let (Some(tiles), Some(host)) = (self.tiles(), host()) else {
+            return;
+        };
+        let wanted = self.filled_units(&tiles);
+        let done = tiles.map(host, &wanted);
+        self.incomplete.store(done.short > 0, Ordering::Release);
+        if done.added > 0 && self.evicted.swap(false, Ordering::Relaxed) {
+            EVICTED[2].fetch_add(1, Ordering::Relaxed);
+        }
+        *self.wanted.lock().unwrap_or_else(|e| e.into_inner()) = wanted;
+    }
+
+    /// Which units of `tiles` its title memory fills now: those whose
+    /// mips' title memory is all committed (in a 3D texture, all of them if
+    /// the whole texture's is).
+    fn filled_units(&self, tiles: &crate::resource::pool::Tiles) -> Vec<bool> {
+        let layout = &self.layout;
+        let parts = committed_parts(self.memory, layout.size as usize);
+        let covered = |start: u64, end: u64| {
+            parts
+                .iter()
+                .any(|&(a, b)| a as u64 <= start && end <= b as u64)
+        };
+        let all = covered(0, layout.size);
+        let three_d = layout.desc.dimension == xtp_formats::texture::Dimension::Tex3d;
+        tiles
+            .units()
+            .iter()
+            .map(|u| {
+                if all || three_d {
+                    return all;
+                }
+                (u.first_mip..u.first_mip + u.mips).all(|mip| {
+                    title_mip(layout, u.slice, mip).map_or(all, |(start, end)| covered(start, end))
+                })
+            })
+            .collect()
+    }
+
     /// Whether host copy `target` holds what was detiled last, as decided
     /// at the submissions so far (a copy into it from that detiling ran or
-    /// was found not needed).
+    /// was found not needed), and every unit of its tiles the title memory
+    /// filled is mapped (or none of those left out can be now).
     fn holds(&self, target: Option<&Weak<crate::resource::HostTexture>>) -> bool {
         let Some(target) = target else {
             return false;
         };
+        if self.wants_tiles() {
+            return false;
+        }
         let written = self.written.load(Ordering::Acquire);
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         copied
@@ -1607,6 +1913,8 @@ impl Staging {
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
             before_write();
             self.detile(&read);
+            #[cfg(feature = "diagnostics")]
+            census::detiled(&mut last.detiled, blake3::hash(&read));
             give_room(read);
             self.written.fetch_add(1, Ordering::Release);
             #[cfg(feature = "diagnostics")]
@@ -1645,7 +1953,11 @@ impl Staging {
             // Hashed below: nothing for the safety net until the next check.
             self.sampled.store(false, Ordering::Relaxed);
         }
-        if !committed(self.memory, size) {
+        // A reserved host copy takes the units whose memory is committed
+        // (`map_units`): a texture streaming in shows the mips it has. Any
+        // other waits for all of it.
+        let whole = committed(self.memory, size);
+        if !whole && !(self.tiles.is_some() && any_committed(self.memory, size)) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -1656,9 +1968,9 @@ impl Staging {
             return 0;
         }
         // Memory the guards report written most likely changed: its
-        // snapshot is taken at once. Otherwise it is hashed in place first,
-        // and copied only if that tells a change.
-        if !reported {
+        // snapshot is taken at once. Otherwise it is hashed in place first
+        // (all of it committed), and copied only if that tells a change.
+        if !reported && whole {
             // SAFETY: committed memory of the texture's layout size.
             let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
             if last.hash == Some(self.hash(tiled)) {
@@ -1683,6 +1995,7 @@ impl Staging {
             {
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 self.seen.changed.fetch_add(1, Ordering::Relaxed);
+                census::detiled(&mut last.detiled, hash);
             }
         }
         give_room(snapshot);
@@ -1744,6 +2057,7 @@ impl Staging {
         let Some(data) = self.mapped() else {
             return;
         };
+        self.map_units();
         match self.convert {
             Some(convert) => self.detile_converted(tiled, convert, data),
             None => self.detile_plain(tiled, data),
@@ -1816,6 +2130,69 @@ impl Staging {
             }
         }
     }
+}
+
+/// The committed parts of `[at, at + len)`, as offsets from `at` (start,
+/// end), neighbours merged.
+fn committed_parts(at: *const u8, len: usize) -> Vec<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let base = at as usize;
+    let end = base.saturating_add(len);
+    let mut parts: Vec<(usize, usize)> = Vec::new();
+    let mut p = base;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            break;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            break;
+        }
+        if info.State == MEM_COMMIT {
+            let (start, stop) = (p - base, next.min(end) - base);
+            match parts.last_mut() {
+                Some(last) if last.1 == start => last.1 = stop,
+                _ => parts.push((start, stop)),
+            }
+        }
+        p = next;
+    }
+    parts
+}
+
+/// Where mip `mip` of array slice `slice` lies in a texture's title memory
+/// of layout `layout` (offsets, start and end): a mip in the mip tail is
+/// the tail block's (at the start of the slice); a standard mip runs to
+/// the next larger one (mips are placed from the smallest up). `None`
+/// outside the layout.
+fn title_mip(layout: &xtp_formats::texture::Layout, slice: u32, mip: u32) -> Option<(u64, u64)> {
+    let mips = &layout.mips;
+    let m = mip as usize;
+    if m >= mips.len() || slice >= layout.slices.max(1) {
+        return None;
+    }
+    let tail = (layout.first_tail_mip as usize).min(mips.len());
+    let (start, end) = if m >= tail {
+        let end = if tail > 0 {
+            mips[tail - 1].offset
+        } else {
+            layout.slice_size
+        };
+        (0, end)
+    } else {
+        let end = if m == 0 {
+            layout.slice_size
+        } else {
+            mips[m - 1].offset
+        };
+        (mips[m].offset, end)
+    };
+    let base = u64::from(slice) * layout.slice_size;
+    (start < end && base + end <= layout.size).then_some((base + start, base + end))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1958,6 +2335,17 @@ fn staging_within(
         suspect: AtomicBool::new(false),
         missed: AtomicU64::new(0),
         host_owned: AtomicBool::new(false),
+        tiles: crate::resource::pool::tiles_of(texture).map(|t| Arc::downgrade(&t)),
+        wanted: Mutex::new(Vec::new()),
+        incomplete: AtomicBool::new(false),
+        evicted: AtomicBool::new(false),
+        asked: AtomicU64::new(SWEEPS.load(Ordering::Relaxed)),
+        asked_at: AtomicU64::new(ASKS.load(Ordering::Relaxed)),
+        looked: AtomicBool::new(false),
+        #[cfg(feature = "diagnostics")]
+        host_bytes: crate::resource::host_copy(resource).map_or(0, |h| h.bytes),
+        #[cfg(feature = "diagnostics")]
+        born: BORN.fetch_add(1, Ordering::Relaxed),
         #[cfg(test)]
         id: IDS.fetch_add(1, Ordering::Relaxed),
         #[cfg(feature = "diagnostics")]
@@ -2079,6 +2467,224 @@ fn summary_due() {
             r.hashed_mb,
             r.changes
         );
+    }
+}
+
+/// Slots a pass over the textures shaders pick by index left for want of
+/// video memory, and the bytes of their textures (`draw.rs`
+/// `heap_textures`), since the last census.
+static LEFT_FOR_ROOM: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A pass left a slot whose texture of `bytes` the video memory left could
+/// not take (for the census).
+pub(crate) fn note_left_for_room(bytes: u64) {
+    LEFT_FOR_ROOM[0].fetch_add(1, Ordering::Relaxed);
+    LEFT_FOR_ROOM[1].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// The order staging states were made in (the census tells a texture
+/// another one's memory was given to after it).
+#[cfg(feature = "diagnostics")]
+static BORN: AtomicU64 = AtomicU64::new(0);
+
+/// Detilings of a texture after its first: of the same bytes as the one
+/// before, of other bytes (Samuel's watch, item 402: fork #821 found
+/// textures uploaded before their DirectStorage read ended, 2,186 of 2,671
+/// uploads again with other bytes).
+#[cfg(feature = "diagnostics")]
+static REDETILED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Every 10 s (diagnostics), one line: the host copies of the textures the
+/// title fills, by state (task cba81604, step 1), beside the frame log's
+/// totals of host textures (those without a staging state were never
+/// uploaded) and the pool's line.
+#[cfg(feature = "diagnostics")]
+mod census {
+    use super::*;
+
+    /// Passes within which a texture counts as read lately: an upload
+    /// recorded (a draw through a table, a pass) or a pass's look.
+    const LATELY: u64 = 64;
+
+    /// The census's period.
+    const EVERY: Duration = Duration::from_secs(10);
+
+    /// A detiling of the bytes that hash `now`, after one of `before`.
+    pub(super) fn detiled(before: &mut Option<blake3::Hash>, now: blake3::Hash) {
+        if let Some(was) = before.replace(now) {
+            REDETILED[usize::from(was != now)].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes a census once [`EVERY`] (at a pass): the map's states, walked
+    /// on a thread of its own (it queries their memory).
+    pub(super) fn due() {
+        static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+        let now = Instant::now();
+        {
+            let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
+            if next.is_some_and(|at| now < at) {
+                return;
+            }
+            *next = Some(now + EVERY);
+        }
+        let states: Vec<Weak<Staging>> = {
+            let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+            map.iter()
+                .flat_map(|m| m.values())
+                .map(Arc::downgrade)
+                .collect()
+        };
+        let (sweeps, asks) = (SWEEPS.load(Ordering::Relaxed), ASKS.load(Ordering::Relaxed));
+        let gpu_written = GPU_WRITTEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, |s| s.len());
+        let spawned = std::thread::Builder::new()
+            .name("xtp-texture-census".into())
+            .spawn(move || take(&states, sweeps, asks, gpu_written));
+        if let Err(e) = spawned {
+            tracing::debug!(error = %e, "no texture census thread");
+        }
+    }
+
+    /// Textures and their host copies' bytes.
+    #[derive(Default, Clone, Copy)]
+    struct Count {
+        n: u64,
+        bytes: u64,
+    }
+
+    impl Count {
+        fn add(&mut self, bytes: u64) {
+            self.n += 1;
+            self.bytes += bytes;
+        }
+    }
+
+    impl std::fmt::Display for Count {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} ({} MiB)", self.n, self.bytes >> 20)
+        }
+    }
+
+    /// One texture's part of the census.
+    struct Seen {
+        start: usize,
+        end: usize,
+        born: u64,
+        bytes: u64,
+    }
+
+    fn take(states: &[Weak<Staging>], sweeps: u64, asks: u64, gpu_written: usize) {
+        let started = Instant::now();
+        let (mut all, mut lately, mut idle, mut never) = Default::default();
+        let (mut gone, mut partly, mut tiled, mut incomplete) = Default::default();
+        let (mut replaced, mut idle_lap): (Count, Count) = Default::default();
+        let (mut uncommitted, mut mapped) = (0u64, 0u64);
+        let lap = 2 * LAP.load(Ordering::Relaxed).max(states.len() as u64);
+        let mut seen = Vec::with_capacity(states.len());
+        for s in states.iter().filter_map(Weak::upgrade) {
+            let s: Arc<Staging> = s;
+            let bytes = s.host_bytes;
+            Count::add(&mut all, bytes);
+            let since = |at: &AtomicU64| sweeps.saturating_sub(at.load(Ordering::Relaxed));
+            if since(&s.recorded).min(since(&s.asked)) < LATELY {
+                Count::add(&mut lately, bytes);
+            } else {
+                Count::add(&mut idle, bytes);
+                if asks.saturating_sub(s.asked_at.load(Ordering::Relaxed)) >= lap {
+                    Count::add(&mut idle_lap, bytes);
+                }
+            }
+            if s.written.load(Ordering::Acquire) == 0 {
+                Count::add(&mut never, bytes);
+            }
+            let size = s.layout.size as usize;
+            let parts = committed_parts(s.memory, size);
+            let committed: usize = parts.iter().map(|&(a, b)| b - a).sum();
+            if committed == 0 {
+                Count::add(&mut gone, bytes);
+            } else if committed < size {
+                Count::add(&mut partly, bytes);
+                uncommitted += uncommitted_bytes(&s, &parts);
+            }
+            if let Some(tiles) = s.tiles() {
+                Count::add(&mut tiled, bytes);
+                mapped += tiles.mapped();
+            }
+            if s.incomplete.load(Ordering::Relaxed) {
+                Count::add(&mut incomplete, bytes);
+            }
+            seen.push(Seen {
+                start: s.memory as usize,
+                end: s.memory as usize + size,
+                born: s.born,
+                bytes,
+            });
+        }
+        // Memory another texture made later also covers: the title gave it
+        // to a new texture (or views it twice).
+        seen.sort_by_key(|t| t.start);
+        let mut older = vec![false; seen.len()];
+        for i in 0..seen.len() {
+            for j in i + 1..seen.len() {
+                if seen[j].start >= seen[i].end {
+                    break;
+                }
+                let first = if seen[i].born < seen[j].born { i } else { j };
+                older[first] = true;
+            }
+        }
+        for (t, _) in seen.iter().zip(&older).filter(|(_, o)| **o) {
+            Count::add(&mut replaced, t.bytes);
+        }
+        let [evicted, evicted_bytes, again] = evicted_total();
+        let [left, left_bytes] = LEFT_FOR_ROOM
+            .each_ref()
+            .map(|a| a.swap(0, Ordering::Relaxed));
+        let [same, other] = REDETILED.each_ref().map(|a| a.load(Ordering::Relaxed));
+        tracing::info!(
+            "texture census: {all} textures with a staging state (host copies' bytes); read in the \
+             last {LATELY} passes {lately}, not {idle} (of them not looked at by a pass for two \
+             laps of its looks {idle_lap}); never given title bytes {never}; title memory gone \
+             (none committed) {gone}; partly committed {partly}, {} MiB of their host copies \
+             over uncommitted title memory; overlapped by a newer texture {replaced}; reserved \
+             {tiled}, {} MiB of tiles mapped, incomplete {incomplete}; GPU-written {gpu_written}; \
+             tiles given back so far {evicted} ({} MiB), mapped again {again}; detiled again \
+             {same} times with the same bytes, {other} with other bytes; slots left for video \
+             memory since the last census {left} ({} MiB); a lap of the passes' looks {} \
+             looks; census {} ms",
+            uncommitted >> 20,
+            mapped >> 20,
+            evicted_bytes >> 20,
+            left_bytes >> 20,
+            LAP.load(Ordering::Relaxed),
+            started.elapsed().as_millis()
+        );
+    }
+
+    /// The bytes of `s`'s host copy whose title memory is not all
+    /// committed (`parts`), subresource by subresource (their share of the
+    /// staging buffer's footprints).
+    fn uncommitted_bytes(s: &Staging, parts: &[(usize, usize)]) -> u64 {
+        let covered = |start: u64, end: u64| {
+            parts
+                .iter()
+                .any(|&(a, b)| a as u64 <= start && end <= b as u64)
+        };
+        let mut out = 0u64;
+        for (i, (footprint, &rows)) in s.footprints.iter().zip(&s.rows).enumerate() {
+            let (mip, slice) = (i as u32 % s.mips, i as u32 / s.mips);
+            let f = footprint.Footprint;
+            let linear = u64::from(f.RowPitch) * u64::from(rows) * u64::from(f.Depth);
+            if !title_mip(&s.layout, slice, mip).is_some_and(|(a, b)| covered(a, b)) {
+                out += linear;
+            }
+        }
+        // As a share of the host copy's bytes.
+        out.saturating_mul(s.host_bytes) / s.size.max(1)
     }
 }
 
@@ -3504,6 +4110,368 @@ mod tests {
         for r in [a, b, never] {
             assert_eq!(crate::object::slot::<Release>(r, 0x10)(r), 0);
         }
+    }
+
+    /// A title texture `desc` (at `address`, or committed) whose host copy
+    /// is a reserved texture of the tests' pool, once it is ready (the
+    /// pool's heaps resident), with its tiles; `None` (the resource
+    /// released) on a device without reserved textures.
+    fn reserved(
+        desc: &crate::resource::ResourceDesc,
+        address: Option<usize>,
+    ) -> Option<(
+        This,
+        &'static ID3D12Resource,
+        Arc<crate::resource::pool::Tiles>,
+    )> {
+        use crate::resource::pool::tests::{Pooled, pool_for_tests};
+        let pool = pool_for_tests()?;
+        assert!(pool.settle(Duration::from_secs(5)));
+        assert!(pool.resident(Duration::from_secs(5)));
+        let resource = {
+            let _pooled = Pooled::new();
+            match address {
+                Some(at) => crate::resource::tests_support::at_address(at as u64, desc),
+                None => committed(desc),
+            }
+        };
+        let started = Instant::now();
+        while crate::resource::host_resource(resource).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never ready");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let texture = crate::resource::host_resource(resource).unwrap();
+        match crate::resource::pool::tiles_of(texture) {
+            Some(tiles) => Some((resource, texture, tiles)),
+            None => {
+                release(resource);
+                None
+            }
+        }
+    }
+
+    fn release(resource: This) {
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+    }
+
+    /// Whether mip `sub` of 256x256 RGBA8 `texture` (as the chains of these
+    /// tests) holds `byte` in every texel.
+    fn mip_is(host: &crate::host::Host, texture: &ID3D12Resource, sub: u32, byte: u8) -> bool {
+        use crate::resource::pool::tests::{read_sub, rows_are};
+        rows_are(&read_sub(host, texture, sub), (256 >> sub) * 4, byte)
+    }
+
+    /// Records in `list` a GPU copy of `byte`s over mip 0 of 256x256 RGBA8
+    /// `resource`, as a title's copy into it is recorded (`list.rs`): its
+    /// write first, then the copy.
+    fn copy_over(host: &crate::host::Host, list: &HostList, resource: This, byte: u8) {
+        let texture = crate::resource::host_resource(resource).unwrap();
+        const PITCH: u32 = 256 * 4;
+        let (buffer, data) = list.upload(host, u64::from(PITCH) * 256).unwrap();
+        // SAFETY: the mapped upload buffer the list holds, its size.
+        unsafe { data.write_bytes(byte, PITCH as usize * 256) };
+        crate::list::ensure_state(list, resource, COPY_DEST);
+        gpu_write(list, resource, true);
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 256,
+                        Height: 256,
+                        Depth: 1,
+                        RowPitch: PITCH,
+                    },
+                },
+            },
+        };
+        // SAFETY: an open list; both locations name live resources the
+        // list holds.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+
+    /// Evicts texture `key` if it is idle `passes` passes from now and
+    /// `looks` looks after a pass last looked at it (later than other
+    /// tests' passes see; their looks move the clock meanwhile).
+    fn evict_later(key: usize, idle: u64, passes: u64, looks: u64) -> (u64, u64) {
+        let now = SWEEPS.load(Ordering::Relaxed) + passes;
+        let asked = state_of(key as This).map_or(0, |s| s.asked_at.load(Ordering::Relaxed));
+        evict_idle_at(now, asked.saturating_add(looks), idle, usize::MAX, |r| {
+            r == key
+        })
+    }
+
+    /// A reserved host copy no list holds, without an upload recorded nor
+    /// a pass's look for `idle` passes and two laps of looks, gives its
+    /// tiles back: the texture stays and reads zero, and a pass's look
+    /// finds it due; its next upload maps its tiles again and copies its
+    /// texels back from title memory, unchanged. One a list holds, one
+    /// uploaded lately or one a pass looked at within the lap keeps them.
+    #[test]
+    fn idle_reserved_textures_give_their_tiles_back_and_come_back_on_demand() {
+        let test =
+            "texture::tests::idle_reserved_textures_give_their_tiles_back_and_come_back_on_demand";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let Some((resource, texture, tiles)) = reserved(&sampled_chain(256, 1, 9), None) else {
+            eprintln!("{test}: skipped, the device reserves no textures (tiled resources tier 2)");
+            return;
+        };
+        let _alone = SweptAlone::new(resource);
+        let key = resource as usize;
+        let (memory, _) = crate::resource::texture_memory(resource).unwrap();
+        let size = staging(resource, texture).unwrap().layout.size as usize;
+        // SAFETY: the texture's own title memory, `size` bytes.
+        unsafe { memory.cast_mut().write_bytes(0x11, size) };
+        sample_in(host, resource, 1);
+        assert!(mip_is(host, texture, 0, 0x11));
+        let mapped = tiles.mapped();
+        let all: u64 = tiles
+            .units()
+            .iter()
+            .map(|u| u64::from(u.tiles) * crate::resource::pool::TILE)
+            .sum();
+        assert_eq!(mapped, all, "all its memory is committed");
+        const IDLE: u64 = 1000;
+        const LAPS: u64 = u64::MAX / 4;
+
+        // Held by a list (an upload recorded, not run): kept.
+        let list = host.new_list().unwrap();
+        assert!(upload(&list, resource, texture));
+        list.close();
+        assert_eq!(evict_later(key, IDLE, IDLE + 1, LAPS), (0, 0), "held");
+        host.execute(&[&list]);
+        host.drain();
+        drop(list);
+        // Uploaded lately: kept.
+        assert_eq!(evict_later(key, IDLE, 1, LAPS), (0, 0), "uploaded lately");
+        // Looked at by a pass within the lap: kept.
+        let _ = memory_change(resource);
+        assert_eq!(evict_later(key, IDLE, IDLE + 1, 1), (0, 0), "looked at");
+        // Idle: its tiles go, the texture stays and reads zero.
+        assert_eq!(evict_later(key, IDLE, IDLE + 1, LAPS), (1, mapped));
+        assert_eq!(tiles.mapped(), 0);
+        assert!(mip_is(host, texture, 0, 0), "unmapped tiles read zero");
+        assert_eq!(memory_change(resource), Change::Yes, "due again");
+        assert_eq!(evict_later(key, IDLE, IDLE + 1, LAPS), (0, 0), "none left");
+
+        // Made again on demand: mapped, and its texels copied back.
+        let again = evicted_total()[2];
+        sample_in(host, resource, 1);
+        assert_eq!(tiles.mapped(), mapped);
+        assert!(mip_is(host, texture, 0, 0x11), "copied back");
+        assert!(evicted_total()[2] > again);
+        assert!(
+            !state_of(resource)
+                .unwrap()
+                .incomplete
+                .load(Ordering::Acquire)
+        );
+        release(resource);
+    }
+
+    /// A reserved host copy the GPU writes gets all its tiles before the
+    /// write runs and keeps them however idle: its contents are the host's
+    /// (not in title memory), and a title write after it does not reach it.
+    #[test]
+    fn gpu_written_reserved_textures_keep_their_tiles() {
+        let test = "texture::tests::gpu_written_reserved_textures_keep_their_tiles";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let Some((resource, texture, tiles)) = reserved(&sampled_chain(256, 1, 9), None) else {
+            eprintln!("{test}: skipped, the device reserves no textures (tiled resources tier 2)");
+            return;
+        };
+        let _alone = SweptAlone::new(resource);
+        let key = resource as usize;
+        let (memory, _) = crate::resource::texture_memory(resource).unwrap();
+        let size = staging(resource, texture).unwrap().layout.size as usize;
+        let fill = |byte: u8| {
+            // SAFETY: the texture's own title memory, `size` bytes.
+            unsafe { memory.cast_mut().write_bytes(byte, size) }
+        };
+        let all = vec![true; tiles.units().len()];
+
+        // Given back while idle, then written by the GPU: every tile
+        // mapped again before the copy runs, which lands.
+        fill(0x11);
+        sample_in(host, resource, 1);
+        assert_eq!(evict_later(key, 1000, 1001, u64::MAX / 4).0, 1);
+        assert!(!tiles.any());
+        let list = host.new_list().unwrap();
+        copy_over(host, &list, resource, 0x5a);
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        drop(list);
+        assert!(tiles.holds(&all), "all mapped for the write");
+        assert!(mip_is(host, texture, 0, 0x5a), "the copy landed");
+
+        // Kept, however idle.
+        assert_eq!(
+            evict_later(key, 1000, 1001, u64::MAX / 4),
+            (0, 0),
+            "GPU-written"
+        );
+        assert!(tiles.holds(&all));
+        assert!(mip_is(host, texture, 0, 0x5a));
+        // The title's later writes do not reach it.
+        fill(0x33);
+        sample_in(host, resource, 1);
+        assert!(mip_is(host, texture, 0, 0x5a));
+        release(resource);
+    }
+
+    /// A reserved host copy maps the units whose title memory is committed:
+    /// mip 0 of a texture whose memory misses a page there stays unmapped
+    /// (it reads zero) while the other mips get their texels; once the page
+    /// is committed and written, mip 0 is mapped and copied too.
+    #[test]
+    fn reserved_textures_map_the_mips_their_title_memory_has() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let test = "texture::tests::reserved_textures_map_the_mips_their_title_memory_has";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        const LEN: usize = 1 << 20;
+        const PAGE: usize = 4096;
+        let at = private_memory(LEN, false);
+        let Some((resource, texture, tiles)) = reserved(&sampled_chain(256, 1, 9), Some(at)) else {
+            eprintln!("{test}: skipped, the device reserves no textures (tiled resources tier 2)");
+            free_memory(at, LEN);
+            return;
+        };
+        let _alone = SweptAlone::new(resource);
+        let state = staging(resource, texture).unwrap();
+        let layout = state.layout.clone();
+        let size = layout.size as usize;
+        assert!(size <= LEN);
+        // A page of mip 0's title memory, decommitted; the rest filled.
+        let (start, end) = title_mip(&layout, 0, 0).expect("mip 0");
+        let page = (start as usize).next_multiple_of(PAGE);
+        assert!(page + PAGE <= end as usize, "a whole page in mip 0");
+        // SAFETY: a page of our own allocation; nothing reads it meanwhile.
+        let freed = unsafe { VirtualFree((at + page) as *mut _, PAGE, MEM_DECOMMIT) };
+        assert_ne!(freed, 0);
+        // SAFETY: the committed parts of our allocation.
+        unsafe {
+            (at as *mut u8).write_bytes(0x22, page);
+            ((at + page + PAGE) as *mut u8).write_bytes(0x22, size - page - PAGE);
+        }
+        sample_in(host, resource, 1);
+        let units = tiles.units().to_vec();
+        let wanted = state.wanted.lock().unwrap().clone();
+        assert_eq!(wanted.len(), units.len());
+        for (u, &w) in units.iter().zip(&wanted) {
+            assert_eq!(w, u.first_mip != 0, "{u:?}");
+        }
+        let bytes = |filter: &dyn Fn(&crate::resource::pool::Unit) -> bool| -> u64 {
+            units
+                .iter()
+                .filter(|u| filter(u))
+                .map(|u| u64::from(u.tiles) * crate::resource::pool::TILE)
+                .sum()
+        };
+        assert_eq!(tiles.mapped(), bytes(&|u| u.first_mip != 0));
+        assert!(mip_is(host, texture, 1, 0x22), "mip 1 has its texels");
+        assert!(mip_is(host, texture, 0, 0), "mip 0 is not mapped");
+        assert!(!state.incomplete.load(Ordering::Acquire), "none left out");
+
+        // Committed and written: mapped and copied.
+        // SAFETY: the page decommitted above, committed again.
+        let again =
+            unsafe { VirtualAlloc((at + page) as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!again.is_null());
+        // SAFETY: the texture's memory, ours, all committed.
+        unsafe { (at as *mut u8).write_bytes(0x22, size) };
+        sample_in(host, resource, 1);
+        assert_eq!(tiles.mapped(), bytes(&|_| true));
+        assert!(mip_is(host, texture, 0, 0x22));
+        drop(state);
+        release(resource);
+        free_memory(at, LEN);
+    }
+
+    /// Where mips lie in title memory: the standard ones from the largest
+    /// at the end of the slice down, the mip tail's at its start; slices
+    /// one after another; nothing outside the layout.
+    #[test]
+    fn title_mips_follow_the_layout() {
+        let desc = sampled_chain(256, 2, 9);
+        let layout = crate::resource::texture_layout(&desc).unwrap().planes[0]
+            .layout
+            .clone();
+        let mut covered = Vec::new();
+        for slice in 0..2 {
+            for mip in 0..9 {
+                let (a, b) = title_mip(&layout, slice, mip).unwrap();
+                assert!(a < b && b <= layout.size, "{slice} {mip}");
+                covered.push((a, b));
+            }
+            // Mip 0 ends its slice.
+            assert_eq!(
+                title_mip(&layout, slice, 0).unwrap().1,
+                (u64::from(slice) + 1) * layout.slice_size
+            );
+        }
+        covered.sort_unstable();
+        covered.dedup();
+        // The ranges of one slice tile it without overlap (tail mips
+        // share the tail block).
+        for w in covered.windows(2) {
+            assert!(w[0].1 <= w[1].0, "{:?}", w);
+        }
+        assert_eq!(covered.last().unwrap().1, layout.size);
+        assert_eq!(title_mip(&layout, 2, 0), None);
+        assert_eq!(title_mip(&layout, 0, 9), None);
+    }
+
+    #[test]
+    fn committed_parts_merge_neighbours() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        const PAGE: usize = 4096;
+        let at = private_memory(8 * PAGE, false);
+        assert_eq!(committed_parts(at as *const u8, 8 * PAGE), [(0, 8 * PAGE)]);
+        // SAFETY: pages of our own allocation, unused.
+        unsafe { VirtualFree((at + 3 * PAGE) as *mut _, 2 * PAGE, MEM_DECOMMIT) };
+        assert_eq!(
+            committed_parts(at as *const u8, 8 * PAGE),
+            [(0, 3 * PAGE), (5 * PAGE, 8 * PAGE)]
+        );
+        assert_eq!(
+            committed_parts((at + PAGE) as *const u8, 3 * PAGE),
+            [(0, 2 * PAGE)]
+        );
+        free_memory(at, 8 * PAGE);
+    }
+
+    #[test]
+    fn eviction_follows_its_switch() {
+        assert_eq!(evict_after_of(None), Some(EVICT_IDLE));
+        assert_eq!(evict_after_of(Some("300")), Some(300));
+        assert_eq!(evict_after_of(Some("off")), None);
+        assert_eq!(evict_after_of(Some("0")), None);
+        assert_eq!(evict_after_of(Some("soon")), Some(EVICT_IDLE));
     }
 
     /// A list reset while its submission runs hands what it holds to the

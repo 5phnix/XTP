@@ -151,6 +151,12 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// A host compute pass replaced the title's root signature and pipeline.
+#[cfg(windows)]
+pub(crate) fn forget_host_bindings(this: This) {
+    with_state(this, |_, state| state.forget_host());
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -1469,6 +1475,8 @@ fn clear_uav(
                 #[cfg(feature = "diagnostics")]
                 crate::capture::note_target(texture);
                 list.twin_use(texture, true, true);
+                // Which twin the view clears, of a depth-stencil texture's two.
+                list.twin_view_written(texture, &view);
                 list.twins_written();
                 ensure_state(list, texture, UNORDERED_ACCESS);
                 crate::resource::decode::wrote(list, texture);
@@ -2063,6 +2071,8 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(windows)]
     if let Some(heap) = crate::query::host_heap(heap, kind, index, 1) {
         with_state(this, |list, state| {
+            // Depth planes due are drawn before the query, not in it.
+            list.twins_query(kind, true);
             heap.begin(list, &mut state.occlusion, kind, index)
         });
     }
@@ -2074,6 +2084,7 @@ extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(windows)]
     if let Some(heap) = crate::query::host_heap(heap, kind, index, 1) {
         with_state(this, |list, state| {
+            list.twins_query(kind, false);
             heap.end(list, &mut state.occlusion, kind, index)
         });
     }
