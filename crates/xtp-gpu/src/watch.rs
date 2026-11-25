@@ -710,24 +710,35 @@ fn finish_opening(g: &Guards, blocks: &[usize]) {
     GUARDED.store(g.protected.len() + g.opening.len(), SeqCst);
 }
 
+/// Complete the opening even if the test hook unwinds. Restore access before
+/// clearing the marks so that a waiting kernel write can use every alias.
+struct Opening(Vec<usize>);
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        make_writable(&self.0);
+        let mut g = guards();
+        for block in &self.0 {
+            g.opening.remove(block);
+        }
+        finish_opening(&g, &self.0);
+        drop(g);
+        REOPENED.notify_all();
+    }
+}
+
 fn reopen(mut g: GuardLock, blocks: Vec<usize>) {
     if blocks.is_empty() {
         return;
     }
     g.opening.extend(&blocks);
     drop(g);
+    let opening = Opening(blocks);
     #[cfg(test)]
     if let Some(hook) = tests::REOPENING.take() {
-        hook(&blocks);
+        hook(&opening.0);
     }
-    make_writable(&blocks);
-    let mut g = guards();
-    for block in &blocks {
-        g.opening.remove(block);
-    }
-    finish_opening(&g, &blocks);
-    drop(g);
-    REOPENED.notify_all();
+    drop(opening);
 }
 
 /// The blocks `[at, at + len)` touches; the length is the title's
@@ -1814,18 +1825,24 @@ pub(crate) mod tests {
     #[test]
     fn a_view_gone_before_the_index_forgets_it() {
         use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
-        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
         let _serial = serial();
         let section = section(1);
-        let (a, b) = (view_of(section, 1), view_of(section, 1));
+        let (a, b) = (view_of(section, 1), placeholder_of(1));
+        let view = map_view(section, b, 0, 1);
         same_pages(&[a, b], 1);
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
         // xmem unmaps `b`: reported, `a`'s copy guards both again, unmapped.
         title_memory_remapped(b, BLOCK);
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
         assert!(!writable(a) && guards().protected.contains(&(b / BLOCK)));
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut _ }) };
+        // Keep the address reserved until the alias index forgets it.
+        // SAFETY: our view replaced this placeholder.
+        assert_ne!(
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) },
+            0
+        );
         // The title writes `a`: the handler opens it, and fails on `b`.
         // SAFETY: plain writes and reads of this thread's last error.
         unsafe { SetLastError(1234) };
@@ -1845,6 +1862,7 @@ pub(crate) mod tests {
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
         assert_eq!(guard(a, a + BLOCK), Some(vec![]));
         assert!(!writable(a) && !linked(a));
+        released(b, 1);
         unmapped(a, 1);
         // SAFETY: our section.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
@@ -2134,6 +2152,15 @@ pub(crate) mod tests {
                 PAGE_READWRITE,
             )
         };
+        if allocation.is_null() {
+            // A parallel allocator can claim the address after the unmap.
+            // SAFETY: read the error from VirtualAlloc on this thread.
+            assert_eq!(
+                unsafe { windows_sys::Win32::Foundation::GetLastError() },
+                windows_sys::Win32::Foundation::ERROR_INVALID_ADDRESS
+            );
+            return;
+        }
         assert_eq!(allocation as usize, at);
         // Reproduit un indice périmé, indépendamment de l'ordonnancement du remappage.
         KNOWN_VIEWS.set(first..first + 1, true);
