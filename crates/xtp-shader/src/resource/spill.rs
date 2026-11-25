@@ -1,7 +1,6 @@
 //! Compute root arguments kept behind the 40-bit pointer in entry s0:s1.
-//! Ported from VIctory (resource.rs, commit 27c3dc9d5), by Marvis and
-//! Claude Fable 5.2. The layout and high-half mask also follow fxceless's
-//! spill.rs (commit 578d459).
+//! Ported from Marvisak/VIctory (commit 27c3dc9d5) by Marvisak and Claude Fable 5.2.
+//! Disposition et masque du mot haut d'après fxceless's VIctory fork (commit 578d459).
 
 use std::collections::{HashMap, HashSet};
 

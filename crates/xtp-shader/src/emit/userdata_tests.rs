@@ -1,5 +1,5 @@
-//! Synthetic compute spill tables, including the overwrite regression
-//! ported from VIctory #489 by louketa.
+//! Tables synthétiques de paramètres déportés. Cas de réécriture des registres :
+//! Ported from Marvisak/VIctory#489 (head fe7210e) by louketa.
 
 use super::{HostShader, translate_program};
 use crate::native::{
@@ -214,4 +214,65 @@ fn overwriting_the_pointer_stops_recognition_at_the_next_load() {
         result,
         Err(ShaderError::Unsupported { offset: 20, .. })
     ));
+}
+
+#[test]
+fn ambiguous_and_unmapped_first_spill_words_are_refused_even_when_dead() {
+    let load = [0xF400_0101, 0xFA00_0004];
+    let code = [PTR.as_slice(), &load, &[END]].concat();
+    for layout in [
+        vec![
+            param(RootType::Constants, 16, 2, 0),
+            param(RootType::Constants, 17, 1, 1),
+        ],
+        vec![param(RootType::Constants, 16, 1, 0)],
+    ] {
+        assert!(matches!(
+            track(&native(&code, layout)),
+            Err(ShaderError::Unsupported {
+                offset: 12,
+                what: "a spill-table dword without a unique root parameter"
+            })
+        ));
+    }
+}
+
+#[test]
+fn unused_entry_pointer_has_no_spill_bindings() {
+    for code in [vec![END], vec![0xBE82_0300, END], vec![0xBE83_0301, END]] {
+        let r = track(&native(&code, vec![param(RootType::Descriptor, 16, 2, 0)])).unwrap();
+        assert!(r.spill_loads.is_empty() && r.params.is_empty());
+    }
+}
+
+#[test]
+fn phi_merges_reloads_only_for_the_same_spilled_descriptor() {
+    let mut code = [
+        PTR.as_slice(),
+        &[
+            0xBF06_8001,
+            0xBF85_0003,
+            0xF404_0101,
+            0xFA00_0000,
+            0xBF82_0002,
+            0xF404_0101,
+            0xFA00_0000,
+            0xF400_0182,
+            0xFA00_0008,
+            END,
+        ],
+    ]
+    .concat();
+    let layout = || {
+        vec![
+            param(RootType::Descriptor, 16, 2, 3),
+            param(RootType::Descriptor, 18, 2, 7),
+        ]
+    };
+    let r = track(&native(&code, layout())).unwrap();
+    assert_eq!(r.spill_loads.len(), 2);
+    assert_ne!(r.spill_loads[0].0, r.spill_loads[1].0);
+    assert_eq!((r.scalar[0].1.param, r.scalar[0].1.offset), (0, 8));
+    code[9] = 0xFA00_0008;
+    assert!(track(&native(&code, layout())).is_err());
 }

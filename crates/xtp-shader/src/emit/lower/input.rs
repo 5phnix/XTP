@@ -526,6 +526,45 @@ impl<'a> Lower<'a> {
         Val::I32(self.s.m.extract(entry, r, index % 4))
     }
 
+    /// Les dwords fournis par l'hôte suivent les arguments du titre.
+    pub(super) fn host_word(&mut self, root: RootType, slot: u8, dword: u32) -> V {
+        if let Some((_, v)) = self
+            .host_words
+            .iter()
+            .find(|(u, _)| (u.root, u.slot, u.dword) == (root, slot, dword))
+        {
+            return *v;
+        }
+        let index = self.host_words.len() as u32;
+        if index.is_multiple_of(4) {
+            self.host_rows.push(self.s.m.pending_i32());
+        }
+        let row = self.host_rows[index as usize / 4];
+        let h = *self
+            .user_data
+            .get_or_insert_with(|| self.s.user_data_handle());
+        let e = self.s.entry;
+        let values = self.s.op(
+            e,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[h, row],
+        );
+        let v = self.s.m.extract(e, values, index % 4);
+        self.host_words.push((
+            UserData {
+                index,
+                slot,
+                root,
+                dword,
+            },
+            v,
+        ));
+        v
+    }
+
     pub(super) fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");

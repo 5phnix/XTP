@@ -111,6 +111,8 @@ pub(crate) struct State {
     /// address, host copy, 0 for a view in place or [`State::writes`] + 1
     /// for a copy of the list's own) → slot.
     root_srv_slots: std::collections::HashMap<(usize, u64, usize, u64), u32>,
+    /// Une vue brute par segment de tampon et par tas pour cet enregistrement.
+    root_uav_slots: std::collections::HashMap<(usize, usize, u64, u64), u32>,
     /// Root CBVs copied on the GPU in this list: (host copy, address,
     /// [`State::writes`]) → host address.
     cbv_copies: std::collections::HashMap<(usize, u64, u64), u64>,
@@ -901,11 +903,10 @@ impl State {
     /// which are bound as tables in a view heap; the console needs no heap
     /// for root views. Once the list has XTP's heap, it keeps it until the
     /// title binds a view heap.
-    fn wanted_heaps(&self, root_srvs: bool) -> [usize; 2] {
+    fn wanted_heaps(&self, tabled: bool) -> [usize; 2] {
         let mut wanted = self.heaps;
         let title_views =
             wanted[0] != 0 && crate::descriptor::heap(wanted[0] as This).host().is_some();
-        let tabled = root_srvs && crate::pipeline::host::bounded_root_srvs();
         if !title_views && (tabled || self.host_heaps[0] == crate::descriptor::OWN_VIEW_HEAP) {
             wanted[0] = crate::descriptor::OWN_VIEW_HEAP;
         }
@@ -942,7 +943,9 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
-        let wanted = self.wanted_heaps(root_srvs);
+        let root_uavs = p.stages.iter().any(|s| !s.root_uavs.is_empty());
+        let wanted =
+            self.wanted_heaps(root_uavs || root_srvs && crate::pipeline::host::bounded_root_srvs());
         self.set_host_heaps(list, wanted);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -992,12 +995,37 @@ impl State {
                 }
                 return Err("no dynamic slots for its tables");
             }
+            let mut biases = Vec::new();
+            for &(slot, param) in &stage.root_uavs {
+                let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                else {
+                    return Err("a root UAV has no bound address");
+                };
+                let (handle, bias) = self.root_uav(list, address)?;
+                biases.push((slot, bias));
+                // SAFETY: le tas actif conserve cette vue pendant la soumission.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootDescriptorTable(param, handle);
+                    } else {
+                        l.SetGraphicsRootDescriptorTable(param, handle);
+                    }
+                }
+            }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    if u.root == xtp_shader::emit::ROOT_UAV_BIAS {
+                        values[u.index as usize] = biases
+                            .iter()
+                            .find(|b| b.0 == u.slot)
+                            .ok_or("missing root UAV bias")?
+                            .1;
+                        continue;
+                    }
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
@@ -1460,6 +1488,47 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// Ported from Marvisak/VIctory#1077 (head 873548f) by DuarttBR.
+    /// Le décalage est celui de la vue liée, y compris pour un compteur
+    /// situé à 4, 8 ou 12 octets du début aligné.
+    fn root_uav(
+        &mut self,
+        list: &HostList,
+        address: u64,
+    ) -> Result<(D3D12_GPU_DESCRIPTOR_HANDLE, u32), &'static str> {
+        let heap = self.host_heaps[0];
+        let host = host_heap(heap).ok_or("a root UAV without a view heap")?;
+        let copy = crate::shadow::find(address, 4).ok_or("a root UAV outside a title buffer")?;
+        // SAFETY: la copie possède la ressource.
+        let flags = unsafe { copy.buffer.GetDesc() }.Flags;
+        if !flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+            return Err("a root UAV on a buffer without unordered access");
+        }
+        let window =
+            xtp_shader::emit::RawWindow::covering(copy.offset(address), copy.left(address) & !3)
+                .ok_or("a root UAV off a dword")?;
+        let key = (
+            heap,
+            copy.buffer.as_raw() as usize,
+            window.first,
+            u64::from(window.dwords),
+        );
+        let slot = match self.root_uav_slots.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                let slot = host.dynamic(1).ok_or("no dynamic slot for a root UAV")?;
+                self.recording.range(list, heap, slot, 1);
+                host.raw_uav_at(slot, &copy.buffer, window);
+                self.root_uav_slots.insert(key, slot);
+                slot
+            }
+        };
+        let bytes = u64::from(window.elements(0)) * 4;
+        copy.refresh(list, address, bytes);
+        copy.gpu_writes(list, address, bytes);
+        Ok((host.gpu_handle(slot), window.bias))
     }
 
     /// The slot, in the view heap set on the host list (the title's, or

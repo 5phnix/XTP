@@ -360,7 +360,10 @@ impl<'a> Lower<'a> {
         };
         let raw = !typed
             && !used.is_some_and(|r| r.kind == ResourceType::Cbv)
-            && (built.is_some() && (crate::emit::raw_structured() || add_tid)
+            && (built.is_some()
+                && (crate::emit::raw_structured()
+                    || add_tid
+                    || used.is_some_and(|u| u.kind == ResourceType::Uav))
                 || self.through_table(index, used, src)?
                 || (index.is_some() && crate::emit::raw_structured()));
         let mut within = self.s.m.i32(u32::from(*offset));
@@ -776,7 +779,7 @@ impl<'a> Lower<'a> {
     /// Saturate an overflowing byte address. No complete dword fits at
     /// u32::MAX, so a later component or base displacement cannot wrap
     /// an invalid access back to the start of the view.
-    fn raw_add(&mut self, a: V, b: V) -> V {
+    pub(super) fn raw_add(&mut self, a: V, b: V) -> V {
         let zero = self.s.m.i32(0);
         if a == zero {
             return b;

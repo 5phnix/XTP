@@ -490,6 +490,7 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
     /// The root parameter of the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]), if its shader reads one: a root SRV of the view
     /// heap's table, which draws bind or are dropped without.
@@ -865,6 +866,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
                 stride_table: None,
             };
             let dwords = t.user_data_dwords();
@@ -893,13 +895,24 @@ impl HostPipeline {
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
                 ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
+                ),
             ] {
                 for &slot in slots {
-                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+                    if kind == D3D12_ROOT_PARAMETER_TYPE_UAV
+                        || kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs()
+                    {
                         // A one-view table: the view's size bounds the reads,
                         // which a root descriptor leaves unbounded.
                         ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                            RangeType: if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
+                                D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+                            } else {
+                                D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                            },
                             NumDescriptors: 1,
                             BaseShaderRegister: u32::from(slot),
                             RegisterSpace: ROOT_CBV_SPACE,
@@ -1648,6 +1661,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
                 stride_table: false,
                 run_time_buffers: 0,
             },
@@ -2056,6 +2070,7 @@ mod tests {
                         static_samplers: vec![],
                         root_cbvs: vec![],
                         root_srvs: vec![],
+                        root_uavs: vec![],
                         stride_table: false,
                         run_time_buffers: 0,
                     },

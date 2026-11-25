@@ -117,6 +117,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     /// The program reads the host's runtime stride table.
     pub stride_table: bool,
     /// Buffers read (and written) through view-heap slots the program
@@ -263,6 +264,8 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     group_base_row: Option<V>,
+    host_words: Vec<(UserData, V)>,
+    host_rows: Vec<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
@@ -767,6 +770,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             group_base_row: None,
+            host_words: Vec::new(),
+            host_rows: Vec::new(),
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -961,6 +966,17 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        let mut user_data: Vec<_> = self.user_reads.values().copied().collect();
+        let first = self.s.user_data.next_multiple_of(4);
+        for (i, row) in self.host_rows.iter().enumerate() {
+            let actual = self.s.m.i32(first / 4 + i as u32);
+            self.s.m.replace_const(*row, actual);
+        }
+        for (mut binding, _) in self.host_words {
+            binding.index += first;
+            self.s.user_data = binding.index + 1;
+            user_data.push(binding);
+        }
         let group_base = self.group_base_row.map(|row| {
             // La rangée suivante reste libre même si des constantes du titre sont déportées.
             let offset = self.s.user_data.next_multiple_of(4);
@@ -969,10 +985,10 @@ impl<'a> Lower<'a> {
             self.s.user_data = offset + 3;
             offset
         });
-        let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let stride_table = self.s.stride_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
@@ -990,6 +1006,7 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             stride_table,
             run_time_buffers: self.run_time_buffers,
             #[cfg(test)]

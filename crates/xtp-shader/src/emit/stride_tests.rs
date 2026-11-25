@@ -117,6 +117,7 @@ fn shader(words: &[u32], uav: u32, io: ComputeIo) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
         stride_table: l.stride_table,
         run_time_buffers: l.run_time_buffers,
     }
@@ -745,6 +746,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
         static_samplers: Vec::new(),
         root_cbvs: plain.root_cbvs,
         root_srvs: plain.root_srvs,
+        root_uavs: plain.root_uavs,
         stride_table: false,
         run_time_buffers: plain.run_time_buffers,
     };
@@ -766,6 +768,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
             static_samplers: Vec::new(),
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
             stride_table: true,
             run_time_buffers: l.run_time_buffers,
         }
