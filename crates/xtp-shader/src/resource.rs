@@ -18,6 +18,7 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+mod spill;
 mod uniform;
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
@@ -115,8 +116,10 @@ pub struct Resources {
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
-    /// User SGPRs holding root parameters: value on entry, layout index,
-    /// dword within the parameter.
+    /// Loads replaced with root arguments, sorted by instruction site.
+    pub spill_loads: Vec<Site>,
+    /// Root arguments from user SGPRs or spill loads, by SSA value, layout
+    /// index and dword within that parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
 }
@@ -152,16 +155,35 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    trace(Tracer::new(p, layout, stage, lanes)?)
+}
+
+/// Traces a native program with its dispatch metadata. Compute programs
+/// with a spilled root signature get their parameters from table loads.
+pub fn track_native(
+    p: &Program,
+    native: &crate::native::NativeProgram,
+    lanes: Option<&Structured>,
+) -> Result<Resources, ShaderError> {
+    let mut t = Tracer::new(p, &native.layout, native.stage, lanes)?;
+    if spill::has_table(native) {
+        t.read_spill_table()?;
+    }
+    trace(t)
+}
+
+fn trace(mut t: Tracer<'_>) -> Result<Resources, ShaderError> {
+    let p = t.p;
     let mut out = Resources {
         params: p
             .inputs
             .iter()
             .filter_map(|&(reg, v)| {
-                let (param, dword) = t.param_of(reg)?;
+                let (param, dword) = t.register_param(reg)?;
                 Some((v, param, dword))
             })
             .collect(),
+        spill_loads: std::mem::take(&mut t.spill.loads),
         ..Resources::default()
     };
     // Group accesses in the same loop so a shared mask can select several
@@ -174,6 +196,13 @@ pub fn track(
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            if out.spill_loads.binary_search(&site).is_ok() {
+                out.params.extend(inst.writes.iter().filter_map(|&(_, v)| {
+                    let &(param, dword) = t.spill.bindings.get(&v)?;
+                    Some((v, param, dword))
+                }));
+                continue;
+            }
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -314,6 +343,7 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    spill: spill::Spill,
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
@@ -380,6 +410,7 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            spill: Default::default(),
             lanes,
             rpo,
             uniformity: uniform::AddressUniformity::new(n),
@@ -417,10 +448,14 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
-                            Some(Moved::Const(c)) => Some(Term::Const(c)),
-                            Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
+                        let new = if let Some(binding) = self.spill.bindings.get(&v) {
+                            Some(Term::Value(self.spill.first[binding]))
+                        } else {
+                            match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                                Some(Moved::Const(c)) => Some(Term::Const(c)),
+                                Some(Moved::Value(s)) => o[s.0 as usize],
+                                None => Some(Term::Value(v)),
+                            }
                         };
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
@@ -467,8 +502,11 @@ impl<'a> Tracer<'a> {
     }
 
     /// Layout index and dword of the root parameter `reg` holds on entry.
-    fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
+    fn register_param(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
+        if self.spill.active {
+            return None;
+        }
         self.layout.iter().enumerate().find_map(|(i, p)| {
             let first = self.stage.user_sgpr(p.user_data);
             let dword = u32::from(code).checked_sub(first.into())?;
@@ -510,8 +548,8 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
+        if self.inputs[v.0 as usize].is_some() || self.spill.bindings.contains_key(&v) {
+            return match self.param_value(v) {
                 Some((_, 0)) => Sum {
                     base: Some(v),
                     offset: 0,
@@ -634,8 +672,8 @@ impl<'a> Tracer<'a> {
         if self.getpc(x).is_some() {
             return CodeBase::Code(x);
         }
-        if let Some(reg) = self.inputs[x.0 as usize] {
-            return match self.param_of(reg) {
+        if self.inputs[x.0 as usize].is_some() || self.spill.bindings.contains_key(&x) {
+            return match self.param_value(x) {
                 Some((_, 0)) => CodeBase::Other,
                 _ => CodeBase::None,
             };
@@ -847,17 +885,15 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
         let (param, _) = self
-            .param_of(reg)
+            .param_value(base)
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
-            }
+            RootType::Descriptor => Some(
+                self.param_high(param)
+                    .ok_or("a root descriptor without its high half")?,
+            ),
             _ => return Err("an address from a root parameter that is no address"),
         };
         // shortcut: with a computed term, a high half that adds anything to the
@@ -926,6 +962,7 @@ impl<'a> Tracer<'a> {
                 "an address read from the first lane of a per-lane value"
             }
             Some(n) if n.starts_with("s_load_") => "an address loaded from memory",
+            None if self.spill.bindings.contains_key(&v) => "an address held in spilled root data",
             None => "an address from a phi",
             _ => "an address not from a root parameter",
         }
@@ -1222,7 +1259,7 @@ impl<'a> Tracer<'a> {
     /// Whether `v` is an input or a constant, through scalar moves.
     fn entry_value(&self, mut v: Value) -> bool {
         for _ in 0..MAX_ROUNDS {
-            if self.inputs[v.0 as usize].is_some() {
+            if self.inputs[v.0 as usize].is_some() || self.spill.bindings.contains_key(&v) {
                 return true;
             }
             let Some(inst) = self.def(v) else {
@@ -1684,8 +1721,8 @@ impl<'a> Tracer<'a> {
             return false;
         };
         for _ in 0..MAX_COPIES {
-            if let Some(reg) = self.inputs[v.0 as usize] {
-                return self.param_of(reg).is_some();
+            if self.param_value(v).is_some() {
+                return true;
             }
             let Some(def) = self.def(v) else { return false };
             let Some(k) = def.writes.iter().position(|w| w.1 == v) else {

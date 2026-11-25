@@ -171,6 +171,13 @@ console keeps none of them in registers: s0 and s1 & 0xff hold the 40-bit
 address of a table, and the parameter the layout declares at user-data
 index N ≥ 16 is at byte 4 × (N − 16).
 
+The 16-digit BLAKE3 hashes in the 20261125-000534 run match 34 of the 52
+compute containers embedded in `XboxBvhBuilder.dll`. All 34 declare four
+user SGPRs and their first root parameter at dword 16. To reproduce, run
+`xtp shader-info --disasm` on the DLL. In containers at DLL offsets
+0x25c40, 0x28770, 0x2b5b0 and 0x34b20, the first table read is at code
+offset 0x2c, 0x2c, 0x40 and 0x30 respectively.
+
 **shadPS4.** This is the PS4's "extended user data": user data beyond 16
 dwords lives behind a pointer in user data. `FlattenExtendedUserdataPass`
 exists for it (its first version is "Implement shader resource tables",
@@ -192,6 +199,14 @@ the value-number slot sharing, and offsets computed from user data, which
 the fork leaves alone. One D3D12 limit: root constants count against the
 64 DWORDs of a root signature. If index N goes past what is left, the user
 data goes in a root CBV of a per-dispatch upload instead.
+
+XTP now tracks each loaded SSA word by root parameter and dword
+(`resource/spill.rs`, ported from VIctory `27c3dc9d5`). It packs the
+constants and descriptor-table offsets the shader reads into the existing
+per-dispatch root constants. Root views use their existing slot bindings.
+On the L4 all 34 reached a later instruction. Thirteen reached emission
+and stopped at a root UAV or typed root view. The other 21 stopped during
+address tracking. None emitted DXIL.
 
 **Image impact:** the largest dispatch count of all classes (223 a frame),
 but the builder only makes the ray-tracing structure. Nothing is lit by it
@@ -216,6 +231,12 @@ otherwise asserts in the flattening pass (`flatten_extended_userdata_pass.cpp`
 (off by default, and then user-data dword 0 is read instead, §2.2).
 Pointers read out of memory per lane (structure nodes) are beyond the
 walker.
+
+In the same run, all 13 have their first root parameter at user-data
+dword 4. At the failing instruction, six read through an SGPR pair after
+a 64-bit left shift by eight and a bitwise OR with 48. Seven issue a
+global load through a VGPR pair. The spill-table rule applies to zero of
+the 2,682 compute programs in the title's pack.
 
 **Raw pointers:** the device-address path, yes.
 
@@ -487,8 +508,8 @@ lighting, shadows, post-process first; ray tracing last).
   `crates/xtp-gpu/src/draw.rs` (shared: add lines only), or R2's heap
   shadow instead (`shader.md` R2).
 - **Effort:** (a) small to medium; the builder programs come from the
-  system library at run time, not from the pack, so the survey needs
-  their containers captured in a session first. (b) medium, translator
+  system library at run time. Its DLL can be passed directly to
+  `xtp translate` for an offline survey. (b) medium, translator
   and GPU layer.
 
 ### 5.4 Not in the top 3

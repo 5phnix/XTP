@@ -1,0 +1,216 @@
+//! Synthetic compute spill tables, including the overwrite regression
+//! ported from VIctory #489 by louketa.
+
+use super::{HostShader, translate_program};
+use crate::native::{
+    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+};
+use crate::{Container, ShaderError, ir, resource};
+
+const PTR: [u32; 3] = [0xBE82_0300, 0x8703_FF01, 0xff]; // s2 = entry s0, s3 = entry s1 & 0xff
+const END: u32 = 0xBF81_0000;
+
+fn param(root: RootType, user_data: u8, sgprs: u32, slot: u8) -> RootParam {
+    RootParam {
+        root,
+        user_data,
+        sgprs,
+        slot,
+        table_offset_dwords: 0,
+        base_register: 0,
+    }
+}
+
+fn native(words: &[u32], layout: Vec<RootParam>) -> NativeProgram {
+    NativeProgram {
+        stage: HwStage::Cs,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [1, 1, 1],
+        }),
+        wave64: false,
+        vgprs: 8,
+        used: vec![],
+        layout,
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+fn track(n: &NativeProgram) -> Result<resource::Resources, ShaderError> {
+    let p = ir::build(&n.code, n.wave64, n.vgprs)?;
+    resource::track_native(&p, n, None)
+}
+
+fn overwrite_shader() -> HostShader {
+    let words = [
+        PTR.as_slice(),
+        &[
+            0xF410_0201,
+            0xFA00_0010, // s_load_dwordx16 s[8:23], s[2:3], 0x10
+            0xF404_0101,
+            0xFA00_0000, // s_load_dwordx2 s[4:5], s[2:3], 0
+            0x7E02_0210, // v1 = s16 (table dword 12)
+            0x7E04_0205, // v2 = s5 (table dword 1)
+            0xBE85_0380, // descriptor-table high half = 0
+            0xF408_0202,
+            0xFA00_0000, // load UAV descriptor through s[4:5]
+            0xE070_0000,
+            0x8002_0100, // store v1 at byte 0
+            0xE070_0004,
+            0x8002_0200, // store v2 at byte 4
+            END,
+        ],
+    ]
+    .concat();
+    let mut n = native(
+        &words,
+        vec![
+            param(RootType::Table, 16, 1, 4),
+            param(RootType::Constants, 17, 19, 2),
+        ],
+    );
+    n.used.push(UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 16,
+        slot: 4,
+    });
+    let resources = track(&n).unwrap();
+    assert_eq!(resources.spill_loads.len(), 2);
+    assert_eq!(resources.scalar.len(), 1);
+    assert_eq!(resources.scalar[0].1.param, 0);
+    let bytes = crate::dxbc::build(&[]);
+    translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap()
+}
+
+#[test]
+fn reloaded_words_keep_their_root_slots_after_register_overwrites() {
+    let shader = overwrite_shader();
+    let mut bindings: Vec<_> = shader.user_data.iter().map(|u| (u.slot, u.dword)).collect();
+    bindings.sort_unstable();
+    assert_eq!(bindings, [(2, 0), (2, 11), (4, 0)]);
+    assert_eq!(shader.user_data_dwords(), 4);
+}
+
+#[cfg(windows)]
+#[test]
+fn dispatch_reads_spilled_constants_and_the_spilled_table() {
+    use super::host::{Dispatch, Host, Root, View};
+    let mut shader = overwrite_shader();
+    if let Ok(mut validator) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        validator.validate(&mut shader.dxil).unwrap();
+    }
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no WARP device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        constants[u.index as usize] = match (u.slot, u.dword) {
+            (2, 11) => 31,
+            (2, 0) => 79,
+            (4, 0) => 0,
+            other => panic!("unexpected binding {other:?}"),
+        };
+    }
+    let output = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(constants))],
+                groups: [1, 1, 1],
+                samplers: &[],
+                views: &[View::RawUav(2)],
+            },
+        )
+        .unwrap();
+    assert_eq!(output[0], [31, 79]);
+}
+
+#[test]
+fn rejects_modified_pointers_dynamic_offsets_and_used_padding() {
+    let layout = || vec![param(RootType::Constants, 16, 1, 0)];
+    let load = [0xF404_0101, 0xFA00_0000]; // x2, second word is padding
+    let words = [PTR.as_slice(), &load, &[END]].concat();
+    let r = track(&native(&words, layout())).unwrap();
+    assert_eq!(r.spill_loads.len(), 1);
+    assert_eq!(r.params.len(), 1);
+    for (k, word) in [
+        (2, 0x7f),
+        (0, 0xBE82_0304),
+        (4, 0x0800_0000),
+        (4, 0xFA00_0002),
+    ] {
+        let mut other = words.clone();
+        other[k] = word;
+        assert!(track(&native(&other, layout())).is_err(), "{word:x}");
+    }
+    let used = [PTR.as_slice(), &load, &[0xBE86_0305, END]].concat();
+    assert!(track(&native(&used, layout())).is_err());
+    // Entry s0:s1 are actual root arguments in this layout.
+    let direct = vec![
+        param(RootType::Descriptor, 0, 2, 1),
+        param(RootType::Constants, 16, 1, 0),
+    ];
+    assert!(track(&native(&words, direct)).is_err());
+}
+
+/// Reload just the high word, then dereference that root descriptor. Its
+/// halves must agree on the parameter even across distinct load sites.
+#[test]
+fn descriptor_halves_keep_their_identity_across_reloads() {
+    let code = [
+        PTR.as_slice(),
+        &[
+            0xF404_0101,
+            0xFA00_0000, // s[4:5] = table dwords 0..1
+            0xF400_0141,
+            0xFA00_0004, // s5 = table dword 1 again
+            0xF400_0182,
+            0xFA00_0008, // s6 = *(s[4:5] + 8)
+            END,
+        ],
+    ]
+    .concat();
+    let layout = || {
+        vec![
+            param(RootType::Descriptor, 16, 2, 3),
+            param(RootType::Descriptor, 18, 2, 7),
+        ]
+    };
+    let r = track(&native(&code, layout())).unwrap();
+    assert_eq!(r.spill_loads.len(), 2);
+    assert_eq!(r.scalar.len(), 1);
+    assert_eq!((r.scalar[0].1.param, r.scalar[0].1.offset), (0, 8));
+    let mut wrong = code;
+    wrong[6] = 0xFA00_000C; // high word from the other descriptor
+    assert!(track(&native(&wrong, layout())).is_err());
+}
+
+#[test]
+fn overwriting_the_pointer_stops_recognition_at_the_next_load() {
+    let code = [
+        PTR.as_slice(),
+        &[
+            0xF404_0081,
+            0xFA00_0000, // overwrite pointer s[2:3] with two constants
+            0xF400_0101,
+            0xFA00_0000, // dereference those constants
+            END,
+        ],
+    ]
+    .concat();
+    let result = track(&native(&code, vec![param(RootType::Constants, 16, 2, 3)]));
+    assert!(matches!(
+        result,
+        Err(ShaderError::Unsupported { offset: 20, .. })
+    ));
+}
