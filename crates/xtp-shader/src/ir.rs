@@ -212,8 +212,12 @@ fn assemble(
     // A program that writes MODE: its 16- and 64-bit float instructions
     // read it too (see `float_modes`).
     let writes_mode = list.iter().any(|i| {
-        i.name()
-            .is_some_and(|n| float_mode_field(n, &i.fields(wave64)).is_some())
+        i.name().is_some_and(|n| {
+            matches!(
+                n,
+                "s_round_mode" | "s_denorm_mode" | "s_setreg_b32" | "s_setreg_imm32_b32"
+            ) && float_mode_field(n, &i.fields(wave64)).is_some()
+        })
     });
     for (n, ((machine, &flow), next)) in list.into_iter().zip(flows).zip(next_offsets).enumerate() {
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1;

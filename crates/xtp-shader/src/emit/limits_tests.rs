@@ -356,7 +356,8 @@ fn translate(words: &[u32]) -> Result<HostShader, ShaderError> {
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &n.layout, n.stage, Some(&st))?;
     let io = io::raise(&p, &n)?;
-    let c = Container::parse(&dxbc::build(&[]))?;
+    let bytes = dxbc::build(&[]);
+    let c = Container::parse(&bytes)?;
     let s = emit(&c, &n, &p, &st, &io, &res)?;
     if let Ok(mut v) =
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref())

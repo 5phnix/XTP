@@ -337,6 +337,10 @@ pub(crate) struct Program {
     /// The console runs it in waves of 64.
     pub wave64: bool,
     pub outcome: Outcome,
+    /// Translated, and a 16- or 64-bit rounding other than to nearest even
+    /// reaches its 16- or 64-bit float instructions: the host rounds to
+    /// nearest even (`xtp_shader::ir::float_modes`, a shortcut).
+    pub half_rounding: bool,
 }
 
 /// One record of the pack and its programs.
@@ -538,10 +542,16 @@ fn record(source: &Source, validator: Option<&mut Validator>, target: emit::Targ
                 what: TESSELLATION.into(),
             },
         };
+        // A translation under a 16- or 64-bit rounding the host does not
+        // apply (counted, not refused: `ir::float_modes`).
+        let half_rounding = matches!(outcome, Outcome::Translated { .. })
+            && xtp_shader::ir::build(&p.patched_code(), p.wave64, p.vgprs)
+                .is_ok_and(|ir| xtp_shader::ir::float_modes_of(&ir).half_rounding);
         out.programs.push(Program {
             stage: p.stage,
             wave64: p.wave64,
             outcome,
+            half_rounding,
         });
     }
     out
@@ -608,6 +618,9 @@ pub(crate) struct Totals {
     /// Programs by (stage, console wave64): how many, and those translated
     /// by the wave size their translation requires.
     pub waves: BTreeMap<(HwStage, bool), WaveCounts>,
+    /// Translations under a 16- or 64-bit rounding the host does not apply
+    /// ([`Program::half_rounding`]).
+    pub half_rounding: PerStage,
     /// The hash of every translation's hash, in pack order.
     pub digest: Option<blake3::Hash>,
 }
@@ -632,6 +645,9 @@ impl Totals {
                     } => {
                         *waves.translated.entry(*wave).or_default() += 1;
                         *t.translated.entry(p.stage).or_default() += 1;
+                        if p.half_rounding {
+                            *t.half_rounding.entry(p.stage).or_default() += 1;
+                        }
                         digest.update(&(i as u64).to_le_bytes());
                         digest.update(&(k as u64).to_le_bytes());
                         digest.update(output.as_bytes());
@@ -835,10 +851,29 @@ pub(crate) fn report(s: &Survey, path: &str) -> String {
     }
     let _ = writeln!(
         o,
+        "\nf16 rounding {} translations under a 16- or 64-bit rounding other than to nearest even, rounded to nearest (not refused){}",
+        sum(&t.half_rounding),
+        per_stage_text(&t.half_rounding)
+    );
+    let _ = writeln!(
+        o,
         "\noutputs      blake3 {} ({translated} translations)",
         t.digest.map(|d| d.to_string()).unwrap_or_default()
     );
     o
+}
+
+/// `counts` as ": CS n, PS n" (nothing when empty).
+fn per_stage_text(counts: &PerStage) -> String {
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(&s, n)| format!("{} {n}", stage_name(s)))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", parts.join(", "))
+    }
 }
 
 fn stage_name(s: HwStage) -> &'static str {
@@ -962,6 +997,7 @@ pub(crate) fn to_json(s: &Survey) -> String {
             let _ = writeln!(o, "  \"validation\": null,");
         }
     }
+    let _ = writeln!(o, "  \"half_rounding\": {},", per_stage(&t.half_rounding));
     let _ = writeln!(
         o,
         "  \"outputs\": \"{}\",",
