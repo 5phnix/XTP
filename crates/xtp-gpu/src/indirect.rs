@@ -397,8 +397,8 @@ const EXTRA: u32 = MAX_GROUPS / LIMIT;
 const RUN_LENGTH: usize = 128;
 const PAGE_BYTES: u32 = 64 << 10;
 
-/// L’ordre des barrières porte sur les ressources D3D12 entières. La série,
-/// elle, peut traverser une écriture sur d’autres octets de la même ressource.
+/// Une écriture dans l’un des deux tampons ferme la série. Seules les écritures
+/// UAV demandent aussi une barrière, les copies ont leurs transitions D3D12.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Writes {
     series: u64,
@@ -411,51 +411,35 @@ pub(crate) struct Writers {
     unknown: u64,
     series: u64,
     watched: [usize; 2],
-    dirty: [Option<(u64, u64)>; 2],
 }
 
 impl Writers {
-    pub(crate) fn record(&mut self, buffer: &ID3D12Resource, offset: u64, bytes: usize, uav: bool) {
+    pub(crate) fn record(&mut self, buffer: &ID3D12Resource, uav: bool) {
         let id = buffer.as_raw() as usize;
         if uav {
             *self.revisions.entry(id).or_default() += 1;
         }
-        let end = offset + bytes as u64;
-        for (watched, dirty) in self.watched.iter().zip(&mut self.dirty) {
-            if *watched == id {
-                let (lo, hi) = dirty.get_or_insert((offset, end));
-                *lo = (*lo).min(offset);
-                *hi = (*hi).max(end);
-            }
+        if self.watched.contains(&id) {
+            self.series += 1;
         }
     }
 
     pub(crate) fn unknown(&mut self) {
         self.unknown += 1;
         self.series += 1;
-        self.dirty = [None; 2];
     }
 
     pub(crate) fn before(
         &mut self,
-        (args, at, bytes): (&ID3D12Resource, u64, u64),
-        count: Option<(&ID3D12Resource, u64)>,
+        args: &ID3D12Resource,
+        count: Option<&ID3D12Resource>,
     ) -> Writes {
         let watched = [
             args.as_raw() as usize,
-            count.map_or(0, |(b, _)| b.as_raw() as usize),
+            count.map_or(0, |b| b.as_raw() as usize),
         ];
-        let count_at = count.map_or(0, |(_, at)| at);
-        let reads = [(at, at + bytes), (count_at, count_at + 4)];
-        if self.watched != watched
-            || self
-                .dirty
-                .iter()
-                .zip(reads)
-                .any(|(dirty, (lo, hi))| dirty.is_some_and(|(start, end)| start < hi && lo < end))
-        {
+        if self.watched != watched {
             self.watched = watched;
-            self.dirty = [None; 2];
             self.series += 1;
         }
         Writes {
@@ -1111,10 +1095,7 @@ mod tests {
         a.refresh(list, args.address(), 16);
         c.refresh(list, count.address(), 4);
         let run = || {
-            let writes = list.indirect_writes(
-                (&a.buffer, a.offset(args.address()), 16),
-                Some((&c.buffer, c.offset(count.address()))),
-            );
+            let writes = list.indirect_writes(&a.buffer, Some(&c.buffer));
             bound(
                 list,
                 (&a.buffer, a.offset(args.address())),
@@ -1129,7 +1110,7 @@ mod tests {
         let first = run();
         let (_before, one) = read_commands(list, &first, 4);
         assert!(crate::shadow::write(list, count.address() + 4, 7, 4));
-        assert!(!run().dispatched, "autre mot du même tampon");
+        assert!(run().dispatched, "autre mot du même tampon surveillé");
         assert!(crate::shadow::write(list, count.address(), 0, 4));
         let next = run();
         assert!(first.dispatched && next.dispatched);

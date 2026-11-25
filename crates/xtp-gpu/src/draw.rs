@@ -2381,7 +2381,7 @@ impl State {
             (&s.buffer, s.offset(*at))
         });
         args.refresh(list, arguments, len);
-        let writes = list.indirect_writes((&args.buffer, args.offset(arguments), len), counter);
+        let writes = list.indirect_writes(&args.buffer, counter.map(|(b, _)| b));
         let compute = kind == DISPATCH;
         self.pending_compute = Some(Vec::new());
         let ready = if compute {
@@ -2522,14 +2522,7 @@ impl State {
     ) -> Result<(), Unready> {
         // The rewritten records: draw arguments, 16 bytes apart.
         let signature = host_signature(0, 16).ok_or("no host signature")?;
-        let writes = list.indirect_writes(
-            (
-                &args.buffer,
-                args.offset(arguments),
-                u64::from(stride) * u64::from(max),
-            ),
-            counter.map(|(s, at)| (&s.buffer, s.offset(at))),
-        );
+        let writes = list.indirect_writes(&args.buffer, counter.map(|(s, _)| &s.buffer));
         let pso = bind(self, list)?;
         let prepared = self.expand_rectangles(
             list,
@@ -4614,6 +4607,93 @@ float4 ps(V v) : SV_Target { return v.color; }
             },
         ];
         (p, c, views)
+    }
+
+    /// Régression de la veille 343 : deux triangles passent dans la même série.
+    /// Une copie met à zéro le compteur ou le nombre de sommets avant le troisième.
+    #[test]
+    fn a_copy_between_two_indirect_executions_of_the_same_run() {
+        let test = "draw::tests::a_copy_between_two_indirect_executions_of_the_same_run";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let painter = Painter::new(host, false);
+        let signature = host_signature(0, 24).unwrap();
+        let zero = title_bytes(&0u32.to_le_bytes());
+        for copy_to_count in [true, false] {
+            let args = title_records(&[[3, 1, 0, 0]]);
+            let count = title_bytes(&1u32.to_le_bytes());
+            let (a, c) = (args.shadow(), count.shadow());
+            let title = TitleList::new();
+            let list = title.host();
+            a.refresh(list, args.address(), 16);
+            c.refresh(list, count.address(), 4);
+            let size = size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>() as u64;
+            let (result, data) = host.shared_buffer(size).unwrap();
+            let mut queries: Option<ID3D12QueryHeap> = None;
+            // SAFETY: un emplacement de requête conservé jusqu’à la lecture du résultat.
+            unsafe {
+                host.device
+                    .CreateQueryHeap(
+                        &D3D12_QUERY_HEAP_DESC {
+                            Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+                            Count: 1,
+                            NodeMask: 0,
+                        },
+                        &mut queries,
+                    )
+                    .unwrap();
+            }
+            let queries = queries.unwrap();
+            let kind = D3D12_QUERY_TYPE_PIPELINE_STATISTICS;
+            // SAFETY: la requête 0 est libre.
+            unsafe { list.list.BeginQuery(&queries, kind, 0) };
+            for execution in 0..3 {
+                if execution == 2 {
+                    let dst = if copy_to_count {
+                        count.address()
+                    } else {
+                        args.address()
+                    };
+                    assert!(crate::shadow::copy(list, dst, zero.address(), 4));
+                }
+                let bounded = crate::indirect::bound(
+                    list,
+                    (&a.buffer, a.offset(args.address())),
+                    (0, 16, 1),
+                    Some((&c.buffer, c.offset(count.address()))),
+                    None,
+                    list.indirect_writes(&a.buffer, Some(&c.buffer)),
+                    crate::indirect::Output::Draw,
+                )
+                .unwrap();
+                assert_eq!(bounded.dispatched, execution != 1);
+                painter.bind(list);
+                // SAFETY: la signature de dessin lit la tranche et son compteur bornés.
+                unsafe {
+                    list.list.ExecuteIndirect(
+                        &signature,
+                        1,
+                        &bounded.buffer,
+                        bounded.offset + 4,
+                        &bounded.buffer,
+                        bounded.offset,
+                    );
+                }
+            }
+            // SAFETY: la requête ouverte couvre les trois ExecuteIndirect et le tampon
+            // reçoit la structure entière. La liste termine avant la lecture CPU.
+            unsafe {
+                list.list.EndQuery(&queries, kind, 0);
+                list.list.ResolveQueryData(&queries, kind, 0, 1, &result, 0);
+                title.run();
+                assert_eq!(
+                    (*data.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>()).IAVertices,
+                    6
+                );
+            }
+        }
     }
 
     /// An indirect rectangle draw end to end, as `indirect_rectangles`

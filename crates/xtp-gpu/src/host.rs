@@ -2296,9 +2296,7 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        deferred
-            .indirect_writers
-            .record(&shadow.buffer, shadow.offset(address as u64), len, true);
+        deferred.indirect_writers.record(&shadow.buffer, true);
         deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
@@ -2314,9 +2312,7 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        deferred
-            .indirect_writers
-            .record(&shadow.buffer, shadow.offset(address as u64), len, false);
+        deferred.indirect_writers.record(&shadow.buffer, false);
         deferred
             .copies
             .push(Step::GpuCopy(shadow.clone(), address, len));
@@ -2324,9 +2320,9 @@ impl HostList {
 
     /// Counts a memory write of `bytes` the list records on the GPU, once
     /// per submission (see [`crate::shadow::write`]).
-    pub(crate) fn count_gpu_write(&self, buffer: &ID3D12Resource, at: u64, bytes: usize) {
+    pub(crate) fn count_gpu_write(&self, buffer: &ID3D12Resource, bytes: usize) {
         let mut deferred = self.deferred();
-        deferred.indirect_writers.record(buffer, at, bytes, false);
+        deferred.indirect_writers.record(buffer, false);
         deferred.copies.push(Step::GpuWord(bytes));
     }
 
@@ -2336,8 +2332,8 @@ impl HostList {
 
     pub(crate) fn indirect_writes(
         &self,
-        args: (&ID3D12Resource, u64, u64),
-        count: Option<(&ID3D12Resource, u64)>,
+        args: &ID3D12Resource,
+        count: Option<&ID3D12Resource>,
     ) -> crate::indirect::Writes {
         self.deferred().indirect_writers.before(args, count)
     }
