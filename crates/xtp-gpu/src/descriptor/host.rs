@@ -5496,13 +5496,18 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// view; the one that submission may read keeps its window (rewritten
     /// in place before, it gave such a submission the new window with the
     /// old stride and bias). Held in flight on WARP behind a fence: a list
-    /// submitted after the change, reading the old raw view, still reads
-    /// the old window. Once the GPU has run what was in flight, the raw
-    /// view comes back to the pool, made null, with its host buffer: the
-    /// retiring ones are bounded by the submissions in flight (before,
+    /// in flight when the view changes, reading the old raw view, still
+    /// reads the old window. Once the GPU has run what was in flight, the
+    /// raw view comes back to the pool, made null, with its host buffer:
+    /// the retiring ones are bounded by the submissions in flight (before,
     /// only taking a raw view emptied them, and a slot rewritten in place
-    /// kept a buffer for good). A view whose window stays keeps its raw
-    /// view.
+    /// kept a buffer for good). A list handed to the queue after the
+    /// change reads the entry as it is after (the table is read when the
+    /// GPU runs), so it is not waited for: here the reader was submitted
+    /// after the change until the Codex review of 244cf78 (finding 3),
+    /// which gives raw views back as soon as the fence reaches what was in
+    /// flight, not at the heap's next use. A view whose window stays keeps
+    /// its raw view.
     #[test]
     fn raw_views_a_submission_in_flight_may_read_stay_until_it_has_run() {
         use crate::testgpu::{TitleBuffer, pattern};
@@ -5524,23 +5529,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         heap.make_at(0, &buffer_view(false, &src, structured(12), (0, 8)));
         assert_eq!(raw_slot(0), pool, "the same window: the same raw view");
         assert_eq!(heap.pool_state(), (0, 3));
-        // A submission in flight, held on the GPU.
+        // Submissions in flight, held on the GPU, one of which reads the raw
+        // view the entry names now (as a shader that read the entry before
+        // the change does).
         let mut gate = crate::host::Gate::close(host);
         let running = host.new_list().expect("a host list");
         running.close();
         host.execute(&[&running]);
         assert!(running.running());
-        // Bytes 32 to 96 as 4 elements of 16: another raw view.
-        heap.make_at(0, &buffer_view(false, &src, structured(16), (2, 4)));
-        assert_eq!(raw_slot(0), pool + 1);
-        assert_eq!(heap.entry(0).stride, 16);
-        assert_eq!(heap.pool_state(), (1, 2), "the old one retires");
-        // Behind the one in flight: a list that reads the old raw view.
         dst.set_words(|_| 0xdead_beef);
         let reader = host.new_list().expect("a host list");
         copy_pool_slot(&reader, &heap, &pipeline, pool, (&src, &dst));
         reader.close();
         host.execute(&[&reader]);
+        // Bytes 32 to 96 as 4 elements of 16: another raw view.
+        heap.make_at(0, &buffer_view(false, &src, structured(16), (2, 4)));
+        assert_eq!(raw_slot(0), pool + 1);
+        assert_eq!(heap.entry(0).stride, 16);
+        assert_eq!(heap.pool_state(), (1, 2), "the old one retires");
         // Changes go on while they are in flight, each to another raw view.
         heap.make_at(0, &buffer_view(false, &src, structured(20), (0, 4)));
         assert_eq!(heap.pool_state(), (2, 1));
@@ -5550,7 +5556,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             .map(|i| if i < 24 { pattern(i) } else { 0 })
             .collect();
         assert_eq!(dst.words()[..64], old[..], "the old window, untouched");
-        // The GPU has run them: back, null, at the next look.
+        // The GPU has run them: back, null, once the host has finished
+        // them, the heap untouched meanwhile.
+        completed_until(host, "never given back", || heap.pool_state() == (0, 3));
         assert!(heap.stride_hold().is_some());
         assert_eq!(heap.pool_state(), (0, 3));
         let list = crate::testgpu::TitleList::new();
