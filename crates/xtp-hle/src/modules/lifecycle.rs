@@ -33,6 +33,10 @@ const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
 static ENDING: AtomicBool = AtomicBool::new(false);
 
+fn claim_ending() -> bool {
+    !ENDING.swap(true, Ordering::SeqCst)
+}
+
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
 pub extern "system" fn RegisterAppStateChangeNotification(
@@ -205,7 +209,7 @@ extern "system" fn window_proc(
 /// Suspends the title as the console does when it ends it, runs `then`
 /// (once), then ends the process. Returns at once; later calls do nothing.
 pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
-    if ENDING.swap(true, Ordering::SeqCst) {
+    if !claim_ending() {
         return;
     }
     RESTART_ON_CRASH
@@ -284,17 +288,7 @@ fn relaunch_on_crash(autopilot: bool) {
     else {
         return;
     };
-    if ENDING.load(Ordering::SeqCst) {
-        return;
-    }
-    if autopilot {
-        tracing::info!("skipping crash restart: autopilot is enabled");
-        return;
-    }
-    if ALREADY_CRASH_RESTARTED.load(Ordering::Relaxed)
-        || std::env::var_os(CRASH_RESTARTED).is_some()
-    {
-        tracing::info!("skipping crash restart: already restarted once");
+    if !claim_crash_restart(autopilot) {
         return;
     }
     if relaunch_with_env(args, Some((CRASH_RESTARTED, "1"))) {
@@ -307,6 +301,21 @@ fn relaunch_on_crash(autopilot: bool) {
             TerminateProcess(GetCurrentProcess(), 1);
         }
     }
+}
+
+fn claim_crash_restart(autopilot: bool) -> bool {
+    if autopilot {
+        tracing::info!("skipping crash restart: autopilot is enabled");
+        return false;
+    }
+    if ALREADY_CRASH_RESTARTED.load(Ordering::Relaxed)
+        || std::env::var_os(CRASH_RESTARTED).is_some()
+    {
+        tracing::info!("skipping crash restart: already restarted once");
+        return false;
+    }
+    // Both paths must claim the shutdown before either can spawn a replacement.
+    claim_ending()
 }
 
 /// Starts `xtp` again with `args` (after the title has suspended); the
@@ -409,6 +418,46 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_restart_and_intentional_end_have_only_one_winner() {
+        const CHILD: &str = "XTP_TEST_CRASH_RESTART_CLAIM";
+        // These flags are process-global, so no other library tests may run here.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "modules::lifecycle::tests::crash_restart_and_intentional_end_have_only_one_winner",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove(CRASH_RESTARTED)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"));
+            return;
+        }
+
+        assert!(!claim_crash_restart(true));
+        assert!(!ENDING.load(Ordering::SeqCst));
+        ALREADY_CRASH_RESTARTED.store(true, Ordering::Relaxed);
+        assert!(!claim_crash_restart(false));
+        assert!(!ENDING.load(Ordering::SeqCst));
+        ALREADY_CRASH_RESTARTED.store(false, Ordering::Relaxed);
+
+        for crash_first in [true, false] {
+            let (crash_won, intentional_won) = if crash_first {
+                let crash_won = claim_crash_restart(false);
+                (crash_won, claim_ending())
+            } else {
+                let intentional_won = claim_ending();
+                (claim_crash_restart(false), intentional_won)
+            };
+            assert_eq!((crash_won, intentional_won), (crash_first, !crash_first));
+            ENDING.store(false, Ordering::SeqCst);
+        }
+    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 
