@@ -164,6 +164,13 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
+    if execute && xtp_game::identify(&hash).is_some() {
+        xtp_gpu::configure_copy_back(
+            cfg.cache_subdir("readmap")
+                .ok()
+                .map(|dir| dir.join(format!("{hash}.v1.map"))),
+        );
+    }
     let images = cfg.cache_subdir("images")?;
     xtp_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = xtp_loader::load(&prepared, &images)?;
@@ -265,6 +272,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    xtp_gpu::save_copy_back_map();
     println!("title exited with {code}");
     Ok(())
 }
