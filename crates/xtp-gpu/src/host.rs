@@ -869,6 +869,7 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// next recording afresh without taking them from it.
 #[derive(Clone, Default)]
 struct Recorded {
+    rt_sizes: std::sync::Arc<Vec<crate::rt::compaction::CompactedSize>>,
     #[cfg(feature = "diagnostics")]
     rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
     #[cfg(feature = "diagnostics")]
@@ -1052,6 +1053,7 @@ impl Drop for DynamicLease {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    rt_sizes: std::sync::Arc<Vec<crate::rt::compaction::CompactedSize>>,
     #[cfg(feature = "diagnostics")]
     rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
     #[cfg(feature = "diagnostics")]
@@ -1071,6 +1073,7 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Immutable BLAS generations referenced by TLAS builds and traces on this recording.
     rt_maps: Vec<std::sync::Arc<crate::rt::BlasMap>>,
+    rt_size_page: crate::rt::compaction::SizePage,
     rt_results: Vec<std::sync::Arc<ID3D12Resource>>,
     /// Dynamic descriptor slots leased by this recording.
     dynamic: Vec<DynamicLease>,
@@ -1795,6 +1798,9 @@ impl Host {
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             self.removed(Some(&p));
         }
+        for size in p.recorded.iter().flat_map(|r| r.rt_sizes.iter()) {
+            size.complete();
+        }
         // About how long it ran: from its submission or the end of the one
         // before, whichever is later, until it was seen done.
         let ran = {
@@ -2426,7 +2432,9 @@ impl HostList {
         };
         #[cfg(feature = "diagnostics")]
         let rt_samples = self.deferred().rt_samples.clone();
+        let rt_sizes = self.deferred().rt_sizes.clone();
         Recorded {
+            rt_sizes,
             #[cfg(feature = "diagnostics")]
             rt_samples,
             #[cfg(feature = "diagnostics")]
@@ -2698,6 +2706,13 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn rt_compacted_size(&self) -> Option<(u64, crate::rt::compaction::CompactedSize)> {
+        let mut deferred = self.deferred();
+        let (address, slot) = deferred.rt_size_page.reserve()?;
+        std::sync::Arc::make_mut(&mut deferred.rt_sizes).push(slot.clone());
+        Some((address, slot))
     }
 
     pub(crate) fn keep_rt_result(&self, result: &std::sync::Arc<ID3D12Resource>) {

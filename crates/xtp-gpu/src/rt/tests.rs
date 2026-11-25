@@ -145,6 +145,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
     output.set_words(|_| u32::MAX);
     let geometry = geometry(&vertices, &indices);
     let blas = TitleBuffer::new(1024);
+    let compacted = TitleBuffer::new(1024);
     let cloned = TitleBuffer::new(1024);
     let first = TitleBuffer::new(1024);
     let second = TitleBuffer::new(1024);
@@ -184,18 +185,38 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
     // SAFETY: the title list and all CPU arrays are live for each call. The recording
     // retains every GPU input, including both generations after their title resources go.
     unsafe {
+        let producer = TitleList::new();
+        let mut original = blas_input(&geometry);
+        original.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
         assert!(build(
-            list.this(),
+            producer.this(),
             &Build {
                 DestAccelerationStructureData: blas.address(),
-                Inputs: blas_input(&geometry),
+                Inputs: original,
                 ..Default::default()
             }
         ));
+        producer.run();
+        let bytes = registry().structures[&blas.address()]
+            .compacted_size
+            .as_ref()
+            .unwrap()
+            .load(Ordering::Acquire);
+        assert!(bytes > 0);
+        assert!(copy(
+            list.this(),
+            compacted.address(),
+            blas.address(),
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT.0
+        ));
+        assert_eq!(
+            width(&registry().structures[&compacted.address()].result),
+            bytes.next_multiple_of(256)
+        );
         assert!(copy(
             list.this(),
             cloned.address(),
-            blas.address(),
+            compacted.address(),
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0
         ));
         assert!(host_tlas(cloned.address()).is_none());

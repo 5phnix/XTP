@@ -1,11 +1,13 @@
 //! Host DXR builds recorded alongside the title's builder commands.
 
 use std::collections::BTreeMap;
+pub(crate) mod compaction;
 mod instances;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod probe;
 
 pub(crate) use instances::BlasMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -100,11 +102,7 @@ impl<'a> Recorder<'a> {
         })
     }
 
-    fn build(
-        &self,
-        inputs: &Inputs,
-        reuse: Option<Arc<ID3D12Resource>>,
-    ) -> Option<Arc<ID3D12Resource>> {
+    fn build(&self, inputs: &Inputs, reuse: Option<Arc<ID3D12Resource>>) -> Option<Structure> {
         let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
         // SAFETY: the caller owns all geometry descriptions for this call.
         unsafe {
@@ -144,6 +142,11 @@ impl<'a> Recorder<'a> {
             // The list kept this exact allocation even if its scratch slot is replaced later.
             scratch_address = unsafe { current.GetGPUVirtualAddress() };
         }
+        let postbuild = inputs
+            .Flags
+            .contains(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION)
+            .then(|| compaction::request(self.list))
+            .flatten();
         self.list.keep_rt_result(&result);
         // SAFETY: all GPU ranges are owned by this recording. The global barriers order prior
         // geometry writers, scratch reuse on the host queue and subsequent reads of the result.
@@ -156,16 +159,40 @@ impl<'a> Recorder<'a> {
                     ScratchAccelerationStructureData: scratch_address,
                     SourceAccelerationStructureData: 0,
                 },
-                None,
+                postbuild
+                    .as_ref()
+                    .map(|(desc, _)| std::slice::from_ref(desc)),
             );
             self.commands.ResourceBarrier(&[uav_barrier()]);
         }
-        Some(result)
+        Some(Structure {
+            result,
+            instances: None,
+            compacted_size: postbuild.map(|(_, size)| size),
+            owner: None,
+        })
     }
 
-    fn clone_structure(&self, source: &ID3D12Resource) -> Option<Arc<ID3D12Resource>> {
-        // SAFETY: source is a live AS previously built by this module.
-        let bytes = unsafe { source.GetDesc().Width };
+    fn copy_structure(
+        &self,
+        source: &Structure,
+        mode: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE,
+    ) -> Option<Structure> {
+        let capacity = width(&source.result);
+        let bytes = match mode {
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE => capacity,
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT => {
+                let measured = source.compacted_size.as_ref()?.load(Ordering::Acquire);
+                // A compact copy recorded before the producing fence (including on the
+                // same list) still fits the original host allocation's upper bound.
+                if measured == 0 {
+                    capacity
+                } else {
+                    measured.checked_next_multiple_of(256)?.min(capacity)
+                }
+            }
+            _ => return None,
+        };
         let dest = buffer(
             self.device,
             bytes,
@@ -177,12 +204,15 @@ impl<'a> Recorder<'a> {
         unsafe {
             self.commands.CopyRaytracingAccelerationStructure(
                 dest.GetGPUVirtualAddress(),
-                source.GetGPUVirtualAddress(),
-                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE,
+                source.result.GetGPUVirtualAddress(),
+                mode,
             );
             self.commands.ResourceBarrier(&[uav_barrier()]);
         }
-        Some(dest)
+        Some(Structure {
+            result: dest,
+            ..source.clone()
+        })
     }
 }
 
@@ -192,6 +222,7 @@ struct Structure {
     // Only TLAS generations refer to a snapshot of the BLAS address space.
     instances: Option<Arc<BlasMap>>,
     owner: Option<usize>,
+    compacted_size: Option<Arc<AtomicU64>>,
 }
 
 impl Structure {
@@ -219,24 +250,16 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 }
 
 impl Registry {
-    fn replace(
-        &mut self,
-        dst: u64,
-        built: Option<(Arc<ID3D12Resource>, Option<Arc<BlasMap>>)>,
-    ) -> bool {
+    fn replace(&mut self, dst: u64, built: Option<Structure>) -> bool {
         let old = self.structures.remove(&dst);
-        if old.is_some_and(|s| s.instances.is_none()) || matches!(built, Some((_, None))) {
+        if old.is_some_and(|s| s.instances.is_none())
+            || built.as_ref().is_some_and(|s| s.instances.is_none())
+        {
             self.snapshot = None;
         }
-        if let Some((result, instances)) = built {
-            self.structures.insert(
-                dst,
-                Structure {
-                    result,
-                    instances,
-                    owner: crate::shadow::buffer_owner(dst),
-                },
-            );
+        if let Some(mut structure) = built {
+            structure.owner = crate::shadow::buffer_owner(dst);
+            self.structures.insert(dst, structure);
             true
         } else {
             false
@@ -332,12 +355,15 @@ pub unsafe fn build(title_list: *const Object, desc: &Build) -> bool {
                     },
                     ..inputs
                 };
-                Some((recorder.build(&inputs, reuse)?, None))
+                recorder.build(&inputs, reuse)
             }
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
                 let map = registry().blas_map()?;
                 let inputs = instances::rewrite(&recorder, title_list, &inputs, &map)?;
-                Some((recorder.build(&inputs, reuse)?, Some(map)))
+                Some(Structure {
+                    instances: Some(map),
+                    ..recorder.build(&inputs, reuse)?
+                })
             }
             _ => None,
         }
@@ -364,19 +390,22 @@ pub unsafe fn rehydrate(list: *const Object, desc: &Build) -> bool {
     recorded
 }
 
-/// Mirrors a clone across title builders.
+/// Mirrors a clone or compact copy across title builders.
 ///
 /// # Safety
 /// `list` is a live title list.
 pub unsafe fn copy(list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
     let copied = (|| {
-        if dst == 0 || mode != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0 {
+        if dst == 0 {
             return None;
         }
         let source = registry().structures.get(&src)?.clone();
         let recorder = Recorder::new(crate::list::host_list(list)?)?;
         source.retain(recorder.list);
-        Some((recorder.clone_structure(&source.result)?, source.instances))
+        recorder.copy_structure(
+            &source,
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode),
+        )
     })();
     registry().replace(dst, copied)
 }
