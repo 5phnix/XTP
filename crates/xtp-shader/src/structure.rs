@@ -416,7 +416,20 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// between edges is a phi ([`Atom::Phi`]). Guard vector instructions with
 /// [`Structured::execs`] and ignore [`Structured::exits`]' conditions.
 pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
-    run(Lanes::new(program, true)?)
+    match run(Lanes::new(program, true)?) {
+        // The console flow takes every branch with the whole wave and guards
+        // each vector instruction with EXEC (`execs`): what a lane knows on
+        // entering a block only narrows guards and branch conditions that
+        // flow does not use. Where that knowledge grows too large (a long
+        // program, every mask join a phi there), the console form goes
+        // without it: each block entered knowing nothing.
+        Err(e) if e == TOO_LARGE => {
+            let mut l = Lanes::new(program, true)?;
+            l.unknowing = true;
+            run(l)
+        }
+        r => r,
+    }
 }
 
 fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
@@ -425,7 +438,11 @@ fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
         while let Some(key) = l.console_pending.pop() {
             l.mask(key);
         }
-        let cond = l.paths()?;
+        let cond = if l.unknowing {
+            vec![Bool::TRUE; l.p.blocks.len()]
+        } else {
+            l.paths()?
+        };
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
             return l.finish(&execs, &cond);
@@ -443,6 +460,9 @@ struct Lanes<'a> {
     p: &'a Program,
     /// See [`structure_console`].
     console: bool,
+    /// The console form without what lanes know on entering each block
+    /// (see [`structure_console`]).
+    unknowing: bool,
     console_pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
@@ -527,6 +547,7 @@ impl<'a> Lanes<'a> {
         Ok(Lanes {
             p,
             console,
+            unknowing: false,
             console_pending: Vec::new(),
             order,
             index,
@@ -584,10 +605,14 @@ impl<'a> Lanes<'a> {
         let mut exec_out: Vec<Halves> = vec![(None, None); p.blocks.len()];
         for n in 0..self.order.len() {
             let b = self.order[n];
-            let mut c = if n == 0 { Bool::TRUE } else { Bool::FALSE };
+            let mut c = if n == 0 || self.unknowing {
+                Bool::TRUE
+            } else {
+                Bool::FALSE
+            };
             for k in 0..self.incoming[b].len() {
                 let (q, taken) = self.incoming[b][k];
-                if self.index[q] < n {
+                if self.index[q] < n && !self.unknowing {
                     let e = self.edge(self.first[q], q, taken);
                     c = self.b.or(c, e);
                 }
@@ -1480,6 +1505,65 @@ mod tests {
             let ne = b.xor(s.masks[&vcc], s.masks[&exec_after]);
             assert_eq!(s.sccs.get(&eq), Some(&(ne, true)));
         }
+    }
+
+    /// The console form without what lanes know on entering each block (its
+    /// fallback when that grows too large) has the same masks, EXECs and
+    /// SCCs; each block is entered knowing nothing.
+    #[test]
+    fn the_console_form_without_path_knowledge_keeps_its_masks() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+                0xBF84_0001, // s_cbranch_scc0 -> 20
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x88FE_0A7E, // 20: s_or_b64 exec, exec, s[10:11]
+                0xBF12_7E6A, // s_cmp_eq_u64 vcc, exec
+                S_ENDPGM,
+            ],
+            true,
+        );
+        // Booleans of two runs compared by their diagrams (the same atoms,
+        // made in the same order: the same reduced diagrams).
+        fn show(b: &Bools, x: Bool) -> String {
+            match b.node(x) {
+                None => format!("{}", x == Bool::TRUE),
+                Some((a, lo, hi)) => format!("({a:?} ? {} : {})", show(b, hi), show(b, lo)),
+            }
+        }
+        let full = structure_console(&p).unwrap();
+        let mut l = Lanes::new(&p, true).unwrap();
+        l.unknowing = true;
+        let bare = run(l).unwrap();
+        assert!(bare.reach.iter().all(|&r| r == Bool::TRUE));
+        let execs = |s: &Structured| -> Vec<Vec<Option<String>>> {
+            s.execs
+                .iter()
+                .map(|b| b.iter().map(|e| e.map(|e| show(&s.bools, e))).collect())
+                .collect()
+        };
+        assert_eq!(execs(&bare), execs(&full));
+        let masks = |s: &Structured| -> Vec<(Value, String)> {
+            let mut m: Vec<_> = s
+                .masks
+                .iter()
+                .map(|(&v, &b)| (v, show(&s.bools, b)))
+                .collect();
+            m.sort_unstable();
+            m
+        };
+        assert_eq!(masks(&bare), masks(&full));
+        let sccs = |s: &Structured| -> Vec<(Value, String, bool)> {
+            let mut m: Vec<_> = s
+                .sccs
+                .iter()
+                .map(|(&v, &(b, n))| (v, show(&s.bools, b), n))
+                .collect();
+            m.sort_unstable();
+            m
+        };
+        assert_eq!(sccs(&bare), sccs(&full));
     }
 
     #[test]

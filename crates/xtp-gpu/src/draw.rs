@@ -731,6 +731,7 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            crate::resource::note_target_view(texture, record.desc().map(|d| d.Format.0 as u32));
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -1624,6 +1625,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            self.rt_dropped(list);
             self.dispatch_dropped(Unready::NoPipeline);
             return;
         };
@@ -1668,6 +1670,33 @@ impl State {
     fn dispatch_dropped(&mut self, why: Unready) {
         self.dropped_dispatch = true;
         dropped("dispatch", self.pipeline, why);
+    }
+
+    /// A dispatch, direct or indirect, dropped for want of a host pipeline:
+    /// if it runs one of the title's trace programs ([`crate::rt_standin`]),
+    /// what its program writes through unordered access is handed over as
+    /// the title's compute tables and root views hold it now, to be counted
+    /// and (its switch on) cleared to "every ray missed". A clear binds
+    /// XTP's own view heap: the next draw or dispatch binds the title's.
+    fn rt_dropped(&mut self, list: &HostList) {
+        let Some(program) = crate::rt_standin::program(self.pipeline as This) else {
+            return;
+        };
+        use crate::rt_standin::Bound;
+        let bound: Vec<Bound> = program
+            .writes()
+            .map(|u| match (u.root, self.compute.get(usize::from(u.slot))) {
+                (RootType::Table, Some(Root::Table(table))) => {
+                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                        .map_or(Bound::Unset, Bound::View)
+                }
+                (RootType::Descriptor, Some(Root::View(address))) => Bound::Root(*address),
+                _ => Bound::Unset,
+            })
+            .collect();
+        if crate::rt_standin::dropped(list, &program, &bound) {
+            self.forget_host();
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2244,6 +2273,9 @@ impl State {
             _ => Err("another kind".into()),
         };
         if let Err(why) = ran {
+            if kind == DISPATCH && why == Unready::NoPipeline {
+                self.rt_dropped(list);
+            }
             return fail(why);
         }
         #[cfg(feature = "diagnostics")]
