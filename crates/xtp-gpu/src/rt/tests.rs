@@ -424,6 +424,12 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             registry().structures[&compacted.address()].result.bytes,
             registry_source_capacity
         );
+        // The title packs the next compacted structure right after it.
+        assert_eq!(
+            registry().ranges[&compacted.address()].end,
+            compacted.address() + 1,
+            "a compacted copy claims its first byte"
+        );
         assert!(Builder.copy(
             cloning.this(),
             cloned.address(),
@@ -620,7 +626,7 @@ fn rt_retirement_cancels_overlapping_publications_and_keeps_adjacent_ranges() {
         table.begin(base + offset, Some(256));
     }
     let old = table.ranges[&(base + 256)].generation;
-    let (new, _) = table.begin(base + 128, Some(384));
+    let new = table.begin(base + 128, Some(384));
     assert!(!table.finish(base + 256, old, None));
     assert_eq!(
         table.ranges.keys().copied().collect::<Vec<_>>(),
@@ -656,4 +662,191 @@ fn rt_owner_survives_more_than_64_intervening_buffers() {
     for i in 1..=100 {
         crate::shadow::unregister(i + 1, base + 2 * i as u64);
     }
+}
+
+/// A spare serves a later generation at its title address once nothing
+/// else holds it, if it fits without wasting over half of it; an address
+/// keeps [`SPARES`] of them, for [`SPARE_FRAMES`] frames.
+#[test]
+fn rt_spares_serve_later_generations_once_free() {
+    let test = "rt_spares_serve_later_generations_once_free";
+    let Some(_gpu) = dxr(test) else {
+        return;
+    };
+    let list = TitleList::new();
+    let rec = Recorder::new(list.host()).expect("a DXR recorder");
+    let mut table = Registry::default();
+    let (free, held) = (
+        ResultBuffer::new(&rec, 4096).unwrap(),
+        ResultBuffer::new(&rec, 4096).unwrap(),
+    );
+    let gpu = free.gpu();
+    // A recording or a slot still holds this one.
+    let holder = held.clone();
+    table.keep_spare(0x100, held);
+    table.keep_spare(0x100, free);
+    assert!(table.take_spare(0x200, 4096).is_none(), "another address");
+    assert!(table.take_spare(0x100, 4097).is_none(), "too small");
+    assert!(table.take_spare(0x100, 2047).is_none(), "over twice as big");
+    let taken = table.take_spare(0x100, 2048).expect("the free one");
+    assert_eq!(taken.gpu(), gpu);
+    assert!(table.take_spare(0x100, 4096).is_none(), "the other is held");
+    drop(holder);
+    assert!(table.take_spare(0x100, 4096).is_some(), "free once let go");
+    assert!(table.spares.is_empty());
+    for _ in 0..SPARES + 2 {
+        table.keep_spare(0x100, ResultBuffer::new(&rec, 256).unwrap());
+    }
+    assert_eq!(table.spares[&0x100].len(), SPARES);
+    let frame = table.aged;
+    table.age_spares(frame + SPARE_FRAMES);
+    assert_eq!(table.spares[&0x100].len(), SPARES, "still recent");
+    table.age_spares(frame + SPARE_FRAMES + 1);
+    assert!(table.spares.is_empty(), "given back");
+    // Memory the title releases or builds over drops its spares.
+    table.keep_spare(0x300, ResultBuffer::new(&rec, 256).unwrap());
+    table.retire(0x2c0, 0x340, None);
+    assert!(table.spares.is_empty());
+}
+
+/// A TLAS rebuilt every frame at one title address alternates between two
+/// results instead of allocating one a frame: the last generation stays in
+/// its slot until the next is submitted, the one before is free again.
+/// The reused result traces as the last build.
+#[test]
+fn rt_tlas_rebuilds_reuse_a_result_nothing_holds() {
+    let test = "rt_tlas_rebuilds_reuse_a_result_nothing_holds";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    let world = World::new();
+    let tlas = world.tlas.address();
+    let first = registry().structures[&tlas].result.gpu();
+    let rebuilt: Vec<u64> = (0..4)
+        .map(|_| {
+            let list = TitleList::new();
+            // SAFETY: the title list and the instance buffer are live.
+            unsafe { assert!(Builder.build(list.this(), &tlas_desc(tlas, &world._inputs[2]))) };
+            list.run();
+            registry().structures[&tlas].result.gpu()
+        })
+        .collect();
+    assert_ne!(rebuilt[0], first, "the first generation is still published");
+    assert_eq!(rebuilt, [rebuilt[0], first, rebuilt[0], first]);
+    if rays {
+        let slot = Descriptor::new(tlas);
+        let list = TitleList::new();
+        let out = unwritten();
+        trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
+        list.run();
+        assert_eq!(out.words(), hit());
+    }
+}
+
+/// A compacted copy, or a copy of a structure whose build was refused (no
+/// title extent), claims its first byte only: the structures the title
+/// packed after it in the buffer stay.
+#[test]
+fn rt_copies_without_a_known_extent_claim_their_first_byte() {
+    let test = "rt_copies_without_a_known_extent_claim_their_first_byte";
+    let Some(_gpu) = crate::testgpu::device(test) else {
+        return;
+    };
+    let packed = TitleBuffer::new(4096);
+    let nothing = TitleBuffer::new(256);
+    let base = packed.address();
+    {
+        let mut table = registry();
+        table.begin(base + 1024, Some(512));
+        table.begin(base + 2048, Some(512));
+    }
+    let list = TitleList::new();
+    for (dst, mode) in [
+        (
+            base,
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT,
+        ),
+        (
+            base + 512,
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE,
+        ),
+    ] {
+        // SAFETY: a live title list; no structure at the source.
+        assert!(!unsafe { Builder.copy(list.this(), dst, nothing.address(), mode.0) });
+        let table = registry();
+        assert!(
+            table.ranges.contains_key(&(base + 1024)) && table.ranges.contains_key(&(base + 2048)),
+            "the packed structures after {dst:#x} stay"
+        );
+    }
+}
+
+/// The title's release of a buffer empties the slots of its structures: a
+/// TLAS or a trace recorded before finds nothing there.
+#[test]
+fn rt_released_buffers_empty_their_slots() {
+    let test = "rt_released_buffers_empty_their_slots";
+    let Some(_gpu) = dxr(test) else {
+        return;
+    };
+    let World {
+        tlas,
+        blas,
+        _inputs,
+    } = World::new();
+    let slots = {
+        let table = registry();
+        [&tlas, &blas].map(|b| table.ranges[&b.address()].slot.clone())
+    };
+    let published = |s: &Slot| s.lock().unwrap().is_some();
+    assert!(slots.iter().all(published));
+    drop((tlas, blas));
+    assert!(!slots.iter().any(published), "emptied by the release");
+}
+
+/// A TLAS build takes the BLAS in the slot current as it reaches the
+/// queue, and the one in the slot it recorded only where the current one
+/// is empty.
+#[test]
+fn rt_current_slots_win_over_recorded_ones() {
+    let test = "rt_current_slots_win_over_recorded_ones";
+    let Some(_gpu) = dxr(test) else {
+        return;
+    };
+    let world = World::new();
+    let second = TitleBuffer::new(1024);
+    let producer = TitleList::new();
+    let geometry = geometry(&world._inputs[0], &world._inputs[1]);
+    // SAFETY: the title list and the CPU arrays are live.
+    unsafe {
+        assert!(Builder.build(
+            producer.this(),
+            &Build {
+                DestAccelerationStructureData: second.address(),
+                Inputs: blas_input(&geometry),
+                ..Default::default()
+            }
+        ));
+    }
+    producer.run();
+    let (old, new) = {
+        let table = registry();
+        let at = |b: &TitleBuffer| table.structures[&b.address()].clone();
+        (at(&world.blas), at(&second))
+    };
+    let at = 0x5157_0000_0000;
+    let slot = |s: Option<&Structure>| -> Candidates {
+        Arc::new(BTreeMap::from([(at, Arc::new(Mutex::new(s.cloned())))]))
+    };
+    let chosen = |recorded: &Candidates, current: &Candidates| {
+        instances::UploadMap::resolve(recorded, current).map(|m| m.generations[0].1.gpu())
+    };
+    let recorded = slot(Some(&old));
+    assert_eq!(chosen(&recorded, &slot(Some(&new))), Some(new.result.gpu()));
+    assert_eq!(chosen(&recorded, &slot(None)), Some(old.result.gpu()));
+    assert_eq!(
+        chosen(&recorded, &Candidates::default()),
+        Some(old.result.gpu())
+    );
+    assert_eq!(chosen(&slot(None), &slot(None)), None);
 }

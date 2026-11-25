@@ -101,12 +101,19 @@ impl<'a> Recorder<'a> {
         })
     }
 
-    fn build(
-        &self,
-        inputs: &Inputs,
-        reuse: Option<Arc<ResultBuffer>>,
-        ordered: bool,
-    ) -> Option<Structure> {
+    /// A result of `bytes` for a structure at title address `at`: the
+    /// result of a generation retired there that nothing holds any more
+    /// ([`Registry::take_spare`]), else a new one.
+    fn result(&self, at: Option<u64>, bytes: u64) -> Option<Arc<ResultBuffer>> {
+        if let Some(spare) = at.and_then(|at| registry().take_spare(at, bytes)) {
+            return Some(spare);
+        }
+        evicting(|| ResultBuffer::new(self, bytes))
+    }
+
+    /// Records the build of `inputs` into a result of its own, reusing one
+    /// retired at title address `at` when it can.
+    fn build(&self, inputs: &Inputs, at: Option<u64>, ordered: bool) -> Option<Structure> {
         let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
         // SAFETY: the caller owns all geometry descriptions for this call.
         unsafe {
@@ -116,11 +123,7 @@ impl<'a> Recorder<'a> {
         if sizes.ResultDataMaxSizeInBytes == 0 {
             return None;
         }
-        // A retired allocation can serve a later generation at the same title address.
-        let result = match reuse {
-            Some(resource) if resource.bytes >= sizes.ResultDataMaxSizeInBytes => resource,
-            _ => ResultBuffer::new(self, sizes.ResultDataMaxSizeInBytes)?,
-        };
+        let result = self.result(at, sizes.ResultDataMaxSizeInBytes)?;
         let mut scratch = self
             .list
             .rt_scratch
@@ -130,7 +133,9 @@ impl<'a> Recorder<'a> {
         let mut scratch_address = 0;
         if bytes != 0 {
             if scratch.as_ref().is_none_or(|buffer| width(buffer) < bytes) {
-                *scratch = Some(buffer(self, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?);
+                *scratch = Some(evicting(|| {
+                    buffer(self, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+                })?);
             }
             let current = scratch.as_ref()?;
             self.list.keep(current);
@@ -171,10 +176,13 @@ impl<'a> Recorder<'a> {
         })
     }
 
+    /// Records a copy of `source` into a result of its own, reusing one
+    /// retired at title address `at` when it can.
     fn copy_structure(
         &self,
         source: &Structure,
         mode: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE,
+        at: u64,
     ) -> Option<Structure> {
         let capacity = source.result.bytes;
         match mode {
@@ -186,7 +194,7 @@ impl<'a> Recorder<'a> {
         // A replay may rebuild different geometry into the same source.
         // Its allocation bounds every execution, unlike a prior fence's measurement.
         let bytes = capacity;
-        let dest = ResultBuffer::new(self, bytes)?;
+        let dest = self.result(Some(at), bytes)?;
         self.list.keep_rt_result(&dest);
         // SAFETY: independent AS resources in the required state, retained through execution.
         unsafe {
@@ -280,6 +288,21 @@ struct Destination {
     generation: u64,
 }
 
+/// The result of a generation retired at a title address, kept for a later
+/// generation there, and the frame it was retired in.
+struct Spare {
+    result: Arc<ResultBuffer>,
+    frame: u64,
+}
+
+/// Spares kept per title address: a structure rebuilt every frame retires
+/// one generation per frame, each held by its slot until the next one is
+/// submitted and by its recording until that has run and been reset.
+const SPARES: usize = 4;
+/// Frames a spare is kept: an address no longer rebuilt gives its spares
+/// back.
+const SPARE_FRAMES: u64 = 8;
+
 #[derive(Default)]
 struct Registry {
     structures: BTreeMap<u64, Structure>,
@@ -288,6 +311,10 @@ struct Registry {
     waiting: BTreeMap<u64, (Option<usize>, WeakSlot)>,
     generation: u64,
     snapshot: Option<Candidates>,
+    /// Results of retired generations by title address, oldest first.
+    spares: BTreeMap<u64, Vec<Spare>>,
+    /// The frame spares were last aged in.
+    aged: u64,
 }
 
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
@@ -359,10 +386,62 @@ impl Registry {
                 previous = old;
             }
         }
+        // Spares in memory the title released or now uses for another range.
+        let spares: Vec<_> = self.spares.range(start..end).map(|(&key, _)| key).collect();
+        for key in spares {
+            self.spares.remove(&key);
+        }
         (previous, slots)
     }
 
-    fn begin(&mut self, start: u64, bytes: Option<u64>) -> (BuildSlot, Option<Arc<ResultBuffer>>) {
+    /// Keeps `result`, of a generation retired at title address `at`, for a
+    /// later one there.
+    fn keep_spare(&mut self, at: u64, result: Arc<ResultBuffer>) {
+        let spares = self.spares.entry(at).or_default();
+        if spares.len() == SPARES {
+            spares.remove(0);
+        }
+        spares.push(Spare {
+            result,
+            frame: self.aged,
+        });
+    }
+
+    /// A result of `bytes` (at most twice as many) retired at title address
+    /// `at` that nothing else holds: no slot, no TLAS's BLAS map and no
+    /// recording, which holds it until it has run and been reset. Every GPU
+    /// use of the old generation has then finished.
+    fn take_spare(&mut self, at: u64, bytes: u64) -> Option<Arc<ResultBuffer>> {
+        let spares = self.spares.get_mut(&at)?;
+        let (i, _) = spares
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                (bytes..=bytes.saturating_mul(2)).contains(&s.result.bytes)
+                    && Arc::strong_count(&s.result) == 1
+            })
+            .min_by_key(|(_, s)| s.result.bytes)?;
+        let spare = spares.remove(i);
+        if spares.is_empty() {
+            self.spares.remove(&at);
+        }
+        Some(spare.result)
+    }
+
+    /// Gives back the spares kept since more than [`SPARE_FRAMES`] before
+    /// `frame`, once per frame.
+    fn age_spares(&mut self, frame: u64) {
+        if frame == self.aged {
+            return;
+        }
+        self.aged = frame;
+        self.spares.retain(|_, spares| {
+            spares.retain(|s| frame.saturating_sub(s.frame) <= SPARE_FRAMES);
+            !spares.is_empty()
+        });
+    }
+
+    fn begin(&mut self, start: u64, bytes: Option<u64>) -> BuildSlot {
         let owner = crate::shadow::buffer_owner(start, bytes.unwrap_or(1));
         let end = match (bytes.filter(|&n| n > 0), owner) {
             (Some(n), _) => start.saturating_add(n),
@@ -375,7 +454,18 @@ impl Registry {
             .map(|r| r.slot.clone())
             .or_else(|| self.waiting.remove(&start).and_then(|(_, w)| w.upgrade()))
             .unwrap_or_default();
+        self.age_spares(crate::frame::current());
+        // The spares at this address serve the new generation.
+        let kept = self.spares.remove(&start);
         let (old, mut overwritten) = self.retire(start, end, None);
+        if let Some(kept) = kept {
+            self.spares.insert(start, kept);
+        }
+        // Its result serves a later generation, once its slot has the new
+        // one and its recording has run.
+        if let Some(old) = old {
+            self.keep_spare(start, old.result);
+        }
         overwritten.retain(|s| !Arc::ptr_eq(s, &slot));
         self.generation += 1;
         self.ranges.insert(
@@ -387,16 +477,13 @@ impl Registry {
                 generation: self.generation,
             },
         );
-        (
-            BuildSlot {
-                known_extent: bytes
-                    .map_or(owner.is_some(), |n| n > 0 && start.checked_add(n).is_some()),
-                generation: self.generation,
-                slot,
-                overwritten,
-            },
-            old.map(|s| s.result).filter(|r| Arc::strong_count(r) == 1),
-        )
+        BuildSlot {
+            known_extent: bytes
+                .map_or(owner.is_some(), |n| n > 0 && start.checked_add(n).is_some()),
+            generation: self.generation,
+            slot,
+            overwritten,
+        }
     }
 
     fn finish(&mut self, start: u64, generation: u64, built: Option<Structure>) -> bool {
@@ -433,8 +520,41 @@ impl Registry {
     }
 }
 
+/// Retires the structures of title memory `[start, end)` that `owner`
+/// released, and empties their slots: a TLAS recorded before, or a trace
+/// of one, finds nothing there (its instances are inactive, its rays miss)
+/// instead of a structure in released memory.
 pub(crate) fn release_buffer(owner: Option<usize>, start: u64, end: u64) {
-    registry().retire(start, end, Some(owner));
+    let (previous, slots) = registry().retire(start, end, Some(owner));
+    drop(previous);
+    for slot in slots {
+        let old = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(old);
+    }
+}
+
+/// `make`, tried again once the spares are given back ([`Registry::spares`])
+/// if it fails: the RT budget is exhausted, and spares hold part of it.
+fn evicting<T>(make: impl Fn() -> Option<T>) -> Option<T> {
+    if let Some(made) = make() {
+        return Some(made);
+    }
+    let spares = std::mem::take(&mut registry().spares);
+    // The others are freed when what holds them goes.
+    let free = spares
+        .values()
+        .flatten()
+        .filter(|s| Arc::strong_count(&s.result) == 1)
+        .count();
+    drop(spares);
+    if free == 0 {
+        return None;
+    }
+    tracing::debug!(
+        free,
+        "host DXR allocation refused: spare results given back, tried again"
+    );
+    make()
 }
 
 /// Resolves and pins the TLAS and its possible BLAS references for this recording.
@@ -607,7 +727,7 @@ unsafe fn build_one(
     if dst == 0 {
         return false;
     }
-    let (generation, reuse) = registry().begin(dst, title_bytes);
+    let generation = registry().begin(dst, title_bytes);
     let built = (|| {
         if !generation.known_extent {
             return None;
@@ -635,13 +755,13 @@ unsafe fn build_one(
                     },
                     ..inputs
                 };
-                recorder.build(&inputs, reuse, ordered)
+                recorder.build(&inputs, Some(dst), ordered)
             }
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
                 let (inputs, map) = instances::rewrite(&recorder, title_list, &inputs)?;
                 let built = Structure {
                     instances: Some(map),
-                    ..recorder.build(&inputs, reuse, ordered || inputs.NumDescs != 0)?
+                    ..recorder.build(&inputs, Some(dst), ordered || inputs.NumDescs != 0)?
                 };
                 // The empty TLAS traces fall back to, made before they bind
                 // their state.
@@ -772,11 +892,23 @@ impl Builder {
         if dst == 0 {
             return false;
         }
+        let mode = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode);
         let (source, generation) = {
             let mut table = registry();
             let source = table.structures.get(&src).cloned();
-            let bytes = table.ranges.get(&src).map(|range| range.end - src);
-            let (generation, _) = table.begin(dst, bytes);
+            // A clone takes its source's title extent. A compacted copy is
+            // smaller by the title builder's measure, which the call does
+            // not give: the title packs the next one right after it. Such a
+            // copy, or one of a source with no extent (its build refused),
+            // claims its first byte only, which retires neither its packed
+            // neighbours nor the rest of the buffer.
+            let bytes = match mode {
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE => {
+                    table.ranges.get(&src).map(|range| range.end - src)
+                }
+                _ => None,
+            };
+            let generation = table.begin(dst, Some(bytes.unwrap_or(1)));
             (source, generation)
         };
         let copied = (|| {
@@ -789,10 +921,7 @@ impl Builder {
                 return None;
             }
             source.retain(recorder.list);
-            recorder.copy_structure(
-                &source,
-                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode),
-            )
+            recorder.copy_structure(&source, mode, dst)
         })();
         if copied.is_none() {
             refused(Refused::Copy, dst);

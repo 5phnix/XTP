@@ -6,18 +6,21 @@ use windows::core::s;
 /// Immutable AS addresses and the GPU upload that names them.
 pub(super) struct UploadMap {
     upload: ID3D12Resource,
-    generations: Vec<(u64, Arc<ResultBuffer>)>,
+    pub(super) generations: Vec<(u64, Arc<ResultBuffer>)>,
 }
 
 impl UploadMap {
-    fn resolve(recorded: &Candidates, current: &Candidates) -> Option<Arc<Self>> {
-        // Recorded slots survive title release. Include producers first recorded
-        // on other threads after the TLAS, if they have reached the queue.
+    /// The BLAS at each title address as the TLAS build reaches the queue:
+    /// the one in the slot current then, or, where that slot is empty, the
+    /// one in the slot `recorded` with the TLAS. A slot the title's release
+    /// emptied gives none, and a BLAS published at that address since, in a
+    /// new slot, wins over an old slot's.
+    pub(super) fn resolve(recorded: &Candidates, current: &Candidates) -> Option<Arc<Self>> {
         let mut entries = BTreeMap::new();
-        for (address, slot) in recorded
-            .iter()
-            .chain(current.iter().filter(|(a, _)| !recorded.contains_key(a)))
-        {
+        for (address, slot) in current.iter().chain(recorded.iter()) {
+            if entries.contains_key(address) {
+                continue;
+            }
             let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(s) = slot.as_ref().filter(|s| s.instances.is_none()) {
                 entries.insert(*address, s.result.clone());
@@ -181,7 +184,7 @@ pub(super) fn rewrite(
     // SAFETY: the caller selected TOP_LEVEL, whose active union member is the instance GPU address.
     let address = unsafe { inputs.Anonymous.InstanceDescs };
     let src = input_range(rec.list, address, bytes, 16)?;
-    let dst = buffer(rec, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+    let dst = evicting(|| buffer(rec, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))?;
     let pass = pipeline(rec.device)?;
     let (args, data) = rec.list.upload(crate::host::made()?, 20)?;
     let mapped = data as usize;
