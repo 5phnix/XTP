@@ -1884,8 +1884,8 @@ pub(crate) mod tests {
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
         assert!(!writable(a) && guards().protected.contains(&(b / BLOCK)));
         // Keep the address reserved until the alias index forgets it.
-        // SAFETY: our view replaced this placeholder.
         assert_ne!(
+            // SAFETY: our view replaced this placeholder.
             unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) },
             0
         );
@@ -2200,8 +2200,8 @@ pub(crate) mod tests {
         };
         if allocation.is_null() {
             // A parallel allocator can claim the address after the unmap.
-            // SAFETY: read the error from VirtualAlloc on this thread.
             assert_eq!(
+                // SAFETY: read the error from VirtualAlloc on this thread.
                 unsafe { windows_sys::Win32::Foundation::GetLastError() },
                 windows_sys::Win32::Foundation::ERROR_INVALID_ADDRESS
             );
