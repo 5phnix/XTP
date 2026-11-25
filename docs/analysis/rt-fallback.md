@@ -42,12 +42,13 @@ other?
   predicate answer "no" switches each of them to its non-traced branch at
   once, which is what the task asks; what each of the others does on that
   branch is section 4's open list.
-- **The switch**: the entries of the predicate and of its twin
-  (`0x4fd8570`, the same test on a given manager) made to return 0, a
-  title-specific patch by RVA in the per-build hooks of `crates/xtp-game`
-  (section 5). Not written yet: this page is the finding, delivered first;
-  the hook and the A/B of the irradiance and probe buffers and of the
-  world's luminance follow (section 7).
+- **The switch**: `XTP_RT_PATH`, off by default (section 5). It makes the
+  predicate and its twin (`0x4fd8570`, the same test on a given manager)
+  answer 0 by a title-specific patch by RVA in the per-build hooks of
+  `crates/xtp-game` (`rt_path.rs`). `fallback` does so for a whole run;
+  `ab` alternates it with the title's own answer within one run. The A/B
+  of the irradiance and probe buffers and of the world's luminance comes
+  next (section 7).
 
 ## 2. The predicate
 
@@ -123,7 +124,7 @@ What the screen probes do without the predicate is the first thing to
 read: their fallback rays (`a953d5b93efe8424`) are refused (wave64 lanes
 in a group over 64, rt-standin.md §3), so that hole would stay.
 
-## 5. Forcing the fallback
+## 5. Forcing the fallback: `XTP_RT_PATH`
 
 The cleanest switch the code allows: the entries of the predicate and of
 its twin made to return 0 ("no scene ready"), so that every caller takes
@@ -133,13 +134,54 @@ dispatches are dropped as now), nobody asks for it. Code that reads the
 manager's fields itself, without either function (the manager's own
 functions, among the 37 references to its pointer), is not affected.
 
-- **Where**: a per-build hook of `crates/xtp-game` (where the watchdog,
-  assertion and intro hooks live, applied from `apps/xtp/src/run.rs` once
-  the image is mapped), checked against the build's BLAKE3 and against a
-  hash of the function's bytes before anything is written.
-- **A/B within one session**: the patch is one aligned 4-byte store at the
-  function's entry, so it can be put in and taken out between frames; the
-  A/B clock of `xtp_core::ab` can drive it.
+Written by task rthook (65fa56c1), 2026-11-25: `crates/xtp-game/src/rt_path.rs`,
+applied from `apps/xtp/src/run.rs` once the image is mapped, before any
+title code runs (next to the watchdog and assertion hooks).
+
+- **Values**:
+  - unset or `bvh`: nothing is written, the title answers itself;
+  - `fallback`: both functions answer 0 for the whole run;
+  - `ab`, `ab:<phase s>` or `ab:<phase s>:<settle s>`: the A/B clock of
+    `xtp_core::ab` alternates the two. Phase A (`XTP_RT_PATH=0` in the
+    A/B lines) is the title's own answer, phase B (`=1`) the fallback. It
+    shares the phases of any other switch set to `ab` (`XTP_RT_STANDIN`,
+    for one).
+- **What is written**: each function's first two bytes become a short
+  jump to the function's own "return 0". For the predicate that is
+  `0x4fd8562`, the path it takes without a manager; for the twin,
+  `0x4fd8581`, the path without scene `i`. Nothing else is written.
+- **Why two bytes and not four**: the predicate's first instruction is two
+  bytes long, the twin's four, and both functions are leaves (no frame, no
+  unwind data). A jump that covers no more than the first instruction is
+  one aligned, atomic two-byte store. While title threads run:
+  - no thread is ever inside a written byte;
+  - a thread that took the jump is in the title's "return 0", which is
+    never written, so taking the jump out cannot strand it.
+
+  A "return 0" of our own written over four bytes (two instructions) would
+  break the second point. A thread stopped between those two instructions
+  would resume, once the patch is taken out, in the middle of the
+  predicate's second instruction. So `ab` can flip the path in a running
+  session.
+- **Checks before writing**: the build's BLAKE3, then an FNV-1a hash of
+  each function's bytes from its entry through its "return 0" (0x15 and
+  0x14 bytes). A mismatch writes nothing. The title's bytes stay outside
+  the repository. The opt-in test `rt_path::tests::sites_in_the_sample_game`
+  (`XTP_SAMPLE_GAME=<title folder>`) checks the hashes against a dump.
+  On 2026-11-25 the image was mapped at `0x7ffa75f40000` (relocated) with
+  `xtp run` without `--execute`. Both sites matched and were written:
+  `ray-tracing scene predicate answers no … sites=2`.
+- **In `ab`**: a thread of ours (`xtp-rt-path`) reads the clock every 5 ms
+  and flips both entries after the present that ends a phase. That is not
+  a frame boundary of the title, so the frame across a flip can see both
+  answers. The phase's settling time (3 s by default) leaves that frame
+  out of the measurements.
+- **Log lines**:
+  - `ray-tracing scene predicate answers no (XTP_RT_PATH=fallback)`;
+  - `ray-tracing path (XTP_RT_PATH=ab): phase A …, phase B …`, then
+    `ray-tracing scene predicate: <path> (A/B arm <A|B>)` at each flip;
+  - a refusal says why: `ray-tracing path not switched (XTP_RT_PATH): …`
+    (unknown build, bytes that are not the expected ones).
 - **Expected**: in the probe and transparent probe passes, the fallback
   programs in the "first bind" lines and no drop of `3592426e3e9142d8`,
   `36f04a4ed0ad1d9b`, `b58eb3ca6ee46427` or `f607780aa8e502d0`; the
@@ -164,15 +206,26 @@ functions, among the 37 references to its pointer), is not affected.
 
 ## 7. What comes next
 
-- **The hook** (section 5), behind a switch of its own, off by default,
-  with `ab` alternating it within one session (the A/B clock of
-  `xtp_core::ab`): `crates/xtp-game` (a new file, its `mod` line) and its
-  call in `apps/xtp/src/run.rs`, next to the intro hook's.
-- **The A/B on the same frames**, one Series S session: in each phase,
-  the "first bind" lines of the fallback programs, the `rt: dropped traces
-  in a frame` lines (probe gathers and cache shadows should fall to 0),
-  the probes' and the transparent probe volume's outputs and the light
-  mixers' inputs in the pass dump (non-zero?), and the world's luminance.
+- **The hook**: written (section 5), `XTP_RT_PATH`, off by default.
+- **The A/B on the same frames**, one Series S session with
+  `XTP_RT_PATH=ab` (not run at this writing). In each phase record:
+  - the "first bind" lines of the fallback programs;
+  - the `rt: dropped traces in a frame` lines: the probe gathers and the
+    cache's shadow rays should fall to 0;
+  - in the pass dump, the probes' writes at pass 17 and the transparent
+    probe volume's at pass 73, and the light mixers' inputs (non-zero?);
+  - the irradiance cache on its own: its gather is not dispatched on this
+    branch, so whether its atlas stays at 0 and whether the mixers still
+    read it are measured apart from the probes;
+  - the luminance chain, G-buffer → lit HDR → presented, as in
+    world-black.md §10.1, and whether the street gets brighter.
+
+  Upstream (watch 25, item 348): on an RTX 4070 SUPER both probe
+  structures stayed at 0 over 553 readings, even with their address
+  fixed. Nobody upstream has measured the forced predicate.
+- **The default**: `fallback` becomes the default only if the A/B shows a
+  clearly better image with no crash and no assertion; otherwise it stays
+  opt-in, and this page says why.
 - **How to confirm the path changed** (watch 23, items 328–330): no
   upstream test has shown the title's non-traced path running. The first
   write into the probe outputs by `81560230fcde2b0a`, then into the
