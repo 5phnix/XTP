@@ -7,6 +7,7 @@ pub use dispatch::{
     IndirectTlas, dispatch_descriptor_tlas, dispatch_indirect_tlas, prepare_indirect_tlas,
 };
 pub(crate) mod compaction;
+mod indices;
 mod instances;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod probe;
@@ -884,7 +885,12 @@ unsafe fn build_one(
         match inputs.Type {
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL => {
                 // SAFETY: the descriptors are borrowed from this title call only.
-                let geometries = unsafe { triangles(list, &inputs) }?;
+                let (mut geometries, jobs) = unsafe { triangles(list, &inputs) }?;
+                if !jobs.is_empty() {
+                    // Its own barriers order what came before the build.
+                    indices::record(&recorder, title_list, &mut geometries, &jobs, dst)?;
+                }
+                let ordered = ordered || !jobs.is_empty();
                 let inputs = Inputs {
                     DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
@@ -1184,52 +1190,29 @@ fn invalid<T>(geometry: usize, why: std::fmt::Arguments<'_>) -> Option<T> {
     None
 }
 
-/// The largest of the `count` indices of `size` bytes at title `address`,
-/// as title memory holds them now, read through the kernel (unmapped pages
-/// read as zeros, guarded ones raise nothing).
-fn largest_index(address: u64, count: u64, size: u64) -> u32 {
-    let Some(len) = count
-        .checked_mul(size)
-        .and_then(|n| usize::try_from(n).ok())
-    else {
-        return u32::MAX;
-    };
-    let mut bytes = vec![0u8; len];
-    crate::host::copy_mapped(bytes.as_mut_ptr(), address as *const u8, len, false);
-    if size == 2 {
-        let (indices, _) = bytes.as_chunks::<2>();
-        indices
-            .iter()
-            .map(|&i| u32::from(u16::from_le_bytes(i)))
-            .max()
-            .unwrap_or(0)
-    } else {
-        let (indices, _) = bytes.as_chunks::<4>();
-        indices
-            .iter()
-            .map(|&i| u32::from_le_bytes(i))
-            .max()
-            .unwrap_or(0)
-    }
-}
-
 /// Translates indexed or non-indexed triangle descriptions to host addresses.
 /// Each input is checked first, and a BLAS with an invalid one is refused
 /// with a log ([`invalid`]): a geometry that is not triangles or has an
 /// unknown format, a vertex stride shorter than a vertex, a vertex or index
 /// count that is no whole number of triangles, vertices, indices or a
-/// transform outside title memory or misaligned, an index past the
-/// vertices (as title memory holds them when the build is recorded), or
-/// more geometries or triangles than DXR allows.
+/// transform outside title memory or misaligned, or more geometries or
+/// triangles than DXR allows. Indices past the vertices are checked on the
+/// GPU, in the version the build reads ([`indices`]): each indexed
+/// geometry comes with the job that copies and checks its indices, and its
+/// index buffer is set when that is recorded.
 ///
 /// # Safety
 /// The active layout supplies NumDescs readable CPU descriptors or pointers to them.
-unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
+unsafe fn triangles(
+    list: &HostList,
+    inputs: &Inputs,
+) -> Option<(Vec<Geometry>, Vec<indices::Job>)> {
     let count = inputs.NumDescs;
     if count > D3D12_RAYTRACING_MAX_GEOMETRIES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE {
         return invalid(0, format_args!("{count} geometries"));
     }
     let mut geometries = Vec::new();
+    let mut jobs = Vec::new();
     let mut total = 0u64;
     for i in 0..count as usize {
         // SAFETY: the caller provides NumDescs CPU descriptions in the selected layout.
@@ -1315,20 +1298,39 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
         total += u64::from(points / 3);
         if index_size != 0 {
             let (at, n) = (t.IndexBuffer, u64::from(t.IndexCount));
-            let Some(host) = range(list, at, n * index_size, index_size) else {
+            let Some(shadow) = input_range(list, at, n * index_size, index_size) else {
                 return invalid(
                     i,
                     format_args!("{n} indices at {at:#x} outside title memory or misaligned"),
                 );
             };
-            let largest = largest_index(at, n, index_size);
-            if largest >= vertices {
+            // The check reads whole 4-byte words of the host copy: the last
+            // 16-bit index's word must lie in its buffer too.
+            let host = shadow.gpu(at);
+            let source = host & !3;
+            let end = (host + n * index_size).next_multiple_of(4);
+            // SAFETY: plain queries on a live buffer.
+            let (base, width) = unsafe {
+                (
+                    shadow.buffer.GetGPUVirtualAddress(),
+                    shadow.buffer.GetDesc().Width,
+                )
+            };
+            if end > base + width {
                 return invalid(
                     i,
-                    format_args!("index {largest} at {at:#x} past its {vertices} vertices"),
+                    format_args!("{n} indices at {at:#x} end 2 bytes before their host copy's end"),
                 );
             }
-            t.IndexBuffer = host;
+            jobs.push(indices::Job {
+                geometry: i,
+                source,
+                offset: (host - source) as u32,
+                count: t.IndexCount,
+                wide: index_size == 4,
+                vertices,
+            });
+            t.IndexBuffer = 0;
         }
         if t.Transform3x4 != 0 {
             let at = t.Transform3x4;
@@ -1345,7 +1347,7 @@ unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
     if total > u64::from(D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE) {
         return invalid(0, format_args!("{total} triangles"));
     }
-    Some(geometries)
+    Some((geometries, jobs))
 }
 
 #[cfg(test)]

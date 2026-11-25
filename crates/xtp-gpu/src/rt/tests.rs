@@ -334,10 +334,18 @@ fn rt_triangle_translation_requires_the_whole_input_range() {
     let mut geometry = geometry(&vertices, &indices);
     // SAFETY: the test owns the descriptor and all referenced buffers.
     unsafe {
-        let translated = triangles(list.host(), &blas_input(&geometry)).unwrap();
+        let (translated, jobs) = triangles(list.host(), &blas_input(&geometry)).unwrap();
         let t = translated[0].Anonymous.Triangles;
         assert_eq!(t.IndexFormat, DXGI_FORMAT_R16_UINT);
-        assert_eq!(t.IndexBuffer, indices.shadow().gpu(indices.address()));
+        // Set when the GPU check of the indices is recorded (`indices`).
+        assert_eq!(t.IndexBuffer, 0);
+        let host = indices.shadow().gpu(indices.address());
+        let job = &jobs[0];
+        assert_eq!((job.geometry, job.count, job.vertices), (0, 3, 3));
+        assert_eq!(
+            (job.source + u64::from(job.offset), job.wide),
+            (host, false)
+        );
         assert_eq!(
             t.VertexBuffer.StartAddress,
             vertices.shadow().gpu(vertices.address())
@@ -1022,8 +1030,8 @@ fn rt_current_slots_win_over_recorded_ones() {
 }
 
 /// A BLAS input DXR cannot build from is refused before its build is
-/// recorded: an index past the vertices, a count that is no whole number
-/// of triangles, a stride shorter than a vertex.
+/// recorded: a count that is no whole number of triangles, a stride
+/// shorter than a vertex.
 #[test]
 fn rt_invalid_blas_inputs_are_refused_before_their_build() {
     let test = "rt_invalid_blas_inputs_are_refused_before_their_build";
@@ -1040,9 +1048,13 @@ fn rt_invalid_blas_inputs_are_refused_before_their_build() {
     let valid = geometry(&vertices, &indices);
     indices.set_words(|i| [1 << 16, 2][i]);
     assert!(translate(&valid));
-    // Index 3 of three vertices.
+    // Index 3 of three vertices: checked on the GPU, as the build reads it
+    // (`rt_indices_are_checked_as_the_build_reads_them`).
     indices.set_words(|i| [1 << 16, 3][i]);
-    assert!(!translate(&valid), "an index past the vertices");
+    assert!(
+        translate(&valid),
+        "an index past the vertices, checked later"
+    );
     indices.set_words(|i| [1 << 16, 2][i]);
     let mut two = valid;
     two.Anonymous.Triangles.IndexCount = 2;
@@ -1421,5 +1433,72 @@ fn rt_a_tlas_without_its_stand_in_is_refused() {
     producer.run();
     for t in &tlas {
         assert!(!registry().structures.contains_key(&t.address()));
+    }
+}
+
+/// The indices a BLAS build reads are checked on the GPU, after every write
+/// before the build in its submission (Codex review 11f27db1, P1-2): valid
+/// in title memory but made invalid by a GPU copy before the build, the
+/// build takes no triangle and every ray misses; invalid in title memory
+/// but made valid by a GPU copy before the build, it is built and hit (the
+/// check of title memory at recording refused it).
+#[test]
+fn rt_indices_are_checked_as_the_build_reads_them() {
+    let test = "rt_indices_are_checked_as_the_build_reads_them";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    if !rays {
+        return;
+    }
+    let vertices = TitleBuffer::new(24);
+    vertices.set_words(|i| POSITIONS[i].to_bits());
+    // 16-bit indices 0, 1, 2, and 0, 1, 3 (past the three vertices).
+    let (valid, invalid) = ([1 << 16, 2], [1 << 16, 3]);
+    let cases = [
+        ("valid", valid, valid, true),
+        ("made invalid by the GPU", valid, invalid, false),
+        ("made valid by the GPU", invalid, valid, true),
+    ];
+    for (case, in_memory, written, hits) in cases {
+        let indices = TitleBuffer::new(8);
+        indices.set_words(|i| in_memory[i]);
+        let patch = TitleBuffer::new(8);
+        patch.set_words(|i| written[i]);
+        indices.shadow();
+        patch.shadow();
+        let (blas, tlas) = (TitleBuffer::new(1024), TitleBuffer::new(1024));
+        let instances = instances_of(&[blas.address()]);
+        let geometry = geometry(&vertices, &indices);
+        let list = TitleList::new();
+        // The GPU writes the indices' host copy before the build.
+        assert!(crate::shadow::copy(
+            list.host(),
+            indices.address(),
+            patch.address(),
+            8
+        ));
+        // SAFETY: the title list and every buffer the descriptions name are live.
+        unsafe {
+            assert!(
+                Builder.build(
+                    list.this(),
+                    &Build {
+                        DestAccelerationStructureData: blas.address(),
+                        Inputs: blas_input(&geometry),
+                        ..Default::default()
+                    }
+                ),
+                "{case}: the BLAS build is recorded"
+            );
+            assert!(Builder.build(list.this(), &tlas_desc(tlas.address(), &instances)));
+        }
+        list.run();
+        let slot = Descriptor::new(tlas.address());
+        let out = unwritten();
+        let tracing = TitleList::new();
+        trace(gpu.host(), &tracing, Scene::Descriptor(slot.handle()), &out);
+        tracing.run();
+        assert_eq!(out.words(), if hits { hit() } else { MISSES }, "{case}");
     }
 }
