@@ -116,6 +116,7 @@ ec5a7ada's builder verdict; world 32 s after the start, removal 14:01:38):
 | dred-760ec60-a | 760ec60 | on | 13:46:26, frame 3052 | about 20 (15–18 s a frame) | no, stopped at 420 s |
 | dred-12-b | this branch (1b24311) | on, with contexts | 13:54:09, frame 2421 | about 15 (16–24 s a frame) | no, stopped at 420 s |
 | dred-12-long | this branch (1b24311) | on, with contexts | 14:01:26, frame 2567 | about 50 (about 20 s a frame) | **yes**, removed 14:18:14 |
+| nodred-main | main 81aeecd (with the CBV cap) | off | 14:23:10, frame 2933 | about 115 (0.3 to 0.9 fps) | **yes**, removed 14:25:08, 2 lists in flight |
 
 Without DRED the L4 runs the world at 0.3 fps (3.5 s a frame); with it,
 0.1 fps, and about 0.05 fps with breadcrumb contexts. Both the time spent
@@ -163,5 +164,6 @@ had the constant buffer view cap (760ec60); on the PC it did not.
   allocators back (`Retired::retire`) run; `retire` keeps only an allocator
   whose `Reset` succeeded.
 - **Constant buffer views over 64 KiB** (capped in e0f8101, on main since
-  760ec60): none of the sessions that lost the device had the cap (5018dd4
-  and 3d3cd28 are older).
+  760ec60): not the cause. `dred-12-long` (760ec60 and this branch) and
+  `nodred-main` (81aeecd) have the cap and lost the device all the same
+  (§4).
