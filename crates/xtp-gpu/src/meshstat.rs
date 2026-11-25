@@ -108,6 +108,7 @@ pub(crate) enum Op {
         indices: u32,
         first: u32,
     },
+    /// `groups`: the groups in all (the product of the three dimensions).
     Mesh {
         groups: u32,
     },

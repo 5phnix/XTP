@@ -759,3 +759,148 @@ draws and 521 dropped a frame.
   gives no sharp image; the depth has to be filled (the mesh programs
   above). The scene colour before the depth of field can be shown with
   `XTP_PRESENT_TARGET=1280x720:f10@731a39171b568298`.
+
+## 10. Volumetric fog reconstruction and the dark world
+
+In `stride-3c/passes-693.txt`, the RGBA16F scene still has a faint signal
+after P560 (91.7% of sampled texels nonzero, blue mean 0.0001). P565
+runs one operation and drops both indirect reconstruction dispatches.
+The first-bind records in the same run identify `d9978c76c746d809`
+and `982f3cccd5c04294`. Their translation stopped at program offsets
+0x508 and 0x510 respectively when control flow joined two addresses of
+an embedded code table. P575 (`577248728544d74b`) then takes that same
+scene texture to exactly zero in all four channels.
+
+The producer fix is `e1b75d7`. It handles the joined PC-relative
+addresses and first-lane reads, with translation and lane-value tests.
+The landing at `2756674` adds diagnostics. In particular, `b3a211a`
+keeps prepared bindings across an upload or alias copy so the dispatch
+can sample its actual SRVs.
+
+The first L4 dump (`cxfog-inputs`, frame 2984) has both reconstruction
+dispatches at P536, with nonzero packed R32 words at 0x994380000 in every
+sample. At P546 the scene's mean RGB goes from (0.0026, 0.0037, 0.0053)
+to (0.0281, 0.0255, 0.0249). The title exposure is 0.57965. The nearby
+presented frame 2983 shows a transition card. In the late L4 control
+(`cxfog-reconstruct-control`) only the two reconstruction programs were
+disabled. Neither dump, 2438 or 2453, contains the application dispatch,
+and frame 2452 is entirely black. The two runs establish neither a
+world-frame comparison nor the identity of the nonfinite R32F input.
+
+### 10.1 From albedo to the presented frame on the PC
+
+`E:\xtp-data\runs\c58683-luma1`, RTX 4080 SUPER, Series S,
+`XTP_TEXTURE_POOL=1`, raw structured reads enabled, no skipped pipeline
+or forced presentation target. The diagnostic build `99e13fc` adds
+per-texel measurements to `2756674` and saves the PNG with the dump's
+own frame number. The autopilot handed back control at frame 649.
+Frame 704 shows poles, overhead lines, buildings and distant lights.
+Frame 697 is almost black. Both contain the 160×90×1 fog dispatch.
+
+Each pair below is the mean and 99th percentile of
+`0.2126 R + 0.7152 G + 0.0722 B`. The percentile is the nearest rank
+of individual finite RGB texels, excluding alpha. Pass measurements use
+the dump's 24 rows, and the screen measurement uses every RGB pixel of
+the same-numbered PNG. HDR values are scene-linear. UNORM and PNG
+values are in normalized code units, without an assumed transfer function.
+
+| Stage (mean / P99) | World 704 | Dark 697 | Control 645 (§10.3) |
+|---|---|---|---|
+| G-buffer albedo, first opaque MRT (RGBA8 typeless), last write before material resolve | P576 · 0.00014372 / 0 | P425 · 0.00033547 / 0.00392157 | P609 · 0 / 0 |
+| First HDR scene write, material resolve `f0c91b4d2578f5bf` | P588 · 0.00122806 / 0.02491223 | **P437 · 0.00000014 / 0.00000456** | P621 · 0.00011184 / 0 |
+| Lit HDR immediately before fog, UAV s1+48 | P751 input · 0.06454895 / 0.27407169 | P598 input · 0.00001603 / 0.00001793 | P792 input · 0.07448187 / 0.29755399 |
+| Same HDR texture after fog | P751 · 0.03116695 / 0.14536154 | P598 · 0.00004759 / 0.00009776 | **P792 · 0.00000391 / 0** |
+| Title exposure at fog and tone mapping (multiplier, reciprocal) | 1.5533783, 0.6437582 | 1.8824562, 0.53122085 | 1.515811, 0.6597129 |
+| After tone mapping, RGB10A2 | P870 · 0.04248161 / 0.19104789 | P715 · 0.00086678 / 0.00391007 | P911 · 0.00092747 / 0.00391007 |
+| Scene plane after the dither copy, RGBA8 | P882 · 0.04206621 / 0.17683451 | P727 · 0.00143428 / 0.00784314 | P923 · 0.00151756 / 0.00784314 |
+| Presented, both planes composed | **0.03769958 / 0.15534353** | **0.00125791 / 0.00392157** | **0.00201171 / 0.00475529** |
+
+Interpreting the PNG bytes as sRGB and linearizing each channel before
+weighting gives display-relative luminance 0.00416024 / 0.02134523 in
+704 and 0.00009736 / 0.00030353 in 697.
+
+In frame 697 the first G-buffer write (P231) already has zero RGB. Its
+albedo remains faint through P425. P437 is the **first HDR pass with
+effectively no light**. The packed RGBA8 material output at that same
+pass has mean 0.73432934 and P99 1; its channels encode material data.
+The sky at P581 adds very little. P598 slightly raises both statistics,
+and the tone mapper produces at most 4/1023 in RGB. In frame 704, the
+sky at P734 raises the HDR mean to 0.06455 and P751 is the first pass
+to substantially attenuate that light. A visible signal reaches the
+screen. Neither frame repeats the exact zero at P575 in stride-3c.
+
+### 10.2 What the fog dispatch actually reads
+
+Frame 704, captured before P751 with `XTP_PASS_INPUTS=577248728544d74b`.
+RGB entries are channel means. Volume entries include all 68 slices.
+
+| Binding | Value before the dispatch |
+|---|---|
+| s1+8 · main depth | 13.9% nonzero, mean 0.0835, range 0–1 |
+| s1+16 · reconstructed scattering, 480×272 | RGB (0.0078, 0.0086, 0.0094). The R9G9B9E5 view at 0x594380000 uses an RGBA16F host texture |
+| s1+24 · reconstructed transmittance, 480×272 | RGB (0.6618, 0.5936, 0.5153) |
+| s0+304 · transmittance volume, 80×46 | RGB (0.8068, 0.7824, 0.7367). Slice 0 is white, slice 67 averages (0.0318, 0.0274, 0.0230) |
+| s0+624 · scattering volume, 80×46 | RGB (0.0051, 0.0061, 0.0077). Slice 0 rounds to zero at four decimal places, slice 67 averages (0.0154, 0.0170, 0.0181) |
+| s1+40 · 1×1 RGBA8 UNORM | 0x557000000, bytes `00 00 00 ff`, decoded (0, 0, 0, 1) |
+| s0+184 and s0+568 · same 1×1 RGBA8 UINT | 0x557010000, bytes `00 00 00 ff`, decoded (0, 0, 0, 255) |
+| s0+552 · 1280×720 RGBA8 | RGB (0.0135, 0.0004, 0.0180) |
+| s0+600 · 64×64 R16 | mean 0.4948, range 0.0010–0.9995 |
+| s0+808 and s1+56 · CPU constants | 3,424 bytes at 0x59276ed80 and 480 bytes at 0x7f764c0 |
+
+Both reconstruction dispatches ran at P741. Its packed R32 writer at
+0x594380000 contains a nonzero word on every sampled texel. Its RGB10A2
+writer at 0x594400000 is the very object bound at s1+24 and has the same
+per-channel means there.
+
+The two CPU-filled 1×1 textures are the same slots and formats as the
+L4 placements at 0x957000000 and 0x957010000. Their alpha bytes confirm
+that the GPU sees populated texels even though their RGB is black.
+
+**s1+32 and the nonfinite R32F are different outputs.** In frame 704,
+P711 writes two 480×272 R32F textures. The one at 0x5cb5e0000 contains
+10,045 nonfinite texels out of 11,520. The other is resource
+`0x16ad82ee5f0` at 0x594080000. P751 binds exactly this second object
+at s1+32, with all samples finite (min 0.05, mean 6,578,034.94, max
+12,710,259). In frame 697 the first output has 11,520 nonfinite samples,
+while s1+32 binds 0x594300000 with a finite range of 0.05–19.8142.
+Both fog outputs are finite on all sampled rows. In the original L4
+frame 2984, the analogous P508 outputs are at 0xac3ee0000 (11,507
+nonfinite) and 0x994300000 (finite).
+
+At P751 and P598 the recorded pass contains a single shader operation
+writing exactly the resource sampled as s1+48 before it. The preceding
+writer on that resource has the same statistics as the dispatch input.
+The tone-map draw is the last op at P870 and P715. These checks tie the
+measurements to the actual writes despite upload and alias-copy markers
+during descriptor preparation.
+
+### 10.3 Disabling only the two reconstruction producers
+
+The PC control, `c58683-luma-ctl1`, uses the same binary, Series S save,
+texture pool and capture schedule (`2000:8:9:7`). Only
+`XTP_SKIP_PIPELINES=d9978c76c746d809,982f3cccd5c04294` changes.
+The control reached the world at frame 589 and wrote all requested
+captures through frame 659 before the session's 300-second limit.
+The no-skip run exited normally.
+The camera advances between captures, so the decisive comparison is the
+same HDR resource immediately before and after each dispatch.
+
+In frame 645, P782 drops the two indirects. The first binds in the run
+log tie their pipeline handles to the two skipped hashes. The application
+still runs at P792. **Both reconstructed RGB inputs read zero** at that
+dispatch. The black scattering view (s1+16 at 0x994380000) has alpha 1;
+the 100% “lit” reported for it counts alpha. The transmittance (s1+24)
+is zero in all four channels. The 3D inputs remain populated: mean RGB
+(0.7927, 0.7740, 0.7380) at s0+304 and (0.0064, 0.0069, 0.0079) at
+s0+624. The 1×1 textures at 0x957000000 and 0x957010000 both read back
+`00 00 00 ff`. Frame 638 also resolves the R32F pair at the **same
+backing addresses as L4 frame 2984**: P553 writes 11,512 nonfinite
+samples at 0xac3ee0000, while the fog at P592 reads the finite output at
+0x994300000 through s1+32 (0.05–15.10).
+
+P792 is where the control loses the lit scene. Mean HDR luminance falls
+from 0.07448187 to 0.00000391; P99 falls from 0.29755399 to zero.
+The screen retains a few points of light on black. With the producers
+running, the corresponding PC world capture 704 retains buildings and
+poles through fog and presentation. The old exact zero, the control's
+near-zero and the already dark HDR of frame 697 are distinct observations.

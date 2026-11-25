@@ -266,6 +266,26 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     format::HostCaps.host_format(format)
 }
 
+/// The host format of a title shader or unordered access view (`unordered`)
+/// described by `words` (the host's layout): [`pc_format`], but a typed
+/// buffer view keeps the title's element size ([`format::buffer_format`]),
+/// as its bytes are the title's. (Raw and structured views read by their
+/// stride; the host names their format itself, `repair_format`.)
+pub(crate) fn pc_view_format(words: &[u32; 10], unordered: bool) -> u32 {
+    const BUFFER_VIEW: u32 = 1;
+    const RAW: u32 = 1;
+    // A buffer view's stride and flags: words 7 and 8 of a shader view
+    // (its buffer part starts at word 4), 5 and 8 of an unordered access
+    // view (at word 2).
+    let stride = if unordered { words[5] } else { words[7] };
+    let flags = words[8];
+    if words[1] == BUFFER_VIEW && stride == 0 && flags & RAW == 0 {
+        format::buffer_format(words[0], unordered)
+    } else {
+        pc_format(words[0])
+    }
+}
+
 /// A title format as the host has it without stand-ins (vertex elements,
 /// whose bytes are the title's). The console's 16-bit depth with stencil
 /// (and its typeless views) has no PC format: the 24-bit ones stand in.
@@ -970,6 +990,41 @@ fn whole_view(
     view
 }
 
+/// The shader view of the whole of title texture `this`, spelled out in
+/// the title's format, for a view the title made without a description:
+/// `None` where D3D12's own view of the host copy reads that format (a
+/// host copy in it). A typeless host copy (depth that shaders read, sRGB
+/// with unordered access: [`host_desc`]) has no view without a
+/// description, and its slot read zeros; a host copy shared with a texture
+/// of another format of the family (`alias`) read in that format. Depth is
+/// read in the color format of its depth plane.
+#[cfg(windows)]
+pub(crate) fn whole_typed_view(
+    this: This,
+) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    // SAFETY: a live resource.
+    let d = unsafe { host_resource(this)?.GetDesc() };
+    let host = d.Format.0 as u32;
+    // Depth with stencil: its depth plane, which a view's plane 0 is.
+    let read = match pc_format(resource(this).desc.format) {
+        20 => 21,
+        40 => 41,
+        45 => 46,
+        55 => 56,
+        f => f,
+    };
+    if read == host || family(read) != family(host) {
+        return None;
+    }
+    if family_members(host).is_some() {
+        format::note_whole_view(read);
+    }
+    let mut view = whole_view(&d);
+    view.Format = DXGI_FORMAT(read as i32);
+    Some(view)
+}
+
 /// The host GPU's copy of a title resource, if it has one the GPU may use
 /// now (resident: [`HostTexture::ready`]).
 #[cfg(windows)]
@@ -1618,6 +1673,13 @@ pub(crate) extern "system" fn create_committed(
 /// `(heap, heap flags, desc1, initial layout, clear value, protected
 /// session, castable format count, castable formats, iid, out)`. The host
 /// copy starts in the common state, as layouts are not tracked.
+///
+/// The castable formats are honoured where the host views a resource in
+/// them without one: the host copy's own family (a typeless copy), or
+/// within D3D12's casting rules ([`format::castable`]). The host has no
+/// castable lists without `ID3D12Device10` and enhanced barriers, which
+/// XTP does not use: each listed format is counted for the frame log,
+/// whether the host can view the copy in it or not.
 #[allow(clippy::too_many_arguments)] // the method's own arguments
 pub(crate) extern "system" fn create_committed3(
     this: This,
@@ -1627,13 +1689,75 @@ pub(crate) extern "system" fn create_committed3(
     _layout: u32,
     clear: *const c_void,
     _protected: This,
-    _castable_count: u32,
-    _castable: *const u32,
+    castable_count: u32,
+    castable: *const u32,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     const COMMON: u32 = 0;
-    create_committed(this, heap, heap_flags, desc, COMMON, clear, iid, out)
+    let made = create_committed(this, heap, heap_flags, desc, COMMON, clear, iid, out);
+    #[cfg(windows)]
+    if made == S_OK && castable_count > 0 && !castable.is_null() && !out.is_null() {
+        // SAFETY: the title passes `castable_count` formats; the resource
+        // was just made there.
+        let (formats, resource) = unsafe {
+            (
+                std::slice::from_raw_parts(castable, castable_count as usize),
+                out.read(),
+            )
+        };
+        note_castable(resource, formats);
+    }
+    #[cfg(not(windows))]
+    let _ = (castable_count, castable);
+    made
+}
+
+/// Counts the castable formats the title listed for resource `this`
+/// (title formats): whether the host can view its host copy in each.
+#[cfg(windows)]
+fn note_castable(this: This, formats: &[u32]) {
+    use format::Caps;
+    let Some(host) = &resource(this).host else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let own = unsafe { host.texture.GetDesc() }.Format.0 as u32;
+    let typeless = family_members(own).is_some();
+    for &title in formats {
+        let view = pc_format(title);
+        if view == own {
+            continue;
+        }
+        let viewable = if typeless {
+            family(view) == own
+        } else {
+            format::castable(own, view) && format::HostCaps.fully_typed_casting()
+        };
+        format::note_view_cast(own, view, format::ViewUse::Listed, viewable);
+    }
+}
+
+/// Counts a render target view in host format `view` (none or 0: the
+/// texture's own) of host texture `texture` in another format of its typed
+/// family: whether D3D12 casts it, or does not allow the cast (the view is
+/// made as the title asks either way).
+#[cfg(windows)]
+pub(crate) fn note_target_view(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    view: Option<u32>,
+) {
+    use format::Caps;
+    let Some(view) = view.filter(|&v| v != 0) else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let own = unsafe { texture.GetDesc() }.Format.0 as u32;
+    if own == view || family_members(own).is_some() {
+        return;
+    }
+    let cast = format::castable(own, view) && format::HostCaps.fully_typed_casting();
+    format::note_view_cast(own, view, format::ViewUse::Target, cast);
 }
 
 /// Registered page pools (64 KiB pages the title maps into tiled
