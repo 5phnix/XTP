@@ -1315,6 +1315,18 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    // Under a target of its own, one line a texture: which title memory
+    // gets uploaded at all, through tables or by index
+    // (`XTP_LOG=info,xtp_gpu::texture_memory=debug`).
+    tracing::debug!(
+        target: "xtp_gpu::texture_memory",
+        memory = ?memory,
+        width = d.Width,
+        height = d.Height,
+        format = d.Format.0,
+        bytes = layout.size,
+        "a texture the title fills gets a staging buffer"
+    );
     let s = Arc::new(Staging {
         buffer,
         size: total,
