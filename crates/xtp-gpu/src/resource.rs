@@ -2603,7 +2603,8 @@ fn decode_now(
     }
     list.keep(&d.words);
     list.keep(&d.texels);
-    if let Some(before) = before.filter(|s| s & (4 | 8) != 0) {
+    // The same command may read the source through an SRV or write its UAV.
+    if let Some(before) = before {
         crate::list::ensure_state(list, source, before);
     }
     list.decode_pipeline.store(true, Ordering::Relaxed);
@@ -4626,7 +4627,10 @@ mod tests {
         let elsewhere = fresh_memory(&mut held);
         let snapshot = at(elsewhere.address(), &texture(16, 16, RGBA16F, 1));
         resident(snapshot);
+        const SHADER_RESOURCE: u32 = 0xc0;
+        crate::list::ensure_state(list.host(), target, SHADER_RESOURCE);
         assert!(alias_copy(list.host(), stand_in));
+        assert!(list.host().transition(target, SHADER_RESOURCE).is_none());
         assert!(alias_copy(list.host(), stand_in));
         // The GPU read between the two clears captures the first color.
         crate::list::ensure_state(list.host(), stand_in, 0x800);
