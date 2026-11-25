@@ -151,6 +151,12 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// A host compute pass replaced the title's root signature and pipeline.
+#[cfg(windows)]
+pub(crate) fn forget_host_bindings(this: This) {
+    with_state(this, |_, state| state.forget_host());
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -555,6 +561,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(src, false, false);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            crate::resource::decode::wrote(list, dst);
             crate::texture::gpu_write(list, dst, true);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -585,9 +592,13 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission; texture to buffer (a read-back) on the GPU
-/// into the buffer's host copy ([`read_back`]).
+/// Texture to texture on the GPU; buffer to texture on the GPU from the
+/// buffer's host copy when it has one (work of the list before the copy
+/// may write it: a read-back, a shader, a buffer copy), else through an
+/// upload buffer filled from title memory at submission; texture to buffer
+/// (a read-back) on the GPU into the buffer's host copy ([`read_back`]).
+/// Footprints in the console's 16-bit depth with stencil are refused
+/// ([`console_depth`]).
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -599,7 +610,10 @@ extern "system" fn copy_texture_region(
 ) {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_BOX, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_TEXTURE_COPY_LOCATION, ID3D12Resource,
+        };
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
@@ -614,6 +628,20 @@ extern "system" fn copy_texture_region(
             read_back(list, dst, [x, y, z], src, source_box);
             return;
         };
+        if src.kind == FOOTPRINT
+            && (console_depth(src.footprint.format()) || console_depth(title_format(dst.resource)))
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    format = src.footprint.format(),
+                    texture = title_format(dst.resource),
+                    "a buffer-to-texture copy in the console's 16-bit depth with stencil, \
+                     which no host footprint describes: not done"
+                )
+            });
+            return;
+        }
         // A destination whose host format stands in for the title's.
         if src.kind == FOOTPRINT
             && crate::texture::copy_converted(
@@ -626,10 +654,13 @@ extern "system" fn copy_texture_region(
                 source_box,
             )
         {
+            crate::resource::decode::wrote(list, dst.resource);
             return;
         }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
+        // A buffer read in COPY_SOURCE by the copy, back in COMMON after it.
+        let mut reading: Option<ID3D12Resource> = None;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
@@ -639,20 +670,37 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
-            #[cfg(feature = "diagnostics")]
-            {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+            let address = data as u64;
+            if let Some(copy) = crate::shadow::existing(address, bytes) {
+                // The host copy, as earlier work of the list leaves it: its
+                // CPU memory has the bytes only once the list has run.
+                let Some((buffer, offset)) = copy_source(list, host, &copy, address, bytes) else {
+                    return;
+                };
+                from.resource = buffer.as_raw().cast_const().cast();
+                from.footprint.offset = offset;
+                #[cfg(feature = "diagnostics")]
+                {
+                    read = Some((copy.gpu(address), bytes));
+                }
+                reading = Some(buffer.clone());
+                _upload = buffer;
+            } else {
+                let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    return;
+                };
+                // The list owns this mapped D3D12 upload buffer. Wine can
+                // report its address as MEM_FREE, so use the host-upload path.
+                list.defer_fill(staging, data, bytes as usize);
+                from.resource = buffer.as_raw().cast_const().cast();
+                from.footprint.offset = 0;
+                #[cfg(feature = "diagnostics")]
+                {
+                    // SAFETY: a live buffer.
+                    read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                }
+                _upload = buffer;
             }
-            _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
@@ -666,6 +714,7 @@ extern "system" fn copy_texture_region(
         }
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
+        crate::resource::decode::wrote(list, dst.resource);
         crate::texture::gpu_write(list, dst.resource, false);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
@@ -704,11 +753,105 @@ extern "system" fn copy_texture_region(
                 z,
                 (&raw const from).cast(),
                 host_box,
-            )
+            );
+            if let Some(buffer) = &reading {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
         };
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// The title format of texture `resource` (0 if it is none of ours).
+#[cfg(windows)]
+fn title_format(resource: This) -> u32 {
+    crate::resource::texture_memory(resource).map_or(0, |(_, desc)| desc.format())
+}
+
+/// Whether `format` is the console's 16-bit depth with 8-bit stencil (118,
+/// and 119 and 120 of its family), which no PC format is: the host makes
+/// such textures 24-bit depth with stencil
+/// ([`crate::resource::pc_vertex_format`]), two planes that a footprint in
+/// the console's layout (3 bytes a texel) does not describe, and D3D12
+/// knows no footprint format by the console's number. Copies between such
+/// textures and buffers are refused (logged once) instead of being handed
+/// to the host.
+/// shortcut: converting the planes (depth to and from 24 bits, stencil
+/// apart) would copy them; no title read seen needs it yet.
+#[cfg(windows)]
+fn console_depth(format: u32) -> bool {
+    (118..=120).contains(&format)
+}
+
+/// `bytes` of title memory at `address`, held by host copy `copy`, as the
+/// source of a texture copy at this place in `list`: the host copy is
+/// brought up to date from title memory at submission, but where work of
+/// the submission writes it ([`crate::shadow::Shadow::refresh`]), and read
+/// on the GPU, so a read-back, a shader or a buffer copy before it in the
+/// list is seen. Returns the buffer to read, in COPY_SOURCE until the copy
+/// is recorded (the caller then puts it back in COMMON), and the
+/// footprint's offset in it: the host copy itself when the bytes sit at a
+/// placement D3D12 accepts (512 bytes), else a buffer of the list's own
+/// they are copied into first.
+#[cfg(windows)]
+fn copy_source(
+    list: &crate::host::HostList,
+    host: &crate::host::Host,
+    copy: &std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    bytes: u64,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
+    use crate::host::{transition, uav_barrier};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+    };
+    const PLACEMENT: u64 = 512;
+    let (common, source, dest) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    let offset = copy.offset(address);
+    let through = if offset.is_multiple_of(PLACEMENT) {
+        None
+    } else {
+        let (through, _) = host.shared_buffer(bytes)?;
+        list.keep(&through);
+        Some(through)
+    };
+    copy.refresh(list, address, bytes);
+    let b = &copy.buffer;
+    // SAFETY: an open list and live buffers (the refresh keeps the host
+    // copy until the list is reset, the list its own buffer); the range is
+    // inside both.
+    unsafe {
+        match through {
+            None => {
+                list.list
+                    .ResourceBarrier(&[uav_barrier(), transition(b, common, source)]);
+                Some((b.clone(), offset))
+            }
+            Some(through) => {
+                list.list.ResourceBarrier(&[
+                    uav_barrier(),
+                    transition(b, common, source),
+                    transition(&through, common, dest),
+                ]);
+                list.list.CopyBufferRegion(&through, 0, b, offset, bytes);
+                list.list.ResourceBarrier(&[
+                    transition(b, source, common),
+                    transition(&through, dest, source),
+                ]);
+                Some((through, 0))
+            }
+        }
+    }
 }
 
 /// Texture to buffer (a read-back) into footprint `dst` of a title buffer:
@@ -716,15 +859,21 @@ extern "system" fn copy_texture_region(
 /// footprint lays the texels out (rows at the title's pitch; the texture's
 /// console tiling is its host copy's business, as for the other copies),
 /// then into title memory once the list has run, as buffer copies go
-/// ([`crate::shadow::copy`]). The footprint's range is brought up to date
-/// from title memory first, so the bytes the copy leaves (between rows,
-/// outside its box) go back as the title had them.
+/// ([`crate::shadow::copy`]): only the bytes the copy writes, row by row of
+/// texels (of blocks, for block-compressed formats) in each depth slice
+/// ([`written_spans`]). The bytes it leaves (between rows, outside its box)
+/// are the title's, which its threads may write while the list runs: none
+/// of them goes back. (Before, the footprint's whole range went back, as
+/// title memory had it at submission, over what the title wrote since.)
 /// shortcut: the host places a footprint 512 bytes apart in its buffer,
 /// with rows a multiple of 256 bytes apart; BTP 6's read-back in VIctory
 /// #1583's run (5x1 texels of format 2, rows 256 bytes apart) fits. Another
 /// placement, a texture whose host format stands in for the title's (the
-/// bytes would need converting back) and a source that is no texture are
-/// logged once and not copied.
+/// bytes would need converting back), the console's 16-bit depth with
+/// stencil ([`console_depth`]) and a source that is no texture are logged
+/// once and not copied. Each row narrower than its pitch is a range of its
+/// own for the submission to write back (rows as wide make one range): a
+/// read-back of a big region in narrow rows declares many.
 #[cfg(windows)]
 fn read_back(
     list: &crate::host::HostList,
@@ -758,9 +907,22 @@ fn read_back(
         return;
     };
     // SAFETY: a live texture.
-    let host_format = unsafe { texture.GetDesc() }.Format.0 as u32;
+    let desc = unsafe { texture.GetDesc() };
+    let host_format = desc.Format.0 as u32;
     let format = crate::resource::texture_memory(src.resource)
         .map_or(footprint.format(), |(_, desc)| desc.format());
+    if console_depth(format) || console_depth(footprint.format()) {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format,
+                footprint = footprint.format(),
+                "a read-back in the console's 16-bit depth with stencil, which no host \
+                 footprint describes: not done"
+            )
+        });
+        return;
+    }
     if crate::resource::format::conversion(format, host_format).is_some() {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
@@ -802,15 +964,24 @@ fn read_back(
         });
         return;
     }
+    // The subresource index is the first word of a location of kind 0.
+    let size = copy_size(&desc, src.footprint.offset as u32, source_box);
+    let Some(spans) = written_spans(&footprint, at, size) else {
+        return;
+    };
+    if spans.is_empty() {
+        return;
+    }
     if crate::texture::title_written(texture) {
         crate::texture::upload(list, src.resource, texture);
     }
     list.twin_use(src.resource, false, false);
     ensure_state(list, src.resource, COPY_SOURCE);
-    // What the copy leaves keeps the title's bytes; the whole range goes
-    // back.
-    copy.refresh(list, target, bytes);
-    copy.gpu_copies(list, target, bytes);
+    // What the copy writes goes back, and only that: the rest of the
+    // range is the title's.
+    for &(from, len) in &spans {
+        copy.gpu_copies(list, target + from, len);
+    }
     let mut to = dst;
     to.resource = copy.buffer.as_raw().cast_const().cast();
     to.footprint.offset = offset;
@@ -826,7 +997,7 @@ fn read_back(
     });
     let (common, dest) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     // SAFETY: an open list; both locations in the host's layout, naming a
-    // live texture and the host copy the list keeps (`refresh`), the
+    // live texture and the host copy the list keeps (`gpu_copies`), the
     // footprint inside it; the box is the title's (same layout).
     unsafe {
         list.list.ResourceBarrier(&[
@@ -844,6 +1015,81 @@ fn read_back(
         list.list
             .ResourceBarrier(&[crate::host::transition(&copy.buffer, dest, common)]);
     }
+}
+
+/// The texels (width, height, depth) a texture copy takes: its box (left,
+/// top, front, right, bottom, back), else all of subresource `sub` of a
+/// texture described by `desc`.
+#[cfg(windows)]
+fn copy_size(
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    sub: u32,
+    source_box: *const [u32; 6],
+) -> [u32; 3] {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    // SAFETY: the title passes a box or null.
+    if let Some(&[left, top, front, right, bottom, back]) = unsafe { source_box.as_ref() } {
+        return [
+            right.saturating_sub(left),
+            bottom.saturating_sub(top),
+            back.saturating_sub(front),
+        ];
+    }
+    let mip = sub % u32::from(desc.MipLevels.max(1));
+    let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        (u32::from(desc.DepthOrArraySize) >> mip).max(1)
+    } else {
+        1
+    };
+    [
+        u32::try_from((desc.Width >> mip).max(1)).unwrap_or(u32::MAX),
+        (desc.Height >> mip).max(1),
+        depth,
+    ]
+}
+
+/// The bytes a texture copy of `size` texels (width, height, depth) to
+/// texel `at` of `footprint` writes, as (offset from the footprint's start,
+/// length): in each depth slice it reaches, each row of texels (of 4x4
+/// blocks, for block-compressed formats) from the block holding `at`'s
+/// column to the one holding the region's last, rows `pitch` bytes apart
+/// and slices as many rows apart as the footprint has. Cut to the
+/// footprint; ranges that touch are merged (rows as wide as the pitch make
+/// one range). `None` for a format of unknown size.
+#[cfg(any(windows, test))]
+fn written_spans(
+    footprint: &crate::resource::PlacedFootprint,
+    at: [u32; 3],
+    size: [u32; 3],
+) -> Option<Vec<(u64, u64)>> {
+    let (element, block) = crate::resource::element(footprint.format())?;
+    let (width, height, depth, pitch) = footprint.shape();
+    let [x, y, z] = at.map(u64::from);
+    let [w, h, d] = size.map(u64::from);
+    let (pitch, rows) = (u64::from(pitch), u64::from(height).div_ceil(block));
+    let (left, right) = (
+        x / block,
+        (x + w)
+            .div_ceil(block)
+            .min(u64::from(width).div_ceil(block)),
+    );
+    let (top, bottom) = (y / block, (y + h).div_ceil(block).min(rows));
+    let back = (z + d).min(u64::from(depth));
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    if left >= right {
+        return Some(spans);
+    }
+    let len = (right - left) * element;
+    for slice in z..back {
+        for row in top..bottom {
+            let start = (slice * rows + row) * pitch + left * element;
+            match spans.last_mut() {
+                Some((from, n)) if *from + *n == start => *n += len,
+                _ => spans.push((start, len)),
+            }
+        }
+    }
+    Some(spans)
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -887,6 +1133,7 @@ extern "system" fn resolve(
         list.twin_use(src, false, false);
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
+        crate::resource::decode::wrote(list, dst);
         crate::texture::gpu_write(list, dst, false);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
@@ -970,6 +1217,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            crate::resource::decode::wrote(list, record.resource);
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -1213,6 +1461,7 @@ fn clear_uav(
                 )),
                 float => float,
             };
+            let mut buffer = false;
             if let Some((address, len)) = range
                 && len > 0
                 && let Some(shadow) = crate::shadow::find(address, len)
@@ -1220,6 +1469,7 @@ fn clear_uav(
                 // A clear of part of the range (rectangles) keeps the rest.
                 shadow.refresh(list, address, len);
                 shadow.gpu_writes(list, address, len);
+                buffer = true;
             } else if let View::Unordered(texture, _, _) = view {
                 let texture = texture as This;
                 #[cfg(feature = "diagnostics")]
@@ -1227,6 +1477,7 @@ fn clear_uav(
                 list.twin_use(texture, true, true);
                 list.twins_written();
                 ensure_state(list, texture, UNORDERED_ACCESS);
+                crate::resource::decode::wrote(list, texture);
                 crate::texture::gpu_write(list, texture, false);
             }
             let rects: &[RECT] = if count > 0 && !rects.is_null() {
@@ -1257,6 +1508,22 @@ fn clear_uav(
                 }
                 // Later shader access sees the clear.
                 list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+                if buffer {
+                    // The clear promoted the buffer's host copy from COMMON
+                    // to UNORDERED_ACCESS for the rest of the list: back to
+                    // COMMON, the state the list's copies and writes into it
+                    // name before theirs (`read_back`, `shadow::copy`,
+                    // `shadow::write`). Before, their barriers named COMMON
+                    // after a clear (the debug layer's message 527).
+                    use windows::Win32::Graphics::Direct3D12::{
+                        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    };
+                    list.list.ResourceBarrier(&[crate::host::transition(
+                        &target,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
             }
             drop(slots);
             // The title's heaps go back on the list at its next draw.
@@ -1551,6 +1818,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         ensure_state(list, color, NON_PIXEL_SHADER_RESOURCE);
         ensure_state(list, output, UNORDERED_ACCESS);
+        crate::resource::decode::wrote(list, output);
         crate::texture::gpu_write(list, output, false);
         #[cfg(feature = "diagnostics")]
         {
@@ -2607,6 +2875,67 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
+    /// A placed footprint: offset, format, width, height and depth in
+    /// texels, row pitch.
+    fn footprint(
+        offset: u64,
+        format: u32,
+        [width, height, depth]: [u32; 3],
+        pitch: u32,
+    ) -> crate::resource::PlacedFootprint {
+        let words = [
+            offset as u32,
+            (offset >> 32) as u32,
+            format,
+            width,
+            height,
+            depth,
+            pitch,
+            0,
+        ];
+        // SAFETY: integers in the footprint's layout (`repr(C)`, 32 bytes).
+        unsafe { std::mem::transmute::<[u32; 8], crate::resource::PlacedFootprint>(words) }
+    }
+
+    /// The bytes a texture copy writes in a footprint: rows of texels, or
+    /// of 4x4 blocks (BC1: 8 bytes a block), slices as many rows apart as
+    /// the footprint has, cut to it; rows as wide as the pitch make one
+    /// range.
+    #[test]
+    fn texture_copies_write_their_rows_of_blocks() {
+        const RGBA8: u32 = 28;
+        const BC1: u32 = 71;
+        let spans = |f, at, size| written_spans(&f, at, size).expect("a known format");
+        // Two rows of one texel, 256 bytes apart: 260 bytes, 8 written.
+        let column = footprint(0, RGBA8, [1, 2, 1], 256);
+        assert_eq!(spans(column, [0, 0, 0], [1, 2, 1]), [(0, 4), (256, 4)]);
+        // A 2x2 box to (2, 1) of a 4x4 footprint; one past its edge, cut.
+        let square = footprint(0, RGBA8, [4, 4, 1], 256);
+        assert_eq!(spans(square, [2, 1, 0], [2, 2, 1]), [(264, 8), (520, 8)]);
+        assert_eq!(spans(square, [2, 3, 0], [4, 4, 1]), [(776, 8)]);
+        assert!(spans(square, [4, 0, 0], [1, 1, 1]).is_empty());
+        let wide = footprint(0, RGBA8, [64, 3, 1], 256);
+        assert_eq!(spans(wide, [0, 0, 0], [64, 3, 1]), [(0, 768)]);
+        // Slices of two rows, 512 bytes apart.
+        let slices = footprint(0, RGBA8, [2, 2, 2], 256);
+        assert_eq!(
+            spans(slices, [0, 0, 0], [2, 2, 2]),
+            [(0, 8), (256, 8), (512, 8), (768, 8)]
+        );
+        assert_eq!(spans(slices, [1, 1, 1], [1, 1, 1]), [(772, 4)]);
+        // BC1: 2x2 blocks; a box of one block; a mip smaller than a block
+        // takes a whole one; slices of two rows of blocks.
+        let blocks = footprint(0, BC1, [8, 8, 1], 256);
+        assert_eq!(spans(blocks, [0, 0, 0], [8, 8, 1]), [(0, 16), (256, 16)]);
+        assert_eq!(spans(blocks, [4, 4, 0], [4, 4, 1]), [(264, 8)]);
+        let small = footprint(0, BC1, [4, 4, 1], 256);
+        assert_eq!(spans(small, [0, 0, 0], [2, 2, 1]), [(0, 8)]);
+        let deep = footprint(0, BC1, [4, 8, 2], 256);
+        assert_eq!(spans(deep, [0, 4, 1], [4, 4, 1]), [(768, 8)]);
+        let unknown = footprint(0, 0, [1, 1, 1], 256);
+        assert_eq!(written_spans(&unknown, [0, 0, 0], [1, 1, 1]), None);
+    }
+
     /// The list's copies and memory writes on the host GPU, in list order
     /// (backlog G3, G4), with kernels standing in for the title's passes.
     #[cfg(windows)]
@@ -2922,6 +3251,375 @@ mod tests {
             assert_eq!(dst.words(), want);
         }
 
+        /// The location of subresource `index` of `texture`.
+        fn subresource(texture: This, index: u32) -> Location {
+            Location {
+                resource: texture,
+                kind: 0,
+                offset: u64::from(index),
+                format: 0,
+                width: 0,
+                height: 0,
+                depth: 0,
+                row_pitch: 0,
+            }
+        }
+
+        /// A footprint `offset` bytes into `buffer`: `format`, width,
+        /// height and depth in texels, rows `pitch` bytes apart.
+        fn placed(
+            buffer: &TitleBuffer,
+            offset: u64,
+            format: u32,
+            [width, height, depth]: [u32; 3],
+            pitch: u32,
+        ) -> Location {
+            Location {
+                resource: buffer.resource(),
+                kind: 1,
+                offset,
+                format,
+                width,
+                height,
+                depth,
+                row_pitch: pitch,
+            }
+        }
+
+        /// `CopyTextureRegion` in `list` from `from` to texel `at` of `to`:
+        /// `area` of `from` (a box: left, top, front, right, bottom, back),
+        /// or all of it.
+        fn copy_region(
+            list: &TitleList,
+            to: &Location,
+            [x, y, z]: [u32; 3],
+            from: &Location,
+            area: Option<&[u32; 6]>,
+        ) {
+            copy_texture_region(
+                list.this(),
+                std::ptr::from_ref(to).cast(),
+                x,
+                y,
+                z,
+                std::ptr::from_ref(from).cast(),
+                area.map_or(std::ptr::null(), std::ptr::from_ref),
+            );
+        }
+
+        /// Writes `value` at title address `address` when `list`'s
+        /// submission is prepared, after the steps recorded before (the
+        /// host copies' refreshes from title memory among them) and before
+        /// the GPU runs the list, so before anything goes back to title
+        /// memory: as one of the title's threads writes while a list it
+        /// submitted is in flight.
+        fn title_write_meanwhile(list: &TitleList, address: u64, value: u32) {
+            list.host().defer((address as usize, 4), (0, 0), move || {
+                // SAFETY: title memory of a test buffer, alive until the
+                // list has run.
+                unsafe { (address as *mut u32).write_unaligned(value) }
+            });
+        }
+
+        /// A read-back writes back only the bytes it copies: rows of
+        /// texels, not the bytes between them nor beside a box, which the
+        /// title may write while the list runs. Two rows of one texel 256
+        /// bytes apart write bytes 0-3 and 256-259 of their footprint, a
+        /// 2x2 box 8 bytes of two rows. Title writes between those rows,
+        /// beside the box and above it, made once the submission took its
+        /// bytes and before the write-back, stay. Before, the footprint's
+        /// whole range went back as title memory was before those writes
+        /// (Codex review of the #1583 port).
+        #[test]
+        fn read_backs_write_back_only_the_bytes_they_copy() {
+            let test = "list::tests::gpu::read_backs_write_back_only_the_bytes_they_copy";
+            let Some(_gpu) = device(test) else { return };
+            const TITLE: u32 = 0xdead_beef;
+            const LATER: u32 = 0x1a7e_0000;
+            let (outer, inner) = ([1, 2, 3, 4], [9, 8, 7, 6]);
+            let t = texture(4, 4);
+            let list = TitleList::new();
+            fill(list.this(), t, (0, 0, 4, 4), outer);
+            fill(list.this(), t, (1, 1, 3, 3), inner);
+            let dst = TitleBuffer::new(4096);
+            dst.set_words(|_| TITLE);
+            let source = subresource(t, 0);
+            // Texels (1, 1) and (1, 2), 512 bytes in: 260 bytes.
+            let column = placed(&dst, 512, RGBA8, [1, 2, 1], 256);
+            copy_region(
+                &list,
+                &column,
+                [0, 0, 0],
+                &source,
+                Some(&[1, 1, 0, 2, 3, 1]),
+            );
+            // The middle 2x2 to (1, 1) of a 4x4 footprint 2048 bytes in.
+            let square = placed(&dst, 2048, RGBA8, [4, 4, 1], 256);
+            copy_region(
+                &list,
+                &square,
+                [1, 1, 0],
+                &source,
+                Some(&[1, 1, 0, 3, 3, 1]),
+            );
+            // Between the column's rows (twice), beside the box in its
+            // first row (both sides), above it.
+            let later = [512 + 64, 512 + 252, 2048 + 256, 2048 + 256 + 12, 2048 + 4];
+            for (i, &byte) in later.iter().enumerate() {
+                title_write_meanwhile(&list, dst.address() + byte, LATER + i as u32);
+            }
+            list.run();
+            release(t);
+            let inner = u32::from_le_bytes(inner);
+            let mut want = vec![TITLE; 1024];
+            want[512 / 4] = inner;
+            want[(512 + 256) / 4] = inner;
+            for y in 1..3 {
+                for x in 1..3 {
+                    want[(2048 + y * 256) / 4 + x] = inner;
+                }
+            }
+            for (i, &byte) in later.iter().enumerate() {
+                want[byte as usize / 4] = LATER + i as u32;
+            }
+            assert_eq!(dst.words(), want);
+        }
+
+        /// Texture A to buffer B, then B to texture C, in one list: C gets
+        /// A's texels, which only B's host copy holds before the list has
+        /// run (read on the GPU, in list order). So does a copy from bytes
+        /// of B a shader wrote earlier in the list, at an offset the host
+        /// places no footprint at (1280 bytes: not a multiple of 512),
+        /// through a buffer of the list's own. Read back from C, in the
+        /// same list. Before, B to C read B's title memory at submission:
+        /// zeros (Codex review of the #1583 port).
+        #[test]
+        fn a_texture_copied_through_a_buffer_in_one_list_arrives() {
+            let test = "list::tests::gpu::a_texture_copied_through_a_buffer_in_one_list_arrives";
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
+            const RED: [u8; 4] = [255, 0, 0, 255];
+            const OTHER: [u8; 4] = [1, 2, 3, 4];
+            const WRITTEN: u64 = 1280;
+            let kernel = Kernel::new(host);
+            let (a, c) = (texture(4, 4), texture(64, 5));
+            let (b, d) = (TitleBuffer::new(4096), TitleBuffer::new(4096));
+            let list = TitleList::new();
+            fill(list.this(), a, (0, 0, 4, 4), RED);
+            fill(list.this(), c, (0, 0, 64, 5), OTHER);
+            let square = placed(&b, 0, RGBA8, [4, 4, 1], 256);
+            copy_region(&list, &square, [0, 0, 0], &subresource(a, 0), None);
+            copy_region(&list, &subresource(c, 0), [0, 0, 0], &square, None);
+            // 64 words of the fill pattern, one row of 64 texels into C's
+            // last row.
+            let at = b.address() + WRITTEN;
+            kernel.dispatch(list.host(), Pass::Fill, at, at);
+            let row = placed(&b, WRITTEN, RGBA8, [64, 1, 1], 256);
+            copy_region(&list, &subresource(c, 0), [0, 4, 0], &row, None);
+            let all = placed(&d, 0, RGBA8, [64, 5, 1], 256);
+            copy_region(&list, &all, [0, 0, 0], &subresource(c, 0), None);
+            list.run();
+            for t in [a, c] {
+                release(t);
+            }
+            let (red, other) = (u32::from_le_bytes(RED), u32::from_le_bytes(OTHER));
+            let mut want = vec![0; 1024];
+            for y in 0..4 {
+                for x in 0..64 {
+                    want[y * 64 + x] = if x < 4 { red } else { other };
+                }
+            }
+            want[256..320].copy_from_slice(&filled(0..64));
+            assert_eq!(d.words(), want, "C read back");
+            let mut want = vec![0; 1024];
+            for y in 0..4 {
+                want[y * 64..y * 64 + 4].fill(red);
+            }
+            want[320..384].copy_from_slice(&filled(0..64));
+            assert_eq!(b.words(), want, "B");
+        }
+
+        /// Read-backs of the second mip of the second slice (subresource 3
+        /// of two mips and two slices), and of a box of the second mip of
+        /// the first (subresource 1), in a block-compressed format (BC1:
+        /// 4x4 blocks of 8 bytes, rows of blocks) and in RGBA8: each
+        /// subresource's own texels arrive, rows at the footprint's pitch,
+        /// and only those bytes go back (title writes beside them, made
+        /// while the list is in flight, stay). The texels come from title
+        /// buffers through buffer-to-texture copies.
+        #[test]
+        fn read_backs_of_mips_slices_and_blocks_copy_their_rows() {
+            let test = "list::tests::gpu::read_backs_of_mips_slices_and_blocks_copy_their_rows";
+            let Some(_gpu) = device(test) else { return };
+            const BC1: u32 = 71;
+            const TITLE: u32 = 0xdead_beef;
+            const LATER: u32 = 0x1a7e_0000;
+            // Format, mip 0's width and height, bytes of a block, its width.
+            for (format, width, element, block) in [(RGBA8, 8u32, 4u32, 1u32), (BC1, 16, 8, 4)] {
+                let t = title_texture(format, u64::from(width), width, [2, 2], 0);
+                let (half, quarter) = (width / 2, width / 4);
+                let s = TitleBuffer::new(4096);
+                s.set_words(|i| 0x5100_0000 + i as u32);
+                let d = TitleBuffer::new(4096);
+                d.set_words(|_| TITLE);
+                let list = TitleList::new();
+                let mip = |b: &TitleBuffer, offset| placed(b, offset, format, [half, half, 1], 256);
+                copy_region(&list, &subresource(t, 3), [0, 0, 0], &mip(&s, 0), None);
+                copy_region(&list, &subresource(t, 1), [0, 0, 0], &mip(&s, 2048), None);
+                copy_region(&list, &mip(&d, 512), [0, 0, 0], &subresource(t, 3), None);
+                // The right half of the top half to the left of the bottom
+                // half.
+                let area = [quarter, 0, 0, half, quarter, 1];
+                copy_region(
+                    &list,
+                    &mip(&d, 2048),
+                    [0, quarter, 0],
+                    &subresource(t, 1),
+                    Some(&area),
+                );
+                // Blocks (texels for RGBA8) across and down mip 1, and the
+                // box; the words of a row of each.
+                let (rows, boxed) = ((half / block) as usize, (quarter / block) as usize);
+                let words = |blocks: usize| blocks * element as usize / 4;
+                let (row, box_row) = (words(rows), words(boxed));
+                // Beside the first row, above the box, beside its first row.
+                let later = [512 + 4 * row, 2048, 2048 + boxed * 256 + 4 * box_row];
+                for (i, &byte) in later.iter().enumerate() {
+                    title_write_meanwhile(&list, d.address() + byte as u64, LATER + i as u32);
+                }
+                list.run();
+                release(t);
+                let source = |byte: usize| 0x5100_0000 + byte as u32 / 4;
+                let mut want = vec![TITLE; 1024];
+                for r in 0..rows {
+                    for k in 0..row {
+                        want[(512 + r * 256) / 4 + k] = source(r * 256) + k as u32;
+                    }
+                }
+                for j in 0..boxed {
+                    for k in 0..box_row {
+                        want[(2048 + (boxed + j) * 256) / 4 + k] =
+                            source(2048 + j * 256 + 4 * box_row) + k as u32;
+                    }
+                }
+                for (i, &byte) in later.iter().enumerate() {
+                    want[byte / 4] = LATER + i as u32;
+                }
+                assert_eq!(d.words(), want, "format {format}");
+            }
+        }
+
+        /// Copies between buffers and a texture in the console's 16-bit
+        /// depth with stencil (format 118), which no host footprint
+        /// describes, are refused: nothing reaches the host (which would
+        /// get the console's format number in a footprint, an invalid
+        /// copy), the list closes, and the buffer keeps its bytes. Before,
+        /// both directions went to the host as they were (Codex review of
+        /// the #1583 port).
+        #[test]
+        fn copies_in_the_consoles_depth_with_stencil_are_refused() {
+            let test = "list::tests::gpu::copies_in_the_consoles_depth_with_stencil_are_refused";
+            let Some(_gpu) = device(test) else { return };
+            const D16S8: u32 = 118;
+            const DEPTH_STENCIL: u32 = 2;
+            const TITLE: u32 = 0xdead_beef;
+            let t = title_texture(D16S8, 4, 4, [1, 1], DEPTH_STENCIL);
+            assert!(
+                crate::resource::host_resource(t).is_some(),
+                "a host texture stands in for it"
+            );
+            let b = TitleBuffer::new(4096);
+            b.set_words(|_| TITLE);
+            let list = TitleList::new();
+            for format in [D16S8, 45] {
+                let footprint = placed(&b, 0, format, [4, 4, 1], 256);
+                copy_region(&list, &footprint, [0, 0, 0], &subresource(t, 0), None);
+            }
+            copy_region(
+                &list,
+                &subresource(t, 0),
+                [0, 0, 0],
+                &placed(&b, 0, D16S8, [4, 4, 1], 256),
+                None,
+            );
+            list.run();
+            release(t);
+            assert_eq!(b.words(), vec![TITLE; 1024]);
+        }
+
+        /// A read-back into a buffer the list wrote on the GPU just before
+        /// (a UAV clear of it) and read (a dispatch, through a root view),
+        /// in one list; then, in a second submission, another read-back
+        /// into it. Under the D3D12 debug layer (`XTP_D3D12_DEBUG=1` with
+        /// diagnostics, as CI's gpu-debug-layer job runs), the barriers
+        /// taking its host copy to the copy's state and back must name the
+        /// state it is in: before, the clear left it in UNORDERED_ACCESS
+        /// (promoted from COMMON) and the read-back's barrier named COMMON
+        /// (message 527, RESOURCE_BARRIER_BEFORE_AFTER_MISMATCH, on WARP).
+        /// Title memory then holds the clear's words but where each
+        /// read-back wrote, and so does what the dispatch read.
+        /// shortcut: a vertex buffer or a root view is a GPU address, which
+        /// the layer does not tie to a resource: only the clear's state is
+        /// checked here.
+        #[test]
+        fn read_backs_into_a_buffer_the_gpu_wrote_and_read() {
+            let test = "list::tests::gpu::read_backs_into_a_buffer_the_gpu_wrote_and_read";
+            let Some(gpu) = device(test) else { return };
+            let host = gpu.host();
+            const R32_UINT: u32 = 42;
+            const BUFFER: u32 = 1;
+            const CLEARED: u32 = 0xc1ea_0000;
+            const RED: [u8; 4] = [255, 0, 0, 255];
+            let kernel = Kernel::new(host);
+            let t = texture(4, 4);
+            let (b, e) = (TitleBuffer::new(4096), TitleBuffer::new(256));
+            b.set_words(|i| i as u32);
+            let heap = crate::descriptor::TestHeap::views(1);
+            let mut slot = [0u64; 4];
+            let view = [R32_UINT, BUFFER, 0, 0, 1024, 0, 0, 0, 0, 0];
+            let (gpu_handle, cpu) = console_handles(b.resource(), Some(&view), &mut slot, &heap);
+            let list = TitleList::new();
+            fill(list.this(), t, (0, 0, 4, 4), RED);
+            let values = [CLEARED, 0, 0, 0];
+            clear_uav_uint(
+                list.this(),
+                gpu_handle,
+                cpu,
+                b.resource(),
+                &values,
+                0,
+                std::ptr::null(),
+            );
+            kernel.dispatch(list.host(), Pass::Copy, b.address(), e.address());
+            copy_region(
+                &list,
+                &placed(&b, 512, RGBA8, [4, 4, 1], 256),
+                [0, 0, 0],
+                &subresource(t, 0),
+                None,
+            );
+            list.run();
+            let red = u32::from_le_bytes(RED);
+            let mut want = vec![CLEARED; 1024];
+            for y in 0..4 {
+                want[(512 + y * 256) / 4..][..4].fill(red);
+            }
+            assert_eq!(b.words(), want, "after the first list");
+            assert_eq!(e.words(), vec![CLEARED; 64], "what the dispatch read");
+            let again = TitleList::new();
+            copy_region(
+                &again,
+                &placed(&b, 2048, RGBA8, [1, 1, 1], 256),
+                [0, 0, 0],
+                &subresource(t, 0),
+                Some(&[0, 0, 0, 1, 1, 1]),
+            );
+            again.run();
+            release(t);
+            want[2048 / 4] = red;
+            assert_eq!(b.words(), want, "after the second list");
+        }
+
         /// A title resource description (`D3D12_RESOURCE_DESC`), as the
         /// title passes it.
         #[repr(C)]
@@ -2946,6 +3644,19 @@ mod tests {
         /// A committed `width` x `height` RGBA8 title texture, a render
         /// target with unordered access (as the FidelityFX output is).
         fn texture(width: u64, height: u32) -> This {
+            title_texture(RGBA8, width, height, [1, 1], 1 | 4)
+        }
+
+        /// A committed 2D title texture: `format`, `width` x `height`,
+        /// `[slices, mips]`, resource `flags` (1 render target, 2 depth
+        /// stencil, 4 unordered access).
+        fn title_texture(
+            format: u32,
+            width: u64,
+            height: u32,
+            [slices, mips]: [u16; 2],
+            flags: u32,
+        ) -> This {
             const DEFAULT_HEAP: [u32; 5] = [1, 0, 0, 0, 0];
             const RESOURCE_IID: Iid = guid(
                 0x696442be,
@@ -2958,13 +3669,13 @@ mod tests {
                 alignment: 0,
                 width,
                 height,
-                depth_or_array_size: 1,
-                mip_levels: 1,
-                format: RGBA8,
+                depth_or_array_size: slices,
+                mip_levels: mips,
+                format,
                 sample_count: 1,
                 sample_quality: 0,
                 layout: 0,
-                flags: 1 | 4,
+                flags,
             };
             let null = std::ptr::null();
             let mut out = null;

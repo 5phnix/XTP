@@ -116,8 +116,8 @@ impl<'a> Lower<'a> {
                 }
             }
             "u64" | "i64" => {
-                let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
                 let signed = ty == "i64";
+                let (a, b) = (self.src64(inst, 0, signed)?, self.src64(inst, 1, signed)?);
                 let p = match op {
                     "eq" => pred::EQ,
                     "ne" | "lg" => pred::NE,

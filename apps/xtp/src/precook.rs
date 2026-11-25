@@ -31,13 +31,11 @@
 //!   one whose library file is gone or smaller than noted passes again,
 //!   as does `--force`. The host rejects the pipeline library after a
 //!   driver update, which the note does not see: `--force` then.
-//! - Generations: after a translator change (the note's key is another),
-//!   or once the library file passes `LIBRARY_REBUILD_BYTES` (since the
-//!   pass the note is of, or to twice its size then), the pass makes the
-//!   library a new generation, which holds what it makes and nothing of the
-//!   translators before (`xtp_gpu::pipeline::precook`). This is looked at
-//!   before the note: a library that grew past its bound makes a whole
-//!   pass even when the note still holds.
+//! - A translator change reuses the pipeline library in place. Entries are
+//!   keyed by the host DXIL, root signature and state. Once the library
+//!   exceeds `LIBRARY_REBUILD_BYTES`, the next pass compacts it, even if
+//!   it crossed the bound during the last save. A compacted library still
+//!   above the bound is compacted again when it doubles or changes translator.
 //! - The note says the kept descriptions that were made again: the file as
 //!   the precook read it, not as it is at the end, which a session may
 //!   have added to meanwhile (the next precook makes those).
@@ -177,6 +175,7 @@ fn precook(o: Options) -> Result<()> {
                 c.map(|c| Cache {
                     recorded: c.recorded,
                     library: c.library,
+                    compacted: None,
                 })
             })
             .map_err(anyhow::Error::msg)
@@ -233,7 +232,8 @@ fn precook(o: Options) -> Result<()> {
             o.pipelines,
             threads,
             o.wait.then_some(&machine),
-            |c, s, p| gpu::container(c, s, p).into(),
+            |c, s, p| gpu::prepare(c, s, p).map_err(Outcome::from),
+            |compute| compute.pipeline().into(),
         ),
         // The containers are as the note says: the kept pipelines alone.
         Plan::Nothing | Plan::Kept => Pass { items: Vec::new() },
@@ -248,7 +248,11 @@ fn precook(o: Options) -> Result<()> {
             derive_wanted(),
         )
     });
+    let save_started = Instant::now();
     let saved = gpu::finish();
+    if o.pipelines {
+        println!("library save {:.3} s", save_started.elapsed().as_secs_f64());
+    }
     let seconds = started.elapsed().as_secs_f64();
     print!(
         "{}",
@@ -288,10 +292,16 @@ fn precook(o: Options) -> Result<()> {
         }
         (Ok(()), None) => {
             let pipelines = match (cache(o.pipelines)?, &replay) {
-                (Some(now), Some(r)) => Some(Cache {
-                    recorded: r.digest.clone(),
-                    library: now.library,
-                }),
+                (Some(mut now), Some(r)) => {
+                    now.recorded = r.digest.clone();
+                    now.compacted = note.compaction_baseline(
+                        found.as_ref(),
+                        now.library,
+                        generation.is_some(),
+                        gpu::LIBRARY_REBUILD_BYTES,
+                    );
+                    Some(now)
+                }
                 (now, _) => now,
             };
             let done = Note { pipelines, ..note };
@@ -335,6 +345,9 @@ struct Note {
 struct Cache {
     recorded: String,
     library: u64,
+    /// Size immediately after the last compaction, while still oversized.
+    /// Earlier notes have no such evidence and compact once above the bound.
+    compacted: Option<u64>,
 }
 
 /// What a precook has to do, by its note ([`Note::plan`]).
@@ -347,6 +360,25 @@ enum Plan {
 }
 
 impl Note {
+    /// Keep the last compacted size across in-place saves. Crossing the
+    /// bound during a save leaves no baseline until a compaction succeeds.
+    fn compaction_baseline(
+        &self,
+        found: Option<&Note>,
+        saved: u64,
+        rebuilt: bool,
+        bound: u64,
+    ) -> Option<u64> {
+        if saved <= bound {
+            return None;
+        }
+        if rebuilt {
+            return Some(saved);
+        }
+        self.pipelines.as_ref().filter(|c| c.library > bound)?;
+        found?.pipelines.as_ref()?.compacted
+    }
+
     fn text(&self) -> String {
         let mut o = format!("{NOTE_FORMAT}\nkey {}\npack {}\n", self.key, self.pack);
         match &self.pipelines {
@@ -356,6 +388,9 @@ impl Note {
                     "pipelines yes\nrecorded {}\nlibrary {}\n",
                     c.recorded, c.library
                 );
+                if let Some(size) = c.compacted {
+                    let _ = writeln!(o, "compacted {size}");
+                }
             }
             None => o.push_str("pipelines no\n"),
         }
@@ -381,6 +416,7 @@ impl Note {
             "yes" => Some(Cache {
                 recorded: field("recorded")?,
                 library: field("library")?.parse().ok()?,
+                compacted: field("compacted").and_then(|s| s.parse().ok()),
             }),
             _ => return None,
         };
@@ -392,20 +428,20 @@ impl Note {
         (note.text() == text).then_some(note)
     }
 
-    /// Why this pass makes the pipeline library a new generation, if it does
-    /// (with pipelines only): another translator than the one `found`
-    /// notes, or a library file past `bound` that grew past it since that
-    /// pass, or to twice its size then. A library already past the bound
-    /// after a new generation holds the title's pipelines of this
-    /// translator: making it again would not shrink it.
+    /// An oversized library is compacted when it crosses the bound, doubles
+    /// or changes translator. Below the bound a new translator can load
+    /// matching entries directly and append any changed pipelines.
     fn new_generation(&self, found: Option<&Note>, bound: u64) -> Option<&'static str> {
         let now = self.pipelines.as_ref()?.library;
-        if found.is_some_and(|f| f.key != self.key) {
-            return Some("another translator");
+        if now <= bound {
+            return None;
         }
-        let then = found.and_then(|f| f.pipelines.as_ref()).map(|c| c.library);
-        (now > bound && then.is_none_or(|then| then <= bound || now >= then.saturating_mul(2)))
-            .then_some("past its bound")
+        let then = found.and_then(|f| f.pipelines.as_ref());
+        (found.is_some_and(|f| f.key != self.key)
+            || then
+                .and_then(|c| c.compacted)
+                .is_none_or(|base| now >= base.saturating_mul(2)))
+        .then_some("past its bound")
     }
 
     /// What this pass has to do after the one `found` notes: nothing if it
@@ -493,20 +529,52 @@ fn container_bytes<'a>(source: &'a Source<'_>) -> Option<Cow<'a, [u8]>> {
 }
 
 /// Precooks every container of the pack in `data` on `threads` threads with
-/// `cook` (container, stage, pipelines), pausing while `machine` says a
-/// title runs.
-fn pass<C>(data: &[u8], pipelines: bool, threads: usize, machine: Option<&Machine>, cook: C) -> Pass
-where
-    C: Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Outcome + Sync,
-{
+/// separate translation and compute phases, pausing while a title runs.
+fn pass<T: Send + Sync>(
+    data: &[u8],
+    pipelines: bool,
+    threads: usize,
+    machine: Option<&Machine>,
+    prepare: impl Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Result<Option<T>, Outcome> + Sync,
+    compute: impl Fn(&T) -> Outcome + Sync,
+) -> Pass {
+    let started = Instant::now();
     let sources = sources(data);
     let seen = Mutex::new(std::collections::HashSet::new());
-    let mut items = parallel(sources.len(), threads, machine, "records", None, |i| {
-        item(&sources[i], &seen, pipelines, &cook)
+    let mut records = parallel(sources.len(), threads, machine, "records", None, |i| {
+        item(&sources[i], &seen, pipelines, &prepare)
     });
-    // In the pack's order (`sources`'s), whichever thread took each.
-    items.sort_by_key(|&(i, _)| i);
-    let mut items: Vec<Item> = items.into_iter().map(|(_, item)| item).collect();
+    records.sort_unstable_by_key(|&(i, _)| i);
+    let mut items = Vec::with_capacity(records.len());
+    let mut pending = Vec::new();
+    for (i, (item, shader)) in records {
+        if let Some(shader) = shader {
+            pending.push((i, shader));
+        }
+        items.push(item);
+    }
+    println!(
+        "translation  {:.3} s (including unpacking and cache access)",
+        started.elapsed().as_secs_f64()
+    );
+    if pipelines {
+        let started = Instant::now();
+        for (j, done) in parallel(
+            pending.len(),
+            threads,
+            machine,
+            "compute pipelines",
+            None,
+            |j| {
+                caught(|| compute(&pending[j].1))
+                    .map(|o| Done::Cooked(Some(xtp_shader::HwStage::Cs), o))
+                    .unwrap_or_else(|panic| panic)
+            },
+        ) {
+            items[pending[j].0].done = done;
+        }
+        println!("compute PSOs {:.3} s", started.elapsed().as_secs_f64());
+    }
     first_takes_the_outcome(&mut items);
     Pass { items }
 }
@@ -528,6 +596,9 @@ where
     T: Send,
     W: Fn(usize) -> T + Sync,
 {
+    if total == 0 {
+        return Vec::new();
+    }
     let next = AtomicUsize::new(0);
     let finished = AtomicUsize::new(0);
     let paused = AtomicBool::new(false);
@@ -849,26 +920,26 @@ fn first_takes_the_outcome(items: &mut [Item]) {
 }
 
 /// Precooks one record's container, once per distinct container.
-fn item<C>(
+fn item<T>(
     source: &Source<'_>,
     seen: &Mutex<std::collections::HashSet<[u8; 32]>>,
     pipelines: bool,
-    cook: &C,
-) -> Item
-where
-    C: Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Outcome,
-{
+    prepare: &impl Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Result<Option<T>, Outcome>,
+) -> (Item, Option<T>) {
     let (offset, name) = match source {
         Source::Raw { offset, .. } => (*offset, None),
         Source::Packed(r) => (r.offset, r.name.map(str::to_owned)),
     };
     let Some(bytes) = container_bytes(source) else {
-        return Item {
-            offset,
-            name,
-            hash: String::new(),
-            done: Done::Corrupt,
-        };
+        return (
+            Item {
+                offset,
+                name,
+                hash: String::new(),
+                done: Done::Corrupt,
+            },
+            None,
+        );
     };
     let full = blake3::hash(&bytes);
     let hash = full.to_hex().to_string();
@@ -877,31 +948,43 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(*full.as_bytes());
     if !first {
-        return Item {
+        return (
+            Item {
+                offset,
+                name,
+                hash,
+                done: Done::Repeated,
+            },
+            None,
+        );
+    }
+    let stage = stage_of(&bytes);
+    let (done, shader) = match caught(|| prepare(&bytes, stage, pipelines)) {
+        Ok(Ok(shader)) => (Done::Cooked(stage, Outcome::Ready), shader),
+        Ok(Err(outcome)) => (Done::Cooked(stage, outcome), None),
+        Err(panic) => (panic, None),
+    };
+    (
+        Item {
             offset,
             name,
             hash,
-            done: Done::Repeated,
-        };
-    }
-    let stage = stage_of(&bytes);
-    // A panic is a translator bug: counted, not fatal.
-    let done = match catch_unwind(AssertUnwindSafe(|| cook(&bytes, stage, pipelines))) {
-        Ok(outcome) => Done::Cooked(stage, outcome),
-        Err(panic) => Done::Panicked(
+            done,
+        },
+        shader,
+    )
+}
+
+fn caught<T>(work: impl FnOnce() -> T) -> Result<T, Done> {
+    catch_unwind(AssertUnwindSafe(work)).map_err(|panic| {
+        Done::Panicked(
             panic
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_owned())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_default(),
-        ),
-    };
-    Item {
-        offset,
-        name,
-        hash,
-        done,
-    }
+        )
+    })
 }
 
 /// The stage of the program a translation of `container` takes.
@@ -1296,6 +1379,7 @@ mod tests {
             Some(Cache {
                 recorded: recorded.into(),
                 library,
+                compacted: None,
             })
         }
         let note = Note {
@@ -1346,10 +1430,9 @@ mod tests {
         assert_eq!(Note::parse(&format!("{text}more\n")), None);
     }
 
-    /// A new generation for another translator, or for a library that grew
-    /// past its bound, whatever the rest of the note says (a session that
-    /// adds compute pipelines alone leaves the note as it was); not for one
-    /// that a new generation left past the bound, until it doubles.
+    /// Crossing the size bound triggers compaction even if the note holds.
+    /// An already oversized library is compacted again when its size doubles
+    /// or the translation key changes.
     #[test]
     fn a_library_past_its_bound_is_made_again_before_the_note_holds() {
         let note = |key: &str, library| Note {
@@ -1358,6 +1441,7 @@ mod tests {
             pipelines: Some(Cache {
                 recorded: "01".into(),
                 library,
+                compacted: None,
             }),
         };
         let bound = 2000;
@@ -1370,16 +1454,33 @@ mod tests {
             Some("past its bound"),
             "looked at first"
         );
-        assert_eq!(
-            note("j", 10).new_generation(Some(&then), bound),
-            Some("another translator")
-        );
+        let changed = note("j", bound);
+        assert_eq!(changed.plan(Some(&then)), Plan::Whole);
+        assert_eq!(changed.new_generation(Some(&then), bound), None);
         assert_eq!(grown.new_generation(None, bound), Some("past its bound"));
         // A new generation that is past the bound by itself.
-        let big = note("k", 3000);
-        assert_eq!(note("k", 3500).new_generation(Some(&big), bound), None);
+        let mut big = note("k", 3000);
         assert_eq!(
-            note("k", 6000).new_generation(Some(&big), bound),
+            then.compaction_baseline(Some(&then), 3000, false, bound),
+            None
+        );
+        assert!(
+            big.new_generation(Some(&big), bound).is_some(),
+            "crossed during a pass or legacy note"
+        );
+        big.pipelines.as_mut().unwrap().compacted =
+            big.compaction_baseline(Some(&then), 3000, true, bound);
+        let big = Note::parse(&big.text()).unwrap();
+        assert_eq!(note("k", 3500).new_generation(Some(&big), bound), None);
+        let mut larger = note("k", 4500);
+        larger.pipelines.as_mut().unwrap().compacted =
+            big.compaction_baseline(Some(&big), 4500, false, bound);
+        assert_eq!(
+            note("j", 3000).new_generation(Some(&big), bound),
+            Some("past its bound")
+        );
+        assert_eq!(
+            note("k", 6000).new_generation(Some(&larger), bound),
             Some("past its bound")
         );
         // Without pipelines, the library is not this pass's business.
@@ -1498,12 +1599,12 @@ mod tests {
         let cook = |c: &[u8], _: Option<xtp_shader::HwStage>, _: bool| {
             cooked.lock().unwrap().push(c.to_vec());
             if c == b.as_slice() {
-                Outcome::Refused("a scalar memory read as data".into())
+                Err(Outcome::Refused("a scalar memory read as data".into()))
             } else {
-                Outcome::Ready
+                Ok(None::<()>)
             }
         };
-        let pass = pass(&file, true, 3, None, cook);
+        let pass = pass(&file, true, 3, None, cook, |_| unreachable!());
         let mut seen = cooked.into_inner().unwrap();
         seen.sort();
         let mut want = vec![a.clone(), b.clone()];

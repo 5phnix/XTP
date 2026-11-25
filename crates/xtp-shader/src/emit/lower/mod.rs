@@ -73,6 +73,8 @@ mod lds;
 mod mask;
 mod mesh;
 mod operand;
+// Inline ray queries in place of traversal walks (RT phase 2b).
+pub(super) mod rayquery;
 mod salu;
 mod smem;
 mod smem_data;
@@ -342,6 +344,8 @@ struct Lower<'a> {
     lane_slots: Option<V>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh: le dernier export d'indices de chaque lane, dans un dword privé.
+    mesh_primitive: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Mesh: which values are the same in every lane (`mesh_prologue`).
@@ -428,6 +432,64 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 // a counted loop whose bound comes from data the host has not mirrored can
 // still run that long.
 pub(super) const COUNTED_LOOP_LIMIT: u32 = 1 << 20;
+
+/// MODE's f32 denormal field (bits 4-5): bit 4 keeps input denormals, bit
+/// 5 output ones.
+const F32_DENORMALS: u32 = 0x30;
+
+/// The `"fp32-denorm-mode"` of `main` (S11): how the program's f32
+/// operations treat denormals, which DXIL declares once per program. The
+/// program starts with the record's float mode (`native.float_mode`, 0xC0
+/// in every record read so far: f32 denormals flushed, so `"ftz"`), and
+/// `ir::float_modes` has refused a program whose f32 instructions run under
+/// two denormal modes. MODE's f32 field 0 (flush both ways) is `"ftz"`, 3
+/// (keep both) `"preserve"`.
+// shortcut: none (DXIL's "any", as before) where the field keeps only one
+// way (1 or 2: no DXIL mode), and where the program writes the field
+// (`s_denorm_mode`, an `s_setreg*` of MODE over bits 4-5) other than with a
+// constant equal to the entry's: the mode its f32 instructions then run
+// under needs `ir::float_modes`'s flow to say. No program of the pack writes
+// the field (shcuts' count of 606 records, task f3d80097).
+pub(crate) fn fp32_denorm_mode(native: &NativeProgram, p: &Program) -> Option<&'static str> {
+    let entry = u32::from(native.float_mode) & F32_DENORMALS;
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        // What the instruction writes of MODE (none: a value it reads from a
+        // register), and which bits.
+        let (value, mask) = match (inst.name(), &inst.fields) {
+            ("s_denorm_mode", Fields::Sopp { imm }) => (Some(u32::from(*imm) << 4), 0xF0),
+            (
+                "s_setreg_imm32_b32" | "s_setreg_b32",
+                Fields::Sop {
+                    imm: Some(hw), src, ..
+                },
+            ) if hw & 63 == 1 => {
+                let offset = u32::from(hw >> 6 & 31);
+                let width = u32::from(hw >> 11 & 31) + 1;
+                let mask = (u32::MAX >> (32 - width)) << offset;
+                let value = match src.first() {
+                    Some(&Operand::Literal(x)) if inst.name() == "s_setreg_imm32_b32" => {
+                        Some(x << offset & mask)
+                    }
+                    _ => None,
+                };
+                (value, mask)
+            }
+            _ => continue,
+        };
+        if mask & F32_DENORMALS == 0 {
+            continue;
+        }
+        if mask & F32_DENORMALS != F32_DENORMALS || value.is_none_or(|v| v & F32_DENORMALS != entry)
+        {
+            return None;
+        }
+    }
+    match entry >> 4 {
+        0 => Some("ftz"),
+        3 => Some("preserve"),
+        _ => None,
+    }
+}
 
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
@@ -845,6 +907,7 @@ impl<'a> Lower<'a> {
             group_reads,
             lane_slots: None,
             flat: None,
+            mesh_primitive: None,
             no_barrier,
             uniform: None,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -1016,6 +1079,10 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        self.s.denormals = fp32_denorm_mode(self.x.native, self.x.p);
+        if let Some(slot) = self.mesh_primitive {
+            self.finish_mesh_indices(slot);
+        }
         #[cfg(debug_assertions)]
         self.s.m.assert_paired_branches();
         let mut user_data: Vec<_> = self.user_reads.values().copied().collect();
@@ -1079,6 +1146,9 @@ impl<'a> Lower<'a> {
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         if let Some(r) = self.merged_inst(b, i) {
+            return r;
+        }
+        if let Some(r) = self.ray_query(b, i) {
             return r;
         }
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];

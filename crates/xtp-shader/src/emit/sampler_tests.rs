@@ -1,4 +1,4 @@
-//! Programme synthétique adapté de VIctory #1477 (2286e038, geiyiliyabumo).
+//! Synthetic program adapted from VIctory #1477 (2286e038, geiyiliyabumo).
 
 use super::container::{SigElement, signature};
 use super::{HostShader, StaticSampler, translate_program};
@@ -15,7 +15,7 @@ const LESS_EQUAL: u32 = 3 << 12;
 fn mixed_sampler(compute: bool, comparison_first: bool, word0: u32) -> HostShader {
     let mut words = Vec::new();
     if compute {
-        // Conserver 16 × l'identifiant du fil dans v7 pour l'écriture finale.
+        // Keep 16 × the thread id in v7 for the final write.
         words.push(0x340E_0084); // v_lshlrev_b32 v7, 4, v0
     }
     words.push(0xBE81_0380); // s_mov_b32 s1, 0
@@ -32,7 +32,7 @@ fn mixed_sampler(compute: bool, comparison_first: bool, word0: u32) -> HostShade
         0xBE8B_0380, // s[9:11] = 0
         0x7E00_02F0,
         0x7E02_02F0,
-        0x7E04_02F0, // v0 (référence), v1 et v2 (UV) = 0,5
+        0x7E04_02F0, // v0 (reference), v1 and v2 (UV) = 0.5
         0xBF8C_0070,
     ]);
     let plain = [SAMPLE, 0x0040_0301];
@@ -45,7 +45,7 @@ fn mixed_sampler(compute: bool, comparison_first: bool, word0: u32) -> HostShade
         words.extend(compare);
     }
     words.extend([
-        0x7E00_02F2, // v0 = 1, deuxième référence
+        0x7E00_02F2, // v0 = 1, second reference
         SAMPLE_C_LZ,
         0x0040_0500, // v5
         plain[0],
@@ -182,7 +182,7 @@ fn immediate_sampler_reads_depth_and_compares() {
                 },
             )
             .unwrap();
-        // Chaque fil lit le texel, compare 0,5 puis 1 à sa profondeur, et le relit.
+        // Each thread reads the texel, compares 0.5 then 1 with its depth, and reads it again.
         let expected = [0.75f32, 1.0, 0.0, 0.75].map(f32::to_bits).repeat(4);
         assert_eq!(result, [expected], "comparison_first={comparison_first}");
     }

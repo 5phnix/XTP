@@ -35,6 +35,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(windows)]
+mod loopstat;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod meshstat;
 pub mod object;
@@ -48,6 +50,8 @@ mod primitive;
 pub mod query;
 #[cfg(windows)]
 mod readmap;
+#[cfg(all(windows, any(test, feature = "diagnostics")))]
+pub mod record;
 #[cfg(windows)]
 pub use readmap::{configure_copy_back, save_copy_back_map};
 #[cfg(windows)]
@@ -71,6 +75,8 @@ pub mod queue;
 mod rectangles;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+pub mod rt;
 #[cfg(windows)]
 mod rt_standin;
 #[cfg(windows)]

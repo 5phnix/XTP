@@ -1,4 +1,4 @@
-//! Tables synthétiques de paramètres déportés. Cas de réécriture des registres :
+//! Synthetic tables of spilled parameters. Register rewrite cases:
 //! Ported from Marvisak/VIctory#489 (head fe7210e) by louketa.
 
 use super::{HostShader, translate_program};
@@ -212,7 +212,7 @@ fn overwriting_the_pointer_stops_recognition_at_the_next_load() {
     let r = track(&native(&code, vec![param(RootType::Constants, 16, 2, 3)])).unwrap();
     assert_eq!(r.spill_loads.len(), 1);
     assert_eq!(r.constant_reads.values().next().unwrap().slot, 3);
-    // Deux constantes de paramètres distincts ne forment pas une adresse liée.
+    // Two constants from distinct parameters do not form a linked address.
     let result = track(&native(
         &code,
         vec![
@@ -263,14 +263,14 @@ fn reads_a_packed_address_and_an_adjacent_pair_from_spilled_constants() {
         PTR.as_slice(),
         &[
             0xF404_0201,
-            0xFA00_0000, // UAV dans s[8:9].
+            0xFA00_0000, // UAV in s[8:9].
             0xF404_0101,
-            0xFA00_0008, // Constantes dans s[4:5].
+            0xFA00_0008, // Constants in s[4:5].
             0xF400_0302,
-            0xFA00_0008, // Lecture par la paire complète.
+            0xFA00_0008, // Read through the full pair.
             0xBE85_0380,
             0x8F84_8804,
-            0x8804_8C04, // Adresse en unités de 256 octets + 12.
+            0x8804_8C04, // Address in units of 256 bytes + 12.
             0xF400_0342,
             0xFA00_0000,
             0xBE8A_03C1,
@@ -299,7 +299,7 @@ fn reads_a_packed_address_and_an_adjacent_pair_from_spilled_constants() {
         .map(|r| (r.slot, r.dword, r.packed, r.offset))
         .collect();
     assert_eq!(reads, [(6, 0, false, 8), (6, 0, true, 12)]);
-    words.insert(12, 0xBE85_0380); // Écraser le mot haut du décalage rompt la preuve.
+    words.insert(12, 0xBE85_0380); // Overwriting the high word of the offset breaks the proof.
     assert!(track(&program(&words)).is_err());
     let bytes = crate::dxbc::build(&[]);
     let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
@@ -345,6 +345,95 @@ fn reads_a_packed_address_and_an_adjacent_pair_from_spilled_constants() {
         )
         .unwrap();
     assert_eq!(out[0], [3, 8]);
+}
+
+#[cfg(windows)]
+#[test]
+fn indexed_spilled_buffer_uses_the_matching_carry_and_gpu_offset() {
+    use super::host::{Dispatch, Host, Root, Stride, View};
+    let mut words = PTR.to_vec();
+    words.extend([
+        0xF404_0201,
+        0xFA00_0000, // s[8:9]: output UAV
+        0xF408_0101,
+        0xFA00_0008, // s[4:7]: base low, high, index, spare
+        0x8000_0604, // s0 = s4 + s6
+        0x8201_8005, // s1 = s5 + carry of the low addition
+        0x7E02_0200,
+        0x7E04_0201, // v[1:2] = s[0:1]
+        0xDC30_8000,
+        0x037D_0001, // v3 = dword at this address
+        0xBE8A_03C1,
+        0xBE8B_03FF,
+        0x3101_4FAC,
+        0xE070_0000,
+        0x8002_0300,
+        END, // write v3 to the UAV
+    ]);
+    let program = |w: &[u32]| {
+        let mut n = root_uav_program(w, [1; 3], false);
+        n.layout.push(param(RootType::Constants, 18, 4, 6));
+        n
+    };
+    let n = program(&words);
+    assert!(
+        track(&n)
+            .unwrap()
+            .constant_reads
+            .values()
+            .any(|r| r.index.is_some())
+    );
+    let mut wrong_high = words.clone();
+    wrong_high[8] = 0x8201_8009; // UAV pair whose low word is missing from the sum
+    assert!(track(&program(&wrong_high)).is_err());
+    words.insert(8, 0xBF06_8004); // SCC is rewritten between the two additions
+    assert!(track(&program(&words)).is_err());
+
+    let bytes = crate::dxbc::build(&[]);
+    let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
+    let Ok(host) = Host::new(false) else {
+        assert!(std::env::var_os("XTP_REQUIRE_GPU").is_none());
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&cs).unwrap();
+    for (bias, index, expected) in [(0, 4, 0x77665544), (3, 2, 0x88776655), (4, u32::MAX, 0)] {
+        let mut ud = vec![0; cs.user_data_dwords() as usize];
+        for u in &cs.user_data {
+            ud[u.index as usize] = match (u.root, u.dword) {
+                (super::INDEXED_ADDRESS_SRV, 0) => 1 << 4 | bias,
+                (RootType::Constants, 2) => index,
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::Table {
+                                sampler: false,
+                                index: 0,
+                            },
+                        ),
+                    ],
+                    groups: [1; 3],
+                    samplers: &[],
+                    views: &[
+                        View::RawUav(1),
+                        View::Buffer {
+                            data: &[0x33221100, 0x77665544, 0xBBAA9988],
+                            stride: Stride::Raw,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(out[0], [expected], "bias={bias}, index={index}");
+    }
 }
 
 #[test]
@@ -412,7 +501,7 @@ fn tbuffer_keeps_its_instruction_format_on_a_root_srv() {
             0xBE8B_0380,
             0xE828_1000,
             0x8002_0200,
-            END, // Le format 8_UINT est dans l'instruction.
+            END, // The 8_UINT format is in the instruction.
         ],
     ]
     .concat();
@@ -488,7 +577,7 @@ fn phi_reads_the_spilled_word_only_on_the_edge_that_keeps_it() {
 }
 
 /// Ported from fxceless's VIctory fork #646 (head 170c24269) by mynzjerko.
-/// Une barrière sépare le comptage d'EXEC de l'écriture dans la vue racine.
+/// A barrier separates the count of EXEC from the write to the root view.
 #[cfg(windows)]
 #[test]
 fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
@@ -497,11 +586,11 @@ fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
         PTR.as_slice(),
         &[
             0xF404_0201,
-            0xFA00_0000, // s[8:9] reçoit l'adresse de l'UAV.
+            0xFA00_0000, // s[8:9] receives the address of the UAV.
             0xBE8A_03C1,
             0xBE8B_03FF,
             0x3101_4FAC,
-            0xBE86_107E, // s6 reçoit la population d'EXEC.
+            0xBE86_107E, // s6 receives the population count of EXEC.
             0xBF8A_0000,
             0x3402_0082,
             0x7E04_0206,
@@ -584,11 +673,11 @@ fn root_halfword_crosses_a_dword_and_typed_access_preserves_its_value() {
             0x7E04_02FF,
             0x12AB,
             0xE068_0003,
-            0x8002_0200, // Demi-mot à l'octet 3.
+            0x8002_0200, // Half-word at byte 3.
             0xE028_0003,
             0x8002_0300,
             0xE010_000C,
-            0x8002_0300, // Écriture et lecture au format R32_UINT.
+            0x8002_0300, // Write and read in the R32_UINT format.
             0xE000_000C,
             0x8002_0400,
             0xE070_0010,
@@ -596,7 +685,7 @@ fn root_halfword_crosses_a_dword_and_typed_access_preserves_its_value() {
             0x7E08_0208,
             0x7E0A_0209,
             0xDC30_800C,
-            0x067D_0004, // Même adresse via la paire de VGPR.
+            0x067D_0004, // Same address through the VGPR pair.
             0xE070_0014,
             0x8002_0600,
             END,

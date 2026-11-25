@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod precook;
 mod preflight;
+mod replay;
 mod run;
 mod shader;
 mod survey;
@@ -184,10 +185,53 @@ enum Command {
         /// Drive the title by this script (autopilot/, docs/dev/autopilot.md).
         #[arg(long, value_name = "SCRIPT")]
         autopilot: Option<PathBuf>,
+        /// Record the title's GPU work into this folder (outside the
+        /// repository: it is game data), as `XTP_RECORD` does; diagnostics
+        /// builds (docs/analysis/frame-replay.md).
+        #[arg(long, value_name = "DIR")]
+        record: Option<PathBuf>,
+        /// The frames to record: `<first>[:<count>]`, or `capture[:<count>]`
+        /// for the first frames `XTP_CAPTURE_WORLD` lists (3 by default), as
+        /// `XTP_RECORD_FRAMES`.
+        #[arg(long, value_name = "N[:COUNT]", requires = "record")]
+        record_frames: Option<String>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
         title_args: Vec<String>,
+    },
+    /// Replay a recording (`run --record`) without the title, printing one
+    /// JSON line per frame; diagnostics builds (docs/analysis/frame-replay.md).
+    Replay {
+        /// The recording's folder.
+        dir: PathBuf,
+        /// The frames to report, by session number: `A..B` or `A`.
+        #[arg(long, value_name = "A..B")]
+        frames: Option<String>,
+        /// Replay the recorded frames this many times.
+        #[arg(long = "loop", value_name = "K", default_value_t = 1)]
+        loops: u32,
+        /// Where captures go (`XTP_CAPTURE`): the recording's `replay`
+        /// folder by default.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// Values written into title memory wherever the replay writes it:
+        /// `<address>[+<offset>]=<f32|u32|u8|hex>:<values>[@<frame>]`.
+        #[arg(long = "poke", value_name = "POKE")]
+        pokes: Vec<String>,
+        /// Pokes from a file, one per line (`#` starts a comment).
+        #[arg(long, value_name = "FILE")]
+        pokes_file: Option<PathBuf>,
+        /// A number of the frame's pass dump (`XTP_PASS_DUMP`) in each line:
+        /// `<name>=ds` (the largest depth target), `<name>=<program hash>`
+        /// (its pass's first output) or `<name>=<W>x<H>:f<format>`.
+        #[arg(long = "stat", value_name = "NAME=WHAT")]
+        stats: Vec<String>,
+        /// Write the pages the session wrote back after each submission
+        /// over the replay's own (exact session memory, fixes to GPU
+        /// results hidden).
+        #[arg(long)]
+        session_gpu_pages: bool,
     },
     /// Show the resolved configuration and check it.
     Config,
@@ -308,14 +352,56 @@ fn main() -> Result<()> {
             execute,
             console,
             autopilot,
+            record,
+            record_frames,
             title_args: _,
         } => {
             let env = std::env::var("XTP_CONSOLE").ok();
             let console = Console::pick(console, env.as_deref())?;
+            if let Some(dir) = record {
+                record_into(&dir, record_frames.as_deref())?;
+            }
             run::run(&target, unimplemented, strict, execute, console, autopilot)
         }
+        Command::Replay {
+            dir,
+            frames,
+            loops,
+            out,
+            pokes,
+            pokes_file,
+            stats,
+            session_gpu_pages,
+        } => replay::run(replay::Args {
+            dir,
+            frames,
+            loops,
+            out,
+            pokes,
+            poke_file: pokes_file,
+            stats,
+            session_gpu_pages,
+        }),
         Command::Config => show_config(),
     }
+}
+
+/// `run --record`: the variables the recorder reads (`XTP_RECORD`,
+/// `XTP_RECORD_FRAMES`), checked here first.
+fn record_into(dir: &std::path::Path, frames: Option<&str>) -> Result<()> {
+    anyhow::ensure!(
+        cfg!(feature = "diagnostics"),
+        "--record needs a diagnostics build (--features diagnostics)"
+    );
+    xtp_core::ensure_outside_repo(dir)?;
+    // SAFETY: set before the title or any thread of ours starts.
+    unsafe {
+        std::env::set_var("XTP_RECORD", dir);
+        if let Some(frames) = frames {
+            std::env::set_var("XTP_RECORD_FRAMES", frames);
+        }
+    }
+    Ok(())
 }
 
 /// `MIN-MAX` lanes per wave, or one size `N`.
@@ -423,6 +509,54 @@ mod tests {
         assert_eq!((lock_holder, no_wait), (Some(12), false));
         assert_eq!(log_filter(Some("run")), "info");
         assert!(log_filter(Some("precook")).starts_with("warn"));
+    }
+
+    #[test]
+    fn replay_takes_its_options() {
+        let cli = Cli::try_parse_from([
+            "xtp",
+            "replay",
+            "E:/r/one",
+            "--frames",
+            "618..620",
+            "--loop",
+            "3",
+            "--poke",
+            "0x10=f32:1",
+            "--poke",
+            "0x20=u8:2@619",
+            "--stat",
+            "depth=ds",
+        ])
+        .unwrap();
+        let Command::Replay {
+            dir,
+            frames,
+            loops,
+            pokes,
+            stats,
+            session_gpu_pages,
+            ..
+        } = cli.command
+        else {
+            panic!("not replay");
+        };
+        assert_eq!(dir, PathBuf::from("E:/r/one"));
+        assert_eq!((frames.as_deref(), loops), (Some("618..620"), 3));
+        assert_eq!(pokes.len(), 2);
+        assert_eq!(stats, ["depth=ds"]);
+        assert!(!session_gpu_pages);
+        let cli = Cli::try_parse_from([
+            "xtp",
+            "run",
+            "game.exe",
+            "--record",
+            "E:/r",
+            "--record-frames",
+            "618:3",
+        ]);
+        assert!(cli.is_ok());
+        assert!(Cli::try_parse_from(["xtp", "run", "game.exe", "--record-frames", "618"]).is_err());
     }
 
     #[test]

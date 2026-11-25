@@ -60,7 +60,7 @@
 //! shader writes are done; the debug layer may report the state.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -1104,7 +1104,7 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return;
         }
-        let Some((now, _)) = crate::watch::writes(first * PAGE, (last + 1) * PAGE, true) else {
+        let Some(now) = crate::watch::writes(first * PAGE, (last + 1) * PAGE, true) else {
             return;
         };
         let start = self.start as usize;
@@ -1181,12 +1181,9 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED && !whole_ranges() {
             #[cfg(test)]
             tests::ASKED.set(tests::ASKED.get() + 1);
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some(now) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied: usize = gaps
-                    .iter()
-                    .map(|&(a, b)| self.copy_stale(a, b, now, &written))
-                    .sum();
+                let copied: usize = gaps.iter().map(|&(a, b)| self.copy_stale(a, b, now)).sum();
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -1237,15 +1234,13 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
-        let Some((_, written)) = crate::watch::writes(from, to, true) else {
+        if crate::watch::writes(from, to, true).is_none() {
             return true;
-        };
+        }
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         (from / PAGE..=(to - 1) / PAGE).any(|page| {
-            let write = written
-                .binary_search_by_key(&page, |&(p, _)| p)
-                .map_or(0, |i| written[i].1);
+            let write = crate::watch::last_write(page);
             let at = page * PAGE;
             !copied[page - base].holds(from.max(at) - at, to.min(at + PAGE) - at, write)
         })
@@ -1257,9 +1252,9 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED && !whole_ranges() {
             #[cfg(test)]
             tests::ASKED.set(tests::ASKED.get() + 1);
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some(now) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -1274,29 +1269,20 @@ impl Shadow {
     }
 
     /// Copies the parts in `[from, to)` of the pages written after the copy
-    /// took them (`written`: last writes by page, in page order, from
-    /// `from`'s page or before; `now`: this asking), whole pages within the
+    /// took them (`now`: this asking), whole pages within the
     /// buffer. A page only partly in the range is copied in part, and that
     /// part is kept ([`Taken`]): a refresh of it (or of less) finds it
     /// current until the title writes the page. (Before W1, such a page
     /// stayed stale, and was copied at every refresh: the ends of every
     /// range that does not start and end on a page, each submission.)
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(&self, from: usize, to: usize, now: u64) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let first = written.partition_point(|&(p, _)| p < from / PAGE);
-        let mut writes = written[first..].iter().peekable();
         let (mut bytes, mut run) = (0, None::<usize>);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
+            let write = crate::watch::last_write(page);
             let at = page * PAGE;
             // The page's part in the range, and in the buffer (offsets in
             // the page).
@@ -1504,6 +1490,438 @@ pub(super) fn copy_instruction(ip: usize) -> bool {
     ip == &raw const xtp_gpu_try_copy_moving as usize
 }
 
+/// What plain reads of title memory know of its 4 KiB pages ([`PAGES`]).
+///
+/// A plain load of a page the title guarded (`PAGE_GUARD`) takes the guard
+/// off before any handler runs, so a title access to the page in the
+/// meantime raises nothing: under concurrent fills, the Codex review of
+/// c4893c8 counted 672 such accesses of 60,390, and a thread's stack does
+/// not grow past a guard page taken that way. The kernel's copy
+/// (`ReadProcessMemory`) fails on a guarded page and leaves the guard
+/// (`fills_leave_guard_pages_guarded`). So a page is read with plain loads
+/// only once the kernel's copy has read it whole, and only until the title
+/// changes its protection or its memory: it had no guard when the kernel's
+/// copy read it, and a readable page gets one only by such a change (guard
+/// pages otherwise come from reserved memory, a stack growing, which the
+/// kernel's copy cannot read). The title's `VirtualProtect`
+/// ([`crate::watch::title_virtual_protect`]) and the runtime's reports of
+/// the title's memory changes ([`crate::watch::title_memory_remapped`])
+/// make the pages of their range unread, with no plain read of them under
+/// way meanwhile ([`title_changing`]): a guard the title puts on a page
+/// reads had read whole is never met by one (the Codex review of 84a92e6
+/// found it met once, and a title access then raised nothing). A guard a
+/// plain read meets anyway sends the page to the kernel's copy until the
+/// next such change.
+///
+/// Asking the system before each read is no option: `VirtualQuery`
+/// measures the run of pages alike around the address (12 µs to 2 ms in
+/// the title's pools, `crate::host::copy_mapped`), `QueryWorkingSetEx`
+/// costs about a microsecond (xtp-loader's `crash.rs`), and a fill's
+/// plain copy about 14 ns.
+///
+/// shortcut: what is still met. The runtime reports the title's commits
+/// and frees after the call (xmem's `VirtualAlloc`, `VirtualFree` and
+/// `XMemVirtualAlloc`): a page reads had read whole that the title commits
+/// again with a guard (`MEM_COMMIT` with `PAGE_GUARD`, freed first or not)
+/// is read plainly until the report. Calls that go around both hooks
+/// (`VirtualProtectEx`, `NtProtectVirtualMemory`, `VirtualAlloc2`) are not
+/// seen at all. A plain read meets such a guard ([`stopped`]), which goes
+/// back at once ([`guard_again`]); a title access between the fault and
+/// its return raises nothing. A report before such a commit (in xmem)
+/// would close the first.
+struct Pages([std::sync::OnceLock<Box<[AtomicU64; Pages::WORDS]>>; Pages::REGIONS]);
+
+impl Pages {
+    /// Pages per region (4 GiB), whose bits are allocated together the
+    /// first time one is set.
+    const REGION: usize = 1 << 20;
+    /// Two bits per page.
+    const WORDS: usize = Self::REGION / 32;
+    /// Regions of the 47-bit user address space.
+    const REGIONS: usize = 1 << 15;
+    /// The first of a page's bits: read whole by the kernel's copy, and no
+    /// guard met since. The one above it: a guard met there, until the
+    /// title changes the page ([`title_changing`]).
+    const READ: u64 = 1;
+
+    const fn new() -> Pages {
+        Pages([const { std::sync::OnceLock::new() }; Self::REGIONS])
+    }
+
+    /// The bits of page number `page`.
+    fn bits(&self, page: usize) -> u64 {
+        self.0
+            .get(page / Self::REGION)
+            .and_then(std::sync::OnceLock::get)
+            .map_or(0, |words| {
+                (words[page / 32 % Self::WORDS].load(Ordering::Relaxed) >> (page % 32 * 2)) & 3
+            })
+    }
+
+    /// How many bytes from `at` (at most `len`) lie in pages whose `READ`
+    /// bit is `read`.
+    fn run(&self, at: usize, len: usize, read: bool) -> usize {
+        let end = at.saturating_add(len);
+        let mut page = at / KERNEL_PAGE;
+        while page * KERNEL_PAGE < end && (self.bits(page) & Self::READ != 0) == read {
+            page += 1;
+        }
+        (page * KERNEL_PAGE).clamp(at, end) - at
+    }
+
+    /// How many bytes from `at` (at most `len`) plain loads may read: in
+    /// pages read whole by the kernel's copy. With a census too: the pages
+    /// its guards are on are noted read when it guards them ([`census`],
+    /// whose handler lets a read go on through them), and a guard of the
+    /// title's met keeps the page from plain loads as without it (the Codex
+    /// review of 84a92e6: before, a census let plain loads read every page,
+    /// those a guard was met in too).
+    fn readable(&self, at: usize, len: usize) -> usize {
+        self.run(at, len, true)
+    }
+
+    /// How many bytes from `at` (at most `len`) lie in pages not read
+    /// whole by the kernel's copy.
+    fn unread(&self, at: usize, len: usize) -> usize {
+        self.run(at, len, false)
+    }
+
+    /// Applies `change(word, its READ bits of the pages)` to the words of
+    /// the pages of `[at, at + len)`; regions without bits are allocated
+    /// with `allocate`, else skipped whole.
+    fn update(&self, at: usize, len: usize, allocate: bool, change: impl Fn(u64, u64) -> u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut page, end) = (
+            at / KERNEL_PAGE,
+            at.saturating_add(len).div_ceil(KERNEL_PAGE),
+        );
+        while page < end {
+            let Some(region) = self.0.get(page / Self::REGION) else {
+                return;
+            };
+            let words = if allocate {
+                Some(region.get_or_init(|| {
+                    let words: Box<[AtomicU64]> =
+                        (0..Self::WORDS).map(|_| AtomicU64::new(0)).collect();
+                    words.try_into().unwrap()
+                }))
+            } else {
+                region.get()
+            };
+            let Some(words) = words else {
+                page = (page / Self::REGION + 1) * Self::REGION;
+                continue;
+            };
+            let count = (end - page).min(32 - page % 32);
+            // The READ bits of `count` pages (1 to 32) from `page`.
+            let read = (0x5555_5555_5555_5555u64 >> (64 - 2 * count)) << (page % 32 * 2);
+            let _ = words[page / 32 % Self::WORDS]
+                .fetch_update(SeqCst, SeqCst, |w| Some(change(w, read)));
+            page += count;
+        }
+    }
+
+    /// The kernel's copy read `[at, at + len)` whole: plain loads may read
+    /// its pages, but those a guard was met in. Only within a [`Reading`],
+    /// which says whether a change of the title's memory is under way.
+    fn note_read(&self, at: usize, len: usize) {
+        self.update(at, len, true, |w, read| w | (read & !(w >> 1)));
+    }
+
+    /// A guard is on the pages of `[at, at + len)`: the kernel's copy reads
+    /// them until the title changes them.
+    fn note_guarded(&self, at: usize, len: usize) {
+        self.update(at, len, true, |w, read| (w | (read << 1)) & !read);
+    }
+
+    /// The pages of `[at, at + len)` could not be read: the kernel's copy
+    /// reads them next, until it reads them whole.
+    fn forget_read(&self, at: usize, len: usize) {
+        self.update(at, len, false, |w, read| w & !read);
+    }
+
+    /// Forgets all of `[at, at + len)`: memory new to reads.
+    fn forget(&self, at: usize, len: usize) {
+        self.update(at, len, false, |w, read| w & !(read | (read << 1)));
+    }
+}
+
+/// What plain reads of title memory know of its pages ([`Pages`]).
+static PAGES: Pages = Pages::new();
+
+/// Slots of the threads' reads under way ([`Reading`]), a thread's for as
+/// long as it lives. A thread past them reads with the kernel's copy alone.
+const SLOTS: usize = 512;
+
+/// A thread's slot: the epoch its read under way began in, plus one (0:
+/// none), in two cache lines of its own (the adjacent line is prefetched
+/// with a line).
+#[repr(align(128))]
+struct ReadSlot {
+    reading: AtomicU64,
+    owned: std::sync::atomic::AtomicBool,
+}
+
+static READERS: [ReadSlot; SLOTS] = [const {
+    ReadSlot {
+        reading: AtomicU64::new(0),
+        owned: std::sync::atomic::AtomicBool::new(false),
+    }
+}; SLOTS];
+/// How many slots from the first a thread ever owned.
+static OWNED: AtomicUsize = AtomicUsize::new(0);
+/// The epoch reads begin in: a change moves it on, then waits for the
+/// reads begun before ([`drain`]).
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+/// How many changes of title memory are under way ([`title_changing`]),
+/// and their ranges of 4 KiB pages.
+static CHANGING: AtomicUsize = AtomicUsize::new(0);
+static CHANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// A thread's slot of [`READERS`], given back when the thread ends, and
+/// how deep its reads are.
+struct Mine {
+    slot: Option<usize>,
+    depth: std::cell::Cell<usize>,
+}
+
+impl Mine {
+    fn claim() -> Mine {
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed, SeqCst};
+        let slot = (0..SLOTS).find(|&i| {
+            READERS[i]
+                .owned
+                .compare_exchange(false, true, AcqRel, Relaxed)
+                .is_ok()
+        });
+        if let Some(i) = slot {
+            // Before the thread's first read: a change that does not see it
+            // here saw no read of it ([`drain`]).
+            OWNED.fetch_max(i + 1, SeqCst);
+            OWN.set(Some(i));
+        }
+        Mine {
+            slot,
+            depth: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl Drop for Mine {
+    fn drop(&mut self) {
+        if let Some(i) = self.slot {
+            let _ = OWN.try_with(|own| own.set(None));
+            READERS[i].reading.store(0, Ordering::Release);
+            READERS[i].owned.store(false, Ordering::Release);
+        }
+    }
+}
+
+thread_local! {
+    static MINE: Mine = Mine::claim();
+    /// [`MINE`]'s slot, for a change on this thread (which claims none).
+    static OWN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The 4 KiB pages of `[at, at + len)` (that of `at` at least), as the
+/// addresses of the first and of the one past the last.
+fn pages_of(at: usize, len: usize) -> (usize, usize) {
+    let end = at.saturating_add(len.max(1));
+    (
+        at & !(KERNEL_PAGE - 1),
+        end.div_ceil(KERNEL_PAGE).saturating_mul(KERNEL_PAGE),
+    )
+}
+
+/// Whether a change of title memory under way covers a page of
+/// `[at, at + len)` ([`title_changing`]).
+fn changing_over(at: usize, len: usize) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    if CHANGING.load(SeqCst) == 0 {
+        return false;
+    }
+    let (from, to) = pages_of(at, len);
+    lock(&CHANGES).iter().any(|&(a, b)| a < to && from < b)
+}
+
+/// A read of title memory `[at, at + len)` ([`read_title`],
+/// [`read_pieces`], [`read_whole`]), in its thread's slot while it lasts,
+/// if no change of title memory over its range is under way: it may then
+/// load pages plainly and note the pages the kernel's copy read whole.
+/// Else it reads with the kernel's copy alone and notes nothing: what it
+/// reads may be from before the change ([`title_changing`]).
+///
+/// A read costs two plain stores into its thread's slot and the loads of
+/// the epoch and of the changes' count: no locked instruction, which would
+/// flush the write-combining buffers of the fill's destination (an upload
+/// heap of a discrete card): two atomic additions made a 64-byte fill into
+/// write-combined memory take 117 ns instead of 18 (`fills_cost`). The
+/// order between the slot's store and the count's load, which the processor
+/// may swap, is the change's to make: it flushes every thread's stores
+/// before it looks at the slots ([`drain`], an asymmetric barrier).
+struct Reading {
+    /// Whether it is in its thread's slot, and may read plainly.
+    entered: bool,
+    free: bool,
+}
+
+impl Reading {
+    fn of(at: usize, len: usize) -> Reading {
+        use std::sync::atomic::Ordering::Relaxed;
+        let entered = MINE
+            .try_with(|mine| {
+                let Some(i) = mine.slot else {
+                    return false;
+                };
+                let depth = mine.depth.get();
+                if depth == 0 {
+                    READERS[i].reading.store(EPOCH.load(Relaxed) + 1, Relaxed);
+                    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+                }
+                mine.depth.set(depth + 1);
+                true
+            })
+            .unwrap_or(false);
+        Reading {
+            entered,
+            free: entered && !changing_over(at, len),
+        }
+    }
+
+    /// [`Pages::readable`]; none during a change.
+    fn readable(&self, at: usize, len: usize) -> usize {
+        if self.free {
+            PAGES.readable(at, len)
+        } else {
+            0
+        }
+    }
+
+    /// [`Pages::unread`]; all of it during a change.
+    fn unread(&self, at: usize, len: usize) -> usize {
+        if self.free {
+            PAGES.unread(at, len)
+        } else {
+            len
+        }
+    }
+
+    /// [`Pages::note_read`]; nothing during a change.
+    fn note_read(&self, at: usize, len: usize) {
+        if self.free {
+            PAGES.note_read(at, len);
+        }
+    }
+
+    /// [`Pages::note_guarded`]; nothing during a change (the guard found
+    /// may be one the change takes off).
+    fn note_guarded(&self, at: usize, len: usize) {
+        if self.free {
+            PAGES.note_guarded(at, len);
+        }
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        if !self.entered {
+            return;
+        }
+        let _ = MINE.try_with(|mine| {
+            let depth = mine.depth.get() - 1;
+            mine.depth.set(depth);
+            if let (0, Some(i)) = (depth, mine.slot) {
+                std::sync::atomic::compiler_fence(Ordering::SeqCst);
+                READERS[i].reading.store(0, Ordering::Release);
+            }
+        });
+    }
+}
+
+/// Waits for the reads begun before now ([`Reading`]): moves the epoch on,
+/// flushes every thread's stores (`FlushProcessWriteBuffers`: each
+/// processor running one of the process's threads serializes), then waits
+/// until no slot holds a read begun in an epoch before. A read that stored
+/// its slot before the flush is seen here; one that stores it after it
+/// loads the changes' count after it too, and sees this change listed (the
+/// caller listed it first). This thread's own read is not waited for (it
+/// cannot end first); only a test changes title memory from within a read.
+fn drain() {
+    use std::sync::atomic::Ordering::{Acquire, SeqCst};
+    let now = EPOCH.fetch_add(1, SeqCst) + 1;
+    // SAFETY: a plain call.
+    unsafe { windows_sys::Win32::System::Threading::FlushProcessWriteBuffers() };
+    let own = OWN.try_with(std::cell::Cell::get).ok().flatten();
+    for (i, slot) in READERS.iter().enumerate().take(OWNED.load(SeqCst)) {
+        if Some(i) == own {
+            continue;
+        }
+        loop {
+            let began = slot.reading.load(Acquire);
+            if began == 0 || began > now {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// A change of title memory under way ([`title_changing`]), until dropped.
+#[must_use]
+pub(crate) struct TitleChange {
+    pages: (usize, usize),
+}
+
+/// Title memory `[at, at + len)` changes: its protection (the title's
+/// `VirtualProtect`, [`crate::watch::title_virtual_protect`], which holds
+/// the change until its call is made), or what it is (the runtime's report
+/// after a commit, a free or a view mapped, before a view unmapped,
+/// [`crate::watch::title_memory_remapped`]). Until it is dropped, reads
+/// over its range read with the kernel's copy alone and note nothing. The
+/// reads under way, which may load its pages plainly or note them read as
+/// they were before, are waited for; then what reads learned of its pages
+/// is forgotten ([`Pages`]): the kernel's copy reads them first again,
+/// which fails on a guard and leaves it.
+///
+/// So a guard the title puts on a page reads had read whole is never met
+/// by a plain read (the Codex review of 84a92e6: one fill met it, and a
+/// title access before the guard was back raised nothing), and the title's
+/// own `VirtualProtect` of a page is never made while [`guard_again`] puts
+/// back a guard a plain read met there, nor undoes its call.
+///
+/// The reads waited for are short: a plain copy, a kernel's copy (which
+/// may wait for the guards' lock, never taken while a change waits), a
+/// query where a copy stopped. A change made from within a read (only a
+/// test does) does not wait for that read.
+pub(crate) fn title_changing(at: usize, len: usize) -> TitleChange {
+    use std::sync::atomic::Ordering::SeqCst;
+    let pages = pages_of(at, len);
+    lock(&CHANGES).push(pages);
+    CHANGING.fetch_add(1, SeqCst);
+    drain();
+    PAGES.forget(pages.0, pages.1 - pages.0);
+    TitleChange { pages }
+}
+
+impl Drop for TitleChange {
+    fn drop(&mut self) {
+        let mut changes = lock(&CHANGES);
+        if let Some(i) = changes.iter().position(|&p| p == self.pages) {
+            changes.swap_remove(i);
+        }
+        CHANGING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The census guarded `[at, at + len)` itself ([`census`]): its handler
+/// lets plain loads go on through its guards, so they may read its pages,
+/// but those a guard of the title's was met in, and but while the title
+/// changes them.
+#[cfg(any(test, feature = "diagnostics"))]
+fn census_guarded(at: usize, len: usize) {
+    Reading::of(at, len).note_read(at, len);
+}
+
 /// The copy's vectored handler: a fault at its `rep movsb` ends the copy
 /// (the instruction after it returns what was left), the address that
 /// faulted noted in [`FAULT`]. It looks at nothing else.
@@ -1516,6 +1934,13 @@ pub(super) fn copy_instruction(ip: usize) -> bool {
 /// into title memory fell back to the kernel's ([`write_title`]), which
 /// fails on a block a refresh guarded again meanwhile: the GPU's bytes
 /// were lost without a word.
+///
+/// Reads of title memory meet a title's guard page (`PAGE_GUARD`) only
+/// where the title guarded a page the kernel's copy had read whole, and
+/// XTP's hooks did not see it ([`Pages`]): the system took the guard off at
+/// the fault; the page goes back to the kernel's copy until the title
+/// changes it, and [`guard_again`] puts the guard back before the copy
+/// stops.
 unsafe extern "system" fn stopped(
     info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {
@@ -1575,6 +2000,24 @@ unsafe extern "system" fn stopped(
     } else {
         0
     };
+    if record.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION
+        && record.NumberParameters >= 2
+        && record.ExceptionInformation[0] == 0
+    {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // A read: the system took the title's guard off; it goes back on
+        // before the copy ends, and reads of the page take the kernel's
+        // copy from now on. (A write takes it off, as `WriteProcessMemory`
+        // does.) The faulting thread's last error stays its own.
+        PAGES.note_guarded(at, 1);
+        #[cfg(test)]
+        tests::met(at);
+        // SAFETY: plain reads and writes of this thread's last error.
+        let error = unsafe { GetLastError() };
+        guard_again(at);
+        // SAFETY: as above.
+        unsafe { SetLastError(error) };
+    }
     if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
         && record.NumberParameters >= 2
         && record.ExceptionInformation[0] == WRITE
@@ -1614,14 +2057,98 @@ unsafe extern "system" fn stopped(
 fn install() {
     use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
     static HANDLER: std::sync::Once = std::sync::Once::new();
-    // SAFETY: a handler that only moves past the copy's instruction, opens
-    // a guarded block as the guard's own handler does, or lets an access to
-    // a page the census guarded go on.
+    // SAFETY: a handler that only moves past the copy's instruction (the
+    // guard of a title page it met put back), opens a guarded block as the
+    // guard's own handler does, or lets an access to a page the census
+    // guarded go on.
     HANDLER.call_once(|| unsafe {
         #[cfg(any(test, feature = "diagnostics"))]
         census::find_our_image();
         AddVectoredExceptionHandler(1, Some(stopped));
     });
+}
+
+/// Puts back the guard (`PAGE_GUARD`) of the 4 KiB page of `at`, which a
+/// plain read just took off ([`stopped`]), on the protection the fault left
+/// and on nothing else. Ported from Marvisak/VIctory#1010 (79c9b93) by
+/// TG0000. The guard is the title's: a guard page of one of its threads'
+/// stacks (without it, the stack does not grow and overflows later), or its
+/// own access tracking. `ReadProcessMemory` fails on a guarded page and
+/// leaves the guard (`fills_leave_guard_pages_guarded`); `WriteProcessMemory`
+/// writes the page and takes the guard off, and so does a plain write
+/// ([`write_title`], `writes_treat_guard_pages_as_the_kernel_does`).
+///
+/// Not while a change of the page is under way ([`title_changing`]). The
+/// title's `VirtualProtect` waits for the read that met the guard: it is
+/// made after this, never between its query and its call, nor between the
+/// call and its undo (the Codex review of 84a92e6: the undo could put an
+/// older protection over the title's `PAGE_EXECUTE_READ`). A report of new
+/// memory there (freed, then committed at the same address) leaves it as
+/// the title committed it.
+///
+/// The protection is asked first, with the page's allocation, and the guard
+/// stays on only if the call finds that very protection under it and the
+/// page in that allocation after it (its base). Else (a change made around
+/// the hooks between the steps) the call is undone, unless the page no
+/// longer has ours then: a later change stays as it is
+/// (`the_guard_put_back_leaves_the_titles_protection_changes`).
+///
+/// shortcut: what stays open. A title access between the fault and the
+/// guard's return raises nothing (the query measures the run of pages
+/// alike around the page, up to milliseconds in a big pool). A page freed
+/// and committed again at the same address before the report of it is
+/// under way gets the guard: the runtime reports frees and commits after
+/// the call, and a commit in the same reservation keeps the allocation's
+/// base. Calls around the hooks may change the page between the steps.
+/// All only where a plain read met a guard at all ([`Pages`]).
+fn guard_again(at: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualProtect,
+        VirtualQuery,
+    };
+    let page = at & !(KERNEL_PAGE - 1);
+    // The page's allocation (its base) and protection, if committed.
+    let query = || {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
+        (n != 0 && info.State == MEM_COMMIT).then_some((info.AllocationBase as usize, info.Protect))
+    };
+    let protect = |protection: u32| {
+        let mut old = 0;
+        // SAFETY: only this page's protection changes; the call fails if the
+        // page is gone meanwhile.
+        (unsafe { VirtualProtect(page as *const _, 1, protection, &mut old) } != 0).then_some(old)
+    };
+    // What the fault left: committed, readable and unguarded. Else the page
+    // is gone, or guarded again (by the title, or by another copy that met
+    // the guard too), or the title changed it since.
+    let Some((base, left)) = query().filter(|&(_, p)| p & (PAGE_GUARD | PAGE_NOACCESS) == 0) else {
+        return;
+    };
+    #[cfg(test)]
+    tests::guarding_again(1, page);
+    // The title changes the page now (its `VirtualProtect`, which waits for
+    // this read), or the runtime reports new memory there: no guard of ours
+    // goes on what it makes.
+    if changing_over(page, KERNEL_PAGE) {
+        return;
+    }
+    let Some(old) = protect(left | PAGE_GUARD) else {
+        return;
+    };
+    if old & !PAGE_GUARD == left && query().is_some_and(|(now, _)| now == base) {
+        return;
+    }
+    #[cfg(test)]
+    tests::guarding_again(2, page);
+    // Another protection under the call, or another allocation, made
+    // around the hooks: back to what the call found, if nothing changed it
+    // again since.
+    if query().is_some_and(|(_, p)| p == left | PAGE_GUARD) {
+        protect(old);
+    }
 }
 
 /// Whether `at` is committed memory that can be written now.
@@ -1698,18 +2225,24 @@ unsafe fn try_copy(dst: *mut u8, src: *const u8, len: usize) -> usize {
     len - at
 }
 
-/// Remplit la mémoire d’upload par lectures directes (TG0000, VIctory #1010).
-/// Le gestionnaire de XTP reprend après une page illisible et conserve les
-/// octets lisibles de part et d’autre, même si le début n’est pas aligné.
+/// Fills upload memory with plain loads of title memory (TG0000, VIctory
+/// #1010). XTP's handler goes on past a page that cannot be read and keeps
+/// the readable bytes on both sides, from an unaligned start too
+/// ([`read_title`]: the title's guard pages stay guarded, copy-backs still
+/// pending are read). With `XTP_SHADOW_ONCE=0`, the kernel's copy.
 ///
 /// # Safety
 ///
 /// `dst` désigne `len` octets accessibles en écriture, réservés à la liste
 /// et disjoints de la source. Les pages lisibles de `src` appartiennent au titre.
 pub(super) unsafe fn fill_upload(dst: *mut u8, src: usize, len: usize) {
+    // Les modes de mesure gardent leur copie brute, absente ou noyau, et
+    // `XTP_SHADOW_ONCE=0` celle du noyau d’avant W1 ([`plain`]).
     #[cfg(feature = "diagnostics")]
-    if crate::copystat::mode() != 0 {
-        // Les modes de mesure gardent leur copie brute, absente ou noyau.
+    let measured = crate::copystat::mode() != 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let measured = false;
+    if measured || !plain() {
         crate::host::copy_mapped(dst, src as *const u8, len, false);
         return;
     }
@@ -1730,40 +2263,145 @@ pub(super) unsafe fn fill_upload(dst: *mut u8, src: usize, len: usize) {
 /// Copies title memory `[src, src + len)` into memory of ours at `dst`
 /// with plain loads; what cannot be read is left as zeros (as the kernel's
 /// copy did). Returns the bytes zeroed.
+///
+/// Plain loads read only pages the kernel's copy has read whole since the
+/// title last changed them, and none while the title changes a page of the
+/// range ([`Reading`]); the others go through the kernel's copy
+/// ([`read_by_kernel`]), which leaves a title's guard in place and gives
+/// zeros for its page, as before 0751149 ([`Pages`]: no read takes a guard
+/// the page had when reads first met it, nor one the title put on it
+/// since).
+/// What a plain copy stops at goes through it too, where committed: a
+/// copy-back view still pending that the handler did not open (the guards'
+/// lock poisoned: `crate::watch::read_fault` gives up) is pinned and read
+/// again, by 4 KiB page, so that a page no access is for next to it in
+/// the same region zeroes only itself; a guard met (put back by
+/// [`stopped`]) gives zeros.
+///
+/// A fill does not mix bytes from before and after a copy-back's merge
+/// when a fault cuts it: before it, the step waits for the submissions
+/// whose GPU writes its range to end, copy-back included (`Batch::settle`),
+/// and a publication from another one does not change the bytes of that
+/// range (`crate::readmap::Owners::publish` changes only what its GPU
+/// wrote). Only a title write during the copy could change them, with the
+/// kernel's copy too.
 fn read_title(dst: *mut u8, src: usize, len: usize) -> usize {
+    #[cfg(test)]
+    tests::TITLE_READS.set(tests::TITLE_READS.get() + 1);
+    let reading = Reading::of(src, len);
     let (mut at, mut zeros) = (0, 0);
     while at < len {
-        // SAFETY: our memory, `len` bytes; title memory a fault leaves alone.
-        let left = unsafe { try_copy(dst.add(at), (src + at) as *const u8, len - at) };
-        at = len - left;
-        if left == 0 {
-            break;
+        let plain = reading.readable(src + at, len - at);
+        if plain == 0 {
+            let n = reading.unread(src + at, len - at);
+            // SAFETY: inside our memory, which nothing else references meanwhile.
+            let piece = unsafe { std::slice::from_raw_parts_mut(dst.add(at), n) };
+            zeros += read_by_kernel(src + at, piece, &reading);
+            at += n;
+            continue;
         }
-        let n = out_of_reach(src + at, false).min(left);
-        // SAFETY: inside our memory.
-        unsafe { dst.add(at).write_bytes(0, n) };
-        zeros += n;
+        // SAFETY: our memory, `plain` bytes; title memory a fault leaves alone.
+        let left = unsafe { try_copy(dst.add(at), (src + at) as *const u8, plain) };
+        at += plain - left;
+        if left == 0 {
+            continue;
+        }
+        let out = reach(src + at, false);
+        let n = out.len.min(len - at);
+        PAGES.forget_read(src + at, n);
+        // SAFETY: inside our memory, which nothing else references meanwhile.
+        let piece = unsafe { std::slice::from_raw_parts_mut(dst.add(at), n) };
+        zeros += if out.committed {
+            read_by_kernel(src + at, piece, &reading)
+        } else {
+            piece.fill(0);
+            n
+        };
         at += n;
     }
     zeros
+}
+
+/// Reads title memory at `src` into `dst` with the kernel's copy, which
+/// fails on a guarded page and leaves its guard: 64 KiB at a time, then by
+/// 4 KiB page in a piece that fails, as `crate::host::copy_mapped` does;
+/// zeros where a page cannot be read, up to the end of a region that is not
+/// committed. Notes the pages it reads whole (in `reading`), and those it
+/// finds guarded ([`PAGES`]). Returns the bytes zeroed.
+fn read_by_kernel(src: usize, dst: &mut [u8], reading: &Reading) -> usize {
+    const PIECE_READ: usize = 64 << 10;
+    let len = dst.len();
+    let (mut at, mut zeros) = (0, 0);
+    // Up to where (an offset in `dst`) a query found memory that cannot be
+    // read, and whether it is committed.
+    let (mut queried, mut committed) = (0, true);
+    while at < len {
+        if at < queried && !committed {
+            let end = queried.min(len);
+            dst[at..end].fill(0);
+            zeros += end - at;
+            at = end;
+            continue;
+        }
+        let end = (at + PIECE_READ - (src + at) % PIECE_READ).min(len);
+        if read_kernel(src + at, &mut dst[at..end], reading) {
+            at = end;
+            continue;
+        }
+        while at < end {
+            let page_end = (at + KERNEL_PAGE - (src + at) % KERNEL_PAGE).min(end);
+            if read_kernel(src + at, &mut dst[at..page_end], reading) {
+                at = page_end;
+                continue;
+            }
+            if at >= queried {
+                let out = reach(src + at, false);
+                if out.guarded {
+                    reading.note_guarded(src + at, out.len);
+                }
+                (queried, committed) = (at + out.len, out.committed);
+                if !committed {
+                    break;
+                }
+            }
+            dst[at..page_end].fill(0);
+            zeros += page_end - at;
+            at = page_end;
+        }
+    }
+    zeros
+}
+
+/// [`crate::host::read_into`] (the kernel's copy, which pins a copy-back
+/// still pending and reads it again), the pages read whole noted, unless
+/// the title changes them now ([`Reading::note_read`]).
+fn read_kernel(src: usize, dst: &mut [u8], reading: &Reading) -> bool {
+    let whole = crate::host::read_into(src as *const u8, dst);
+    if whole && !dst.is_empty() {
+        reading.note_read(src, dst.len());
+    }
+    whole
 }
 
 /// Reads title memory at `src` into `dst`: with one copy where it can all
 /// be read, else the pieces that can be (Marvisak/VIctory#1124: a range
 /// shorter than a piece can still cross a piece boundary, and a read that
 /// fails keeps the readable pieces). Returns the parts read, as offsets in
-/// `dst`: whole pieces of title memory, but at `dst`'s ends.
+/// `dst`: whole pieces of title memory, but at `dst`'s ends. With the
+/// kernel's copy where a page of it was not read whole by it yet, or the
+/// title changes one now ([`Reading`]).
 fn read_pieces(src: usize, dst: &mut [u8]) -> Vec<(usize, usize)> {
     let len = dst.len();
+    let reading = Reading::of(src, len);
     // The end of the piece holding `at` (an offset in `dst`).
     let piece_end = |at: usize| (at + PIECE - (src + at) % PIECE).min(len);
     let mut parts: Vec<(usize, usize)> = Vec::new();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackRead, len as u64);
-    if !plain() {
+    if !plain() || reading.readable(src, len) < len {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackReads, 1);
-        if crate::host::read_into(src as *const u8, dst) {
+        if read_kernel(src, dst, &reading) {
             parts.push((0, len));
             return parts;
         }
@@ -1773,7 +2411,7 @@ fn read_pieces(src: usize, dst: &mut [u8]) -> Vec<(usize, usize)> {
             let end = piece_end(at);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackReads, 1);
-            if crate::host::read_into((src + at) as *const u8, &mut dst[at..end]) {
+            if read_kernel(src + at, &mut dst[at..end], &reading) {
                 match parts.last_mut() {
                     Some(last) if last.1 == at => last.1 = end,
                     _ => parts.push((at, end)),
@@ -1819,6 +2457,22 @@ fn read_pieces(src: usize, dst: &mut [u8]) -> Vec<(usize, usize)> {
 /// otherwise) to the end of its 4 KiB page. One query per region out of
 /// reach: the kernel's copy tried each 4 KiB page of it.
 fn out_of_reach(at: usize, write: bool) -> usize {
+    reach(at, write).len
+}
+
+/// What a query says of title memory from `at` ([`reach`]).
+struct Reach {
+    /// The bytes [`out_of_reach`] counts.
+    len: usize,
+    /// Whether they are committed (the query failed: no more than a 4 KiB
+    /// page, taken for committed).
+    committed: bool,
+    /// Whether they are guarded (`PAGE_GUARD`).
+    guarded: bool,
+}
+
+/// [`out_of_reach`], and what those bytes are.
+fn reach(at: usize, write: bool) -> Reach {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
@@ -1827,25 +2481,37 @@ fn out_of_reach(at: usize, write: bool) -> usize {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    let reachable = info.State == MEM_COMMIT
+    let committed = info.State == MEM_COMMIT;
+    let reachable = committed
         && if write {
             can_write(info.Protect)
         } else {
             info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
         };
     if n == 0 || reachable {
-        return page_end;
+        return Reach {
+            len: page_end,
+            committed: true,
+            guarded: false,
+        };
     }
-    (info.BaseAddress as usize + info.RegionSize)
+    let end = (info.BaseAddress as usize + info.RegionSize)
         .saturating_sub(at)
-        .max(page_end)
+        .max(page_end);
+    Reach {
+        len: end,
+        committed,
+        guarded: committed && info.Protect & PAGE_GUARD != 0,
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it cannot be
-/// read.
+/// read. With the kernel's copy where a page of it was not read whole by it
+/// yet, or the title changes one now ([`Reading`]).
 fn read_whole(src: usize, dst: &mut [u8]) -> bool {
-    if !plain() {
-        return crate::host::read_into(src as *const u8, dst);
+    let reading = Reading::of(src, dst.len());
+    if !plain() || reading.readable(src, dst.len()) < dst.len() {
+        return read_kernel(src, dst, &reading);
     }
     // SAFETY: our buffer; title memory a fault leaves alone.
     unsafe { try_copy(dst.as_mut_ptr(), src as *const u8, dst.len()) == 0 }
@@ -2109,13 +2775,6 @@ pub(crate) mod census {
         (0..SMALL).filter(move |i| mask & (1 << i) != 0)
     }
 
-    /// The journal's last writing of `block`'s page (0: none known).
-    fn last_write(written: &[(usize, u64)], block: usize) -> u64 {
-        written
-            .binary_search_by_key(&block, |&(p, _)| p)
-            .map_or(0, |i| written[i].1)
-    }
-
     /// How a copy-back takes part: whether the census counts it, and
     /// guards its range after.
     #[derive(Clone, Copy)]
@@ -2166,7 +2825,7 @@ pub(crate) mod census {
                     // same submission: the same GPU work.
                     continue;
                 }
-                let written = asked.as_ref().map_or(0, |(_, w)| last_write(w, block));
+                let written = asked.map_or(0, |_| crate::watch::last_write(block));
                 // Written since it was guarded: a write the guard did not see
                 // (which may have taken the guards off), unless a store to
                 // one of its pages faulted, which the journal cannot tell
@@ -2243,7 +2902,7 @@ pub(crate) mod census {
             );
             let pages = mask(a, b);
             let bytes = ((b - a) * KERNEL_PAGE) as u64;
-            let Some((now, written)) = &asked else {
+            let Some(now) = asked else {
                 add(K::Unarmed, bytes);
                 continue;
             };
@@ -2256,7 +2915,7 @@ pub(crate) mod census {
             }
             let ours = gpu.iter().any(|&n| n != 0);
             // Where the copy-back wrote, its write and another's look alike.
-            let theirs = !ours && last_write(written, block) == *now;
+            let theirs = !ours && crate::watch::last_write(block) >= now;
             let Census { blocks, ever, .. } = census;
             let entry = blocks.entry(block).or_insert(Block {
                 submission,
@@ -2275,7 +2934,7 @@ pub(crate) mod census {
             let intact = entry.guarded & pages == pages && !ours && !theirs;
             *entry = Block {
                 submission,
-                asked: *now,
+                asked: now,
                 armed: pages,
                 guarded: entry.guarded,
                 gpu,
@@ -2319,7 +2978,8 @@ pub(crate) mod census {
     /// the guard: read-only for view memory, which the guard of view memory
     /// keeps so (read-write too with `all`), read-write for other memory
     /// (`all` only). Returns whether the protection under it is read-only,
-    /// or `None` (the protection as it was) for any other protection.
+    /// or `None` (the protection as it was) for any other protection. Plain
+    /// loads may read the pages it guards ([`super::census_guarded`]).
     fn guard(at: usize, pages: usize, view: bool) -> Option<bool> {
         use windows_sys::Win32::System::Memory::{
             PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
@@ -2337,17 +2997,21 @@ pub(crate) mod census {
         let expected = if view { PAGE_READONLY } else { PAGE_READWRITE };
         let old = set(expected | PAGE_GUARD)?;
         let under = old & !PAGE_GUARD;
-        if under == expected {
-            return Some(view);
-        }
-        if view && under == PAGE_READWRITE && mode() == 2 {
+        let read_only = if under == expected {
+            Some(view)
+        } else if view && under == PAGE_READWRITE && mode() == 2 {
             // A view block written since it was guarded: read-write.
-            return set(PAGE_READWRITE | PAGE_GUARD).map(|_| false);
+            set(PAGE_READWRITE | PAGE_GUARD).map(|_| false)
+        } else {
+            // Not what the guard or the title leaves there (another
+            // modifier, no access): as it was.
+            set(old);
+            None
+        };
+        if read_only.is_some() {
+            super::census_guarded(at, len);
         }
-        // Not what the guard or the title leaves there (another modifier,
-        // no access): as it was.
-        set(old);
-        None
+        read_only
     }
 
     /// The handler, at a guard fault on `at` (`write`: a store) by the
@@ -3793,7 +4457,10 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let removed = buffers().remove(&(start, resource));
+    if let Some(entry) = removed {
+        crate::rt::release_buffer(Some(resource), start, entry.end);
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -3873,6 +4540,16 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         );
     }
     Some(made)
+}
+
+/// The innermost title resource containing this address.
+pub(crate) fn buffer_owner(address: u64) -> Option<usize> {
+    buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, entry)| entry.end > address)
+        .map(|(key, _)| key.1)
 }
 
 /// The title buffers holding `address`, innermost first (the one [`find`]
@@ -4173,17 +4850,70 @@ mod tests {
     /// A title write while a copy-back runs, given the piece's address.
     type TitleWrite = Box<dyn FnMut(usize)>;
 
+    /// The title's protection changes between [`guard_again`]'s steps,
+    /// given the step and the page.
+    type GuardStep = Box<dyn FnMut(u8, usize)>;
+
     thread_local! {
         /// What [`after_reading`] does on this thread.
         static AFTER_READING: std::cell::RefCell<Option<TitleWrite>> =
             const { std::cell::RefCell::new(None) };
         /// The plain reads [`read_pieces`] made on this thread.
         pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Les copies directes que [`read_title`] a faites sur ce thread.
+        pub(super) static TITLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The write-watch askings refreshes made on this thread.
         pub(super) static ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// How far short of the faulting byte the next fault at the copy's
         /// instruction on this thread stops it ([`stopped`]).
         pub(super) static LAG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// What [`guarding_again`] does on this thread.
+        static GUARD_AGAIN: std::cell::RefCell<Option<GuardStep>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called by [`guard_again`] on the faulting thread, with its step (1:
+    /// after its query; 2: after its call, the protection found changed)
+    /// and the page.
+    pub(super) fn guarding_again(step: u8, page: usize) {
+        GUARD_AGAIN.with_borrow_mut(|f| {
+            if let Some(f) = f {
+                f(step, page);
+            }
+        });
+    }
+
+    /// The 4 KiB pages where a plain read met a guard ([`stopped`]).
+    static MET: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    /// A plain read met a guard at `at` ([`stopped`]).
+    pub(super) fn met(at: usize) {
+        MET.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(at & !(KERNEL_PAGE - 1));
+    }
+
+    /// How many times plain reads met a guard in the 4 KiB page of `at`.
+    fn met_on(at: usize) -> usize {
+        let page = at & !(KERNEL_PAGE - 1);
+        MET.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&p| p == page)
+            .count()
+    }
+
+    /// Notes `[at, at + len)` read whole by the kernel's copy, as a first
+    /// read of it does: plain loads read it from now on.
+    fn known(at: usize, len: usize) {
+        PAGES.note_read(at, len);
+    }
+
+    /// Held by the tests that count on what reads learned of pages
+    /// ([`Pages`]): the guard's tests report all title memory changed
+    /// (`crate::watch::tests::serial`), which forgets it.
+    fn learned() -> std::sync::MutexGuard<'static, ()> {
+        crate::watch::tests::serial()
     }
 
     /// The census's mode for this process ([`census::mode`]) plus one, 0
@@ -4205,6 +4935,11 @@ mod tests {
     /// handlers are the process's, and the guard's own tests count the
     /// guarded blocks (they hold a lock of theirs for it).
     fn alone(test: &str, body: impl FnOnce()) {
+        alone_with(test, &[], body);
+    }
+
+    /// [`alone`], le processus du test ayant en plus les variables `vars`.
+    fn alone_with(test: &str, vars: &[(&str, &str)], body: impl FnOnce()) {
         const CHILD: &str = "XTP_SHADOW_TEST_ALONE";
         if std::env::var_os(CHILD).is_some() {
             body();
@@ -4213,6 +4948,7 @@ mod tests {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([test, "--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
+            .envs(vars.iter().copied())
             .output()
             .unwrap();
         let (stdout, stderr) = (
@@ -4832,8 +5568,9 @@ mod tests {
             // SAFETY: the test's memory.
             unsafe { ((base + i) as *mut u8).write((i * 7 + 3) as u8) };
         }
-        // The second page decommitted, the first 4 KiB of the third not
-        // readable.
+        // Read whole before (plain loads read it), then the second page
+        // decommitted, the first 4 KiB of the third not readable.
+        known(base, len);
         unmap(base + PAGE, PAGE);
         let mut old = 0;
         // SAFETY: the test's memory.
@@ -4846,6 +5583,9 @@ mod tests {
         crate::host::copy_mapped(kernel.as_mut_ptr(), src as *const u8, n, false);
         assert!(plain == kernel, "as the kernel's copy");
         assert_eq!(zeros, PAGE + 4096);
+        // The pages a plain copy could not read go to the kernel's copy
+        // next, and read the same.
+        assert_eq!(PAGES.readable(base + PAGE, PAGE + 4096), 0);
         let mut upload = vec![0xee; n];
         // SAFETY: le vecteur couvre toute la destination, hors de la réservation.
         unsafe { fill_upload(upload.as_mut_ptr(), src, n) };
@@ -4870,6 +5610,1000 @@ mod tests {
                 .iter()
                 .all(|&b| b == 0x5a)
         );
+    }
+
+    /// `pages` pages de 4 Kio à nous, l’octet `i` valant [`pattern`]`(i)`.
+    fn kernel_pages(pages: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        // SAFETY: une réservation neuve, à nous.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                pages * KERNEL_PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        for i in 0..pages * KERNEL_PAGE {
+            // SAFETY: la mémoire du test.
+            unsafe { ((at + i) as *mut u8).write(pattern(i)) };
+        }
+        // New memory, not read yet, no guard met there yet (its address may
+        // have been another test's).
+        PAGES.forget(at, pages * KERNEL_PAGE);
+        MET.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|page| !(at..at + pages * KERNEL_PAGE).contains(page));
+        at
+    }
+
+    /// L’octet `i` des pages de [`kernel_pages`].
+    fn pattern(i: usize) -> u8 {
+        (i * 31 + i / 256 + 1) as u8
+    }
+
+    /// Libère des pages de [`kernel_pages`].
+    fn free_pages(at: usize, pages: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // What reads learned of them goes too: the address may be another
+        // test's memory next.
+        PAGES.forget(at, pages * KERNEL_PAGE);
+        // SAFETY: une réservation du test, que plus rien n’utilise.
+        assert_ne!(unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// La protection de la page de 4 Kio de `at`, `PAGE_GUARD` compris.
+    fn protection(at: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        assert_ne!(n, 0);
+        info.Protect
+    }
+
+    /// Donne `protection` à la page de 4 Kio de `at`.
+    fn set_protection(at: usize, protection: u32) {
+        use windows_sys::Win32::System::Memory::VirtualProtect;
+        let mut old = 0;
+        // SAFETY: une page du test.
+        let done = unsafe { VirtualProtect(at as *const _, KERNEL_PAGE, protection, &mut old) };
+        assert_ne!(done, 0);
+    }
+
+    /// Si les remplissages de ce processus lisent directement (sinon, par la
+    /// copie du noyau).
+    fn plain_fills() -> bool {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            return false;
+        }
+        plain()
+    }
+
+    /// Une page de garde du titre qu’un remplissage atteint reste gardée,
+    /// avec son autre protection, et le remplissage en reçoit ce que la
+    /// copie du noyau en donne (des zéros pour la page, dont le noyau laisse
+    /// la garde), où que la plage tombe sur elle. De même pour un
+    /// rafraîchissement et pour les lectures d’une copie en retour. Ported
+    /// from VIctory#1010 (79c9b93) by TG0000 (`guard_pages_stay_guarded`).
+    #[test]
+    fn fills_leave_guard_pages_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+        };
+        const P: usize = KERNEL_PAGE;
+        for other in [PAGE_READWRITE, PAGE_READONLY, PAGE_EXECUTE_READ] {
+            for (start, len) in [
+                (P, 1),
+                (P + 2000, 1),
+                (P + 2000, 100),
+                (2 * P - 1, 1),
+                (P - 1, 2),
+                (P - 7, 16),
+                (P - 500, 1000),
+                (2 * P - 8, 64),
+                (0, 3 * P),
+            ] {
+                let case = format!("protection {other:#x}, octets {start}+{len}");
+                let at = kernel_pages(3);
+                let guarded = other | PAGE_GUARD;
+                set_protection(at + P, guarded);
+                let src = at + start;
+                let mut kernel = vec![0xeeu8; len];
+                crate::host::copy_mapped(kernel.as_mut_ptr(), src as *const u8, len, false);
+                assert_eq!(protection(at + P), guarded, "le noyau: {case}");
+                let mut filled = vec![0xeeu8; len];
+                TITLE_READS.set(0);
+                // SAFETY: le vecteur couvre la destination.
+                unsafe { fill_upload(filled.as_mut_ptr(), src, len) };
+                assert_eq!(TITLE_READS.get(), usize::from(plain_fills()), "{case}");
+                assert_eq!(protection(at + P), guarded, "le remplissage: {case}");
+                assert!(filled == kernel, "comme la copie du noyau: {case}");
+                for (i, &b) in filled.iter().enumerate() {
+                    let i = start + i;
+                    let want = if (P..2 * P).contains(&i) {
+                        0
+                    } else {
+                        pattern(i)
+                    };
+                    assert_eq!(b, want, "octet {i}: {case}");
+                }
+                let mut read = vec![0xeeu8; len];
+                let guarded_bytes = (start + len).min(2 * P).saturating_sub(start.max(P));
+                assert_eq!(read_title(read.as_mut_ptr(), src, len), guarded_bytes);
+                assert!(read == kernel, "un rafraîchissement: {case}");
+                assert!(!read_whole(src, &mut read));
+                let _ = read_pieces(src, &mut read);
+                assert_eq!(protection(at + P), guarded, "une copie en retour: {case}");
+                // No read took the guard off, not even for a moment.
+                assert_eq!(met_on(at + P), 0, "{case}");
+                free_pages(at, 3);
+            }
+        }
+    }
+
+    /// Une écriture dans la mémoire du titre fait d’une page de garde ce
+    /// qu’en fait la copie du noyau (`WriteProcessMemory`) : elle écrit la
+    /// page et en retire la garde (vu sur la ferme et sur le PC). Seule une
+    /// lecture la remet ([`guard_again`]).
+    #[test]
+    fn writes_treat_guard_pages_as_the_kernel_does() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READWRITE};
+        const P: usize = KERNEL_PAGE;
+        for (start, len) in [(P, 1), (P - 7, 16), (2 * P - 8, 64), (0, 3 * P)] {
+            let ours = vec![0x5au8; len];
+            let [direct, kernel] = [(); 2].map(|_| kernel_pages(3));
+            for at in [direct, kernel] {
+                set_protection(at + P, PAGE_READWRITE | PAGE_GUARD);
+            }
+            write_title(direct + start, ours.as_ptr(), len);
+            crate::host::write_mapped((kernel + start) as *mut u8, ours.as_ptr(), len);
+            let guards = [direct, kernel].map(|at| protection(at + P));
+            for at in [direct, kernel] {
+                set_protection(at + P, PAGE_READWRITE);
+            }
+            let written = |at: usize| title(at, 3 * P).iter().filter(|&&b| b == 0x5a).count();
+            assert_eq!(
+                (guards[0], written(direct)),
+                (guards[1], written(kernel)),
+                "(protection, octets écrits) directs, puis du noyau: {start}+{len}"
+            );
+            assert!(title(direct, 3 * P) == title(kernel, 3 * P));
+            free_pages(direct, 3);
+            free_pages(kernel, 3);
+        }
+    }
+
+    /// Two threads fill from the same guard page, guarded when reads first
+    /// meet it: every fill gives zeros, as a fill alone does (the kernel's
+    /// copy reads the page and leaves the guard), and the page is guarded
+    /// when they are done. Before, one could read the page's bytes between
+    /// the other's fault and the guard's return. Ported from VIctory#1010
+    /// (79c9b93) by TG0000.
+    #[test]
+    fn two_fills_of_a_guard_page() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READWRITE};
+        let at = kernel_pages(1);
+        set_protection(at, PAGE_READWRITE | PAGE_GUARD);
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    let mut to = [0xeeu8; 256];
+                    for _ in 0..2000 {
+                        // SAFETY: `to` has the room.
+                        unsafe { fill_upload(to.as_mut_ptr(), at + 64, to.len()) };
+                        assert_eq!(to, [0; 256], "zeros, as a fill alone gives");
+                        to.fill(0xee);
+                    }
+                });
+            }
+        });
+        assert_eq!(protection(at), PAGE_READWRITE | PAGE_GUARD);
+        assert_eq!(met_on(at), 0, "no fill took the guard off");
+        free_pages(at, 1);
+    }
+
+    /// The title's `VirtualProtect` of the 4 KiB page of `at`, through XTP's
+    /// hook ([`crate::watch::title_virtual_protect`]): the protection the
+    /// page had.
+    fn title_protect(at: usize, protection: u32) -> u32 {
+        let mut old = 0;
+        // SAFETY: a page of the test's; the arguments of `VirtualProtect`.
+        let done = unsafe {
+            crate::watch::title_virtual_protect(at as *const _, KERNEL_PAGE, protection, &mut old)
+        };
+        assert_ne!(done, 0);
+        old
+    }
+
+    /// The title uses a guard page while fills read it: it arms the guard
+    /// (its `VirtualProtect`), and its next access is its alarm. Its handler
+    /// comes ahead of XTP's, knows the page by address alone, and counts the
+    /// faults of the title's thread (its alarms) apart from the others'
+    /// (fills that met the guard). Every access of the title's raises its
+    /// alarm, no fill meets the guard, and the page ends guarded as the
+    /// title left it: whether reads had read the page whole before the
+    /// title first guarded it (the Codex review of 84a92e6: a fill then met
+    /// the guard, and a title access before its return raised nothing) or
+    /// not. Ported from VIctory#1010 (79c9b93) by TG0000
+    /// (`a_guard_page_the_title_touches_meanwhile`, where the Codex review of
+    /// c4893c8 counted 672 alarms lost of 60,390).
+    #[test]
+    fn fills_lose_no_alarm_of_a_guard_page_the_title_uses() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+        use windows_sys::Win32::Foundation::STATUS_GUARD_PAGE_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+            EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READWRITE};
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        static PAGE_AT: AtomicUsize = AtomicUsize::new(0);
+        static TITLE_THREAD: AtomicU32 = AtomicU32::new(0);
+        /// Guard faults in the page: the title's thread's (its alarms), and
+        /// the other threads' (fills that met the guard).
+        static ALARMS: AtomicUsize = AtomicUsize::new(0);
+        static FILLS_MET: AtomicUsize = AtomicUsize::new(0);
+        /// The title's handler: a guard fault in its page is its alarm,
+        /// whatever instruction made it; the test tells the threads apart.
+        unsafe extern "system" fn title(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched.
+            let r = unsafe { &*(*info).ExceptionRecord };
+            if r.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION
+                && r.NumberParameters >= 2
+                && r.ExceptionInformation[1] & !(KERNEL_PAGE - 1) == PAGE_AT.load(Relaxed)
+            {
+                // SAFETY: a plain call.
+                if unsafe { GetCurrentThreadId() } == TITLE_THREAD.load(Relaxed) {
+                    ALARMS.fetch_add(1, Relaxed);
+                } else {
+                    FILLS_MET.fetch_add(1, Relaxed);
+                }
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            }
+        }
+        let _learned = learned();
+        let guarded = PAGE_READWRITE | PAGE_GUARD;
+        for read_before in [true, false] {
+            let at = kernel_pages(1);
+            ALARMS.store(0, Relaxed);
+            FILLS_MET.store(0, Relaxed);
+            PAGE_AT.store(at, Relaxed);
+            // SAFETY: a plain call.
+            TITLE_THREAD.store(unsafe { GetCurrentThreadId() }, Relaxed);
+            let fill = || {
+                let mut to = [0xeeu8; 64];
+                // SAFETY: `to` has the room.
+                unsafe { fill_upload(to.as_mut_ptr(), at + 64, to.len()) };
+                to
+            };
+            if read_before {
+                let mut read = vec![0xeeu8; KERNEL_PAGE];
+                assert_eq!(read_title(read.as_mut_ptr(), at, KERNEL_PAGE), 0);
+                assert_eq!(
+                    PAGES.readable(at, KERNEL_PAGE),
+                    KERNEL_PAGE,
+                    "plain loads next"
+                );
+            }
+            // XTP's handler first, so that the title's comes ahead of it.
+            install();
+            // SAFETY: removed below; it takes only the faults of its page.
+            let handler = unsafe { AddVectoredExceptionHandler(1, Some(title)) };
+            assert_eq!(title_protect(at, guarded), PAGE_READWRITE);
+            let first = fill();
+            let stop = AtomicBool::new(false);
+            let (mut touches, mut fills) = (0, 0);
+            std::thread::scope(|s| {
+                let filling: Vec<_> = (0..2)
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut n = 0;
+                            while !stop.load(Relaxed) {
+                                std::hint::black_box(fill());
+                                n += 1;
+                                for _ in 0..2000 {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                            n
+                        })
+                    })
+                    .collect();
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+                while std::time::Instant::now() < until {
+                    // SAFETY: a committed page; its guard goes to the title's handler.
+                    std::hint::black_box(unsafe { (at as *const u8).read_volatile() });
+                    touches += 1;
+                    title_protect(at, guarded);
+                }
+                stop.store(true, Relaxed);
+                fills = filling
+                    .into_iter()
+                    .map(|f| f.join().unwrap())
+                    .sum::<usize>();
+            });
+            // SAFETY: the handler added above.
+            unsafe { RemoveVectoredExceptionHandler(handler) };
+            let (alarms, met) = (ALARMS.load(Relaxed), FILLS_MET.load(Relaxed));
+            println!(
+                "read before: {read_before}; {alarms} alarms of the title's {touches} accesses, \
+                 {met} fills met the guard, {fills} fills meanwhile"
+            );
+            assert_eq!(first, [0; 64], "zeros, as the kernel's copy gives");
+            assert!(fills > 0 && touches > 0);
+            assert_eq!(met, 0, "no fill met the guard");
+            assert_eq!(alarms, touches, "no alarm lost, none too many");
+            assert_eq!(met_on(at), 0, "nor did XTP's handler see one");
+            assert_eq!(protection(at), guarded);
+            free_pages(at, 1);
+        }
+    }
+
+    /// A guard the title puts on a page reads have read whole (its
+    /// `VirtualProtect`) is never met by a plain read, whatever protection
+    /// it is on (read-write, read-only, executable): the page goes to the
+    /// kernel's copy, which gives zeros for it and leaves the guard. The
+    /// Codex review of 84a92e6 found it met once, and a title access before
+    /// the guard's return raised nothing. Once the title takes the guard
+    /// off, the kernel's copy reads the page whole again, then plain loads.
+    #[test]
+    fn a_guard_the_title_puts_on_a_page_read_before_is_never_met() {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+        };
+        const P: usize = KERNEL_PAGE;
+        let _learned = learned();
+        for under in [PAGE_READWRITE, PAGE_READONLY, PAGE_EXECUTE_READ] {
+            let at = kernel_pages(3);
+            let mut read = vec![0xeeu8; 3 * P];
+            assert_eq!(read_title(read.as_mut_ptr(), at, 3 * P), 0);
+            assert!(read.iter().enumerate().all(|(i, &b)| b == pattern(i)));
+            assert_eq!(PAGES.readable(at, 3 * P), 3 * P, "plain loads next");
+            assert_eq!(title_protect(at + P, under | PAGE_GUARD), PAGE_READWRITE);
+            assert_eq!(PAGES.readable(at, 3 * P), P, "unread: {under:#x}");
+            for _ in 0..3 {
+                read.fill(0xee);
+                assert_eq!(read_title(read.as_mut_ptr(), at, 3 * P), P);
+                for (i, &b) in read.iter().enumerate() {
+                    let want = if (P..2 * P).contains(&i) {
+                        0
+                    } else {
+                        pattern(i)
+                    };
+                    assert_eq!(b, want, "byte {i}, protection {under:#x}");
+                }
+                assert_eq!(protection(at + P), under | PAGE_GUARD, "{under:#x}");
+            }
+            assert_eq!(met_on(at + P), 0, "never met: {under:#x}");
+            assert_eq!(title_protect(at + P, PAGE_READWRITE), under | PAGE_GUARD);
+            read.fill(0xee);
+            assert_eq!(read_title(read.as_mut_ptr(), at, 3 * P), 0);
+            assert!(read.iter().enumerate().all(|(i, &b)| b == pattern(i)));
+            assert_eq!(PAGES.readable(at, 3 * P), 3 * P, "plain loads again");
+            free_pages(at, 3);
+        }
+    }
+
+    /// A guard put on a page reads have read whole by a call around XTP's
+    /// hooks (`VirtualProtectEx`, `NtProtectVirtualMemory`) is met once by
+    /// a plain read ([`Pages`]'s shortcut). The guard goes back on the very
+    /// protection it was on (read-write, read-only, executable), the read
+    /// gives zeros for the page, as the kernel's copy does, and the
+    /// kernel's copy reads it from then on. Only a title access between
+    /// that fault and the guard's return raises nothing.
+    #[test]
+    fn a_guard_put_around_the_hooks_on_a_page_read_before_is_met_once() {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+        };
+        const P: usize = KERNEL_PAGE;
+        let _learned = learned();
+        for under in [PAGE_READWRITE, PAGE_READONLY, PAGE_EXECUTE_READ] {
+            let at = kernel_pages(3);
+            let mut read = vec![0xeeu8; 3 * P];
+            assert_eq!(read_title(read.as_mut_ptr(), at, 3 * P), 0);
+            assert!(read.iter().enumerate().all(|(i, &b)| b == pattern(i)));
+            assert_eq!(PAGES.readable(at, 3 * P), 3 * P, "plain loads next");
+            set_protection(at + P, under | PAGE_GUARD);
+            for _ in 0..3 {
+                read.fill(0xee);
+                assert_eq!(read_title(read.as_mut_ptr(), at, 3 * P), P);
+                for (i, &b) in read.iter().enumerate() {
+                    let want = if (P..2 * P).contains(&i) {
+                        0
+                    } else {
+                        pattern(i)
+                    };
+                    assert_eq!(b, want, "byte {i}, protection {under:#x}");
+                }
+                assert_eq!(protection(at + P), under | PAGE_GUARD, "{under:#x}");
+            }
+            assert_eq!(met_on(at + P), 1, "met once: {under:#x}");
+            assert_eq!(PAGES.readable(at + P, P), 0, "the kernel's copy reads it");
+            free_pages(at, 3);
+        }
+    }
+
+    /// The guard goes back only on the protection the fault left. A
+    /// protection set around XTP's hooks between the guard's query and its
+    /// call is the title's after it (read-only), and so is one set again
+    /// before that call is undone (executable: before, the undo put the
+    /// first over it), or the title's own guard.
+    #[test]
+    fn the_guard_put_back_leaves_the_titles_protection_changes() {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+        };
+        let _learned = learned();
+        let guarded = PAGE_READWRITE | PAGE_GUARD;
+        for (first, then, left) in [
+            (PAGE_READONLY, None, PAGE_READONLY),
+            (PAGE_READONLY, Some(PAGE_EXECUTE_READ), PAGE_EXECUTE_READ),
+            (guarded, None, guarded),
+        ] {
+            let at = kernel_pages(1);
+            known(at, KERNEL_PAGE);
+            set_protection(at, guarded);
+            // The title's changes, made on the faulting thread between the
+            // guard's steps (no assertion there: it runs in the handler).
+            GUARD_AGAIN.set(Some(Box::new(move |step, page| {
+                if page == at {
+                    match (step, then) {
+                        (1, _) => set_protection(page, first),
+                        (2, Some(protection)) => set_protection(page, protection),
+                        _ => {}
+                    }
+                }
+            })));
+            let mut read = [0xeeu8; 64];
+            let zeros = read_title(read.as_mut_ptr(), at, 64);
+            GUARD_AGAIN.set(None);
+            let case = format!("{first:#x}, then {then:x?}");
+            assert_eq!(met_on(at), 1, "{case}");
+            assert_eq!(protection(at), left, "the title's: {case}");
+            // The bytes the kernel's copy gives for the page as left.
+            let guard = left & PAGE_GUARD != 0;
+            assert_eq!(zeros, if guard { 64 } else { 0 }, "{case}");
+            for (i, &b) in read.iter().enumerate() {
+                assert_eq!(b, if guard { 0 } else { pattern(i) }, "byte {i}: {case}");
+            }
+            free_pages(at, 1);
+        }
+    }
+
+    /// No guard goes back over a change of the page under way, nor on
+    /// another allocation (the Codex review of 84a92e6). A plain read meets
+    /// a guard put around XTP's hooks on a page it had read whole, and
+    /// between [`guard_again`]'s query and its call the title changes the
+    /// page: its `VirtualProtect`, whose hook waits for the read (the
+    /// protection is the title's after it, put over what the fault left, no
+    /// guard of ours); a free and a commit again at the same address, whose
+    /// report is under way (the page stays as committed); another
+    /// allocation there, around the hooks (the guard put on it is taken
+    /// off).
+    #[test]
+    fn the_guard_goes_back_neither_over_a_change_nor_on_another_allocation() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_GUARD,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        /// The title's other thread, its change waiting for the read.
+        static TITLE: Mutex<Option<std::thread::JoinHandle<u32>>> = Mutex::new(None);
+        let _learned = learned();
+        for case in ["protect", "recommit", "reallocate"] {
+            // The first page of the second 64 KiB of a reservation of two.
+            // SAFETY: a fresh reservation of ours.
+            let base =
+                unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) }
+                    as usize;
+            assert_ne!(base, 0);
+            let at = base + PAGE;
+            // SAFETY: inside the reservation.
+            let committed =
+                unsafe { VirtualAlloc(at as *const _, KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE) };
+            assert!(!committed.is_null());
+            set_title(at, KERNEL_PAGE, 0x5c);
+            PAGES.forget(base, 2 * PAGE);
+            MET.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|&page| page != at);
+            known(at, KERNEL_PAGE);
+            set_protection(at, PAGE_READWRITE | PAGE_GUARD);
+            // On the faulting thread, after the guard's query (no assertion
+            // there: it runs in the handler).
+            GUARD_AGAIN.set(Some(Box::new(move |step, page| {
+                if page != at || step != 1 {
+                    return;
+                }
+                let title = match case {
+                    "protect" => std::thread::spawn(move || title_protect(page, PAGE_EXECUTE_READ)),
+                    "recommit" => {
+                        // SAFETY: the test's page; nothing else uses it.
+                        unsafe {
+                            VirtualFree(page as *mut _, KERNEL_PAGE, MEM_DECOMMIT);
+                            VirtualAlloc(page as *const _, KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE);
+                        }
+                        std::thread::spawn(move || {
+                            crate::watch::title_memory_remapped(page, KERNEL_PAGE);
+                            0
+                        })
+                    }
+                    _ => {
+                        // SAFETY: the test's reservation, released, then one
+                        // of its own at the page.
+                        unsafe {
+                            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+                            VirtualAlloc(
+                                page as *const _,
+                                KERNEL_PAGE,
+                                MEM_RESERVE | MEM_COMMIT,
+                                PAGE_READWRITE,
+                            );
+                        }
+                        return;
+                    }
+                };
+                *lock(&TITLE) = Some(title);
+                // Its change is under way, waiting for this read.
+                while !changing_over(page, KERNEL_PAGE) {
+                    std::thread::yield_now();
+                }
+            })));
+            let mut read = [0xeeu8; 64];
+            let zeros = read_title(read.as_mut_ptr(), at, 64);
+            GUARD_AGAIN.set(None);
+            let title = lock(&TITLE).take().map(|title| title.join().unwrap());
+            assert_eq!(met_on(at), 1, "{case}");
+            assert_eq!(zeros, 0, "{case}");
+            let (left, byte) = match case {
+                "protect" => (PAGE_EXECUTE_READ, 0x5c),
+                _ => (PAGE_READWRITE, 0),
+            };
+            assert_eq!(protection(at), left, "no guard of ours: {case}");
+            assert!(read.iter().all(|&b| b == byte), "{case}");
+            if case == "protect" {
+                assert_eq!(
+                    title,
+                    Some(PAGE_READWRITE),
+                    "under the title's call, what the fault left"
+                );
+            }
+            let first = if case == "reallocate" { at } else { base };
+            // SAFETY: the test's reservation, which nothing uses now.
+            assert_ne!(unsafe { VirtualFree(first as *mut _, 0, MEM_RELEASE) }, 0);
+            PAGES.forget(base, 2 * PAGE);
+        }
+    }
+
+    /// The Codex review of 84a92e6's interleaving, with a title handler
+    /// ahead of XTP's that knows its guard page by address alone: reads have
+    /// read the page whole, the title guards it (its `VirtualProtect`), a
+    /// fill reads it. The fill takes the kernel's copy (zeros for the page),
+    /// the title's handler sees no fault of it, and the guard stays for the
+    /// title's own access, which raises its alarm. Before, the fill's plain
+    /// load raised the title's alarm in its place, read the page's bytes and
+    /// left the guard off.
+    #[test]
+    fn a_fill_after_the_title_guards_a_page_read_before_raises_none_of_its_alarms() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use windows_sys::Win32::Foundation::STATUS_GUARD_PAGE_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+            EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READWRITE};
+        static PAGE_AT: AtomicUsize = AtomicUsize::new(0);
+        static REPORTED: AtomicUsize = AtomicUsize::new(0);
+        /// The title's handler: a guard fault in its page is its alarm,
+        /// whatever instruction made it.
+        unsafe extern "system" fn title(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched.
+            let r = unsafe { &*(*info).ExceptionRecord };
+            if r.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION
+                && r.NumberParameters >= 2
+                && r.ExceptionInformation[1] & !(KERNEL_PAGE - 1) == PAGE_AT.load(Relaxed)
+            {
+                REPORTED.fetch_add(1, Relaxed);
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            }
+        }
+        let _learned = learned();
+        let at = kernel_pages(1);
+        PAGE_AT.store(at, Relaxed);
+        let mut read = [0xeeu8; 64];
+        assert_eq!(read_title(read.as_mut_ptr(), at + 64, 64), 0);
+        assert_eq!(
+            PAGES.readable(at, KERNEL_PAGE),
+            KERNEL_PAGE,
+            "plain loads next"
+        );
+        // XTP's handler first, so that the title's comes ahead of it.
+        install();
+        // SAFETY: removed below; it takes only the faults of its page.
+        let handler = unsafe { AddVectoredExceptionHandler(1, Some(title)) };
+        assert_eq!(
+            title_protect(at, PAGE_READWRITE | PAGE_GUARD),
+            PAGE_READWRITE
+        );
+        read.fill(0xee);
+        let zeros = read_title(read.as_mut_ptr(), at + 64, 64);
+        let (reported, guarded) = (REPORTED.load(Relaxed), protection(at));
+        // SAFETY: a committed page; its guard goes to the title's handler.
+        std::hint::black_box(unsafe { (at as *const u8).read_volatile() });
+        // SAFETY: the handler added above.
+        unsafe { RemoveVectoredExceptionHandler(handler) };
+        assert_eq!(reported, 0, "the title's handler saw no fault of the fill");
+        assert_eq!((zeros, read), (64, [0; 64]), "the kernel's copy");
+        assert_eq!(guarded, PAGE_READWRITE | PAGE_GUARD, "the guard stays");
+        assert_eq!(
+            REPORTED.load(Relaxed),
+            1,
+            "the title's access raised its alarm"
+        );
+        assert_eq!(met_on(at), 0, "XTP's handler saw no fault either");
+        assert_eq!(protection(at), PAGE_READWRITE);
+        free_pages(at, 1);
+    }
+
+    /// With a census (`XTP_COPYBACK_CENSUS=1`), plain loads still read only
+    /// pages reads have read whole (or the census guarded), so a title's
+    /// guard page is met no more than without it: one the title guarded
+    /// before any read, or after one (its `VirtualProtect`), never; one
+    /// guarded around XTP's hooks after a read, once, and the kernel's copy
+    /// reads it from then on. Before (the Codex review of 84a92e6), a census
+    /// let plain loads read every page, those a guard was met in too. In a
+    /// process of its own: the census's mode is the process's.
+    #[test]
+    fn the_census_leaves_the_titles_guard_pages_to_the_kernels_copy() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READWRITE};
+        const P: usize = KERNEL_PAGE;
+        let test = "shadow::tests::the_census_leaves_the_titles_guard_pages_to_the_kernels_copy";
+        alone(test, || {
+            CENSUS.store(2, Ordering::SeqCst);
+            assert_eq!(census::mode(), 1);
+            let guarded = PAGE_READWRITE | PAGE_GUARD;
+            for (case, met) in [
+                ("before any read", 0),
+                ("by the title after a read", 0),
+                ("around the hooks after a read", 1),
+            ] {
+                let at = kernel_pages(3);
+                let mut read = vec![0xeeu8; 3 * P];
+                if case == "before any read" {
+                    set_protection(at + P, guarded);
+                } else {
+                    assert_eq!(read_title(read.as_mut_ptr(), at, 3 * P), 0);
+                    if case == "by the title after a read" {
+                        title_protect(at + P, guarded);
+                    } else {
+                        set_protection(at + P, guarded);
+                    }
+                }
+                for _ in 0..3 {
+                    read.fill(0xee);
+                    // SAFETY: the vector covers the destination.
+                    unsafe { fill_upload(read.as_mut_ptr(), at, 3 * P) };
+                    for (i, &b) in read.iter().enumerate() {
+                        let want = if (P..2 * P).contains(&i) {
+                            0
+                        } else {
+                            pattern(i)
+                        };
+                        assert_eq!(b, want, "byte {i}: {case}");
+                    }
+                    assert_eq!(protection(at + P), guarded, "{case}");
+                }
+                assert_eq!(met_on(at + P), met, "{case}");
+                free_pages(at, 3);
+            }
+            CENSUS.store(0, Ordering::SeqCst);
+        });
+    }
+
+    /// Un remplissage vide ne lit ni n’écrit rien, même depuis une page
+    /// illisible ou gardée, ou l’adresse 0, vers une destination factice.
+    #[test]
+    fn an_empty_fill_touches_nothing() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE};
+        let at = kernel_pages(2);
+        set_protection(at, PAGE_NOACCESS);
+        set_protection(at + KERNEL_PAGE, PAGE_READWRITE | PAGE_GUARD);
+        let nowhere = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        for src in [0, at, at + 100, at + KERNEL_PAGE, at + KERNEL_PAGE + 100] {
+            // SAFETY: rien à écrire.
+            unsafe { fill_upload(nowhere, src, 0) };
+        }
+        assert_eq!(protection(at + KERNEL_PAGE), PAGE_READWRITE | PAGE_GUARD);
+        free_pages(at, 2);
+    }
+
+    /// `XTP_SHADOW_ONCE=0` ramène la copie du noyau d’avant W1 pour les
+    /// remplissages aussi : aucune copie directe, les octets du noyau. Dans
+    /// un processus à lui, où la variable est lue à nouveau.
+    #[test]
+    fn fills_take_the_kernels_copy_with_shadow_once_off() {
+        use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+        let test = "shadow::tests::fills_take_the_kernels_copy_with_shadow_once_off";
+        alone_with(test, &[("XTP_SHADOW_ONCE", "0")], || {
+            assert!(!once() && !plain());
+            let at = kernel_pages(3);
+            set_protection(at + KERNEL_PAGE, PAGE_NOACCESS);
+            let (start, len) = (0x40, 3 * KERNEL_PAGE - 0x80);
+            let mut filled = vec![0xeeu8; len];
+            TITLE_READS.set(0);
+            // SAFETY: le vecteur couvre la destination.
+            unsafe { fill_upload(filled.as_mut_ptr(), at + start, len) };
+            assert_eq!(TITLE_READS.get(), 0, "aucune copie directe");
+            for (i, &b) in filled.iter().enumerate() {
+                let i = start + i;
+                let unreadable = (KERNEL_PAGE..2 * KERNEL_PAGE).contains(&i);
+                assert_eq!(b, if unreadable { 0 } else { pattern(i) }, "octet {i}");
+            }
+        });
+    }
+
+    /// Un remplissage lit une copie en retour encore en attente (vues sans
+    /// accès jusqu’au premier toucher) par le gestionnaire, sans apprendre sa
+    /// clé (`crate::watch::read_fault`, `learn` faux) : les octets du GPU, pas
+    /// des zéros. De même à cheval sur deux pages en attente ; pendant que
+    /// d’autres copies en retour publient à côté de sa plage (les octets de
+    /// la plage ne changent pas : pas de mélange d’avant et d’après une
+    /// fusion) ; verrou des gardes tenu par un autre thread (le remplissage
+    /// l’attend) ; et verrou empoisonné (la copie du noyau épingle la page et
+    /// la relit). Dans un processus à lui : la consultation des vues de xmem
+    /// est la sienne.
+    #[test]
+    fn fills_read_pending_copy_backs_whatever_the_guards_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let test = "shadow::tests::fills_read_pending_copy_backs_whatever_the_guards_lock";
+        /// Ce que fait la prochaine consultation des vues, verrou des gardes
+        /// tenu : 1 le garder 200 ms, 2 paniquer (il est alors empoisonné).
+        static NEXT: AtomicU8 = AtomicU8::new(0);
+        static HELD: AtomicBool = AtomicBool::new(false);
+        static LEFT: AtomicBool = AtomicBool::new(false);
+        /// Les adresses de blocs qui montrent la même page, comme l’index de
+        /// xmem.
+        static SAME: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        fn other_views(range: std::ops::Range<usize>, out: &mut Vec<(usize, usize)>) {
+            match NEXT.swap(0, SeqCst) {
+                1 => {
+                    HELD.store(true, SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    LEFT.store(true, SeqCst);
+                }
+                2 => panic!("une panique, verrou des gardes tenu"),
+                _ => {}
+            }
+            for &(a, b) in SAME.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                for (at, other) in [(a, b), (b, a)] {
+                    if range.contains(&at) {
+                        out.push((at, other));
+                    }
+                }
+            }
+        }
+        alone(test, || {
+            let Some(gpu) = crate::testgpu::device(test) else {
+                return;
+            };
+            let host = gpu.host();
+            let local = tempfile::tempdir().unwrap();
+            crate::configure_copy_back(Some(local.path().join("fills.v1")));
+            // Avant celle du montage : la première posée reste.
+            crate::watch::set_alias_lookup(other_views);
+            let elsewhere = kernel_pages(PAGE / KERNEL_PAGE);
+            crate::watch::tests::with_physical_views(|at, alias, _private| {
+                SAME.lock()
+                    .unwrap()
+                    .extend((0..4).map(|k| (at + k * PAGE, alias + k * PAGE)));
+                register(1, at as u64, (4 * PAGE) as u64);
+                let s = find(at as u64, (4 * PAGE) as u64).unwrap();
+                s.update(at, 4 * PAGE);
+                let publish = |address: usize, byte: u8| {
+                    let id = submission();
+                    s.writing_by(id, address, PAGE, 123);
+                    s.set_host(address + 7, 1, byte);
+                    s.copy_back(id, address, PAGE)
+                };
+                let fill = |from: usize, len: usize| {
+                    let mut bytes = vec![0xeeu8; len];
+                    // SAFETY: le vecteur couvre la destination.
+                    unsafe { fill_upload(bytes.as_mut_ptr(), from, len) };
+                    bytes
+                };
+                // `len` octets à zéro, sauf `byte` à l’index `at`.
+                let one = |len: usize, at: usize, byte: u8| {
+                    let mut bytes = vec![0u8; len];
+                    bytes[at] = byte;
+                    bytes
+                };
+
+                assert_eq!(publish(at + PAGE, 0xa1), 0, "en attente");
+                assert!(fill(at + PAGE, PAGE) == one(PAGE, 7, 0xa1));
+                assert_eq!(
+                    publish(at + PAGE, 0xa2),
+                    0,
+                    "un remplissage n’apprend pas la clé"
+                );
+                assert!(
+                    fill(alias + PAGE, PAGE) == one(PAGE, 7, 0xa2),
+                    "l’autre vue"
+                );
+
+                // À cheval sur deux pages en attente.
+                assert_eq!(publish(at, 0x51), 0);
+                assert_eq!(publish(at + PAGE, 0xa3), 0);
+                assert!(fill(at + 16, PAGE) == one(PAGE, PAGE - 16 + 7, 0xa3));
+
+                // D’autres copies en retour publient à côté de la plage
+                // `[at + 16, at + PAGE + 4)` pendant qu’elle est remplie.
+                let done = AtomicBool::new(false);
+                let mut fills = 0;
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        for i in 0..200u8 {
+                            publish(at + usize::from(i % 2) * PAGE, i | 1);
+                        }
+                        done.store(true, SeqCst);
+                    });
+                    while !done.load(SeqCst) {
+                        assert!(fill(at + 16, PAGE - 12) == vec![0; PAGE - 12]);
+                        fills += 1;
+                    }
+                });
+                println!("{fills} remplissages pendant 200 publications");
+
+                // Verrou des gardes tenu par un autre thread : le
+                // remplissage l’attend.
+                assert_eq!(publish(at + 2 * PAGE, 0xb1), 0);
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        NEXT.store(1, SeqCst);
+                        crate::watch::title_memory_remapped(elsewhere, PAGE);
+                    });
+                    while !HELD.load(SeqCst) {
+                        std::thread::yield_now();
+                    }
+                    let held = !LEFT.load(SeqCst);
+                    assert!(fill(at + 2 * PAGE, PAGE) == one(PAGE, 7, 0xb1));
+                    assert!(!held || LEFT.load(SeqCst), "fini une fois le verrou rendu");
+                });
+
+                // Verrou des gardes empoisonné : le gestionnaire renonce, la
+                // copie du noyau épingle la page et la relit.
+                assert_eq!(publish(at + 3 * PAGE, 0xc1), 0);
+                NEXT.store(2, SeqCst);
+                let poisoned = std::panic::catch_unwind(|| {
+                    crate::watch::title_memory_remapped(elsewhere, PAGE);
+                });
+                assert!(poisoned.is_err());
+                assert!(
+                    fill(at + 3 * PAGE, PAGE) == one(PAGE, 7, 0xc1),
+                    "pas des zéros"
+                );
+
+                // The lock still poisoned, a pending view next to a view no
+                // access is for, in one region without access: the kernel's
+                // copy reads them by 4 KiB page, the GPU's bytes of the
+                // pending one, zeros for the other. Before, the read of the
+                // whole region failed after pinning, and zeroed both.
+                assert_eq!(publish(at + 3 * PAGE, 0xc2), 0);
+                let forbidden = at + 2 * PAGE;
+                let protect = |protection: u32| {
+                    let mut old = 0;
+                    // SAFETY: a block of the test's view.
+                    let done = unsafe {
+                        windows_sys::Win32::System::Memory::VirtualProtect(
+                            forbidden as *const _,
+                            PAGE,
+                            protection,
+                            &mut old,
+                        )
+                    };
+                    assert_ne!(done, 0);
+                    old
+                };
+                let old = protect(windows_sys::Win32::System::Memory::PAGE_NOACCESS);
+                let (from, len) = (forbidden + 0x100, 2 * PAGE - 0x100);
+                assert!(
+                    fill(from, len) == one(len, PAGE - 0x100 + 7, 0xc2),
+                    "the pending view's bytes, zeros for its neighbour"
+                );
+                protect(old);
+                SAME.lock().unwrap().clear();
+                host.drain();
+                unregister(1, at as u64);
+            });
+        });
+    }
+
+    /// Mesure (`--ignored --nocapture`) : des remplissages de tailles
+    /// courantes, par la copie du noyau (`ReadProcessMemory`, avant
+    /// 0751149) puis par lectures directes, vers de la mémoire en cache, de
+    /// la mémoire combinée en écriture (`PAGE_WRITECOMBINE`, comme le tas
+    /// d’upload d’un GPU discret) et un tampon d’upload de l’appareil de
+    /// test. VIctory #1010 prévient que `rep movsb` vers de la mémoire
+    /// combinée en écriture est lent sur certains processeurs.
+    #[test]
+    #[ignore = "benchmark"]
+    fn fills_cost() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_WRITECOMBINE, VirtualAlloc,
+        };
+        const LEN: usize = 4 << 20;
+        let test = "shadow::tests::fills_cost";
+        let gpu = crate::testgpu::device(test);
+        let src = kernel_pages(LEN / KERNEL_PAGE);
+        let mut cached = vec![0u8; LEN];
+        // SAFETY: une réservation neuve, à nous, jamais libérée.
+        let combined = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE | PAGE_WRITECOMBINE,
+            )
+        } as *mut u8;
+        assert!(!combined.is_null());
+        let upload = gpu
+            .as_ref()
+            .and_then(|gpu| gpu.host().upload_buffer(LEN as u64));
+        let mut destinations = vec![
+            ("en cache", cached.as_mut_ptr()),
+            ("combinée en écriture", combined),
+        ];
+        if let Some((_, data)) = &upload {
+            destinations.push(("tampon d’upload", *data));
+        }
+        println!(
+            "BENCH {}; remplissages directs : {}",
+            std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default(),
+            plain()
+        );
+        for (name, dst) in destinations {
+            for size in [64usize, 256, 1024, 4096, 64 << 10] {
+                let count = ((32 << 20) / size).clamp(2_000, 200_000);
+                let mut ns = [0f64; 2];
+                for (k, kernel) in [true, false].into_iter().enumerate() {
+                    let mut best = f64::MAX;
+                    for _ in 0..5 {
+                        let started = std::time::Instant::now();
+                        for i in 0..count {
+                            let at = (i * size * 7) % (LEN - size) / 64 * 64;
+                            // SAFETY: dans les deux zones de LEN octets.
+                            let (to, from) = (unsafe { dst.add(at) }, src + at);
+                            if kernel {
+                                crate::host::copy_mapped(to, from as *const u8, size, false);
+                            } else {
+                                read_title(to, from, size);
+                            }
+                        }
+                        best = best.min(started.elapsed().as_secs_f64() * 1e9 / count as f64);
+                    }
+                    ns[k] = best;
+                }
+                println!(
+                    "BENCH {name:>22}, {size:>6} o : noyau {:>9.0} ns ({:>5.2} Go/s), \
+                     direct {:>9.0} ns ({:>5.2} Go/s), gain x{:.1}",
+                    ns[0],
+                    size as f64 / ns[0],
+                    ns[1],
+                    size as f64 / ns[1],
+                    ns[0] / ns[1]
+                );
+            }
+        }
+        drop(upload);
     }
 
     /// The copy-back's scans by 8 bytes find what the byte loop found: the
@@ -4903,6 +6637,7 @@ mod tests {
     #[test]
     fn a_copy_back_keeps_the_readable_pieces_of_a_run() {
         let test = "shadow::tests::a_copy_back_keeps_the_readable_pieces_of_a_run";
+        let _learned = learned();
         let Some(_gpu) = crate::testgpu::device(test) else {
             return;
         };
@@ -4943,6 +6678,7 @@ mod tests {
     #[test]
     fn a_copy_back_run_keeps_title_writes_made_after_its_read() {
         let test = "shadow::tests::a_copy_back_run_keeps_title_writes_made_after_its_read";
+        let _learned = learned();
         let Some(_gpu) = crate::testgpu::device(test) else {
             return;
         };
@@ -5127,6 +6863,7 @@ mod tests {
             MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         const LAG_BYTES: usize = 0x40;
+        let _learned = learned();
         let len = 4 * PAGE;
         // SAFETY: a fresh reservation of our own, never freed.
         let base = unsafe {
@@ -5142,6 +6879,8 @@ mod tests {
             // SAFETY: the test's memory.
             unsafe { ((base + i) as *mut u8).write((i * 13 + 5) as u8) };
         }
+        // Read whole before (plain loads read it), then unmapped in part.
+        known(base, len);
         unmap(base + 2 * PAGE, PAGE);
         let (mut ours, mut kernel) = (vec![0xeeu8; len], vec![0xeeu8; len]);
         LAG.set(LAG_BYTES);
@@ -5150,8 +6889,10 @@ mod tests {
         crate::host::copy_mapped(kernel.as_mut_ptr(), base as *const u8, len, false);
         assert!(ours == kernel, "as the kernel's copy");
         assert_eq!(zeros, PAGE);
-        // A copy-back's read (with plain copies).
+        // A copy-back's read (with plain copies; the read above sent the
+        // unmapped page to the kernel's copy: as if read before again).
         if plain() {
+            known(base, len);
             LAG.set(LAG_BYTES);
             let mut read = vec![0u8; len];
             assert_eq!(
@@ -5199,9 +6940,9 @@ mod tests {
             assert!(writable(view + PAGE), "the guard opened the block");
             assert!(!writable(view), "and only it");
             // Noted written, as the guard's handler notes a write.
-            let (now, written) = crate::watch::writes(view, view + 2 * PAGE, true).unwrap();
-            assert!(written.contains(&(view / PAGE + 1, now)));
-            assert!(!written.contains(&(view / PAGE, now)));
+            let now = crate::watch::writes(view, view + 2 * PAGE, true).unwrap();
+            assert_eq!(crate::watch::last_write(view / PAGE + 1), now);
+            assert_ne!(crate::watch::last_write(view / PAGE), now);
         });
     }
 

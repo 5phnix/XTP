@@ -1,5 +1,5 @@
-//! Mesh programs: the output counts and the primitives no lane exports
-//! (the prologue), the thread index in the group, and what a console wave64
+//! Mesh programs: the output counts, the initial primitive for each lane,
+//! the thread index in the group, and what a console wave64
 //! program needs on a host without 64-lane waves. Backlog G2 (merged ES +
 //! GS as one mesh shader) and L4.
 //!
@@ -100,8 +100,8 @@ impl<'a> Lower<'a> {
     /// Mesh: the counts and the primitives no lane exports. The console's
     /// counts come from one lane's allocation request, which DXIL cannot
     /// express (one call, dominating every output write).
-    // shortcut: the counts are the declared maxima and each lane first culls
-    // its primitive (all indices 0, zero area), so primitives past the
+    // shortcut: the counts are the declared maxima and each lane starts with
+    // a degenerate primitive (all indices 0, zero area), so primitives past the
     // program's count are culled and vertices past it unused; this costs
     // the host the unused vertex and primitive slots. Pass the program's own
     // counts if that shows in frame time.
@@ -137,19 +137,10 @@ impl<'a> Lower<'a> {
         );
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
-        let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
-        let at = self.begin_guarded(guard);
-        let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
-        self.end_guarded(at, &[]);
+        let slot = self.s.m.local_i32(e);
+        let zero = self.s.m.i32(0);
+        self.s.m.store(e, slot, zero);
+        self.mesh_primitive = Some(slot);
         Ok(())
     }
 

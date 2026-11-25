@@ -528,17 +528,16 @@ fn draw_flat(native: &NativeProgram, size: (u32, u32)) -> Option<(Target, String
         eprintln!("no SM 6.6 device; skipped");
         return None;
     };
+    Some(draw_flat_on(&host, native, size))
+}
+
+pub(super) fn draw_flat_on(
+    host: &Host,
+    native: &NativeProgram,
+    size: (u32, u32),
+) -> (Target, String, Vec<[f32; 4]>) {
     let target = host.target();
-    let ms_sig = crate::dxbc::build(&[(
-        crate::FourCC::OSG1,
-        &super::container::signature(
-            &[
-                element("SV_Position", 3, 0, 15),
-                element("TEXCOORD", 0, 1, 15),
-            ],
-            false,
-        ),
-    )]);
+    let (ms, ops) = translate_flat_mesh(native, target);
     let ps_sig = crate::dxbc::build(&[
         (
             crate::FourCC::ISG1,
@@ -555,9 +554,7 @@ fn draw_flat(native: &NativeProgram, size: (u32, u32)) -> Option<(Target, String
             &super::container::signature(&[element("SV_Target", 16, 0, 15)], false),
         ),
     ]);
-    let ms_c = crate::Container::parse(&ms_sig).unwrap();
     let ps_c = crate::Container::parse(&ps_sig).unwrap();
-    let (ms, ops) = translate(native, &ms_c, target).unwrap();
     let (ps, _) = translate(&flat_pixel(), &ps_c, target).unwrap();
     let (root, pso) = host.mesh_pipeline(&ms, &ps).unwrap();
     let texels = host
@@ -576,7 +573,21 @@ fn draw_flat(native: &NativeProgram, size: (u32, u32)) -> Option<(Target, String
         )
         .unwrap();
     eprintln!("{target:?}: {} texels drawn", texels.len());
-    Some((target, ops, texels))
+    (target, ops, texels)
+}
+
+pub(super) fn translate_flat_mesh(native: &NativeProgram, target: Target) -> (HostShader, String) {
+    let sig = crate::dxbc::build(&[(
+        crate::FourCC::OSG1,
+        &super::container::signature(
+            &[
+                element("SV_Position", 3, 0, 15),
+                element("TEXCOORD", 0, 1, 15),
+            ],
+            false,
+        ),
+    )]);
+    translate(native, &crate::Container::parse(&sig).unwrap(), target).unwrap()
 }
 
 /// [`drawn_mesh`] drawn into 63 x 2 texels on the test adapter, for the
@@ -653,19 +664,19 @@ fn the_loop_limit_drain_of_mesh_programs() {
 }
 
 /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
-const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+pub(super) const TRIANGLE: u32 = 1 << 10 | 2 << 20;
 /// The corners' edge flags (bits 9, 19 and 29).
-const EDGE_FLAGS: u32 = 1 << 9 | 1 << 19 | 1 << 29;
+pub(super) const EDGE_FLAGS: u32 = 1 << 9 | 1 << 19 | 1 << 29;
 /// The culling bit.
-const CULL: u32 = 1 << 31;
+pub(super) const CULL: u32 = 1 << 31;
 
 /// Ported from Marvisak/VIctory#1718 (head c0228d9) by tjthebigbearcat-hub:
-/// a wave32 mesh program of 32 lanes, each exporting primitive `prim` and,
+/// a wave32 mesh program of 32 lanes, each exporting the words in `primitives` and,
 /// as vertex `lane`, the position (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1,
 /// 0.5, 1), so that triangle (0, 1, 2) covers the whole target, with the
 /// attribute (1, 0.5, 0.25, 1).
-fn triangle_mesh(prim: u32) -> NativeProgram {
-    let words = [
+pub(super) fn triangle_mesh(primitives: &[u32]) -> NativeProgram {
+    let mut words = vec![
         0xD765_0001,
         0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
         0x3604_0281, // v_and_b32 v2, 1, v1
@@ -687,12 +698,12 @@ fn triangle_mesh(prim: u32) -> NativeProgram {
         0x0706_0504, // exp pos0, v4, v5, v6, v7 done
         0xF800_020F,
         0x0D0C_0B0A, // exp param0, v10, v11, v12, v13
-        0x7E12_02FF,
-        prim, // v_mov_b32 v9, prim
-        0xF800_0941,
-        0x0000_0009, // exp prim, v9, off, off, off done
-        S_ENDPGM,
     ];
+    for (i, &packed) in primitives.iter().enumerate() {
+        let done = u32::from(i + 1 == primitives.len()) << 11;
+        words.extend([0x7E12_02FF, packed, 0xF800_0141 | done, 9]);
+    }
+    words.push(S_ENDPGM);
     NativeProgram {
         stage: crate::HwStage::Ms,
         wave64: false,
@@ -728,7 +739,7 @@ fn triangle_mesh(prim: u32) -> NativeProgram {
 /// past the program's 32.) Each module is checked by dxil.dll where it is.
 #[test]
 fn edge_flagged_triangles_draw_as_unflagged_ones() {
-    let text: Vec<String> = crate::gfx10::decode(&triangle_mesh(TRIANGLE).code)
+    let text: Vec<String> = crate::gfx10::decode(&triangle_mesh(&[TRIANGLE]).code)
         .unwrap()
         .iter()
         .map(|i| i.text(false))
@@ -747,7 +758,7 @@ fn edge_flagged_triangles_draw_as_unflagged_ones() {
         (TRIANGLE | EDGE_FLAGS, false),
         (TRIANGLE | EDGE_FLAGS | CULL, true),
     ] {
-        let Some((target, _, texels)) = draw_flat(&triangle_mesh(prim), (16, 16)) else {
+        let Some((target, _, texels)) = draw_flat(&triangle_mesh(&[prim]), (16, 16)) else {
             return;
         };
         let lit = texels.iter().filter(|t| t[3] != 0.0).count();

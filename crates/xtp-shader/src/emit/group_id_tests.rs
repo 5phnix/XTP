@@ -1,4 +1,4 @@
-//! Sonde des collisions d'identifiants signalées par 0xkn0wh3r3 (VIctory #2126).
+//! Probe for the identifier collisions reported by 0xkn0wh3r3 (VIctory #2126).
 
 use super::host::{Dispatch, Host, Root, View};
 use super::tests::{compute, emit_for};
@@ -39,7 +39,7 @@ fn probe(width: u32, height: u32, wave32: bool) -> crate::NativeProgram {
         slot: 0,
     });
     p.io = StageIo::Cs(ComputeIo {
-        rsrc2: 1 << 1 | 1 << 11, // Table en s0, coordonnées locales en v0 et v1.
+        rsrc2: 1 << 1 | 1 << 11, // Table in s0, local coordinates in v0 and v1.
         threads: [width, height, 1],
     });
     p
@@ -67,8 +67,8 @@ fn check(host: &Host, wave32: bool) {
                 },
             )
             .unwrap();
-        // Chaque thread écrit une fois. Les n cases doivent donc toutes être
-        // écrites, y compris la case zéro. Les bits hauts vérifient aussi la lane.
+        // Each thread writes once. So all n slots must be written, slot zero
+        // included. The high bits also check the lane.
         let wrong = (0..n)
             .filter(|&i| {
                 let lane = if wave32 { i % 32 } else { 0 };

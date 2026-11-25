@@ -52,6 +52,12 @@
 //!   descriptors (1,024 world compute programs, ray-tracing material
 //!   resolves) read raw views this way.
 //!
+//! * **Loop-limit counter** (with [`loop_count`]): a root UAV `u0` in
+//!   [`LOOP_COUNTER_SPACE`], a raw buffer whose first dword a lane adds 1 to
+//!   where it leaves a loop at XTP's limit or budget
+//!   ([`HostShader::loop_counter`] says the shader has one). The host points
+//!   it at the pipeline's own dword (`xtp-gpu`'s `loopstat`).
+//!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
 //!   host's view at that index must be an R32 integer view (64-bit atomics
@@ -96,20 +102,30 @@ mod input_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 #[cfg(all(test, windows))]
+mod lightloop_tests;
+#[cfg(all(test, windows))]
 mod limits_tests;
+#[cfg(all(test, windows))]
+mod literal64_tests;
 #[cfg(all(test, windows))]
 mod loop_limit_tests;
 #[cfg(all(test, windows))]
 mod mask_tests;
 #[cfg(all(test, windows))]
 mod mesh_tests;
+#[cfg(all(test, windows))]
+mod meshidx_tests;
 // IR to DXIL, one file per encoding or concern: which backlog item of
 // docs/analysis/shader.md edits which file is at the top of `lower/mod.rs`.
 pub(crate) mod lower;
 #[cfg(all(test, windows))]
 mod r1_tests;
 #[cfg(all(test, windows))]
+mod r4_tests;
+#[cfg(all(test, windows))]
 mod raw_tests;
+#[cfg(all(test, windows))]
+mod rayquery_tests;
 pub mod rect_gs;
 mod sampler;
 #[cfg(test)]
@@ -143,7 +159,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::opt::dxil_opt;
 pub(crate) use lower::geometry::GsShape;
+/// The root SRV register of an inline ray query's acceleration structure.
+pub use lower::rayquery::TLAS_REGISTER;
 pub use sampler::StaticSampler;
+pub use shader::LOOP_COUNTER_SPACE;
 pub use shader::{
     ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
 };
@@ -239,6 +258,50 @@ fn parse_loop_budget(value: Option<&str>) -> u32 {
             None => v.parse().ok(),
         })
         .unwrap_or(DEFAULT_LOOP_BUDGET)
+}
+
+/// Whether a lane that leaves a loop at XTP's limit (the loop limit, the
+/// spin-wait limit, a counted loop's) or at the budget adds itself to its
+/// pipeline's loop-limit counter ([`LOOP_COUNTER_SPACE`]) before it leaves:
+/// `XTP_SHADER_LOOP_COUNT` set to anything but `0` or nothing, in every
+/// build, read once (or [`with_loop_count`] on this thread). `xtp-gpu`
+/// binds each counting pipeline's dword and reads the counts per frame and
+/// per pipeline into the frame line (`loopstat`). Off (the default), a
+/// translation is byte for byte what it is without the counter. On, a
+/// program with a limited loop declares the counter, and each stopped lane
+/// costs an atomic. The switch is part of the translation, so the shader
+/// cache must key on it (`xtp-gpu`'s does).
+pub fn loop_count() -> bool {
+    if LOOP_COUNT_HERE.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_loop_count(std::env::var_os("XTP_SHADER_LOOP_COUNT").as_deref()))
+}
+
+/// Whether `XTP_SHADER_LOOP_COUNT`'s value turns [`loop_count`] on: set,
+/// and neither empty nor `0`. Pure, for testing.
+fn parse_loop_count(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+thread_local! {
+    /// [`with_loop_count`] is running on this thread.
+    static LOOP_COUNT_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with [`loop_count`] on for the translations this thread makes
+/// in it, whatever `XTP_SHADER_LOOP_COUNT` says (tests; a shader cache
+/// keyed on the switch alone must not keep what it translates).
+pub fn with_loop_count<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOOP_COUNT_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(LOOP_COUNT_HERE.replace(true));
+    f()
 }
 
 /// `XTP_SHADER_LOOP_LIMIT`'s value; none when it is unset, unreadable or
@@ -339,6 +402,8 @@ pub const DISPATCH_THREADS: RootType = RootType::Other(0x104);
 pub const PACKED_ADDRESS_SRV: RootType = RootType::Other(0x105);
 pub const SCALAR_ADDRESS_SRV: RootType = RootType::Other(0x106);
 pub const VECTOR_ADDRESS_SRV: RootType = RootType::Other(0x107);
+/// Slot d'une SRV brute alignée, suivi en bits 0..3 du décalage de la base du titre.
+pub const INDEXED_ADDRESS_SRV: RootType = RootType::Other(0x108);
 
 /// Entries before slot 0's in the host's runtime stride table
 /// ([`StrideEntry`]): slot `i`'s entry is at `(i + STRIDE_HEADER) * 8`. The
@@ -380,6 +445,31 @@ impl HostShader {
         let at = |o: usize| crate::dxbc::u32_at(psv, o).ok();
         let (min, max) = (at(4 + 16)?, at(4 + 20)?);
         (min == max).then_some(min)
+    }
+
+    /// Whether the shader writes the loop-limit counter ([`loop_count`]):
+    /// its `PSV0` binds a raw UAV at `u0` in [`LOOP_COUNTER_SPACE`], which
+    /// the host must bind (a root UAV) for it to run.
+    pub fn loop_counter(&self) -> bool {
+        let Ok(c) = Container::parse(&self.dxil) else {
+            return false;
+        };
+        let Some(psv) = c.part(FourCC::PSV0).map(|p| p.data) else {
+            return false;
+        };
+        let at = |o: usize| crate::dxbc::u32_at(psv, o).ok();
+        // The runtime information, then the bindings: their count and size.
+        let Some(first) = at(0).map(|info| 4 + info as usize) else {
+            return false;
+        };
+        let (Some(count), Some(size)) = (at(first), at(first + 4)) else {
+            return false;
+        };
+        (0..count as usize).any(|i| {
+            let r = first + 8 + i * size as usize;
+            // PSV resource type 7: a raw UAV.
+            (at(r), at(r + 4), at(r + 8)) == (Some(7), Some(LOOP_COUNTER_SPACE), Some(0))
+        })
     }
 }
 
@@ -568,6 +658,7 @@ pub fn translate_program_for(
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)
         .map_err(|e| (Step::Decode, e))?;
     let p = lower::geometry::prepared(p, native.stage).map_err(|e| (Step::Decode, e))?;
+    let p = lower::rayquery::prepared(p, native).map_err(|e| (Step::Decode, e))?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);

@@ -45,7 +45,18 @@ fn lowered_with(
     target: Target,
     stride: u32,
 ) -> Result<super::lower::Lowered, crate::ShaderError> {
-    let used = |kind, table_offset_dwords| UsedResource {
+    let used = |kind, table_offset_dwords| table_entry(kind, table_offset_dwords, stride);
+    lowered_using(
+        words,
+        vec![used(ResourceType::Srv, 0), used(ResourceType::Uav, uav)],
+        io,
+        target,
+    )
+}
+
+/// A used-resource entry of the table at `s4` (root parameter 1).
+fn table_entry(kind: ResourceType, table_offset_dwords: u32, stride: u32) -> UsedResource {
+    UsedResource {
         kind,
         root: RootType::Table,
         table_offset_dwords,
@@ -54,7 +65,16 @@ fn lowered_with(
         dwords: 4,
         user_data: 4,
         slot: 1,
-    };
+    }
+}
+
+/// [`lowered`] with the table's used-resource entries `used`.
+fn lowered_using(
+    words: &[u32],
+    used: Vec<UsedResource>,
+    io: ComputeIo,
+    target: Target,
+) -> Result<super::lower::Lowered, crate::ShaderError> {
     let param = |root, sgprs, user_data, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -72,7 +92,7 @@ fn lowered_with(
             param(RootType::Constants, 4, 0, 0),
             param(RootType::Table, 1, 4, 1),
         ],
-        used: vec![used(ResourceType::Srv, 0), used(ResourceType::Uav, uav)],
+        used,
         io: StageIo::Cs(io),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -99,7 +119,12 @@ fn lowered_with(
 /// [`lowered`] for the target with the table, validated where `dxil.dll`
 /// is, as a host shader.
 fn shader(words: &[u32], uav: u32, io: ComputeIo) -> HostShader {
-    let mut l = lowered(words, uav, io, TABLE).expect("lowered with the table");
+    host_shader(lowered(words, uav, io, TABLE).expect("lowered with the table"))
+}
+
+/// A program lowered for the target with the table, validated where
+/// `dxil.dll` is, as a host shader.
+fn host_shader(mut l: super::lower::Lowered) -> HostShader {
     assert!(l.stride_table, "the program reads the table");
     if let Ok(mut v) =
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
@@ -197,9 +222,22 @@ fn run(
     entries: &[StrideEntry],
     groups: u32,
 ) -> Vec<Vec<u32>> {
+    run_at(host, cs, (user, 0), views, entries, groups)
+}
+
+/// [`run`] with the table at user data `table` in `s4` (a byte offset in
+/// the heap, with [`super::REMAPPED_SLOT`] for a table the host remapped).
+fn run_at(
+    host: &Host,
+    cs: &HostShader,
+    (user, table_at): ([u32; 4], u32),
+    views: &[View],
+    entries: &[StrideEntry],
+    groups: u32,
+) -> Vec<Vec<u32>> {
     let (root, pso) = host.compute_pipeline(cs).expect("a pipeline");
     let mut constants = user.to_vec();
-    constants.push(0);
+    constants.push(table_at);
     host.dispatch(
         &root,
         &pso,
@@ -825,4 +863,259 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
         assert_eq!(out[0], want, "through the table on {name}");
     }
     super::RAW_STRUCTURED_TEST.set(None);
+}
+
+/// Codex review of 244cf78, finding 1: a table the host remapped (made
+/// afresh in its dynamic slots, `draw.rs` `tables`) has one slot per
+/// descriptor up to the last its used-resource entries name, and the next
+/// such table follows it there. Reads through the stride table were
+/// bounded by the whole table: a descriptor array indexed past its table
+/// (A[2] where A has 2 slots) read the next table's first slot. Each
+/// remapped table is bounded by its own slots now, through an index known
+/// when the program runs as through a constant one; a title table (not
+/// remapped) is not: its slots are the title's own, past the entries too.
+/// Whether a table is remapped is its base's, before an index large enough
+/// to wrap the 32-bit address is added (Codex review of a090f22, point 1).
+#[test]
+fn remapped_tables_are_read_inside_their_own_slots() {
+    // The table: an unordered view at dword 0 (A[0]), a shader view at
+    // dword 8 (A[1]), the first of an array: two slots (the host makes
+    // as many).
+    let used = || {
+        vec![
+            table_entry(ResourceType::Uav, 0, 0),
+            table_entry(ResourceType::Srv, 8, 0),
+        ]
+    };
+    // Loads [s1, 4] of A[1 + s0] (no stride known) and stores it at byte 0
+    // of A[0], by offset alone.
+    let dynamic: &[u32] = &[
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0x0
+        0x8F06_8500, // s_lshl_b32 s6, s0, 5
+        0xF408_0202,
+        0x0C00_0020, // s_load_dwordx4 s[8:11], s[4:5], s6 offset:0x20
+        0x7E00_0201, // v_mov_b32 v0, s1
+        0x7E02_0284, // v_mov_b32 v1, 4
+        0xE030_3000,
+        0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xE070_1000,
+        0x8003_0205, // buffer_store_dword v2, v5, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    // The same with A[2] at a constant place.
+    let mut constant = dynamic.to_vec();
+    constant[3] = 0xBF80_0000; // s_nop 0
+    constant[5] = 0xFA00_0040; // s_load_dwordx4 s[8:11], s[4:5], 0x40
+    let shaders = [
+        (
+            "an index known when it runs",
+            host_shader(lowered_using(dynamic, used(), ONE_THREAD, TABLE).unwrap()),
+        ),
+        (
+            "a constant index",
+            host_shader(lowered_using(&constant, used(), ONE_THREAD, TABLE).unwrap()),
+        ),
+    ];
+    let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
+    // Table A in slots 0 and 1, table B after it in slots 2 and 3, as the
+    // host makes adjacent remapped tables; the raw views of A[1] and B[0]
+    // in slots 4 and 5.
+    let (raw_a, entry_a) = raw_view_of(1, 4, (0, 16, 16));
+    let (raw_b, entry_b) = raw_view_of(2, 5, (0, 16, 16));
+    let views = [
+        View::RawUav(4),
+        View::Buffer {
+            data: &a,
+            stride: Stride::Structured(16),
+        },
+        View::Buffer {
+            data: &b,
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(4),
+        raw_a,
+        raw_b,
+    ];
+    let out = StrideEntry {
+        stride: 0,
+        raw_slot: Some(0),
+        bias: 0,
+        count: 4,
+    };
+    let entries = [
+        out,
+        entry_a,
+        entry_b,
+        StrideEntry::NONE,
+        StrideEntry::NONE,
+        StrideEntry::NONE,
+    ];
+    let remapped = super::REMAPPED_SLOT << 5;
+    // [1, 4] of 16-byte elements: dword 5.
+    let (of_a, of_b) = (a[5], b[5]);
+    let (_one, hosts) = hosts();
+    for (name, host) in &hosts {
+        for (how, cs) in &shaders {
+            let read = |s0: u32, table: u32| {
+                run_at(host, cs, ([s0, 1, 0, 0], table), &views, &entries, 1)[0][0]
+            };
+            if how.starts_with("an index") {
+                assert_eq!(read(0, remapped), of_a, "A[1], remapped, {how} on {name}");
+                assert_eq!(read(1, remapped), 0, "A[2] is not B[0], {how} on {name}");
+                assert_eq!(read(2, remapped), 0, "A[3] is not B[1], {how} on {name}");
+                // Codex review of a090f22, point 1: an index of 2^26 or
+                // more moves the address by 2^31 bytes or more, and the
+                // 32-bit add wraps past the remapped base's bit 31. The
+                // table is still the remapped A: what the add leaves is
+                // not a title slot (A[1 + 2^26] at byte 0x20 read title
+                // slot 1, A's; A[2 + 2^26] at byte 0x40, title slot 2,
+                // B's B[5] = 205).
+                assert_eq!(
+                    read(0x0400_0000, remapped),
+                    0,
+                    "A[1 + 2^26] is not title slot 1, {how} on {name}"
+                );
+                assert_eq!(
+                    read(0x0400_0001, remapped),
+                    0,
+                    "A[2 + 2^26] is not title slot 2, {how} on {name}"
+                );
+                // The other way: a title table's address the add carries
+                // into bit 31 is past every title slot, not remapped slot 2.
+                assert_eq!(
+                    read(0x0400_0001, 0),
+                    0,
+                    "title A[2 + 2^26] is not remapped slot 2, {how} on {name}"
+                );
+                assert_eq!(
+                    read(1, 0),
+                    of_b,
+                    "a title table's array goes on, {how} on {name}"
+                );
+            } else {
+                assert_eq!(read(0, remapped), 0, "A[2] is not B[0], {how} on {name}");
+                assert_eq!(
+                    read(0, 0),
+                    of_b,
+                    "a title table's array goes on, {how} on {name}"
+                );
+            }
+        }
+    }
+}
+
+/// A descriptor reloaded at the same table place on every path through
+/// nested joins (A and B join before meeting C) is rebuilt from the table's
+/// address at the last join (`phi_heap_index`, 631657d). Read through the
+/// stride table, that rebuilt slot is bounded by its remapped table's own
+/// slots as a single load's is: A[2] of a remapped A of two slots is not
+/// the next table's B[0] (it read B[5] = 205); A[1] is A's, and a title
+/// table's array goes on.
+#[test]
+fn nested_joins_read_a_remapped_table_inside_its_own_slots() {
+    // The table: A[0] an unordered view, A[1] a shader view (two slots).
+    let used = || {
+        vec![
+            table_entry(ResourceType::Uav, 0, 0),
+            table_entry(ResourceType::Srv, 8, 0),
+        ]
+    };
+    // Loads A[2] on each of three paths picked by s2, reads [s1, 4] of it
+    // (no stride known) and stores it at byte 0 of A[0], by offset alone.
+    let past: &[u32] = &[
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0x0
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_0009, // s_cbranch_scc1 C
+        0xBF06_8102, // s_cmp_eq_u32 s2, 1
+        0xBF85_0003, // s_cbranch_scc1 B
+        0xF408_0202,
+        0xFA00_0040, // A: s_load_dwordx4 s[8:11], s[4:5], 0x40
+        0xBF82_0002, // s_branch inner
+        0xF408_0202,
+        0xFA00_0040, // B: s_load_dwordx4 s[8:11], s[4:5], 0x40
+        0xBF80_0000, // inner: s_nop 0
+        0xBF82_0002, // s_branch read
+        0xF408_0202,
+        0xFA00_0040, // C: s_load_dwordx4 s[8:11], s[4:5], 0x40
+        0x7E00_0201, // read: v_mov_b32 v0, s1
+        0x7E02_0284, // v_mov_b32 v1, 4
+        0xE030_3000,
+        0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xE070_1000,
+        0x8003_0205, // buffer_store_dword v2, v5, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    // The same with A[1] on every path.
+    let mut inside = past.to_vec();
+    for at in [8, 11, 15] {
+        inside[at] = 0xFA00_0020;
+    }
+    let past = host_shader(lowered_using(past, used(), ONE_THREAD, TABLE).unwrap());
+    let inside = host_shader(lowered_using(&inside, used(), ONE_THREAD, TABLE).unwrap());
+    let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
+    // As in `remapped_tables_are_read_inside_their_own_slots`: A in slots
+    // 0 and 1, B after it in slots 2 and 3, the raw views of A[1] and B[0]
+    // in slots 4 and 5.
+    let (raw_a, entry_a) = raw_view_of(1, 4, (0, 16, 16));
+    let (raw_b, entry_b) = raw_view_of(2, 5, (0, 16, 16));
+    let views = [
+        View::RawUav(4),
+        View::Buffer {
+            data: &a,
+            stride: Stride::Structured(16),
+        },
+        View::Buffer {
+            data: &b,
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(4),
+        raw_a,
+        raw_b,
+    ];
+    let out = StrideEntry {
+        stride: 0,
+        raw_slot: Some(0),
+        bias: 0,
+        count: 4,
+    };
+    let entries = [
+        out,
+        entry_a,
+        entry_b,
+        StrideEntry::NONE,
+        StrideEntry::NONE,
+        StrideEntry::NONE,
+    ];
+    let remapped = super::REMAPPED_SLOT << 5;
+    // [1, 4] of 16-byte elements: dword 5.
+    let (of_a, of_b) = (a[5], b[5]);
+    let (_one, hosts) = hosts();
+    for (name, host) in &hosts {
+        let read = |cs: &HostShader, path: u32, table: u32| {
+            run_at(host, cs, ([0, 1, path, 0], table), &views, &entries, 1)[0][0]
+        };
+        for path in 0..3 {
+            assert_eq!(
+                read(&past, path, remapped),
+                0,
+                "A[2] is not B[0], path {path} on {name}"
+            );
+        }
+        assert_eq!(
+            read(&inside, 2, remapped),
+            of_a,
+            "A[1], remapped, on {name}"
+        );
+        assert_eq!(
+            read(&past, 2, 0),
+            of_b,
+            "a title table's array goes on, on {name}"
+        );
+    }
 }

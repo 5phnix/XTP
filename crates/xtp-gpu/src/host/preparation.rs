@@ -39,6 +39,12 @@ thread_local! {
     static CLOCK: RefCell<Option<Clock>> = const { RefCell::new(None) };
 }
 
+/// A fault can interrupt a clock update on this thread.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn active() -> bool {
+    CLOCK.with(|clock| !clock.try_borrow().is_ok_and(|c| c.is_none()))
+}
+
 impl Phase {
     fn switch(self) -> Option<Self> {
         CLOCK.with_borrow_mut(|clock| {
@@ -144,6 +150,37 @@ pub(super) fn take() -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phases_inside_a_submission_wait_stay_off_the_preparation_clock() {
+        let Some(host) = crate::testgpu::device("phases_inside_a_submission_wait") else {
+            return;
+        };
+        let start = Instant::now();
+        let waited = super::super::waited_here();
+        let _recording = Recording::start(start, waited);
+        {
+            let _copy = Phase::Copies.enter();
+            host.waiting(|| {
+                let _watch = Phase::Watch.enter();
+                host.waiting(|| {
+                    let _snapshot = Phase::Snapshots.enter();
+                    std::thread::sleep(Duration::from_millis(1));
+                });
+            });
+        }
+        let now = Instant::now();
+        let after = super::super::waited_here();
+        let mut clock = CLOCK.take().unwrap();
+        clock.advance(now, after);
+        assert!(after > waited);
+        assert_eq!(clock.times[Phase::Watch as usize], Duration::ZERO);
+        assert_eq!(clock.times[Phase::Snapshots as usize], Duration::ZERO);
+        assert_eq!(
+            clock.times.iter().sum::<Duration>(),
+            now - start - Duration::from_micros(after - waited)
+        );
+    }
 
     #[test]
     fn nested_watch_and_staging_wait_are_exclusive() {

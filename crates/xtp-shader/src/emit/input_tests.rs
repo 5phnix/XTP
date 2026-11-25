@@ -118,7 +118,7 @@ fn validate(shader: &HostShader) {
     }
 }
 
-/// Mode d’interpolation d’une ligne TEXCOORD float4 dans PSV0.
+/// Interpolation mode of a TEXCOORD float4 row in PSV0.
 fn texcoord_mode(shader: &HostShader, register: u8) -> u8 {
     let c = Container::parse(&shader.dxil).unwrap();
     let psv = c.part(FourCC::PSV0).unwrap().data;
@@ -332,8 +332,8 @@ fn p10_of_an_interpolated_attribute() {
     assert!(pixel(&words, PERSP_CENTER).is_err());
 }
 
-/// Triangle couvrant 2 × 2 pixels. I vaut 1/8 ou 3/8 selon la colonne,
-/// J prend les mêmes valeurs selon la ligne. TEXCOORD0.x vaut 2, 10 et 50.
+/// Triangle covering 2 × 2 pixels. I is 1/8 or 3/8 depending on the column,
+/// J takes the same values depending on the row. TEXCOORD0.x is 2, 10 and 50.
 fn draw_pixels(ps: &HostShader) -> Option<Vec<[f32; 4]>> {
     use super::host::{Draw, Host};
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -431,13 +431,13 @@ fn conditional_pixel_export_keeps_the_lane_for_later_exports() {
         exp & !0x1800,
         data,
         0x7d84_00ff,
-        0.125f32.to_bits(), // I = 1/8 dans la colonne de gauche
+        0.125f32.to_bits(), // I = 1/8 in the left column
         0xbe8a_3c6a,        // s_and_saveexec_b32 s10, vcc_lo
         exp & !0x1800,
         0x0303_0303,
         0xbefe_030a, // s_mov_b32 exec_lo, s10
         0xf800_1808,
-        0x0400_0000, // alpha = 4 dans les deux colonnes
+        0x0400_0000, // alpha = 4 in both columns
         S_ENDPGM,
     ];
     let out = pixel(&words, PERSP_CENTER).unwrap();
@@ -456,10 +456,10 @@ fn an_earlier_vm_cannot_be_replaced_by_the_exec_of_done() {
         0x7d84_0080,
         0xbe8a_3c6a,
         0xf800_101f,
-        0x0101_0101, // mrt1 avec VM sous EXEC réduit
+        0x0101_0101, // mrt1 with VM under a reduced EXEC
         0xbefe_030a,
         0xf800_080f,
-        0x0101_0101, // mrt0 done après restauration
+        0x0101_0101, // mrt0 done after the restore
         S_ENDPGM,
     ];
     assert!(matches!(
@@ -473,13 +473,13 @@ fn an_earlier_vm_cannot_be_replaced_by_the_exec_of_done() {
 
 #[test]
 fn sgpr_and_unpaired_halves_preserve_other_rows_interpolation() {
-    // Deux paires complètes : attr0 au centre, attr1 au centroïde.
+    // Two complete pairs: attr0 at the center, attr1 at the centroid.
     let pairs = [0xc810_0000, 0xc811_0001, 0xc814_0402, 0xc815_0403];
     let [exp, _] = exp_mrt0(0);
     for (extra, bary) in [
-        (vec![0x7e0c_0208], false), // v6 = s8, temporaire à l'entrée
-        (vec![0xc819_0801], true),  // p2 seul, attr2.x
-        (vec![0xc818_0800], true),  // p1 seul, attr2.x
+        (vec![0x7e0c_0208], false), // v6 = s8, temporary at entry
+        (vec![0xc819_0801], true),  // p2 alone, attr2.x
+        (vec![0xc818_0800], true),  // p1 alone, attr2.x
     ] {
         let words = [pairs.as_slice(), &extra, &[exp, 0x0606_0504, S_ENDPGM]].concat();
         let mut n = native_pixel(&words, PERSP_CENTER | PERSP_CENTROID, 0);
@@ -596,18 +596,18 @@ fn a_mask_on_a_skipped_pixel_data_edge_is_dead_only_behind_its_flag() {
 fn a_descriptor_on_a_skipped_pixel_data_edge_needs_no_host_value() {
     use crate::native::{RootParam, RootType};
     let words = [
-        0xbe81_0380, // s_mov_b32 s1, 0 (poids fort de la table)
-        0xbf06_8008, // s_cmp_eq_u32 s8, 0 (temporaire à l’entrée)
-        0xbf84_0004, // s_cbranch_scc0 vers les données
+        0xbe81_0380, // s_mov_b32 s1, 0 (high half of the table)
+        0xbf06_8008, // s_cmp_eq_u32 s8, 0 (temporary at entry)
+        0xbf84_0004, // s_cbranch_scc0 to the data
         0xf408_0100,
         0xfa00_0520, // s_load_dwordx4 s[4:7], s[0:1], 0x520
-        0x7e04_0280, // v_mov_b32 v2, 0 (branche du descripteur)
+        0x7e04_0280, // v_mov_b32 v2, 0 (descriptor branch)
         0xbf82_0002,
-        0xbe87_0387, // s_mov_b32 s7, 7 (branche des données)
+        0xbe87_0387, // s_mov_b32 s7, 7 (data branch)
         0x7e04_02c1, // v_mov_b32 v2, -1
         0x7d84_04c1, // v_cmp_eq_u32 vcc, -1, v2
         0x8aea_6a7e, // s_andn2_b64 vcc, exec, vcc
-        0xbf87_0001, // sauter la lecture sur la branche du descripteur
+        0xbf87_0001, // skip the read on the descriptor branch
         0x7e06_0207, // v_mov_b32 v3, s7
         0xf800_180f,
         0x0303_0303,
