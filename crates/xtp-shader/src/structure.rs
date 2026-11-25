@@ -1099,42 +1099,6 @@ impl<'a> Lanes<'a> {
         })
     }
 
-    /// Whether scalar operation `inst` tests bits of a number held in a
-    /// register that holds a mask on another path: one source is a constant
-    /// that is no lane set (neither none nor all lanes), another a join of
-    /// values one of which a scalar memory read loads. The console compiler
-    /// reuses registers across paths: such a join is a mask where the path
-    /// it came by left one and a number where a load did, and a bit test of
-    /// it with a constant is the number's (a flag word read after the load).
-    /// Its result is a number, not a mask.
-    fn tests_a_reused_number(&self, inst: &Inst, src: &[Operand]) -> bool {
-        let p = self.p;
-        let all = if p.wave64 {
-            u64::MAX
-        } else {
-            u64::from(u32::MAX)
-        };
-        let constant = |v: u64| v != 0 && v != all;
-        let lane_set = src.iter().any(|op| match *op {
-            Operand::Literal(x) => constant(u64::from(x)),
-            Operand::Const(c @ 129..=192) => constant(u64::from(c) - 128),
-            _ => false,
-        });
-        let loaded = |v: Value| {
-            self.defs
-                .get(&v)
-                .is_some_and(|&(b, i)| matches!(p.blocks[b].insts[i].fields, Fields::Smem { .. }))
-        };
-        let reused = src.iter().any(|op| match *op {
-            Operand::Scalar { code, .. } if code != NULL => inst
-                .read(Reg::S(code))
-                .and_then(|v| self.phis.get(&v))
-                .is_some_and(|&(b, i)| p.blocks[b].phis[i].args.iter().any(|&a| loaded(a))),
-            _ => false,
-        });
-        lane_set && reused
-    }
-
     /// Records the masks `inst` defines; `exec` is EXEC there, if known.
     fn step(&mut self, inst: &Inst, exec: Option<Bool>) {
         let name = inst.name();
@@ -1150,7 +1114,6 @@ impl<'a> Lanes<'a> {
                         takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
                     }
                 }
-                takes_mask &= !self.tests_a_reused_number(inst, src);
                 let touches_exec =
                     inst.write(Reg::S(EXEC)).is_some() || inst.read(Reg::S(EXEC)).is_some();
                 if (takes_mask || touches_exec)
@@ -1193,22 +1156,6 @@ impl<'a> Lanes<'a> {
                     let m = if eq { self.b.not(ne) } else { ne };
                     self.scc_lane.insert(scc, m);
                     self.scc_wave.insert(scc, (ne, eq));
-                }
-                // `s_bcnt1` of a mask: its SCC is "the count is not zero",
-                // "some lane is set", as a mask operation's. The compiler's
-                // test for a value the whole wave holds counts the lanes that
-                // differ from the first lane's (`v_readfirstlane`, `v_cmp_eq`,
-                // `s_xor` with EXEC) and branches on that SCC alone: each lane
-                // then takes the general path if its own value differs and
-                // the scalar one if not, where the first lane's value is its
-                // own. The count itself stays a mask read as data.
-                if takes_mask
-                    && name.strip_prefix("s_bcnt1_i32_b") == Some(width)
-                    && let (Some(scc), [a]) = (inst.write(Reg::Scc), &src[..])
-                    && let Some((m, _)) = self.operand(inst, a)
-                {
-                    self.scc_lane.insert(scc, m);
-                    self.scc_wave.insert(scc, (m, false));
                 }
             }
             Fields::Valu(v) => {
@@ -1558,81 +1505,6 @@ mod tests {
             let ne = b.xor(s.masks[&vcc], s.masks[&exec_after]);
             assert_eq!(s.sccs.get(&eq), Some(&(ne, true)));
         }
-    }
-
-    /// `s_bcnt1` of a mask sets SCC as the mask's own operations do: "some
-    /// lane is set". The compiler's test for a value the whole wave holds
-    /// (the lanes that differ from the first lane's, counted) branches on
-    /// it; each lane takes that branch on its own bit, and the console flow
-    /// when some lane of the wave has it (wave64, both forms).
-    #[test]
-    fn the_scc_of_a_mask_count_is_some_lane_set() {
-        let p = build(
-            &[
-                0x7E00_0501, // v_readfirstlane_b32 s0, v1
-                0x7D84_0200, // v_cmp_eq_u32 vcc, s0, v1
-                0x8982_7E6A, // s_xor_b64 s[2:3], vcc, exec
-                0xBE84_1002, // s_bcnt1_i32_b64 s4, s[2:3]
-                0xBF85_0001, // s_cbranch_scc1 -> 24
-                0x7E02_0280, // v_mov_b32 v1, 0
-                S_ENDPGM,    // 24
-            ],
-            true,
-        );
-        let insts = &p.blocks[0].insts;
-        assert_eq!(insts[3].name(), "s_bcnt1_i32_b64");
-        let differ = insts[2].write(Reg::S(2)).unwrap();
-        let scc = insts[3].write(Reg::Scc).unwrap();
-        for s in [structure(&p).unwrap(), structure_console(&p).unwrap()] {
-            let m = s.masks[&differ];
-            assert_eq!(s.sccs.get(&scc), Some(&(m, false)));
-            let LaneExit::Branch { when, taken, .. } = s.exits[0] else {
-                panic!("{:?}", s.exits)
-            };
-            assert_eq!(when, m);
-            assert_eq!(p.blocks[taken].offset, 24);
-            assert!(
-                !s.bools
-                    .support(when)
-                    .iter()
-                    .any(|a| matches!(a, Atom::Uniform(_)))
-            );
-        }
-    }
-
-    /// A register the compiler reuses across paths: s2 is a mask (a compare
-    /// result) where the load is skipped and a loaded number where it is
-    /// not; a bit test of it with a constant after the join is the number's,
-    /// not a mask operation. The same test of the compare's own mask stays
-    /// one (wave32).
-    #[test]
-    fn a_bit_test_of_a_reused_register_is_a_number() {
-        let p = build(
-            &[
-                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
-                0xBE82_036A, // s_mov_b32 s2, vcc_lo
-                0xBF06_0100, // s_cmp_eq_u32 s0, s1
-                0xBF85_0002, // s_cbranch_scc1 -> 24
-                0xF400_0080,
-                0xFA00_0000, // s_load_dword s2, s[0:1], 0x0
-                0x8703_FF02,
-                0x0000_0100, // 24: s_and_b32 s3, s2, lit(0x100)
-                0x8704_FF6A,
-                0x0000_0100, // s_and_b32 s4, vcc_lo, lit(0x100)
-                0xBF06_8003, // s_cmp_eq_u32 s3, 0
-                S_ENDPGM,
-            ],
-            false,
-        );
-        let join = p.blocks.iter().find(|b| b.offset == 24).unwrap();
-        assert_eq!(join.insts[0].name(), "s_and_b32");
-        let number = join.insts[0].write(Reg::S(3)).unwrap();
-        let mask = join.insts[1].write(Reg::S(4)).unwrap();
-        let scc = join.insts[2].write(Reg::Scc).unwrap();
-        let s = structure(&p).unwrap();
-        assert!(!s.masks.contains_key(&number), "{:?}", s.masks);
-        assert!(!s.sccs.contains_key(&scc));
-        assert!(s.masks.contains_key(&mask));
     }
 
     /// The console form without what lanes know on entering each block (its

@@ -178,13 +178,20 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
-            Atom::Uniform(v) => match self.get(v)? {
-                Val::Bit(x) => Ok(x),
-                Val::I32(x) => {
+            Atom::Uniform(v) => match self.get(v) {
+                Ok(Val::Bit(x)) => Ok(x),
+                Ok(Val::I32(x)) => {
                     let z = self.s.m.i32(0);
                     Ok(self.s.m.cmp(at, pred::NE, x, z))
                 }
-                Val::Missing(w) => Err(w),
+                Ok(Val::Missing(w)) => Err(w),
+                // Mesh programs count no mask: the SCC of a count, "some
+                // lane is set", is each lane's own bit, as a mask
+                // operation's is in a branch (structurisation's rule).
+                Err(w) => match self.count_scc(v) {
+                    Some(m) if self.mask_data == MaskData::None => self.boolean(m, at),
+                    _ => Err(w),
+                },
             },
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
@@ -367,6 +374,34 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The mask `s_bcnt1_i32_b*` counts where `scc` is that count's SCC
+    /// ("the count is not zero": some lane of the mask is set), as lane bits.
+    fn count_scc(&self, scc: Value) -> Option<Bool> {
+        let p = self.x.p;
+        let &b = self.def_block.get(&scc)?;
+        let inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.write(Reg::Scc) == Some(scc))?;
+        let width = if self.x.native.wave64 { "64" } else { "32" };
+        if inst.name().strip_prefix("s_bcnt1_i32_b") != Some(width) {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let &Operand::Scalar { code, .. } = src.first()? else {
+            return None;
+        };
+        let lo = inst.read(Reg::S(code))?;
+        let hi = if self.x.native.wave64 {
+            Some(inst.read(Reg::S(code + 1))?)
+        } else {
+            None
+        };
+        self.x.st.mask_bits(lo, hi)
+    }
+
     /// Whether `v_readfirstlane_b32` `inst`, in block `b`, is the first-lane
     /// read of the console compiler's test for a value the whole wave holds:
     ///
@@ -384,8 +419,8 @@ impl<'a> Lower<'a> {
     /// its own value, as the console's wave does when every lane holds it;
     /// the general path gives each lane what the scalar path gives it with
     /// its own value (it exists for the waves whose lanes differ). The
-    /// branch is the lane's own bit (structurisation, [`Structured::sccs`]'
-    /// rule for `s_bcnt1`). No read of `s` but the compare may lie where the
+    /// branch is the lane's own bit (the SCC of a count in a mesh program,
+    /// [`Self::atom`]). No read of `s` but the compare may lie where the
     /// scalar path does not decide it: every other reader is in a block the
     /// scalar path's first block dominates.
     pub(super) fn uniform_test_first_lane(&self, inst: &Inst, b: usize) -> bool {
