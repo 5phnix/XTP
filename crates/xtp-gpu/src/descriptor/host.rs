@@ -298,8 +298,14 @@ struct Aliases {
     /// (`draw.rs` `fresh_tables`), whose shaders read the entry when they
     /// run: it names the view then (Codex review of 244cf78, finding 4:
     /// the entry stayed none for good). Title slots are made again by the
-    /// next draw or sweep that reads them instead.
-    refused_slots: BTreeMap<u32, Viewed>,
+    /// next draw or sweep that reads them instead. With the window each
+    /// waits for, and the same by window: a raw view of it made for another
+    /// slot is theirs too at once, at no cost, the pool full or not (Codex
+    /// review of 8612e27, a new bug: the slot waited for a pool slot to come
+    /// back, and `reap` stopped once the pool was full again, though the
+    /// first one back had just made the window it waited for).
+    refused_slots: BTreeMap<u32, (Viewed, RawKey)>,
+    waiting_for: HashMap<RawKey, BTreeSet<u32>>,
     /// The table is in [`FENCED`], or about to be (`to_list`).
     listed: bool,
     to_list: bool,
@@ -357,10 +363,12 @@ impl Aliases {
         });
         if pool.is_none() {
             self.refused += 1;
+            POOL_REFUSED.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         self.used += 1;
         if self.used > self.peak {
+            POOL_PEAK.fetch_max(self.used, Ordering::Relaxed);
             // Logged at each new eighth of the pool.
             let eighth = |v: u32| u64::from(v) * 8 / u64::from(self.size.max(1));
             if eighth(self.used) > eighth(self.peak) {
@@ -421,6 +429,26 @@ impl Aliases {
             }
         }
         done
+    }
+
+    /// Dynamic slot `index`, whose view `v` reads window `key`, waits for a
+    /// raw view ([`Aliases::refused_slots`]).
+    fn wait(&mut self, index: u32, v: &Viewed, key: RawKey) {
+        self.unwait(index);
+        self.refused_slots.insert(index, (v.clone(), key));
+        self.waiting_for.entry(key).or_default().insert(index);
+    }
+
+    /// Slot `index` waits for a raw view no more: its view, if it did.
+    fn unwait(&mut self, index: u32) -> Option<Viewed> {
+        let (v, key) = self.refused_slots.remove(&index)?;
+        if let Some(slots) = self.waiting_for.get_mut(&key) {
+            slots.remove(&index);
+            if slots.is_empty() {
+                self.waiting_for.remove(&key);
+            }
+        }
+        Some(v)
     }
 }
 
@@ -495,11 +523,16 @@ impl Strides {
     fn reap(&self, a: &mut Aliases) {
         self.reclaim(a);
         while a.has_free() {
-            let Some((index, v)) = a.refused_slots.pop_first() else {
+            let Some((&index, &(_, key))) = a.refused_slots.first_key_value() else {
                 break;
             };
+            let Some(v) = a.unwait(index) else {
+                break;
+            };
+            // Slots waiting for the same window get the raw view made for
+            // it as well ([`Strides::name`]).
             if self.name(a, index, &v) == Noted::Refused {
-                a.refused_slots.insert(index, v);
+                a.wait(index, &v, key);
                 break;
             }
         }
@@ -535,7 +568,7 @@ impl Strides {
     /// slot ends that wait.
     fn note(self: &Arc<Self>, index: u32, viewed: Option<&Viewed>) -> Noted {
         self.with_pool(|s, a| {
-            a.refused_slots.remove(&index);
+            a.unwait(index);
             let noted = match viewed {
                 Some(v) => s.name(a, index, v),
                 None => {
@@ -546,12 +579,24 @@ impl Strides {
             if noted == Noted::Refused
                 && s.dynamic(index)
                 && let Some(v) = viewed
+                && let Some((_, _, key)) = v.window()
             {
-                a.refused_slots.insert(index, v.clone());
+                a.wait(index, v, key);
             }
             s.reap(a);
             noted
         })
+    }
+
+    /// Slot `index`'s entry for view `v`, read through raw view `pool` of
+    /// its window `window` of elements of `element` bytes.
+    fn entry(&self, v: &Viewed, window: RawWindow, element: u32, pool: u32) -> StrideEntry {
+        StrideEntry {
+            stride: element,
+            raw_slot: Some(self.alias_base + pool),
+            bias: window.bias,
+            count: (v.len / v.element).min(u64::from(window.elements(element))) as u32,
+        }
     }
 
     /// Slot `index`'s entry for buffer view `v`. A raw view is read in its
@@ -575,35 +620,19 @@ impl Strides {
             self.unalias(a, index);
             return Noted::Named;
         }
-        let element = u32::try_from(v.element).unwrap_or(0);
-        let window = RawWindow::covering(v.start, v.len).filter(|_| {
-            element > 0 && element.is_multiple_of(4) && element <= StrideEntry::MAX_STRIDE
-        });
-        let Some(window) = window else {
+        let Some((window, element, key)) = v.window() else {
             // shortcut: a view starting off a dword of its host copy, or of
             // elements no entry holds, is read through the table as no view.
             once!(
                 start = v.start,
-                element,
+                element = v.element,
                 "a buffer view the stride table cannot name a raw view for: read as none"
             );
             self.unname(a, index);
             return Noted::Nothing;
         };
         let buffer = &v.copy.buffer;
-        let key = (
-            buffer.as_raw() as usize,
-            window.first,
-            window.dwords,
-            v.unordered,
-        );
-        let count = (v.len / v.element).min(u64::from(window.elements(element))) as u32;
-        let entry = |pool: u32| StrideEntry {
-            stride: element,
-            raw_slot: Some(self.alias_base + pool),
-            bias: window.bias,
-            count,
-        };
+        let entry = |pool: u32| self.entry(v, window, element, pool);
         if a.of.get(&index) == Some(&key)
             && let Some(alias) = a.named.get(&key)
         {
@@ -647,6 +676,7 @@ impl Strides {
                     slots: 1,
                 },
             );
+            self.give_waiting(a, key, pool);
             pool
         };
         let old = a.of.insert(index, key);
@@ -655,6 +685,31 @@ impl Strides {
             a.unname(old);
         }
         Noted::Named
+    }
+
+    /// Raw view `pool` was just made for window `key`: the dynamic slots
+    /// that waited for that window name it too, the pool full or not.
+    fn give_waiting(&self, a: &mut Aliases, key: RawKey, pool: u32) {
+        let Some(slots) = a.waiting_for.remove(&key) else {
+            return;
+        };
+        for index in slots {
+            let Some((v, _)) = a.refused_slots.remove(&index) else {
+                continue;
+            };
+            let Some((window, element, _)) = v.window() else {
+                continue;
+            };
+            if let Some(alias) = a.named.get_mut(&key) {
+                alias.slots += 1;
+            }
+            // A waiting slot names no raw view (its refusal unnamed it).
+            let old = a.of.insert(index, key);
+            self.set_entry(index, self.entry(&v, window, element, pool));
+            if let Some(old) = old {
+                a.unname(old);
+            }
+        }
     }
 
     /// Slot `index`'s entry says none, then its raw view retires if no
@@ -695,6 +750,25 @@ struct Viewed {
     /// The view is raw (read in its own slot).
     raw: bool,
     unordered: bool,
+}
+
+impl Viewed {
+    /// The window of its host copy a raw view of the view reads, its bytes
+    /// per element, and the raw view's key; none if the stride table cannot
+    /// name one ([`Strides::name`]).
+    fn window(&self) -> Option<(RawWindow, u32, RawKey)> {
+        let element = u32::try_from(self.element).unwrap_or(0);
+        let window = RawWindow::covering(self.start, self.len).filter(|_| {
+            element > 0 && element.is_multiple_of(4) && element <= StrideEntry::MAX_STRIDE
+        })?;
+        let key = (
+            self.copy.buffer.as_raw() as usize,
+            window.first,
+            window.dwords,
+            self.unordered,
+        );
+        Some((window, element, key))
+    }
 }
 
 /// What each title slot of a host heap was made from.
@@ -784,9 +858,9 @@ const RUN_GAP: u64 = crate::watch::PAGE as u64;
 /// The title memory the buffer views of a heap's title slots read and
 /// write, by host copy, for shaders that pick slots when they run
 /// ([`HostHeap::picked_spans`]); kept as the views come and go
-/// ([`Made::read`]), with the order the copies changed in, so that a
-/// recording catches up on what changed since it last looked
-/// ([`PickedUse`]): a step per host copy that changed.
+/// ([`Made::read`]), with the order the copies changed in, so that what a
+/// submission gives to refresh catches up on what changed since it last
+/// looked ([`Due`]): a step per host copy that changed.
 ///
 /// Codex review of a090f22, P2: a listing was made afresh at each change,
 /// a step per host copy, and a new buffer before each of N dispatches made
@@ -795,6 +869,15 @@ const RUN_GAP: u64 = crate::watch::PAGE as u64;
 /// copies listed 1.9 GB, refreshed by every list that picks, 8 to 17 GB
 /// copied a frame, much of it memory no view reads, unmapped memory read
 /// as zeros among it).
+///
+/// One listing per view heap, shared by every list whose shaders pick its
+/// slots, and walked once per submission whichever lists ask
+/// ([`PickedStep`]). Ported from Marvisak/VIctory (6d021fe) by Marvisak:
+/// its title memory page table is one per view heap, shared by lists, and
+/// the copies it names are refreshed once per submission. Before (stride
+/// round 4b), each new recording caught up on the listing from nothing and
+/// added a refresh step per run: 5,435 runs by some 42 lists, 226,575
+/// refresh steps a frame (`stall-stride4b-1`).
 #[derive(Default)]
 struct Listing {
     copies: HashMap<usize, Copied>,
@@ -803,9 +886,87 @@ struct Listing {
     changes: u64,
     changed: BTreeMap<u64, usize>,
     changed_at: HashMap<usize, u64>,
-    /// Host copies looked at by recordings catching up (tests, the sweep's
-    /// log).
+    /// Host copies looked at catching up (tests, the sweep's log).
     visits: u64,
+    /// What submissions were given of it.
+    due: Due,
+}
+
+/// What the submissions were given of a heap's [`Listing`]
+/// ([`Listing::due`]): the runs as last given, by host copy, so that a
+/// submission is given every run once, and again only those that changed
+/// meanwhile or, after a step of its own that wrote title memory, all of
+/// them; and the same for the runs of unordered views, declared written
+/// once per submission.
+///
+/// What the title's other threads write into a run after its refresh in a
+/// submission is taken by the next submission, not by a later list of the
+/// same one (as VIctory 6d021fe and `crate::watch`'s single asking per
+/// range have it): on the console it would race the GPU.
+#[derive(Default)]
+struct Due {
+    /// The submission the runs were last given in
+    /// ([`crate::shadow::submission`]), and the steps of its preparation
+    /// that wrote title memory before (the batch's count).
+    submission: u64,
+    written: u64,
+    /// The runs were given to refresh in `submission`, after `written`
+    /// such steps.
+    current: bool,
+    /// The runs of unordered views were declared written in `submission`.
+    declared: bool,
+    /// The listing's change caught up to, for the runs refreshed and for
+    /// those declared written (0: none).
+    seen: u64,
+    seen_writes: u64,
+    /// Per host copy (held, so that no other takes its address), its runs
+    /// as last given, and those of its unordered views as last declared.
+    reads: HashMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>,
+    writes: HashMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>,
+    /// What `submission` was given, for what its GPU work touches
+    /// ([`Listing::touches`]): title ranges refreshed, runs declared.
+    given_reads: Vec<(usize, usize)>,
+    given_writes: Vec<Span>,
+}
+
+impl Due {
+    /// Catches `memo` up on the runs `listing` lists now for each copy
+    /// that changed after change `seen` (those of unordered views with
+    /// `writes`): the runs that are new or other than those of `memo`
+    /// go into `out` unless everything is due anyway (`all`).
+    fn catch_up(
+        listing: &mut Listing,
+        memo: &mut HashMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>,
+        seen: u64,
+        writes: bool,
+        all: bool,
+        out: &mut Vec<Span>,
+    ) {
+        listing.since(seen, writes, |key, copy, runs| {
+            if runs.is_empty() {
+                memo.remove(&key);
+                return;
+            }
+            let (_, was) = memo
+                .entry(key)
+                .or_insert_with(|| (copy.clone(), BTreeMap::new()));
+            if !all {
+                out.extend(
+                    runs.iter()
+                        .filter(|&(from, to)| was.get(from) != Some(to))
+                        .map(|(&from, &to)| (copy.clone(), from, to)),
+                );
+            }
+            was.clone_from(runs);
+        });
+    }
+
+    /// Every run of `memo`.
+    fn every(memo: &HashMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>) -> Vec<Span> {
+        memo.values()
+            .flat_map(|(copy, runs)| runs.iter().map(|(&from, &to)| (copy.clone(), from, to)))
+            .collect()
+    }
 }
 
 /// The views of one host copy in a [`Listing`], which keeps the copy alive
@@ -920,12 +1081,14 @@ impl Listing {
             c.writes.remove(read.from, read.to);
         }
         if c.reads.views.is_empty() {
-            // Nothing to refresh for it: recordings that refreshed it
-            // keep what they did, and catch up if it comes back.
+            // Nothing to refresh for it, nor to declare written: the
+            // submissions catch up if it comes back. Not held any more.
             self.copies.remove(&read.copy);
             if let Some(at) = self.changed_at.remove(&read.copy) {
                 self.changed.remove(&at);
             }
+            self.due.reads.remove(&read.copy);
+            self.due.writes.remove(&read.copy);
         } else {
             self.changed(read.copy);
         }
@@ -966,6 +1129,76 @@ impl Listing {
                 each(key, copy, runs);
             }
         }
+    }
+
+    /// At a list's step in `submission` ([`PickedStep::due`]), after
+    /// `written` steps of its preparation that wrote title memory: the runs
+    /// to refresh, and (`writing`: the list's shaders write through slots
+    /// they pick) those to declare written, each sorted by copy, then
+    /// address (the order the submission's batch keeps, so that each lands
+    /// at its end). The submission's first step gets every run; later ones
+    /// only what changed since (none if nothing did), or every run again
+    /// after a step that wrote title memory. Runs are declared written once
+    /// per submission, and those that changed since.
+    fn due(&mut self, submission: u64, written: u64, writing: bool) -> (Vec<Span>, Vec<Span>) {
+        let mut due = std::mem::take(&mut self.due);
+        if due.submission != submission {
+            due.submission = submission;
+            due.current = false;
+            due.declared = false;
+            due.given_reads.clear();
+            due.given_writes.clear();
+        }
+        let all = !due.current || due.written != written;
+        let mut reads = Vec::new();
+        Due::catch_up(self, &mut due.reads, due.seen, false, all, &mut reads);
+        due.seen = self.changes;
+        if all {
+            reads = Due::every(&due.reads);
+            (due.current, due.written) = (true, written);
+        }
+        let mut writes = Vec::new();
+        if writing {
+            let all = !due.declared;
+            Due::catch_up(
+                self,
+                &mut due.writes,
+                due.seen_writes,
+                true,
+                all,
+                &mut writes,
+            );
+            due.seen_writes = self.changes;
+            if all {
+                writes = Due::every(&due.writes);
+                due.declared = true;
+            }
+        }
+        for spans in [&mut reads, &mut writes] {
+            spans.sort_unstable_by_key(|(copy, from, _)| (Arc::as_ptr(copy) as usize, *from));
+        }
+        due.given_reads.extend(
+            reads
+                .iter()
+                .map(|&(_, from, to)| (from as usize, to as usize)),
+        );
+        due.given_writes.extend(writes.iter().cloned());
+        self.due = due;
+        (reads, writes)
+    }
+
+    /// What `submission` was given of the listing, once (the first list of
+    /// the submission naming it takes it): the title ranges refreshed, and
+    /// the runs declared written.
+    fn touches(&mut self, submission: u64) -> (Vec<(usize, usize)>, Vec<Span>) {
+        let due = &mut self.due;
+        if due.submission != submission {
+            return Default::default();
+        }
+        (
+            std::mem::take(&mut due.given_reads),
+            std::mem::take(&mut due.given_writes),
+        )
     }
 
     /// For the sweep's log: host copies, runs, their bytes, the bytes from
@@ -1031,16 +1264,72 @@ impl Picked {
     }
 }
 
-/// What one recording of a list did with a heap's listing
-/// ([`HostHeap::picked_spans`]): the runs it refreshed since its list's
-/// last title copy ([`crate::host::HostList::refresh_epoch`]) and those it
-/// declared written, so that each draw or dispatch that picks slots adds
-/// only what changed since the last one: none when nothing did (a sweep's
-/// refresh went over every span of the heap at every such dispatch), and
-/// otherwise the runs of the copies whose views changed, found with a step
-/// per such copy ([`Listing`]). Codex review of 244cf78: a recording kept
-/// every listing it had declared written, which with a new buffer before
-/// each of N dispatches was N listings of 1 to N spans, and as many steps.
+/// A list's step for the shaders of its recording that pick slots of a view
+/// heap ([`PickedUse::defer`], `crate::host`'s `Step::Picked`): at each
+/// submission of the list, the runs the heap's buffer views read are
+/// brought up to date, and those its unordered views write declared written
+/// if a shader of the recording writes through slots it picks; once per
+/// submission whichever lists ask ([`Listing::due`]).
+pub(crate) struct PickedStep {
+    picked: Arc<Picked>,
+    /// A shader of the recording writes through slots it picks, and the
+    /// pipeline the list had bound then (`crate::readmap`'s writer).
+    writes: std::sync::atomic::AtomicBool,
+    writer: AtomicU64,
+}
+
+impl PickedStep {
+    /// At the step's run in `submission`, after `written` steps of its
+    /// preparation that wrote title memory: the runs to refresh and those
+    /// to declare written ([`Listing::due`]).
+    pub(crate) fn due(&self, submission: u64, written: u64) -> (Vec<Span>, Vec<Span>) {
+        let writing = self.writes.load(Ordering::Relaxed);
+        let (reads, writes) = self.picked.listing().due(submission, written, writing);
+        let bytes: u64 = reads.iter().map(|(_, from, to)| to - from).sum();
+        for (counter, n) in [
+            (0, reads.len() as u64),
+            (1, bytes),
+            (2, writes.len() as u64),
+        ] {
+            PICKS[counter].fetch_add(n, Ordering::Relaxed);
+            PICKED_FRAME[counter].fetch_add(n, Ordering::Relaxed);
+        }
+        PICKED_FRAME[3].fetch_add(1, Ordering::Relaxed);
+        if !reads.is_empty() {
+            PICKED_FRAME[4].fetch_add(1, Ordering::Relaxed);
+        }
+        (reads, writes)
+    }
+
+    /// The pipeline a shader writing through picked slots belongs to.
+    pub(crate) fn writer(&self) -> u64 {
+        self.writer.load(Ordering::Relaxed)
+    }
+
+    /// What `submission`'s GPU work touches of the heap's listing, once
+    /// per submission ([`Listing::touches`]): title ranges it reads, and
+    /// runs its shaders write.
+    pub(crate) fn touches(&self, submission: u64) -> (Vec<(usize, usize)>, Vec<Span>) {
+        self.picked.listing().touches(submission)
+    }
+}
+
+/// What a recording of a list did with a heap's listing
+/// ([`HostHeap::picked_spans`]): its step for the list's current refresh
+/// epoch ([`crate::host::HostList::refresh_epoch`]). A draw or dispatch that
+/// picks slots adds nothing to the list but that step, once per epoch: the
+/// runs are given at submission ([`PickedStep`]).
+///
+/// Codex review of 8612e27 (stride round 4b), P2: each recording caught up
+/// on the listing from nothing, its first pick adding a refresh step per run
+/// of the heap (5,435 runs, some 42 lists a frame: 226,575 refresh steps),
+/// each settled and merged at submission. And the steps the sweep at each
+/// submission added stayed in the list (a closed list resubmitted with
+/// another buffer in a slot each time refreshed every buffer it had seen,
+/// and held it, until its reset), and a copy's runs were copied whole at
+/// each pick (N disjoint views of one copy, N(N+1)/2 runs looked at). Now
+/// what a submission is given is worked out at submission, held by the
+/// heap's listing, not the list.
 #[derive(Default)]
 pub(crate) struct PickedUse {
     /// A shader of the recording writes through slots it picks.
@@ -1048,90 +1337,75 @@ pub(crate) struct PickedUse {
     /// The recording has another heap under the key now (`draw.rs`
     /// `forget_heap`): nothing more is done for this one.
     pub(crate) forgotten: bool,
-    /// The refresh epoch of `reads`.
-    epoch: u64,
-    /// The runs refreshed, and those declared written.
-    reads: Caught,
-    writes: Caught,
+    /// The step for refresh epoch `.0`.
+    step: Option<(u64, Arc<PickedStep>)>,
 }
 
-/// How far a recording caught up on a heap's [`Listing`], for the runs it
-/// refreshed or those it declared written.
-#[derive(Default)]
-struct Caught {
-    /// The listing (held, so that no other takes its address), and the
-    /// change caught up to (0: none).
-    listing: Option<Arc<Mutex<Listing>>>,
-    seen: u64,
-    /// Per host copy (the copy held, so that no other takes its address
-    /// meanwhile), the runs done.
-    done: HashMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>,
-}
-
-impl Caught {
-    /// The runs of `p` (those of unordered views with `writes`) that are
-    /// not done as they are, noted done.
-    fn catch_up(&mut self, p: &Picked, writes: bool) -> Vec<Span> {
-        if !self
-            .listing
-            .as_ref()
-            .is_some_and(|l| Arc::ptr_eq(l, &p.listing))
-        {
-            *self = Caught {
-                listing: Some(p.listing.clone()),
-                ..Caught::default()
-            };
-        }
-        let mut out = Vec::new();
-        let done = &mut self.done;
-        let mut listing = p.listing();
-        listing.since(self.seen, writes, |key, copy, runs| {
-            let (_, was) = done
-                .entry(key)
-                .or_insert_with(|| (copy.clone(), BTreeMap::new()));
-            for (&from, &to) in runs {
-                if was.get(&from) != Some(&to) {
-                    out.push((copy.clone(), from, to));
-                }
-            }
-            was.clone_from(runs);
-        });
-        self.seen = listing.changes;
-        drop(listing);
-        // In the order the submission's batch keeps refreshes (by copy, then
-        // address), so that each lands at its end: in the listing's own
-        // order, each was put among those before it.
-        out.sort_unstable_by_key(|(copy, from, _)| (Arc::as_ptr(copy) as usize, *from));
-        out
-    }
-}
-
-/// Since the start, for the sweep's log: runs recordings were given to
-/// refresh ([`PickedUse::unrefreshed`]), their bytes, and runs given to
-/// declare written.
+/// Since the start, for the sweep's log: runs submissions were given to
+/// refresh ([`PickedStep::due`]), their bytes, and runs given to declare
+/// written.
 static PICKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-impl PickedUse {
-    /// The runs `p` reads that the recording has not refreshed at refresh
-    /// epoch `epoch`, noted refreshed (all of them again in another epoch).
-    pub(crate) fn unrefreshed(&mut self, p: &Picked, epoch: u64) -> Vec<Span> {
-        if self.epoch != epoch {
-            self.epoch = epoch;
-            self.reads = Caught::default();
-        }
-        let runs = self.reads.catch_up(p, false);
-        let bytes: u64 = runs.iter().map(|(_, from, to)| to - from).sum();
-        PICKS[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-        PICKS[1].fetch_add(bytes, Ordering::Relaxed);
-        runs
-    }
+/// Since the last frame line ([`log_picked_frame`]): as [`PICKS`], then
+/// the steps run and those given runs.
+static PICKED_FRAME: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
-    /// The runs `p`'s views write that the recording has not declared
-    /// written, noted declared.
-    pub(crate) fn undeclared(&mut self, p: &Picked) -> Vec<Span> {
-        let runs = self.writes.catch_up(p, true);
-        PICKS[2].fetch_add(runs.len() as u64, Ordering::Relaxed);
-        runs
+/// The most raw views of a stride table's pool taken at once, since the
+/// start (any heap), and the raw views refused.
+static POOL_PEAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static POOL_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// The frame line's account of what shaders that pick slots at run time
+/// cost the submissions (`crate::host`'s frame log): steps, runs and bytes
+/// given to refresh, runs declared written, per frame; and the raw views'
+/// pool high-water mark. Nothing without such steps.
+pub(crate) fn log_picked_frame(frames: f64) {
+    let [runs, bytes, declared, steps, giving] = PICKED_FRAME
+        .each_ref()
+        .map(|n| n.swap(0, Ordering::Relaxed));
+    if steps == 0 {
+        return;
+    }
+    let per = |n: u64| n as f64 / frames;
+    tracing::info!(
+        "slots picked at run time per frame: {:.1} steps ({:.1} given runs), {:.1} runs refreshed \
+         ({:.1} MB), {:.1} runs declared written; raw view pool peak {} ({} refused so far)",
+        per(steps),
+        per(giving),
+        per(runs),
+        per(bytes) / 1e6,
+        per(declared),
+        POOL_PEAK.load(Ordering::Relaxed),
+        POOL_REFUSED.load(Ordering::Relaxed),
+    );
+}
+
+impl PickedUse {
+    /// A draw or dispatch of `list` binds a shader that picks slots of the
+    /// heap listed in `p` (and, `writes`, writes through them): the list's
+    /// step for its refresh epoch, made at the first such draw of the epoch
+    /// (a title copy or work of the list starts another, after which every
+    /// run is brought up to date again), marked writing.
+    pub(crate) fn defer(&mut self, list: &crate::host::HostList, p: &Arc<Picked>, writes: bool) {
+        self.writing |= writes;
+        let epoch = list.refresh_epoch();
+        let step = match &self.step {
+            Some((at, step)) if *at == epoch && Arc::ptr_eq(&step.picked, p) => step.clone(),
+            _ => {
+                let step = Arc::new(PickedStep {
+                    picked: p.clone(),
+                    writes: std::sync::atomic::AtomicBool::new(false),
+                    writer: AtomicU64::new(0),
+                });
+                list.defer_picked(step.clone());
+                self.step = Some((epoch, step.clone()));
+                step
+            }
+        };
+        if writes && !step.writes.load(Ordering::Relaxed) {
+            step.writer.store(list.writer(), Ordering::Relaxed);
+            step.writes.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2459,7 +2733,7 @@ impl HostHeap {
                     .flat_map(|&(first, n)| first..first.saturating_add(n).min(s.alias_base))
             };
             for index in slots() {
-                a.refused_slots.remove(&index);
+                a.unwait(index);
                 s.set_entry(index, StrideEntry::NONE);
             }
             if a.of.is_empty() {
@@ -2486,11 +2760,12 @@ impl HostHeap {
     ///
     /// Every draw or dispatch that binds such a shader calls it (`draw.rs`
     /// `picked_buffers`), and so does each list that did as it closes and
-    /// at each of its submissions; each list refreshes what it lists for
-    /// its own submission ([`PickedUse`]): whichever list the title submits
-    /// first, or drops, each reads the title memory of its own submission
-    /// (a sweep once a frame for the frame's first list left the others the
-    /// frame before's, and views written after it null).
+    /// at each of its submissions; each list's step ([`PickedStep`]) has
+    /// what it lists refreshed for its own submission, once per submission
+    /// whichever lists ask: whichever list the title submits first, or
+    /// drops, each reads the title memory of its own submission (a sweep
+    /// once a frame for the frame's first list left the others the frame
+    /// before's, and views written after it null).
     ///
     /// Every view waiting is made, never left null for a later call (Codex
     /// review of 244cf78, finding 6): those whose host copy is there first
@@ -2504,9 +2779,9 @@ impl HostHeap {
     /// its bytes refreshed for the submission. So the work of a call is
     /// bounded by what the title wrote since the last: the queue holds each
     /// view once, and nothing waits from one call to the next; the listing
-    /// is kept as views change ([`Listing`]), and what a list refreshes and
-    /// declares written is the runs of the copies whose views changed since
-    /// its last call, a step per such copy ([`PickedUse`]).
+    /// is kept as views change ([`Listing`]), and a call adds the list
+    /// nothing but its step for the refresh epoch ([`PickedUse::defer`]),
+    /// the runs being given at submission ([`Listing::due`]).
     ///
     /// The approach of Marvisak/VIctory#1544 (n-romanovich): views written
     /// by the title made before a draw that reads the heap directly, their
@@ -6023,21 +6298,34 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// What a list running [`unknown_stride_program`] refreshes of the
+    /// title memory the program reads.
+    #[derive(Clone, Copy)]
+    enum Reads<'a> {
+        /// The source buffer's first 4 KiB.
+        Whole,
+        /// Each run of a listing.
+        Runs(&'a Picked),
+        /// Nothing itself: the step of the list's picks does
+        /// ([`PickedUse::defer`]).
+        Step,
+    }
+
     /// Runs [`unknown_stride_program`] once over `heap` with the table at
     /// user data `base` (the byte offset the host gives a table: slot 0 is
     /// read at `base`, slot 1 written at `base + 32`), `src`'s copy
-    /// refreshed for it (`spans` of it, or its first 4 KiB) and `dst`'s
-    /// written back; what `dst` holds after.
+    /// refreshed for it (`reads`) and `dst`'s written back; what `dst`
+    /// holds after.
     fn run_table_program(
         heap: &HostHeap,
         pipeline: &(ID3D12RootSignature, ID3D12PipelineState),
         cs: &xtp_shader::emit::HostShader,
         (src, dst): (&crate::testgpu::TitleBuffer, &crate::testgpu::TitleBuffer),
         base: u32,
-        spans: Option<&Picked>,
+        reads: Reads<'_>,
     ) -> Vec<u32> {
         let list = crate::testgpu::TitleList::new();
-        record_table_program(list.host(), heap, pipeline, cs, (src, dst), base, spans);
+        record_table_program(list.host(), heap, pipeline, cs, (src, dst), base, reads);
         list.run();
         dst.words()
     }
@@ -6050,18 +6338,19 @@ mod tests {
         cs: &xtp_shader::emit::HostShader,
         (src, dst): (&crate::testgpu::TitleBuffer, &crate::testgpu::TitleBuffer),
         base: u32,
-        spans: Option<&Picked>,
+        reads: Reads<'_>,
     ) {
         let (root, pso) = pipeline;
         let (table, _) = heap.stride_table().expect("a table");
         let (from, to) = (src.shadow(), dst.shadow());
-        match spans {
-            Some(picked) => {
+        match reads {
+            Reads::Runs(picked) => {
                 for (copy, at, end) in &picked.reads() {
                     copy.refresh(l, *at, end - at);
                 }
             }
-            None => from.refresh(l, src.address(), 1 << 12),
+            Reads::Whole => from.refresh(l, src.address(), 1 << 12),
+            Reads::Step => {}
         }
         to.refresh(l, dst.address(), 1 << 12);
         to.gpu_writes(l, dst.address(), 1 << 12);
@@ -6137,7 +6426,7 @@ mod tests {
             ),
         ] {
             dst.set_words(|_| 0);
-            let out = run_table_program(&heap, &pipeline, &cs, (&src, &dst), base, None);
+            let out = run_table_program(&heap, &pipeline, &cs, (&src, &dst), base, Reads::Whole);
             if reads {
                 assert_eq!(out[..64], want[..64], "{what}");
             } else {
@@ -6482,7 +6771,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // the listing says, and only that.
         src.set_words(|i| 7000 + i as u32);
         dst.set_words(|_| 0);
-        let out = run_table_program(&heap, &pipeline, &cs, (&src, &dst), 0, Some(&picked));
+        let out = run_table_program(&heap, &pipeline, &cs, (&src, &dst), 0, Reads::Runs(&picked));
         // [2, 4] of the view from byte 20: byte 48, dword 12, stored at
         // [1, 8] of the output's 12-byte elements (dword 5); 20 at [2, 0].
         assert_eq!((out[5], out[6]), (7012, 20), "what the title wrote last");
@@ -7132,7 +7421,15 @@ void main() {
         dst.set_words(|_| 0);
         let list = TitleList::new();
         let base = (table * 32) | (xtp_shader::emit::REMAPPED_SLOT << 5);
-        record_table_program(list.host(), &heap, &pipeline, &cs, (&src, &dst), base, None);
+        record_table_program(
+            list.host(),
+            &heap,
+            &pipeline,
+            &cs,
+            (&src, &dst),
+            base,
+            Reads::Whole,
+        );
         // The holder's view goes while a submission is in flight: its raw
         // view comes back once the fence reaches that submission.
         let mut gate = crate::host::Gate::close(host);
@@ -7198,66 +7495,337 @@ void main() {
         RUN_TIME_VIEWS_TEST.set(None);
     }
 
-    /// Codex review of 244cf78 (a new bug): a recording kept each listing
-    /// it declared written, so a new buffer before each of N dispatches
-    /// that write through slots they pick kept N listings of 1 to N spans,
-    /// and declared as many. A recording refreshes and declares what
-    /// changed since its last pick now: N runs in all, none again when
-    /// nothing changed; after a title copy in its list (another refresh
-    /// epoch), every run is refreshed again. Codex review of a090f22, P2:
-    /// each change made the whole listing afresh, N(N+1)/2 copies looked at
-    /// over the N dispatches; a pick looks at the copies that changed since
-    /// the recording's last one now, N in all for each of the two.
+    /// The step of a list's picks ([`PickedUse::defer`]; VIctory 6d021fe):
+    /// N buffers whose unordered views the title writes before each of N
+    /// dispatches that write through slots they pick add one step to the
+    /// list and look at no copy while recording (Codex review of 8612e27,
+    /// P2: each new recording caught up on the listing from nothing, a
+    /// refresh step per run). At submission the first list's step is given
+    /// every run, a later list's step of the same submission what changed
+    /// since (nothing if nothing did), every run again after a step that
+    /// wrote title memory, and a new submission every run; runs are
+    /// declared written once per submission. Each copy that changed is
+    /// looked at once (Codex reviews of 244cf78 and a090f22, P2: N(N+1)/2
+    /// copies over the N dispatches). A copy no view reads any more is
+    /// given no more.
     #[test]
-    fn each_pick_refreshes_and_declares_only_what_changed() {
-        use crate::testgpu::TitleBuffer;
+    fn picks_add_one_step_and_submissions_are_given_the_listing_once() {
+        use crate::testgpu::{TitleBuffer, TitleList};
         const N: usize = 8;
-        let test = "descriptor::host::tests::each_pick_refreshes_and_declares_only_what_changed";
+        let test = "descriptor::host::tests::picks_add_one_step_and_submissions_are_given_the_listing_once";
         let Some(_gpu) = crate::testgpu::device(test) else {
             return;
         };
         RUN_TIME_VIEWS_TEST.set(Some(true));
-        let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
-        let buffers: Vec<TitleBuffer> = (0..N).map(|_| TitleBuffer::new(1 << 12)).collect();
-        let slots = vec![0u64; 8 * 4];
+        let heap = HostHeap::new_with(false, 16, true).expect("a host view heap");
+        let buffers: Vec<TitleBuffer> = (0..=N).map(|_| TitleBuffer::new(1 << 12)).collect();
+        let slots = vec![0u64; 16 * 4];
         let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
-        let mut used = PickedUse::default();
-        let (mut refreshed, mut declared) = (0, 0);
-        for (i, b) in buffers.iter().enumerate() {
-            let View::Unordered(r, _, Some(words)) = buffer_view(true, b, structured(16), (0, 16))
+        let uav = |i: usize| {
+            let View::Unordered(r, _, Some(words)) =
+                buffer_view(true, &buffers[i], structured(16), (0, 16))
             else {
                 unreachable!()
             };
             let r = r as crate::object::This;
             crate::descriptor::create_uav(std::ptr::null(), r, std::ptr::null(), &words, at(i));
             heap.mirror(i as u32, at(i), false);
+        };
+        let list = TitleList::new();
+        let l = list.host();
+        let mut used = PickedUse::default();
+        for i in 0..N {
+            uav(i);
             let picked = heap.picked_spans(at(0)).expect("a listing");
             assert_eq!(picked.writes().len(), i + 1);
-            refreshed += used.unrefreshed(&picked, 0).len();
-            declared += used.undeclared(&picked).len();
+            used.defer(l, &picked, true);
         }
-        assert_eq!((refreshed, declared), (N, N));
+        assert_eq!(l.steps(), 1, "one step for the N picks");
+        assert_eq!(heap.visits(), 0, "no copy looked at while recording");
+        let step = used.step.as_ref().map(|(_, s)| s.clone()).expect("a step");
+        let count = |(reads, writes): (Vec<Span>, Vec<Span>)| (reads.len(), writes.len());
+        let submission = crate::shadow::submission();
         assert_eq!(
-            heap.visits(),
-            2 * N as u64,
-            "a copy a pick, not the listing"
+            count(step.due(submission, 0)),
+            (N, N),
+            "every run, declared"
         );
-        let picked = heap.picked_spans(at(0)).expect("a listing");
-        assert!(used.unrefreshed(&picked, 0).is_empty() && used.undeclared(&picked).is_empty());
+        assert_eq!(heap.visits(), 2 * N as u64, "each copy once, for each");
+        // The submission's next list.
+        assert_eq!(count(step.due(submission, 0)), (0, 0), "nothing changed");
+        assert_eq!(heap.visits(), 2 * N as u64, "nothing looked at");
+        // A view the title writes meanwhile: its run alone.
+        uav(N);
+        heap.picked_spans(at(0)).expect("a listing");
+        assert_eq!(count(step.due(submission, 0)), (1, 1), "what changed");
+        assert_eq!(heap.visits(), 2 * N as u64 + 2);
+        // After a step of the submission that wrote title memory.
         assert_eq!(
-            heap.visits(),
-            2 * N as u64,
-            "nothing changed: nothing looked at"
+            count(step.due(submission, 1)),
+            (N + 1, 0),
+            "refreshed again"
         );
-        assert_eq!(used.unrefreshed(&picked, 1).len(), N, "after a title copy");
-        assert!(used.undeclared(&picked).is_empty());
-        // The title copies an empty slot over slot 0: its copy goes from the
-        // listing, and a recording that catches up finds nothing to do.
-        crate::descriptor::copy_simple(std::ptr::null(), 1, at(0), at(7), 0);
+        // What the submission's GPU work touches: once.
+        let (reads, writes) = step.touches(submission);
+        assert_eq!((reads.len(), writes.len()), (2 * N + 2, N + 1));
+        let (reads, writes) = step.touches(submission);
+        assert!(reads.is_empty() && writes.is_empty(), "taken");
+        // The next submission: every run.
+        let next = crate::shadow::submission();
+        assert_eq!(count(step.due(next, 0)), (N + 1, N + 1));
+        // The title copies an empty slot over slot 0: its copy goes from
+        // the listing, and from what submissions are given.
+        crate::descriptor::copy_simple(std::ptr::null(), 1, at(0), at(15), 0);
         heap.mirror(0, at(0), true);
-        assert_eq!(picked.reads().len(), N - 1);
-        assert!(used.unrefreshed(&picked, 1).is_empty());
+        assert_eq!(count(step.due(crate::shadow::submission(), 0)), (N, N));
+        let held = heap.listed.listing().due.reads.len();
+        assert_eq!(held, N, "the copy no view reads is not held");
         RUN_TIME_VIEWS_TEST.set(None);
+    }
+
+    /// Codex review of 8612e27, P2: N disjoint views of one host copy, each
+    /// written before a pick, made each pick copy the copy's whole map of
+    /// runs: 1 + ... + N runs looked at under the listing's lock. A pick
+    /// looks at nothing now, and the submission is given the N runs once,
+    /// the copy looked at once.
+    #[test]
+    fn disjoint_views_of_one_copy_are_given_at_submission_not_at_each_pick() {
+        use crate::testgpu::{TitleBuffer, TitleList};
+        const N: usize = 8;
+        let test = "descriptor::host::tests::disjoint_views_of_one_copy_are_given_at_submission_not_at_each_pick";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        RUN_TIME_VIEWS_TEST.set(Some(true));
+        let heap = HostHeap::new_with(false, 16, true).expect("a host view heap");
+        // Views two pages apart: a run each.
+        let apart = 2 * RUN_GAP as usize;
+        let buffer = TitleBuffer::new(N * apart);
+        let slots = vec![0u64; 16 * 4];
+        let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
+        let list = TitleList::new();
+        let l = list.host();
+        let mut used = PickedUse::default();
+        for i in 0..N {
+            let first = (i * apart / 16) as u32;
+            let View::Shader(r, Some(words)) =
+                buffer_view(false, &buffer, structured(16), (first, 16))
+            else {
+                unreachable!()
+            };
+            let r = r as crate::object::This;
+            crate::descriptor::create_srv(std::ptr::null(), r, &words, at(i));
+            heap.mirror(i as u32, at(i), false);
+            let picked = heap.picked_spans(at(0)).expect("a listing");
+            used.defer(l, &picked, false);
+        }
+        assert_eq!((l.steps(), heap.visits()), (1, 0));
+        let step = used.step.as_ref().map(|(_, s)| s.clone()).expect("a step");
+        let (reads, writes) = step.due(crate::shadow::submission(), 0);
+        let base = buffer.address();
+        let runs: Vec<(u64, u64)> = reads.iter().map(|&(_, a, b)| (a - base, b - a)).collect();
+        let want: Vec<(u64, u64)> = (0..N).map(|i| ((i * apart) as u64, 256)).collect();
+        assert_eq!(runs, want, "the N runs, by address");
+        assert!(writes.is_empty(), "no shader writes through them");
+        assert_eq!(heap.visits(), 1, "the copy looked at once");
+        RUN_TIME_VIEWS_TEST.set(None);
+    }
+
+    /// Codex review of 8612e27, P2 (a new bug): a closed list submitted
+    /// again after the title pointed the slot it picks at another buffer
+    /// added that buffer's refresh to its steps at each submission, and
+    /// held them, and the buffers, until its reset: after N submissions, N
+    /// refreshes for one slot. The list keeps its one step; each
+    /// submission is given what the slot holds then, and the listing holds
+    /// that buffer's copy alone.
+    #[test]
+    fn a_resubmitted_list_refreshes_what_its_slot_holds_now_only() {
+        use crate::testgpu::{TitleBuffer, TitleList};
+        const N: usize = 4;
+        let test =
+            "descriptor::host::tests::a_resubmitted_list_refreshes_what_its_slot_holds_now_only";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        RUN_TIME_VIEWS_TEST.set(Some(true));
+        let host = gpu.host();
+        let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
+        let slots = vec![0u64; 8 * 4];
+        let start = slots.as_ptr() as u64;
+        let buffers: Vec<TitleBuffer> = (0..N).map(|_| TitleBuffer::new(1 << 12)).collect();
+        let write = |b: &TitleBuffer| {
+            let View::Shader(r, Some(words)) = buffer_view(false, b, structured(16), (0, 16))
+            else {
+                unreachable!()
+            };
+            crate::descriptor::create_srv(
+                std::ptr::null(),
+                r as crate::object::This,
+                &words,
+                start,
+            );
+            heap.mirror(0, start, false);
+        };
+        write(&buffers[0]);
+        let list = TitleList::new();
+        let l = list.host();
+        let used = Arc::new(Mutex::new(PickedUse::default()));
+        let picked = heap.picked_spans(start).expect("a listing");
+        used.lock().unwrap().defer(l, &picked, false);
+        // The list sweeps at each of its submissions, as `draw.rs` has it.
+        let (at, sweeping) = (std::ptr::from_ref(&heap) as usize, used.clone());
+        l.at_submit(move |list| {
+            // SAFETY: the heap outlives the list's submissions below.
+            let heap = unsafe { &*(at as *const HostHeap) };
+            if let Some(picked) = heap.picked_spans(start) {
+                sweeping.lock().unwrap().defer(list, &picked, false);
+            }
+        });
+        type Close = extern "system" fn(crate::object::This) -> crate::object::HRESULT;
+        let close = crate::object::slot::<Close>(list.this(), 0x48);
+        assert_eq!(close(list.this()), crate::object::S_OK);
+        for (k, b) in buffers.iter().enumerate() {
+            if k > 0 {
+                write(b);
+            }
+            host.submit(&[l]);
+            host.drain();
+            assert_eq!(l.steps(), 1, "submission {k}: still the one step");
+            let copies: Vec<usize> = heap.listed.listing().due.reads.keys().copied().collect();
+            let now = Arc::as_ptr(&b.shadow()) as usize;
+            assert_eq!(
+                copies,
+                [now],
+                "submission {k}: the buffer the slot holds alone"
+            );
+        }
+        RUN_TIME_VIEWS_TEST.set(None);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Two lists of one submission pick slots of one heap: the first one's
+    /// step refreshes what the listing reads, the second's nothing more
+    /// (VIctory 6d021fe), and the programs of both read what the title
+    /// wrote last; written again, the next submission of the two reads the
+    /// new bytes.
+    #[test]
+    fn lists_of_a_submission_share_one_refresh_and_read_the_titles_bytes() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
+        use crate::testgpu::{TitleBuffer, TitleList};
+        let test = "descriptor::host::tests::lists_of_a_submission_share_one_refresh_and_read_the_titles_bytes";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        RUN_TIME_VIEWS_TEST.set(Some(true));
+        let host = gpu.host();
+        let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
+        let cs = unknown_stride_program();
+        let pipeline = table_pipeline(&host.device, &cs);
+        let src = TitleBuffer::new(1 << 12);
+        let dsts = [TitleBuffer::new(1 << 12), TitleBuffer::new(1 << 12)];
+        let slots = vec![0u64; 8 * 4];
+        let at = |i: u32| slots.as_ptr() as u64 + 32 * u64::from(i);
+        // Each list's table: the title's view of `src` (waiting for a
+        // sweep), then its output (made by a draw's table).
+        for (k, dst) in dsts.iter().enumerate() {
+            let slot = 2 * k as u32;
+            let View::Shader(r, Some(words)) = buffer_view(false, &src, structured(16), (0, 16))
+            else {
+                unreachable!()
+            };
+            crate::descriptor::create_srv(
+                std::ptr::null(),
+                r as crate::object::This,
+                &words,
+                at(slot),
+            );
+            heap.mirror(slot, at(slot), false);
+            heap.make_at(slot + 1, &buffer_view(true, dst, structured(16), (0, 16)));
+        }
+        let lists = [TitleList::new(), TitleList::new()];
+        for (k, list) in lists.iter().enumerate() {
+            let l = list.host();
+            let picked = heap.picked_spans(at(0)).expect("a listing");
+            PickedUse::default().defer(l, &picked, false);
+            let base = 64 * k as u32;
+            record_table_program(
+                l,
+                &heap,
+                &pipeline,
+                &cs,
+                (&src, &dsts[k]),
+                base,
+                Reads::Step,
+            );
+            type Close = extern "system" fn(crate::object::This) -> crate::object::HRESULT;
+            let close = crate::object::slot::<Close>(list.this(), 0x48);
+            assert_eq!(close(list.this()), crate::object::S_OK);
+        }
+        let (one, two) = (lists[0].host(), lists[1].host());
+        for value in [5000, 6000] {
+            src.set_words(|i| value + i as u32);
+            dsts.iter().for_each(|d| d.set_words(|_| 0));
+            host.submit(&[one, two]);
+            host.drain();
+            // [2, 4] of 16-byte elements (dword 9) stored at [1, 8] (dword
+            // 6); 10 added twice at [2, 0] (dword 8).
+            for (k, dst) in dsts.iter().enumerate() {
+                let out = dst.words();
+                assert_eq!((out[6], out[8]), (value + 9, 20), "list {k}, {value}");
+            }
+        }
+        RUN_TIME_VIEWS_TEST.set(None);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Codex review of 8612e27, P2 (a new bug): two dynamic slots waited
+    /// for a raw view of one window; the first raw view back made it for
+    /// the first slot, and `reap` stopped there, the pool full again,
+    /// though the second slot could name it at no cost: it read zeros until
+    /// another came back. It names it now, the pool full or not.
+    #[test]
+    fn slots_waiting_for_one_window_share_the_raw_view_made_for_it() {
+        use crate::testgpu::TitleBuffer;
+        let test =
+            "descriptor::host::tests::slots_waiting_for_one_window_share_the_raw_view_made_for_it";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let heap = HostHeap::with_pool(8, 2).expect("a host view heap");
+        let (a, b, c) = (
+            TitleBuffer::new(1 << 12),
+            TitleBuffer::new(1 << 12),
+            TitleBuffer::new(1 << 12),
+        );
+        // Title slots 0 and 1 hold the pool's two raw views.
+        heap.make_at(0, &buffer_view(false, &a, structured(16), (0, 8)));
+        heap.make_at(1, &buffer_view(false, &b, structured(16), (0, 8)));
+        assert_eq!(heap.pool_state(), (0, 0), "the pool is full");
+        // Two dynamic slots read one window of `c`, as 16- and 32-byte
+        // elements: no raw view for them.
+        let first = heap.dynamic(2).expect("dynamic slots");
+        heap.make_at(first, &buffer_view(false, &c, structured(16), (0, 16)));
+        heap.make_at(first + 1, &buffer_view(false, &c, structured(32), (0, 8)));
+        assert_eq!(heap.entry(first), StrideEntry::NONE);
+        assert_eq!(heap.entry(first + 1), StrideEntry::NONE);
+        // Slot 1's view goes: once the GPU is past what may read its raw
+        // view, the first slot waiting makes `c`'s window with it, and the
+        // second names it too, the pool full again.
+        heap.make_null(1);
+        completed_until(host, "never given one", || {
+            heap.entry(first).raw_slot.is_some()
+        });
+        let (one, two) = (heap.entry(first), heap.entry(first + 1));
+        assert_eq!(two.raw_slot, one.raw_slot, "the same raw view");
+        assert_eq!((one.stride, one.count), (16, 16));
+        assert_eq!((two.stride, two.count), (32, 8));
+        assert_eq!(heap.pool_state(), (0, 0), "one pool slot for both");
+        heap.release(first, 2);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// What a pick refreshes of a host copy is its views' runs: ranges that

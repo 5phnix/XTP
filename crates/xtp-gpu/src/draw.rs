@@ -646,15 +646,16 @@ fn default_buffer(size: u64) -> Option<ID3D12Resource> {
     Some(buffer)
 }
 
-/// What a recording refreshed and declared written of a view heap's
-/// listings for shaders that pick slots at run time.
+/// What a recording did with a view heap's listing for shaders that pick
+/// slots at run time: its step for the list.
 type PickedUse = std::sync::Arc<std::sync::Mutex<crate::descriptor::host::PickedUse>>;
 
-/// The views of `host`'s slots (title heap at `start`) made, and for the
-/// list's submission what they read and has changed since `used` last
-/// looked refreshed, then (`writes`, after the refresh) what they may
-/// write declared written, so that what the GPU writes goes back to title
-/// memory and no later refresh copies title memory over it.
+/// The views of `host`'s slots (title heap at `start`) made, and the list's
+/// step for them ([`crate::descriptor::host::PickedUse::defer`]): at each
+/// submission what they read is brought up to date, then (`writes`, after
+/// the refresh) what they may write declared written, so that what the GPU
+/// writes goes back to title memory and no later refresh copies title
+/// memory over it; once per submission whichever lists ask.
 fn picked_refresh(
     list: &HostList,
     host: &crate::descriptor::host::HostHeap,
@@ -665,16 +666,9 @@ fn picked_refresh(
     let Some(picked) = host.picked_spans(start) else {
         return;
     };
-    let mut used = used.lock().unwrap_or_else(|e| e.into_inner());
-    for (copy, from, to) in used.unrefreshed(&picked, list.refresh_epoch()) {
-        copy.refresh(list, from, to - from);
-    }
-    if writes {
-        used.writing = true;
-        for (copy, from, to) in used.undeclared(&picked) {
-            copy.gpu_writes(list, from, to - from);
-        }
-    }
+    used.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .defer(list, &picked, writes);
 }
 
 /// The host heap behind a key of [`State::host_heaps`]: a title heap, or
