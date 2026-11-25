@@ -209,7 +209,6 @@ fn assemble(
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
-    let uses_mode = list.iter().any(|i| i.name() == Some("v_cvt_f32_f64"));
     for (n, ((machine, &flow), next)) in list.into_iter().zip(flows).zip(next_offsets).enumerate() {
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
         let name = machine.name().ok_or(ShaderError::Unsupported {
@@ -235,7 +234,7 @@ fn assemble(
             };
         }
         if let Some((mut reads, mut writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
-            if uses_mode && float_mode_field(name, &fields).is_some() {
+            if float_mode_field(name, &fields).is_some() {
                 reads.push(Reg::FloatMode);
                 writes.push(Reg::FloatMode);
             } else if name == "v_cvt_f32_f64" {
@@ -317,6 +316,7 @@ fn assemble(
         }
     }
     remove_trivial_phis(&mut blocks, values);
+    float_modes(&blocks)?;
     Ok(Program {
         wave64,
         vgprs,
@@ -349,22 +349,394 @@ fn reg_at(i: usize) -> Reg {
     }
 }
 
-/// Bits de MODE lus par la conversion f64 vers f32 (arrondi f32,
-/// conservation des dénormalisés en entrée f64 et en sortie f32).
-pub(crate) fn float_mode_field(name: &str, fields: &Fields) -> Option<(u32, u32)> {
-    match (name, fields) {
-        ("s_round_mode", _) => Some((0, 0x03)),
-        ("s_denorm_mode", _) => Some((4, 0x60)),
-        ("s_setreg_b32" | "s_setreg_imm32_b32", Fields::Sop { imm: Some(hw), .. })
-            if hw & 63 == 1 =>
-        {
-            let offset = u32::from(hw >> 6 & 31);
-            let width = u32::from(hw >> 11) + 1;
-            let mask = (u32::MAX >> (32 - width)) << offset & 0x63;
-            (mask != 0).then_some((offset, mask))
-        }
-        _ => None,
+/// The float bits of the MODE register: FP_ROUND (bits 0-1 for f32, 2-3
+/// for f16 and f64; 0 round to nearest even, 1 toward +inf, 2 toward -inf,
+/// 3 toward zero) and FP_DENORM (bits 4-5 for f32, 6-7 for f16 and f64; bit
+/// 0 of each keeps input denormals, bit 1 output ones).
+const FLOAT_MODE_BITS: u32 = 0xFF;
+
+/// MODE bits beyond [`FLOAT_MODE_BITS`] that change float results:
+/// DX10_CLAMP (8), IEEE (9) and FP16_OVFL (23). The translation does not
+/// follow them ([`float_modes`] refuses a write to them).
+const OTHER_FLOAT_BITS: u32 = 1 << 8 | 1 << 9 | 1 << 23;
+
+/// MODE as a hardware register (`hwreg(HW_REG_MODE)`).
+const HW_REG_MODE: u16 = 1;
+
+/// The bits of MODE an `s_setreg*` (`hwreg` in `imm`) writes, from bit
+/// `offset`: (offset, mask of MODE).
+fn setreg_field(name: &str, fields: &Fields) -> Option<(u32, u32)> {
+    let ("s_setreg_b32" | "s_setreg_imm32_b32", Fields::Sop { imm: Some(hw), .. }) = (name, fields)
+    else {
+        return None;
+    };
+    if hw & 63 != HW_REG_MODE {
+        return None;
     }
+    let offset = u32::from(hw >> 6 & 31);
+    let width = u32::from(hw >> 11) + 1;
+    Some((offset, (u32::MAX >> (32 - width)) << offset))
+}
+
+/// The float bits of MODE ([`FLOAT_MODE_BITS`]) that `name` writes: the
+/// field's offset in MODE (its source's bit 0 goes there) and the bits.
+/// [`float_modes`] checks every such write.
+fn mode_write(name: &str, fields: &Fields) -> Option<(u32, u32)> {
+    let (offset, mask) = match name {
+        "s_round_mode" => (0, 0x0F),
+        "s_denorm_mode" => (4, 0xF0),
+        _ => setreg_field(name, fields)?,
+    };
+    let mask = mask & FLOAT_MODE_BITS;
+    (mask != 0).then_some((offset, mask))
+}
+
+/// The MODE bits a lowering reads: `v_cvt_f32_f64`'s f32 rounding (0-1),
+/// f32 output denormals (5) and f64 input denormals (6).
+const LOWERED_MODE_BITS: u32 = 0x63;
+
+/// What [`mode_write`] writes of [`LOWERED_MODE_BITS`]: the writes the
+/// IR follows as [`Reg::FloatMode`], for the lowering (`set_float_mode`).
+/// The other float bits stay out of the SSA form, which nothing would read
+/// (the values a whole-wave section writes must all be ones its simulation
+/// follows, and each would put a constant in the module); [`float_modes`]
+/// checks them.
+pub(crate) fn float_mode_field(name: &str, fields: &Fields) -> Option<(u32, u32)> {
+    let (offset, mask) = mode_write(name, fields)?;
+    let mask = mask & LOWERED_MODE_BITS;
+    (mask != 0).then_some((offset, mask))
+}
+
+/// Float precisions: f32.
+const F32: u8 = 1;
+/// Float precisions: f16 or f64 (MODE's second field of each kind).
+const F16_64: u8 = 2;
+
+/// Which MODE fields a VALU instruction's result depends on: the rounding
+/// of its result's precision, the denormal handling of every precision it
+/// takes or gives ([`F32`], [`F16_64`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct FloatKinds {
+    pub rounds: u8,
+    pub denormals: u8,
+}
+
+/// [`FloatKinds`] of VALU opcode `name`, by its name's types: the first one
+/// is the result's (`v_cvt_f16_f32`, `v_dot2_f32_f16`), and all of them
+/// are taken in. Instructions whose result is exact whatever the mode
+/// (moves, selects, min and max, floor, compares, conversions to integers
+/// or with their own rounding) do not round. `v_cvt_f32_f64` is left out:
+/// its lowering reads MODE itself.
+pub(crate) fn float_kinds(name: &str) -> FloatKinds {
+    let Some(rest) = name.strip_prefix("v_") else {
+        return FloatKinds::default();
+    };
+    if name == "v_cvt_f32_f64" {
+        return FloatKinds::default();
+    }
+    let kind = |t: &str| match t {
+        "f32" => F32,
+        "f16" | "f64" => F16_64,
+        _ => 0,
+    };
+    let types: Vec<u8> = rest.split('_').map(kind).filter(|&k| k != 0).collect();
+    let Some(&first) = types.first() else {
+        return FloatKinds::default();
+    };
+    let mut denormals = types.iter().fold(0, |a, &k| a | k);
+    if rest.contains("_mix") {
+        // f16 or f32 operands, by their selects.
+        denormals |= F32 | F16_64;
+    }
+    let packed = rest.strip_prefix("pk_").unwrap_or(rest);
+    let exact = rest.starts_with("cmp")
+        || rest.starts_with("mov")
+        || rest.starts_with("cndmask")
+        || rest.starts_with("interp_mov")
+        || [
+            "max", "min", "med3", "max3", "min3", "floor", "ceil", "trunc", "rndne",
+        ]
+        .iter()
+        .any(|op| packed.starts_with(op) && packed[op.len()..].starts_with('_'))
+        || rest.starts_with("fract")
+        || rest.starts_with("frexp")
+        || rest.starts_with("cvt_pkrtz")
+        || rest.starts_with("cvt_flr")
+        || rest.starts_with("cvt_rpi")
+        || rest.starts_with("cvt_off")
+        || rest.starts_with("cvt_pknorm")
+        || rest.starts_with("cvt_") && kind(rest.split('_').nth(1).unwrap_or("")) == 0;
+    let rounds = match name {
+        _ if exact => 0,
+        // An f32 result from 16-bit attributes.
+        "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => F32,
+        _ => first,
+    };
+    FloatKinds { rounds, denormals }
+}
+
+/// What [`float_modes`] found: whether a 16- or 64-bit rounding other than
+/// to nearest even (in BTP 6, toward zero around 16-bit interpolation)
+/// reaches a 16- or 64-bit float instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FloatModes {
+    pub half_rounding: bool,
+}
+
+/// A refusal of [`float_modes`]: an f32 rounding other than to nearest
+/// even reaches an f32 instruction (DXIL rounds f32 results to nearest).
+pub const F32_ROUNDING: &str =
+    "an f32 rounding mode other than round to nearest even reaching an f32 float instruction";
+/// A refusal of [`float_modes`]: MODE bits the program computes when it
+/// runs (an `s_setreg_b32` of a register no constant moves into) reach a
+/// float instruction.
+pub const RUN_TIME_MODE: &str = "a float mode computed at run time reaching a float instruction";
+/// A refusal of [`float_modes`]: float instructions of one precision run
+/// under more than one denormal mode (DXIL declares one per program).
+pub const DENORMALS_CHANGE: &str = "a float denormal mode that changes within the program";
+/// A refusal of [`float_modes`]: `v_cvt_f32_f64` reads MODE bits that
+/// differ between the paths that reach it. The console's wave runs a MODE
+/// write for all its lanes, the translation per lane only for those that
+/// take its path (a write in a block some lanes skip), so the lanes need
+/// not agree with the console there.
+pub const MODE_BY_PATH: &str =
+    "a float mode that differs between the paths to a v_cvt_f32_f64 that reads it";
+/// A refusal of [`float_modes`]: a write to MODE bits that change float
+/// results but that the translation does not follow ([`OTHER_FLOAT_BITS`]).
+pub const OTHER_MODE_BITS: &str = "a MODE write to its DX10_CLAMP, IEEE or FP16_OVFL bits";
+
+/// What one 2-bit field of MODE may hold at a point: a bit per known value
+/// (bits 0-3), [`ENTRY`] (what the program started with, whatever that is:
+/// the translation reads the record's float mode byte but does not need it
+/// here), [`RUN_TIME`].
+type Field = u8;
+const ENTRY: Field = 1 << 4;
+const RUN_TIME: Field = 1 << 5;
+
+/// MODE's four float fields: f32 rounding, f16/f64 rounding, f32
+/// denormals, f16/f64 denormals.
+type Mode = [Field; 4];
+
+/// The float modes the program's float instructions run under, over the
+/// console's control flow (a MODE write is scalar: the wave runs it with
+/// every lane, active or not). Refuses what the translation cannot give
+/// them:
+/// - an f32 rounding other than to nearest even ([`F32_ROUNDING`]);
+/// - a mode computed at run time ([`RUN_TIME_MODE`]);
+/// - two denormal modes for one precision ([`DENORMALS_CHANGE`]): DXIL
+///   has one per program (its `fp32-denorm-mode` attribute, which the
+///   translation does not declare yet);
+/// - bits of a `v_cvt_f32_f64`'s mode that differ by path ([`MODE_BY_PATH`]);
+/// - a write to the other float bits of MODE ([`OTHER_MODE_BITS`]).
+///
+/// What the entry mode is does not matter: a field the program never
+/// writes is what the program started with, which the lowering gives
+/// (`v_cvt_f32_f64`) or which is the host's default.
+// shortcut: a 16- or 64-bit rounding other than to nearest even is not
+// refused ([`FloatModes::half_rounding`]): the 16-bit results are the
+// host's, rounded to nearest even, at most one f16 ulp away. BTP 6's pixel
+// programs set round toward zero before their 16-bit interpolation (about
+// 70 % of those dumped, the light loop included); the lowering of 16-bit
+// results (`input.rs`, `valu16.rs`, `valu.rs`) has to round toward zero
+// under such a mode for the results to be the console's (MODE's bits 2-3
+// then in [`Reg::FloatMode`], read by the 16-bit instructions).
+pub fn float_modes(blocks: &[Block]) -> Result<FloatModes, ShaderError> {
+    let refuse = |offset, what| ShaderError::Unsupported { offset, what };
+    // The constant a scalar register holds, where a move of one wrote it.
+    let mut constants: std::collections::HashMap<Value, u32> = std::collections::HashMap::new();
+    let mut any = false;
+    for inst in blocks.iter().flat_map(|b| &b.insts) {
+        if let Some((_, mask)) = setreg_field(inst.name(), &inst.fields)
+            && mask & OTHER_FLOAT_BITS != 0
+        {
+            return Err(refuse(inst.machine.offset, OTHER_MODE_BITS));
+        }
+        any |= mode_write(inst.name(), &inst.fields).is_some();
+        if let (
+            "s_mov_b32" | "s_movk_i32",
+            Fields::Sop {
+                dst: Some(Operand::Scalar { code, .. }),
+                src,
+                imm,
+            },
+        ) = (inst.name(), &inst.fields)
+        {
+            let k = match (inst.name(), src.first()) {
+                ("s_movk_i32", _) => imm.map(|i| i as i16 as u32),
+                (_, Some(&Operand::Literal(x))) => Some(x),
+                (_, Some(&Operand::Const(c))) => crate::resource::inline(c),
+                _ => None,
+            };
+            if let (Some(k), Some(v)) = (k, inst.write(Reg::S(*code))) {
+                constants.insert(v, k);
+            }
+        }
+    }
+    if !any {
+        return Ok(FloatModes::default());
+    }
+    // The bits a write sets, shifted into MODE (`None`: known at run time).
+    let written = |inst: &Inst, offset: u32, mask: u32| -> Option<u32> {
+        let source = match &inst.fields {
+            Fields::Sopp { imm } => Some(u32::from(*imm) & 0xF),
+            Fields::Sop { src, .. } => match *src.first()? {
+                Operand::Literal(x) => Some(x),
+                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Scalar { code, .. } => constants.get(&inst.read(Reg::S(code))?).copied(),
+                _ => None,
+            },
+            _ => None,
+        }?;
+        Some(source << offset & mask)
+    };
+    let write = |mode: &mut Mode, inst: &Inst| {
+        let Some((offset, mask)) = mode_write(inst.name(), &inst.fields) else {
+            return;
+        };
+        let bits = written(inst, offset, mask);
+        for (j, field) in mode.iter_mut().enumerate() {
+            let m = (mask >> (2 * j) & 3) as u8;
+            if m == 0 {
+                continue;
+            }
+            *field = match bits {
+                None => RUN_TIME,
+                Some(bits) => {
+                    let b = (bits >> (2 * j) & 3) as u8;
+                    if m == 3 {
+                        1 << b
+                    } else {
+                        // One bit of the field: each value it may hold with
+                        // that bit written; the entry's, unknown here, is
+                        // then only known at run time.
+                        let mut f = (0..4u8)
+                            .filter(|&c| *field >> c & 1 != 0)
+                            .fold(0, |a, c| a | 1 << (c & !m | b));
+                        if *field & (ENTRY | RUN_TIME) != 0 {
+                            f |= RUN_TIME;
+                        }
+                        f
+                    }
+                }
+            };
+        }
+    };
+    let order = reverse_postorder(blocks);
+    let mut entry: Vec<Mode> = vec![[0; 4]; blocks.len()];
+    entry[0] = [ENTRY; 4];
+    let exit_of = |b: usize, entry: &[Mode]| {
+        let mut mode = entry[b];
+        for inst in &blocks[b].insts {
+            write(&mut mode, inst);
+        }
+        mode
+    };
+    loop {
+        let mut changed = false;
+        for &b in &order {
+            let out = exit_of(b, &entry);
+            for t in blocks[b].exit.successors() {
+                for j in 0..4 {
+                    if entry[t][j] | out[j] != entry[t][j] {
+                        entry[t][j] |= out[j];
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut found = FloatModes::default();
+    let mut denormals = [0 as Field; 2];
+    let non_nearest = 1 << 1 | 1 << 2 | 1 << 3;
+    for &b in &order {
+        let mut mode = entry[b];
+        for inst in &blocks[b].insts {
+            let at = inst.machine.offset;
+            let name = inst.name();
+            if name == "v_cvt_f32_f64" {
+                // Its rounding (f32), output denormals (f32), input
+                // denormals (f64): one value each, or paths that every lane
+                // of a wave takes together.
+                if [mode[0], mode[2], mode[3]]
+                    .iter()
+                    .any(|f| f.count_ones() > 1)
+                    && !uniform_branches(blocks)
+                {
+                    return Err(refuse(at, MODE_BY_PATH));
+                }
+            } else if matches!(inst.fields, Fields::Valu(_) | Fields::Vintrp { .. }) {
+                let k = float_kinds(name);
+                for (p, round, denormal) in [(F32, 0, 2), (F16_64, 1, 3)] {
+                    if k.rounds & p != 0 {
+                        if mode[round] & RUN_TIME != 0 {
+                            return Err(refuse(at, RUN_TIME_MODE));
+                        }
+                        if mode[round] & non_nearest != 0 {
+                            if p == F32 {
+                                return Err(refuse(at, F32_ROUNDING));
+                            }
+                            found.half_rounding = true;
+                        }
+                    }
+                    if k.denormals & p != 0 {
+                        if mode[denormal] & RUN_TIME != 0 {
+                            return Err(refuse(at, RUN_TIME_MODE));
+                        }
+                        denormals[denormal - 2] |= mode[denormal];
+                        if denormals[denormal - 2].count_ones() > 1 {
+                            return Err(refuse(at, DENORMALS_CHANGE));
+                        }
+                    }
+                }
+            }
+            write(&mut mode, inst);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether every branch of the program is one all lanes of a wave take
+/// together: on SCC from a 32-bit scalar compare of registers other than
+/// lane masks. Any other (EXEC, VCC, SCC of a mask operation) the
+/// translation may run per lane.
+fn uniform_branches(blocks: &[Block]) -> bool {
+    let scc_by: std::collections::HashMap<Value, &Inst> = blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|i| Some((i.write(Reg::Scc)?, i)))
+        .collect();
+    let mask = |op: &Operand| {
+        matches!(*op, Operand::Scalar { code, .. }
+            if (VCC..VCC + 2).contains(&code) || (EXEC..EXEC + 2).contains(&code))
+    };
+    blocks.iter().all(|b| {
+        if !matches!(b.exit, Exit::Branch { .. }) {
+            return true;
+        }
+        let Some(last) = b.insts.last() else {
+            return false;
+        };
+        if !matches!(last.name(), "s_cbranch_scc0" | "s_cbranch_scc1") {
+            return false;
+        }
+        let Some(cmp) = last.read(Reg::Scc).and_then(|v| scc_by.get(&v)) else {
+            return false;
+        };
+        let n = cmp.name();
+        let compare = (n.starts_with("s_cmp_") || n.starts_with("s_cmpk_"))
+            && (n.ends_with("_u32") || n.ends_with("_i32"))
+            || n.starts_with("s_bitcmp") && n.ends_with("_b32");
+        compare && matches!(&cmp.fields, Fields::Sop { src, .. } if !src.iter().any(mask))
+    })
+}
+
+/// [`float_modes`] of a program the IR builds: what its float instructions
+/// run under, for counts (`xtp shader-survey`).
+pub fn float_modes_of(p: &Program) -> FloatModes {
+    float_modes(&p.blocks).unwrap_or_default()
 }
 
 fn insert(set: &mut RegSet, reg: Reg) {

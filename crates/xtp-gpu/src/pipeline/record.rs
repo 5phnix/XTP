@@ -40,15 +40,26 @@
 //!   meanwhile. An entry that does not read back (its digest) is skipped,
 //!   and a pipeline whose containers do not is kept again when a session
 //!   makes it; the part of an entry a run left when it ended while writing
-//!   is cut off. (The first version of the file kept the early key where
-//!   the key now is: nothing reads it, the key is the entry's own.)
+//!   is cut off.
+//! - Versions: version 1 kept the part of a stream before a subobject it
+//!   could not keep as if it were the whole stream, so that its entries may
+//!   describe another pipeline than the title's; version 2 keeps whole
+//!   streams only. A file of version 1 is started again, empty (by the
+//!   first session that keeps a pipeline, or by `xtp precook`); a file of a
+//!   later version is left as it is, and nothing is kept in it.
 //! - Room: the file stops growing at [`MAX_BYTES`]. Past [`COMPACT_AT`],
-//!   `xtp precook`, which runs alone, rewrites it ([`compact`]): entries
-//!   that do not read back, repeats and containers no pipeline uses go, and
-//!   then the oldest pipelines until it is under [`COMPACT_TO`]. A pipeline
-//!   that goes is kept again when a session makes it.
+//!   `xtp precook` rewrites it ([`compact`]): entries that do not read back,
+//!   repeats and containers no pipeline uses go, and then the oldest
+//!   pipelines until it is under [`COMPACT_TO`]. A pipeline that goes is
+//!   kept again when a session makes it. A file that another process has
+//!   open (a session that started anyway) is not rewritten: the session
+//!   would go on writing into the file it opened, which the rewrite
+//!   replaces. A session opens the file under the lock that the rewrite
+//!   holds until the new file is in place, so that it never opens the one
+//!   being replaced; one that cannot open the file while it is rewritten
+//!   tries again [`RETRY`] later.
 //! - A file that cannot be opened (its folder, say) is tried again
-//!   [`RETRY`] later; a file of another version is left as it is.
+//!   [`RETRY`] later, and a full one is looked at again as often.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
@@ -71,9 +82,38 @@ use super::host::GraphicsState;
 
 /// The file, in the pipeline cache's folder.
 pub(crate) const FILE: &str = "recorded-pipelines.bin";
-/// The file's first bytes: its format, version 1. A file of another
-/// version is left as it is, and nothing is kept in it.
-const MAGIC: &[u8; 8] = b"XTPREC\x00\x01";
+/// The file's first bytes: its format, then its version (2; see the
+/// module).
+const MAGIC: &[u8; 8] = b"XTPREC\x00\x02";
+
+/// What a file's first bytes say it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Version {
+    /// This build's.
+    Ours,
+    /// An earlier version's, which this build starts again.
+    Earlier,
+    /// A later version's, or no file of ours: left as it is.
+    Other,
+}
+
+/// The version of a file whose first bytes are `head` (all of them, or its
+/// first [`MAGIC`]`.len()`).
+fn version(head: &[u8]) -> Version {
+    let n = MAGIC.len() - 1;
+    match head.get(..MAGIC.len()) {
+        Some(h) if h == MAGIC => Version::Ours,
+        Some(h) if h[..n] == MAGIC[..n] && h[n] >= 1 && h[n] < MAGIC[n] => Version::Earlier,
+        _ => Version::Other,
+    }
+}
+
+/// Windows' "the file is open in another process in a way that excludes
+/// this one" (`ERROR_SHARING_VIOLATION`).
+const SHARING_VIOLATION: i32 = 32;
+/// The share mode that lets no other handle read or write the file while
+/// it is open, but lets it be renamed over (`FILE_SHARE_DELETE`).
+const SHARE_DELETE_ONLY: u32 = 4;
 /// The file stops growing at this size (a session's pipelines take a few
 /// megabytes, their containers some ten).
 const MAX_BYTES: u64 = 1 << 30;
@@ -440,9 +480,10 @@ struct Lock(windows_sys::Win32::Foundation::HANDLE);
 unsafe impl Send for Lock {}
 
 impl Lock {
-    /// The lock of the file at `path`, which exists.
+    /// The lock of the file at `path`, which need not exist yet (a session
+    /// opens the file under it).
     fn of(path: &Path) -> std::io::Result<Lock> {
-        let full = std::fs::canonicalize(path)?;
+        let full = std::path::absolute(path)?;
         let digest = blake3::hash(full.to_string_lossy().to_lowercase().as_bytes());
         let name: Vec<u16> = format!("Local\\xtp-recorded-pipelines-{}", &digest.to_hex()[..32])
             .encode_utf16()
@@ -503,17 +544,21 @@ struct Writer {
     end: u64,
     containers: HashSet<[u8; 32]>,
     pipelines: HashSet<[u8; 16]>,
-    /// Nothing more is written: the file is full.
-    full: bool,
+    /// When the file was found full: nothing more is written until it is
+    /// looked at again, [`RETRY`] later.
+    full: Option<Instant>,
 }
 
 impl Writer {
     /// The file at `path`, made with its folder if there is none, with what
-    /// it holds taken in.
+    /// it holds taken in. It is opened under the lock, which a rewrite
+    /// holds until the new file is in place ([`compact`]).
     fn open(path: &Path) -> std::io::Result<Writer> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        let lock = Lock::of(path)?;
+        let held = lock.hold()?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -522,13 +567,15 @@ impl Writer {
             .open(path)?;
         let mut writer = Writer {
             file,
-            lock: Lock::of(path)?,
+            lock,
             end: 0,
             containers: HashSet::new(),
             pipelines: HashSet::new(),
-            full: false,
+            full: None,
         };
-        writer.locked(Writer::catch_up)?;
+        let caught = writer.catch_up();
+        drop(held);
+        caught?;
         Ok(writer)
     }
 
@@ -556,15 +603,26 @@ impl Writer {
             let head = len.min(MAGIC.len() as u64) as usize;
             self.file.seek(SeekFrom::Start(0))?;
             self.file.read_exact(&mut magic[..head])?;
-            if magic[..head] != MAGIC[..head] {
-                return Err(std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "another format (another version of XTP): nothing is kept in it",
-                ));
-            }
-            self.end = MAGIC.len() as u64;
-            if head < MAGIC.len() {
+            let again = match version(&magic[..head]) {
+                Version::Ours => false,
                 // New, or its magic cut short.
+                Version::Other if magic[..head] == MAGIC[..head] => true,
+                Version::Earlier => {
+                    tracing::info!(
+                        bytes = len,
+                        "recorded pipelines: a file of an earlier version, started again"
+                    );
+                    true
+                }
+                Version::Other => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "another format (another version of XTP): nothing is kept in it",
+                    ));
+                }
+            };
+            self.end = MAGIC.len() as u64;
+            if again {
                 self.file.set_len(0)?;
                 self.file.seek(SeekFrom::Start(0))?;
                 self.file.write_all(MAGIC)?;
@@ -640,11 +698,11 @@ impl Writer {
         listed: &[(u8, [u8; 32])],
         body: &[u8],
     ) -> std::io::Result<Keep> {
-        if self.full {
-            return Ok(Keep::Full);
-        }
         if self.pipelines.contains(&key) {
             return Ok(Keep::Held);
+        }
+        if self.full.is_some_and(|t| t.elapsed() < RETRY) {
+            return Ok(Keep::Full);
         }
         self.locked(|w| {
             // What other processes wrote meanwhile, and the end they left.
@@ -666,14 +724,17 @@ impl Writer {
             }
             bytes.extend(entry(PIPELINE, &pipeline_payload(&key, body)));
             if w.end + bytes.len() as u64 > MAX_BYTES {
-                tracing::warn!(
-                    bytes = w.end,
-                    "recorded pipelines: the file is full; no more pipelines are kept until \
-                     `xtp precook` makes room"
-                );
-                w.full = true;
+                if w.full.is_none() {
+                    tracing::warn!(
+                        bytes = w.end,
+                        "recorded pipelines: the file is full; no more pipelines are kept until \
+                         `xtp precook` makes room"
+                    );
+                }
+                w.full = Some(Instant::now());
                 return Ok(Keep::Full);
             }
+            w.full = None;
             w.file.seek(SeekFrom::Start(w.end))?;
             w.file.write_all(&bytes)?;
             w.end += bytes.len() as u64;
@@ -819,6 +880,12 @@ pub(crate) struct Contents {
     pub(crate) damaged: usize,
     /// The file's size.
     pub(crate) bytes: u64,
+    /// The BLAKE3 of the file's bytes as read, in hexadecimal; `none`
+    /// without a file.
+    pub(crate) digest: String,
+    /// The file is of an earlier version: what it holds is not read, and
+    /// the precook starts it again ([`compact`]).
+    pub(crate) earlier: bool,
 }
 
 impl Contents {
@@ -833,7 +900,12 @@ pub(crate) fn read(dir: &Path) -> Result<Contents, String> {
     let path = dir.join(FILE);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Contents::default()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok(Contents {
+                digest: "none".into(),
+                ..Contents::default()
+            });
+        }
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
     parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))
@@ -843,15 +915,20 @@ pub(crate) fn read(dir: &Path) -> Result<Contents, String> {
 fn parse(bytes: &[u8]) -> Result<Contents, String> {
     let mut out = Contents {
         bytes: bytes.len() as u64,
+        digest: blake3::hash(bytes).to_hex().to_string(),
         ..Contents::default()
     };
-    if bytes.is_empty() {
-        return Ok(out);
+    match version(bytes) {
+        Version::Ours => {}
+        Version::Earlier => {
+            out.earlier = true;
+            return Ok(out);
+        }
+        // Empty, or its magic cut short: as a session leaves a new file.
+        Version::Other if bytes == &MAGIC[..bytes.len().min(MAGIC.len())] => return Ok(out),
+        Version::Other => return Err("another format (another version of XTP)".into()),
     }
-    let mut r = Reader(bytes);
-    if r.bytes(MAGIC.len()) != Some(MAGIC) {
-        return Err("another format (another version of XTP)".into());
-    }
+    let mut r = Reader(&bytes[MAGIC.len()..]);
     while r.0.len() >= HEAD {
         let tag = r.u8().unwrap_or_default();
         let n = r.u32().unwrap_or_default() as usize;
@@ -907,22 +984,36 @@ pub(crate) struct Compacted {
     /// containers did not read back, then the oldest for room.
     pub(crate) kept: usize,
     pub(crate) dropped: usize,
+    /// The file was of an earlier version, started again.
+    pub(crate) earlier: bool,
 }
 
 /// Rewrites the file in `dir` with what reads back in it, each description
 /// once with the containers it uses, newest first until it would pass `to`
-/// bytes (the oldest go), in the file's order. Only `xtp precook` does, and
-/// alone: a session's open file would go on with the file it opened.
-pub(crate) fn compact(dir: &Path, to: u64) -> Result<Compacted, String> {
+/// bytes (the oldest go), in the file's order; a file of an earlier version
+/// is started again, empty. Only `xtp precook` does, and only while no
+/// other process has the file open: `None` if one has (a session that
+/// started anyway would go on writing into the file it opened). The lock
+/// is held until the new file is in place, and sessions open the file
+/// under it ([`Writer::open`]).
+pub(crate) fn compact(dir: &Path, to: u64) -> Result<Option<Compacted>, String> {
+    use std::os::windows::fs::OpenOptionsExt;
     let path = dir.join(FILE);
     let failed = |e: std::io::Error| format!("{}: {e}", path.display());
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(failed)?;
     let lock = Lock::of(&path).map_err(failed)?;
     let held = lock.hold().map_err(failed)?;
+    // Alone: another process's handle refuses this one, and this one
+    // refuses theirs while it is open.
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(SHARE_DELETE_ONLY)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => return Ok(None),
+        Err(e) => return Err(failed(e)),
+    };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(failed)?;
     let contents = parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -982,12 +1073,13 @@ pub(crate) fn compact(dir: &Path, to: u64) -> Result<Compacted, String> {
         .and_then(|()| std::fs::rename(&tmp, &path))
         .map_err(failed)?;
     drop(held);
-    Ok(Compacted {
+    Ok(Some(Compacted {
         before: bytes.len() as u64,
         after: out.len() as u64,
         kept: chosen.len(),
         dropped: contents.pipelines.len() - chosen.len(),
-    })
+        earlier: contents.earlier,
+    }))
 }
 
 /// For tests: keeps a pipeline in the file in `dir` as a session's worker
@@ -1329,21 +1421,81 @@ mod tests {
         let parsed = parse(&bytes).unwrap();
         assert_eq!((parsed.pipelines.len(), parsed.damaged), (2, 1));
 
-        // Another version's file.
-        std::fs::write(&path, b"XTPREC\x00\x02 and more").unwrap();
-        assert_eq!(
-            Writer::open(&path).err().map(|e| e.kind()),
-            Some(ErrorKind::InvalidData)
-        );
-        assert!(super::read(dir.path()).is_err());
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"XTPREC\x00\x02 and more",
-            "left as it is"
-        );
+        // A later version's file, or no file of ours.
+        for other in [&b"XTPREC\x00\x03 and more"[..], b"something else"] {
+            std::fs::write(&path, other).unwrap();
+            assert_eq!(
+                Writer::open(&path).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidData)
+            );
+            assert!(super::read(dir.path()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), other, "left as it is");
+        }
         // No file: nothing kept.
         let empty = tempfile::tempdir().unwrap();
-        assert_eq!(super::read(empty.path()).unwrap().pipelines.len(), 0);
+        let none = super::read(empty.path()).unwrap();
+        assert_eq!((none.pipelines.len(), none.digest.as_str()), (0, "none"));
+    }
+
+    /// Version 1 kept the part of a stream before a subobject it could not
+    /// keep as the whole stream: its descriptions are not read, and a file
+    /// of version 1 is started again, by a session or by the precook.
+    #[test]
+    fn a_file_of_version_1_is_started_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let stream = kept_stream(&title_stream(13));
+        let shaders = [shader("vertex", b"v1 vs"), shader("pixel", b"v1 ps")];
+        assert_eq!(
+            keep(&mut Writer::open(&path).unwrap(), &shaders, &stream),
+            Keep::Written
+        );
+        let mut v1 = std::fs::read(&path).unwrap();
+        v1[MAGIC.len() - 1] = 1;
+        std::fs::write(&path, &v1).unwrap();
+        let read = super::read(dir.path()).unwrap();
+        assert!(read.earlier);
+        assert_eq!(read.pipelines.len(), 0, "not read");
+        assert_eq!(read.digest, blake3::hash(&v1).to_hex().to_string());
+
+        // A session starts it again, and keeps what it makes.
+        let mut w = Writer::open(&path).unwrap();
+        assert_eq!(w.pipelines.len(), 0);
+        assert_eq!(keep(&mut w, &shaders, &stream), Keep::Written);
+        drop(w);
+        let read = super::read(dir.path()).unwrap();
+        assert_eq!((read.earlier, read.pipelines.len()), (false, 1));
+
+        // The precook starts it again too.
+        std::fs::write(&path, &v1).unwrap();
+        let c = compact(dir.path(), u64::MAX).unwrap().unwrap();
+        assert!(c.earlier);
+        assert_eq!((c.kept, c.after), (0, MAGIC.len() as u64));
+        assert_eq!(std::fs::read(&path).unwrap(), MAGIC);
+    }
+
+    /// A rewrite leaves a file that another process has open as it is (it
+    /// would go on writing into the file it opened); once that one is
+    /// closed, the rewrite is made, and a session opened after it keeps
+    /// into the new file.
+    #[test]
+    fn a_file_another_process_has_open_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let stream = kept_stream(&title_stream(14));
+        let a = [shader("vertex", b"open vs"), shader("pixel", b"open ps a")];
+        let b = [shader("vertex", b"open vs"), shader("pixel", b"open ps b")];
+        let mut session = Writer::open(&path).unwrap();
+        assert_eq!(keep(&mut session, &a, &stream), Keep::Written);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(compact(dir.path(), 0).unwrap(), None, "open in a session");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "left as it is");
+        drop(session);
+        let c = compact(dir.path(), 0).unwrap().expect("rewritten");
+        assert_eq!((c.kept, c.dropped), (0, 1));
+        let mut session = Writer::open(&path).unwrap();
+        assert_eq!(keep(&mut session, &b, &stream), Keep::Written);
+        assert_eq!(super::read(dir.path()).unwrap().pipelines.len(), 1);
     }
 
     /// The first session of a fresh cache makes the folder the file goes
@@ -1475,7 +1627,7 @@ mod tests {
             .unwrap();
         let before = std::fs::metadata(&path).unwrap().len();
         // Room for about two.
-        let c = compact(dir.path(), 4000).unwrap();
+        let c = compact(dir.path(), 4000).unwrap().expect("no session");
         assert_eq!((c.before, c.kept, c.dropped), (before, 2, 3));
         assert_eq!(c.after, std::fs::metadata(&path).unwrap().len());
         let read = super::read(dir.path()).unwrap();

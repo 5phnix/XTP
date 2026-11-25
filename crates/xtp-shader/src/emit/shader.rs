@@ -1,9 +1,11 @@
-//! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
-//! the `dx.op` declarations it calls, its signatures and bound resources,
-//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
+//! A DXIL vertex, pixel, compute, mesh or geometry shader under
+//! construction: the module, the `dx.op` declarations it calls, its
+//! signatures and bound resources, and the metadata and container that wrap
+//! it up (SM 6.6, validator 1.6).
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
+use super::lower::geometry::GsShape;
 
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
@@ -195,6 +197,9 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// A geometry shader of this shape (`gs_6_6`): its inputs are one input
+    /// vertex's, its outputs stream 0's (`docs/analysis/es-gs.md`).
+    pub geometry: Option<GsShape>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -279,6 +284,7 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            geometry: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -692,6 +698,12 @@ impl Shader {
                     });
                 }
             }
+            // A geometry shader's view-id state is per stream: stream 0's
+            // output scalars and table above, then streams 1 to 3, which
+            // output nothing (and so have no table).
+            if self.geometry.is_some() {
+                view.extend([0, 0, 0]);
+            }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
             let arr = self.m.aggregate(arr, &elems);
@@ -712,14 +724,19 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
-        // Entry properties: shader flags (tag 0), thread-group size (4),
-        // wave size (11).
+        // Entry properties: shader flags (tag 0), geometry state (1),
+        // thread-group size (4), wave size (11).
         let mut props = Vec::new();
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
             let i64t = self.m.int(64);
             let f = self.m.int_const(i64t, self.flags as i64);
             props.push(self.m.md_value(f));
+        }
+        if let Some(shape) = self.geometry {
+            props.push(i32c(&mut self, 1));
+            let state = shape.state().map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
         }
         if let Some(threads) = self.threads {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
@@ -771,9 +788,10 @@ impl Shader {
         // such a module by its rules; declared 1.8, they want PSV0 version 3
         // and other signature parts (they refuse every module otherwise).
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.geometry.is_some() => ("gs", 2),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
             (None, false) => ("vs", 1),
@@ -832,9 +850,9 @@ impl Shader {
         } else {
             self.outputs.iter().any(|o| o.kind == 3)
         };
-        let psv0 = container::psv(&Psv {
+        let mut psv0 = container::psv(&Psv {
             stage: kind as u8,
-            flag: flag && self.threads.is_none(),
+            flag: flag && self.threads.is_none() && self.geometry.is_none(),
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
@@ -845,6 +863,11 @@ impl Shader {
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
         });
+        // GSInfo replaces VSInfo: the geometry state again, and whether a
+        // position is output (its own byte, where VSInfo has its flag).
+        if let Some(shape) = self.geometry {
+            shape.runtime_info(&mut psv0, flag);
+        }
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =

@@ -750,6 +750,9 @@ struct Recorded {
     pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
     #[cfg(feature = "diagnostics")]
     notes: std::sync::Arc<Vec<Note>>,
+    /// What its draws read and its dispatches wrote (`XTP_MESH_STATS`).
+    #[cfg(feature = "diagnostics")]
+    meshes: std::sync::Arc<Vec<crate::meshstat::Probe>>,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -925,6 +928,10 @@ impl Drop for DynamicLease {
 struct Deferred {
     #[cfg(feature = "diagnostics")]
     dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
+    /// What the list's draws read and its dispatches wrote, in recorded
+    /// order (`XTP_MESH_STATS`).
+    #[cfg(feature = "diagnostics")]
+    meshes: std::sync::Arc<Vec<crate::meshstat::Probe>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1279,6 +1286,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // `XTP_MESH_STATS`: what the draws read, against title memory.
+        #[cfg(feature = "diagnostics")]
+        crate::meshstat::submitting(runs, batch.submission);
         // Copies of big title buffers in the card's memory
         // (`shadow::cards_around`): what their CPU side took goes up first,
         // and what the shaders wrote is found on the card after the lists,
@@ -1625,6 +1635,9 @@ impl Host {
         for sample in p.recorded.iter().flat_map(|r| r.dispatch_samples.iter()) {
             sample.report();
         }
+        // `XTP_MESH_STATS`: what the draws read, as the GPU left it.
+        #[cfg(feature = "diagnostics")]
+        crate::meshstat::finished(p.submission, p.recorded.iter().map(|r| &r.meshes));
         let copying = std::time::Instant::now();
         for (shadow, address, len) in &p.copied {
             let written = shadow.write_back(p.submission, *address, *len);
@@ -1823,10 +1836,10 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host RTV, valid until recorded. A null resource needs a typed description.
     pub(crate) fn rtv(
         &self,
-        resource: &ID3D12Resource,
+        resource: impl windows::core::Param<ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
@@ -2208,12 +2221,27 @@ impl HostList {
                 .clone(),
             #[cfg(feature = "diagnostics")]
             notes: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            #[cfg(feature = "diagnostics")]
+            meshes: self.deferred().meshes.clone(),
         }
     }
 
     #[cfg(feature = "diagnostics")]
     pub(crate) fn dispatch_sample(&self, sample: crate::indirect::Sample) {
         std::sync::Arc::make_mut(&mut self.deferred().dispatch_samples).push(sample);
+    }
+
+    /// Notes what a draw or dispatch of the list read and wrote
+    /// (`crate::meshstat`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn mesh_probe(&self, probe: crate::meshstat::Probe) {
+        std::sync::Arc::make_mut(&mut self.deferred().meshes).push(probe);
+    }
+
+    /// What the list's draws read and its dispatches wrote so far.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn mesh_probes(&self) -> std::sync::Arc<Vec<crate::meshstat::Probe>> {
+        self.deferred().meshes.clone()
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -2961,8 +2989,12 @@ impl Meter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take(frames, 8);
+        #[cfg(feature = "diagnostics")]
+        let meshes = crate::meshstat::take();
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::list::cuts::log();
             #[cfg(feature = "diagnostics")]
             tracing::info!(
                 pipelines = crate::pipeline::host::BOUNDED_PIPELINES.load(Ordering::Relaxed),
@@ -3010,6 +3042,7 @@ impl Meter {
                         *n as f64 / frames
                     );
                 }
+                crate::meshstat::log(meshes, frames);
             }
         }
         if self.caption.is_none() {

@@ -52,6 +52,12 @@ translation loop ran on this PC.
   `emit/mod.rs`, `lower/mod.rs` and `lower/lds.rs`, the survey, and the host
   PSO. It needs the stage data fields listed in §3.4, and a way past the
   resource tracker's refusal of the ring-base load.
+- **Phase 2, first piece** (§7.2): all 390 halves translate (195 ES as
+  vertex shaders, 195 GS as `gs_6_6` geometry shaders) and `dxil.dll`
+  accepts every one. No other program's translation changed. A host
+  pipeline with a geometry shader runs the ES and the GS. Left: the
+  survey's own change, the resource tracker's parameter, the frame-time
+  cost on NVIDIA.
 
 ## 2. How GFX10 runs ES + GS (as these programs show it)
 
@@ -296,6 +302,13 @@ The rules that make D3D12's emits give what the copy shader reads:
   written and emitted on either side of a branch, but not written in a
   branch and emitted after the join (that would need a phi of ring values).
 - At most the declared vertices; nothing after GS_DONE; stream 0 only.
+- Every emit and cut under one lane mask (EXEC), the same value on every
+  path to it. The IR places phis only where a register is live, and a
+  message reads M0 alone, so after a join that nothing reads EXEC after,
+  no phi joins the two sides' masks: the mask is then followed back on
+  every path, and an emit whose paths bring two masks is refused (Codex
+  review of phase 1's fixes; before, the first predecessor's mask was
+  taken).
 
 ### 5.3 D3D12 hooks and refusals
 
@@ -362,8 +375,8 @@ Results: §7.
 
 ## 6. Phase 2: wiring, file by file
 
-These are held by other tasks today (refusals.md §4). Ask on this task
-when they deliver.
+The plan as phase 1 wrote it. What its first piece did, item by item,
+and what is left, is in §7.
 
 1. **`native.rs` (G1):**
    - read the ES stage data (the VS layout, §3.4) into `StageIo::Es` with
@@ -409,6 +422,8 @@ Then measure the voxelization pass's cost on NVIDIA (§4.2).
 
 ## 7. Results and checks
 
+### 7.1 Phase 1
+
 - `cargo-slot.ps1 test -p xtp-shader --locked geometry` (the task's check),
   2026-11-25:
   - 10 passed on the build farm (xtp-farm-2), and again on this PC with
@@ -425,6 +440,107 @@ Then measure the voxelization pass's cost on NVIDIA (§4.2).
   pairs are still "not attempted" until phase 2's `survey.rs` and entry
   point.
 
+### 7.2 Phase 2, first piece (task 5baa47be, 2026-11-25)
+
+What §6 asked for, item by item:
+
+1. **`native.rs`**: `StageIo::Es` (the VS layout and the item in dwords)
+   and `StageIo::Gs` (outputs, item, the E+0x280 count, most vertices,
+   vertex). A half whose stage data does not read keeps no I/O, so the
+   plain VS beside an ES still translates. The translation refuses that
+   half ("whose stage data the translation does not read").
+2. **`io.rs`**: the GS half's system VGPRs v0 to v4 in both halves, the
+   ES's vertex id in v5 and its attributes at the stage data's VGPRs. No
+   export in either half. s3 is not raised:
+   - `geometry::drop_lane_prologue` removes each half's EXEC set-up from
+     s3 (`s_bfe_i32`, `s_bfm_b64 exec`, `s_cmp_eq_u32 64`,
+     `s_cselect_b64 exec`). Its readers then take the entry's EXEC: every
+     host invocation is one of the half's lanes.
+   - Its other readers only compute ring addresses or M0.
+   - `Io::geometry` carries the GS's shape from `PSV0`. `emit_for` sets
+     it.
+3. **`emit/shader.rs`**: the geometry kind, made by `Shader::finish` when
+   `Shader::geometry` is set:
+   - program kind 2, `gs` 6.6;
+   - the entry's tag 1 from `GsShape::state`;
+   - `PSV0` with `GsShape::runtime_info`;
+   - the view-id state of four streams.
+
+   The phase-1 WARP draws now go through it (their test frame is gone).
+4. **`lower/mod.rs`** (ES/GS arms only). A field and three calls:
+   `merged_start` after the inputs, `merged_inst` before the dispatch by
+   encoding, `merged_end` before the block's exit. The hooks themselves
+   are in `geometry.rs`:
+   - set-up sites are skipped;
+   - ring reads are `loadInput` under the read's lane guard;
+   - ES ring writes are `storeOutput` under the write's guard;
+   - GS writes are kept until their vertex's emit;
+   - emits and cuts run under the lanes' EXEC where some lane outside it
+     gets there;
+   - the halves' `s_barrier` and the ES's `s_setpc_b64` are dropped, and
+     the ES's indirect exit returns.
+
+   `lds.rs` needs nothing: every LDS access of a half is a plan site.
+   16-bit ring rows are refused.
+5. **Resources**: a workaround, not the `resource.rs` change §6 asks
+   for:
+   - `geometry::tracked` gives `resource::track` a copy where the
+     set-up's scalar loads are an `s_nop` with the same results. The GS's
+     ring base is read from the console driver's table (user data 0-1,
+     offset 0xb8 in the title), which no root parameter holds.
+   - Sites and values stay the same, and the lowering never reads those
+     loads.
+   - A plan's refusal is reported at the resources' step.
+   - A parameter of `resource::track` should replace it.
+6. **`emit/mod.rs`**: `translate_for` takes a GS program. The new
+   `translate_es_for` takes a vertex shader container's ES (the first
+   program would be the ES, so `translate_for` keeps the plain VS).
+   `translate_program_for` removes the lane set-up after `ir::build` and
+   tracks the copy above.
+7. **Survey**: `survey.rs` was another task's. The farm surveyed main
+   (e6f17bb) and this branch with a one-line survey change that is not in
+   the repository: ES and GS go to the translated arm. Both runs used
+   `shader-survey --validate --host-lanes 32-32` on the same pack:
+
+   | | before | after |
+   |---|---:|---:|
+   | translated | 25725 of 26698 (96.4 %) | 26115 (97.8 %) |
+   | ES / GS | 0 / 0 of 195 / 195 | 195 / 195 |
+   | `dxil.dll` accepts | 25654 | 26044 |
+   | failed | 973 | 583 |
+
+   - Every other program has the same outcome, the same output hash and
+     the same validator verdict in both runs: none lost, none changed.
+   - The 195 GS give 4 distinct translations, one per code variant of
+     §3.2. The 195 ES give 11.
+8. **Host PSO** (`pipeline/host.rs`): a geometry stage is taken, but not
+   beside a mesh stage, nor with the rectangles' own geometry stage.
+   - The vertex stage runs the vertex shader container's ES and the
+     geometry stage the GS (`merged_half`).
+   - Each half is translated once per container, with its own console
+     program's resources. `pipeline.rs`'s `Shader::native` reads only VS,
+     PS, MS and CS programs, so a GS container would bind no tables.
+   - `Stage::translated` gives these translations, so draws bind each
+     half's tables and user data.
+   - `shader_cache::host_es_shader` keeps the ES under a key of its own.
+9. **NVIDIA cost**: not measured yet (it needs a game session).
+
+Also fixed, from the Codex review of phase 1's fixes: an emit's lane mask
+after a join without a phi (§5.2).
+
+Checks:
+
+- `cargo-slot.ps1 test -p xtp-shader --locked` (merged with main
+  e6f17bb): 391 passed, 37 ignored, none skipped. The WARP draws ran and
+  `dxil.dll` validated. `geometry_pair_translates_and_streams_out` takes
+  the pair through `translate_program` and compares every streamed-out
+  dword. The join test fails on the previous `live_at`.
+- `cargo-slot.ps1 test -p xtp-gpu --locked -- pipeline::host
+  shader_cache`: 28 passed, among them
+  `a_pipeline_with_a_geometry_shader_runs_the_export_shader` on WARP.
+- `clippy -p xtp-shader` and `-p xtp-gpu`, `--all-targets -D warnings`:
+  clean.
+
 ## 8. Open points
 
 - E+0x280 of the GS stage data (1 everywhere): the instance or stream
@@ -432,3 +548,12 @@ Then measure the voxelization pass's cost on NVIDIA (§4.2).
 - The ES instance id VGPR (v8 in the GFX9 layout): no title ES reads it.
 - Streams 1-3 and their ring layout: none in the title.
 - GS performance on NVIDIA: measure in phase 2.
+- The survey's own change (ES and GS attempted) and a parameter of
+  `resource::track` for the sites to leave out, in place of
+  `geometry::tracked` (§7.2, items 5 and 7).
+- `pipeline.rs`'s `Shader::native` reads no GS program: the host makes
+  the GS's translation with its resources itself (`merged_half`).
+- A validated translation is not yet a correct one on the title's own
+  programs: the pair has run on WARP only as hand-assembled programs. The
+  first game session with the voxelization pass checks the real ones
+  (pipelines made, the pass's output).

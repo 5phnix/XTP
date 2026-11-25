@@ -178,13 +178,20 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
-            Atom::Uniform(v) => match self.get(v)? {
-                Val::Bit(x) => Ok(x),
-                Val::I32(x) => {
+            Atom::Uniform(v) => match self.get(v) {
+                Ok(Val::Bit(x)) => Ok(x),
+                Ok(Val::I32(x)) => {
                     let z = self.s.m.i32(0);
                     Ok(self.s.m.cmp(at, pred::NE, x, z))
                 }
-                Val::Missing(w) => Err(w),
+                Ok(Val::Missing(w)) => Err(w),
+                // Mesh programs count no mask: the SCC of a count, "some
+                // lane is set", is each lane's own bit, as a mask
+                // operation's is in a branch (structurisation's rule).
+                Err(w) => match self.count_scc(v) {
+                    Some(m) if self.mask_data == MaskData::None => self.boolean(m, at),
+                    _ => Err(w),
+                },
             },
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
@@ -365,5 +372,158 @@ impl<'a> Lower<'a> {
                 .entry(w)
                 .or_insert(Val::Missing("a lane mask read as data"));
         }
+    }
+
+    /// The mask `s_bcnt1_i32_b*` counts where `scc` is that count's SCC
+    /// ("the count is not zero": some lane of the mask is set), as lane bits.
+    fn count_scc(&self, scc: Value) -> Option<Bool> {
+        let p = self.x.p;
+        let &b = self.def_block.get(&scc)?;
+        let inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.write(Reg::Scc) == Some(scc))?;
+        let width = if self.x.native.wave64 { "64" } else { "32" };
+        if inst.name().strip_prefix("s_bcnt1_i32_b") != Some(width) {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let &Operand::Scalar { code, .. } = src.first()? else {
+            return None;
+        };
+        let lo = inst.read(Reg::S(code))?;
+        let hi = if self.x.native.wave64 {
+            Some(inst.read(Reg::S(code + 1))?)
+        } else {
+            None
+        };
+        self.x.st.mask_bits(lo, hi)
+    }
+
+    /// Whether `v_readfirstlane_b32` `inst`, in block `b`, is the first-lane
+    /// read of the console compiler's test for a value the whole wave holds:
+    ///
+    /// ```text
+    /// v_readfirstlane_b32 s, v
+    /// v_cmp_eq_u32 m, s, v           (the lanes that hold the first lane's)
+    /// s_xor_b64 d, m, exec           (those that do not)
+    /// [s_bcnt1_i32_b64 n, d]
+    /// s_cbranch_scc1 general         (some lane differs: a waterfall loop)
+    /// ...                            (else the scalar path, which uses s)
+    /// ```
+    ///
+    /// Each lane may take its own value as the first lane's: its compare
+    /// then holds, its bit of `d` is clear, and it takes the scalar path with
+    /// its own value, as the console's wave does when every lane holds it;
+    /// the general path gives each lane what the scalar path gives it with
+    /// its own value (it exists for the waves whose lanes differ). The
+    /// branch is the lane's own bit (the SCC of a count in a mesh program,
+    /// [`Self::atom`]). No read of `s` but the compare may lie where the
+    /// scalar path does not decide it: every other reader is in a block the
+    /// scalar path's first block dominates.
+    pub(super) fn uniform_test_first_lane(&self, inst: &Inst, b: usize) -> bool {
+        let p = self.x.p;
+        let block = &p.blocks[b];
+        let Fields::Valu(rf) = &inst.fields else {
+            return false;
+        };
+        let (Some(&(Reg::S(_), s)), Some(&Operand::Vector { reg, .. })) =
+            (inst.writes.first(), rf.src.first())
+        else {
+            return false;
+        };
+        let Some(v) = inst.read(Reg::V(reg)) else {
+            return false;
+        };
+        let Some(at) = block
+            .insts
+            .iter()
+            .position(|i| i.machine.offset == inst.machine.offset)
+        else {
+            return false;
+        };
+        let rest = &block.insts[at + 1..];
+        let reads = |i: &Inst, x: Value| i.reads.iter().any(|r| r.1 == x);
+        // The compare of the value with its first lane's.
+        let Some(cmp) = rest.iter().find(|i| {
+            matches!(i.name(), "v_cmp_eq_u32" | "v_cmp_eq_i32")
+                && matches!(&i.fields, Fields::Valu(f) if f.sdwa.is_none() && f.dpp.is_none())
+                && reads(i, s)
+                && reads(i, v)
+        }) else {
+            return false;
+        };
+        let same: Vec<Value> = cmp
+            .writes
+            .iter()
+            .filter(|w| matches!(w.0, Reg::S(_)))
+            .map(|w| w.1)
+            .collect();
+        // The lanes that differ: the compare's mask against EXEC.
+        let xor = if self.x.native.wave64 {
+            "s_xor_b64"
+        } else {
+            "s_xor_b32"
+        };
+        let Some(differ) = rest.iter().find(|i| {
+            i.name() == xor && i.read(Reg::S(EXEC)).is_some() && same.iter().any(|&m| reads(i, m))
+        }) else {
+            return false;
+        };
+        // The block's branch on "some lane differs".
+        let Some(last) = block.insts.last() else {
+            return false;
+        };
+        let taken_differ = match last.name() {
+            "s_cbranch_scc1" => true,
+            "s_cbranch_scc0" => false,
+            _ => return false,
+        };
+        let crate::ir::Exit::Branch { taken, not_taken } = block.exit else {
+            return false;
+        };
+        let Some(scc) = last.read(Reg::Scc) else {
+            return false;
+        };
+        let counted = rest.iter().any(|i| {
+            i.name().starts_with("s_bcnt1_i32_")
+                && i.write(Reg::Scc) == Some(scc)
+                && differ.writes.iter().any(|w| reads(i, w.1))
+        });
+        if differ.write(Reg::Scc) != Some(scc) && !counted {
+            return false;
+        }
+        let scalar = if taken_differ { not_taken } else { taken };
+        // Every other read of the value where the scalar path decides it.
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        let mut index = vec![usize::MAX; p.blocks.len()];
+        for (n, &q) in order.iter().enumerate() {
+            index[q] = n;
+        }
+        let idom = crate::ir::idoms(&p.blocks, &order, &index);
+        let dominated = |mut q: usize| loop {
+            if q == scalar {
+                break true;
+            }
+            if idom[q] == q || idom[q] == usize::MAX {
+                break false;
+            }
+            q = idom[q];
+        };
+        p.blocks.iter().enumerate().all(|(q, blk)| {
+            let insts = blk
+                .insts
+                .iter()
+                .all(|i| std::ptr::eq(i, cmp) || !reads(i, s) || dominated(q));
+            let phis = blk.phis.iter().all(|phi| {
+                phi.args
+                    .iter()
+                    .zip(&blk.preds)
+                    .all(|(&a, &pred)| a != s || dominated(pred))
+            });
+            insts && phis
+        })
     }
 }

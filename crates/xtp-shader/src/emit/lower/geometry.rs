@@ -58,23 +58,19 @@
 //! refused, as are emits on other streams than 0: none of the title's
 //! programs writes one, so the ring layout of streams 1 to 3 is not known.
 
-#![cfg_attr(
-    not(all(test, windows)),
-    expect(
-        dead_code,
-        reason = "the lowering and the translation entry call it from W10's second phase on \
-                  (docs/analysis/es-gs.md, section 6)"
-    )
-)]
-
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::Why;
-use crate::emit::bitcode::{Attr, Cast, V};
+use super::{Lower, Stop, Val, Why, unsupported};
+use crate::ShaderError;
+use crate::dxbc::{Container, FourCC};
+use crate::emit::bitcode::{Attr, Cast, Term, V};
 use crate::emit::container::SigElement;
 use crate::emit::shader::Shader;
-use crate::gfx10::{Fields, NULL, Operand, Valu};
-use crate::ir::{EXEC, Inst, M0, Program, Reg, Value, idoms, reverse_postorder};
+use crate::gfx10::{Encoding, Fields, Instruction, NULL, Operand, Valu};
+use crate::io::Io;
+use crate::ir::{EXEC, Exit, Inst, M0, Program, Reg, Value, idoms, reverse_postorder};
+use crate::native::{GeometryIo, HwStage, NativeProgram, StageIo, VsOutput};
 use crate::resource::{Site, inline};
 
 /// A ring access the rings do not explain: an address the plans cannot
@@ -108,6 +104,19 @@ pub(crate) const SCALARS: Why =
 pub(crate) const ROWS: Why = "a geometry shader signature past D3D12's 32 rows";
 pub(crate) const INSTANCES: Why = "a geometry shader beyond D3D12's 32 instances";
 pub(crate) const BOOLEAN: Why = "a boolean geometry shader input or output";
+/// A merged half that does not start by setting EXEC to its lanes from s3
+/// as the title's do ([`drop_lane_prologue`]).
+pub(crate) const PROLOGUE: Why =
+    "a merged ES + GS program whose EXEC set-up from s3 the translation does not know";
+pub(crate) const PSV: Why = "a geometry shader whose PSV0 the translation does not read";
+pub(crate) const PRIMITIVE: Why =
+    "a geometry shader input primitive other than points, lines or triangles";
+pub(crate) const TOPOLOGY: Why =
+    "a geometry shader output topology other than points, line strips or triangle strips";
+pub(crate) const MOST_VERTICES: Why =
+    "a geometry shader whose stage data and PSV0 disagree on its most vertices";
+pub(crate) const COUNT: Why =
+    "a geometry shader whose stage data instance or stream count is not 1";
 
 /// D3D12's geometry-shader limits: registers per input vertex and per output
 /// vertex (`D3D12_GS_INPUT_REGISTER_COUNT`, `D3D12_GS_OUTPUT_REGISTER_COUNT`),
@@ -126,11 +135,6 @@ pub(crate) const GS_MAX_INSTANCES: u32 = 32;
 /// adjacent vertices, in v4) are the GFX9 merged layout, not seen in use.
 pub(crate) const VERTEX_OFFSETS: [(u8, u8); 6] =
     [(0, 0), (0, 16), (1, 0), (1, 16), (4, 0), (4, 16)];
-
-/// The VGPR holding an ES lane's vertex id (v0 to v4 hold the GS half's
-/// inputs, which the ES keeps): what the title's ES programs index their
-/// vertex streams with.
-pub(crate) const ES_VERTEX_ID: u8 = 5;
 
 /// `s_sendmsg` message ids (bits 0-3) of the GS messages.
 const MSG_GS: u16 = 2;
@@ -810,6 +814,54 @@ pub(crate) struct GsShape {
 }
 
 impl GsShape {
+    /// The shape of a console geometry shader: input primitive, output
+    /// topology and most vertices from its container's `PSV0` (`psv`, the
+    /// part's data), the GSVS ring layout from its stage data (`io`), which
+    /// must agree on the most vertices. Stream 0 only, one instance: the
+    /// stage data's count is 1 in every program of the title, which does not
+    /// say whether it counts instances or streams.
+    pub(crate) fn of(psv: &[u8], io: &GeometryIo) -> Result<GsShape, Why> {
+        let at = |o: usize| {
+            psv.get(o..o + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let size = at(0).ok_or(PSV)? as usize;
+        // GSInfo, then runtime info 1: the stage (2) and the most vertices.
+        if size < 28 || psv.len() < 4 + size || psv[4 + 24] != 2 {
+            return Err(PSV);
+        }
+        let input = match at(4).ok_or(PSV)? {
+            1 => Primitive::Point,
+            2 => Primitive::Line,
+            3 => Primitive::Triangle,
+            _ => return Err(PRIMITIVE),
+        };
+        let topology = match at(8).ok_or(PSV)? {
+            1 => Topology::Points,
+            3 => Topology::LineStrip,
+            5 => Topology::TriangleStrip,
+            _ => return Err(TOPOLOGY),
+        };
+        if at(12).ok_or(PSV)? != 1 {
+            return Err(STREAMS);
+        }
+        let max_vertices = u32::from(u16::from_le_bytes([psv[4 + 26], psv[4 + 27]]));
+        if max_vertices != io.max_vertices {
+            return Err(MOST_VERTICES);
+        }
+        if io.count != 1 {
+            return Err(COUNT);
+        }
+        Ok(GsShape {
+            input,
+            topology,
+            max_vertices,
+            vertex_dwords: io.vertex_dwords,
+            item_dwords: io.item_dwords,
+            instances: 1,
+        })
+    }
+
     /// D3D12's limits for this shape with these signatures (`inputs` one
     /// input vertex's, `outputs` stream 0's).
     pub(crate) fn check(&self, inputs: &[SigElement], outputs: &[SigElement]) -> Result<(), Why> {
@@ -920,47 +972,230 @@ fn message(inst: &Inst) -> Option<Result<Message, Why>> {
     })
 }
 
-/// The value `reg` holds when the instruction at `site` runs: the last one
-/// before it in its block to read or write `reg` says it, else the block's
-/// phi of `reg`, else what every predecessor holds at its end (the same
-/// value, phis being placed where two differ), back to the entry's input
-/// (`None` for an entry value the program never reads; also for a block
-/// no path reaches).
-fn live_at(p: &Program, reg: Reg, site: Site) -> Option<Value> {
+/// What a register holds when an instruction runs ([`live_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Live {
+    Value(Value),
+    /// The entry's, which the program never reads (no value names it).
+    Entry,
+    /// The paths that reach the instruction bring different values, which
+    /// no phi joins (the IR places phis only where a register is live, and
+    /// a message reads M0 alone), or no path does.
+    Unknown,
+}
+
+/// The value `reg` holds when the instruction at `site` runs: on each path
+/// back from it, the last instruction to read or write `reg`, else the
+/// block's phi of `reg`, else the entry's input. Every path must bring the
+/// same: a join without a phi of `reg` (it is dead there) may bring two.
+fn live_at(p: &Program, reg: Reg, site: Site) -> Live {
+    let mut found = None;
     let mut seen = HashSet::new();
     let mut work = vec![site];
     while let Some((b, i)) = work.pop() {
         let block = &p.blocks[b];
-        let before = block.insts[..i].iter().rev();
-        if let Some(v) = before
-            .filter_map(|x| x.write(reg).or_else(|| x.read(reg)))
-            .next()
-        {
-            return Some(v);
+        let here = block.insts[..i]
+            .iter()
+            .rev()
+            .find_map(|x| x.write(reg).or_else(|| x.read(reg)))
+            .or_else(|| {
+                block
+                    .phis
+                    .iter()
+                    .find(|ph| ph.reg == reg)
+                    .map(|ph| ph.value)
+            });
+        let reached = match here {
+            Some(v) => Some(Live::Value(v)),
+            None if b == 0 => Some(
+                p.inputs
+                    .iter()
+                    .find(|r| r.0 == reg)
+                    .map_or(Live::Entry, |r| Live::Value(r.1)),
+            ),
+            None => None,
+        };
+        if let Some(v) = reached {
+            match found {
+                None => found = Some(v),
+                Some(f) if f != v => return Live::Unknown,
+                Some(_) => {}
+            }
         }
-        if let Some(phi) = block.phis.iter().find(|ph| ph.reg == reg) {
-            return Some(phi.value);
-        }
-        if b == 0 {
-            return p.inputs.iter().find(|r| r.0 == reg).map(|r| r.1);
-        }
-        for &q in &block.preds {
-            if seen.insert(q) {
-                work.push((q, p.blocks[q].insts.len()));
+        // The entry's predecessors (a loop back to the first instruction)
+        // bring their own value too.
+        if here.is_none() {
+            for &q in &block.preds {
+                if seen.insert(q) {
+                    work.push((q, p.blocks[q].insts.len()));
+                }
             }
         }
     }
-    None
+    found.unwrap_or(Live::Unknown)
 }
 
 /// The lane mask (EXEC) at `site`: its low dword, and in a wave64 program
-/// its high one.
-fn exec_at(p: &Program, site: Site) -> (Option<Value>, Option<Value>) {
-    let hi = p
-        .wave64
-        .then(|| live_at(p, Reg::S(EXEC + 1), site))
-        .flatten();
-    (live_at(p, Reg::S(EXEC), site), hi)
+/// its high one; `None` when a path brings another ([`Live::Unknown`]).
+fn exec_at(p: &Program, site: Site) -> Option<(Live, Live)> {
+    let lo = live_at(p, Reg::S(EXEC), site);
+    let hi = match p.wave64 {
+        true => live_at(p, Reg::S(EXEC + 1), site),
+        false => Live::Entry,
+    };
+    (lo != Live::Unknown && hi != Live::Unknown).then_some((lo, hi))
+}
+
+/// Each half of a merged stage first sets EXEC to its own lanes from the
+/// counts in s3 (the ES's in bits 0-7, the GS's in 8-15), as the title's
+/// programs do it:
+///
+/// ```text
+/// s_bfe_i32 sN, s3, 0x80000 | first bit
+/// s_bfm_b64 exec, sN, 0
+/// s_cmp_eq_u32 sN, 64
+/// s_cselect_b64 exec, -1, exec
+/// ```
+///
+/// On the host every vertex shader and geometry shader invocation is one
+/// of those lanes, so EXEC stays as it enters (every lane): this removes
+/// the four instructions and gives their EXEC's readers the entry's. Other
+/// stages are left as they are; a merged half without this set-up, or
+/// whose count or compare something else reads, is refused. Runs before
+/// anything else looks at the program (its instructions' sites change).
+pub(crate) fn drop_lane_prologue(p: &mut Program, stage: HwStage) -> Result<(), Why> {
+    let first = match stage {
+        HwStage::Es => 0,
+        HwStage::Gs => 8,
+        _ => return Ok(()),
+    };
+    if !p.wave64 || p.blocks.is_empty() {
+        return Err(PROLOGUE);
+    }
+    let s3 = p.inputs.iter().find(|i| i.0 == Reg::S(3)).map(|i| i.1);
+    let insts = &p.blocks[0].insts;
+    let scalar = |op: Option<Operand>| match op {
+        Some(Operand::Scalar { code, .. }) => Some(code),
+        _ => None,
+    };
+    let constant = |op: Option<Operand>| match op {
+        Some(Operand::Const(c)) => inline(c),
+        Some(Operand::Literal(x)) => Some(x),
+        _ => None,
+    };
+    let src = |i: &Inst, k: usize| match &i.fields {
+        Fields::Sop { src, .. } => src.get(k).copied(),
+        _ => None,
+    };
+    let dst = |i: &Inst| match &i.fields {
+        Fields::Sop { dst, .. } => scalar(*dst),
+        _ => None,
+    };
+    let at = (0..insts.len().saturating_sub(3)).find(|&k| {
+        let [bfe, bfm, cmp, sel] = [&insts[k], &insts[k + 1], &insts[k + 2], &insts[k + 3]];
+        let Some(n) = dst(bfe) else {
+            return false;
+        };
+        let count = bfe.write(Reg::S(n));
+        matches!(bfe.name(), "s_bfe_i32" | "s_bfe_u32")
+            && scalar(src(bfe, 0)) == Some(3)
+            && s3.is_some()
+            && bfe.read(Reg::S(3)) == s3
+            && constant(src(bfe, 1)) == Some(8 << 16 | first)
+            && bfm.name() == "s_bfm_b64"
+            && dst(bfm) == Some(EXEC)
+            && bfm.read(Reg::S(n)) == count
+            && constant(src(bfm, 1)) == Some(0)
+            && cmp.name() == "s_cmp_eq_u32"
+            && scalar(src(cmp, 0)) == Some(n)
+            && cmp.read(Reg::S(n)) == count
+            && constant(src(cmp, 1)) == Some(64)
+            && sel.name() == "s_cselect_b64"
+            && dst(sel) == Some(EXEC)
+            && constant(src(sel, 0)) == Some(u32::MAX)
+            && scalar(src(sel, 1)) == Some(EXEC)
+            && sel.read(Reg::Scc) == cmp.write(Reg::Scc)
+            && sel.read(Reg::S(EXEC)) == bfm.write(Reg::S(EXEC))
+            && sel.read(Reg::S(EXEC + 1)) == bfm.write(Reg::S(EXEC + 1))
+    });
+    let at = at.ok_or(PROLOGUE)?;
+    let removed: Vec<Inst> = p.blocks[0].insts[at..at + 4].to_vec();
+    let sel = &removed[3];
+    // What the first three write, which only the four may read: the count,
+    // SCC (the extract's, which the compare overwrites, and the compare's),
+    // the narrowed EXEC. The selected EXEC's readers get the entry's.
+    let internal: HashSet<Value> = removed[..3]
+        .iter()
+        .flat_map(|i| i.writes.iter().map(|w| w.1))
+        .collect();
+    let (Some(lo), Some(hi)) = (sel.write(Reg::S(EXEC)), sel.write(Reg::S(EXEC + 1))) else {
+        return Err(PROLOGUE);
+    };
+    let read_elsewhere = p.blocks.iter().enumerate().any(|(b, block)| {
+        block
+            .phis
+            .iter()
+            .any(|phi| phi.args.iter().any(|a| internal.contains(a)))
+            || block.insts.iter().enumerate().any(|(i, x)| {
+                (b != 0 || !(at..at + 4).contains(&i))
+                    && x.reads.iter().any(|r| internal.contains(&r.1))
+            })
+    });
+    if read_elsewhere {
+        return Err(PROLOGUE);
+    }
+    let mut next = fresh_value(p);
+    let mut entry = |p: &mut Program, reg: Reg| match p.inputs.iter().find(|i| i.0 == reg) {
+        Some(i) => i.1,
+        None => {
+            let v = Value(next);
+            next += 1;
+            p.inputs.push((reg, v));
+            v
+        }
+    };
+    let map = [
+        (lo, entry(p, Reg::S(EXEC))),
+        (hi, entry(p, Reg::S(EXEC + 1))),
+    ];
+    let to = |v: Value| map.iter().find(|m| m.0 == v).map_or(v, |m| m.1);
+    p.blocks[0].insts.drain(at..at + 4);
+    for block in &mut p.blocks {
+        for phi in &mut block.phis {
+            for a in &mut phi.args {
+                *a = to(*a);
+            }
+        }
+        for x in &mut block.insts {
+            for r in &mut x.reads {
+                r.1 = to(r.1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A value number no value of `p` has.
+fn fresh_value(p: &Program) -> u32 {
+    let mut top = p.inputs.iter().map(|i| i.1.0).max().unwrap_or(0);
+    for block in &p.blocks {
+        for phi in &block.phis {
+            top = phi
+                .args
+                .iter()
+                .map(|a| a.0)
+                .fold(top.max(phi.value.0), u32::max);
+        }
+        for x in &block.insts {
+            top = x
+                .reads
+                .iter()
+                .chain(&x.writes)
+                .map(|r| r.1.0)
+                .fold(top, u32::max);
+        }
+    }
+    top + 1
 }
 
 /// A geometry shader's ring accesses and messages.
@@ -1199,7 +1434,7 @@ pub(crate) fn gs_plan(p: &Program, shape: &GsShape) -> Result<GsPlan, Why> {
         if m == Message::Done || index[site.0] == usize::MAX {
             continue;
         }
-        let here = exec_at(p, site);
+        let here = exec_at(p, site).ok_or(MASKED)?;
         match mask {
             None => mask = Some(here),
             Some(m) if m != here => return Err(MASKED),
@@ -1552,5 +1787,319 @@ impl Vertices {
     pub(crate) fn cut(s: &mut Shader, block: usize) {
         let (stream, void) = (s.m.i8(0), s.t.void);
         s.op(block, "cutStream", Attr::NoUnwind, void, 98, &[stream]);
+    }
+}
+
+// The translation's use of the plans (`docs/analysis/es-gs.md`, section 6):
+// the entry point prepares a merged half and its resources, the lowering
+// calls the hooks below at the plans' sites.
+
+/// A merged half whose stage data the translation does not read
+/// (`native.rs`): no ring layout, no outputs.
+pub(crate) const STAGE_DATA: Why =
+    "a merged ES + GS program whose stage data the translation does not read";
+/// A ring row holding two 16-bit values per dword: the ring dword is no
+/// signature element's 32-bit value.
+pub(crate) const HALF: Why = "a 16-bit row in a merged ES + GS ring";
+
+fn refused(what: Why) -> ShaderError {
+    ShaderError::Unsupported { offset: 0, what }
+}
+
+/// A merged half's program as the rest of the translation takes it: each
+/// half's EXEC set-up from s3 left out ([`drop_lane_prologue`]); other
+/// stages' as they are.
+pub(crate) fn prepared(mut p: Program, stage: HwStage) -> Result<Program, ShaderError> {
+    drop_lane_prologue(&mut p, stage).map_err(refused)?;
+    Ok(p)
+}
+
+/// The shape of the geometry shader of `c`, whose console program is
+/// `native` ([`GsShape::of`]).
+fn shape_of(c: &Container, native: &NativeProgram) -> Result<GsShape, ShaderError> {
+    let StageIo::Gs(io) = &native.io else {
+        return Err(refused(STAGE_DATA));
+    };
+    let psv = c.part(FourCC::PSV0).ok_or(refused(PSV))?.data;
+    GsShape::of(psv, io).map_err(refused)
+}
+
+/// The program the resource tracker reads: in a merged half, the scalar
+/// loads that only set up ring addresses ([`EsPlan::address_only`],
+/// [`GsPlan::address_only`]) are an `s_nop` with the same results. They read
+/// a table of the console's driver (the GS's ring base), which no root
+/// parameter holds; the lowering leaves them out. A plan's refusal is
+/// reported here, at the resources' step: the plan says which loads those
+/// are.
+// shortcut: until `resource::track` takes the sites to leave out (es-gs.md,
+// section 6, item 5), it reads this copy; sites and values are the same.
+pub(crate) fn tracked<'p>(
+    c: &Container,
+    p: &'p Program,
+    native: &NativeProgram,
+) -> Result<Cow<'p, Program>, ShaderError> {
+    let address_only = match native.stage {
+        HwStage::Es => es_plan(p).map_err(refused)?.address_only,
+        HwStage::Gs => {
+            gs_plan(p, &shape_of(c, native)?)
+                .map_err(refused)?
+                .address_only
+        }
+        _ => return Ok(Cow::Borrowed(p)),
+    };
+    let loads: Vec<Site> = address_only
+        .into_iter()
+        .filter(|&(b, i)| matches!(p.blocks[b].insts[i].fields, Fields::Smem { .. }))
+        .collect();
+    if loads.is_empty() {
+        return Ok(Cow::Borrowed(p));
+    }
+    let mut q = p.clone();
+    for (b, i) in loads {
+        let inst = &mut q.blocks[b].insts[i];
+        inst.machine = Instruction {
+            offset: inst.machine.offset,
+            encoding: Encoding::Sopp,
+            opcode: 0,
+            words: vec![0xBF80_0000],
+        };
+        inst.fields = Fields::Sopp { imm: 0 };
+        inst.reads.clear();
+    }
+    Ok(Cow::Owned(q))
+}
+
+/// `io` with the geometry shader's shape ([`Io::geometry`]) when `native`
+/// is a GS: its container's `PSV0` gives it, which the lowering does not
+/// read.
+pub(crate) fn with_shape<'i>(
+    c: &Container,
+    native: &NativeProgram,
+    io: &'i Io,
+) -> Result<Cow<'i, Io>, ShaderError> {
+    if native.stage != HwStage::Gs || io.geometry.is_some() {
+        return Ok(Cow::Borrowed(io));
+    }
+    Ok(Cow::Owned(Io {
+        geometry: Some(shape_of(c, native)?),
+        ..io.clone()
+    }))
+}
+
+/// DXC's interpolation of a vertex output by its kind and component type,
+/// as `emit_for` declares a vertex shader's: a geometry shader's inputs
+/// are declared as the vertex shader's outputs they are.
+fn vertex_interp(e: &SigElement) -> u8 {
+    match (e.kind, e.comp) {
+        (3, _) => 4,
+        (13, _) => 1,
+        (28, _) => 2,
+        (0 | 6 | 7, 9) => 2,
+        (0, _) => 1,
+        _ => 0,
+    }
+}
+
+/// What the lowering of a merged half needs at its plan's sites.
+pub(super) struct Merged {
+    stage: HwStage,
+    /// GS ring reads, ES or GS ring writes, by site.
+    reads: HashMap<Site, Vec<(Reg, Slot)>>,
+    writes: HashMap<Site, Vec<(Reg, Slot)>>,
+    messages: HashMap<Site, Message>,
+    emits: BTreeMap<Site, Vec<Written>>,
+    address_only: BTreeSet<Site>,
+    vertices: Vertices,
+    /// The shader's signatures, as declared.
+    inputs: Vec<SigElement>,
+    outputs: Vec<SigElement>,
+}
+
+impl Lower<'_> {
+    /// Before the blocks: an ES or GS program's plan, and for a GS its
+    /// geometry state and input declarations.
+    pub(super) fn merged_start(&mut self) -> Result<(), Stop> {
+        let x = self.x;
+        let stage = x.native.stage;
+        let rows = |outputs: &[VsOutput]| outputs.iter().any(|o| o.fp16 || o.pack2);
+        let half = |els: &[SigElement]| els.iter().any(|e| e.half);
+        let fail = |what| unsupported(0, what);
+        let mut m = Merged {
+            stage,
+            reads: HashMap::new(),
+            writes: HashMap::new(),
+            messages: HashMap::new(),
+            emits: BTreeMap::new(),
+            address_only: BTreeSet::new(),
+            vertices: Vertices::default(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+        match (&x.native.io, stage) {
+            (StageIo::Es(es), HwStage::Es) => {
+                if rows(&es.outputs) || half(&self.s.outputs) {
+                    return Err(fail(HALF));
+                }
+                let plan = es_plan(x.p).map_err(fail)?;
+                m.writes = plan
+                    .writes
+                    .into_iter()
+                    .map(|w| (w.site, w.dwords))
+                    .collect();
+                m.address_only = plan.address_only;
+            }
+            (StageIo::Gs(gs), HwStage::Gs) => {
+                if rows(&gs.outputs) || half(&self.s.inputs) || half(&self.s.outputs) {
+                    return Err(fail(HALF));
+                }
+                let shape = x.io.geometry.ok_or_else(|| fail(PSV))?;
+                for e in &mut self.s.inputs {
+                    e.interp = vertex_interp(e);
+                }
+                shape.check(&self.s.inputs, &self.s.outputs).map_err(fail)?;
+                let plan = gs_plan(x.p, &shape).map_err(fail)?;
+                m.reads = plan.reads.into_iter().map(|r| (r.site, r.dwords)).collect();
+                m.writes = plan
+                    .writes
+                    .into_iter()
+                    .map(|w| (w.site, w.dwords))
+                    .collect();
+                m.messages = plan.messages.into_iter().collect();
+                m.emits = plan.emits;
+                m.address_only = plan.address_only;
+                self.s.geometry = Some(shape);
+            }
+            (_, HwStage::Es | HwStage::Gs) => return Err(fail(STAGE_DATA)),
+            _ => return Ok(()),
+        }
+        m.inputs = self.s.inputs.clone();
+        m.outputs = self.s.outputs.clone();
+        self.merged = Some(Box::new(m));
+        Ok(())
+    }
+
+    /// Instruction `(b, i)` of a merged half where the plan says what it is
+    /// (`None` elsewhere): ring set-up is left out, ring reads load inputs,
+    /// ES ring writes store outputs, GS ring writes are kept until their
+    /// vertex's emit, messages emit and cut. The halves' barriers and the
+    /// ES's jump to the GS half have no host form: the rings they order are
+    /// gone.
+    pub(super) fn merged_inst(&mut self, b: usize, i: usize) -> Option<Result<(), Stop>> {
+        let mut m = self.merged.take()?;
+        let r = self.merged_site(&mut m, b, i);
+        self.merged = Some(m);
+        r
+    }
+
+    fn merged_site(&mut self, m: &mut Merged, b: usize, i: usize) -> Option<Result<(), Stop>> {
+        let inst: &Inst = &self.x.p.blocks[b].insts[i];
+        let site = (b, i);
+        let offset = inst.machine.offset;
+        if m.address_only.contains(&site) || matches!(inst.name(), "s_barrier" | "s_setpc_b64") {
+            return Some(Ok(()));
+        }
+        if let Some(dwords) = m.reads.get(&site) {
+            return Some(self.merged_read(inst, b, i, &m.inputs, dwords));
+        }
+        if let Some(dwords) = m.writes.get(&site) {
+            let r = match m.stage {
+                HwStage::Es => self.item_write(inst, b, i, &m.outputs, dwords),
+                _ => dwords.iter().try_for_each(|&(reg, _)| {
+                    let v = inst.read(reg).ok_or("an unread operand")?;
+                    let value = self.i32_of(v)?;
+                    m.vertices.write(site, reg, value);
+                    Ok(())
+                }),
+            };
+            return Some(r.map_err(|why| unsupported(offset, why)));
+        }
+        let &message = m.messages.get(&site)?;
+        Some(
+            self.message(m, b, i, message)
+                .map_err(|why| unsupported(offset, why)),
+        )
+    }
+
+    /// A GS ring read: each dword it loads is that input vertex's
+    /// signature element, under the instruction's lane guard. A dword no
+    /// element holds reads as missing ([`NOT_INPUT`]).
+    fn merged_read(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        inputs: &[SigElement],
+        dwords: &[(Reg, Slot)],
+    ) -> Result<(), Stop> {
+        let guard = self
+            .guard(b, i)
+            .map_err(|why| unsupported(inst.machine.offset, why))?;
+        for &(reg, slot) in dwords {
+            match read_vertex(&mut self.s, self.cur, inputs, slot) {
+                Ok(v) => self.write_placed(inst, reg, v, guard),
+                Err(why) => self.set(inst.write(reg), Val::Missing(why)),
+            }
+        }
+        Ok(())
+    }
+
+    /// An ES ring write: each item dword is the vertex shader's output at
+    /// its row and column, stored by the lanes the instruction runs in.
+    fn item_write(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        outputs: &[SigElement],
+        dwords: &[(Reg, Slot)],
+    ) -> Result<(), Why> {
+        let values = dwords
+            .iter()
+            .map(|&(reg, slot)| {
+                let v = inst.read(reg).ok_or("an unread operand")?;
+                Ok((slot.dword, self.i32_of(v)?))
+            })
+            .collect::<Result<Vec<_>, Why>>()?;
+        let guard = self.guard(b, i)?;
+        let at = self.begin_guarded(guard);
+        for (dword, value) in values {
+            write_item(&mut self.s, self.cur, outputs, dword, value);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// A GS message: an emit stores its vertex and emits it, a cut ends the
+    /// strip, under the lanes' EXEC where some lane outside it gets there.
+    fn message(&mut self, m: &Merged, b: usize, i: usize, message: Message) -> Result<(), Why> {
+        if message == Message::Done {
+            return Ok(());
+        }
+        let guard = self.scalar_guard(b, i)?;
+        let at = self.begin_guarded(guard);
+        match message {
+            Message::Emit { cut, .. } => {
+                let dwords = m.emits.get(&(b, i)).ok_or(SOME_PATHS)?;
+                m.vertices.emit(&mut self.s, self.cur, &m.outputs, dwords)?;
+                if cut {
+                    Vertices::cut(&mut self.s, self.cur);
+                }
+            }
+            Message::Cut { .. } => Vertices::cut(&mut self.s, self.cur),
+            Message::Done => {}
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Whether block `b` ends a merged half's program: the ES's jump to the
+    /// GS half ends the vertex shader (it returns).
+    pub(super) fn merged_end(&mut self, b: usize) -> bool {
+        let ends = self.merged.as_ref().is_some_and(|m| m.stage == HwStage::Es)
+            && self.x.p.blocks[b].exit == Exit::Indirect;
+        if ends {
+            self.s.m.terminate(self.cur, Term::Ret);
+        }
+        ends
     }
 }

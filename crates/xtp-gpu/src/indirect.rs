@@ -86,6 +86,7 @@ void main(uint lane : SV_GroupIndex) {
                     InterlockedMax(metrics[2], g.z);
                     if (any(g > LIMIT)) InterlockedAdd(metrics[3], 1);
                 }
+                if (kind == 10 && measure && any(g == 0)) InterlockedAdd(metrics[14], 1);
                 if (all(g != 0)) {
                     uint weight = kind == 2 ? 64 : 128;
                     if (measure && g.x > (1u << 20) / g.y / g.z) InterlockedAdd(metrics[12], 1);
@@ -138,7 +139,7 @@ void main(uint lane : SV_GroupIndex) {
             stats.Store4(0, uint4(metrics[0], metrics[1], metrics[2], metrics[3]));
             stats.Store4(16, uint4(metrics[4], metrics[5], metrics[6], active));
             stats.Store4(32, uint4(metrics[8], metrics[9], metrics[10], metrics[11]));
-            stats.Store2(48, uint2(metrics[12], BUDGET - left));
+            stats.Store3(48, uint3(metrics[12], BUDGET - left, metrics[14]));
         }
     }
 }
@@ -189,6 +190,7 @@ struct Counts {
     instance_limit: u64,
     over_million_groups: u64,
     max_list_cost: u32,
+    empty_mesh: u64,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -228,6 +230,7 @@ impl Sample {
         c.instance_limit += u64::from(read(11));
         c.over_million_groups += u64::from(read(12));
         c.max_list_cost = c.max_list_cost.max(read(13));
+        c.empty_mesh += u64::from(read(14));
     }
 }
 
@@ -655,6 +658,9 @@ mod tests {
             }
             words[..3].fill(u32::MAX);
             words[3] = 17;
+            // An active empty record and one beyond the count. Only the first is measured.
+            words[4 * 16 + 1] = 0;
+            words[4 * 17 + 1] = 0;
             let gpu = args.GetGPUVirtualAddress();
             assert!(super::rewrite(
                 &list,
@@ -675,7 +681,8 @@ mod tests {
                 assert_eq!(pair, [0, 0, 0, 65535, 1, 1, 65535, 0, 0, 4465, 1, 1]);
             }
             let metrics = std::slice::from_raw_parts(counts.cast::<u32>(), 8);
-            assert_eq!(metrics, [u32::MAX, u32::MAX, u32::MAX, 17, 0, 1, 2, 17]);
+            assert_eq!(metrics, [u32::MAX, u32::MAX, u32::MAX, 17, 0, 1, 1, 17]);
+            assert_eq!(counts.cast::<u32>().add(14).read_volatile(), 1);
             assert_eq!(words[4], 70000);
         }
     }
