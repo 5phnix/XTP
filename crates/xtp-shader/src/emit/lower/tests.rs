@@ -13,6 +13,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 256,
         layout: vec![],
         used: vec![],
@@ -65,6 +66,7 @@ fn lower_wave(
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64,
+        float_mode: 0,
         vgprs: 256,
         layout,
         used,
@@ -162,6 +164,7 @@ fn perm_features(selector: u32) -> u64 {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 256,
         layout: vec![],
         used: vec![],
@@ -514,6 +517,7 @@ fn selects_from_independently_written_mask_words() {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64,
+            float_mode: 0,
             vgprs: 4,
             layout: vec![RootParam {
                 root: RootType::Table,

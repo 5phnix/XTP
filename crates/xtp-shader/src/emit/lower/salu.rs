@@ -11,6 +11,33 @@ use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Inst, Reg};
 
 impl<'a> Lower<'a> {
+    pub(super) fn set_float_mode(&mut self, inst: &Inst) -> Result<(), Why> {
+        let (offset, mask) =
+            crate::ir::float_mode_field(inst.name(), &inst.fields).ok_or("a float mode field")?;
+        let old = self.i32_of(inst.read(Reg::FloatMode).ok_or("the previous float mode")?)?;
+        let source = match &inst.fields {
+            Fields::Sopp { imm } => self.s.m.i32(u32::from(*imm)),
+            Fields::Sop { src, .. } => self.operand(inst, &src[0])?,
+            _ => unreachable!(),
+        };
+        let value =
+            if let (Some(a), Some(b)) = (self.s.m.int_value(old), self.s.m.int_value(source)) {
+                self.s
+                    .m
+                    .i32((a as u32 & !mask) | ((b as u32) << offset & mask))
+            } else {
+                let shift = self.s.m.i32(offset);
+                let bits = self.s.m.bin(self.cur, Bin::Shl, source, shift);
+                let keep = self.s.m.i32(!mask);
+                let mask = self.s.m.i32(mask);
+                let old = self.s.m.bin(self.cur, Bin::And, old, keep);
+                let bits = self.s.m.bin(self.cur, Bin::And, bits, mask);
+                self.s.m.bin(self.cur, Bin::Or, old, bits)
+            };
+        self.set(inst.write(Reg::FloatMode), Val::I32(value));
+        Ok(())
+    }
+
     pub(super) fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
         let Fields::Sop { dst, src, imm } = &inst.fields else {
             unreachable!()
@@ -47,8 +74,8 @@ impl<'a> Lower<'a> {
             // so a join of paths into tables in the code, or a first-lane read
             // of such an address, is the byte in the code (resource tracking
             // gives either as the computed term, `Tracer::counts_code`).
-            // shortcut: a program that uses the counter otherwise, as data,
-            // computes with that offset where the console has the address.
+            // Une lecture comme donnée utilise le même espace de code, relatif
+            // au début du programme, que les adresses des tables.
             let code = dst_code.ok_or("a missing operand")?;
             let at = self.s.m.i32(inst.machine.offset as u32 + 4);
             let z = self.s.m.i32(0);
@@ -562,6 +589,7 @@ mod tests {
         NativeProgram {
             stage: crate::HwStage::Cs,
             wave64: false,
+            float_mode: 0,
             vgprs: 8,
             layout: vec![RootParam {
                 root: RootType::Table,

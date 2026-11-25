@@ -321,6 +321,43 @@ fn masks_read_whole_count_both_halves() {
     console_flow_case("s_bcnt1 of lanes below 40", &body, 32, |_| 32);
 }
 
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn masked_double_sum_counts_both_halves() {
+    // Chaque lane fournit 0.0 ou 1.0 en double précision. Lire les lanes
+    // une par une donne un ordre de sommation indépendant des permutations.
+    let mut body = vec![
+        0x7d88_00a9, // vcc = (41 > v0)
+        0x7e02_0280,
+        0x7e04_02ff,
+        0x3ff0_0000, // v[1:2] = 1.0
+        0xbe8e_25c1, // s[14:15] = EXEC, EXEC = -1
+        0x8790_0e6a, // s[16:17] = vcc & s[14:15]
+        0xd501_0003,
+        0x0042_0280, // v3 = masque ? v1 : 0
+        0xd501_0004,
+        0x0042_0480, // v4 = masque ? v2 : 0
+    ];
+    for lane in 0..64 {
+        let index = (128 + lane) << 9;
+        body.extend([0xd760_000a, index | 259, 0xd760_000b, index | 260]);
+        if lane == 0 {
+            body.extend([0x7e0a_020a, 0x7e0c_020b]); // v[5:6] = s[10:11]
+        } else {
+            body.extend([0xd564_0005, (261 << 9) | 10]); // v[5:6] += s[10:11]
+        }
+    }
+    body.extend([
+        0xd760_000a,
+        0x0001_0105,
+        0xd760_000b,
+        0x0001_0106, // lecture de la somme
+        0xbefe_040e,
+        0x7e04_1e0a, // restauration d’EXEC et conversion dans v2
+    ]);
+    console_flow_case("masked double sum", &body, 64, |_| 41f32.to_bits());
+}
+
 /// A lane of the other half: lane 40 is the upper half's lane 8.
 #[test]
 #[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
@@ -1469,6 +1506,7 @@ fn every_hardware_case_translates_and_validates_without_a_device() {
     in_half_lane_reads_match_the_console_on_every_adapter();
     three_dimensional_groups_keep_the_consoles_lanes();
     masks_read_whole_count_both_halves();
+    masked_double_sum_counts_both_halves();
     lane_reads_cross_halves();
     lane_reads_cross_halves_in_groups_of_several_console_waves();
     exchanges_inside_a_branch_one_half_skips();
