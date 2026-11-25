@@ -248,6 +248,9 @@ ferme, la comparaison de `6e99955` et `1084cf6` avec
 `shader-survey --host-lanes 32-32 --json` donne les mêmes résultats pour
 les 26 698 programmes, entrée par entrée. Les 25 725 programmes traduits
 ont tous conservé la même empreinte DXIL.
+Après intégration de `main` (`d24d377`), le même relevé sur la ferme
+compare cette base à `8e29dce`. Les 25 768 traductions produisent le même
+DXIL et les 930 refus gardent leur catégorie.
 
 La veille 26 (item 362, VIctory #2118) signale qu'un constructeur exécuté
 en partie peut écrire une structure incomplète. Au chargement de la DLL,
