@@ -35,6 +35,10 @@
 //! the texture (a depth texture is copied whole, as D3D12 asks), read back
 //! at the present; the read-back memory is [`BUDGET`] bytes a frame.
 //!
+//! `XTP_PASS_INPUTS=<program hash>` also samples the textures bound by
+//! each matching op just before it runs. Volume samples are reported by
+//! depth slice. Tiny textures include the individual texels.
+//!
 //! shortcut: a dropped draw or dispatch is put in the list the thread last
 //! recorded an op, a binding or targets for (`dropped` is not told its
 //! list); the copies, resolves and buffer writes of a list are listed in
@@ -762,6 +766,7 @@ enum Out {
     Target,
     Depth,
     Unordered,
+    Binding(u8, u32),
 }
 
 impl Out {
@@ -770,6 +775,7 @@ impl Out {
             Out::Target => "rt",
             Out::Depth => "ds",
             Out::Unordered => "uav",
+            Out::Binding(..) => "binding",
         }
     }
 }
@@ -781,6 +787,8 @@ struct Sample {
     /// The format of the rows (a depth texture's first plane: its
     /// footprint's).
     format: u32,
+    /// Number of sampled rows in each depth slice, in z order.
+    rows_per_slice: usize,
     /// Each sampled row: its y and its offset.
     rows: Vec<(u32, u64)>,
 }
@@ -794,6 +802,7 @@ type Desc = Option<(u32, u32, u32)>;
 struct After {
     resource: usize,
     how: Out,
+    address: u64,
     desc: Desc,
     sample: Result<Sample, &'static str>,
 }
@@ -813,6 +822,7 @@ struct Pass {
 struct Op {
     ran: bool,
     text: String,
+    before: Vec<After>,
     buffers: Vec<(u64, u64, Result<u64, &'static str>)>,
 }
 
@@ -825,6 +835,7 @@ struct Recording {
     depth: usize,
     /// The unordered-access textures of the op being prepared.
     pending: Vec<usize>,
+    bindings: Vec<(usize, Out)>,
 }
 
 /// The read-back buffer samples go to, from offset 0 for each frame.
@@ -976,6 +987,15 @@ impl Dump {
             _ if r.passes.is_empty() => r.passes.push(Pass::default()),
             _ => {}
         }
+        let bindings = std::mem::take(&mut r.bindings);
+        let before = if input_program().is_some_and(|hash| programs(text).contains(&hash)) {
+            bindings
+                .into_iter()
+                .map(|(resource, how)| snapshot(readback, device, list, resource, how, 0))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let buffers = small_buffers(text)
             .into_iter()
             .map(|(address, len)| {
@@ -990,6 +1010,7 @@ impl Dump {
             p.ops.push(Op {
                 ran: true,
                 text: text.to_owned(),
+                before,
                 buffers,
             });
         }
@@ -1001,12 +1022,14 @@ impl Dump {
             return;
         };
         r.pending.clear();
+        r.bindings.clear();
         if r.passes.is_empty() {
             r.passes.push(Pass::default());
         }
         if let Some(p) = r.passes.last_mut() {
             p.ops.push(Op {
                 ran: false,
+                before: Vec::new(),
                 text,
                 buffers: Vec::new(),
             });
@@ -1203,13 +1226,27 @@ fn sample_pass(
     width: u64,
 ) {
     for &(resource, how) in &pass.outputs {
-        let (desc, sample) = sample(readback, device, list, resource as This, width);
-        pass.after.push(After {
-            resource,
-            how,
-            desc,
-            sample,
-        });
+        pass.after
+            .push(snapshot(readback, device, list, resource, how, width));
+    }
+}
+
+fn snapshot(
+    readback: &mut Readback,
+    device: &ID3D12Device,
+    list: &HostList,
+    resource: usize,
+    how: Out,
+    width: u64,
+) -> After {
+    let (desc, sample) = sample(readback, device, list, resource as This, width);
+    let address = crate::resource::texture_memory(resource as This).map_or(0, |(p, _)| p as u64);
+    After {
+        resource,
+        how,
+        address,
+        desc,
+        sample,
     }
 }
 
@@ -1236,8 +1273,11 @@ fn sample(
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let desc = Some((d.Width as u32, d.Height, d.Format.0 as u32));
-    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
-        return (desc, Err("not a 2D texture"));
+    if !matches!(
+        d.Dimension,
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D
+    ) {
+        return (desc, Err("not a 2D or 3D texture"));
     }
     if d.SampleDesc.Count > 1 {
         return (desc, Err("multisampled"));
@@ -1265,7 +1305,7 @@ fn sample(
         return (desc, Err("format not sampled"));
     }
     // D3D12 copies no part of a depth texture: it is copied whole.
-    let whole = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
+    let whole = f.Depth > 1 || d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
     let pitch = u64::from(f.RowPitch);
     let ys = rows_of(d.Height);
     let row_bytes = pitch.next_multiple_of(512);
@@ -1311,7 +1351,10 @@ fn sample(
             };
             list.list
                 .CopyTextureRegion(&to(placed), 0, 0, 0, &from, None);
-            rows.extend(ys.iter().map(|&y| (y, at + u64::from(y) * pitch)));
+            for z in 0..f.Depth {
+                let slice = at + u64::from(z) * u64::from(f.Height) * pitch;
+                rows.extend(ys.iter().map(|&y| (y, slice + u64::from(y) * pitch)));
+            }
         } else {
             for (i, &y) in ys.iter().enumerate() {
                 let offset = at + i as u64 * row_bytes;
@@ -1345,6 +1388,7 @@ fn sample(
         Ok(Sample {
             width: f.Width,
             format: f.Format.0 as u32,
+            rows_per_slice: ys.len(),
             rows,
         }),
     )
@@ -1528,7 +1572,7 @@ struct Stats {
     odd: u64,
 }
 
-fn stats(sample: &Sample, bytes: &[u8]) -> Option<Stats> {
+fn stats(sample: &Sample, rows: &[(u32, u64)], bytes: &[u8]) -> Option<Stats> {
     let size = bytes_per_texel(sample.format)? as usize;
     let channels = channels(sample.format);
     let mut s = Stats {
@@ -1541,7 +1585,7 @@ fn stats(sample: &Sample, bytes: &[u8]) -> Option<Stats> {
         lit: 0,
         odd: 0,
     };
-    for &(_, at) in &sample.rows {
+    for &(_, at) in rows {
         let at = at as usize;
         let row = bytes.get(at..at + sample.width as usize * size)?;
         for t in row.chunks_exact(size) {
@@ -1627,6 +1671,33 @@ fn words(bytes: &[u8], len: u64, at: &Result<u64, &'static str>) -> String {
     format!("[{}] ({})", floats.join(", "), hex.join(" "))
 }
 
+fn write_details(out: &mut String, a: &After, bytes: &[u8]) {
+    let Ok(s) = &a.sample else { return };
+    for (z, rows) in s.rows.chunks(s.rows_per_slice).enumerate() {
+        if s.rows.len() > s.rows_per_slice
+            && let Some(slice) = stats(s, rows, bytes)
+        {
+            let _ = writeln!(out, "      slice {z}: {}", slice.text());
+        }
+        if s.width <= 4 && a.desc.is_some_and(|(_, h, _)| h <= 4) {
+            let size = bytes_per_texel(s.format).unwrap() as usize;
+            for &(y, offset) in rows {
+                let at = offset as usize;
+                if let Some(row) = bytes.get(at..at + s.width as usize * size) {
+                    for (x, t) in row.chunks_exact(size).enumerate() {
+                        let v = texel(s.format, t);
+                        let _ = writeln!(
+                            out,
+                            "      texel ({x},{y},{z}): {:?} bytes {t:02x?}",
+                            &v[..channels(s.format)]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The report of `lists` (in submission order), their samples in `bytes`.
 fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
     let passes: usize = lists.iter().map(|l| l.passes.len()).sum();
@@ -1653,7 +1724,7 @@ fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
             .desc
             .map_or("?".to_owned(), |(w, h, f)| format!("{w}x{h} f{f}"));
         let what = match &a.sample {
-            Ok(s) => stats(s, bytes).map_or("not read back".to_owned(), |s| s.text()),
+            Ok(s) => stats(s, &s.rows, bytes).map_or("not read back".to_owned(), |s| s.text()),
             Err(why) => format!("not sampled: {why}"),
         };
         (desc, what)
@@ -1684,7 +1755,8 @@ fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
                     a.how.name(),
                     a.resource
                 );
-                let line = format!("P{n} {what}");
+                write_details(&mut out, a, bytes);
+                let line = format!("P{n} {what} at {:#x}", a.address);
                 match timeline.iter_mut().find(|t| t.0 == a.resource) {
                     Some(t) => t.2.push(line),
                     None => timeline.push((a.resource, desc, vec![line])),
@@ -1707,6 +1779,18 @@ fn report_text(frame: u64, lists: &[Recording], bytes: &[u8]) -> String {
             let _ = writeln!(out, "P{n} L{}", l + 1);
             for op in &pass.ops {
                 let _ = writeln!(out, "  {}{}", if op.ran { "" } else { "DROPPED " }, op.text);
+                for a in &op.before {
+                    let Out::Binding(slot, offset) = a.how else {
+                        continue;
+                    };
+                    let (desc, what) = after_text(a);
+                    let _ = writeln!(
+                        out,
+                        "    s{slot}+{offset} {:#x} at {:#x} {desc} before it: {what}",
+                        a.resource, a.address
+                    );
+                    write_details(&mut out, a, bytes);
+                }
                 for (address, len, at) in &op.buffers {
                     let _ = writeln!(
                         out,
@@ -1777,6 +1861,37 @@ pub(crate) fn targets(list: &HostList, targets: &[usize], depth: usize) {
     dump()
         .get_or_insert_with(|| Dump::new(BUDGET, dump_width()))
         .targets(list, targets, depth);
+}
+
+fn input_program() -> Option<&'static str> {
+    static HASH: OnceLock<Option<String>> = OnceLock::new();
+    HASH.get_or_init(|| {
+        std::env::var("XTP_PASS_INPUTS")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+    })
+    .as_deref()
+}
+
+/// The resource actually prepared for a table slot, after resolving placed views.
+pub(crate) fn binding(list: &HostList, resource: This, slot: u8, offset: u32) {
+    if input_program().is_none()
+        || !recording()
+        || crate::resource::host_resource(resource).is_none()
+    {
+        return;
+    }
+    CURRENT.set(key(list));
+    let mut guard = dump();
+    let r = guard
+        .get_or_insert_with(|| Dump::new(BUDGET, dump_width()))
+        .open
+        .entry(key(list))
+        .or_default();
+    let binding = (resource as usize, Out::Binding(slot, offset));
+    if !r.bindings.contains(&binding) {
+        r.bindings.push(binding);
+    }
 }
 
 /// `readable`: a texture the op being prepared in `list` binds for
@@ -2016,9 +2131,10 @@ mod tests {
         let sample = Sample {
             width: 2,
             format: 54,
+            rows_per_slice: 2,
             rows: vec![(0, 0), (1, 4)],
         };
-        let s = stats(&sample, &bytes).unwrap();
+        let s = stats(&sample, &sample.rows, &bytes).unwrap();
         assert_eq!((s.texels, s.lit, s.odd), (4, 3, 1));
         assert_eq!((s.min[0], s.max[0]), (0.0, 2.0));
         assert!((s.sum[0] / s.finite[0] as f64 - 2.5 / 3.0).abs() < 1e-9);
