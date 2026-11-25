@@ -617,7 +617,8 @@ fn clear(list: &HostList, view: &View, fill: Fill) -> Result<(), &'static str> {
         list.twin_use(texture, true, true);
         list.twins_written();
         crate::list::ensure_state(list, texture, UNORDERED_ACCESS);
-        crate::texture::host_written(texture);
+        // A view clears one subresource, not every texel of the texture.
+        crate::texture::gpu_write(list, texture, false);
     }
     #[cfg(feature = "diagnostics")]
     if let View::Unordered(resource, _, _) = view {

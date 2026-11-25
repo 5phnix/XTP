@@ -36,6 +36,14 @@ if ($r.ExitCode -eq 0) {
     Write-FarmMessage "deleting firewall rule $fw"
     Invoke-FarmGcloud -Config $c -Arguments @('compute', 'firewall-rules', 'delete', $fw) | Out-Null
 }
+# The shader pack's URL signer (Copy-FarmPack.ps1); its bucket binding
+# then names a deleted account and grants nothing.
+$signer = "$($c.packSigner)@$($c.project).iam.gserviceaccount.com"
+$r = Invoke-FarmGcloud -Config $c -AllowFailure -Arguments @('iam', 'service-accounts', 'describe', $signer)
+if ($r.ExitCode -eq 0) {
+    Write-FarmMessage "deleting service account $signer"
+    Invoke-FarmGcloud -Config $c -Arguments @('iam', 'service-accounts', 'delete', $signer) | Out-Null
+}
 foreach ($f in 'instances.json', 'slots.json', 'health.json', 'image.json') { Remove-Item -Force -LiteralPath (Join-Path $c.stateDir $f) -ErrorAction SilentlyContinue }
 Remove-Item -Force -Path (Join-Path $c.stateDir 'vms\*'), (Join-Path $c.stateDir 'ssh\known_hosts') -ErrorAction SilentlyContinue
 Write-FarmMessage 'farm removed'
