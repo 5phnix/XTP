@@ -640,6 +640,38 @@ fn raw_multidword_transfers_keep_each_in_range_component() {
             let p = program(&access, kind, store);
             for mode in [Mode::Raw, Mode::Table] {
                 let cs = translate(&p, mode).unwrap();
+                if !store && let Some(ir) = super::smem_tests::disassembly(&cs) {
+                    // La table se lit par paires de dwords. Aucun load scalaire
+                    // ne doit apparaître dans ces programmes de lecture vectorielle.
+                    let loads: Vec<_> = ir
+                        .lines()
+                        .filter(|line| {
+                            line.contains("call") && line.contains("@dx.op.rawBufferLoad")
+                        })
+                        .collect();
+                    let mask = format!("i8 {}, i32 4)", (1 << count) - 1);
+                    assert!(
+                        loads.iter().any(|line| line.contains(&mask)),
+                        "x{count} {mode:?} : {loads:?}"
+                    );
+                    assert!(
+                        loads.iter().all(|line| !line.contains("i8 1, i32 4)")),
+                        "x{count} {mode:?} : {loads:?}"
+                    );
+                    if mode == Mode::Raw {
+                        assert_eq!(loads.len(), 1);
+                    }
+                    eprintln!(
+                        "x{count} {mode:?} : {} octets DXIL, {} lectures, {} handles du tas, {} branches conditionnelles",
+                        cs.dxil.len(),
+                        loads.len(),
+                        ir.lines()
+                            .filter(|line| line.contains("call")
+                                && line.contains("@dx.op.createHandleFromHeap"))
+                            .count(),
+                        ir.matches("br i1 ").count()
+                    );
+                }
                 for (name, host) in &hosts {
                     let out = run(host, &cs, kind, store, mode, 2 + count);
                     let start = (12 + offset) as usize / 4;
@@ -704,7 +736,7 @@ fn raw_scalar_offset_moves_the_base_for_load_store_and_atomic() {
 
 /// Root SRV at s[2:3], descriptor at s[8:11], base displaced by 12.
 fn rebuilt_program(
-    stride: u32,
+    word1: u32,
     records: u32,
     word3: u32,
     threads: u32,
@@ -719,7 +751,7 @@ fn rebuilt_program(
         0x8008_8c02, // s_add_u32 s8, s2, 12
         0x8209_8003, // s_addc_u32 s9, s3, 0
         0x8809_ff09,
-        stride << 16, // s_or_b32 s9, s9, stride bits
+        word1, // s_or_b32 s9, s9, contrôles du descripteur
         0xbe8a_03ff,
         records,
         0xbe8b_03ff,
@@ -753,18 +785,21 @@ fn rebuilt_program(
 fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
     let (_one, hosts) = hosts();
     // The used-resource stride is deliberately absent: word 1 supplies it.
-    for (oob, records, index, within, scalar, want) in [
-        (0, 2, 0, 0, 0, Some(3)),
-        (0, 2, 0, 0, 12, Some(6)),
-        (0, 2, 0, 12, 0, None),
-        (0, 2, 2, 0, 0, None),
-        (1, 2, 0, 12, 0, Some(6)),
-        (1, 2, 2, 0, 0, None),
-        (2, 1, 2, 12, 0, Some(12)),
-        (2, 0, 0, 0, 0, None),
-        (3, 16, 0, 0, 12, Some(6)),
-        (3, 16, 0, 4, 12, None),
-        (3, 14, 0, 0, 12, None),
+    for (oob, stride, records, index, within, scalar, want) in [
+        (0, 12, 2, 0, 0, 0, Some(3)),
+        (0, 12, 2, 0, 0, 12, Some(6)),
+        (0, 12, 2, 0, 12, 0, None),
+        (0, 12, 2, 2, 0, 0, None),
+        (0, 6, 2, 0, 4, 0, None), // Deux octets du dword dépassent du record.
+        (1, 12, 2, 0, 12, 0, Some(6)),
+        (1, 12, 2, 2, 0, 0, None),
+        (2, 12, 1, 2, 12, 0, Some(12)),
+        (2, 12, 0, 0, 0, 0, None),
+        // LLVM, IntrinsicsAMDGPU.td : SOFFSET déplace la base après le contrôle.
+        (3, 12, 16, 0, 0, 12, Some(6)),
+        (3, 12, 16, 0, 4, 12, Some(7)),
+        (3, 12, 14, 0, 0, 12, Some(6)),
+        (3, 12, 14, 0, 12, 0, None),
     ] {
         let mut access = vec![
             0x7e02_0280, // v1 = 0
@@ -774,7 +809,7 @@ fn raw_rebuilt_descriptor_uses_its_base_count_and_oob_select() {
             0x1402_0203,
         ];
         access.extend(EPILOGUE);
-        let p = rebuilt_program(12, records, 0x0101_4fac | (oob << 28), 1, &access);
+        let p = rebuilt_program(stride << 16, records, 0x0101_4fac | (oob << 28), 1, &access);
         for mode in [Mode::Raw, Mode::Table] {
             let cs = translate(&p, mode).unwrap();
             assert_eq!(cs.root_srvs, [1]);
@@ -795,10 +830,16 @@ fn raw_add_tid_indexes_by_console_lane_with_and_without_idxen() {
     let (_one, hosts) = hosts();
     let source = data();
     for wave in [32, 64] {
-        for (idxen, add_tid) in [(false, false), (false, true), (true, true)] {
+        for (opcode, idxen, add_tid) in [
+            (0xe030_0000, false, false),
+            (0xe030_0000, false, true),
+            (0xe030_0000, true, true),
+            (0xe800_0000 | (20 << 19), false, true), // MTBUF 32_UINT
+            (0xe800_0000 | (20 << 19), true, true),
+        ] {
             let access = [
                 0x7e06_0282, // v3 = 2 (used only with IDXEN)
-                0xe030_0000 | (u32::from(idxen) << 13),
+                opcode | (u32::from(idxen) << 13),
                 0x8002_0203,
                 0xbf8c_3f70,
                 0x3408_0082, // v4 = group thread x * 4
@@ -807,7 +848,7 @@ fn raw_add_tid_indexes_by_console_lane_with_and_without_idxen() {
                 0xbf81_0000,
             ];
             let word3 = 0x0101_4fac | (u32::from(add_tid) << 23);
-            let mut p = rebuilt_program(4, 40, word3, 96, &access);
+            let mut p = rebuilt_program(4 << 16, 40, word3, 96, &access);
             p.wave64 = wave == 64;
             let want: Vec<_> = (0..96)
                 .map(|x| {
@@ -822,9 +863,48 @@ fn raw_add_tid_indexes_by_console_lane_with_and_without_idxen() {
                     let out = run(host, &cs, Kind::Raw, false, mode, 96);
                     assert_eq!(
                         out[0], want,
-                        "wave{wave} idxen={idxen} ADD_TID_ENABLE={add_tid} {mode:?} on {name}"
+                        "{opcode:x} wave{wave} idxen={idxen} ADD_TID_ENABLE={add_tid} {mode:?} on {name}"
                     );
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_rebuilt_vector_and_swizzled_format_respect_the_record_end() {
+    let (_one, hosts) = hosts();
+    let src = data();
+    // Index 9 : deuxième groupe de 8, lane 1. SOFFSET décale la base
+    // d'un dword après le swizzle. En MTBUF les deux canaux doivent tenir.
+    for (swizzle, opcode, want) in [
+        (false, 0xe038_2000, vec![src[31], src[32], src[33], 0]),
+        (true, 0xe038_2000, vec![src[29], src[37], src[45], 0]),
+        (true, 0xe801_2004 | (62 << 19), vec![src[37], src[45]]),
+        (true, 0xe801_2008 | (62 << 19), vec![0, 0]),
+    ] {
+        let mut access = vec![
+            0x7e0c_0289, // v6 = 9
+            0xbe94_0384, // s20 = 4
+            opcode,
+            0x1402_0206,
+            0xbf8c_3f70,
+        ];
+        for k in 0..want.len() as u32 {
+            access.extend([0xe070_0000 + 4 * k, 0x8004_0200 + (k << 8)]);
+        }
+        access.push(0xbf81_0000);
+        let word1 = (12 << 16) | (u32::from(swizzle) << 31);
+        let oob = if swizzle { 3 } else { 0 };
+        let p = rebuilt_program(word1, 10, 0x0101_4fac | (oob << 28), 1, &access);
+        for mode in [Mode::Raw, Mode::Table] {
+            let cs = translate(&p, mode).unwrap();
+            for (name, host) in &hosts {
+                let out = run(host, &cs, Kind::Raw, false, mode, want.len() as u32);
+                assert_eq!(
+                    out[0], want,
+                    "{opcode:x} swizzle={swizzle} {mode:?} sur {name}"
+                );
             }
         }
     }
