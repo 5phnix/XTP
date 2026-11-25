@@ -85,7 +85,7 @@ impl Module {
                 let func = &self.funcs[*f as usize];
                 matches!(effect(func), Effect::Writes) && func.name != "dx.op.barrier"
             }
-            Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
+            Op::LocalI32(_) | Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
             _ => false,
         };
         if !separate {

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use super::{Lower, Why, packed_half, packed_partners};
-use crate::emit::bitcode::{Attr, Bin, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Term, V, pred};
 use crate::emit::container::SigElement;
 use crate::io::{Export, Target};
 use crate::native::{StageIo, Usage};
@@ -76,7 +76,7 @@ impl<'a> Lower<'a> {
                 .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
         }
         if mesh && e.target == Target::Primitive {
-            return self.emit_indices(e, guard);
+            return self.save_mesh_indices(e, guard);
         }
         let param_row = |usage: Usage, row: u8| match usage {
             // The 2020 compiler leaves a mesh program's first entry zeroed
@@ -263,6 +263,18 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Ported from Marvisak/VIctory#2245 (2e26c46a6) by andrewpozdnakov7-jpg.
+    /// Une lane inactive conserve son export précédent.
+    fn save_mesh_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
+        let v = e.values[0].ok_or("a primitive export without its indices")?;
+        let x = self.i32_of(v)?;
+        let slot = self.mesh_primitive.expect("mesh prologue");
+        let at = self.begin_guarded(guard);
+        self.s.m.store(self.cur, slot, x);
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
     /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
     /// and 29), which only the console's edge-flag rasterisation reads and
@@ -270,14 +282,19 @@ impl<'a> Lower<'a> {
     /// area). Ported from Marvisak/VIctory#1718 (head c0228d9) by
     /// tjthebigbearcat-hub: a 10-bit mask made a flagged corner's index 512
     /// or more, past any mesh program's vertices.
-    pub(super) fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
-        let v = e.values[0].ok_or("a primitive export without its indices")?;
-        let x = self.i32_of(v)?;
+    pub(super) fn finish_mesh_indices(&mut self, slot: V) {
+        let mesh = self.s.mesh.expect("mesh prologue");
+        self.cur = self.s.m.join_returns();
+        let flat = self.mesh_thread();
+        let max = self.s.m.i32(mesh.max_primitives);
+        let guard = (self.s.threads.expect("mesh")[0] > mesh.max_primitives)
+            .then(|| self.s.m.cmp(self.cur, pred::IULT, flat, max));
         let at = self.begin_guarded(guard);
         let c = self.cur;
+        let x = self.s.m.load(c, slot);
         let z = self.s.m.i32(0);
         let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let mut args = vec![flat];
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
@@ -288,7 +305,7 @@ impl<'a> Lower<'a> {
         self.s
             .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
-        Ok(())
+        self.s.m.terminate(self.cur, Term::Ret);
     }
 
     /// The per-vertex arbitrary row no mesh output entry names but one

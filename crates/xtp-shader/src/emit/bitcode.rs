@@ -146,6 +146,8 @@ enum Op {
     Phi(Vec<(V, usize)>),
     /// `getelementptr` over the pointee type, from a pointer.
     Gep(Ty, V, Vec<V>),
+    /// alloca i32, with a constant element count of one.
+    LocalI32(V),
     Load(V),
     /// Pointer, value.
     Store(V, V),
@@ -475,6 +477,12 @@ impl Module {
         let zero = self.i32(0);
         self.push(block, ty, Op::Gep(arr, ptr, vec![zero, index]))
     }
+    pub fn local_i32(&mut self, entry: usize) -> V {
+        let i32t = self.int(32);
+        let ptr = self.ptr(i32t);
+        let one = self.i32(1);
+        self.push(entry, ptr, Op::LocalI32(one))
+    }
     pub fn load(&mut self, block: usize, ptr: V) -> V {
         let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
             panic!("load from a non-pointer")
@@ -511,6 +519,18 @@ impl Module {
 
     fn terminate_one(&mut self, block: usize, t: Term) {
         self.blocks[block].term = Some(t);
+    }
+
+    /// All return paths, including loop-limit and barrier-drain exits,
+    /// run the same epilogue.
+    pub fn join_returns(&mut self) -> usize {
+        let exit = self.new_block();
+        for block in &mut self.blocks {
+            if matches!(block.term, Some(Term::Ret)) {
+                block.term = Some(Term::Br(exit));
+            }
+        }
+        exit
     }
 
     pub fn md_str(&mut self, s: &str) -> Md {
@@ -900,6 +920,12 @@ impl Module {
                         r.extend(idx.iter().map(|&i| rel(i)));
                         w.record(43, &r);
                     }
+                    Op::LocalI32(count) => {
+                        let ty = u64::from(self.type_of(*count).0);
+                        // ALLOCA: explicit element type, count type and absolute
+                        // value ID, explicit-type flag and four-byte alignment.
+                        w.record(19, &[ty, ty, u64::from(abs(*count)), (1 << 6) | 3]);
+                    }
                     // Alignment 4 (log2 + 1), not volatile.
                     Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
                     Op::Store(p, v) => w.record(44, &[rel(*p), rel(*v), 3, 0]),
@@ -947,7 +973,7 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*a);
             f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) | Op::LocalI32(v) => f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             f(*a);
             f(*b);
