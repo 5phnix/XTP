@@ -717,8 +717,6 @@ pub mod effects;
 #[cfg(windows)]
 pub use builder::register_builder;
 #[cfg(windows)]
-pub use builder::{BuilderCall, builder_call};
-#[cfg(windows)]
 pub(crate) fn builder_held(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::admitted()
 }

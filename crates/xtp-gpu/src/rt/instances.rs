@@ -6,21 +6,18 @@ use windows::core::s;
 /// Immutable AS addresses and the GPU upload that names them.
 pub(super) struct UploadMap {
     upload: ID3D12Resource,
-    pub(super) generations: Vec<(u64, Arc<ResultBuffer>)>,
+    generations: Vec<(u64, Arc<ResultBuffer>)>,
 }
 
 impl UploadMap {
-    /// The BLAS at each title address as the TLAS build reaches the queue:
-    /// the one in the slot current then, or, where that slot is empty, the
-    /// one in the slot `recorded` with the TLAS. A slot the title's release
-    /// emptied gives none, and a BLAS published at that address since, in a
-    /// new slot, wins over an old slot's.
-    pub(super) fn resolve(recorded: &Candidates, current: &Candidates) -> Option<Arc<Self>> {
+    fn resolve(recorded: &Candidates, current: &Candidates) -> Option<Arc<Self>> {
+        // Recorded slots survive title release. Include producers first recorded
+        // on other threads after the TLAS, if they have reached the queue.
         let mut entries = BTreeMap::new();
-        for (address, slot) in current.iter().chain(recorded.iter()) {
-            if entries.contains_key(address) {
-                continue;
-            }
+        for (address, slot) in recorded
+            .iter()
+            .chain(current.iter().filter(|(a, _)| !recorded.contains_key(a)))
+        {
             let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(s) = slot.as_ref().filter(|s| s.instances.is_none()) {
                 entries.insert(*address, s.result.clone());
@@ -163,16 +160,10 @@ pub(super) fn compute_pass(
     }
 }
 
-/// Rewrites the title's instances of `inputs` for a host TLAS build: each
-/// names the host BLAS at its title BLAS address in queue order, or, where
-/// the host has none, the BLAS at `stand_in` with mask 0, which no ray
-/// selects (the console's instance of a null BLAS is inactive; WARP faults
-/// on one).
 pub(super) fn rewrite(
     rec: &Recorder<'_>,
     title_list: *const Object,
     inputs: &Inputs,
-    stand_in: u64,
 ) -> Option<(Inputs, Arc<BlasMap>)> {
     let count = inputs.NumDescs;
     if inputs.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY
@@ -190,7 +181,7 @@ pub(super) fn rewrite(
     // SAFETY: the caller selected TOP_LEVEL, whose active union member is the instance GPU address.
     let address = unsafe { inputs.Anonymous.InstanceDescs };
     let src = input_range(rec.list, address, bytes, 16)?;
-    let dst = evicting(|| buffer(rec, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))?;
+    let dst = buffer(rec, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
     let pass = pipeline(rec.device)?;
     let (args, data) = rec.list.upload(crate::host::made()?, 20)?;
     let mapped = data as usize;
@@ -223,23 +214,21 @@ pub(super) fn rewrite(
         *destination.0.lock().unwrap_or_else(|e| e.into_inner()) = chosen;
     });
     rec.list.keep(&dst);
-    #[cfg(feature = "diagnostics")]
-    rec.list.note_op(|| {
-        format!("host DXR instance rewrite of {count} instances at title address {address:#x}")
-    });
-    let constants = [count, stand_in as u32, (stand_in >> 32) as u32];
     // SAFETY: each root view covers the shader's checked range. The recording retains its
     // inputs and output, and the transition orders rewrite stores before the DXR build.
-    // The title's instances need no transition to be read as a UAV: a buffer in the common
-    // state is promoted to it, and one a title shader wrote earlier in the submission
-    // already is (a COMMON -> UNORDERED_ACCESS barrier would name the wrong state).
     unsafe {
         let gpu = dst.GetGPUVirtualAddress();
-        rec.commands.ResourceBarrier(&[uav_barrier()]);
+        rec.commands.ResourceBarrier(&[
+            uav_barrier(),
+            crate::host::transition(
+                &src.buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+        ]);
         rec.commands.SetComputeRootSignature(&pass.root);
         rec.commands.SetPipelineState(&pass.pso);
-        rec.commands
-            .SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+        rec.commands.SetComputeRoot32BitConstant(0, count, 0);
         rec.commands
             .SetComputeRootUnorderedAccessView(2, src.gpu(address));
         rec.commands.SetComputeRootUnorderedAccessView(3, gpu);

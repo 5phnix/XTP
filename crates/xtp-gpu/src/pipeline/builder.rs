@@ -81,57 +81,7 @@ pub(super) fn member(shaders: &[Arc<Shader>]) -> Option<Arc<make::Pending>> {
     Some(host.clone())
 }
 
-thread_local! {
-    /// The verdict of the builder call this thread is in ([`builder_call`]).
-    static CALL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
-/// A call into the title's BVH builder, which records every stage of its
-/// builds or copies into the title's list on the calling thread. Until it
-/// is dropped, each of those dispatches takes the verdict the call had at
-/// its start, so the call runs whole or not at all (VIctory #2118). A
-/// verdict read again at each dispatch held a call's first stages and ran
-/// the next ones once the frame advanced and the pipelines were ready.
-#[must_use = "the verdict holds while the call lives"]
-pub struct BuilderCall {
-    /// The verdict of the call this one is made in, given back after it.
-    outer: Option<bool>,
-    admitted: bool,
-}
-
-impl BuilderCall {
-    /// Whether the call's dispatches run.
-    pub fn admitted(&self) -> bool {
-        self.admitted
-    }
-}
-
-impl Drop for BuilderCall {
-    fn drop(&mut self) {
-        CALL.set(self.outer);
-    }
-}
-
-/// Starts a call into the title's BVH builder on this thread: see
-/// [`BuilderCall`]. A call made inside another takes the outer verdict.
-pub fn builder_call() -> BuilderCall {
-    enter(|| BUILDER.get().is_none() || decided())
-}
-
-fn enter(verdict: impl FnOnce() -> bool) -> BuilderCall {
-    let outer = CALL.get();
-    let admitted = outer.unwrap_or_else(verdict);
-    CALL.set(Some(admitted));
-    BuilderCall { outer, admitted }
-}
-
-/// Whether the builder's dispatches run: the verdict of the builder call
-/// this thread is in, else the session's at this frame.
 pub(super) fn admitted() -> bool {
-    CALL.get().unwrap_or_else(decided)
-}
-
-fn decided() -> bool {
     let group = BUILDER.get().expect("registered builder member");
     let mut last = group.decision.lock().unwrap_or_else(|e| e.into_inner());
     decide(&mut last, crate::frame::current(), || {
@@ -161,24 +111,4 @@ fn builder_finishes_preparation_between_frames() {
     let mut refused = None;
     assert!(!decide(&mut refused, 3, || Some(false)));
     assert!(!decide(&mut refused, 4, || panic!("refus définitif")));
-}
-
-/// Every dispatch of one builder call takes the verdict of its start, even
-/// if the session's changes meanwhile; a call inside it takes it too.
-#[test]
-fn builder_call_keeps_its_verdict_for_every_stage() {
-    let held = enter(|| false);
-    assert!(!held.admitted());
-    assert!(!admitted(), "the frozen verdict, not the session's");
-    {
-        let inner = enter(|| panic!("an inner call takes the outer verdict"));
-        assert!(!inner.admitted());
-    }
-    assert_eq!(CALL.get(), Some(false));
-    drop(held);
-    assert_eq!(CALL.get(), None);
-    let run = enter(|| true);
-    assert!(run.admitted() && admitted());
-    drop(run);
-    assert_eq!(CALL.get(), None);
 }

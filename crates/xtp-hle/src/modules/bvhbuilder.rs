@@ -122,67 +122,9 @@ extern "system" fn copy(this: Object, list: Object, dst: u64, src: u64, mode: i3
         compact = mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT.0,
         "copy"
     );
-    {
-        let call = xtp_gpu::pipeline::builder_call();
-        copy::original()(this, list, dst, src, mode);
-        note_call(call.admitted(), "copy", [(dst, src)].into_iter());
-    }
+    copy::original()(this, list, dst, src, mode);
     // SAFETY: the DLL receives this same live title list.
     unsafe { xtp_gpu::rt::Builder.copy(list.cast(), dst, src, mode) };
-}
-
-/// Title addresses of structures the title builder last wrote in a call it
-/// held (its dispatches dropped, `xtp_gpu::pipeline::builder_call`): they
-/// hold nothing built until a call it runs builds them whole again.
-static UNBUILT: std::sync::Mutex<std::collections::BTreeSet<u64>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-/// Notes the structures one builder call writes, `(destination, structure
-/// it reads or 0)` each, as built or not; warns when a call that runs reads
-/// one never built (a refit or a copy of it): that stage would run on what
-/// a held call left, the builder then running in part across calls.
-fn note_call(admitted: bool, what: &str, writes: impl Iterator<Item = (u64, u64)>) {
-    static READS: AtomicU64 = AtomicU64::new(0);
-    let mut unbuilt = UNBUILT.lock().unwrap_or_else(|e| e.into_inner());
-    if unbuilt.len() >= 1 << 16 {
-        unbuilt.clear();
-    }
-    for (dst, src) in writes.filter(|&(dst, _)| dst != 0) {
-        let reads_unbuilt = src != 0 && unbuilt.contains(&src);
-        if admitted && reads_unbuilt {
-            let reads = READS.fetch_add(1, Ordering::Relaxed) + 1;
-            if reads.is_power_of_two() {
-                tracing::warn!(
-                    what,
-                    dst = format_args!("{dst:#x}"),
-                    src = format_args!("{src:#x}"),
-                    reads,
-                    "the BVH builder runs a call that reads a structure a held call left unbuilt"
-                );
-            }
-        }
-        if admitted && !reads_unbuilt {
-            unbuilt.remove(&dst);
-        } else {
-            unbuilt.insert(dst);
-        }
-    }
-}
-
-/// What a build writes and reads: a refit reads its source, the
-/// destination itself when it names none.
-fn build_writes(desc: &Desc) -> (u64, u64) {
-    let dst = desc.DestAccelerationStructureData;
-    let refit = desc
-        .Inputs
-        .Flags
-        .contains(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE);
-    let src = match desc.SourceAccelerationStructureData {
-        _ if !refit => 0,
-        0 => dst,
-        src => src,
-    };
-    (dst, src)
 }
 
 // Sample the frame at entry. The ID joins records from one call when
@@ -351,16 +293,7 @@ extern "system" fn build(this: Object, list: Object, count: u32, entries: *const
             }
         }
     }
-    {
-        let call = xtp_gpu::pipeline::builder_call();
-        build::original()(this, list, count, entries);
-        if !entries.is_null() {
-            // SAFETY: the title supplies count live entries.
-            let entries = unsafe { std::slice::from_raw_parts(entries, count as usize) };
-            let writes = entries.iter().map(|entry| build_writes(&entry.build));
-            note_call(call.admitted(), "build", writes);
-        }
-    }
+    build::original()(this, list, count, entries);
     if !entries.is_null() {
         // SAFETY: the title supplies count live entries and records no intervening list commands.
         unsafe {
@@ -429,20 +362,7 @@ extern "system" fn rehydrate(
             }
         }
     }
-    let hr = {
-        let call = xtp_gpu::pipeline::builder_call();
-        let hr = rehydrate::original()(this, list, count, descs, cpu);
-        if hr >= 0 && !descs.is_null() {
-            // SAFETY: the original call accepted this array of count descriptions.
-            let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
-            // A rehydration builds whole from the title's data.
-            let writes = descs
-                .iter()
-                .map(|desc| (desc.DestAccelerationStructureData, 0));
-            note_call(call.admitted(), "rehydrate", writes);
-        }
-        hr
-    };
+    let hr = rehydrate::original()(this, list, count, descs, cpu);
     if hr >= 0 && !descs.is_null() {
         let mut recorded = 0;
         for i in 0..count {
@@ -526,36 +446,5 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(hook(8 as Object, 16 as Object, 1, &desc, &64), -42);
-    }
-
-    /// A structure a held call wrote stays unbuilt through refits and
-    /// copies, until a call that runs builds it whole.
-    #[test]
-    fn rt_builder_notes_what_held_calls_left_unbuilt() {
-        let (a, b) = (0x7e57_0000_1000, 0x7e57_0000_2000);
-        let unbuilt = |at| UNBUILT.lock().unwrap().contains(&at);
-        let refit = Desc {
-            DestAccelerationStructureData: a,
-            Inputs: Inputs {
-                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(
-            build_writes(&refit),
-            (a, a),
-            "an update in place reads its destination"
-        );
-        note_call(false, "build", [(a, 0)].into_iter());
-        assert!(unbuilt(a));
-        note_call(true, "build", [build_writes(&refit)].into_iter());
-        assert!(unbuilt(a), "a refit that runs updates nothing built");
-        note_call(true, "copy", [(b, a)].into_iter());
-        assert!(unbuilt(b));
-        note_call(true, "build", [(a, 0)].into_iter());
-        assert!(!unbuilt(a));
-        note_call(true, "copy", [(b, a)].into_iter());
-        assert!(!unbuilt(b));
     }
 }
