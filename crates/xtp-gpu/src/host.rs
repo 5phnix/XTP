@@ -514,6 +514,34 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn recorded_preserves_both_diagnostic_samples_without_deadlock() {
+        let test = "host::tests::recorded_preserves_both_diagnostic_samples_without_deadlock";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let list = host.new_list().unwrap();
+            let snapshot = list.recorded();
+            let deferred = list.deferred();
+            done.send(
+                std::sync::Arc::ptr_eq(&snapshot.dispatch_samples, &deferred.dispatch_samples)
+                    && std::sync::Arc::ptr_eq(&snapshot.meshes, &deferred.meshes),
+            )
+            .unwrap();
+        });
+        // Un second verrouillage du même mutex bloquerait toute la suite de tests.
+        assert!(
+            result
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("recorded")
+        );
+        worker.join().unwrap();
+    }
+
     /// Where a list stopped, the device-removed report names the commands
     /// between the barriers around it by their markers, and the noted
     /// commands after them: DRED's count may lag the GPU (xcl#1592).
