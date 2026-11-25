@@ -632,6 +632,7 @@ impl<'a> Run<'a> {
             }
             Fields::Smem { .. } => {
                 let l = match name {
+                    _ if self.x.res.spill_loads.binary_search(&(b, i)).is_ok() => Level::Group,
                     "s_memtime" | "s_memrealtime" => Level::Lane,
                     "s_get_waveid_in_workgroup" => Level::Wave,
                     _ if self.writes_memory => Level::Lane,
@@ -1150,6 +1151,7 @@ mod tests {
         NativeProgram {
             stage: crate::HwStage::Ms,
             wave64: true,
+            float_mode: 0,
             vgprs: 16,
             layout: vec![RootParam {
                 root: RootType::Table,

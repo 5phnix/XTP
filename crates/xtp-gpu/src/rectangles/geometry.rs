@@ -644,9 +644,10 @@ mod tests {
     fn rectangles_without_vertex_inputs_get_their_fourth_corner() {
         let test =
             "rectangles::geometry::tests::rectangles_without_vertex_inputs_get_their_fourth_corner";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let cases = cases();
         let (vs, ps) = (vertex_shader(&cases, None), probe::pixel());
         let gs = stage(&vs, &ps);
@@ -686,9 +687,10 @@ mod tests {
     #[test]
     fn without_the_stage_rectangles_keep_one_triangle() {
         let test = "rectangles::geometry::tests::without_the_stage_rectangles_keep_one_triangle";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let mut cases = cases();
         let (vs, ps) = (vertex_shader(&cases, None), probe::pixel());
         let vertices = 3 * cases.len() as u32;
@@ -708,9 +710,10 @@ mod tests {
     #[test]
     fn flat_floats_keep_the_first_vertex_on_both_halves() {
         let test = "rectangles::geometry::tests::flat_floats_keep_the_first_vertex_on_both_halves";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let mut cases = rectangles();
         for c in &mut cases {
             c.values = Values::Flat([1.0, 2.0, 4.0]);
@@ -729,9 +732,10 @@ mod tests {
     #[test]
     fn a_common_w_and_noperspective_draw_as_at_w_1() {
         let test = "rectangles::geometry::tests::a_common_w_and_noperspective_draw_as_at_w_1";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let mut cases = rectangles();
         for c in &mut cases {
             c.w = [2.0; 3];
@@ -789,9 +793,10 @@ mod tests {
     #[test]
     fn centroid_and_sample_interpolation_hold_at_the_diagonal_under_msaa() {
         let test = "rectangles::geometry::tests::centroid_and_sample_interpolation_hold_at_the_diagonal_under_msaa";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !four_samples(&host.device) {
             let why = "the device has no 4 samples a pixel to render and resolve four floats";
             crate::testgpu::skip(test, why);
@@ -816,9 +821,10 @@ mod tests {
     #[test]
     fn clip_distances_clip_both_halves_along_their_plane() {
         let test = "rectangles::geometry::tests::clip_distances_clip_both_halves_along_their_plane";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let mut cases = rectangles();
         for (n, c) in cases.iter_mut().enumerate() {
             let plane = [1.0, 0.5, -((n as u32 * CELL) as f32 + 12.0)];
@@ -844,9 +850,10 @@ mod tests {
     fn cull_distances_cull_the_half_whose_three_are_negative() {
         let test =
             "rectangles::geometry::tests::cull_distances_cull_the_half_whose_three_are_negative";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let mut cases = rectangles();
         let culls = [[-1.0, 1.0, -3.0], [-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0]];
         for (n, c) in cases.iter_mut().enumerate() {
@@ -870,9 +877,10 @@ mod tests {
     #[test]
     fn an_unread_primitive_id_keeps_the_stage() {
         let test = "rectangles::geometry::tests::an_unread_primitive_id_keeps_the_stage";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let cases = cases();
         let vs = vertex_shader(&cases, None);
         let ps = probe::pixel_with(2, PrimitiveId::Declared);
@@ -1050,9 +1058,10 @@ mod tests {
     #[test]
     fn only_finite_rectangles_with_an_area_get_a_second_triangle() {
         let test = "rectangles::geometry::tests::only_finite_rectangles_with_an_area_get_a_second_triangle";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let (nan, inf) = (f32::NAN, f32::INFINITY);
         let inputs: [(&str, Vertices, usize); 14] = [
             (
@@ -1145,9 +1154,10 @@ mod tests {
     fn the_fourth_corner_takes_x_y_and_w_from_its_neighbours() {
         let test =
             "rectangles::geometry::tests::the_fourth_corner_takes_x_y_and_w_from_its_neighbours";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let (tiny, big, huge) = (2f32.powi(-25), 2f32.powi(126), 2f32.powi(127));
         // The three vertices (x, y, w), which is the corner, and the fourth
         // corner's x, y and w.
@@ -1231,9 +1241,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let test = "rectangles::geometry::tests::indirect_rectangles_without_vertex_inputs_get_their_fourth_corner";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let cases = cases();
         let (vs, ps) = (vertex_shader(&cases, None), probe::pixel());
         let gs = stage(&vs, &ps);

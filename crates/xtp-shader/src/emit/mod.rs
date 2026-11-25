@@ -80,11 +80,17 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod desc_data_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod geometry_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
 mod image_tests;
+#[cfg(all(test, windows))]
+mod input_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 #[cfg(all(test, windows))]
@@ -98,15 +104,25 @@ pub(crate) mod lower;
 mod raw_tests;
 pub mod rect_gs;
 mod sampler;
+#[cfg(test)]
+mod sampler_tests;
+#[cfg(all(test, windows))]
+mod scalar_gap_tests;
 mod shader;
+#[cfg(all(test, windows))]
+mod smem_data_tests;
 #[cfg(all(test, windows))]
 mod smem_tests;
 #[cfg(all(test, windows))]
 mod split_tests;
 #[cfg(all(test, windows))]
 mod stride_tests;
+#[cfg(test)]
+mod userdata_tests;
 #[cfg(windows)]
 pub mod validator;
+#[cfg(all(test, windows))]
+mod validator_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
@@ -268,7 +284,9 @@ pub struct HostShader {
 
 /// Whether buffers read by element with a stride known at translation are
 /// read through raw handles (`index * stride + offset`) instead of
-/// structured ones: `XTP_RAW_STRUCTURED=1`, read once. `xtp-gpu` then makes
+/// structured ones: on by default since 2026-11-25 (every image session ran
+/// with it; without it the world draws black), `XTP_RAW_STRUCTURED=0` turns
+/// it off, read once. `xtp-gpu` then makes
 /// the title's structured views raw views of the same bytes where it can
 /// (Marvisak/VIctory#1762, after fxceless's VIctory fork's `raw_window`):
 /// on NVIDIA a raw read through a structured view returns other dwords or
@@ -283,7 +301,7 @@ pub fn raw_structured() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var("XTP_RAW_STRUCTURED").is_ok_and(|v| v == "0"))
 }
 
 #[cfg(test)]
@@ -327,7 +345,7 @@ impl HostShader {
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
-    /// Dword in the user-data buffer (the console's user-data index).
+    /// Dword in the host user-data buffer. Spilled root arguments are packed.
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
@@ -486,8 +504,8 @@ pub fn translate_program_for(
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())
-        .map_err(|e| (Step::Resources, e))?;
+    let res =
+        resource::track_native(&p, native, st.as_ref().ok()).map_err(|e| (Step::Resources, e))?;
     let io = io::raise(&p, native).map_err(|e| (Step::Io, e))?;
     let st = st.map_err(|e| (Step::Structure, e))?;
     emit_for(c, native, &p, &st, &io, &res, target).map_err(|e| (Step::Emit, e))
@@ -636,7 +654,8 @@ pub fn emit_for(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    // D3D12 encode comparaison, minimum et maximum dans le même champ.
+                    s.filter = (s.filter & !(3 << 7)) | 0x80;
                 }
                 s
             })
@@ -803,12 +822,14 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
+            float_mode: 0,
             vgprs: 2,
             layout: vec![],
             used: vec![],
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: 0,
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -863,6 +884,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: true,
+            float_mode: 0,
             vgprs: 2,
             layout: vec![],
             used: vec![],
@@ -999,6 +1021,7 @@ mod tests {
             let native = super::NativeProgram {
                 stage: super::HwStage::Ps,
                 wave64: false,
+                float_mode: 0,
                 vgprs: 4,
                 layout: vec![],
                 used: vec![],
@@ -1014,6 +1037,7 @@ mod tests {
                         row2: 0,
                     }],
                     input_addr,
+                    rsrc2: 0,
                     db_shader_control: 0,
                     patches: vec![],
                 },
@@ -1070,6 +1094,7 @@ mod tests {
         let native = super::NativeProgram {
             stage: super::HwStage::Ps,
             wave64: false,
+            float_mode: 0,
             vgprs: 4,
             layout: vec![],
             used: vec![],
@@ -1085,6 +1110,7 @@ mod tests {
                     row2: 0,
                 }],
                 input_addr: 0,
+                rsrc2: 0,
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -1123,6 +1149,7 @@ mod tests {
         crate::NativeProgram {
             stage: crate::HwStage::Cs,
             wave64,
+            float_mode: 0,
             vgprs: 8,
             layout: vec![],
             used: vec![],

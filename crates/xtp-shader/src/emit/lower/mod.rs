@@ -64,6 +64,7 @@ mod compare;
 mod descriptor;
 mod export;
 mod flow;
+pub(super) mod geometry;
 mod image;
 mod input;
 mod integer;
@@ -142,6 +143,7 @@ pub(crate) struct Lowered {
     pub scalar_guards: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
     pub p: &'a Program,
@@ -198,6 +200,20 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             what: UNTRACKED_SELECT,
             ..
         }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
+        Err(ShaderError::Unsupported {
+            what: "the first half of an interpolation" | "a hardware SGPR input",
+            ..
+        }) if parts.native.stage == HwStage::Ps => {
+            let mut io = crate::io::raise_inputs(parts.p, parts.native, true)?;
+            io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
+            lower_program(
+                &Parts {
+                    io: &io,
+                    ..parts.clone()
+                },
+                false,
+            )
+        }
         result => result,
     }
 }
@@ -241,6 +257,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Une somme f64 de lanes masquées lit les votes de la vague console.
+    emitted_double_count: bool,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -451,6 +469,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.ordered_uavs = x.native.io.pops();
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -718,6 +737,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            emitted_double_count: false,
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -979,6 +999,7 @@ impl<'a> Lower<'a> {
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
         let r = match &inst.fields {
+            _ if inst.write(Reg::FloatMode).is_some() => self.set_float_mode(inst),
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
@@ -1016,6 +1037,16 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+        }?;
+        if !self.bad.is_empty() {
+            for &(_, w) in &inst.writes {
+                if self.bad.get(&w) == Some(&mask::LANE_MASK)
+                    && let Ok(word) = self.mask_dword(w)
+                {
+                    self.vals.insert(w, Val::I32(word));
+                }
+            }
         }
+        Ok(())
     }
 }
