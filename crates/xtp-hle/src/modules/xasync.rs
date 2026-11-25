@@ -165,11 +165,13 @@ impl Port {
         lock(&self.dispatchers).contains(&std::thread::current().id())
     }
 
-    /// Takes the queued task with this context out of the queue, unless a
+    /// Takes `task` (same context and callback) out of the queue, unless a
     /// dispatcher (or termination) took it first.
-    fn remove(&self, context: usize) -> Option<Task> {
+    fn remove(&self, task: Task) -> Option<Task> {
         let mut tasks = lock(&self.tasks);
-        let index = tasks.iter().position(|t| t.context == context)?;
+        let index = tasks
+            .iter()
+            .position(|t| t.context == task.context && t.callback == task.callback)?;
         tasks.remove(index)
     }
 }
@@ -502,9 +504,9 @@ struct Completion {
     /// routine, if the title set one, has returned.
     done: bool,
     /// The completion routine's task while it waits in a manual or
-    /// serialized port (the port and the task's context), for a waiter on a
-    /// thread that runs that port's tasks to run it instead of deadlocking.
-    queued: Option<(Arc<Port>, usize)>,
+    /// serialized port, for a waiter on a thread that runs that port's tasks
+    /// to run it instead of deadlocking.
+    queued: Option<(Arc<Port>, Task)>,
 }
 
 /// A queued completion routine: the call it ends and the title's block.
@@ -534,9 +536,14 @@ impl Call {
             if done.done {
                 return done.result.unwrap();
             }
-            if let Some((port, context)) = done.queued.take_if(|(port, _)| port.runs_here()) {
+            if let Some((port, task)) = done.queued.take_if(|(port, _)| port.runs_here()) {
+                // Taken out under `done`: until it is, `finish` cannot run, so
+                // the routine's box (the task's context) is still the one
+                // queued, not another task's at a reused address. The lock
+                // order is `done`, then the port's tasks, never the reverse.
+                let ours = port.remove(task);
                 drop(done);
-                if let Some(task) = port.remove(context) {
+                if let Some(task) = ours {
                     task.run(false);
                 }
                 done = lock(&self.done);
@@ -633,8 +640,15 @@ impl Call {
             self.finish(block);
             return;
         }
-        // Waiters arriving before the routine returns still find the call.
-        registry.routines.insert(block as usize, self.clone());
+        // A call with result data: waiters arriving before the routine
+        // returns still find it. One without, or a failed one, is detached
+        // from its block here, as libHttpClient detaches its state at
+        // completion: a later wait returns at once (a provider that completes
+        // inside Begin leaves no wait on a port nobody has dispatched yet).
+        // Waiters that hold it already wait for the routine, as there.
+        if !cleanup {
+            registry.routines.insert(block as usize, self.clone());
+        }
         drop(registry);
         let context = Box::into_raw(Box::new(Routine {
             call: self.clone(),
@@ -648,7 +662,7 @@ impl Call {
                     let mut done = lock(&self.done);
                     // Unless a dispatcher has run it already.
                     if !done.done {
-                        done.queued = Some((port.clone(), task.context));
+                        done.queued = Some((port.clone(), task));
                         self.finished.notify_all();
                     }
                 }
@@ -810,6 +824,9 @@ fn begin(
         finished: Condvar::new(),
     });
     registry.active.insert(block as usize, call.clone());
+    // An older call whose routine is still queued or running (or left in a
+    // manual port nobody dispatches) no longer shadows the block's waiters.
+    registry.routines.remove(&(block as usize));
     drop(registry);
     // A failed begin fails the call, so the completion routine still runs.
     let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
@@ -852,8 +869,12 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 }
 
 /// A blocking query stays with one call and waits through cleanup and, if
-/// the title set a completion routine, until that routine has returned (as
-/// the public API documents, and libHttpClient's implementation does).
+/// the title set a completion routine, until that routine has returned, as
+/// the public API documents and libHttpClient's implementation does. A call
+/// with no result data, or a failed one, is detached from its block when it
+/// completes, as libHttpClient does: a query that comes after that returns
+/// its status at once, and only queries already waiting wait for the
+/// routine.
 ///
 /// Cleanup must not wait, directly or indirectly through a join, lock or
 /// event, on a thread blocking with `wait = true` on the same block: the
@@ -869,7 +890,10 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 /// itself, out of turn, as its next dispatch would have. Other waiters
 /// wait, so the routine still runs on a thread the title dispatches with;
 /// a wait on a manual port no thread has dispatched yet waits for the
-/// first dispatch.
+/// first dispatch. A thread stays one of a port's dispatchers once it has
+/// dispatched it. Only the completion routine is run this way: a waiter
+/// that is also the one dispatching a manual *work* port still deadlocks,
+/// as in the GDK.
 pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
@@ -2011,8 +2035,9 @@ mod tests {
         XTaskQueueCloseHandle(q);
     }
 
-    /// A waiter arriving while the completion routine runs returns only
-    /// after it has returned, even though the call was cleaned up already.
+    /// A waiter arriving while the completion routine of a call with result
+    /// data runs returns only after it has returned, even though the routine
+    /// took the result (which ends the call) first.
     #[test]
     fn a_status_wait_returns_after_the_completion_routine() {
         if !bounded_child("a_status_wait_returns_after_the_completion_routine") {
@@ -2024,9 +2049,16 @@ mod tests {
             release: Mutex<Receiver<()>>,
         }
         static ROUTINE_DONE: AtomicBool = AtomicBool::new(false);
+        static TOOK: AtomicBool = AtomicBool::new(false);
+        const IDENTITY: *const c_void = 0x45 as *const c_void;
         extern "system" fn routine(block: *mut AsyncBlock) {
             // SAFETY: the test leaks the gate behind the block's context.
             let gate = unsafe { &*(*block).context.cast::<Gate>() };
+            let mut value = 0u64;
+            TOOK.store(
+                result(block, IDENTITY, &mut value) == S_OK && value == 7,
+                Ordering::SeqCst,
+            );
             lock(&gate.entered).send(()).unwrap();
             let _ = lock(&gate.release).recv_timeout(Duration::from_secs(10));
             ROUTINE_DONE.store(true, Ordering::SeqCst);
@@ -2046,11 +2078,12 @@ mod tests {
             callback: Some(routine),
             internal: [0; 4],
         }));
-        // No result data: the call is cleaned up as it completes.
-        assert_eq!(finished(block, std::ptr::null(), S_OK), S_OK);
+        assert_eq!(finished_with(block, IDENTITY, Ok(bytes(7u64))), S_OK);
         routine_entered
             .recv_timeout(Duration::from_secs(5))
             .expect("the routine ran");
+        assert!(TOOK.load(Ordering::SeqCst), "the routine took the result");
+        assert!(call(block).is_none(), "taking the result ended the call");
         assert_eq!(XAsyncGetStatus(block, false), S_OK, "published");
         let retained = waiting_call(block).expect("waiters still find the call");
         let baseline = Arc::strong_count(&retained);
@@ -2173,7 +2206,8 @@ mod tests {
         }
         extern "system" fn outer(context: *mut c_void, _: bool) {
             let block = context.cast::<AsyncBlock>();
-            let begun = finished(block, std::ptr::null(), S_OK);
+            // With result data, so the wait is for the routine.
+            let begun = finished_with(block, std::ptr::null(), Ok(bytes(1u64)));
             let hr = XAsyncGetStatus(block, true);
             let ok = begun == S_OK && hr == S_OK && INNER_RAN.load(Ordering::SeqCst);
             OUTER.store(if ok { 1 } else { 2 }, Ordering::SeqCst);
@@ -2194,6 +2228,104 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(OUTER.load(Ordering::SeqCst), 1);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A call without result data that completes inside Begin is detached:
+    /// a wait on a manual port nobody has dispatched returns at once, as in
+    /// libHttpClient, and the routine runs at the first dispatch.
+    #[test]
+    fn a_wait_after_a_call_without_data_completed_returns_at_once() {
+        if !bounded_child("a_wait_after_a_call_without_data_completed_returns_at_once") {
+            return;
+        }
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn routine(_: *mut AsyncBlock) {
+            RAN.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(routine),
+            internal: [0; 4],
+        }));
+        assert_eq!(finished(block, std::ptr::null(), S_OK), S_OK);
+        assert_eq!(XAsyncGetStatus(block, true), S_OK);
+        assert_eq!(RAN.load(Ordering::SeqCst), 0, "not dispatched yet");
+        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert_eq!(RAN.load(Ordering::SeqCst), 1);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// Terminating the queue runs a queued routine (cancelled), which
+    /// releases a waiter on a thread that does not dispatch the port.
+    #[test]
+    fn terminating_the_queue_releases_a_waiter() {
+        if !bounded_child("terminating_the_queue_releases_a_waiter") {
+            return;
+        }
+        static CANCELED: AtomicBool = AtomicBool::new(false);
+        extern "system" fn routine(_: *mut AsyncBlock) {
+            CANCELED.store(true, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(routine),
+            internal: [0; 4],
+        }));
+        assert_eq!(
+            finished_with(block, std::ptr::null(), Ok(bytes(1u64))),
+            S_OK
+        );
+        let retained = waiting_call(block).expect("a call with result data");
+        let baseline = Arc::strong_count(&retained);
+        let address = block as usize;
+        let waiter = std::thread::spawn(move || XAsyncGetStatus(address as *mut AsyncBlock, true));
+        while Arc::strong_count(&retained) == baseline && !waiter.is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(!waiter.is_finished(), "the waiter waits for the routine");
+        assert_eq!(
+            XTaskQueueTerminate(q, true, std::ptr::null_mut(), None),
+            S_OK
+        );
+        assert_eq!(waiter.join().unwrap(), S_OK);
+        assert!(CANCELED.load(Ordering::SeqCst), "the routine ran");
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A new call on the block drops an older call's routine entry: once the
+    /// new call is over and detached, a wait finds no call, not the old one
+    /// whose routine is still queued.
+    #[test]
+    fn begin_drops_an_older_routines_entry() {
+        extern "system" fn routine(_: *mut AsyncBlock) {}
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
+        let block: *mut AsyncBlock = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(routine),
+            internal: [0; 4],
+        }));
+        let identity = 0x46 as *const c_void;
+        assert_eq!(finished_with(block, identity, Ok(bytes(2u64))), S_OK);
+        let mut value = 0u64;
+        assert_eq!(result(block, identity, &mut value), S_OK);
+        assert!(call(block).is_none(), "taking the result ended it");
+        assert!(waiting_call(block).is_some(), "its routine is still queued");
+        // No result data: it completes inside Begin and is detached.
+        assert_eq!(finished(block, identity, S_OK), S_OK);
+        assert!(
+            waiting_call(block).is_none(),
+            "a wait would follow the older call"
+        );
+        XTaskQueueTerminate(q, true, std::ptr::null_mut(), None);
         XTaskQueueCloseHandle(q);
     }
 
