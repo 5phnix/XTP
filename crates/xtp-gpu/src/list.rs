@@ -520,7 +520,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(src, false, false);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
+            crate::texture::gpu_write(list, dst, true);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -632,7 +632,7 @@ extern "system" fn copy_texture_region(
         }
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(dst.resource);
+        crate::texture::gpu_write(list, dst.resource, false);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -718,7 +718,7 @@ extern "system" fn resolve(
         list.twin_use(src, false, false);
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
+        crate::texture::gpu_write(list, dst, false);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -1047,7 +1047,7 @@ fn clear_uav(
                 list.twin_use(texture, true, true);
                 list.twins_written();
                 ensure_state(list, texture, UNORDERED_ACCESS);
-                crate::texture::host_written(texture);
+                crate::texture::gpu_write(list, texture, false);
             }
             let rects: &[RECT] = if count > 0 && !rects.is_null() {
                 // SAFETY: the title passes `count` rectangles, laid out as the host's.
@@ -1371,7 +1371,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         ensure_state(list, color, NON_PIXEL_SHADER_RESOURCE);
         ensure_state(list, output, UNORDERED_ACCESS);
-        crate::texture::host_written(output);
+        crate::texture::gpu_write(list, output, false);
         #[cfg(feature = "diagnostics")]
         {
             crate::capture::note_target(output);
