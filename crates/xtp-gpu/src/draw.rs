@@ -4618,49 +4618,31 @@ float4 ps(V v) : SV_Target { return v.color; }
             return;
         };
         let host = gpu.host();
-        let painter = Painter::new(host, false);
         let signature = host_signature(0, 24).unwrap();
         let zero = title_bytes(&0u32.to_le_bytes());
         for copy_to_count in [true, false] {
-            let args = title_records(&[[3, 1, 0, 0]]);
+            let painter = Painter::new(host, false);
+            let args = title_records(&[[3, 1, 0, 0], [3, 1, 3, 0], [3, 1, 6, 0]]);
             let count = title_bytes(&1u32.to_le_bytes());
             let (a, c) = (args.shadow(), count.shadow());
             let title = TitleList::new();
             let list = title.host();
-            a.refresh(list, args.address(), 16);
+            a.refresh(list, args.address(), 48);
             c.refresh(list, count.address(), 4);
-            let size = size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>() as u64;
-            let (result, data) = host.shared_buffer(size).unwrap();
-            let mut queries: Option<ID3D12QueryHeap> = None;
-            // SAFETY: un emplacement de requête conservé jusqu’à la lecture du résultat.
-            unsafe {
-                host.device
-                    .CreateQueryHeap(
-                        &D3D12_QUERY_HEAP_DESC {
-                            Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
-                            Count: 1,
-                            NodeMask: 0,
-                        },
-                        &mut queries,
-                    )
-                    .unwrap();
-            }
-            let queries = queries.unwrap();
-            let kind = D3D12_QUERY_TYPE_PIPELINE_STATISTICS;
-            // SAFETY: la requête 0 est libre.
-            unsafe { list.list.BeginQuery(&queries, kind, 0) };
+            painter.clear(list);
             for execution in 0..3 {
+                let address = args.address() + 16 * execution;
                 if execution == 2 {
                     let dst = if copy_to_count {
                         count.address()
                     } else {
-                        args.address()
+                        address
                     };
                     assert!(crate::shadow::copy(list, dst, zero.address(), 4));
                 }
                 let bounded = crate::indirect::bound(
                     list,
-                    (&a.buffer, a.offset(args.address())),
+                    (&a.buffer, a.offset(address)),
                     (0, 16, 1),
                     Some((&c.buffer, c.offset(count.address()))),
                     None,
@@ -4682,15 +4664,13 @@ float4 ps(V v) : SV_Target { return v.color; }
                     );
                 }
             }
-            // SAFETY: la requête ouverte couvre les trois ExecuteIndirect et le tampon
-            // reçoit la structure entière. La liste termine avant la lecture CPU.
-            unsafe {
-                list.list.EndQuery(&queries, kind, 0);
-                list.list.ResolveQueryData(&queries, kind, 0, 1, &result, 0);
-                title.run();
+            let pixels = painter.read(host, &title);
+            for cell in 0..3 {
+                let expected = if cell < 2 { [255; 4] } else { CLEAR };
                 assert_eq!(
-                    (*data.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>()).IAVertices,
-                    6
+                    pixel(&pixels, cell * SIDE / 4, SIDE - 1),
+                    expected,
+                    "triangle {cell}, copie dans le compteur = {copy_to_count}"
                 );
             }
         }
