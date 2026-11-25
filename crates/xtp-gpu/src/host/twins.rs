@@ -7,7 +7,7 @@
 //! copies), onto XTP's lists.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -58,18 +58,20 @@ impl TwinUses {
 }
 
 /// `XTP_PLANE_NOW=0`: a depth plane is drawn from its twin only when its
-/// list closes, as before `planes_now`.
+/// list closes, as before `planes_now`; `ab` alternates the two within a
+/// run (`xtp_core::ab`). Read once; its value for the frame being prepared.
 fn plane_now() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("XTP_PLANE_NOW").is_none_or(|v| v != "0");
-        if !on {
-            tracing::info!(
-                "XTP_PLANE_NOW=0: depth planes are drawn from their twins when their list closes"
-            );
-        }
-        on
-    })
+    static NOW: LazyLock<xtp_core::ab::Switch<bool>> = LazyLock::new(|| {
+        let switch = xtp_core::ab::switch("XTP_PLANE_NOW", true);
+        let mode = match (switch.alternates(), switch.get()) {
+            (true, _) => "at their list's close in A/B phase A, before the next draw in phase B",
+            (false, true) => "before the next draw or dispatch",
+            (false, false) => "when their list closes",
+        };
+        tracing::info!("depth planes are drawn from their twins {mode} (XTP_PLANE_NOW)");
+        switch
+    });
+    NOW.get()
 }
 
 /// A copy the prelude records: the depth texture, its twin, and whether
@@ -306,11 +308,9 @@ impl HostList {
     }
 
     /// `draw::viewports`: the viewports the title sets, which `planes_now`
-    /// sets back after its pass.
+    /// sets back after its pass (noted whatever `XTP_PLANE_NOW` says: an
+    /// A/B may turn it on in the middle of a list).
     pub(crate) fn note_viewports(&self, viewports: &[D3D12_VIEWPORT]) {
-        if !plane_now() {
-            return;
-        }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let noted = twins.viewports.get_or_insert_with(Vec::new);
         noted.clear();
@@ -319,9 +319,6 @@ impl HostList {
 
     /// `draw::scissors`: the same for the scissor rectangles.
     pub(crate) fn note_scissors(&self, rects: &[RECT]) {
-        if !plane_now() {
-            return;
-        }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let noted = twins.scissors.get_or_insert_with(Vec::new);
         noted.clear();
