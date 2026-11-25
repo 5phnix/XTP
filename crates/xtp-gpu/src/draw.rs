@@ -149,6 +149,9 @@ pub(crate) struct State {
     heaps: [usize; 2],
     graphics: Vec<Root>,
     compute: Vec<Root>,
+    /// The title's graphics and compute root signatures, for
+    /// [`State::set_root_signature`].
+    title_roots: [usize; 2],
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
@@ -755,6 +758,18 @@ impl State {
                 let samplers = crate::descriptor::heap(h).samplers();
                 self.heaps[usize::from(samplers)] = h as usize;
             }
+        }
+    }
+
+    /// The title sets its graphics or compute root signature: another one
+    /// than the stage has leaves the stage's root arguments unset, as D3D12
+    /// does (they are stale until set again); the same one keeps them. The
+    /// host's root signature is the translated pipeline's, set by `bind`.
+    pub(crate) fn set_root_signature(&mut self, compute: bool, signature: This) {
+        let title = &mut self.title_roots[usize::from(compute)];
+        if *title != signature as usize {
+            *title = signature as usize;
+            self.roots(compute).clear();
         }
     }
 
@@ -5356,5 +5371,35 @@ float4 ps(V v) : SV_Target { return v.color; }
             crate::rectangles::pooled(&scratch),
             "given back once the recording has gone"
         );
+    }
+
+    /// Root arguments of a stage last until the title sets another root
+    /// signature for that stage: setting the same one keeps them, another
+    /// one (null included) leaves them unset, and the other stage's stay.
+    /// Before, the root signature calls did nothing and draws read
+    /// arguments the title had set for an earlier signature.
+    #[test]
+    fn changing_root_signatures_invalidates_only_the_matching_bindings() {
+        let mut state = State::default();
+        let first = std::ptr::without_provenance(1);
+        let second = std::ptr::without_provenance(2);
+        state.set_root_signature(false, first);
+        state.set_root_signature(true, first);
+        state.set_table(false, 0, 0x1000);
+        state.set_view(false, 1, 0x2000);
+        state.set_constants(false, 2, &[42], 0);
+        state.set_constants(true, 0, &[7], 0);
+
+        state.set_root_signature(false, first);
+        assert!(matches!(&state.graphics[..], [
+            Root::Table(0x1000), Root::View(0x2000), Root::Constants(values)
+        ] if values == &[42]));
+
+        state.set_root_signature(false, second);
+        assert!(state.graphics.is_empty());
+        assert!(matches!(&state.compute[..], [Root::Constants(values)] if values == &[7]));
+
+        state.set_root_signature(true, std::ptr::null());
+        assert!(state.compute.is_empty());
     }
 }
