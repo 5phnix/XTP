@@ -4267,6 +4267,46 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn resident(r: This) {
+        let copy = resource(r).host.as_ref().unwrap();
+        assert!(copy.residency.wait(std::time::Duration::from_secs(5)));
+    }
+
+    /// A new view may still be waiting for residency. Wait for its fence before
+    /// requesting the resident view from the same entry point.
+    #[cfg(windows)]
+    fn resident_view(address: u64, desc: &[u32; 14]) -> This {
+        if let Some(view) = texture_at(address, desc) {
+            return view;
+        }
+        let key = (address, canonical_resource_desc(*desc));
+        let view = placed_textures()[&key].resource as This;
+        resident(view);
+        texture_at(address, desc).unwrap()
+    }
+
+    /// Drain only the deferred references for this test's memory.
+    #[cfg(windows)]
+    fn release_views_at(address: u64) {
+        let mut due = Vec::new();
+        RELEASED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(_, raw)| {
+                let r = raw as This;
+                if resource(r).data() as u64 == address {
+                    due.push(r);
+                    false
+                } else {
+                    true
+                }
+            });
+        for r in due {
+            resource_release(r);
+        }
+    }
+
+    #[cfg(windows)]
     fn same_copy(a: This, b: This) -> bool {
         Arc::ptr_eq(&host_copy(a).unwrap(), &host_copy(b).unwrap())
     }
@@ -4539,21 +4579,23 @@ mod tests {
                 ..texture(16, 16, R32_FLOAT, 1)
             },
         );
-        let rtv = [0u64; 16];
+        resident(target);
+        let mut descriptor = [0u64; 16];
+        let rtv = descriptor.as_mut_ptr() as u64;
         let null = std::ptr::null();
-        crate::descriptor::create_rtv(null, target, null.cast(), rtv.as_ptr() as u64);
+        crate::descriptor::create_rtv(null, target, null.cast(), rtv);
         let list = crate::testgpu::TitleList::new();
         type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const u8);
         let packed = [f32::from_bits(PACKED), 0.0, 0.0, 0.0];
         let clear = slot::<Clear>(list.this(), 0x1a0);
-        clear(list.this(), rtv.as_ptr() as u64, &packed, 0, null.cast());
+        clear(list.this(), rtv, &packed, 0, null.cast());
         list.run();
 
         const R9G9B9E5: u32 = 67;
-        let view = texture_at(address, &words(&texture(16, 16, R9G9B9E5, 1), [1, 2])).unwrap();
+        let view = resident_view(address, &words(&texture(16, 16, R9G9B9E5, 1), [1, 2]));
         assert!(!same_copy(view, target), "two formats: two copies");
-        let word = |words: &[u32], x: usize, y: usize| words[y * 64 + x];
-        assert_eq!(word(&read_words(host, view), 3, 5), 0, "title memory");
+        let source = read_words(host, target);
+        assert_eq!(source[0], PACKED, "packed word written to the R32 source");
 
         let reads = crate::testgpu::TitleList::new();
         assert!(alias_copy(reads.host(), view));
@@ -4563,8 +4605,19 @@ mod tests {
         );
         reads.run();
         let texels = read_words(host, view);
+        // SAFETY: the reader's command list retains the view's host copy.
+        let format = unsafe { host_resource(view).unwrap().GetDesc() }.Format.0 as u32;
         for (x, y) in [(0, 0), (15, 15), (7, 9)] {
-            assert_eq!(word(&texels, x, y), PACKED, "texel {x},{y}");
+            let row = y * 64;
+            match format {
+                R9G9B9E5 => assert_eq!(texels[row + x], PACKED, "texel {x},{y}"),
+                10 => assert_eq!(
+                    texels[row + 2 * x..row + 2 * x + 2],
+                    [0x3400_3800, 0x3c00_3000],
+                    "RGBA16F texel {x},{y}"
+                ),
+                other => panic!("unexpected host format {other}"),
+            }
         }
         // A texture of the target's own format over it is no such alias.
         let same = texture_at(address, &words(&texture(16, 16, R32_FLOAT, 1), [3, 4])).unwrap();
@@ -4595,16 +4648,6 @@ mod tests {
                 ..texture(16, 16, R32_FLOAT, 1)
             },
         );
-        let resident = |r| {
-            assert!(
-                resource(r)
-                    .host
-                    .as_ref()
-                    .unwrap()
-                    .residency
-                    .wait(std::time::Duration::from_secs(5))
-            );
-        };
         resident(target);
         let mut descriptor = [0u64; 16];
         let rtv = descriptor.as_mut_ptr() as u64;
@@ -4727,7 +4770,7 @@ mod tests {
         assert_eq!(texture_at(address, &view), Some(after));
         // The resource it replaced goes after its grace.
         memory_remapped(address as usize, KIB_64 as usize);
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
         assert_eq!(Arc::strong_count(&replaced), 1, "released");
     }
 
@@ -4756,12 +4799,12 @@ mod tests {
             .keys()
             .all(|&(a, _)| a != address);
         assert!(gone);
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
         assert_eq!(Arc::strong_count(&copy), 1, "the resource let go of it");
         let again = texture_at(address, &view).unwrap();
         assert!(!Arc::ptr_eq(&host_copy(again).unwrap(), &copy));
         memory_remapped(address as usize, KIB_64 as usize);
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
     }
 
     /// A remapped range that starts inside a placed view's texture takes it
@@ -4793,7 +4836,7 @@ mod tests {
             .keys()
             .all(|&(a, _)| a != address);
         assert!(gone, "a texture over the remapped memory stays");
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
     }
 
     /// A view that shows a released target's copy keeps it until the title
@@ -4812,7 +4855,7 @@ mod tests {
         let plain = texture(16, 16, 28, 1);
         let target = at(address, &ResourceDesc { flags: 1, ..plain });
         let view = words(&plain, [0, 0]);
-        let shown = texture_at(address, &view).unwrap();
+        let shown = resident_view(address, &view);
         assert!(same_copy(shown, target));
         let drawn = host_copy(target).unwrap();
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
@@ -4823,13 +4866,15 @@ mod tests {
         );
         // The title puts a texture of its own there.
         let streamed = at(address, &plain);
-        let now = texture_at(address, &view).unwrap();
-        assert_ne!(now, shown);
+        release_views_at(address);
+        // The allocator can reuse the released object's address. The host copy
+        // retained in drawn identifies the contents being replaced.
+        let now = resident_view(address, &view);
         assert!(!Arc::ptr_eq(&host_copy(now).unwrap(), &drawn));
         assert!(crate::texture::title_written(host_resource(now).unwrap()));
         assert_eq!(slot::<Release>(streamed, 0x10)(streamed), 0);
         memory_remapped(address as usize, KIB_64 as usize);
-        release_waiting(std::time::Duration::ZERO);
+        release_views_at(address);
     }
 
     /// Textures the title fills itself are placed in the texture pool;
