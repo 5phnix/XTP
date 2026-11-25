@@ -168,6 +168,9 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     );
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
+    // A missing capture folder cost three image sessions on 2026-11-24/25
+    // ("os error 3" on every frame): make it, as a session would expect.
+    let _ = std::fs::create_dir_all(folder);
     match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),

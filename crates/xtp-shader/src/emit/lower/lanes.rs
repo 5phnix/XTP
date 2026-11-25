@@ -10,8 +10,117 @@ use super::{Lower, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Dpp, Fields, Operand};
-use crate::ir::{Inst, Reg, Value};
+use crate::ir::{Inst, Program, Reg, Value};
 use crate::structure::Bool;
+
+/// A `v_readlane_b32` of a lane fixed in the code (an inline constant or a
+/// literal).
+pub(super) fn constant_lane_read(i: &Inst) -> bool {
+    i.name() == "v_readlane_b32"
+        && matches!(&i.fields, Fields::Valu(v) if matches!(
+            v.src.get(1),
+            Some(Operand::Literal(_)) | Some(Operand::Const(_))
+        ))
+}
+
+/// Whether the halves of several console waves can run `p` each lane on its
+/// own path, with its lane reads through group-shared memory
+/// ([`Lower::group_read_lane`]): what lets every thread of the group meet at
+/// each group barrier, and the program's own LDS keep its order.
+///
+/// - No loop: a lane that leaves one early would miss the barriers inside.
+/// - The blocks that hold a barrier (`s_barrier`, or a lane read, which
+///   meets twice) follow one another by dominance: the barriers a lane
+///   passes are then a prefix of the same sequence in every lane, and a
+///   lane that skips a block of them passes no barrier after it, so it can
+///   only end. (The program's own `s_barrier` is lowered the same way
+///   wherever it stands.)
+/// - Every LDS write and every later LDS read, and every read and later
+///   write, have an `s_barrier` between them on every path: the console runs
+///   a wave's 64 lanes in step, so its compiler may leave out the barrier
+///   between lanes of one wave, which are two host waves here. (Two writes
+///   are not ordered: lanes writing one dword without a barrier between
+///   them race in the source program too, whose group-shared memory D3D12
+///   and the console's compiler order only at barriers.)
+pub(super) fn group_reads_meet(p: &Program) -> bool {
+    let n = p.blocks.len();
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; n];
+    for (k, &b) in order.iter().enumerate() {
+        index[b] = k;
+    }
+    let reachable = |b: usize| index[b] != usize::MAX;
+    let back = (0..n).filter(|&b| reachable(b)).any(|b| {
+        p.blocks[b]
+            .exit
+            .successors()
+            .iter()
+            .any(|&s| index[s] <= index[b])
+    });
+    if back {
+        return false;
+    }
+    // The blocks with barriers, in reverse postorder: each dominates the next.
+    let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let dominates = |d: usize, mut b: usize| loop {
+        if b == d {
+            return true;
+        }
+        if idom[b] == b || idom[b] == usize::MAX {
+            return false;
+        }
+        b = idom[b];
+    };
+    let meets: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&b| {
+            p.blocks[b]
+                .insts
+                .iter()
+                .any(|i| i.name() == "s_barrier" || i.name() == "v_readlane_b32")
+        })
+        .collect();
+    if meets.windows(2).any(|w| !dominates(w[0], w[1])) {
+        return false;
+    }
+    // LDS: from each access, the paths until an `s_barrier`.
+    let lds = |i: &Inst| -> Option<bool> {
+        let name = i.name();
+        (matches!(i.fields, Fields::Ds { .. })
+            && !name.starts_with("ds_swizzle")
+            && !name.contains("permute"))
+        .then(|| !name.starts_with("ds_read"))
+    };
+    for (b, block) in p.blocks.iter().enumerate().filter(|&(b, _)| reachable(b)) {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let Some(writes) = lds(inst) else { continue };
+            let mut seen = vec![false; n];
+            let mut work = vec![(b, i + 1)];
+            while let Some((x, from)) = work.pop() {
+                let mut stopped = false;
+                for later in &p.blocks[x].insts[from..] {
+                    if later.name() == "s_barrier" {
+                        stopped = true;
+                        break;
+                    }
+                    if lds(later).is_some_and(|w| w != writes) {
+                        return false;
+                    }
+                }
+                if stopped {
+                    continue;
+                }
+                for s in p.blocks[x].exit.successors() {
+                    if !std::mem::replace(&mut seen[s], true) {
+                        work.push((s, 0));
+                    }
+                }
+            }
+        }
+    }
+    true
+}
 
 impl<'a> Lower<'a> {
     /// Finds the whole-wave sections and the values they leave.
@@ -638,7 +747,64 @@ impl<'a> Lower<'a> {
         if self.console_cf && self.split && threads > 32 && self.s.lds_dwords + 2 > 8192 {
             return Err("a wave64 program whose LDS leaves no room for its halves' exchange");
         }
+        if self.group_reads && self.s.lds_dwords + threads > 8192 {
+            return Err("a wave64 program whose LDS leaves no room for its lane reads");
+        }
         Ok(())
+    }
+
+    /// `v_readlane_b32` in halves of several console waves
+    /// ([`Self::group_read_lane`]). It ignores EXEC, as on the console.
+    pub(super) fn group_lane_read(&mut self, inst: &Inst) -> Result<(), Why> {
+        let (x, lane) = (self.src(inst, 0)?, self.src(inst, 1)?);
+        self.cross_lane(false)?;
+        let r = self.group_read_lane(x, lane)?;
+        self.write_i(inst, r, None)
+    }
+
+    /// Halves of several console waves, each lane on its own path
+    /// ([`Self::group_reads`]): `x` of console lane `lane`, fixed in the code,
+    /// of this thread's console wave. Every thread that is here writes its
+    /// `x` at its console thread's place in group-shared memory, the group
+    /// meets, each thread reads its wave's lane, and the group meets again
+    /// before the next read writes. Every thread that has not ended is here
+    /// ([`group_reads_meet`]). A lane that ended earlier wrote nothing: what
+    /// is read for it is what the place held (on the console, what its
+    /// registers held).
+    pub(super) fn group_read_lane(&mut self, x: V, lane: V) -> Result<V, Why> {
+        let k = self
+            .s
+            .m
+            .int_value(lane)
+            .ok_or("a lane read at a computed lane across 32-lane halves")?;
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        let slots = match self.lane_slots {
+            Some(g) => g,
+            None => {
+                let arr = self.s.m.array(threads, self.s.t.i32);
+                let g = self.s.m.global("lanes", arr, 3);
+                self.lane_slots = Some(g);
+                g
+            }
+        };
+        let c = self.cur;
+        let f = self.console_flat();
+        let void = self.s.t.void;
+        // Thread-group sync with a group-shared memory fence.
+        let mode = self.s.m.i32(1 | 8);
+        let mine = self.s.m.element(c, slots, f);
+        self.s.m.store(c, mine, x);
+        self.s
+            .op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let (wave, at) = (self.s.m.i32(!63), self.s.m.i32(k as u32 & 63));
+        let first = self.s.m.bin(c, Bin::And, f, wave);
+        let index = self.s.m.bin(c, Bin::Add, first, at);
+        let theirs = self.s.m.element(c, slots, index);
+        let r = self.s.m.load(c, theirs);
+        // Every thread read before the next lane read writes.
+        self.s
+            .op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        Ok(r)
     }
 
     /// Console flow: each half gives `x` (the same in all its lanes) and
@@ -678,5 +844,94 @@ impl<'a> Lower<'a> {
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         (lo, hi)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group_reads_meet;
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+    const S_BARRIER: u32 = 0xBF8A_0000;
+    /// v_readlane_b32 s4, v0, 40
+    const READ_LANE_40: [u32; 2] = [0xD760_0004, 0x0001_5100];
+    /// ds_write_b32 v1, v0
+    const DS_WRITE: [u32; 2] = [0xD834_0000, 0x0000_0001];
+    /// ds_read_b32 v2, v1
+    const DS_READ: [u32; 2] = [0xD8D8_0000, 0x0200_0001];
+
+    fn meet(words: &[u32]) -> bool {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        group_reads_meet(&crate::ir::build(&code, true, 256).unwrap())
+    }
+
+    #[test]
+    fn lane_reads_and_barriers_every_thread_that_has_not_ended_reaches_meet() {
+        let mut words = vec![
+            0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+            0xBF88_0007, // s_cbranch_execz to the end: lanes 40 and up end
+        ];
+        words.extend(DS_WRITE);
+        words.push(S_BARRIER);
+        words.extend(DS_READ);
+        words.extend(READ_LANE_40);
+        words.push(S_ENDPGM);
+        assert!(meet(&words));
+    }
+
+    #[test]
+    fn a_lane_read_in_an_arm_some_lanes_skip_does_not_meet() {
+        let mut words = vec![
+            0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0
+            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+            0xBF88_0002, // s_cbranch_execz over the lane read
+        ];
+        words.extend(READ_LANE_40);
+        words.extend([
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]: lanes 5 and up go on
+            S_BARRIER,
+            S_ENDPGM,
+        ]);
+        assert!(!meet(&words));
+    }
+
+    #[test]
+    fn a_lane_read_in_a_loop_does_not_meet() {
+        let mut words = vec![
+            0xBE80_0384, // s_mov_b32 s0, 4
+            0x8080_8100, // 0x04: s_sub_u32 s0, s0, 1
+        ];
+        words.extend(READ_LANE_40);
+        words.extend([
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_FFFB, // s_cbranch_scc1 0x04
+            S_ENDPGM,
+        ]);
+        assert!(!meet(&words));
+    }
+
+    /// The console runs one wave's lanes in step, so its compiler may leave
+    /// out the barrier between an LDS write and a read of another lane of
+    /// the wave: in two host waves the read may come first.
+    #[test]
+    fn lds_read_after_a_write_without_a_barrier_does_not_meet() {
+        let mut words = DS_WRITE.to_vec();
+        words.extend(DS_READ);
+        words.extend(READ_LANE_40);
+        words.push(S_ENDPGM);
+        assert!(!meet(&words));
+        // Two writes, then a barrier, then the read: ordered.
+        let mut words = DS_WRITE.to_vec();
+        words.extend(DS_WRITE);
+        words.push(S_BARRIER);
+        words.extend(DS_READ);
+        words.push(S_ENDPGM);
+        assert!(meet(&words));
+        // A read, then a write without a barrier.
+        let mut words = DS_READ.to_vec();
+        words.extend(DS_WRITE);
+        words.push(S_ENDPGM);
+        assert!(!meet(&words));
     }
 }

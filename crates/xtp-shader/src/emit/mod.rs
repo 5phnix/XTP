@@ -1172,11 +1172,22 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the halves cannot meet at a group barrier yet.
+        // Two per group: the console flow cannot run it (its waves need not
+        // branch alike), so each lane takes its own path in two 32-lane
+        // halves and the lane read at lane 5 goes through group-shared
+        // memory (`lower::lanes::group_reads_meet`).
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
+        assert_eq!(emit_for(&two, NVIDIA).unwrap().wave_size(), Some(32));
+        // At a lane the code computes (s1), still not.
+        let computed = [
+            0xD760_0000,
+            0x0000_0300, // v_readlane_b32 s0, v0, s1
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0xBF81_0000, // s_endpgm
+        ];
         assert_eq!(
-            emit_for(&two, NVIDIA),
+            emit_for(&compute_of(&computed, true, 128), NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
                 what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
