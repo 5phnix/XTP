@@ -292,6 +292,20 @@ fn read(t: &Table) -> (Read, Option<CopyFrom>) {
     if let Some(h) = &t.host_view {
         let _ = write!(text, "\n      host slot made from: {h}");
     }
+    // A small texture the title placed (the 1×1 ones the CPU fills): its
+    // first texels as title memory holds them, whatever the swizzle.
+    if let Some(crate::descriptor::View::Placed(_, r, d)) = &view
+        && r[0] != 1
+        && u64::from(r[4]) * u64::from(r[6]) <= 16
+    {
+        let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+        let _ = write!(
+            text,
+            "\n      texels in title memory {address:#x}: {}; {}",
+            memory_text(address),
+            snapshot(address, 64).map_or_else(|| "not readable".to_owned(), |s| s.text(64))
+        );
+    }
     let range = view
         .as_ref()
         .and_then(crate::descriptor::host::buffer_range)
