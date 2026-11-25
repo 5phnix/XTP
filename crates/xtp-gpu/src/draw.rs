@@ -1643,7 +1643,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            self.rt_dropped(list);
+            self.rt_dropped(list, crate::rt_standin::Work::Groups([x, y, z]));
             self.dispatch_dropped(Unready::NoPipeline);
             return;
         };
@@ -1692,29 +1692,35 @@ impl State {
         dropped("dispatch", self.pipeline, why);
     }
 
-    /// A dispatch, direct or indirect, dropped for want of a host pipeline:
-    /// if it runs one of the title's trace programs ([`crate::rt_standin`]),
-    /// what its program writes through unordered access is handed over as
-    /// the title's compute tables and root views hold it now, to be counted
-    /// and (its switch on) cleared to "every ray missed". A clear binds
-    /// XTP's own view heap: the next draw or dispatch binds the title's.
-    fn rt_dropped(&mut self, list: &HostList) {
+    /// A dispatch, direct or indirect, dropped for want of a host pipeline,
+    /// which would have run `work`: if it runs one of the title's trace
+    /// programs ([`crate::rt_standin`]), it is counted, and with the
+    /// stand-in on, what its program writes through unordered access is
+    /// handed over as the title's compute tables (in the bound heaps only)
+    /// and root views hold it now, to be cleared to "every ray missed". A
+    /// clear binds XTP's own view heap: the next draw or dispatch binds the
+    /// title's.
+    fn rt_dropped(&mut self, list: &HostList, work: crate::rt_standin::Work) {
         let Some(program) = crate::rt_standin::program(self.pipeline as This) else {
             return;
         };
         use crate::rt_standin::Bound;
-        let bound: Vec<Bound> = program
-            .writes()
-            .map(|u| match (u.root, self.compute.get(usize::from(u.slot))) {
-                (RootType::Table, Some(Root::Table(table))) => {
-                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
-                        .map_or(Bound::Unset, Bound::View)
-                }
-                (RootType::Descriptor, Some(Root::View(address))) => Bound::Root(*address),
-                _ => Bound::Unset,
-            })
-            .collect();
-        if crate::rt_standin::dropped(list, &program, &bound) {
+        let bound = || {
+            program
+                .writes()
+                .map(|u| match (u.root, self.compute.get(usize::from(u.slot))) {
+                    (RootType::Table, Some(Root::Table(table))) => {
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        self.heap_of(handle)
+                            .and_then(|_| crate::descriptor::view(handle))
+                            .map_or(Bound::Unset, Bound::View)
+                    }
+                    (RootType::Descriptor, Some(Root::View(address))) => Bound::Root(*address),
+                    _ => Bound::Unset,
+                })
+                .collect()
+        };
+        if crate::rt_standin::dropped(list, &program, work, bound) {
             self.forget_host();
         }
     }
@@ -2340,7 +2346,10 @@ impl State {
         };
         if let Err(why) = ran {
             if kind == DISPATCH && why == Unready::NoPipeline {
-                self.rt_dropped(list);
+                // The rewrite above left the count of its commands that run
+                // a group at the start of the expanded arguments.
+                let count = expanded.as_ref().map(|(buffer, _)| (buffer.clone(), 0));
+                self.rt_dropped(list, crate::rt_standin::Work::Commands(count));
             }
             return fail(why);
         }
