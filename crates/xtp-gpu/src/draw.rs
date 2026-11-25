@@ -1118,6 +1118,8 @@ impl State {
         self.heap_textures(list);
         for stage in &p.stages {
             let t = stage.translated();
+            #[cfg(feature = "diagnostics")]
+            crate::frameprobe::begin(&stage.shader.hash);
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
             if self.table_failed {
@@ -1130,6 +1132,13 @@ impl State {
                     );
                 }
                 return Err("no dynamic slots for its tables");
+            }
+            // XTP_FRAME_PROBE: what the stage reads through its tables, and
+            // the host copies' bytes just before the op (`frameprobe`).
+            #[cfg(feature = "diagnostics")]
+            if crate::frameprobe::wanted(&stage.shader.hash) {
+                let tables = self.probe_tables(&t.used, &made, compute);
+                crate::frameprobe::stage(list, &stage.shader.hash, tables);
             }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
@@ -2180,6 +2189,46 @@ impl State {
         out
     }
 
+    /// What `XTP_FRAME_PROBE` reports of a stage's table reads
+    /// (diagnostics): each entry's title descriptor and slot, and the host
+    /// slot the shader reads, given the tables `made` afresh
+    /// ([`State::tables`]).
+    #[cfg(feature = "diagnostics")]
+    fn probe_tables(
+        &self,
+        used: &[UsedResource],
+        made: &[(u8, u32)],
+        compute: bool,
+    ) -> Vec<crate::frameprobe::Table> {
+        used.iter()
+            .filter(|u| u.root == RootType::Table)
+            .filter_map(|u| {
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                else {
+                    return None;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let heap = self.heap_of(table);
+                let host = heap.and_then(|h| h.host());
+                let index = heap.and_then(|h| h.index(handle));
+                Some(crate::frameprobe::Table {
+                    slot: u.slot,
+                    offset_dwords: u.table_offset_dwords,
+                    kind: u.kind,
+                    handle,
+                    index,
+                    mirrored: host.map(|h| h.count()),
+                    title_offset: heap.map(|h| (table - h.start) as u32),
+                    fresh_offset: made.iter().find(|m| m.0 == u.slot).map(|m| m.1),
+                    host_view: match (host, index) {
+                        (Some(h), Some(i)) if i < h.count() => h.describe_slot(i),
+                        _ => None,
+                    },
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -2838,6 +2887,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             {
                 crate::texture::upload(list, *resource as This, t);
             }
+            #[cfg(feature = "diagnostics")]
+            crate::frameprobe::texture(list, *resource as This, false);
             crate::resource::alias_copy(list, *resource as This);
             list.twin_use(*resource as This, false, false);
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
@@ -2855,6 +2906,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            #[cfg(feature = "diagnostics")]
+            crate::frameprobe::texture(list, *resource as This, true);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             #[cfg(feature = "diagnostics")]
