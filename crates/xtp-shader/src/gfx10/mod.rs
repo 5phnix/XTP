@@ -65,6 +65,16 @@ impl Instruction {
     }
 }
 
+/// Decodes a single GFX10 instruction starting at byte offset 0 of `code`.
+/// The input length must be a multiple of four bytes. The instruction includes
+/// any literals and extra dwords, and trailing dwords are ignored.
+pub fn decode_one(code: &[u8]) -> Result<Instruction, ShaderError> {
+    if !code.len().is_multiple_of(4) {
+        return Err(isa(code.len(), "code size is not a multiple of 4"));
+    }
+    instruction(code, 0)
+}
+
 /// Decodes every instruction reachable from offset 0, sorted by offset.
 pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     if !code.len().is_multiple_of(4) {

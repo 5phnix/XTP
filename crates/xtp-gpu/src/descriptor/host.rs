@@ -701,6 +701,12 @@ struct Viewed {
 struct Made {
     /// The record (view index and generation; 0 when not made).
     keys: Vec<u64>,
+    /// The record ([`super::record_key`]) the title last wrote at each slot
+    /// through its view calls and descriptor copies (a mirror that is not
+    /// for a draw), or that the look for records copied in as bytes last
+    /// found there ([`HostHeap::copied_records`]): a record found there
+    /// that is neither was copied in as bytes, with no call.
+    written: Vec<u64>,
     /// For a texture view, the host texture the slot views (0: none, the
     /// slot is null) and, for a texture the title placed itself, the
     /// resource made for its memory (see [`HostHeap::mirror`]).
@@ -1458,7 +1464,8 @@ impl HostHeap {
     }
 
     /// XTP's own view heap of `dynamic` dynamic slots and no title slots,
-    /// for lists that bind no view heap but read root SRVs.
+    /// bound in the view slot of lists that bind no hosted view heap of the
+    /// title's (root SRVs are read through tables in it).
     pub(crate) fn own(dynamic: u32) -> Option<Self> {
         let host = host()?;
         let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -1476,6 +1483,32 @@ impl HostHeap {
             Ok(heap) => Self::from_heap(heap, kind, false, 0, dynamic, 0),
             Err(e) => {
                 tracing::warn!(error = %e, dynamic, "no view heap of XTP's own");
+                None
+            }
+        }
+    }
+
+    /// XTP's own sampler heap: a few null samplers, bound so that a root
+    /// signature indexing the sampler heap directly may be set in a list
+    /// that binds no sampler heap of the title's.
+    pub(crate) fn own_samplers() -> Option<Self> {
+        const SLOTS: u32 = 16;
+        let host = host()?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        // SAFETY: plain heap creation.
+        let made = unsafe {
+            host.device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: SLOTS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+        };
+        match made {
+            Ok(heap) => Self::from_heap(heap, kind, true, 0, SLOTS, 0),
+            Err(e) => {
+                tracing::warn!(error = %e, "no sampler heap of XTP's own");
                 None
             }
         }
@@ -1539,6 +1572,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(Made {
                 keys: vec![0; count as usize],
+                written: vec![0; count as usize],
                 textures: HashMap::new(),
                 waiting: Vec::new(),
                 queued: vec![false; if sampler { 0 } else { count as usize }],
@@ -1919,15 +1953,33 @@ impl HostHeap {
             .and_then(|slot| std::mem::replace(slot, resource))
     }
 
+    /// Makes slot `index` a null constant buffer view: it reads zeros, as
+    /// the console's empty or zero-sized constant views do. (A null 2D
+    /// texture view where the shader declares a constant buffer is a type
+    /// mismatch GPU-based validation reports.)
+    pub(crate) fn null_constant(&self, index: u32) {
+        self.forget_view(index);
+        self.keep(index, None);
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap; no description makes a null view.
+        unsafe { host.device.CreateConstantBufferView(None, self.cpu(index)) };
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
+    /// memory (the list's own, which it holds): [`constant_bytes`] of it,
+    /// whose bytes past `size` the caller zeroed. A view of nothing (no
+    /// address or no bytes) is a null one.
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        if gpu == 0 || size == 0 {
+            self.null_constant(index);
+            return;
+        }
         self.forget_view(index);
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_bytes(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -2134,6 +2186,11 @@ impl HostHeap {
         if header_at(handle) != header {
             // Published meanwhile.
             return Err(Unmade::Rewritten);
+        }
+        if !for_draw {
+            // The title's own write, through a call: not a record it copied
+            // in as bytes ([`HostHeap::copied_records`]).
+            made.written[index as usize] = super::record_key(header);
         }
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -3171,6 +3228,31 @@ fn fills_texture(view: &View) -> bool {
     }
 }
 
+/// What a title slot the title copied a record into as bytes holds
+/// ([`HostHeap::copied_kind`]), for the count of such slots and of those
+/// shaders pick by index (`super::sync_heaps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopiedKind {
+    /// A view of a texture the title fills ([`fills_texture`]): one that
+    /// shaders pick by index, unless a draw read the slot through a table
+    /// within [`TABLED_FRAMES`] frames (`tabled`: such draws make it).
+    Texture { tabled: bool },
+    /// A buffer view ([`buffer_range`]); `picked`: shaders that pick
+    /// buffers at run time read the heap (its sweeps ran in this frame or
+    /// the one before). The sweeps run with `XTP_RUN_TIME_VIEWS=1` only
+    /// ([`run_time_views`]): without it no buffer view counts as picked,
+    /// and such shaders read null views whatever the title wrote.
+    Buffer { picked: bool },
+    /// A slot of a sampler heap.
+    Sampler,
+    /// Another view of ours: a constant buffer, a texture the host renders
+    /// to or writes.
+    Other,
+    /// No view of ours: bytes that hold no record, or a view of a resource
+    /// the title released.
+    None,
+}
+
 /// [`HostHeap::tabled`]'s stamp for `frame`.
 fn stamp_of(frame: u64) -> u32 {
     (frame as u32).wrapping_add(1)
@@ -3361,6 +3443,60 @@ impl HostHeap {
             .get(index as usize)
             .map_or(0, |s| s.load(Ordering::Relaxed));
         stamp != 0 && u64::from(stamp_of(clock).wrapping_sub(stamp)) <= frames
+    }
+
+    /// Of the records `keys` ([`super::record_key`]) that the look for
+    /// records copied in as bytes (`super::sync_heaps`) found at title
+    /// slots `first`, `first + 1`, ...: those the title wrote with no call,
+    /// each with whether its host slot was made from it. Neither did the
+    /// title's calls (view creation, descriptor copies) write them last,
+    /// nor did an earlier look find them; each is noted found, so that it
+    /// counts once. Slots past the host heap are left out.
+    pub(crate) fn copied_records(&self, first: u32, keys: &[u64]) -> Vec<(u32, bool)> {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = &mut *made;
+        let mut copied = Vec::new();
+        for (index, &key) in (first..).zip(keys) {
+            let Some(written) = made.written.get_mut(index as usize) else {
+                break;
+            };
+            if *written != key {
+                *written = key;
+                copied.push((index, key != 0 && made.keys[index as usize] == key));
+            }
+        }
+        copied
+    }
+
+    /// What title slot `index`, which the title copied a record into as
+    /// bytes ([`HostHeap::copied_records`]), holds for the shaders that may
+    /// read it: `view` (`None`: no view of ours).
+    pub(crate) fn copied_kind(&self, index: u32, view: Option<&View>) -> CopiedKind {
+        if self.sampler {
+            return CopiedKind::Sampler;
+        }
+        let Some(view) = view else {
+            return CopiedKind::None;
+        };
+        if fills_texture(view) {
+            let clock = self.clock(pass_frame());
+            return CopiedKind::Texture {
+                tabled: self.tabled_within(index, clock, TABLED_FRAMES),
+            };
+        }
+        if buffer_range(view).is_some() {
+            return CopiedKind::Buffer {
+                picked: self.swept_lately(),
+            };
+        }
+        CopiedKind::Other
+    }
+
+    /// Whether shaders that pick buffers at run time read this heap in this
+    /// frame or the one before (its sweeps ran: [`HostHeap::picked_spans`]).
+    fn swept_lately(&self) -> bool {
+        let sweeps = self.picked.lock().unwrap_or_else(|e| e.into_inner());
+        sweeps.began.is_some() && crate::frame::current().saturating_sub(sweeps.frame) <= 1
     }
 
     /// The work of a pass over the textures shaders pick from this heap by
@@ -4112,6 +4248,41 @@ thread_local! {
     static NOT_RESIDENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Bytes of a host constant buffer view at most: the 64 KiB a shader can
+/// index (4096 vectors of 16 bytes). A larger view removes the device on
+/// NVIDIA (`0x887A0001`), and title heaps hold such sizes in slots they
+/// leave stale (969,472 and 1,306,368 bytes seen).
+pub(crate) const CBV_BYTES: u32 = 64 << 10;
+
+/// The bytes of the host's constant buffer view of a title one of `size`:
+/// whole 256s, at most [`CBV_BYTES`].
+pub(crate) fn constant_bytes(size: u32) -> u32 {
+    size.min(CBV_BYTES).next_multiple_of(256)
+}
+
+/// A title constant view's `size` capped at [`CBV_BYTES`], what the host
+/// reads of it. Larger sizes are logged (counted), with the largest seen.
+pub(crate) fn capped_constant(address: u64, size: u32) -> u32 {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    static LARGEST: AtomicU32 = AtomicU32::new(0);
+    if size <= CBV_BYTES {
+        return size;
+    }
+    let largest = LARGEST.fetch_max(size, Ordering::Relaxed).max(size);
+    let count = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        tracing::warn!(
+            count,
+            address = format_args!("{address:#x}"),
+            size,
+            largest,
+            "a constant buffer view over 64 KiB: the host views its first 64 KiB"
+        );
+    }
+    CBV_BYTES
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4128,6 +4299,12 @@ fn make_with(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            // No address or no bytes (a null description, or a slot the
+            // title cleared): a null view (`null_for`), not one of 0 bytes.
+            if address == 0 || size == 0 {
+                return None;
+            }
+            let size = capped_constant(address, size);
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -4139,7 +4316,7 @@ fn make_with(
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_bytes(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -4254,7 +4431,7 @@ fn make_with(
 /// buffer views.
 fn copy_range(view: &View) -> Option<(u64, u64)> {
     match view {
-        &View::Constant(address, size) => Some((address, u64::from(size))),
+        &View::Constant(address, size) => Some((address, u64::from(size.min(CBV_BYTES)))),
         View::Shader(r, Some(_)) | View::Unordered(r, _, Some(_)) => {
             crate::resource::buffer_bytes(*r as crate::object::This)
                 .map(|(data, len)| (data as u64, len))
@@ -4499,6 +4676,49 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Constant views over 64 KiB are cut to 64 KiB, and those of no
+    /// address or no bytes are null ones: in the title's slots (`make`) and
+    /// in dynamic ones (`constant_at`). The device stays (NVIDIA removes it
+    /// for a view over 64 KiB, VIctory #1640; WARP does not).
+    #[test]
+    fn constant_views_are_capped_at_64_kib_and_null_when_empty() {
+        use crate::testgpu::TitleBuffer;
+        let test =
+            "descriptor::host::tests::constant_views_are_capped_at_64_kib_and_null_when_empty";
+        assert_eq!(constant_bytes(480), 512);
+        assert_eq!(constant_bytes(64 << 10), 64 << 10);
+        assert_eq!(constant_bytes(969_472), 64 << 10);
+        assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+        assert_eq!(capped_constant(0x1000, 1_306_368), CBV_BYTES);
+        assert_eq!(capped_constant(0x1000, 4096), 4096);
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        // SAFETY: a plain device query.
+        let alive = || unsafe { host.device.GetDeviceRemovedReason() }.is_ok();
+        let heap = HostHeap::new(false, 4).expect("a host view heap");
+        // A title buffer of 1 MiB: views of the title's oversized sizes lie
+        // in its host copy.
+        let buffer = TitleBuffer::new(1 << 20);
+        let at = buffer.address();
+        for size in [969_472, 896_256] {
+            assert!(make(&View::Constant(at, size), heap.cpu(0)).is_some());
+            assert!(alive(), "a view of {size} bytes");
+        }
+        // No bytes or no address: no view of the host's (the slot gets a
+        // null one, `null_for`).
+        assert!(make(&View::Constant(at, 0), heap.cpu(1)).is_none());
+        assert!(make(&View::Constant(0, 256), heap.cpu(1)).is_none());
+        assert!(make(&View::Constant(0, 0), heap.cpu(1)).is_none());
+        let gpu_at = buffer.shadow().gpu(at);
+        heap.constant_at(2, gpu_at, 969_472);
+        heap.constant_at(3, gpu_at, 0);
+        heap.constant_at(3, 0, 256);
+        heap.null_constant(3);
+        assert!(alive(), "views of the list's own memory");
+    }
 
     /// A view whose buffer does not start on one of its elements in the
     /// host copy (watch.md items 180, 201) still gives the stride table its
@@ -5174,6 +5394,22 @@ mod tests {
         assert_eq!(kept, Some(copy.buffer.as_raw() as usize));
     }
 
+    /// Waits until title texture `r`'s host copy is resident, at most 5 s.
+    /// Host copies are made resident in the background (`resource/
+    /// residency.rs`: a fence the driver signals when it is done), and until
+    /// then lookups find none and a slot made over the texture is null.
+    /// Issue #54: the two placed-texture tests below made their slot at
+    /// once, and now and then (a serial run under the debug layer on WARP,
+    /// CI's gpu-debug-layer run of PR #26) before the fence: the slot was
+    /// null, or `host_copy` found none.
+    fn resident(r: crate::object::This) {
+        let started = std::time::Instant::now();
+        while crate::resource::host_resource(r).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never resident");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// A slot viewing a texture the title placed itself follows the
     /// resource made for that memory: when a texture the GPU writes comes
     /// there (#643), the slot is made again over its copy, although the
@@ -5212,11 +5448,18 @@ mod tests {
                 .map(|t| t.as_raw() as usize)
         };
         let host_of = |r: This| crate::resource::host_resource(r).map(|t| t.as_raw() as usize);
+        // The texture made for the memory, resident before the slot is made
+        // (see `resident`).
+        let before = crate::resource::texture_at(address, &resource).unwrap();
+        resident(before);
         assert!(matches!(
             host.mirror(1, handle, true),
             Some(View::Shader(..))
         ));
-        let before = crate::resource::texture_at(address, &resource).unwrap();
+        assert_eq!(
+            crate::resource::texture_at(address, &resource),
+            Some(before)
+        );
         // Taken now: once replaced, `before` may be released at any time
         // (and its address reused); its copy stays while this holds it.
         let old = crate::resource::host_copy(before).expect("a host copy");
@@ -5241,6 +5484,7 @@ mod tests {
             &mut rt,
         );
         assert_eq!(made, S_OK);
+        resident(rt);
         assert!(matches!(
             host.mirror(1, handle, true),
             Some(View::Shader(..))
@@ -5404,11 +5648,18 @@ mod tests {
                 .map(|t| t.as_raw() as usize)
         };
         let host_of = |r: This| crate::resource::host_resource(r).map(|t| t.as_raw() as usize);
+        // The texture made for the memory, resident before the slot is made
+        // (see `resident`).
+        let written = crate::resource::texture_at(address, &resource).unwrap();
+        resident(written);
         assert!(matches!(
             host.mirror(1, handle, true),
             Some(View::Unordered(..))
         ));
-        let written = crate::resource::texture_at(address, &resource).unwrap();
+        assert_eq!(
+            crate::resource::texture_at(address, &resource),
+            Some(written)
+        );
         assert!(host_of(written).is_some());
         assert_eq!(
             kept(host, 1),
@@ -5731,7 +5982,6 @@ mod tests {
     /// load at 4 and the store at 8 are past the element: 0, dropped).
     #[test]
     fn a_translated_program_reads_and_writes_through_the_heaps_table() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::{TitleBuffer, TitleList};
         let test = "descriptor::host::tests::a_translated_program_reads_and_writes_through_the_heaps_table";
         let Some(gpu) = crate::testgpu::device(test) else {
@@ -5771,7 +6021,10 @@ mod tests {
             // SAFETY: an open list with every root argument set; the heap
             // and its table outlive the run.
             unsafe {
-                l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.list
+                    .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                        &heap.heap,
+                    )));
                 l.list.SetComputeRootSignature(&root);
                 l.list.SetPipelineState(&pso);
                 l.list.SetComputeRoot32BitConstants(
@@ -5852,7 +6105,10 @@ mod tests {
         // SAFETY: an open list with every root argument set; the heap and
         // its table outlive the run.
         unsafe {
-            l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.list
+                .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                    &heap.heap,
+                )));
             l.list.SetComputeRootSignature(root);
             l.list.SetPipelineState(pso);
             l.list
@@ -5871,7 +6127,6 @@ mod tests {
     /// table's entries, anything else as no view (loads 0, stores dropped).
     #[test]
     fn stride_table_reads_stay_inside_the_table_and_tell_remapped_slots() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::stride_table_reads_stay_inside_the_table_and_tell_remapped_slots";
         let Some(gpu) = crate::testgpu::device(test) else {
@@ -6003,7 +6258,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: an open list; live objects kept until it is reset; the
         // slot is in the heap set on it.
         unsafe {
-            l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.list
+                .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                    &heap.heap,
+                )));
             l.list.SetComputeRootSignature(root);
             l.list.SetPipelineState(pso);
             l.list
@@ -6206,7 +6464,6 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// to the copy, and the program reads what the title wrote last.
     #[test]
     fn views_read_through_the_table_only_are_refreshed_for_picks() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::TitleBuffer;
         let test =
             "descriptor::host::tests::views_read_through_the_table_only_are_refreshed_for_picks";
@@ -6398,7 +6655,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: an open list; live objects kept until it is reset; the
         // slot is in the heap set on it.
         unsafe {
-            l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.list
+                .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                    &heap.heap,
+                )));
             l.list.SetComputeRootSignature(&root);
             l.list.SetPipelineState(&pso);
             l.list
@@ -6656,7 +6916,10 @@ void main() {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 )]);
-                l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.list
+                    .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                        &heap.heap,
+                    )));
                 l.list.SetComputeRootSignature(&root);
                 l.list.SetPipelineState(&pso);
                 l.list
@@ -6879,7 +7142,6 @@ void main() {
     /// table is submitted: its dispatch reads and writes through it.
     #[test]
     fn a_remapped_slot_gets_a_raw_view_once_one_comes_back() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::{TitleBuffer, TitleList};
         let test = "descriptor::host::tests::a_remapped_slot_gets_a_raw_view_once_one_comes_back";
         let Some(gpu) = crate::testgpu::device(test) else {

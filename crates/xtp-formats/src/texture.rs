@@ -651,10 +651,32 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
-    /// Copies one subresource out of tiled memory (the whole texture,
-    /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
-    /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
-    /// `row_pitch` bytes apart, depth slices `depth_pitch`.
+    /// Bytes from the start of the texture that hold `first_mip` and all
+    /// smaller mips, including the whole tail block if present. Returns
+    /// [`Layout::size`] for mip 0 and for layouts other than single-slice,
+    /// single-sampled 2D textures. Returns `None` for an invalid mip index.
+    pub fn resident_bytes(&self, first_mip: u32) -> Option<u64> {
+        let mip = self.mips.get(first_mip as usize)?;
+        if first_mip == 0
+            || self.desc.dimension != Dimension::Tex2d
+            || self.slices != 1
+            || self.desc.samples != 1
+        {
+            return Some(self.size);
+        }
+        if mip.tail.is_some() {
+            return Some(self.alignment);
+        }
+        // The next larger mip starts right after this one, including its padding.
+        Some(self.mips[first_mip as usize - 1].offset)
+    }
+
+    /// Copies mip `mip` of array slice `slice` into linear rows (3D: every
+    /// depth slice of the mip, `slice` 0). Rows are `row_pitch` bytes apart,
+    /// depth slices `depth_pitch`.
+    ///
+    /// `tiled` starts at offset 0 of the texture and must hold at least
+    /// [`Layout::resident_bytes`] for `mip`, or the copy returns [`Error::TooSmall`].
     pub fn detile(
         &self,
         tiled: &[u8],
@@ -664,8 +686,9 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
+        let needed = self.resident_bytes(mip).ok_or(Error::Invalid)?;
         self.walk(
-            tiled.len(),
+            (tiled.len() as u64) < needed,
             mip,
             slice,
             linear.len(),
@@ -677,7 +700,9 @@ impl Layout {
         )
     }
 
-    /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
+    /// Copies linear rows into mip `mip` of array slice `slice`, with the
+    /// same row and depth pitches as [`Layout::detile`]. `tiled` must hold
+    /// the whole texture ([`Layout::size`] bytes).
     pub fn tile(
         &self,
         tiled: &mut [u8],
@@ -688,7 +713,7 @@ impl Layout {
         depth_pitch: usize,
     ) -> Result<(), Error> {
         self.walk(
-            tiled.len(),
+            (tiled.len() as u64) < self.size,
             mip,
             slice,
             linear.len(),
@@ -704,7 +729,7 @@ impl Layout {
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
-        tiled_len: usize,
+        tiled_too_small: bool,
         mip: u32,
         slice: u32,
         linear_len: usize,
@@ -736,7 +761,7 @@ impl Layout {
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        if tiled_too_small || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
         // The row and slice add whole blocks to every column and XOR the same
@@ -1121,6 +1146,134 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn detiles_smaller_mips_from_a_prefix() {
+        let cases = [
+            desc(250, 175, 8, 8, Swizzle::SW_4KB_S),
+            Desc {
+                block: 4,
+                ..desc(1024, 768, 10, 16, Swizzle::SW_64KB_D)
+            },
+            desc(30, 20, 5, 4, Swizzle::LINEAR),
+            desc(300, 200, 9, 4, Swizzle::SW_64KB_R_X),
+        ];
+        for d in cases {
+            let l = Layout::for_gpu(&d, Pipes::SERIES_S, 0x2d).unwrap();
+            let n = d.element_bytes as usize;
+            let mut tiled = vec![0; l.size as usize];
+            let mut round_trip = vec![0; tiled.len()];
+            let mut images = Vec::new();
+            for (mip, m) in l.mips.iter().enumerate() {
+                let row = m.width as usize * n;
+                let image: Vec<u8> = (0..row * m.height as usize)
+                    .map(|i| ((i * 7) ^ (i >> 8) ^ (mip * 53)) as u8)
+                    .collect();
+                for y in 0..m.height {
+                    for x in 0..m.width {
+                        let at = l.offset(mip as u32, x, y, 0).unwrap() as usize;
+                        let from = y as usize * row + x as usize * n;
+                        tiled[at..at + n].copy_from_slice(&image[from..from + n]);
+                    }
+                }
+                l.tile(&mut round_trip, mip as u32, 0, &image, row, 0)
+                    .unwrap();
+                // Size the prefix by the padded extent of this mip or tail.
+                let end = if m.tail.is_some() {
+                    l.alignment as usize
+                } else {
+                    m.offset as usize + m.pitch as usize * m.rows as usize * n
+                };
+                images.push((end, row, image));
+            }
+            assert_eq!(round_trip, tiled, "{d:?}");
+            assert_eq!(images[0].0, tiled.len(), "{d:?}");
+            assert!(images[1].0 < tiled.len(), "{d:?}");
+            if d.swizzle != Swizzle::LINEAR {
+                assert!((2..d.mips - 1).contains(&l.first_tail_mip), "{d:?}");
+            }
+
+            for (first, (end, row, image)) in images.iter().enumerate() {
+                assert_eq!(l.resident_bytes(first as u32), Some(*end as u64), "{d:?}");
+                let mut out = vec![0xcc; image.len()];
+                assert_eq!(
+                    l.detile(&tiled[..end - 1], first as u32, 0, &mut out, *row, 0),
+                    Err(Error::TooSmall),
+                    "{d:?} mip {first}"
+                );
+                assert!(out.iter().all(|&byte| byte == 0xcc));
+                for (mip, (needed, row, image)) in images.iter().enumerate() {
+                    let mut out = vec![0xcc; image.len()];
+                    let result = l.detile(&tiled[..*end], mip as u32, 0, &mut out, *row, 0);
+                    if needed <= end {
+                        result.unwrap();
+                        assert_eq!(&out, image, "{d:?} first mip {first}, mip {mip}");
+                    } else {
+                        assert_eq!(result, Err(Error::TooSmall), "{d:?} mip {mip}");
+                        assert!(out.iter().all(|&byte| byte == 0xcc));
+                    }
+                }
+            }
+            assert_eq!(l.resident_bytes(d.mips), None);
+            assert_eq!(
+                l.detile(&tiled, d.mips, 0, &mut [], 0, 0),
+                Err(Error::Invalid)
+            );
+            let (end, row, image) = &images[1];
+            let mut short = vec![0xcc; *end];
+            assert_eq!(
+                l.tile(&mut short, 1, 0, image, *row, 0),
+                Err(Error::TooSmall)
+            );
+            assert!(short.iter().all(|&byte| byte == 0xcc));
+        }
+    }
+
+    #[test]
+    fn other_layouts_require_the_whole_texture() {
+        let base = desc(64, 64, 5, 4, Swizzle::SW_4KB_S);
+        for d in [
+            Desc { depth: 2, ..base },
+            Desc {
+                dimension: Dimension::Tex3d,
+                depth: 2,
+                ..base
+            },
+            Desc {
+                dimension: Dimension::Tex1d,
+                ..desc(64, 1, 5, 4, Swizzle::LINEAR)
+            },
+            Desc {
+                samples: 2,
+                ..desc(4, 4, 1, 4, Swizzle::LINEAR)
+            },
+        ] {
+            let l = Layout::new(&d).unwrap();
+            let mip = d.mips - 1;
+            let m = &l.mips[mip as usize];
+            let row = (m.width * d.element_bytes) as usize;
+            let plane = row * m.height as usize;
+            let mut out = vec![0; plane * m.depth as usize];
+            let tiled = vec![0; l.size as usize];
+            assert_eq!(l.resident_bytes(mip), Some(l.size), "{d:?}");
+            assert_eq!(
+                l.detile(&tiled[..tiled.len() - 1], mip, 0, &mut out, row, plane),
+                Err(Error::TooSmall),
+                "{d:?}"
+            );
+            l.detile(&tiled, mip, 0, &mut out, row, plane).unwrap();
+        }
+        let msaa = Layout::new(&Desc {
+            samples: 2,
+            ..desc(4, 4, 1, 4, Swizzle::SW_4KB_S)
+        })
+        .unwrap();
+        assert_eq!(msaa.resident_bytes(0), Some(msaa.size));
+        assert_eq!(
+            msaa.detile(&vec![0; msaa.size as usize], 0, 0, &mut [0; 64], 16, 0),
+            Err(Error::Unsupported)
+        );
     }
 
     /// Hand-checked: in a 64 KiB `D` block of 4-byte elements, x bits go to

@@ -1,7 +1,17 @@
+#ifdef SPLICED
+// Bound as a RayQuery splice binds it: t240 (TLAS_REGISTER) in the root
+// views' space (ROOT_CBV_SPACE), under the root signature the host pipeline
+// makes for it.
+RaytracingAccelerationStructure scene : register(t240, space1);
+RWByteAddressBuffer result : register(u0);
+#define ROOT
+#else
 RaytracingAccelerationStructure scene : register(t0);
 RWByteAddressBuffer result : register(u0);
+#define ROOT [RootSignature("SRV(t0), UAV(u0)")]
+#endif
 
-[RootSignature("SRV(t0), UAV(u0)")]
+ROOT
 [numthreads(2, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     RayDesc ray;
