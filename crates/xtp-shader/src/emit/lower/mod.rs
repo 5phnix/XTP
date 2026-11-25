@@ -143,6 +143,7 @@ pub(crate) struct Lowered {
     pub scalar_guards: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
     pub p: &'a Program,
@@ -199,6 +200,20 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             what: UNTRACKED_SELECT,
             ..
         }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
+        Err(ShaderError::Unsupported {
+            what: "the first half of an interpolation" | "a hardware SGPR input",
+            ..
+        }) if parts.native.stage == HwStage::Ps => {
+            let mut io = crate::io::raise_inputs(parts.p, parts.native, true)?;
+            io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
+            lower_program(
+                &Parts {
+                    io: &io,
+                    ..parts.clone()
+                },
+                false,
+            )
+        }
         result => result,
     }
 }
@@ -454,6 +469,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.ordered_uavs = x.native.io.pops();
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);

@@ -63,6 +63,7 @@ fn mixed_sampler(compute: bool, comparison_first: bool, word0: u32) -> HostShade
         StageIo::Ps {
             inputs: vec![],
             input_addr: 0,
+            rsrc2: 0,
             db_shader_control: 0,
             patches: vec![],
         }
