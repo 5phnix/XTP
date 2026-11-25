@@ -1,5 +1,4 @@
-//! Query heaps. Nothing runs on a GPU yet, so no query ever produces a
-//! result; the heap only remembers its description.
+//! Title query heaps and their host occlusion and pipeline-statistics queries.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
@@ -29,6 +28,8 @@ pub(crate) struct Desc {
 struct Heap {
     object: Object,
     desc: Desc,
+    #[cfg(windows)]
+    host: Option<windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap>,
 }
 
 /// Device method.
@@ -46,8 +47,52 @@ pub(crate) extern "system" fn create(
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
+        #[cfg(windows)]
+        host: make_host(desc),
     });
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
+}
+
+#[cfg(windows)]
+fn make_host(desc: Desc) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let kind = match desc.kind {
+        0 => D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+        2 => D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+        _ => return None,
+    };
+    let mut heap = None;
+    // SAFETY: the output belongs to us and the descriptor lives through the call.
+    unsafe {
+        crate::host::host()?.device.CreateQueryHeap(
+            &D3D12_QUERY_HEAP_DESC {
+                Type: kind,
+                Count: desc.count,
+                NodeMask: 0,
+            },
+            &mut heap,
+        )
+    }
+    .ok()?;
+    heap
+}
+
+#[cfg(windows)]
+pub(crate) fn host_heap<'a>(
+    this: This,
+    kind: u32,
+    first: u32,
+    count: u32,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap> {
+    // SAFETY: a title query heap passed to one of its command-list methods.
+    let heap = unsafe { this.cast::<Heap>().as_ref()? };
+    if !matches!((heap.desc.kind, kind), (0, 0 | 1) | (2, 3))
+        || count == 0
+        || first.checked_add(count)? > heap.desc.count
+    {
+        return None;
+    }
+    heap.host.as_ref()
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -60,6 +105,60 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 }
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::object::slot;
+    use crate::testgpu::{TitleBuffer, TitleList};
+
+    #[test]
+    fn empty_draws_resolve_to_zero_in_the_title_buffer() {
+        let test = "query::tests::empty_draws_resolve_to_zero_in_the_title_buffer";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        for (heap_kind, kind, words) in [(0, 0, 2), (0, 1, 2), (2, 3, 22)] {
+            let mut heap = std::ptr::null();
+            let desc = Desc {
+                kind: heap_kind,
+                count: 2,
+                nodes: 0,
+            };
+            assert_eq!(
+                create(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap),
+                crate::object::S_OK
+            );
+            let list = TitleList::new();
+            let out = TitleBuffer::new(256);
+            out.set_words(|_| 0xface);
+            for offset in [0xe0, 0xe8] {
+                slot::<extern "system" fn(This, This, u32, u32)>(list.this(), offset)(
+                    list.this(),
+                    heap,
+                    kind,
+                    1,
+                );
+            }
+            slot::<extern "system" fn(This, This, u32, u32, u32, This, u64)>(list.this(), 0xf0)(
+                list.this(),
+                heap,
+                kind,
+                1,
+                1,
+                out.resource(),
+                8,
+            );
+            release(heap);
+            list.run();
+            let result = out.words();
+            assert_eq!(&result[2..2 + words], vec![0; words]);
+            assert_eq!((result[1], result[2 + words]), (0xface, 0xface));
+        }
+        host.drain();
+    }
 }
 
 /// IUnknown 3, object 4, device child 1.

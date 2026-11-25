@@ -47,9 +47,9 @@
 //! - the fourth corner is computed `precise` (no reassociation), as the
 //!   CPU does it.
 //!
-//! shortcut: the vertex scratch holds 8 MiB ([`SCRATCH_BYTES`]), shared by
-//! the records of one draw; records whose expanded vertices do not fit draw
-//! nothing.
+//! The vertex scratch grows from 8 MiB to fit the bounded draw. For indexed
+//! records the expansion gathers three R16 or R32 indices and applies the
+//! signed base vertex before computing the fourth corner.
 //!
 //! shortcut: as in [`crate::primitive`], the fourth corner of a pipeline with
 //! per-vertex inputs is computed from the vertex inputs, not the vertex
@@ -289,8 +289,8 @@ cbuffer Params : register(b0) {
     uint max_src_verts;
     uint vert_capacity;
     uint need_verts;
-    uint pad0;
-    uint pad1;
+    uint indexed;
+    uint pad;
 };
 // Buffers as 32-bit words, and no root signature attribute: Wine's system
 // compiler (vkd3d-shader) has no Load on RWByteAddressBuffer and ignores the
@@ -330,6 +330,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     // The clamp's bounds again: 2^24 vertices, 2^26 vertex instances.
     rec.x = min(rec.x, 1u << 24);
     rec.y = min(rec.y, (1u << 26) / max(rec.x, 1u));
+    if (indexed != 0u) rec.w = src_args[at + 4u];
     uint rects = rec.x / 3u;
     uint src_verts = rects * 3u;
     uint out_verts = rects * 6u;
@@ -363,7 +364,9 @@ cbuffer Params : register(b0) {
     uint vb_src_stride;
     uint vb_dst_stride;
     uint elem_count;
-    uint pad0;
+    uint index_bytes;
+    uint index_bias;
+    uint vertex_limit;
 };
 // Buffers as 32-bit words (see the rewrite pass); byte positions are
 // turned into word indices here.
@@ -372,6 +375,17 @@ RWStructuredBuffer<uint> src_args : register(u0);
 RWStructuredBuffer<uint> dst_args : register(u1);
 RWStructuredBuffer<uint> src_vb : register(u2);
 RWStructuredBuffer<uint> dst_vb : register(u3);
+RWStructuredBuffer<uint> indices : register(u4);
+
+uint vertex_id(uint at, uint base) {
+    if (index_bytes == 0u) return at;
+    uint pos = index_bias + at * index_bytes;
+    uint word = indices[pos >> 2u];
+    uint index = index_bytes == 4u ? word : (word >> ((pos & 2u) * 8u)) & 0xffffu;
+    uint id = index + base;
+    if (asint(base) >= 0 && id < index) return 0xffffffffu;
+    return id;
+}
 
 uint load_u8(uint pos) {
     uint w = src_vb[(pos & ~3u) >> 2u];
@@ -521,9 +535,19 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint src_start = src_args[r * (src_stride / 4u) + 2u];
 
     for (uint rect = gtid.x; rect < rects; rect += 64u) {
-        uint v0_src = vb_src_bias + (src_start + rect * 3u) * vb_src_stride;
-        uint v1_src = v0_src + vb_src_stride;
-        uint v2_src = v1_src + vb_src_stride;
+        uint at = src_start + rect * 3u;
+        uint base = 0;
+        if (index_bytes != 0u) base = src_args[r * (src_stride / 4u) + 3u];
+        uint3 ids = uint3(vertex_id(at, base), vertex_id(at + 1u, base), vertex_id(at + 2u, base));
+        if (any(ids >= vertex_limit)) {
+            // A malformed triplet becomes a degenerate triangle. Never read outside a root view.
+            uint begin = (dst_start + rect * 6u) * vb_dst_stride / 4u;
+            for (uint i = 0; i < 6u * (vb_dst_stride / 4u); i++) dst_vb[begin + i] = 0;
+            continue;
+        }
+        uint v0_src = vb_src_bias + ids.x * vb_src_stride;
+        uint v1_src = vb_src_bias + ids.y * vb_src_stride;
+        uint v2_src = vb_src_bias + ids.z * vb_src_stride;
         uint d = (dst_start + rect * 6u) * vb_dst_stride;
 
         copy_vertex(v0_src, d);
@@ -634,7 +658,7 @@ fn root_signature(
             Constants: D3D12_ROOT_CONSTANTS {
                 ShaderRegister: 0,
                 RegisterSpace: 0,
-                Num32BitValues: 8,
+                Num32BitValues: 10,
             },
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -708,7 +732,7 @@ fn make() -> windows::core::Result<Shaders> {
         device,
         s!("rect_expand"),
         EXPAND_SOURCE,
-        &[SRV, UAV, UAV, UAV, UAV],
+        &[SRV, UAV, UAV, UAV, UAV, UAV],
     )?;
     Ok(Shaders { rewrite, expand })
 }
@@ -719,7 +743,7 @@ fn make() -> windows::core::Result<Shaders> {
 /// state on its first such draw, given back ([`give_back`]) once the
 /// recording has gone. Its buffers are made as draws need them.
 pub(crate) struct Scratch {
-    /// [`SCRATCH_BYTES`], made by the first draw with a per-vertex slot.
+    /// Created or grown on demand for a draw with per-vertex inputs.
     vertices: Option<Buffer>,
     /// Made larger when a draw has more records.
     args: Option<Buffer>,
@@ -805,6 +829,13 @@ pub(crate) fn give_back(mut scratch: Scratch) {
         b.state = D3D12_RESOURCE_STATE_COMMON;
         b.kept = false;
     }
+    if scratch
+        .vertices
+        .as_ref()
+        .is_some_and(|v| v.len > SCRATCH_BYTES)
+    {
+        scratch.vertices = None;
+    }
     if scratch.args.as_ref().is_some_and(|a| a.len > ARGS_POOLED) {
         scratch.args = None;
     }
@@ -877,7 +908,7 @@ fn take_scratch<'a>(
     list: &HostList,
     held: &'a mut Option<Scratch>,
     args_len: u64,
-    vertices: bool,
+    vertices_len: u64,
 ) -> Option<&'a mut Scratch> {
     let s = match held {
         Some(s) => s,
@@ -894,8 +925,12 @@ fn take_scratch<'a>(
         // The list keeps a smaller one it used until its reset.
         s.args = Some(Buffer::new(args_growth(have, args_len), "arguments")?);
     }
-    if vertices && s.vertices.is_none() {
-        s.vertices = Some(Buffer::new(SCRATCH_BYTES, "vertices")?);
+    if vertices_len > s.vertices.as_ref().map_or(0, |v| v.len) {
+        s.vertices = Some(Buffer::new(vertices_len, "vertices")?);
+        #[cfg(feature = "diagnostics")]
+        if vertices_len > SCRATCH_BYTES {
+            crate::list::cuts::GROWTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     for b in [&mut s.vertices, &mut s.args].into_iter().flatten() {
         b.keep(list);
@@ -949,6 +984,12 @@ struct Source {
     elements: Vec<Element>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Records<'a> {
+    Title(&'a Arc<Shadow>, u64),
+    Direct([u32; 5]),
+}
+
 /// Clamps an indirect rectangle draw's `max` records of `stride` bytes at
 /// title address `arguments` (host copy `args`), the record count at
 /// `count` if the title gives one, and records the passes that rewrite
@@ -960,16 +1001,21 @@ struct Source {
 /// [`Prepared::args`] with stride 16, the same buffer as its count buffer.
 /// The list's recording must hold `held` until it has gone. On error
 /// nothing was recorded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn expand(
     list: &HostList,
     held: &mut Option<Scratch>,
     inputs: &[Input],
     vertices: &[(u64, u32, u32); 32],
-    (args, arguments, stride, max): (&Arc<Shadow>, u64, u32, u32),
+    (records, stride, max): (Records, u32, u32),
+    index: Option<crate::draw::IndexView>,
     count: Option<(&Arc<Shadow>, u64)>,
     stats: Option<u64>,
 ) -> Result<Prepared, &'static str> {
-    if stride < 16 || !stride.is_multiple_of(4) || !args.gpu(arguments).is_multiple_of(4) {
+    if stride < if index.is_some() { 20 } else { 16 }
+        || !stride.is_multiple_of(4)
+        || matches!(records, Records::Title(s, at) if !s.gpu(at).is_multiple_of(4))
+    {
         return Err("rectangle records short or not 4-byte aligned");
     }
     if max > MAX_RECORDS {
@@ -1015,16 +1061,56 @@ pub(crate) fn expand(
         });
     }
     let strides: Vec<(u32, u32)> = sources.iter().map(|s| (s.slot, s.stride)).collect();
-    let Some((capacity, layouts)) = scratch_layout(&strides, SCRATCH_BYTES) else {
+    let max_src_verts = max_source_vertices(&bounds);
+    let indices = index
+        .map(|v| {
+            let bytes = match v.format {
+                57 => 2,
+                42 => 4,
+                _ => return Err("rectangle index format is not R16_UINT or R32_UINT"),
+            };
+            if !v.address.is_multiple_of(bytes) || v.size == 0 {
+                return Err("invalid rectangle index view");
+            }
+            let shadow = crate::shadow::find(v.address, v.size.into())
+                .ok_or("rectangle index buffer outside title buffers")?;
+            Ok((v, bytes as u32, shadow))
+        })
+        .transpose()?;
+    let source_limit = indices
+        .as_ref()
+        .map_or(max_src_verts, |(v, bytes, _)| v.size / bytes);
+    // Every active record may reuse the entire source. The clamp also limits
+    // a record to 2^24 vertices and a list to 2^27 vertex instances.
+    let max_per_record = match records {
+        Records::Direct(words) => words[0],
+        Records::Title(..) => 1 << 24,
+    };
+    let vertices_needed =
+        (u64::from(source_limit.min(max_per_record) / 3) * u64::from(max)).min((1 << 27) / 3) * 6;
+    let mut needed = 0u64;
+    for &(_, stride) in &strides {
+        let stride = stride
+            .checked_next_multiple_of(4)
+            .ok_or("rectangle stride overflow")?;
+        needed = (needed.next_multiple_of(16) + vertices_needed * u64::from(stride))
+            .min(u64::from(u32::MAX));
+    }
+    // A vertex view and the shader's byte offsets are 32-bit.
+    let bytes = if strides.is_empty() {
+        0
+    } else {
+        needed.clamp(SCRATCH_BYTES, u64::from(u32::MAX - 15))
+    };
+    let Some((capacity, layouts)) = scratch_layout(&strides, bytes) else {
         return Err("rectangle vertices larger than the scratch");
     };
-    let max_src_verts = max_source_vertices(&bounds);
     let Some(passes) = shaders() else {
         return Err("no rectangle expander");
     };
     let records_len = u64::from(max.max(1)) * 16;
     let need_vertices = !sources.is_empty();
-    let Some(scratch) = take_scratch(list, held, COUNTER_BYTES + records_len, need_vertices) else {
+    let Some(scratch) = take_scratch(list, held, COUNTER_BYTES + records_len, bytes) else {
         return Err("no scratch for rectangles");
     };
     let (Some(args_buffer), vertices_buffer) = (scratch.args.as_mut(), scratch.vertices.as_mut())
@@ -1054,25 +1140,46 @@ pub(crate) fn expand(
         .map_err(|_| "no immediate writes on the host list")?;
 
     // The title's buffers, as the title left them at this place.
-    args.refresh(list, arguments, u64::from(stride) * u64::from(max.max(1)));
+    let src_args = match records {
+        Records::Title(args, at) => {
+            args.refresh(list, at, u64::from(stride) * u64::from(max.max(1)));
+            args.gpu(at)
+        }
+        Records::Direct(words) => {
+            let (buffer, data) = host()
+                .and_then(|h| h.shared_buffer(20))
+                .ok_or("no memory for direct rectangle arguments")?;
+            list.keep(&buffer);
+            // SAFETY: a fresh mapped buffer retained until the recording retires.
+            unsafe {
+                data.cast::<[u32; 5]>().write_unaligned(words);
+                buffer.GetGPUVirtualAddress()
+            }
+        }
+    };
+    if let Some((v, _, shadow)) = &indices {
+        shadow.refresh(list, v.address, v.size.into());
+    }
     if let Some((s, at)) = count {
         s.refresh(list, at, 4);
     }
     for s in &sources {
         s.shadow.refresh(list, s.address, u64::from(s.size));
     }
-    let src_args = args.gpu(arguments);
-    if !crate::indirect::rewrite(
-        list,
-        src_args,
-        (0, stride, max),
-        count.map(|(s, at)| s.gpu(at)),
-        None,
-        stats,
-    ) {
+    if matches!(records, Records::Title(..))
+        && !crate::indirect::rewrite(
+            list,
+            src_args,
+            (u32::from(index.is_some()), stride, max),
+            count.map(|(s, at)| s.gpu(at)),
+            None,
+            stats,
+        )
+    {
         return Err("not bounded (no clamp)");
     }
 
+    let direct = matches!(records, Records::Direct(_));
     let args_gpu = args_buffer.gpu();
     let (counter, records) = (args_gpu, args_gpu + COUNTER_BYTES);
     let count_gpu = count.map_or(src_args, |(s, at)| s.gpu(at));
@@ -1080,14 +1187,18 @@ pub(crate) fn expand(
         max,
         stride,
         u32::from(count.is_some()),
-        max_src_verts,
+        source_limit,
         capacity,
         u32::from(need_vertices),
-        0,
+        u32::from(index.is_some()),
         0,
     ];
     let mut barriers = Vec::new();
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    // A direct indexed draw can follow a dispatch which wrote its indices.
+    if direct {
+        barriers.push(uav_barrier());
+    }
     args_buffer.to(&mut barriers, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut vertices = None;
     if need_vertices && let Some(v) = vertices_buffer {
@@ -1134,6 +1245,12 @@ pub(crate) fn expand(
             l.SetPipelineState(&passes.expand.pso);
             l.SetComputeRootUnorderedAccessView(2, src_args);
             l.SetComputeRootUnorderedAccessView(3, records);
+            let (index_gpu, index_bytes) = indices
+                .as_ref()
+                .map_or((src_args, 0), |(v, bytes, shadow)| {
+                    (shadow.gpu(v.address), *bytes)
+                });
+            l.SetComputeRootUnorderedAccessView(6, index_gpu & !3);
             for ((s, layout), table) in sources.iter().zip(&layouts).zip(tables) {
                 let src = s.shadow.gpu(s.address);
                 let to = vertices_gpu + layout.dst_offset;
@@ -1145,9 +1262,11 @@ pub(crate) fn expand(
                     s.stride,
                     layout.dst_stride,
                     s.elements.len() as u32,
-                    0,
+                    index_bytes,
+                    (index_gpu & 3) as u32,
+                    max_src_verts,
                 ];
-                l.SetComputeRoot32BitConstants(0, 8, expand.as_ptr().cast(), 0);
+                l.SetComputeRoot32BitConstants(0, 10, expand.as_ptr().cast(), 0);
                 l.SetComputeRootShaderResourceView(1, table);
                 l.SetComputeRootUnorderedAccessView(4, src & !3);
                 l.SetComputeRootUnorderedAccessView(5, to);
@@ -1576,7 +1695,8 @@ mod tests {
                 &mut held,
                 &inputs,
                 &bound,
-                (&args_copy, args.address(), 16, 5),
+                (Records::Title(&args_copy, args.address()), 16, 5),
+                None,
                 Some((&count_copy, count.address())),
                 None,
             )
@@ -1624,6 +1744,104 @@ mod tests {
         done(&mut held);
     }
 
+    #[test]
+    fn rectangle_records_fill_the_grown_vertex_scratch() {
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let test = "rectangles::tests::rectangle_records_fill_the_grown_vertex_scratch";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        // 1025 records, each covering 64 rectangles of 24-byte vertices.
+        let max = 1025;
+        let count = 3 * 64;
+        let stride = 24;
+        let (vb, _) = title_bytes((count * stride) as usize, &[]);
+        let (args, shadow) = title_records(&vec![[count, 1, 0, 0]; max as usize]);
+        let mut bound = [(0, 0, 0); 32];
+        bound[0] = (vb.address(), count * stride, stride);
+        let list = TitleList::new();
+        let mut held = None;
+        expand(
+            list.host(),
+            &mut held,
+            &[input(0, 0, 41, false)],
+            &bound,
+            (Records::Title(&shadow, args.address()), 16, max),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let left = run_and_read(&list, &mut held, max as usize, &[]);
+        assert_eq!(left.counter, max * count * 2);
+        assert!(u64::from(left.counter * stride) > SCRATCH_BYTES);
+        assert!(left.records.iter().all(|row| row[0] == count * 2));
+        host.drain();
+        done(&mut held);
+    }
+
+    #[test]
+    fn indexed_rectangles_gather_gpu_indices_and_keep_the_instance_start() {
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let test =
+            "rectangles::tests::indexed_rectangles_gather_gpu_indices_and_keep_the_instance_start";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let source = rectangle_vertices();
+        let (vertices, _copy) = title_bytes(source.len(), &source);
+        let mut bound = [(0, 0, 0); 32];
+        bound[0] = (vertices.address(), source.len() as u32, STRIDE as u32);
+        let inputs = rectangle_inputs();
+        let elements: Vec<_> = inputs.iter().map(|i| (i.offset, i.format)).collect();
+        let mut expected = vec![0; 6 * STRIDE];
+        let triplet: Vec<u8> = [2, 0, 1]
+            .iter()
+            .flat_map(|&i| source[i * STRIDE..(i + 1) * STRIDE].iter().copied())
+            .collect();
+        primitive::expand_rects(&triplet, &mut expected, STRIDE, &elements);
+        for (format, bytes) in [(57, 2usize), (42, 4)] {
+            let raw: Vec<u8> = [99u32, 99, 3, 1, 2]
+                .into_iter()
+                .flat_map(|i| i.to_le_bytes().into_iter().take(bytes))
+                .collect();
+            let (ib, _) = title_bytes(raw.len().next_multiple_of(4), &raw);
+            let index = crate::draw::IndexView {
+                address: ib.address() + bytes as u64,
+                size: (raw.len() - bytes) as u32,
+                format,
+            };
+            let record = [3u32, 2, 1, (-1i32) as u32, 7];
+            let words: Vec<u8> = record.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let (args, shadow) = title_bytes(256, &words);
+            let records = if bytes == 2 {
+                Records::Title(&shadow, args.address())
+            } else {
+                Records::Direct(record)
+            };
+            let list = TitleList::new();
+            let mut held = None;
+            expand(
+                list.host(),
+                &mut held,
+                &inputs,
+                &bound,
+                (records, 20, 1),
+                Some(index),
+                None,
+                None,
+            )
+            .expect("expanded");
+            let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
+            assert_eq!(left.records, [[6, 2, 0, 7]]);
+            assert_eq!(left.vertices.unwrap()[0], expected);
+            done(&mut held);
+        }
+        host.drain();
+    }
+
     /// A vertex buffer of exactly three vertices draws its rectangle: the
     /// source is bounded by its host copy (rounded up to 64 KiB), not 4
     /// bytes short of the title buffer's end, which dropped the record.
@@ -1653,7 +1871,8 @@ mod tests {
             &mut held,
             &inputs,
             &bound,
-            (&args_copy, args.address(), 16, 1),
+            (Records::Title(&args_copy, args.address()), 16, 1),
+            None,
             None,
             None,
         )
@@ -1706,7 +1925,8 @@ mod tests {
             &mut held,
             &inputs,
             &[(0, 0, 0); 32],
-            (&args_copy, args.address(), 16, 4),
+            (Records::Title(&args_copy, args.address()), 16, 4),
+            None,
             Some((&count_copy, count.address())),
             None,
         )
@@ -1793,7 +2013,8 @@ mod tests {
             &mut held,
             &inputs,
             &bound,
-            (&args_copy, args.address(), 16, 2),
+            (Records::Title(&args_copy, args.address()), 16, 2),
+            None,
             None,
             None,
         )

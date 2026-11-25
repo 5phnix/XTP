@@ -1269,7 +1269,12 @@ mod tests {
             &mut held,
             &[],
             &[(0, 0, 0); 32],
-            (&args_copy, args.address(), 16, 1),
+            (
+                crate::rectangles::Records::Title(&args_copy, args.address()),
+                16,
+                1,
+            ),
+            None,
             None,
             None,
         )

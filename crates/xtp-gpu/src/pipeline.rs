@@ -198,6 +198,13 @@ fn native(container: &[u8]) -> Result<Native, String> {
             }),
         None => None,
     };
+    #[cfg(feature = "diagnostics")]
+    if matches!(native.as_ref().map(|p| &p.io),
+        Some(xtp_shader::native::StageIo::Ps { db_shader_control, .. }) if db_shader_control & (1 << 16) != 0)
+    {
+        // GFX10 DB_SHADER_CONTROL.PRIMITIVE_ORDERED_PIXEL_SHADER.
+        crate::list::cuts::POPS_SHADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(match native {
         Some(p) => Native {
             wave64: p.wave64,
