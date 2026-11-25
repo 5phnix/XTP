@@ -1305,17 +1305,18 @@ impl<'a> Lower<'a> {
                 known.extend(more);
             }
         }
-        let mut work = vec![(pred, b, known)];
-        let mut seen = HashSet::new();
+        // What a lane knows entering each block by each edge: on all the
+        // paths there found so far, so it only shrinks as the search goes.
+        let mut knows: HashMap<(usize, usize), Vec<(Atom, bool)>> = HashMap::new();
+        knows.insert((pred, b), known);
+        let mut work = vec![(pred, b)];
         let mut steps = 0;
-        'paths: while let Some((from, at, known)) = work.pop() {
-            if !seen.insert((from, at, known.clone())) {
-                continue;
-            }
+        'paths: while let Some((from, at)) = work.pop() {
             steps += 1;
             if steps > UNREAD_STEPS {
                 return false;
             }
+            let known = knows[&(from, at)].clone();
             let path = Path {
                 joined: &joined,
                 at,
@@ -1372,7 +1373,19 @@ impl<'a> Lower<'a> {
                     let over = k.len().saturating_sub(MAX_KNOWN);
                     k.drain(..over);
                 }
-                work.push((at, to, k));
+                match knows.get_mut(&(at, to)) {
+                    None => {
+                        knows.insert((at, to), k);
+                    }
+                    Some(old) => {
+                        let len = old.len();
+                        old.retain(|f| k.contains(f));
+                        if old.len() == len {
+                            continue;
+                        }
+                    }
+                }
+                work.push((at, to));
             }
         }
         true
