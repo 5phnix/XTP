@@ -1075,14 +1075,23 @@ impl HostHeap {
     /// view is made in the title's dimension).
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
+            // Diagnostic (NVIDIA heap cap): title slots past the host heap,
+            // which are not mirrored, counted apart for the title's writes
+            // and for draws reading one through a table (it reads nothing);
+            // logged at each new highest slot and at each power of two.
+            // shortcut: shaders reading such a slot by heap index (not seen
+            // here) read XTP's dynamic slots, or past the heap.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            static PAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+            let higher = HIGHEST.fetch_max(index, Ordering::Relaxed) < index;
+            let n = PAST[usize::from(for_draw)].fetch_add(1, Ordering::Relaxed) + 1;
+            if higher || n.is_power_of_two() {
                 tracing::warn!(
                     index,
+                    highest = HIGHEST.load(Ordering::Relaxed),
                     count = self.count,
                     for_draw,
+                    times = n,
                     "title slot past the host heap"
                 );
             }
@@ -1098,13 +1107,14 @@ impl HostHeap {
             // index may find there.
             self.queue_texture(index, view.as_ref().map(|v| (key, v)));
         }
-        // A texture the title placed itself is viewed through the resource
-        // made for its memory, which another replaces when a texture the
-        // GPU writes comes there (#643): the record stays the same, so the
-        // slot is made again when the host texture changes. Resolved
-        // before the lock, since making the resource can wait.
+        // A texture the title placed itself is viewed (shader or unordered
+        // access) through the resource made for its memory, which another
+        // replaces when a texture the GPU writes comes there (#643): the
+        // record stays the same, so the slot is made again when the host
+        // texture changes. Resolved before the lock, since making the
+        // resource can wait.
         let placed = match &view {
-            Some(v @ View::Placed(false, resource, _)) if for_draw && resource[0] != 1 => {
+            Some(v @ View::Placed(_, resource, _)) if for_draw && resource[0] != 1 => {
                 Some(placed_texture(v))
             }
             _ => None,
@@ -1117,7 +1127,7 @@ impl HostHeap {
             |r: usize| host_copy_of(r as crate::object::This).map_or(0, |t| t.as_raw() as usize);
         let texture = match (&placed, &view) {
             (Some(p), _) => Some(match p {
-                Some(View::Shader(r, _)) => (host_of(*r), *r),
+                Some(View::Shader(r, _) | View::Unordered(r, ..)) => (host_of(*r), *r),
                 _ => (0, 0),
             }),
             (None, Some(View::Shader(r, _) | View::Unordered(r, _, _)))
@@ -2930,6 +2940,15 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 /// takes, which a shader-visible heap cannot give): the host resource it
 /// views, or `None` if the host cannot make it (or it views none).
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    // shortcut: a UAV clear (`list::clear_uav`, its one caller) moves only
+    // the texture of an unordered access view of a texture object to the
+    // state a clear needs: a clear of a texture the title placed itself is
+    // not done, as before (resolving its view with `placed_texture` there
+    // would do it).
+    if matches!(view, View::Placed(true, resource, _) if resource[0] != 1) {
+        once!("a UAV clear of a texture the title placed itself: not done");
+        return None;
+    }
     make(view, at).flatten()
 }
 
@@ -3068,12 +3087,12 @@ fn make_with(
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
+                // No resource for its memory (yet): none could be made, or
+                // its host copy is not resident; the next use asks again.
                 once!(
                     dimension = resource[0],
-                    "placed unordered texture view not mirrored"
+                    unordered,
+                    "a view of a texture the title placed itself without a host texture: null"
                 );
                 return None;
             }
@@ -3108,19 +3127,28 @@ fn copy_range(view: &View) -> Option<(u64, u64)> {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in
+/// memory itself, as a view of the resource made for that memory (on first
+/// use). Unordered access views of such textures were null before, so what
+/// shaders wrote through them was lost (in 49 of 103 sessions); they are
+/// mirrored as shader views are, and their writes stay in the host copy
+/// that later views of that memory share (`alias`).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let &View::Placed(unordered, ref resource, ref desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let texture = crate::resource::texture_at(address, resource)? as usize;
+    let desc = desc[..10].try_into().ok();
+    Some(if unordered {
+        View::Unordered(texture, 0, desc)
+    } else {
+        View::Shader(texture, desc)
+    })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -3915,6 +3943,76 @@ mod tests {
         host.mirror(1, handle, true);
         assert_eq!(kept(host), host_of(after));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(rt, 0x10)(rt), 0);
+        drop(heap);
+        crate::resource::memory_remapped(address as usize, KIB_64 as usize);
+        drop(std::mem::ManuallyDrop::into_inner(memory));
+    }
+
+    /// An unordered access view of a texture the title placed itself is
+    /// made, for a draw, over the resource made for that memory, as shader
+    /// views are (it was null: its writes were lost); a shader view placed
+    /// at the same memory later reads the same host copy, what the GPU
+    /// wrote through the first.
+    #[test]
+    fn placed_unordered_texture_views_are_made_over_their_memory() {
+        use crate::object::This;
+        use crate::resource::tests_support::target;
+        let test =
+            "descriptor::host::tests::placed_unordered_texture_views_are_made_over_their_memory";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        const KIB_64: u64 = 1 << 16;
+        // Freed only once nothing is placed in it any more.
+        let memory =
+            std::mem::ManuallyDrop::new(crate::resource::Memory::zeroed(KIB_64, KIB_64).unwrap());
+        let address = memory.address();
+        // A 16x16 RGBA8 texture placed there that shaders write.
+        // SAFETY: a description is 56 bytes, 14 words.
+        let mut resource: [u32; 14] = unsafe { std::mem::transmute_copy(&target(16, 16, 28)) };
+        const UNORDERED: u32 = 4;
+        resource[12] = UNORDERED;
+        // Format, 2D (an unordered access view's 4), mip 0, plane 0; then
+        // the address.
+        let mut uav = [0u32; 16];
+        uav[..2].copy_from_slice(&[28, 4]);
+        (uav[10], uav[11]) = (address as u32, (address >> 32) as u32);
+        let heap = crate::descriptor::TestHeap::views(4);
+        let title = crate::descriptor::heap(heap.0);
+        let host = title.host().expect("a host heap");
+        let handle = title.start + 32;
+        crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &uav, handle);
+        let kept = |h: &HostHeap, i: usize| {
+            h.kept.lock().unwrap_or_else(|e| e.into_inner())[i]
+                .as_ref()
+                .map(|t| t.as_raw() as usize)
+        };
+        let host_of = |r: This| crate::resource::host_resource(r).map(|t| t.as_raw() as usize);
+        assert!(matches!(
+            host.mirror(1, handle, true),
+            Some(View::Unordered(..))
+        ));
+        let written = crate::resource::texture_at(address, &resource).unwrap();
+        assert!(host_of(written).is_some());
+        assert_eq!(
+            kept(host, 1),
+            host_of(written),
+            "the slot views its texture"
+        );
+        // A shader view placed over the same memory, the title's
+        // description without unordered access: the GPU-written copy.
+        let mut sampled = resource;
+        sampled[12] = 0;
+        let mut srv = [0u32; 16];
+        srv[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (srv[10], srv[11]) = (uav[10], uav[11]);
+        let other = title.start + 2 * 32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &sampled, &srv, other);
+        assert!(matches!(
+            host.mirror(2, other, true),
+            Some(View::Shader(..))
+        ));
+        assert_eq!(kept(host, 2), host_of(written), "one host copy");
         drop(heap);
         crate::resource::memory_remapped(address as usize, KIB_64 as usize);
         drop(std::mem::ManuallyDrop::into_inner(memory));
