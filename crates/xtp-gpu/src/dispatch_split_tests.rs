@@ -10,12 +10,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
 use xtp_shader::native::{ComputeIo, StageIo};
 
 fn counting(axis: usize) -> HostPipeline {
-    let (container, mut native) = crate::shader_cache::wave64_program(false);
-    native.wave64 = false;
-    native.io = StageIo::Cs(ComputeIo {
-        rsrc2: 2 | 1 << (7 + axis),
-        threads: [1, 1, 1],
-    });
+    let (container, template) = crate::shader_cache::wave64_program(false);
     // s0 désigne la table UAV, s1 contient l’unique composante de GroupID demandée.
     // Chaque groupe écrit son identifiant, puis incrémente son compteur de passages.
     let words: [u32; 14] = [
@@ -34,7 +29,16 @@ fn counting(axis: usize) -> HostPipeline {
         0x8001_0203, // atomic_add au dword suivant
         0xBF81_0000,
     ];
-    native.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let native = xtp_shader::NativeProgram {
+        wave64: false,
+        float_mode: 0,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 | 1 << (7 + axis),
+            threads: [1, 1, 1],
+        }),
+        code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        ..template
+    };
     let shader = xtp_shader::emit::translate_program(&container, &native).expect("traduction");
     let shader = Arc::new(Shader {
         stage: "compute",
