@@ -3,11 +3,13 @@
 //! address and sample parts of `image`) and I1 (64-bit image atomics: its
 //! atomic branch).
 
+use std::collections::HashSet;
+
 use super::{Lower, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{Inst, Reg};
+use crate::ir::{Inst, Reg, Value};
 use crate::native::ResourceType;
 use crate::resource::{Site, Source};
 
@@ -48,6 +50,73 @@ struct SampleForm {
 /// Not a DXIL operation: a gather at a level known only at run time, made
 /// of four samples (`Lower::image`).
 const GATHER_AT_LEVEL: u32 = 1 << 16;
+
+/// A cube sample whose face operand is neither a face id nor a face id
+/// plus 8 × a slice ([`Lower::cube_view`]): the host view's dimension
+/// (cube or cube array) is not known.
+pub(super) const CUBE_FACE_UNTRACED: Why =
+    "a cube sample whose face operand is neither a face id nor a face id plus 8 × a slice";
+
+/// How far [`Lower::layer_of`] follows a face operand back.
+const LAYER_DEPTH: u32 = 12;
+
+/// The face of a cube sample: a float from the address (a cube, converted
+/// as before), or the face id taken out of a cube array's face-and-slice.
+#[derive(Debug, Clone, Copy)]
+enum CubeFace {
+    Float(V),
+    Index(V),
+}
+
+/// What a cube sample's face operand is ([`Lower::layer_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layer {
+    /// A face id, 0 to 5 (`v_cubeid_f32`): a cube.
+    Face,
+    /// A face id plus 8 × a slice: a cube array (the console's face
+    /// operand of a cube array sample).
+    Slice,
+    /// Neither, as far as the operand is followed.
+    Unknown,
+}
+
+impl Layer {
+    /// Both, at a join or a select: a cube array if either is one.
+    fn join(self, other: Layer) -> Layer {
+        match (self, other) {
+            (Layer::Unknown, _) | (_, Layer::Unknown) => Layer::Unknown,
+            (Layer::Face, Layer::Face) => Layer::Face,
+            _ => Layer::Slice,
+        }
+    }
+
+    /// A float constant: a face id, or a face id plus 8 × a slice.
+    fn of_constant(bits: u32) -> Layer {
+        let x = f32::from_bits(bits);
+        if !(x >= 0.0 && x.fract() == 0.0 && x < 16_777_216.0) {
+            return Layer::Unknown;
+        }
+        match (x as u32 % 8, x < 8.0) {
+            (0..6, true) => Layer::Face,
+            (0..6, false) => Layer::Slice,
+            _ => Layer::Unknown,
+        }
+    }
+}
+
+/// The bits of 8.0.
+const EIGHT: u32 = 0x4100_0000;
+
+/// The dword (and half, with a16) of a cube sample's face operand, its
+/// third coordinate: after the offset, bias and comparison dwords and the
+/// two face-coordinate derivatives per direction (see [`Lower::image`]).
+fn cube_face_at(f: SampleForm, a16: bool) -> (usize, Option<u32>) {
+    let whole = usize::from(f.o) + usize::from(f.b) + usize::from(f.c);
+    let grads = if f.d { 2 } else { 0 };
+    let per_direction = if f.g16 { grads.div_ceil(2) } else { grads };
+    let first = whole + 2 * per_direction;
+    if a16 { (first + 1, Some(0)) } else { (first + 2, None) }
+}
 
 fn sample_form(name: &str) -> Option<SampleForm> {
     let (gather, rest) = match name.strip_prefix("image_sample") {
@@ -203,12 +272,12 @@ impl<'a> Lower<'a> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
-        let (kind, coords) = match dim {
+        let (mut kind, coords) = match dim {
             0 => (1, 1),
             1 => (2, 2),
             2 => (4, 3),
             // Sampled (face coordinates and face, see `cube_direction`) or
-            // sized only.
+            // sized only; a cube or a cube array (`cube_view`).
             3 if name.starts_with("image_sample")
                 || name.starts_with("image_gather")
                 || name == "image_get_resinfo" =>
@@ -246,6 +315,9 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked image")?;
+        if kind == 5 {
+            kind = self.cube_view(inst, src)?;
+        }
         let store = name.starts_with("image_store");
         let uav = store
             || self
@@ -435,6 +507,12 @@ impl<'a> Lower<'a> {
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                 let x = if ch == 3 && uav || !present[ch as usize] {
                     one
+                } else if ch == 2 && kind == 9 {
+                    // The console counts a cube array's layers, six per
+                    // cube (its code divides by 6); DXIL counts cubes.
+                    let n = self.s.m.extract(c, d, ch);
+                    let six = self.s.m.i32(6);
+                    self.s.m.bin(c, Bin::Mul, n, six)
                 } else {
                     self.s.m.extract(c, d, ch)
                 };
@@ -479,7 +557,7 @@ impl<'a> Lower<'a> {
             // (the third coordinate is the face).
             let grads = match (f.d, kind) {
                 (false, _) => 0,
-                (true, 5) => 2,
+                (true, 5 | 9) => 2,
                 (true, _) => spatial,
             };
             let g16 = f.g16;
@@ -550,12 +628,12 @@ impl<'a> Lower<'a> {
                 if dmask.count_ones() != 1 {
                     return Err("a gather of several channels");
                 }
-                if !matches!(kind, 2 | 5 | 7) {
+                if !matches!(kind, 2 | 5 | 7 | 9) {
                     return Err("a gather from a 1D or 3D image");
                 }
                 if level_zero {
                     if f.c { 74 } else { 73 }
-                } else if f.c || kind == 5 {
+                } else if f.c || matches!(kind, 5 | 9) {
                     // A comparison's function is in the sampler, and a cube's
                     // texel grid is per face.
                     return Err("a gather at a level not known to be 0");
@@ -600,15 +678,30 @@ impl<'a> Lower<'a> {
                 *slot = float(self, coord_at(k))?;
             }
             let mut cube_face = None;
-            if kind == 5 {
+            if matches!(kind, 5 | 9) {
                 if *unorm || op == 81 {
                     return Err("a cube sample with texel coordinates or a level query");
                 }
                 if f.o {
                     return Err("a texel offset on a cube image");
                 }
-                cube_face = Some(cs[2]);
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                let face = if kind == 9 {
+                    // Face id plus 8 × the slice: the face is the low three
+                    // bits of the whole number, the slice the rest (the
+                    // host's array index, rounded and clamped as the
+                    // console clamps it).
+                    let i32t = self.s.t.i32;
+                    let n = self.s.m.cast(c, Cast::FpToUi, cs[2], i32t);
+                    let (k7, k3) = (self.s.m.i32(7), self.s.m.i32(3));
+                    let face = self.s.m.bin(c, Bin::And, n, k7);
+                    let slice = self.s.m.bin(c, Bin::LShr, n, k3);
+                    cs[3] = self.s.m.cast(c, Cast::UiToFp, slice, self.s.t.f32);
+                    CubeFace::Index(face)
+                } else {
+                    CubeFace::Float(cs[2])
+                };
+                cube_face = Some(face);
+                let dir = self.cube_direction(cs[0], cs[1], face);
                 cs[..3].copy_from_slice(&dir);
             }
             if *unorm {
@@ -650,7 +743,11 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            let offsets = if kind == 5 { 0 } else { spatial.min(3) };
+            let offsets = if matches!(kind, 5 | 9) {
+                0
+            } else {
+                spatial.min(3)
+            };
             let zero = self.s.m.i32(0);
             let mut os = vec![iu; 3];
             for o in os.iter_mut().take(offsets) {
@@ -1037,10 +1134,9 @@ impl<'a> Lower<'a> {
     /// The direction a cube sample's face coordinates stand for: the
     /// console takes s and t in [1, 2] (`v_cubesc`/`v_cubetc` over
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
-    /// host's cube sampling turns back into the same texel.
-    // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
-    pub(super) fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
+    /// host's cube sampling turns back into the same texel. A cube array's
+    /// slice is its own coordinate on the host ([`Self::cube_view`]).
+    fn cube_direction(&mut self, s: V, t: V, face: CubeFace) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
         let (two, three) = (k(self, 2.0), k(self, 3.0));
@@ -1069,7 +1165,7 @@ impl<'a> Lower<'a> {
     /// `dt` of its face coordinates: [`Self::cube_direction`] is linear in s
     /// and t on a face (u = 2s - 3, v = 2t - 3), so its derivative is the
     /// same table with 2 ds for u, 2 dt for v and 0 for the constant axis.
-    fn cube_gradient(&mut self, ds: V, dt: V, face: V) -> [V; 3] {
+    fn cube_gradient(&mut self, ds: V, dt: V, face: CubeFace) -> [V; 3] {
         let c = self.cur;
         let two = self.s.m.f32(2.0f32.to_bits());
         let u = self.s.m.bin(c, Bin::Mul, ds, two);
@@ -1090,10 +1186,269 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// Each row's value for cube face `face` (a float 0-5).
-    fn by_face(&mut self, face: V, table: [[V; 6]; 3]) -> [V; 3] {
+    /// A cube image instruction's view: a cube (DXIL kind 5) or a cube
+    /// array (9). The console has one image dimension for both, and the
+    /// host view is the one the title made, of the dimension its HLSL
+    /// declared, so the translation must declare the same.
+    ///
+    /// A sample or gather tells by its face operand: the console compiler
+    /// gives a cube the face id `v_cubeid_f32` makes, and a cube array that
+    /// id plus 8 × the slice (Mesa `ac_prepare_cube_coords` does the same).
+    /// A size query tells by asking for the layer count (a cube's HLSL size
+    /// has none), or by a sample of the same descriptor that is an array's.
+    /// A sample whose face operand is neither is refused
+    /// ([`CUBE_FACE_UNTRACED`]).
+    fn cube_view(&self, inst: &Inst, src: &Source) -> Result<u32, Why> {
+        let Fields::Image { dmask, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let name = inst.name();
+        if name == "image_get_resinfo" {
+            let p = self.x.p;
+            let sampled_as_array = self.descriptors.iter().any(|(&((b, i), sampler), &s)| {
+                let other = &p.blocks[b].insts[i];
+                !sampler
+                    && s == src
+                    && other.name() != "image_get_resinfo"
+                    && matches!(other.fields, Fields::Image { dim: 3, .. })
+                    && self.face_layer(other) == Layer::Slice
+            });
+            return Ok(if dmask >> 2 & 1 != 0 || sampled_as_array {
+                9
+            } else {
+                5
+            });
+        }
+        match self.face_layer(inst) {
+            Layer::Face => Ok(5),
+            Layer::Slice => Ok(9),
+            Layer::Unknown => Err(CUBE_FACE_UNTRACED),
+        }
+    }
+
+    /// What the face operand of cube sample or gather `inst` is.
+    fn face_layer(&self, inst: &Inst) -> Layer {
+        let Fields::Image { addr, a16, .. } = &inst.fields else {
+            return Layer::Unknown;
+        };
+        let Some(form) = sample_form(inst.name()) else {
+            return Layer::Unknown;
+        };
+        let regs: Vec<u8> = addr
+            .iter()
+            .filter_map(|a| match *a {
+                Operand::Vector { reg, dwords } => Some((0..dwords).map(move |k| reg + k)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let (at, half) = cube_face_at(form, *a16);
+        let Some(v) = regs.get(at).and_then(|&r| inst.read(Reg::V(r))) else {
+            return Layer::Unknown;
+        };
+        let mut seen = HashSet::new();
+        match half {
+            None => self.layer_of(v, LAYER_DEPTH, &mut seen),
+            Some(_) => self.layer_of_low_half(v, &mut seen),
+        }
+    }
+
+    /// [`Self::layer_of`] for the low f16 half of `v`: the f32 face the
+    /// half was converted from (`v_cvt_pkrtz_f16_f32`, `v_pack_b32_f16` of
+    /// a `v_cvt_f16_f32`, or that conversion alone).
+    fn layer_of_low_half(&self, v: Value, seen: &mut HashSet<Value>) -> Layer {
+        let Some((inst, f)) = self.plain_valu_def(v) else {
+            return Layer::Unknown;
+        };
+        match inst.name() {
+            "v_cvt_pkrtz_f16_f32" | "v_cvt_f16_f32" => {
+                self.layer_of_operand(inst, f, 0, LAYER_DEPTH, seen)
+            }
+            "v_pack_b32_f16" => match f.src.first() {
+                Some(&Operand::Vector { reg, .. }) => match inst.read(Reg::V(reg)) {
+                    Some(x) => self.layer_of_low_half(x, seen),
+                    None => Layer::Unknown,
+                },
+                _ => Layer::Unknown,
+            },
+            _ => Layer::Unknown,
+        }
+    }
+
+    /// What value `v`, a cube sample's face operand, is: followed back
+    /// through moves, selects and joins to the face id, or to that id plus
+    /// 8 × something (a multiply-add by 8.0, or an addition of a product by
+    /// 8.0 or of a multiple of 8). `depth` bounds the search.
+    fn layer_of(&self, v: Value, depth: u32, seen: &mut HashSet<Value>) -> Layer {
+        if depth == 0 {
+            return Layer::Unknown;
+        }
+        if !seen.insert(v) {
+            // A loop back to a value on the way: what the other arguments
+            // say (`Face` is the join's identity).
+            return Layer::Face;
+        }
+        let p = self.x.p;
+        let Some(&b) = self.def_block.get(&v) else {
+            return Layer::Unknown;
+        };
+        if let Some(phi) = p.blocks[b].phis.iter().find(|ph| ph.value == v) {
+            let mut l = Layer::Face;
+            for &a in &phi.args {
+                l = l.join(self.layer_of(a, depth - 1, seen));
+            }
+            return l;
+        }
+        let Some((inst, f)) = self.plain_valu_def(v) else {
+            return Layer::Unknown;
+        };
+        let d = depth - 1;
+        let op = |l: &Self, k: usize, seen: &mut HashSet<Value>| l.layer_of_operand(inst, f, k, d, seen);
+        let some_face = |l: Layer| matches!(l, Layer::Face | Layer::Slice);
+        match inst.name() {
+            "v_cubeid_f32" => Layer::Face,
+            "v_mov_b32" => op(self, 0, seen),
+            "v_cndmask_b32" => op(self, 0, seen).join(op(self, 1, seen)),
+            // D = S0 × S1 + D: a face plus 8 × a slice.
+            "v_fmac_f32" | "v_mac_f32" => {
+                let Some(Operand::Vector { reg, .. }) = f.dst else {
+                    return Layer::Unknown;
+                };
+                let acc = inst.read(Reg::V(reg));
+                let by_eight = (0..2).any(|k| self.constant(inst, f, k) == Some(EIGHT));
+                match acc {
+                    Some(acc) if by_eight && some_face(self.layer_of(acc, d, seen)) => {
+                        Layer::Slice
+                    }
+                    _ => Layer::Unknown,
+                }
+            }
+            // S0 × S1 + S2 (the mk and ak forms in that order).
+            "v_fma_f32" | "v_mad_f32" | "v_fmamk_f32" | "v_madmk_f32" => {
+                let by_eight = (0..2).any(|k| self.constant(inst, f, k) == Some(EIGHT));
+                if by_eight && some_face(op(self, 2, seen)) {
+                    Layer::Slice
+                } else {
+                    Layer::Unknown
+                }
+            }
+            "v_add_f32" => {
+                let eight_times = |l: &Self, k: usize| l.eight_times(inst, f, k);
+                if eight_times(self, 0) && some_face(op(self, 1, seen))
+                    || eight_times(self, 1) && some_face(op(self, 0, seen))
+                {
+                    Layer::Slice
+                } else {
+                    Layer::Unknown
+                }
+            }
+            _ => Layer::Unknown,
+        }
+    }
+
+    /// [`Self::layer_of`] of source `k` of `inst`: a constant's own, a
+    /// VGPR's value's.
+    fn layer_of_operand(
+        &self,
+        inst: &Inst,
+        f: &crate::gfx10::Valu,
+        k: usize,
+        depth: u32,
+        seen: &mut HashSet<Value>,
+    ) -> Layer {
+        if let Some(bits) = self.constant(inst, f, k) {
+            return Layer::of_constant(bits);
+        }
+        if f.neg >> k & 1 != 0 || f.abs >> k & 1 != 0 {
+            return Layer::Unknown;
+        }
+        match f.src.get(k) {
+            Some(&Operand::Vector { reg, .. }) => match inst.read(Reg::V(reg)) {
+                Some(x) => self.layer_of(x, depth, seen),
+                None => Layer::Unknown,
+            },
+            _ => Layer::Unknown,
+        }
+    }
+
+    /// Whether source `k` of `inst` is a multiple of 8: a constant one, or
+    /// a product with 8.0.
+    fn eight_times(&self, inst: &Inst, f: &crate::gfx10::Valu, k: usize) -> bool {
+        if let Some(bits) = self.constant(inst, f, k) {
+            let x = f32::from_bits(bits);
+            return x >= 0.0 && x < 16_777_216.0 && x.fract() == 0.0 && x as u32 % 8 == 0;
+        }
+        let Some(&Operand::Vector { reg, .. }) = f.src.get(k) else {
+            return false;
+        };
+        let Some((m, mf)) = inst.read(Reg::V(reg)).and_then(|x| self.plain_valu_def(x)) else {
+            return false;
+        };
+        matches!(m.name(), "v_mul_f32" | "v_mul_legacy_f32")
+            && (0..2).any(|j| self.constant(m, mf, j) == Some(EIGHT))
+    }
+
+    /// Source `k` of `inst` as a constant: an inline constant or literal,
+    /// or a register a move of one wrote (unmodified).
+    fn constant(&self, inst: &Inst, f: &crate::gfx10::Valu, k: usize) -> Option<u32> {
+        if f.neg >> k & 1 != 0 || f.abs >> k & 1 != 0 {
+            return None;
+        }
+        let reg = match *f.src.get(k)? {
+            Operand::Literal(bits) => return Some(bits),
+            Operand::Const(code) => return crate::resource::inline(code),
+            Operand::Vector { reg, .. } => Reg::V(reg),
+            Operand::Scalar { code, .. } => Reg::S(code),
+            Operand::Attr { .. } => return None,
+        };
+        let v = inst.read(reg)?;
+        let &b = self.def_block.get(&v)?;
+        let def = self.x.p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        if !matches!(def.name(), "v_mov_b32" | "s_mov_b32") {
+            return None;
+        }
+        let src = match &def.fields {
+            Fields::Valu(g) if g.dpp.is_none() && g.sdwa.is_none() && g.neg | g.abs == 0 => {
+                g.src.first()?
+            }
+            Fields::Sop { src, .. } => src.first()?,
+            _ => return None,
+        };
+        match *src {
+            Operand::Literal(bits) => Some(bits),
+            Operand::Const(code) => crate::resource::inline(code),
+            _ => None,
+        }
+    }
+
+    /// The VALU instruction that writes `v` as its result, with no DPP,
+    /// SDWA, clamp or output modifier (a move, select, multiply-add...).
+    fn plain_valu_def(&self, v: Value) -> Option<(&'a Inst, &'a crate::gfx10::Valu)> {
+        let p = self.x.p;
+        let &b = self.def_block.get(&v)?;
+        let inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let result = matches!(f.dst, Some(Operand::Vector { reg, .. })
+            if inst.write(Reg::V(reg)) == Some(v));
+        (result && f.dpp.is_none() && f.sdwa.is_none() && !f.clamp && f.omod == 0)
+            .then_some((inst, f))
+    }
+
+    /// Each row's value for cube face `face` (0-5).
+    fn by_face(&mut self, face: CubeFace, table: [[V; 6]; 3]) -> [V; 3] {
         let c = self.cur;
-        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        let f = match face {
+            CubeFace::Float(x) => self.s.m.cast(c, Cast::FpToUi, x, self.s.t.i32),
+            CubeFace::Index(n) => n,
+        };
         table.map(|row| {
             let mut r = row[0];
             for (n, &x) in row.iter().enumerate().skip(1) {
