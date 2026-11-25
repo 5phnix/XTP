@@ -1307,7 +1307,8 @@ impl<'a> Tracer<'a> {
     /// other side. So wherever these lanes may take the side a lane of the
     /// wave can leave them on, every path from the other side must come
     /// into `block` from `q` too. For a branch on SCC either side may be
-    /// the wave's.
+    /// the wave's. Paths here take back edges too: a wave sent round a loop
+    /// by other lanes can come into `block` from elsewhere a pass later.
     fn wave_comes_by(&self, block: usize, q: usize, known: &Known) -> bool {
         let Some(lanes) = self.lanes else {
             return false;
@@ -1318,15 +1319,7 @@ impl<'a> Tracer<'a> {
         let Some(&top) = idom.get(block).filter(|&&d| d != usize::MAX) else {
             return false;
         };
-        let forward = |a: usize| {
-            blocks[a]
-                .exit
-                .successors()
-                .into_iter()
-                .filter(move |&s| self.rpo[s] > self.rpo[a])
-        };
-        // The blocks that lead to `to` over forward edges, not through
-        // `block`.
+        // The blocks that lead to `to`, not through `block`.
         let leading = |to: usize| {
             let mut seen = vec![false; blocks.len()];
             let mut stack = vec![to];
@@ -1334,13 +1327,7 @@ impl<'a> Tracer<'a> {
                 if x == block || std::mem::replace(&mut seen[x], true) {
                     continue;
                 }
-                stack.extend(
-                    blocks[x]
-                        .preds
-                        .iter()
-                        .copied()
-                        .filter(|&p| self.rpo[p] < self.rpo[x]),
-                );
+                stack.extend(&blocks[x].preds);
             }
             seen
         };
@@ -1359,10 +1346,11 @@ impl<'a> Tracer<'a> {
                 if y == q || !to_block[y] || std::mem::replace(&mut seen[y], true) {
                     continue;
                 }
-                if blocks[y].exit.successors().contains(&block) {
+                let next = blocks[y].exit.successors();
+                if next.contains(&block) {
                     return true;
                 }
-                stack.extend(forward(y));
+                stack.extend(next);
             }
             false
         };
@@ -1373,7 +1361,7 @@ impl<'a> Tracer<'a> {
             if x == block || !to_block[x] || std::mem::replace(&mut region[x], true) {
                 continue;
             }
-            stack.extend(forward(x));
+            stack.extend(blocks[x].exit.successors());
         }
         for x in (0..blocks.len()).filter(|&x| region[x]) {
             let LaneExit::Branch {
