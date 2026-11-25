@@ -233,6 +233,22 @@ Le shader aurait besoin de la correspondance décrite en §5.4 pour choisir
 la copie, vérifier les limites et conserver l'identité des écritures et
 des opérations atomiques.
 
+Sur le L4 en vagues de 32 lanes, `translate --list --validate --pipelines`
+sur `1084cf6` donne **21 DXIL validés et 21 pipelines créés parmi les
+34 programmes de la session (+21, 0 perdu)**. Ce sont les 13 programmes
+à vue racine, les six à adresse compactée, ainsi que `162216b9` et
+`3df629ff`. Les 13 autres s'arrêtent au suivi d'adresse. Parmi eux,
+`5e687674` reste le refus de l'item 312. Les trois autres empreintes
+suivies par cet item (`caa78b8c`, `28918b71`, `4ddd6f97`) ont un
+pipeline. Sur les 52 conteneurs de la bibliothèque, le même relevé passe
+de 0 à 30 DXIL validés et pipelines créés.
+
+Le pack du titre et la bibliothèque système se mesurent séparément. Sur la
+ferme, la comparaison de `6e99955` et `1084cf6` avec
+`shader-survey --host-lanes 32-32 --json` donne les mêmes résultats pour
+les 26 698 programmes, entrée par entrée. Les 25 725 programmes traduits
+ont tous conservé la même empreinte DXIL.
+
 **Image impact:** the largest dispatch count of all classes (223 a frame),
 but the builder only makes the ray-tracing structure. Nothing is lit by it
 until the trace programs of §3.2 translate too.
