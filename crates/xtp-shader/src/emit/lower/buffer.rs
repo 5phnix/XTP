@@ -531,11 +531,11 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if halfword {
-            let Some(Operand::Vector { reg, .. }) = *data else {
+            let Some(d @ Operand::Vector { reg, .. }) = data else {
                 return Err(name);
             };
             let source = if store {
-                Some(self.vgprs(inst, data.as_ref().unwrap(), 1)?[0])
+                Some(self.vgprs(inst, d, 1)?[0])
             } else {
                 None
             };
@@ -548,7 +548,7 @@ impl<'a> Lower<'a> {
             let xs =
                 self.guarded_values(Some(enabled), |l| Ok(l.raw_halfword(handle, byte, source)))?;
             if !store {
-                self.write(inst, Reg::V(reg), xs[0], guard);
+                self.write(inst, Reg::V(*reg), xs[0], guard);
             }
             return Ok(());
         }

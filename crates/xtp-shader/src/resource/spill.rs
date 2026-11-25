@@ -157,6 +157,10 @@ impl Tracer<'_> {
         };
         let root = self.layout.get(param)?;
         let offset = offset.checked_add(field)?;
+        let end = offset.checked_add(4 * inst.writes.len() as u32)?;
+        if end > super::MISALIGNED_SRV_BYTES {
+            return None;
+        }
         (root.root == crate::native::RootType::Constants && offset.is_multiple_of(4)).then_some(
             super::ConstantRead {
                 slot: root.slot,

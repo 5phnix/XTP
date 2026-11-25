@@ -134,6 +134,9 @@ pub struct ConstantRead {
     pub offset: u32,
 }
 
+/// Taille maximale de la copie d'une SRV racine mal alignée sur l'hôte.
+pub const MISALIGNED_SRV_BYTES: u32 = 1 << 20;
+
 /// Waterfall loops over descriptors that differ between lanes: each pass
 /// reads the first active lane's descriptor with `v_readfirstlane_b32`,
 /// compares it with every lane's own (`v_cmp_eq`), and runs the access with

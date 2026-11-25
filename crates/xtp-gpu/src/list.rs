@@ -1471,10 +1471,9 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// - So the flags are taken as that register, and bit 5
 ///   ([`USE_THREAD_DIMENSIONS`]) makes the counts threads. Without bit 1
 ///   the command processor runs whole groups, the last one rounded up (radv
-///   dispatches rays that way and lets its shaders check their bounds):
-///   what the host runs too, so no thread needs masking. A dispatch with
-///   bit 1 is logged ([`PARTIAL_GROUPS`]): there the host runs threads the
-///   console would not.
+///   dispatches rays that way and lets its shaders check their bounds).
+///   Pour le constructeur, les tailles en threads sont aussi transmises au
+///   shader : il masque les lanes de queue, comme dans le fork (#646).
 ///
 /// `XTP_DISPATCH_X_THREADS` sets other bits (`0` for none: every count is
 /// a group count, as before).

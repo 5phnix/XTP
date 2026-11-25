@@ -146,7 +146,7 @@ const CBV_SPAN: u64 = 1 << 16;
 /// The bytes of a root SRV not on 16 bytes of its host copy that are
 /// copied for its view: what was brought up to date for root SRVs before
 /// they were bounded (the view has no size of its own).
-const MISALIGNED_SPAN: u64 = 1 << 20;
+const MISALIGNED_SPAN: u64 = xtp_shader::resource::MISALIGNED_SRV_BYTES as u64;
 
 /// Bytes of the list's own memory per chunk, past which nothing is placed:
 /// [`CBV_SPAN`] more follow, so a root CBV copied there never reads past

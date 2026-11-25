@@ -245,6 +245,98 @@ fn unused_entry_pointer_has_no_spill_bindings() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn reads_a_packed_address_and_an_adjacent_pair_from_spilled_constants() {
+    use super::host::{Dispatch, Host, Root, Stride, View};
+    let mut words = [
+        PTR.as_slice(),
+        &[
+            0xF404_0201,
+            0xFA00_0000, // UAV dans s[8:9].
+            0xF404_0101,
+            0xFA00_0008, // Constantes dans s[4:5].
+            0xF400_0302,
+            0xFA00_0008, // Lecture par la paire complète.
+            0xBE85_0380,
+            0x8F84_8804,
+            0x8804_8C04, // Adresse en unités de 256 octets + 12.
+            0xF400_0342,
+            0xFA00_0000,
+            0xBE8A_03C1,
+            0xBE8B_03FF,
+            0x3101_4FAC,
+            0x7E04_020C,
+            0x7E06_020D,
+            0xE070_0000,
+            0x8002_0200,
+            0xE070_0004,
+            0x8002_0300,
+            END,
+        ],
+    ]
+    .concat();
+    let program = |w: &[u32]| {
+        let mut n = root_uav_program(w, [1; 3], false);
+        n.layout.push(param(RootType::Constants, 18, 2, 6));
+        n
+    };
+    let n = program(&words);
+    let resources = track(&n).unwrap();
+    let reads: Vec<_> = resources
+        .constant_reads
+        .values()
+        .map(|r| (r.slot, r.dword, r.packed, r.offset))
+        .collect();
+    assert_eq!(reads, [(6, 0, false, 8), (6, 0, true, 12)]);
+    words.insert(12, 0xBE85_0380); // Écraser le mot haut du décalage rompt la preuve.
+    assert!(track(&program(&words)).is_err());
+    let bytes = crate::dxbc::build(&[]);
+    let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&cs).unwrap();
+    let mut ud = vec![0; cs.user_data_dwords() as usize];
+    for u in &cs.user_data {
+        ud[u.index as usize] = match u.root {
+            super::SCALAR_ADDRESS_SRV => 1,
+            super::PACKED_ADDRESS_SRV => 2,
+            _ => 0,
+        };
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(ud)),
+                    (
+                        1,
+                        Root::Table {
+                            sampler: false,
+                            index: 0,
+                        },
+                    ),
+                ],
+                groups: [1; 3],
+                samplers: &[],
+                views: &[
+                    View::RawUav(2),
+                    View::Buffer {
+                        data: &[7, 5, 3, 1],
+                        stride: Stride::Raw,
+                    },
+                    View::Buffer {
+                        data: &[2, 4, 6, 8],
+                        stride: Stride::Raw,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    assert_eq!(out[0], [3, 8]);
+}
+
 #[test]
 fn phi_merges_reloads_only_for_the_same_spilled_descriptor() {
     let mut code = [
