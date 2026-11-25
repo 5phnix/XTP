@@ -203,6 +203,9 @@ pub struct Io {
     pub exports: Vec<Export>,
     /// Number of defined entry SGPRs when the stage layout is known.
     pub initialized_sgprs: Option<u8>,
+    /// A geometry shader's shape, from its container's `PSV0`
+    /// (`emit::emit_for` sets it; [`raise`] cannot, having no container).
+    pub(crate) geometry: Option<crate::emit::GsShape>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for

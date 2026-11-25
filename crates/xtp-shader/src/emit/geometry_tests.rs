@@ -24,9 +24,13 @@ use super::lower::geometry::{
     self, EsPlan, GsPlan, GsShape, Message, Primitive, RingAccess, Slot, Topology, Vertices,
 };
 use super::shader::Shader;
+use super::{HostShader, container};
+use crate::dxbc::{self, Container, FourCC};
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{self, Exit, Inst, Program, Reg};
-use crate::native::{GeometryIo, HwStage};
+use crate::native::{
+    ExportIo, GeometryIo, HwStage, NativeProgram, StageIo, Usage, VsOutput,
+};
 use crate::resource::Site;
 
 // GFX10 encodings (AMD's RDNA ISA reference).
@@ -253,12 +257,18 @@ enum Step {
 
 fn gs_program(steps: &[Step], max_vertices: u32) -> Program {
     let mut code = Code::default();
-    gs_prelude(&mut code, max_vertices * VERTEX_DWORDS * 4);
+    gs_code(&mut code, steps, max_vertices);
+    code.program()
+}
+
+/// [`gs_program`]'s code, after what `code` holds.
+fn gs_code(code: &mut Code, steps: &[Step], max_vertices: u32) {
+    gs_prelude(code, max_vertices * VERTEX_DWORDS * 4);
     let mut n = 0;
     for &step in steps {
         match step {
             Step::Emit(k) | Step::EmitCut(k) | Step::EmitDone(k) => {
-                gs_vertex(&mut code, n, k);
+                gs_vertex(code, n, k);
                 code.add([match step {
                     Step::Emit(_) => EMIT,
                     Step::EmitCut(_) => EMIT_CUT,
@@ -271,7 +281,6 @@ fn gs_program(steps: &[Step], max_vertices: u32) -> Program {
         }
     }
     code.add([S_ENDPGM]);
-    code.program()
 }
 
 fn shape(max_vertices: u32) -> GsShape {
@@ -432,7 +441,7 @@ fn es_tail(code: &mut Code) {
     }
     code.add(ds(DS_WRITE2_B32, 0, 15, [20, 21], 4, 5));
     code.add(ds(DS_WRITE2_B32, 0, 15, [22, 23], 6, 7));
-    code.add(ds_at(DS_WRITE_B32, 0, 15, geometry::ES_VERTEX_ID, 32));
+    code.add(ds_at(DS_WRITE_B32, 0, 15, crate::io::ES_VERTEX_ID, 32));
     code.add([S_BARRIER, sop1(S_SETPC_B64, 0, 6)]);
 }
 
@@ -1172,7 +1181,7 @@ fn lower_es(p: &Program, plan: &EsPlan) -> Vec<u8> {
     let undef = s.m.undef(i32t);
     let args = [s.m.i32(0), s.m.i32(0), s.m.i8(0), undef];
     let id = s.op(block, "loadInput.i32", Attr::ReadNone, i32t, 4, &args);
-    let mut regs = HashMap::from([(Reg::V(geometry::ES_VERTEX_ID), id)]);
+    let mut regs = HashMap::from([(Reg::V(crate::io::ES_VERTEX_ID), id)]);
     let writes: HashMap<Site, &RingAccess> = plan.writes.iter().map(|w| (w.site, w)).collect();
     let outputs = item();
     for (b, blk) in p.blocks.iter().enumerate() {
@@ -1608,6 +1617,148 @@ fn geometry_es_and_gs_pair_streams_out() {
         return;
     };
     let words = stream_out(&host, &vs, &gs, &outputs(), 6).expect("a draw");
+    let mut want = Vec::new();
+    for prim in 0..2 {
+        for (n, k) in [1, 2, 0].into_iter().enumerate() {
+            want.push(record(es_word, prim, n as u32, k));
+        }
+    }
+    assert_eq!(records(&words), want);
+}
+
+/// The vertex shader container of an ES of [`es_program`]'s form, its
+/// lane set-up first, as the translation takes it: the ES beside its
+/// output signature (the ring item's rows).
+fn es_container() -> (Vec<u8>, NativeProgram) {
+    let mut code = Code::default();
+    lane_prologue(&mut code, 0);
+    code.add(es_code().words);
+    es_position(&mut code, ES_CONSTANTS[..4].try_into().unwrap());
+    es_tail(&mut code);
+    let out = |usage, row| VsOutput {
+        usage,
+        row,
+        param: 0,
+        fp16: false,
+        pack2: false,
+    };
+    let native = merged_native(
+        HwStage::Es,
+        &code.words,
+        StageIo::Es(ExportIo {
+            inputs: Vec::new(),
+            outputs: vec![
+                out(Usage::Other(0), 0),
+                out(Usage::Generic, 1),
+                out(Usage::Generic, 2),
+            ],
+            item_dwords: 12,
+        }),
+    );
+    let osg1 = container::signature(&item(), false);
+    (dxbc::build(&[(FourCC::OSG1, &osg1)]), native)
+}
+
+/// The geometry shader container of [`gs_program`]`(steps, 3)`, its lane
+/// set-up first: its input signature (the ES's item), its stream 0, and a
+/// `PSV0` of its shape (`psv` false: none).
+fn gs_container(steps: &[Step], psv: bool) -> (Vec<u8>, NativeProgram) {
+    let mut code = Code::default();
+    lane_prologue(&mut code, 8);
+    gs_code(&mut code, steps, 3);
+    let mut gs_io = gs_io(3, 1);
+    gs_io.outputs = (0..4)
+        .map(|row| VsOutput {
+            usage: if row == 0 {
+                Usage::Other(0)
+            } else {
+                Usage::Generic
+            },
+            row,
+            param: 0,
+            fp16: false,
+            pack2: false,
+        })
+        .collect();
+    let native = merged_native(HwStage::Gs, &code.words, StageIo::Gs(gs_io));
+    let (isg1, osg1) = (
+        container::signature(&item(), true),
+        container::signature(&outputs(), false),
+    );
+    let shape = gs_psv(3, 5, 1, 2, 3);
+    let mut parts = vec![(FourCC::ISG1, &isg1[..]), (FourCC::OSG1, &osg1[..])];
+    if psv {
+        parts.push((FourCC::PSV0, &shape[..]));
+    }
+    (dxbc::build(&parts), native)
+}
+
+/// A wave64 console program of a merged half with no root parameters: the
+/// GS's ring base comes from user data no root parameter holds (the
+/// console driver's table).
+fn merged_native(stage: HwStage, words: &[u32], io: StageIo) -> NativeProgram {
+    NativeProgram {
+        stage,
+        wave64: true,
+        float_mode: 0,
+        vgprs: 64,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io,
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// What the translation makes of `container` and its program, panicking
+/// with the step and reason when it refuses it.
+fn translated(what: &str, (container, native): (Vec<u8>, NativeProgram)) -> HostShader {
+    let c = Container::parse(&container).expect("a container");
+    let host = super::translate_program(&c, &native)
+        .unwrap_or_else(|(step, e)| panic!("{what}: {}: {e}", step.name()));
+    validate(what, &host.dxil);
+    host
+}
+
+/// The pair through the translation itself (W10's second phase): each
+/// half's EXEC set-up from s3 left out, the GS's ring base, loaded from the
+/// console driver's table, left out of its resources, the ES translated as
+/// a vertex shader and the GS as a geometry shader (`gs_6_6`). Drawn, they
+/// stream out what the console's copy shader would read from the ring. A
+/// GS container without a `PSV0` has no shape, and is refused.
+#[test]
+fn geometry_pair_translates_and_streams_out() {
+    let vs = translated("the ES", es_container());
+    assert_eq!(vs.stage, HwStage::Es);
+    let dxil = Container::parse(&vs.dxil).expect("a container");
+    let program = dxil.part(FourCC::DXIL).expect("a DXIL part").data;
+    assert_eq!(&program[..4], &(1u32 << 16 | 0x66).to_le_bytes(), "vs_6_6");
+    let steps = [
+        Step::Emit(1),
+        Step::Emit(2),
+        Step::Emit(0),
+        Step::Cut,
+        Step::Done,
+    ];
+    let gs = translated("the GS", gs_container(&steps, true));
+    assert_eq!(gs.stage, HwStage::Gs);
+    assert!(gs.user_data.is_empty(), "the ring base's table is not read");
+    let dxil = Container::parse(&gs.dxil).expect("a container");
+    let psv = dxil.part(FourCC::PSV0).expect("a PSV0 part").data;
+    assert_eq!(GsShape::of(psv, &gs_io(3, 1)), Ok(shape(3)));
+
+    let (container, native) = gs_container(&steps, false);
+    let c = Container::parse(&container).expect("a container");
+    match super::translate_program(&c, &native) {
+        Err((super::Step::Resources, crate::ShaderError::Unsupported { what, .. })) => {
+            assert_eq!(what, geometry::PSV);
+        }
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+
+    let Some((host, _one)) = device() else {
+        return;
+    };
+    let words = stream_out(&host, &vs.dxil, &gs.dxil, &outputs(), 6).expect("a draw");
     let mut want = Vec::new();
     for prim in 0..2 {
         for (n, k) in [1, 2, 0].into_iter().enumerate() {

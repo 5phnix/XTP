@@ -58,24 +58,19 @@
 //! refused, as are emits on other streams than 0: none of the title's
 //! programs writes one, so the ring layout of streams 1 to 3 is not known.
 
-#![cfg_attr(
-    not(all(test, windows)),
-    expect(
-        dead_code,
-        reason = "the lowering and the translation entry call it from W10's second phase on \
-                  (docs/analysis/es-gs.md, section 6)"
-    )
-)]
-
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::Why;
-use crate::emit::bitcode::{Attr, Cast, V};
+use super::{Lower, Stop, Val, Why, unsupported};
+use crate::ShaderError;
+use crate::dxbc::{Container, FourCC};
+use crate::emit::bitcode::{Attr, Cast, Term, V};
 use crate::emit::container::SigElement;
 use crate::emit::shader::Shader;
-use crate::gfx10::{Fields, NULL, Operand, Valu};
-use crate::ir::{EXEC, Inst, M0, Program, Reg, Value, idoms, reverse_postorder};
-use crate::native::{GeometryIo, HwStage};
+use crate::gfx10::{Encoding, Fields, Instruction, NULL, Operand, Valu};
+use crate::io::Io;
+use crate::ir::{EXEC, Exit, Inst, M0, Program, Reg, Value, idoms, reverse_postorder};
+use crate::native::{GeometryIo, HwStage, NativeProgram, StageIo, VsOutput};
 use crate::resource::{Site, inline};
 
 /// A ring access the rings do not explain: an address the plans cannot
@@ -140,11 +135,6 @@ pub(crate) const GS_MAX_INSTANCES: u32 = 32;
 /// adjacent vertices, in v4) are the GFX9 merged layout, not seen in use.
 pub(crate) const VERTEX_OFFSETS: [(u8, u8); 6] =
     [(0, 0), (0, 16), (1, 0), (1, 16), (4, 0), (4, 16)];
-
-/// The VGPR holding an ES lane's vertex id (v0 to v4 hold the GS half's
-/// inputs, which the ES keeps): what the title's ES programs index their
-/// vertex streams with ([`crate::io::ES_VERTEX_ID`]).
-pub(crate) const ES_VERTEX_ID: u8 = crate::io::ES_VERTEX_ID;
 
 /// `s_sendmsg` message ids (bits 0-3) of the GS messages.
 const MSG_GS: u16 = 2;
@@ -1771,5 +1761,324 @@ impl Vertices {
     pub(crate) fn cut(s: &mut Shader, block: usize) {
         let (stream, void) = (s.m.i8(0), s.t.void);
         s.op(block, "cutStream", Attr::NoUnwind, void, 98, &[stream]);
+    }
+}
+
+// The translation's use of the plans (`docs/analysis/es-gs.md`, section 6):
+// the entry point prepares a merged half and its resources, the lowering
+// calls the hooks below at the plans' sites.
+
+/// A merged half whose stage data the translation does not read
+/// (`native.rs`): no ring layout, no outputs.
+pub(crate) const STAGE_DATA: Why =
+    "a merged ES + GS program whose stage data the translation does not read";
+/// A ring row holding two 16-bit values per dword: the ring dword is no
+/// signature element's 32-bit value.
+pub(crate) const HALF: Why = "a 16-bit row in a merged ES + GS ring";
+
+fn refused(what: Why) -> ShaderError {
+    ShaderError::Unsupported { offset: 0, what }
+}
+
+/// A merged half's program as the rest of the translation takes it: each
+/// half's EXEC set-up from s3 left out ([`drop_lane_prologue`]); other
+/// stages' as they are.
+pub(crate) fn prepared(mut p: Program, stage: HwStage) -> Result<Program, ShaderError> {
+    drop_lane_prologue(&mut p, stage).map_err(refused)?;
+    Ok(p)
+}
+
+/// The shape of the geometry shader of `c`, whose console program is
+/// `native` ([`GsShape::of`]).
+fn shape_of(c: &Container, native: &NativeProgram) -> Result<GsShape, ShaderError> {
+    let StageIo::Gs(io) = &native.io else {
+        return Err(refused(STAGE_DATA));
+    };
+    let psv = c.part(FourCC::PSV0).ok_or(refused(PSV))?.data;
+    GsShape::of(psv, io).map_err(refused)
+}
+
+/// The program the resource tracker reads: in a merged half, the scalar
+/// loads that only set up ring addresses ([`EsPlan::address_only`],
+/// [`GsPlan::address_only`]) are an `s_nop` with the same results. They read
+/// a table of the console's driver (the GS's ring base), which no root
+/// parameter holds; the lowering leaves them out. A plan's refusal is
+/// reported here, at the resources' step: the plan says which loads those
+/// are.
+// shortcut: until `resource::track` takes the sites to leave out (es-gs.md,
+// section 6, item 5), it reads this copy; sites and values are the same.
+pub(crate) fn tracked<'p>(
+    c: &Container,
+    p: &'p Program,
+    native: &NativeProgram,
+) -> Result<Cow<'p, Program>, ShaderError> {
+    let address_only = match native.stage {
+        HwStage::Es => es_plan(p).map_err(refused)?.address_only,
+        HwStage::Gs => {
+            gs_plan(p, &shape_of(c, native)?)
+                .map_err(refused)?
+                .address_only
+        }
+        _ => return Ok(Cow::Borrowed(p)),
+    };
+    let loads: Vec<Site> = address_only
+        .into_iter()
+        .filter(|&(b, i)| matches!(p.blocks[b].insts[i].fields, Fields::Smem { .. }))
+        .collect();
+    if loads.is_empty() {
+        return Ok(Cow::Borrowed(p));
+    }
+    let mut q = p.clone();
+    for (b, i) in loads {
+        let inst = &mut q.blocks[b].insts[i];
+        inst.machine = Instruction {
+            offset: inst.machine.offset,
+            encoding: Encoding::Sopp,
+            opcode: 0,
+            words: vec![0xBF80_0000],
+        };
+        inst.fields = Fields::Sopp { imm: 0 };
+        inst.reads.clear();
+    }
+    Ok(Cow::Owned(q))
+}
+
+/// `io` with the geometry shader's shape ([`Io::geometry`]) when `native`
+/// is a GS: its container's `PSV0` gives it, which the lowering does not
+/// read.
+pub(crate) fn with_shape<'i>(
+    c: &Container,
+    native: &NativeProgram,
+    io: &'i Io,
+) -> Result<Cow<'i, Io>, ShaderError> {
+    if native.stage != HwStage::Gs || io.geometry.is_some() {
+        return Ok(Cow::Borrowed(io));
+    }
+    Ok(Cow::Owned(Io {
+        geometry: Some(shape_of(c, native)?),
+        ..io.clone()
+    }))
+}
+
+/// DXC's interpolation of a vertex output by its kind and component type,
+/// as `emit_for` declares a vertex shader's: a geometry shader's inputs
+/// are declared as the vertex shader's outputs they are.
+fn vertex_interp(e: &SigElement) -> u8 {
+    match (e.kind, e.comp) {
+        (3, _) => 4,
+        (13, _) => 1,
+        (28, _) => 2,
+        (0 | 6 | 7, 9) => 2,
+        (0, _) => 1,
+        _ => 0,
+    }
+}
+
+/// What the lowering of a merged half needs at its plan's sites.
+pub(super) struct Merged {
+    stage: HwStage,
+    /// GS ring reads, ES or GS ring writes, by site.
+    reads: HashMap<Site, Vec<(Reg, Slot)>>,
+    writes: HashMap<Site, Vec<(Reg, Slot)>>,
+    messages: HashMap<Site, Message>,
+    emits: BTreeMap<Site, Vec<Written>>,
+    address_only: BTreeSet<Site>,
+    vertices: Vertices,
+    /// The shader's signatures, as declared.
+    inputs: Vec<SigElement>,
+    outputs: Vec<SigElement>,
+}
+
+impl Lower<'_> {
+    /// Before the blocks: an ES or GS program's plan, and for a GS its
+    /// geometry state and input declarations.
+    pub(super) fn merged_start(&mut self) -> Result<(), Stop> {
+        let x = self.x;
+        let stage = x.native.stage;
+        let rows = |outputs: &[VsOutput]| outputs.iter().any(|o| o.fp16 || o.pack2);
+        let half = |els: &[SigElement]| els.iter().any(|e| e.half);
+        let fail = |what| unsupported(0, what);
+        let mut m = Merged {
+            stage,
+            reads: HashMap::new(),
+            writes: HashMap::new(),
+            messages: HashMap::new(),
+            emits: BTreeMap::new(),
+            address_only: BTreeSet::new(),
+            vertices: Vertices::default(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+        match (&x.native.io, stage) {
+            (StageIo::Es(es), HwStage::Es) => {
+                if rows(&es.outputs) || half(&self.s.outputs) {
+                    return Err(fail(HALF));
+                }
+                let plan = es_plan(x.p).map_err(fail)?;
+                m.writes = plan
+                    .writes
+                    .into_iter()
+                    .map(|w| (w.site, w.dwords))
+                    .collect();
+                m.address_only = plan.address_only;
+            }
+            (StageIo::Gs(gs), HwStage::Gs) => {
+                if rows(&gs.outputs) || half(&self.s.inputs) || half(&self.s.outputs) {
+                    return Err(fail(HALF));
+                }
+                let shape = x.io.geometry.ok_or_else(|| fail(PSV))?;
+                for e in &mut self.s.inputs {
+                    e.interp = vertex_interp(e);
+                }
+                shape
+                    .check(&self.s.inputs, &self.s.outputs)
+                    .map_err(fail)?;
+                let plan = gs_plan(x.p, &shape).map_err(fail)?;
+                m.reads = plan.reads.into_iter().map(|r| (r.site, r.dwords)).collect();
+                m.writes = plan
+                    .writes
+                    .into_iter()
+                    .map(|w| (w.site, w.dwords))
+                    .collect();
+                m.messages = plan.messages.into_iter().collect();
+                m.emits = plan.emits;
+                m.address_only = plan.address_only;
+                self.s.geometry = Some(shape);
+            }
+            (_, HwStage::Es | HwStage::Gs) => return Err(fail(STAGE_DATA)),
+            _ => return Ok(()),
+        }
+        m.inputs = self.s.inputs.clone();
+        m.outputs = self.s.outputs.clone();
+        self.merged = Some(Box::new(m));
+        Ok(())
+    }
+
+    /// Instruction `(b, i)` of a merged half where the plan says what it is
+    /// (`None` elsewhere): ring set-up is left out, ring reads load inputs,
+    /// ES ring writes store outputs, GS ring writes are kept until their
+    /// vertex's emit, messages emit and cut. The halves' barriers and the
+    /// ES's jump to the GS half have no host form: the rings they order are
+    /// gone.
+    pub(super) fn merged_inst(&mut self, b: usize, i: usize) -> Option<Result<(), Stop>> {
+        let mut m = self.merged.take()?;
+        let r = self.merged_site(&mut m, b, i);
+        self.merged = Some(m);
+        r
+    }
+
+    fn merged_site(&mut self, m: &mut Merged, b: usize, i: usize) -> Option<Result<(), Stop>> {
+        let inst: &Inst = &self.x.p.blocks[b].insts[i];
+        let site = (b, i);
+        let offset = inst.machine.offset;
+        if m.address_only.contains(&site) || matches!(inst.name(), "s_barrier" | "s_setpc_b64") {
+            return Some(Ok(()));
+        }
+        if let Some(dwords) = m.reads.get(&site) {
+            return Some(self.merged_read(inst, b, i, &m.inputs, dwords));
+        }
+        if let Some(dwords) = m.writes.get(&site) {
+            let r = match m.stage {
+                HwStage::Es => self.item_write(inst, b, i, &m.outputs, dwords),
+                _ => dwords.iter().try_for_each(|&(reg, _)| {
+                    let v = inst.read(reg).ok_or("an unread operand")?;
+                    let value = self.i32_of(v)?;
+                    m.vertices.write(site, reg, value);
+                    Ok(())
+                }),
+            };
+            return Some(r.map_err(|why| unsupported(offset, why)));
+        }
+        let &message = m.messages.get(&site)?;
+        Some(
+            self.message(m, b, i, message)
+                .map_err(|why| unsupported(offset, why)),
+        )
+    }
+
+    /// A GS ring read: each dword it loads is that input vertex's
+    /// signature element, under the instruction's lane guard. A dword no
+    /// element holds reads as missing ([`NOT_INPUT`]).
+    fn merged_read(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        inputs: &[SigElement],
+        dwords: &[(Reg, Slot)],
+    ) -> Result<(), Stop> {
+        let guard = self
+            .guard(b, i)
+            .map_err(|why| unsupported(inst.machine.offset, why))?;
+        for &(reg, slot) in dwords {
+            match read_vertex(&mut self.s, self.cur, inputs, slot) {
+                Ok(v) => self.write_placed(inst, reg, v, guard),
+                Err(why) => self.set(inst.write(reg), Val::Missing(why)),
+            }
+        }
+        Ok(())
+    }
+
+    /// An ES ring write: each item dword is the vertex shader's output at
+    /// its row and column, stored by the lanes the instruction runs in.
+    fn item_write(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        outputs: &[SigElement],
+        dwords: &[(Reg, Slot)],
+    ) -> Result<(), Why> {
+        let values = dwords
+            .iter()
+            .map(|&(reg, slot)| {
+                let v = inst.read(reg).ok_or("an unread operand")?;
+                Ok((slot.dword, self.i32_of(v)?))
+            })
+            .collect::<Result<Vec<_>, Why>>()?;
+        let guard = self.guard(b, i)?;
+        let at = self.begin_guarded(guard);
+        for (dword, value) in values {
+            write_item(&mut self.s, self.cur, outputs, dword, value);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// A GS message: an emit stores its vertex and emits it, a cut ends the
+    /// strip, under the lanes' EXEC where some lane outside it gets there.
+    fn message(&mut self, m: &Merged, b: usize, i: usize, message: Message) -> Result<(), Why> {
+        if message == Message::Done {
+            return Ok(());
+        }
+        let guard = self.scalar_guard(b, i)?;
+        let at = self.begin_guarded(guard);
+        match message {
+            Message::Emit { cut, .. } => {
+                let dwords = m.emits.get(&(b, i)).ok_or(SOME_PATHS)?;
+                m.vertices.emit(&mut self.s, self.cur, &m.outputs, dwords)?;
+                if cut {
+                    Vertices::cut(&mut self.s, self.cur);
+                }
+            }
+            Message::Cut { .. } => Vertices::cut(&mut self.s, self.cur),
+            Message::Done => {}
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Whether block `b` ends a merged half's program: the ES's jump to the
+    /// GS half ends the vertex shader (it returns).
+    pub(super) fn merged_end(&mut self, b: usize) -> bool {
+        let ends = self
+            .merged
+            .as_ref()
+            .is_some_and(|m| m.stage == HwStage::Es)
+            && self.x.p.blocks[b].exit == Exit::Indirect;
+        if ends {
+            self.s.m.terminate(self.cur, Term::Ret);
+        }
+        ends
     }
 }

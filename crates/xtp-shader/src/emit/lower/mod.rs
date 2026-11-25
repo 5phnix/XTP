@@ -373,6 +373,8 @@ struct Lower<'a> {
     /// Values read other than as a resource access's descriptor: by an
     /// instruction that accesses no resource, or by a phi.
     data_reads: HashSet<Value>,
+    /// A merged ES or GS half's plan ([`geometry::Merged`]).
+    merged: Option<Box<geometry::Merged>>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -851,6 +853,7 @@ impl<'a> Lower<'a> {
                 }
                 reads
             },
+            merged: None,
         }
     }
 
@@ -913,6 +916,7 @@ impl<'a> Lower<'a> {
             self.find_sections();
         }
         self.inputs()?;
+        self.merged_start()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -958,6 +962,9 @@ impl<'a> Lower<'a> {
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
+            if self.merged_end(b) {
+                continue;
+            }
             self.exit(b)?;
         }
         self.fill_phis()?;
@@ -1009,6 +1016,9 @@ impl<'a> Lower<'a> {
     }
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        if let Some(r) = self.merged_inst(b, i) {
+            return r;
+        }
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
