@@ -400,9 +400,18 @@ impl<'a> Lower<'a> {
             RootType::Constants | RootType::Table => {}
             _ => return Val::Missing("a root descriptor"),
         }
-        let index = u32::from(rp.user_data) + dword;
+        // A spilled signature starts at table byte zero. Bind only the
+        // reads the program needs, without reserving its absent user SGPRs.
+        let logical = u32::from(rp.user_data) + dword;
+        let index = if self.x.res.spill_loads.is_empty() {
+            logical
+        } else {
+            self.user_reads
+                .get(&logical)
+                .map_or(self.user_reads.len() as u32, |u| u.index)
+        };
         self.user_reads.insert(
-            index,
+            logical,
             UserData {
                 index,
                 slot: rp.slot,
