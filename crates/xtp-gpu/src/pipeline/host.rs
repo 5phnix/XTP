@@ -568,13 +568,13 @@ fn merged_translation(container: &[u8], es: bool) -> Result<Translated, String> 
         (host, HwStage::Gs)
     };
     if host.stage != stage {
-        return Err(format!("the container's {:?} program translated", host.stage));
+        return Err(format!(
+            "the container's {:?} program translated",
+            host.stage
+        ));
     }
     let c = xtp_shader::Container::parse(container).map_err(|e| e.to_string())?;
-    let dxil = c
-        .part(xtp_shader::FourCC::DXIL)
-        .ok_or("no DXIL part")?
-        .data;
+    let dxil = c.part(xtp_shader::FourCC::DXIL).ok_or("no DXIL part")?.data;
     let native = xtp_shader::native_programs(dxil)
         .map_err(|e| e.to_string())?
         .into_iter()
@@ -943,7 +943,8 @@ impl HostPipeline {
                 if matches!(s.stage, "vertex" | "geometry") {
                     *m = merged_half(s, s.stage == "vertex");
                     if m.is_none() {
-                        let why = format!("its {} shader's merged half does not translate", s.stage);
+                        let why =
+                            format!("its {} shader's merged half does not translate", s.stage);
                         return refuse(why, shaders);
                     }
                 }
@@ -1095,13 +1096,14 @@ impl HostPipeline {
                 }
             };
         let code = |i: usize| {
-            translations.get(i).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+            translations
+                .get(i)
+                .map_or(D3D12_SHADER_BYTECODE::default(), |t| {
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: t.host.dxil.as_ptr().cast(),
+                        BytecodeLength: t.host.dxil.len(),
+                    }
+                })
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -2251,7 +2253,11 @@ mod tests {
 
     /// A title's `stage` shader named `hash`, already translated (or not:
     /// `None`), without a container.
-    fn title_shader(stage: &'static str, hash: &str, translated: Option<Translated>) -> Arc<Shader> {
+    fn title_shader(
+        stage: &'static str,
+        hash: &str,
+        translated: Option<Translated>,
+    ) -> Arc<Shader> {
         Arc::new(Shader {
             stage,
             hash: hash.to_owned(),

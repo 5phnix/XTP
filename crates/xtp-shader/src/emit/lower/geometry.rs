@@ -821,7 +821,10 @@ impl GsShape {
     /// stage data's count is 1 in every program of the title, which does not
     /// say whether it counts instances or streams.
     pub(crate) fn of(psv: &[u8], io: &GeometryIo) -> Result<GsShape, Why> {
-        let at = |o: usize| psv.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        let at = |o: usize| {
+            psv.get(o..o + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
         let size = at(0).ok_or(PSV)? as usize;
         // GSInfo, then runtime info 1: the stage (2) and the most vertices.
         if size < 28 || psv.len() < 4 + size || psv[4 + 24] != 2 {
@@ -995,10 +998,21 @@ fn live_at(p: &Program, reg: Reg, site: Site) -> Live {
             .iter()
             .rev()
             .find_map(|x| x.write(reg).or_else(|| x.read(reg)))
-            .or_else(|| block.phis.iter().find(|ph| ph.reg == reg).map(|ph| ph.value));
+            .or_else(|| {
+                block
+                    .phis
+                    .iter()
+                    .find(|ph| ph.reg == reg)
+                    .map(|ph| ph.value)
+            });
         let reached = match here {
             Some(v) => Some(Live::Value(v)),
-            None if b == 0 => Some(p.inputs.iter().find(|r| r.0 == reg).map_or(Live::Entry, |r| Live::Value(r.1))),
+            None if b == 0 => Some(
+                p.inputs
+                    .iter()
+                    .find(|r| r.0 == reg)
+                    .map_or(Live::Entry, |r| Live::Value(r.1)),
+            ),
             None => None,
         };
         if let Some(v) = reached {
@@ -1118,7 +1132,10 @@ pub(crate) fn drop_lane_prologue(p: &mut Program, stage: HwStage) -> Result<(), 
         return Err(PROLOGUE);
     };
     let read_elsewhere = p.blocks.iter().enumerate().any(|(b, block)| {
-        block.phis.iter().any(|phi| phi.args.iter().any(|a| internal.contains(a)))
+        block
+            .phis
+            .iter()
+            .any(|phi| phi.args.iter().any(|a| internal.contains(a)))
             || block.insts.iter().enumerate().any(|(i, x)| {
                 (b != 0 || !(at..at + 4).contains(&i))
                     && x.reads.iter().any(|r| internal.contains(&r.1))
@@ -1163,10 +1180,19 @@ fn fresh_value(p: &Program) -> u32 {
     let mut top = p.inputs.iter().map(|i| i.1.0).max().unwrap_or(0);
     for block in &p.blocks {
         for phi in &block.phis {
-            top = phi.args.iter().map(|a| a.0).fold(top.max(phi.value.0), u32::max);
+            top = phi
+                .args
+                .iter()
+                .map(|a| a.0)
+                .fold(top.max(phi.value.0), u32::max);
         }
         for x in &block.insts {
-            top = x.reads.iter().chain(&x.writes).map(|r| r.1.0).fold(top, u32::max);
+            top = x
+                .reads
+                .iter()
+                .chain(&x.writes)
+                .map(|r| r.1.0)
+                .fold(top, u32::max);
         }
     }
     top + 1
@@ -1930,9 +1956,7 @@ impl Lower<'_> {
                 for e in &mut self.s.inputs {
                     e.interp = vertex_interp(e);
                 }
-                shape
-                    .check(&self.s.inputs, &self.s.outputs)
-                    .map_err(fail)?;
+                shape.check(&self.s.inputs, &self.s.outputs).map_err(fail)?;
                 let plan = gs_plan(x.p, &shape).map_err(fail)?;
                 m.reads = plan.reads.into_iter().map(|r| (r.site, r.dwords)).collect();
                 m.writes = plan
@@ -2071,10 +2095,7 @@ impl Lower<'_> {
     /// Whether block `b` ends a merged half's program: the ES's jump to the
     /// GS half ends the vertex shader (it returns).
     pub(super) fn merged_end(&mut self, b: usize) -> bool {
-        let ends = self
-            .merged
-            .as_ref()
-            .is_some_and(|m| m.stage == HwStage::Es)
+        let ends = self.merged.as_ref().is_some_and(|m| m.stage == HwStage::Es)
             && self.x.p.blocks[b].exit == Exit::Indirect;
         if ends {
             self.s.m.terminate(self.cur, Term::Ret);

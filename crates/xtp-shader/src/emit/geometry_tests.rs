@@ -28,9 +28,7 @@ use super::{HostShader, container};
 use crate::dxbc::{self, Container, FourCC};
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{self, Exit, Inst, Program, Reg};
-use crate::native::{
-    ExportIo, GeometryIo, HwStage, NativeProgram, StageIo, Usage, VsOutput,
-};
+use crate::native::{ExportIo, GeometryIo, HwStage, NativeProgram, StageIo, Usage, VsOutput};
 use crate::resource::Site;
 
 // GFX10 encodings (AMD's RDNA ISA reference).
@@ -971,10 +969,7 @@ fn geometry_shape_from_psv0_and_stage_data() {
         Err(geometry::COUNT)
     );
     // Another stage's runtime information; one too short; none.
-    assert_eq!(
-        GsShape::of(&gs_psv(3, 5, 1, 1, 3), &io),
-        Err(geometry::PSV)
-    );
+    assert_eq!(GsShape::of(&gs_psv(3, 5, 1, 1, 3), &io), Err(geometry::PSV));
     let mut short = gs_psv(3, 5, 1, 2, 3);
     short[..4].copy_from_slice(&24u32.to_le_bytes());
     assert_eq!(GsShape::of(&short, &io), Err(geometry::PSV));
