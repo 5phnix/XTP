@@ -270,8 +270,8 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
-    /// A console wave64 compute program run as two 32-lane host waves
-    /// (each lane's reads stay in its half; see `Lower::new`).
+    /// A wave64 program lowered in 32-lane halves. In paired mode both
+    /// register sets belong to the same host wave.
     split: bool,
     /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
     console_cf: bool,
@@ -588,9 +588,8 @@ impl<'a> Lower<'a> {
             split |= group_reads;
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half) or to share LDS in
-            // the console's instruction order: the console flow, for a group
-            // of one console wave. What keeps a program out of it is the
-            // reason it stops with.
+            // the console's instruction order. A single console wave can
+            // exchange through LDS; multiple complete waves use paired lanes.
             let needs_wave64 =
                 (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
             if needs_wave64 && !x.target.runs(64) {
@@ -647,6 +646,7 @@ impl<'a> Lower<'a> {
             if x.console_cf && split && threads > 64 {
                 // Each physical lane carries console lanes i and i+32. One
                 // physical wave therefore follows one console program counter.
+                group_reads = false;
                 s.m.pair_lanes();
                 flat_group = Some(cs.threads);
                 s.threads = Some([threads / 2, 1, 1]);
@@ -860,6 +860,8 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        // All 64 logical lanes are present in a paired wave. Execute the
+        // original steps, including FP16 operations and their rounding.
         if !self.s.m.paired_lanes() {
             self.find_sections();
         }

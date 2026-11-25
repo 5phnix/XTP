@@ -15,10 +15,9 @@ read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
 half, divergent branches and loops, LDS shared in the console's
 instruction order, and (in groups of exactly 64 threads) whole-wave
-reductions and prefix sums, of integers and floats. Still open: groups of
-several console waves, whole-wave sections in other groups, and
-`ds_permute`; each stops with its own reason. (`ds_bpermute` gathers within each 32-lane half
-and is lowered as an in-half read, like `ds_swizzle`.) Wave64 mesh programs
+reductions and prefix sums, of integers and floats. For multiple complete waves, one host lane can carry two
+console lanes ([Groups of several console waves](#groups-of-several-console-waves)).
+Partial final waves in that form and forward `ds_permute` remain open. Wave64 mesh programs
 run on 32-lane hosts ([Mesh programs](#mesh-programs)).
 
 ## The problem
@@ -171,45 +170,69 @@ What still stops says why: `console wave64 lanes in a group of more than 64
 threads`, `ds_permute across the halves`, or `a whole-wave section` (in
 other groups), each `on a host without 64-lane waves`.
 
-### Groups of several console waves (planned)
+### Groups of several console waves
 
-A group barrier is reached by every thread of the group only where all its
-console waves branch alike, and they need not: each console wave takes its
-`s_cbranch_*` for itself. The earlier plan was a meeting point per console
-wave (arrival counters, double-buffered slots, a bounded wait). It is
-dropped: a wait is met only if the partner half runs meanwhile, and D3D12
-promises no such thing. On an RTX 5070 the upper half of a group does not
-write LDS before the lower half reads it unless a barrier orders them, in
-20 of 20 runs (`lds_written_and_read_in_different_masked_blocks`), which is
-what waves run one after the other would give. A wait would then never be
-met, and a bounded one gives a wrong result instead of a hang.
+The inexpensive per-lane paths run first, including constant lane reads
+through group-shared memory where the barriers meet. Otherwise a group
+of *k* complete console waves can declare `[numthreads(32*k,1,1)]` and
+`WaveSize(32)`. Host wave *w*, lane *i* carries console flat thread ids
+`64*w+i` and `64*w+i+32`. The original group dimensions decode both ids
+into x, y, z. Direct and indirect dispatch keep their original group counts.
 
-What the programs are (an offline translate over a local copy of the
-title's shaders, 43 programs stopped for their group size): groups of
-16x16x1 (15), 1024x1x1 (7), 8x16x1 (6), 256x1x1 (4), 512x1x1 (2), 128x1x1
-(2) and 32x32x1 (1). Nearly all count mask bits (`v_mbcnt`) and read a mask
-as a number; about two thirds have no LDS and no `s_barrier`.
+One host wave has all the registers of one console wave. At entry, the
+flat-id mapping covers every console thread once. Each SSA instruction
+takes its operands from the corresponding half. Wave operations on the
+two sets of registers produce the two words of a ballot or the two
+candidate values for a lane read. Both halves can use either result at the
+same instruction. This gives `mbcnt` the console lane number and `readfirstlane`
+the value from the first set bit in the complete EXEC mask.
 
-**Without LDS: one console wave per host group.** The console waves of
-such a group share nothing but the resources every group shares, so they
-can be separate host groups. The program is emitted with 64 threads per
-group, and a dispatch of (x, y, z) groups of k console waves each becomes
-(x * k, y, z) host groups: host group id x gives the console group
-(x / k) and the wave in it (x % k), the flat thread id is 64 * wave +
-the id in the host group, and the console's thread and group ids follow
-from those. Each host group is then one console wave in two host waves,
-which is the console flow as it is. Needed outside the translator: the
-emitted shader says its k, direct dispatches multiply x (within D3D12's
-65535 groups per dimension; refuse beyond), and indirect dispatches
-multiply the record's x where the indirect records are already rewritten
-(`xtp-gpu`'s clamp pass).
+A console branch makes one decision using both halves. Both register sets
+therefore take the same phi edge, even when the next console wave takes a
+different branch or runs a different number of loop iterations. A predicated
+store or atomic executes under each half's own guard. Joining its result
+under that guard preserves the register in each inactive lane. For LDS,
+both halves finish the access before the next instruction's shared-memory
+fence. Only the program's group synchronisation (and the existing loop-limit
+drain when needed) brings the physical waves together.
 
-**With LDS and `s_barrier`:** the waves of a group do meet there, so they
-must stay one host group. Open; candidates are group barriers where every
-console wave provably arrives (as VIctory #189 places them) and, for the rest, a
-group-wide form in which every thread runs every block any console wave of
-its group enters, with each wave's scalars and effects guarded by whether
-that wave is really there.
+The paired form executes a whole-wave section instruction by instruction.
+This covers the FP16 reduction with an opposite-row gather in
+`b22a16a178976e1b`. Each FP16 addition rounds at its original step.
+
+#### World-session refusals on 32-lane hosts
+
+The 23 distinct container hashes in the 20261125-000534 log all use
+`v_mbcnt_lo/hi`, previously excluded from the large-group form. The table
+gives the other relevant instructions and control flow in their disassemblies.
+A number counts static occurrences. “Mask” counts `s_bcnt1_i32_b64` and
+`s_ff1_i32_b64`. The branch column counts branches to an earlier instruction.
+
+| Container | Back branches | Read first lane | Mask | LDS barriers | Read lane | Write lane |
+|---|---:|---:|---:|---:|---:|---:|
+| `02384a60fda6f2d0` | 10 | 12 | 2 | 5 | 6 | 0 |
+| `0c028454b58543f0` | 0 | 7 | 3 | 1 | 4 | 0 |
+| `191ecaed66eea3b1` | 0 | 9 | 5 | 0 | 0 | 0 |
+| `1d44a723bdebbf27` | 0 | 9 | 5 | 0 | 0 | 0 |
+| `240cb516c1af0bc3` | 0 | 9 | 5 | 0 | 0 | 0 |
+| `31d703207b51549a` | 0 | 9 | 7 | 0 | 0 | 0 |
+| `466ec41d3f9d24c0` | 4 | 10 | 8 | 0 | 0 | 0 |
+| `56f3bf2d9388e5a7` | 4 | 10 | 8 | 0 | 0 | 0 |
+| `5c6224a6bc3a4066` | 0 | 0 | 2 | 1 | 2 | 0 |
+| `65de113e23fa4fdd` | 0 | 7 | 5 | 0 | 0 | 0 |
+| `804b342cb4b9d1e9` | 0 | 7 | 5 | 0 | 0 | 0 |
+| `922e1d0ee1e19a85` | 2 | 19 | 16 | 0 | 4 | 0 |
+| `a1bf269d5b19f025` | 6 | 3 | 0 | 10 | 2 | 0 |
+| `ab5455fc6abb804f` | 0 | 9 | 7 | 0 | 0 | 0 |
+| `abd7a22106898c66` | 4 | 14 | 8 | 0 | 0 | 0 |
+| `b22a16a178976e1b` | 0 | 0 | 0 | 0 | 8 | 0 |
+| `b4b0427232707598` | 4 | 15 | 8 | 0 | 0 | 0 |
+| `b8f3f7979d6bbc50` | 4 | 2 | 2 | 3 | 0 | 0 |
+| `be6ce5d849d51127` | 2 | 27 | 12 | 0 | 4 | 0 |
+| `ce79e9eba7ae0348` | 4 | 15 | 8 | 0 | 20 | 20 |
+| `d7db57731ada919b` | 4 | 14 | 12 | 0 | 0 | 0 |
+| `eae3498e6553afa8` | 3 | 2 | 2 | 2 | 0 | 0 |
+| `fa0bd10a35bfef3c` | 4 | 14 | 12 | 0 | 30 | 30 |
 
 ### The console flow on every host
 

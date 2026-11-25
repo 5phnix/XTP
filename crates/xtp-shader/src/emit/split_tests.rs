@@ -67,7 +67,10 @@ const IN_HALF: &[u32] = &[
 ];
 
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
-    let target = host.target();
+    run_for(host, native, groups, host.target())
+}
+
+fn run_for(host: &Host, native: &crate::NativeProgram, groups: u32, target: super::Target) -> Result<Vec<u32>, String> {
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
     // The validator, where one is installed: drivers take some modules it
     // refuses.
@@ -455,16 +458,8 @@ fn a_select_on_a_mask_held_as_a_number_translates_for_every_host() {
             Some(if target.runs(64) { 64 } else { 32 })
         );
     }
-    // Two console waves per group: the console flow's halves meet at
-    // group barriers, so it runs one console wave per group only, and the
-    // program stops with the split form's reason.
-    match emit_for(&program(HELD_SELECT, 128), HOSTS[0]) {
-        Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(
-            what,
-            "a lane mask held as a number in a wave64 program split in halves"
-        ),
-        r => panic!("{r:?}"),
-    }
+    emit_for(&program(HELD_SELECT, 128), HOSTS[0]).unwrap();
+    assert!(super::last_module_summary().ends_with("; console flow with paired lanes"));
 }
 
 #[test]
@@ -476,6 +471,9 @@ fn a_select_on_a_mask_held_as_a_number_runs_as_the_console() {
         64,
         held_select,
     );
+    console_flow_case("numeric mask in independent waves", HELD_SELECT, 128, |t| {
+        if t < 64 { held_select(t) } else { 1 }
+    });
 }
 
 /// Constant lane reads retain the existing small exchange. A computed
@@ -838,6 +836,10 @@ fn wave64_inclusive_prefix_joins_both_host_waves() {
         0x7E04_0301, // v_mov_b32 v2, v1
     ];
     console_flow_case("whole-wave inclusive sum", &body, 64, |n| n * (n + 1) / 2);
+    console_flow_case("prefix in several console waves", &body, 128, |t| {
+        let lane = t & 63;
+        (lane + 1) * (t & !63) + lane * (lane + 1) / 2
+    });
 }
 
 /// A scan of the lane ids with `opcode` (a VOP2 operation) as its step and
@@ -1488,6 +1490,7 @@ fn every_hardware_case_translates_and_validates_without_a_device() {
     lane_reads_in_branches_beside_a_whole_wave_section();
     a_lane_read_past_the_wave_reads_its_low_bits();
     paired_lanes_share_lds_and_count_their_own_mask_bits();
+    paired_lanes_execute_a_half_precision_whole_wave_section();
     lds_in_a_group_of_48_threads_reads_both_halves();
     a_loop_exit_mask_read_inside_the_loop_counts_the_lanes_that_left();
     DRY.with(|d| d.set(false));
@@ -1663,4 +1666,35 @@ fn paired_lanes_share_lds_and_count_their_own_mask_bits() {
         },
         true,
     );
+}
+
+/// A whole-wave section with a half-precision addition, which the symbolic
+/// reduction pass cannot express. Each lane doubles the FP16 value from
+/// lane 0 of its opposite 16-lane row. Both rows then read console lane 32.
+#[test]
+#[ignore = "hardware: 32-lane waves (see hardware())"]
+fn paired_lanes_execute_a_half_precision_whole_wave_section() {
+    let body = [
+        0x4A02_00FF, 0x3C00, // v_add_nc_u32 v1, 0x3c00, v0
+        0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+        0xD778_0002, 0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x6404_0502, // v_add_f16 v2, v2, v2
+        0xD760_0009, 0x0001_4102, // v_readlane_b32 s9, v2, 32
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    let p = program(&body, 128);
+    let mut cs = emit_for(&p, HOSTS[0]).unwrap();
+    if let Ok(mut validator) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+        validator.validate(&mut cs.dxil).unwrap();
+    }
+    for (name, host) in hardware() {
+        if host.target().runs(32) {
+            let out = run_for(&host, &p, 1, HOSTS[0]).unwrap();
+            let expected: Vec<u32> = (0..128).map(|t| {
+                0x8000 + ((t & !15) ^ 16) + (t & !63) + 48
+            }).collect();
+            assert_eq!(out, expected, "{name}: paired FP16 rows");
+        }
+    }
 }

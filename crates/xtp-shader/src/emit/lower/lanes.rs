@@ -714,11 +714,9 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the console flow can run this compute program on the host:
-    /// what `Lower::new` requires before it asks for it. In two 32-lane
-    /// halves, one console wave per group (the halves meet at group
-    /// barriers), no `ds_permute` across the halves, and whole-wave
-    /// sections only in a group of exactly 64 threads; on a host that runs
-    /// the console's waves, no `ds_permute`.
+    /// used when a per-lane mask read needs all 64 console lanes.
+    /// Complete waves can run paired. A partial single wave can use the
+    /// original group exchange when it has no whole-wave section.
     pub(super) fn console_flow_runs(&self) -> bool {
         if self.mask_data != MaskData::Console {
             return false;
@@ -736,7 +734,9 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 && !self.x.target.runs(64) {
             let sections =
                 (0..p.blocks.len()).any(|b| !crate::emit::wave::sections(p, b).is_empty());
-            self.x.target.runs(32) && threads <= 64 && !permute && (threads == 64 || !sections)
+            self.x.target.runs(32)
+                && !permute
+                && (threads.is_multiple_of(64) || threads < 64 && !sections)
         } else {
             self.x.target.runs(self.wave()) && !permute
         }

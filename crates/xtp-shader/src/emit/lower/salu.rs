@@ -22,7 +22,12 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        // A packed console wave can execute a whole-wave section literally.
+        // Retain the actual dword when it sets EXEC a word at a time: a
+        // ballot of the very mask being defined would depend on itself.
+        if !(self.s.m.paired_lanes() && name == "s_mov_b32")
+            && (inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo))
+        {
             return Err(LANE_MASK);
         }
         if matches!(
