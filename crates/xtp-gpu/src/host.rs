@@ -342,13 +342,20 @@ pub(crate) fn host() -> Option<&'static Host> {
 /// The host GPU, created on first use, or why there is none (tests print
 /// it when they skip: `crate::testgpu`).
 pub(crate) fn created() -> &'static Result<Host, String> {
-    HOST.get_or_init(|| {
+    let made = HOST.get_or_init(|| {
         let made = software().and_then(|software| create(software).map_err(|e| e.to_string()));
         if let Err(e) = &made {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
         }
         made
-    })
+    });
+    // In tests, the debug layer reports to `testgpu` from the device's first
+    // use on, whichever way a test reached it.
+    #[cfg(test)]
+    if let Ok(host) = made {
+        crate::testgpu::watch(host);
+    }
+    made
 }
 
 /// Whether the host device is made on the software adapter (WARP): in
@@ -738,8 +745,6 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// next recording afresh without taking them from it.
 #[derive(Clone, Default)]
 struct Recorded {
-    #[cfg(feature = "diagnostics")]
-    dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
     #[cfg(feature = "diagnostics")]
     notes: std::sync::Arc<Vec<Note>>,
@@ -916,8 +921,6 @@ impl Drop for DynamicLease {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
-    #[cfg(feature = "diagnostics")]
-    dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1614,10 +1617,6 @@ impl Host {
         // from their snapshot, each byte once per submission, however many
         // dispatches declared ranges over it (the world's passes declare the
         // same big ranges dozens of times).
-        #[cfg(feature = "diagnostics")]
-        for sample in p.recorded.iter().flat_map(|r| r.dispatch_samples.iter()) {
-            sample.report();
-        }
         let copying = std::time::Instant::now();
         for (shadow, address, len) in &p.copied {
             let written = shadow.write_back(p.submission, *address, *len);
@@ -1774,6 +1773,13 @@ impl Host {
             }
         }
         text
+    }
+
+    /// The debug layer's message queue (`XTP_D3D12_DEBUG=1` in a
+    /// diagnostics build), for tests to fail on its errors.
+    #[cfg(test)]
+    pub(crate) fn message_queue(&self) -> Option<&ID3D12InfoQueue> {
+        self.messages.as_ref()
     }
 
     /// Moves the debug layer's messages into our log; returns the first
@@ -2185,8 +2191,6 @@ impl HostList {
     /// What a submission of the list keeps of its recording.
     fn recorded(&self) -> Recorded {
         Recorded {
-            #[cfg(feature = "diagnostics")]
-            dispatch_samples: self.deferred().dispatch_samples.clone(),
             pipelines: self
                 .pipelines
                 .lock()
@@ -2195,11 +2199,6 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             notes: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
-    }
-
-    #[cfg(feature = "diagnostics")]
-    pub(crate) fn dispatch_sample(&self, sample: crate::indirect::Sample) {
-        std::sync::Arc::make_mut(&mut self.deferred().dispatch_samples).push(sample);
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -2975,8 +2974,6 @@ impl Meter {
                 longest_lists = title.longest_lists,
                 making = crate::pipeline::making()
             );
-            #[cfg(feature = "diagnostics")]
-            crate::indirect::log_counts();
             crate::device::log_frame();
             if let Some(pools) = buffers::summary() {
                 tracing::info!("buffer heaps: {pools}");
