@@ -3277,6 +3277,8 @@ impl Meter {
             .take(frames, 8);
         #[cfg(feature = "diagnostics")]
         let meshes = crate::meshstat::take();
+        #[cfg(feature = "diagnostics")]
+        twins::stale::frames(frames);
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -3331,6 +3333,8 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             crate::indirect::log_counts();
+            #[cfg(feature = "diagnostics")]
+            twins::stale::log();
             crate::device::log_frame();
             if let Some(pools) = buffers::summary() {
                 tracing::info!("buffer heaps: {pools}");

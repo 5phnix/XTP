@@ -1223,6 +1223,8 @@ impl State {
         compute: bool,
         limits: [u32; 3],
     ) -> Result<(), &'static str> {
+        #[cfg(feature = "diagnostics")]
+        list.twin_reader(&p.name);
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.

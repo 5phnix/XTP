@@ -129,6 +129,10 @@ impl HostList {
             }
         };
         u.behind[side] = Some(false);
+        #[cfg(feature = "diagnostics")]
+        if twin.plane.is_some() {
+            stale::used(colour, write, copy, u.late);
+        }
         match (write, colour) {
             // Shaders write the twin when the draw or dispatch runs: what
             // the same one reads of the depth texture is prepared before
@@ -207,6 +211,10 @@ impl HostList {
             if *copy {
                 self.twin_copy(depth, twin, false);
             }
+            #[cfg(feature = "diagnostics")]
+            if twin.plane.is_some() {
+                stale::pass(false);
+            }
             // Nothing of the title's is recorded after this: the pass may
             // leave its own pipeline and target set.
             self.pass_plane(depth, twin);
@@ -244,6 +252,150 @@ impl HostList {
             u.twin.behind.store(left, Ordering::Relaxed);
         }
         syncs
+    }
+
+    /// `draw::State::bind`, before anything of a draw or dispatch is
+    /// recorded: the pipeline (`name`: its programs) the uses of twins that
+    /// follow on this thread are counted for (diagnostics, [`stale`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn twin_reader(&self, name: &str) {
+        stale::reader(name);
+    }
+}
+
+/// Diagnostics: how often a depth plane is used while its twin holds what
+/// it lacks, for the frame line (`log`). A use of the depth texture of a
+/// depth plane's twin that shaders of the same list wrote since the plane
+/// was last drawn is *late* (`TwinUse::late`): the copies are recorded,
+/// the plane's pass waits. That use and those after it until the pass
+/// find the plane *stale*. Uses are counted for the pipeline last bound on
+/// the thread (`HostList::twin_reader`); the copies, resolves and clears
+/// of `crate::list` count for that pipeline too.
+#[cfg(feature = "diagnostics")]
+pub(super) mod stale {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    thread_local! {
+        /// The pipeline this thread binds (`reader`).
+        static READER: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+
+    /// Since the start: late uses; uses of a stale plane read only, and as
+    /// a depth target or written (copies into it, clears); the plane's
+    /// passes before a draw or dispatch and at a list's close; frames.
+    static LATE: AtomicU64 = AtomicU64::new(0);
+    static STALE_READS: AtomicU64 = AtomicU64::new(0);
+    static STALE_TARGETS: AtomicU64 = AtomicU64::new(0);
+    static PASSES_NOW: AtomicU64 = AtomicU64::new(0);
+    static PASSES_AT_CLOSE: AtomicU64 = AtomicU64::new(0);
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+    /// By pipeline, since the start: writes of the plane's twin, and uses
+    /// of the depth texture with the plane up to date and stale, read only
+    /// and as a target ([`Uses`]).
+    static BY_READER: Mutex<Option<HashMap<String, Uses>>> = Mutex::new(None);
+
+    /// Twin writes, fresh reads, stale reads, fresh target uses, stale
+    /// target uses.
+    type Uses = [u64; 5];
+
+    /// The totals at the previous line, to give each line its frames.
+    static LAST: Mutex<[u64; 6]> = Mutex::new([0; 6]);
+
+    pub(super) fn reader(name: &str) {
+        READER.with(|r| {
+            let mut r = r.borrow_mut();
+            r.clear();
+            r.push_str(name);
+        });
+    }
+
+    /// A use of a depth texture whose depth plane has a twin: of the twin
+    /// (`colour`) or the depth texture, written or read only; `copy`: the
+    /// list wrote the twin since the depth texture was given it; `late`:
+    /// the plane was already waiting for its pass.
+    pub(super) fn used(colour: bool, write: bool, copy: bool, late: bool) {
+        let stale = !colour && (copy || late);
+        if !colour && copy {
+            LATE.fetch_add(1, Ordering::Relaxed);
+        }
+        if stale {
+            let total = if write { &STALE_TARGETS } else { &STALE_READS };
+            total.fetch_add(1, Ordering::Relaxed);
+        }
+        let at = match (colour, write, stale) {
+            (true, _, _) => 0,
+            (false, false, false) => 1,
+            (false, false, true) => 2,
+            (false, true, false) => 3,
+            (false, true, true) => 4,
+        };
+        let name = READER.with(|r| r.borrow().clone());
+        let mut by = BY_READER.lock().unwrap_or_else(|e| e.into_inner());
+        by.get_or_insert_with(HashMap::new).entry(name).or_default()[at] += 1;
+    }
+
+    /// A pass that draws a depth plane from its twin, before a draw or
+    /// dispatch (`now`) or at a list's close.
+    pub(super) fn pass(now: bool) {
+        let total = if now { &PASSES_NOW } else { &PASSES_AT_CLOSE };
+        total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Frames presented since the previous call (each second).
+    pub(crate) fn frames(frames: f64) {
+        FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
+    }
+
+    /// The line: per frame since the previous line, the totals since the
+    /// start, and the pipelines using planes, most uses first.
+    pub(crate) fn log() {
+        let now = [
+            &LATE,
+            &STALE_READS,
+            &STALE_TARGETS,
+            &PASSES_NOW,
+            &PASSES_AT_CLOSE,
+            &FRAMES,
+        ]
+        .map(|c| c.load(Ordering::Relaxed));
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let frames = now[5].saturating_sub(last[5]).max(1) as f64;
+        let [late, reads, targets, passes_now, passes_at_close, _] =
+            std::array::from_fn(|i| now[i].saturating_sub(last[i]) as f64 / frames);
+        *last = now;
+        drop(last);
+        if now[0] + now[3] + now[4] == 0 {
+            return;
+        }
+        let by = BY_READER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut readers: Vec<_> = by.iter().flatten().collect();
+        readers.sort_by_key(|(name, uses)| (std::cmp::Reverse(uses.iter().sum::<u64>()), *name));
+        let readers: Vec<String> = readers
+            .iter()
+            .take(16)
+            .map(|(name, [w, fr, sr, ft, st])| {
+                let name = name.replace('"', "");
+                let name = if name.is_empty() { "-" } else { name.as_str() };
+                format!("{name}: {w} twin writes, reads {fr} fresh {sr} stale, targets {ft} fresh {st} stale")
+            })
+            .collect();
+        tracing::info!(
+            "depth planes from twins, per frame: {late:.2} late uses, uses of a stale plane \
+             {reads:.2} read and {targets:.2} as target, passes {passes_now:.2} before a draw \
+             or dispatch and {passes_at_close:.2} at a list's close; since the start ({} frames): \
+             {} late, {} stale reads, {} stale target uses, {} passes before, {} at close; by \
+             pipeline: {readers:?}",
+            now[5],
+            now[0],
+            now[1],
+            now[2],
+            now[3],
+            now[4],
+        );
     }
 }
 
