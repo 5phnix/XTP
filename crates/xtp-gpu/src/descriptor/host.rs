@@ -3610,9 +3610,9 @@ mod tests {
         use crate::resource::tests_support::{committed, sampled};
         let test =
             "descriptor::host::tests::texture_object_slots_are_made_once_their_copy_is_resident";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let object = committed(&sampled(16, 16, 28));
         let started = std::time::Instant::now();
         while crate::resource::host_resource(object).is_none() {
