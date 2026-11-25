@@ -2215,9 +2215,14 @@ impl HostList {
 
     /// What a submission of the list keeps of its recording.
     fn recorded(&self) -> Recorded {
+        #[cfg(feature = "diagnostics")]
+        let (dispatch_samples, meshes) = {
+            let deferred = self.deferred();
+            (deferred.dispatch_samples.clone(), deferred.meshes.clone())
+        };
         Recorded {
             #[cfg(feature = "diagnostics")]
-            dispatch_samples: self.deferred().dispatch_samples.clone(),
+            dispatch_samples,
             pipelines: self
                 .pipelines
                 .lock()
@@ -2226,7 +2231,7 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             notes: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             #[cfg(feature = "diagnostics")]
-            meshes: self.deferred().meshes.clone(),
+            meshes,
         }
     }
 
