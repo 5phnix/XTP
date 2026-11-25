@@ -108,8 +108,12 @@ pub(crate) enum C {
     FullRefreshes,
     FullRefreshBytes,
     FullRefreshUs,
+    /// Of those, bytes of 64 KiB pieces the copies held otherwise than
+    /// title memory while the write tracking had them current: missed
+    /// writes.
+    FullRefreshMissed,
 }
-const COUNTERS: usize = 55;
+const COUNTERS: usize = 56;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -230,10 +234,11 @@ pub(crate) fn log(frames: f64) {
     );
     if c[C::FullRefreshes as usize] > 0.0 {
         tracing::info!(
-            "full refreshes per frame (XTP_FULL_REFRESH): {:.1}, {:.1} MB in {:.1} ms",
+            "full refreshes per frame (XTP_FULL_REFRESH): {:.1}, {:.1} MB in {:.1} ms, {:.2} MB              of pieces the write tracking missed",
             c[C::FullRefreshes as usize],
             mb(c[C::FullRefreshBytes as usize]),
             ms(c[C::FullRefreshUs as usize]),
+            mb(c[C::FullRefreshMissed as usize]),
         );
     }
     if let Some(cards) = crate::shadow::card_summary() {

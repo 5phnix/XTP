@@ -2266,6 +2266,13 @@ pub(crate) mod census {
 ///   (buffers read through directly indexed heaps). `1` is every
 ///   submission: about 2 GB of copies each time in the Series S world
 ///   (its System pool), so `30`, about once a frame, keeps it usable.
+///   First each 64 KiB piece is compared: one the copy holds otherwise
+///   than title memory while the tracking has it current is a write the
+///   tracking missed, counted on the copystat line, the first 64 logged
+///   with the memory they are in (watch item 237: in the fork, missed
+///   writes came through another view of the same physical pages). A
+///   shader write outside the ranges it declared, into a copy in system
+///   memory, counts too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FullRefresh {
     Off,
@@ -2330,18 +2337,22 @@ fn refresh_everything(submission: u64) -> usize {
         busy.extend(shadow.busy().iter().map(|b| (b.from, b.to)));
     }
     let busy = joined(busy);
-    let mut bytes = 0;
+    let (mut bytes, mut missed) = (0, 0);
     for shadow in &copies {
         let (from, to) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
         let mut at = from;
+        let mut take = |a: usize, b: usize| {
+            missed += shadow.missed(a, b);
+            bytes += shadow.copy(a, b);
+        };
         for &(a, e) in busy.iter().filter(|&&(a, e)| a < to && e > from) {
             if a > at {
-                bytes += shadow.copy(at, a);
+                take(at, a);
             }
             at = at.max(e);
         }
         if at < to {
-            bytes += shadow.copy(at, to);
+            take(at, to);
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -2349,9 +2360,71 @@ fn refresh_everything(submission: u64) -> usize {
         use crate::copystat::{C, add};
         add(C::FullRefreshes, 1);
         add(C::FullRefreshBytes, bytes as u64);
+        add(C::FullRefreshMissed, missed as u64);
         add(C::FullRefreshUs, started.elapsed().as_micros() as u64);
     }
+    let _ = missed;
     bytes
+}
+
+impl Shadow {
+    /// For [`refresh_everything`]: the bytes of the 64 KiB pieces of title
+    /// memory `[from, to)` (within the copy) that the copy holds otherwise
+    /// than title memory while the write tracking says it holds them as
+    /// they are ([`Shadow::stale`] false): writes it missed. The first ones
+    /// are logged with what memory they are in (a view of physical pages,
+    /// which the title may show at other addresses too, or other memory).
+    /// Pieces that cannot all be read are left out.
+    fn missed(&self, from: usize, to: usize) -> usize {
+        /// Pieces logged at most, over the run.
+        static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        thread_local! {
+            static PIECE_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let mut missed = 0;
+        let mut at = from;
+        PIECE_BYTES.with_borrow_mut(|title| {
+            while at < to {
+                let end = (at + PIECE - at % PIECE).min(to);
+                title.resize(end - at, 0);
+                // SAFETY: inside the copy's mapping; only this thread writes
+                // the copy outside ranges in flight, which are left out.
+                let held =
+                    unsafe { std::slice::from_raw_parts(self.data.add(at - start), end - at) };
+                if read_whole(at, title) && held != &title[..] && !self.stale(at, end) {
+                    let differ = held
+                        .iter()
+                        .zip(title.iter())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    missed += end - at;
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
+                        use windows_sys::Win32::System::Memory::{
+                            MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+                        };
+                        // SAFETY: plain data filled in by the query.
+                        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                        // SAFETY: a valid out pointer of the right size.
+                        unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+                        tracing::info!(
+                            at = format_args!("{at:#x}"),
+                            len = end - at,
+                            differ,
+                            copy = format_args!("{start:#x}+{:#x}", self.len),
+                            view = info.Type == MEM_MAPPED,
+                            protect = format_args!("{:#x}", info.Protect),
+                            region = format_args!("{:#x}", info.AllocationBase as usize),
+                            watched = self.watched.load(Ordering::Relaxed),
+                            "a write the tracking missed (XTP_FULL_REFRESH)"
+                        );
+                    }
+                }
+                at = end;
+            }
+        });
+        missed
+    }
 }
 
 /// `mutex`'s guard, poisoned or not.
@@ -3980,10 +4053,18 @@ mod tests {
         // than title memory.
         shadow.set_host(window, 4 * PAGE, 0x22);
         assert!(!shadow.stale(window, window + 4 * PAGE));
+        // The four pieces count as writes the tracking missed; the busy
+        // page is left out by the caller, not by the count.
+        assert_eq!(shadow.missed(window, window + 4 * PAGE), 4 * PAGE);
         // GPU work in flight writes the second page.
         let gpu = submission();
         shadow.writing(gpu, window + PAGE, PAGE);
         let lists = cards_around(submission());
+        assert_eq!(
+            shadow.missed(window, window + PAGE),
+            0,
+            "taken: nothing missed now"
+        );
         assert!(
             lists.0.is_none() && lists.1.is_none(),
             "no copy on the card"
