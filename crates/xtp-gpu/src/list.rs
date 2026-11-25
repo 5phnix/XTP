@@ -1638,19 +1638,10 @@ fn note_dispatch_x(
 
 extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(windows)]
-    if let (Some(list), Some(heap)) = (
-        host_list(this),
-        crate::query::host_heap(heap, kind, index, 1),
-    ) {
-        list.keep(heap);
-        // SAFETY: a matching heap and in-range slot retained by this list.
-        unsafe {
-            list.list.BeginQuery(
-                heap,
-                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
-                index,
-            )
-        };
+    if let Some(heap) = crate::query::host_heap(heap, kind, index, 1) {
+        with_state(this, |list, state| {
+            heap.begin(list, &mut state.occlusion, kind, index)
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, heap, kind, index);
@@ -1658,19 +1649,10 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
 
 extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(windows)]
-    if let (Some(list), Some(heap)) = (
-        host_list(this),
-        crate::query::host_heap(heap, kind, index, 1),
-    ) {
-        list.keep(heap);
-        // SAFETY: as in begin_query.
-        unsafe {
-            list.list.EndQuery(
-                heap,
-                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
-                index,
-            )
-        };
+    if let Some(heap) = crate::query::host_heap(heap, kind, index, 1) {
+        with_state(this, |list, state| {
+            heap.end(list, &mut state.occlusion, kind, index)
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, heap, kind, index);
@@ -1729,7 +1711,6 @@ extern "system" fn resolve_queries(
         && dst.offset(at).is_multiple_of(8)
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        list.keep(heap);
         dst.gpu_copies(list, at, u64::from(count) * bytes);
         let common = D3D12_RESOURCE_STATE_COMMON;
         let copy = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -1739,14 +1720,7 @@ extern "system" fn resolve_queries(
                 crate::host::uav_barrier(),
                 crate::host::transition(&dst.buffer, common, copy),
             ]);
-            list.list.ResolveQueryData(
-                heap,
-                D3D12_QUERY_TYPE(kind as i32),
-                _first,
-                count,
-                &dst.buffer,
-                dst.offset(at),
-            );
+            heap.resolve(list, kind, _first, count, &dst.buffer, dst.offset(at));
             list.list
                 .ResourceBarrier(&[crate::host::transition(&dst.buffer, copy, common)]);
         }
@@ -2027,6 +2001,7 @@ mod state {
         super::count_draw();
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
+            with_state(this, |_, s| s.occlusion.dropped_draw());
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
@@ -2140,6 +2115,10 @@ extern "system" fn execute_indirect(
     if ran {
         return;
     }
+    #[cfg(windows)]
+    if max != 0 && args.iter().any(|arg| matches!(arg[0], 0 | 1 | 10)) {
+        with_state(this, |_, s| s.occlusion.dropped_draw());
+    }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -2170,6 +2149,7 @@ pub(crate) mod cuts {
     pub(crate) static GROWTH: AtomicU64 = AtomicU64::new(0);
     pub(crate) static MISSING_TARGET: AtomicU64 = AtomicU64::new(0);
     pub(crate) static SHIFTED_TARGET: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static VISIBLE: AtomicU64 = AtomicU64::new(0);
     pub(super) static OCCLUSION: AtomicU64 = AtomicU64::new(0);
     pub(super) static STATS: AtomicU64 = AtomicU64::new(0);
     pub(super) static DEPTH_ORDER: AtomicU64 = AtomicU64::new(0);
@@ -2185,6 +2165,7 @@ pub(crate) mod cuts {
             scratch_growth = GROWTH.load(Relaxed),
             missing_rtv = MISSING_TARGET.load(Relaxed),
             rtv_after_hole = SHIFTED_TARGET.load(Relaxed),
+            occlusion_forced_visible = VISIBLE.load(Relaxed),
             occlusion_results = OCCLUSION.load(Relaxed),
             statistics_results = STATS.load(Relaxed),
             depth_order = DEPTH_ORDER.load(Relaxed),

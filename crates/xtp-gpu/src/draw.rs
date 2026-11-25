@@ -144,6 +144,7 @@ impl IncompleteTargets {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    pub(crate) occlusion: crate::query::Active,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -2111,6 +2112,7 @@ impl State {
             meshes.ran();
         }
         if let Err(why) = ran {
+            self.occlusion.dropped_draw();
             dropped("mesh dispatch", self.pipeline, why);
         }
     }
@@ -2433,6 +2435,7 @@ impl State {
             meshes.ran();
         }
         if let Err(why) = ran {
+            self.occlusion.dropped_draw();
             dropped("draw", self.pipeline, why);
         }
     }
@@ -2532,7 +2535,10 @@ impl State {
                         #[cfg(feature = "diagnostics")]
                         meshes.ran();
                     }
-                    Err(why) => dropped("indexed draw", self.pipeline, why),
+                    Err(why) => {
+                        self.occlusion.dropped_draw();
+                        dropped("indexed draw", self.pipeline, why);
+                    }
                 }
                 return;
             }
@@ -2558,7 +2564,10 @@ impl State {
                 #[cfg(feature = "diagnostics")]
                 meshes.ran();
             }
-            Err(why) => dropped("indexed draw", self.pipeline, why),
+            Err(why) => {
+                self.occlusion.dropped_draw();
+                dropped("indexed draw", self.pipeline, why);
+            }
         }
     }
 }
@@ -3188,7 +3197,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::descriptor::host::SHARED_CHUNK;
     use crate::descriptor::{OWN_VIEW_HEAP, TestHeap};
@@ -4680,7 +4689,7 @@ float4 ps(V v) : SV_Target { return v.color; }
     /// in slot 0, colors (R8G8B8A8_UNORM) in slot 1. Without: corners from
     /// the vertex id, in white: vertex `i` is corner `i % 3` (top left,
     /// bottom left, bottom right) of cell `i / 3`.
-    struct Painter {
+    pub(crate) struct Painter {
         root: ID3D12RootSignature,
         pso: ID3D12PipelineState,
         target: ID3D12Resource,
@@ -4723,7 +4732,7 @@ float4 ps(V v) : SV_Target { return v.color; }
             code.expect("compiled code")
         }
 
-        fn new(host: &Host, inputs: bool) -> Painter {
+        pub(crate) fn new(host: &Host, inputs: bool) -> Painter {
             use windows::Win32::Graphics::Dxgi::Common::*;
             let entry = if inputs {
                 s!("vs_inputs")
@@ -4854,7 +4863,7 @@ float4 ps(V v) : SV_Target { return v.color; }
 
         /// Binds the pipeline and its target, as `prepare` binds a
         /// title's draw.
-        fn bind(&self, list: &HostList) {
+        pub(crate) fn bind(&self, list: &HostList) {
             let side = SIDE as f32;
             // SAFETY: an open list; our live objects, alive until it has run.
             unsafe {
