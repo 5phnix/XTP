@@ -7749,7 +7749,6 @@ void main() {
     /// new bytes.
     #[test]
     fn lists_of_a_submission_share_one_refresh_and_read_the_titles_bytes() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::{TitleBuffer, TitleList};
         let test = "descriptor::host::tests::lists_of_a_submission_share_one_refresh_and_read_the_titles_bytes";
         let Some(gpu) = crate::testgpu::device(test) else {
