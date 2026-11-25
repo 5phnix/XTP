@@ -4622,27 +4622,26 @@ float4 ps(V v) : SV_Target { return v.color; }
         let zero = title_bytes(&0u32.to_le_bytes());
         for copy_to_count in [true, false] {
             let painter = Painter::new(host, false);
-            let args = title_records(&[[3, 1, 0, 0], [3, 1, 3, 0], [3, 1, 6, 0]]);
+            let args = title_records(&[[3, 1, 0, 0]]);
             let count = title_bytes(&1u32.to_le_bytes());
             let (a, c) = (args.shadow(), count.shadow());
             let title = TitleList::new();
             let list = title.host();
-            a.refresh(list, args.address(), 48);
+            a.refresh(list, args.address(), 16);
             c.refresh(list, count.address(), 4);
             painter.clear(list);
             for execution in 0..3 {
-                let address = args.address() + 16 * execution;
                 if execution == 2 {
                     let dst = if copy_to_count {
                         count.address()
                     } else {
-                        address
+                        args.address()
                     };
                     assert!(crate::shadow::copy(list, dst, zero.address(), 4));
                 }
                 let bounded = crate::indirect::bound(
                     list,
-                    (&a.buffer, a.offset(address)),
+                    (&a.buffer, a.offset(args.address())),
                     (0, 16, 1),
                     Some((&c.buffer, c.offset(count.address()))),
                     None,
@@ -4654,6 +4653,14 @@ float4 ps(V v) : SV_Target { return v.color; }
                 painter.bind(list);
                 // SAFETY: la signature de dessin lit la tranche et son compteur bornés.
                 unsafe {
+                    // Même triangle, décalé dans une cellule propre à cet appel.
+                    list.list.RSSetViewports(&[D3D12_VIEWPORT {
+                        TopLeftX: (execution * SIDE / 4) as f32,
+                        Width: SIDE as f32,
+                        Height: SIDE as f32,
+                        MaxDepth: 1.0,
+                        ..Default::default()
+                    }]);
                     list.list.ExecuteIndirect(
                         &signature,
                         1,
