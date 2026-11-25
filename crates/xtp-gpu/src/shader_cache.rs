@@ -141,6 +141,28 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
     }
 }
 
+/// The translation of the export shader (ES) of a console vertex shader
+/// container, the vertex shader of a pipeline with a geometry shader
+/// (`xtp_shader::emit::translate_es_for`), from the cache when there is
+/// one: under a key of its own, the container being the same.
+pub(crate) fn host_es_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
+    let translate =
+        |c: &[u8]| xtp_shader::emit::translate_es_for(c, target).map_err(|e| e.to_string());
+    match CACHE.get() {
+        Some(cache) => cached(cache, &es_key(&key(build(), target)), container, translate),
+        None => translate(container),
+    }
+}
+
+/// An ES translation's key ([`host_es_shader`]) from the container's
+/// translation's ([`key`]).
+fn es_key(key: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(key);
+    h.update(b"export shader");
+    *h.finalize().as_bytes()
+}
+
 /// `translate`'s translation of `container` for `target` from `cache`,
 /// under this build's key for that target; made and stored on a miss.
 /// The target that keys the entry is the one `translate` is for: the

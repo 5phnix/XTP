@@ -17,6 +17,8 @@ use crate::resource::{Address, CODE, Role, Site, Source};
 /// tiling) holds as data: [`Lower::descriptor_data`] rebuilds only sizes.
 pub(super) const DESCRIPTOR_WORD: Why = "a descriptor's address or format read as data";
 
+pub(super) const ONLY_DATA: Why = "a descriptor read only as data";
+
 /// What [`Lower::unused_descriptor`] finds a descriptor load to be.
 enum Unused<'a> {
     /// No dword has a host value ([`DESCRIPTOR_WORD`]): a join takes it as
@@ -45,7 +47,7 @@ impl<'a> Lower<'a> {
             let h = self.constant_read_handle(read, true);
             for (k, &(reg, _)) in inst.writes.iter().enumerate() {
                 let at = self.s.m.i32(read.offset + 4 * k as u32);
-                let x = self.raw_dword(h, at);
+                let x = self.raw_words(h, at, 1)[0];
                 self.write(inst, reg, x, None);
             }
             return Ok(());
@@ -273,7 +275,10 @@ impl<'a> Lower<'a> {
     ///
     /// The view's kind comes from how the program uses the descriptor
     /// (its own access, or a twin load's), else from what the load is:
-    /// [`Self::unused_descriptor`].
+    /// [`Self::unused_descriptor`]. A constant buffer's size has no query:
+    /// its dwords are data only where something other than its
+    /// `s_buffer_load`s and joins with numbers reads them
+    /// ([`Self::reused_after_access`]), and then the program stops.
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
@@ -377,6 +382,17 @@ impl<'a> Lower<'a> {
                         let raw = match used.map(|u| u.kind) {
                             Some(ResourceType::Srv) => 11,
                             Some(ResourceType::Uav) => 11 | 0x1000,
+                            // A constant buffer whose registers the program
+                            // gives to numbers after its last access, which
+                            // joins take (r1smem's group B: a CBV table
+                            // entry the console compiler reads uniformly):
+                            // no dword is read as data (`smem_data.rs`).
+                            Some(_) if self.reused_after_access(site, &dwords) => {
+                                for v in dwords.into_iter().flatten() {
+                                    self.vals.insert(v, Val::Missing(OTHER));
+                                }
+                                return Ok(());
+                            }
                             Some(_) => return Err("a constant buffer's descriptor read as data"),
                             None => self.slot_raw_kind(&src),
                         };
@@ -612,7 +628,6 @@ impl<'a> Lower<'a> {
         count: u32,
         dwords: &[Option<Value>],
     ) -> Result<Unused<'a>, Why> {
-        const ONLY_DATA: Why = "a descriptor read only as data";
         let sampler = self.x.res.descriptors.iter().any(|d| {
             d.role == Role::Sampler
                 && d.source.leaves().into_iter().any(|l| {

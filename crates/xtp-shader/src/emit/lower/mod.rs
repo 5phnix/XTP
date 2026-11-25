@@ -75,6 +75,7 @@ mod mesh;
 mod operand;
 mod salu;
 mod smem;
+mod smem_data;
 mod spin;
 #[cfg(test)]
 mod tests;
@@ -202,19 +203,37 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             what: UNTRACKED_SELECT,
             ..
         }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
-        Err(ShaderError::Unsupported {
-            what: "the first half of an interpolation" | "a hardware SGPR input",
-            ..
-        }) if parts.native.stage == HwStage::Ps => {
-            let mut io = crate::io::raise_inputs(parts.p, parts.native, true)?;
-            io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
-            lower_program(
-                &Parts {
-                    io: &io,
-                    ..parts.clone()
-                },
-                false,
-            )
+        Err(original @ ShaderError::Unsupported { what, .. })
+            if parts.native.stage == HwStage::Ps
+                && matches!(
+                    what,
+                    "the first half of an interpolation" | "a hardware SGPR input"
+                ) =>
+        {
+            let retry = |io: &mut Io| {
+                io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
+                lower_program(
+                    &Parts {
+                        io,
+                        ..parts.clone()
+                    },
+                    false,
+                )
+            };
+            if what == "a hardware SGPR input" {
+                // Le nombre de SGPR définis à l'entrée ne change aucune paire.
+                match retry(&mut parts.io.clone()) {
+                    Ok(result) => return Ok(result),
+                    Err(ShaderError::Unsupported {
+                        what: "the first half of an interpolation",
+                        ..
+                    }) => {}
+                    Err(_) => return Err(original),
+                }
+            }
+            crate::io::raise_inputs(parts.p, parts.native, true)
+                .and_then(|mut io| retry(&mut io))
+                .map_err(|_| original)
         }
         result => result,
     }
@@ -223,7 +242,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects).run() {
+        match Lower::new(parts, &bad, numeric_selects).and_then(Lower::run) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -377,6 +396,8 @@ struct Lower<'a> {
     /// Values read other than as a resource access's descriptor: by an
     /// instruction that accesses no resource, or by a phi.
     data_reads: HashSet<Value>,
+    /// A merged ES or GS half's plan ([`geometry::Merged`]).
+    merged: Option<Box<geometry::Merged>>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -490,7 +511,11 @@ impl<'a> Lower<'a> {
         self.s.m.bin(entry, super::bitcode::Bin::Add, id, offset)
     }
 
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        numeric_selects: bool,
+    ) -> Result<Self, Stop> {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -500,6 +525,15 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.ordered_uavs = x.native.io.pops();
+        // Portage de VIctory #2085 (0xkn0wh3r3, 1f6fa41, GPL-3.0).
+        // DEPTH_BEFORE_SHADER fait rejeter les pixels masqués avant leurs écritures UAV.
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = x.native.io
+            && db_shader_control & (1 << 12) != 0
+        {
+            s.flags |= super::shader::flags::FORCE_EARLY_DEPTH_STENCIL;
+        }
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -615,23 +649,23 @@ impl<'a> Lower<'a> {
                 && !x.target.runs(64)
                 && x.target.runs(32)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
-            // A group of several console waves, which the console flow does
-            // not take (its waves need not branch alike to meet at one
-            // barrier), whose only reads of other lanes outside the half are
-            // lane reads at a lane fixed in the code: the same two halves,
-            // each lane on its own path, the lane reads through group-shared
-            // memory between group barriers every thread that has not ended
-            // reaches, and its LDS ordered by its own barriers
-            // ([`lanes::group_reads_meet`]).
+            // Une dernière wave incomplète peut échanger par LDS si chaque
+            // thread publie sa valeur et si la lane source existe partout.
             group_reads = console_lanes
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && cs.threads.iter().product::<u32>() > 64
+                && threads > 64
+                && !threads.is_multiple_of(64)
+                // Le dernier groupe physique de 32 publie aussi tous ses indices.
+                && threads.is_multiple_of(32)
+                && reads_whole
                 && !masks_held
                 && !insts().any(|i| i.name() == "v_readfirstlane_b32")
-                && insts().filter(|&i| whole(i)).all(lanes::constant_lane_read)
+                && insts()
+                    .filter(|&i| whole(i))
+                    .all(|i| lanes::present_lane_read(i, threads))
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 && lanes::group_reads_meet(p);
             split |= group_reads;
@@ -693,6 +727,12 @@ impl<'a> Lower<'a> {
                 split = x.native.wave64 && !x.target.runs(64);
             }
             if x.console_cf && split && threads > 64 {
+                if !threads.is_multiple_of(64) {
+                    return Err(unsupported(
+                        0,
+                        "paired lanes require complete console waves",
+                    ));
+                }
                 // Each physical lane carries console lanes i and i+32. One
                 // physical wave therefore follows one console program counter.
                 group_reads = false;
@@ -751,7 +791,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Lower {
+        Ok(Lower {
             s,
             x,
             bad,
@@ -858,7 +898,8 @@ impl<'a> Lower<'a> {
                 }
                 reads
             },
-        }
+            merged: None,
+        })
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -923,6 +964,7 @@ impl<'a> Lower<'a> {
             self.dispatch_threads();
         }
         self.inputs()?;
+        self.merged_start()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -968,9 +1010,14 @@ impl<'a> Lower<'a> {
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
+            if self.merged_end(b) {
+                continue;
+            }
             self.exit(b)?;
         }
         self.fill_phis()?;
+        #[cfg(debug_assertions)]
+        self.s.m.assert_paired_branches();
         let mut user_data: Vec<_> = self.user_reads.values().copied().collect();
         let first = self.s.user_data.next_multiple_of(4);
         for (i, row) in self.host_rows.iter().enumerate() {
@@ -1031,6 +1078,9 @@ impl<'a> Lower<'a> {
     }
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        if let Some(r) = self.merged_inst(b, i) {
+            return r;
+        }
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();

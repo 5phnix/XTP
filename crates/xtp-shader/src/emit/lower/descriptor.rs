@@ -50,7 +50,12 @@ impl<'a> Lower<'a> {
                         self.x.native.layout[address.param].slot,
                         0,
                     );
-                    Some(x.map_or(bias, |v| self.raw_add(v, bias)))
+                    Some(x.map_or(bias, |v| {
+                        let mut valid = self.s.m.bool(true);
+                        let sum = self.raw_add(v, bias, &mut valid);
+                        let max = self.s.m.i32(u32::MAX);
+                        self.s.m.select(self.cur, valid, sum, max)
+                    }))
                 } else {
                     x
                 };

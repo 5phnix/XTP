@@ -1338,7 +1338,8 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         }
         _ => return None,
     };
-    let desc = srv_desc(words);
+    let mut desc = srv_desc(words);
+    desc.Format = DXGI_FORMAT(words[0] as i32);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
@@ -1358,7 +1359,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
     } else {
-        crate::resource::element(desc.Format.0 as u32)?.0
+        crate::resource::element(words[0])?.0
     };
     Some((
         base + buffer.FirstElement * element,
@@ -4046,6 +4047,27 @@ mod tests {
             w[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             (w[4], w[6], w[7], w[8]) = (first, count, stride, flags);
             View::Shader(r.resource() as usize, Some(w))
+        }
+    }
+
+    #[test]
+    fn three_byte_views_keep_their_title_range_in_both_directions() {
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        for format in 118..=120 {
+            for unordered in [false, true] {
+                let mut words = [0; 16];
+                words[0] = format;
+                words[1] = 1;
+                words[10] = 4096;
+                let first = if unordered { 2 } else { 4 };
+                words[first] = 4;
+                words[first + 2] = 7;
+                assert_eq!(
+                    buffer_range(&View::Placed(unordered, resource, words)),
+                    Some((4108, 21))
+                );
+            }
         }
     }
 

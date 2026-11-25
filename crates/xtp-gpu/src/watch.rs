@@ -176,6 +176,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 const BLOCK: usize = PAGE;
 
 struct Guards {
+    owners: crate::readmap::Owners,
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
@@ -211,6 +212,7 @@ struct Guards {
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+    owners: crate::readmap::Owners::new(),
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
@@ -427,7 +429,7 @@ fn protect_other_views(g: &mut Guards, from: usize, to: usize) {
 
 /// Sets the protection of `blocks` (title memory); false if it failed: not
 /// all mapped, or more than one view (whose protections change apart).
-fn set_protection(blocks: Range<usize>, protection: u32) -> bool {
+pub(super) fn set_protection(blocks: Range<usize>, protection: u32) -> bool {
     use windows_sys::Win32::System::Memory::VirtualProtect;
     #[cfg(test)]
     tests::PROTECTED.with(|n| n.set(n.get() + 1));
@@ -501,8 +503,11 @@ fn placeholder(at: usize) -> bool {
 /// them written, and the same for the other views of their pages that a
 /// guard linked to them (a write through one view of a page is a write to
 /// all); true if any of `blocks` was guarded.
-fn open(g: &mut Guards, blocks: Range<usize>) -> bool {
+fn open(g: &mut Guards, blocks: Range<usize>, learn: bool) -> bool {
     let mut opening: Vec<usize> = g.protected.range(blocks.clone()).copied().collect();
+    for &block in &opening {
+        g.owners.touch(block, learn);
+    }
     let guarded = !opening.is_empty();
     // Only linked blocks are looked up: a kernel write range can be huge.
     let linked: Vec<usize> = g.aliased.range(blocks).copied().collect();
@@ -529,6 +534,9 @@ fn unguard(g: &mut Guards, mut blocks: Vec<usize>) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     blocks.sort_unstable();
     blocks.dedup();
+    for &block in &blocks {
+        g.owners.touch(block, false);
+    }
     blocks.retain(|block| g.protected.remove(block));
     for block in &blocks {
         g.clean.remove(block);
@@ -564,7 +572,7 @@ pub fn writing(at: usize, len: usize) {
     if !guarding() {
         return;
     }
-    open(&mut guards(), blocks(at, len));
+    open(&mut guards(), blocks(at, len), false);
 }
 
 /// Kernel writes into title memory under way ([`kernel_writing`]): each
@@ -712,8 +720,151 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     // waits for it, and the opening undoes what it guarded; a copy after it
     // sees this write. (`writing`'s shortcut never fires in the world, where
     // some view is always guarded.)
-    open(&mut guards(), pages.clone());
+    open(&mut guards(), pages.clone(), true);
     KernelWrite { id, pages }
+}
+
+/// The permanent address of an xmem page and all title views that show it.
+type PageLookup = fn(usize, &mut Vec<usize>) -> Option<usize>;
+static PAGE_LOOKUP: OnceLock<PageLookup> = OnceLock::new();
+
+/// # Safety
+/// The returned addresses must designate the same committed page. The runtime
+/// must pin the permanent range before changing any mapping or writing it.
+pub unsafe fn set_copy_back_lookup(lookup: PageLookup) {
+    let _ = PAGE_LOOKUP.set(lookup);
+}
+
+#[must_use]
+pub struct CopyBackPin(Option<Range<usize>>);
+
+impl Drop for CopyBackPin {
+    fn drop(&mut self) {
+        if let Some(r) = self.0.take() {
+            guards().owners.unpin(r);
+        }
+    }
+}
+
+/// Holds a range accessible across a kernel call or a physical mapping change.
+pub fn pin_copy_back(at: usize, len: usize) -> CopyBackPin {
+    if !crate::readmap::enabled() || len == 0 {
+        return CopyBackPin(None);
+    }
+    let r = blocks(at, len);
+    guards().owners.pin(r.clone(), false);
+    CopyBackPin(Some(r))
+}
+
+pub(super) fn pin_read(at: usize, len: usize) -> Option<CopyBackPin> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let r = blocks(at, len);
+    let mut g = guards();
+    if !g.owners.may_have_faulted(r.clone()) {
+        return None;
+    }
+    let _released = g.owners.pin(r.clone(), true);
+    #[cfg(feature = "diagnostics")]
+    if _released > 0 {
+        use crate::copystat::{C, add};
+        add(C::KernelReadPages, _released as u64);
+        add(C::KernelReadNs, started.elapsed().as_nanos() as u64);
+    }
+    Some(CopyBackPin(Some(r)))
+}
+
+pub(super) fn publish(
+    at: usize,
+    key: crate::readmap::Key,
+    gpu: &mut [u8],
+    old: Option<&[u8]>,
+) -> Option<(usize, u64)> {
+    let lookup = PAGE_LOOKUP.get()?;
+    let block = at / PAGE;
+    let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = guards();
+    let mut views = Vec::new();
+    let physical = lookup(block * PAGE, &mut views)? / PAGE;
+    views.iter_mut().for_each(|v| *v /= PAGE);
+    if !views.contains(&block) || g.owners.pinned(physical, &views) {
+        return None;
+    }
+    if !g.protected.contains(&block) {
+        // A write-only GPU destination may never have been refreshed. Start
+        // watching it now. A pending kernel write keeps every alias open.
+        if views
+            .iter()
+            .any(|&v| !g.protected.contains(&v) && !writable_range(v * PAGE, PAGE))
+            || FLYING.load(SeqCst) != 0 && views.iter().any(|&v| !flying(v..v + 1).is_empty())
+        {
+            return None;
+        }
+        install();
+        protect(&mut g, block, block + 1);
+        // A newly guarded view may already have changed since another
+        // shadow used it. The next asking must report it even if publication
+        // below falls back. The journal stamp covers successful publication.
+        for view in &views {
+            g.clean.remove(view);
+        }
+    }
+    if views.iter().any(|v| !g.protected.contains(v)) {
+        return None;
+    }
+    let written = g
+        .owners
+        .publish(physical, &views, key, at % PAGE, gpu, old)?;
+    journal.asked += 1;
+    let now = journal.asked;
+    for view in views {
+        journal.written.insert(view, now);
+        g.clean.insert(view);
+    }
+    Some((written, now))
+}
+
+/// Two readers may fault together. The second retries the already restored
+/// mapping. Only our own remembered pages with read access qualify.
+pub(super) fn read_fault(at: usize) -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    if !crate::readmap::enabled() {
+        return false;
+    }
+    // SAFETY: saves/restores the faulting thread's last error across the query.
+    let error = unsafe { GetLastError() };
+    let handled = resolve_read_fault(at);
+    // SAFETY: restores the caller's last-error value on this thread.
+    unsafe { SetLastError(error) };
+    handled
+}
+fn resolve_read_fault(at: usize) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let mut g = guards();
+    let block = at / PAGE;
+    if g.owners.touch(block, true) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::ReadFaults, 1);
+            add(C::ReadFaultNs, started.elapsed().as_nanos() as u64);
+        }
+        return true;
+    }
+    if !g.owners.restored(block) {
+        return false;
+    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: a sized result and a query-only address.
+    unsafe {
+        VirtualQuery(at as _, &mut info, size_of_val(&info)) != 0
+            && info.State == MEM_COMMIT
+            && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
+    }
 }
 
 /// For diagnostics (`XTP_FULL_REFRESH`): at how many other addresses the
@@ -785,6 +936,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     let g = &mut *g;
     let range = blocks(at, len);
+    g.owners.forget(range.clone());
     for known in [
         &mut g.absent,
         &mut g.views,
@@ -822,20 +974,37 @@ fn install() {
         const WRITE: usize = 1;
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
+            || r.ExceptionInformation[0] > WRITE
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        if r.ExceptionInformation[0] == 0 {
+            return if read_fault(at) {
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            };
+        }
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let mut g = guards();
+        #[cfg(feature = "diagnostics")]
+        let owned = g.owners.owns(at / BLOCK);
         // The faulting thread's last error stays the title's: opening the
         // other views of the page fails where one is unmapped meanwhile.
         // SAFETY: plain reads and writes of this thread's last error.
         let error = unsafe { GetLastError() };
-        let opened = open(&mut g, at / BLOCK..at / BLOCK + 1);
+        let opened = open(&mut g, at / BLOCK..at / BLOCK + 1, true);
+        #[cfg(feature = "diagnostics")]
+        if owned {
+            use crate::copystat::{C, add};
+            add(C::WriteFaults, 1);
+            add(C::ReadFaultNs, started.elapsed().as_nanos() as u64);
+        }
         // SAFETY: as above.
         unsafe { SetLastError(error) };
         if opened {
@@ -858,6 +1027,10 @@ fn install() {
 
 /// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
+    writable_range(at, 1)
+}
+
+fn writable_range(at: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
     };
@@ -865,7 +1038,10 @@ fn writable(at: usize) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect == PAGE_READWRITE
+        && info.RegionSize - (at - info.BaseAddress as usize) >= len
 }
 
 #[cfg(test)]
@@ -1000,6 +1176,36 @@ pub(crate) mod tests {
         let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, blocks * BLOCK) }.Value;
         assert!(!view.is_null());
         view as usize
+    }
+
+    /// xmem fixture for the isolated shadow test. A private view stays
+    /// writable while both addresses available to the title are no-access.
+    pub(crate) fn with_physical_views(body: impl FnOnce(usize, usize, usize)) {
+        const N: usize = 4;
+        static VIEWS: OnceLock<[usize; 3]> = OnceLock::new();
+        fn lookup(at: usize, out: &mut Vec<usize>) -> Option<usize> {
+            let &[first, second, private] = VIEWS.get()?;
+            let offset = [first, second]
+                .into_iter()
+                .find_map(|v| at.checked_sub(v).filter(|n| *n < N * PAGE))?;
+            out.extend([first + offset, second + offset]);
+            Some(private + offset)
+        }
+        let section = section(N);
+        let [first, second, private] = std::array::from_fn(|_| view_of(section, N));
+        VIEWS.set([first, second, private]).unwrap();
+        same_pages(&[first, second], N);
+        // SAFETY: all three views live throughout the test, and the private
+        // range is pinned over unmapping.
+        unsafe {
+            set_copy_back_lookup(lookup);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        body(first, second, private);
+        let _pin = pin_copy_back(private, N * PAGE);
+        for at in [first, second, private] {
+            unmapped(at, N);
+        }
     }
 
     /// Writes byte `byte` at `at` as the title's CPU does (into our handler

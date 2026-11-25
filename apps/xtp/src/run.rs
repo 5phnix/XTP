@@ -164,6 +164,13 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
+    if execute && xtp_game::identify(&hash).is_some() {
+        xtp_gpu::configure_copy_back(
+            cfg.cache_subdir("readmap")
+                .ok()
+                .map(|dir| dir.join(format!("{hash}.v1.map"))),
+        );
+    }
     let images = cfg.cache_subdir("images")?;
     xtp_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = xtp_loader::load(&prepared, &images)?;
@@ -171,6 +178,8 @@ pub fn run(
     unsafe { xtp_game::watchdog::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
     // SAFETY: as above.
     unsafe { xtp_game::asserts::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
+    // SAFETY: as above; the image stays mapped for the process.
+    unsafe { xtp_game::rt_path::apply_if_asked(&hash, image.base(), image.info().size_of_image) };
     xtp_hle::runtime::set_main_image(image.base());
     xtp_hle::runtime::set_image_path(image.base(), &exe);
     println!(
@@ -266,6 +275,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    xtp_gpu::save_copy_back_map();
     println!("title exited with {code}");
     Ok(())
 }
