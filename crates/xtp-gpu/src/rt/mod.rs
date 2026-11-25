@@ -1,12 +1,12 @@
 //! Host DXR builds recorded alongside the title's builder commands.
 
-use std::collections::BTreeMap;
 pub(crate) mod compaction;
 mod instances;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod probe;
 
 pub(crate) use instances::BlasMap;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -67,6 +67,7 @@ fn buffer(
         ..Default::default()
     };
     let mut resource = None;
+    let started = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
     // SAFETY: one committed, shader-writable buffer with a state matching its use.
     unsafe {
         device.CreateCommittedResource(
@@ -79,6 +80,14 @@ fn buffer(
         )
     }
     .ok()?;
+    if let Some(started) = started {
+        tracing::debug!(
+            bytes,
+            state = state.0,
+            us = started.elapsed().as_micros() as u64,
+            "host DXR buffer allocation"
+        );
+    }
     resource
 }
 
@@ -401,6 +410,8 @@ pub unsafe fn build(title_list: *const Object, desc: &Build) -> bool {
             | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY;
         let list = crate::list::host_list(title_list)?;
         let recorder = Recorder::new(list)?;
+        let _timing =
+            crate::timestamps::command(list, crate::timestamps::What::RaytracingBuild, None);
         match inputs.Type {
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL => {
                 // SAFETY: the descriptors are borrowed from this title call only.
