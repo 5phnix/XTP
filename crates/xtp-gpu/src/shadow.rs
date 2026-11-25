@@ -5589,11 +5589,16 @@ mod tests {
     /// Plain copies of title memory read what the kernel's copy read, with
     /// zeros where a page is decommitted or not readable, from any offset;
     /// a copy stops at the first byte it cannot read.
+    ///
+    /// It counts on what reads learned of its pages ([`learned`]): a guard
+    /// test's report of all title memory changed, made meanwhile, has the
+    /// copy note nothing, and the pages noted [`known`] before stay read.
     #[test]
     fn plain_copies_read_as_the_kernel_did() {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
         };
+        let _learned = learned();
         let len = 4 * PAGE;
         // SAFETY: a fresh reservation of our own, never freed.
         let base = unsafe {
