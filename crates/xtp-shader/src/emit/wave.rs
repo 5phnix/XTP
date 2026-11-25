@@ -35,7 +35,9 @@ pub(crate) enum Op {
 impl Op {
     fn of(name: &str) -> Option<Op> {
         Some(match name {
-            "v_add_nc_u32" => Op::AddU,
+            // The VGPR holds the same wrapping sum with or without carry-out.
+            // A subsequent add with carry-in needs the carry and stays unknown.
+            "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
@@ -356,6 +358,13 @@ fn simulate(
             }
             continue;
         };
+        if let Some(Operand::Scalar { code, dwords }) = v.carry {
+            for r in code..code + dwords {
+                if let Some(w) = inst.write(Reg::S(r)) {
+                    uni.insert(w, Sym::Unknown);
+                }
+            }
+        }
         let lanes = |op: &Operand,
                      vec: &HashMap<Value, Vec<Sym>>,
                      uni: &HashMap<Value, Sym>|
@@ -780,6 +789,53 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sum_with_carry_out_reduces_only_the_low_word() {
+        let mut words: Vec<u32> = vec![
+            0xbe86_3dc1, // save EXEC in s6 and enable the whole wave
+            0xd501_0005,
+            0x001a_0080, // v5 = saved mask ? v0 : 0
+        ];
+        // Exchange partners at distances 1, 2, 4 and 8 inside each row.
+        for distance in [1, 2, 4, 8] {
+            words.extend([
+                0x7e0c_02fa,
+                0xff01_6005 | (distance << 8), // v6 = row_xmask(v5)
+                0xd70f_6a05,
+                0x0002_0b06, // v5 = v6 + v5, carry in VCC
+            ]);
+        }
+        words.extend([
+            0xd778_0006,
+            0x0201_0105, // lane 0 in the other row
+            0xd70f_6a05,
+            0x0002_0b06, // low word
+            0x500e_0f07, // v7 = v7 + v7 + carry
+            0xd760_0004,
+            0x0001_0105, // read v5 from lane 0 into s4
+            0xd760_0005,
+            0x0001_0107, // read v7 from lane 0 into s5
+            0xbefe_0306,
+            0xbf81_0000, // restore EXEC and end
+        ]);
+        let code = words
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>();
+        let p = crate::ir::build(&code, false, 16).unwrap();
+        let sections = sections(&p, 0);
+        let sec = &sections[&0];
+        let insts = &p.blocks[0].insts;
+        let read = |r| insts.iter().find_map(|i| i.write(Reg::S(r))).unwrap();
+        let input = insts[1].read(Reg::V(0)).unwrap();
+        let mask = insts[0].write(Reg::S(6)).unwrap();
+        assert_eq!(
+            sec.shapes.get(&read(4)),
+            Some(&Shape::Active(Op::AddU, input, mask, 0))
+        );
+        assert!(!sec.shapes.contains_key(&read(5)));
+    }
 
     #[test]
     fn dpp_lanes_follow_the_isa() {
