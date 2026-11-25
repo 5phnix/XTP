@@ -738,6 +738,8 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// next recording afresh without taking them from it.
 #[derive(Clone, Default)]
 struct Recorded {
+    #[cfg(feature = "diagnostics")]
+    dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
     #[cfg(feature = "diagnostics")]
     notes: std::sync::Arc<Vec<Note>>,
@@ -914,6 +916,8 @@ impl Drop for DynamicLease {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    #[cfg(feature = "diagnostics")]
+    dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1610,6 +1614,10 @@ impl Host {
         // from their snapshot, each byte once per submission, however many
         // dispatches declared ranges over it (the world's passes declare the
         // same big ranges dozens of times).
+        #[cfg(feature = "diagnostics")]
+        for sample in p.recorded.iter().flat_map(|r| r.dispatch_samples.iter()) {
+            sample.report();
+        }
         let copying = std::time::Instant::now();
         for (shadow, address, len) in &p.copied {
             let written = shadow.write_back(p.submission, *address, *len);
@@ -2177,6 +2185,8 @@ impl HostList {
     /// What a submission of the list keeps of its recording.
     fn recorded(&self) -> Recorded {
         Recorded {
+            #[cfg(feature = "diagnostics")]
+            dispatch_samples: self.deferred().dispatch_samples.clone(),
             pipelines: self
                 .pipelines
                 .lock()
@@ -2185,6 +2195,11 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             notes: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dispatch_sample(&self, sample: crate::indirect::Sample) {
+        std::sync::Arc::make_mut(&mut self.deferred().dispatch_samples).push(sample);
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -2960,6 +2975,8 @@ impl Meter {
                 longest_lists = title.longest_lists,
                 making = crate::pipeline::making()
             );
+            #[cfg(feature = "diagnostics")]
+            crate::indirect::log_counts();
             crate::device::log_frame();
             if let Some(pools) = buffers::summary() {
                 tracing::info!("buffer heaps: {pools}");
