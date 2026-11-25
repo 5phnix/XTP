@@ -33,6 +33,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod meshstat;
 pub mod object;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod passdump;
