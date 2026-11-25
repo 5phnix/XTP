@@ -44,7 +44,7 @@ fn pixel(db_shader_control: u32) -> HostShader {
 
 #[test]
 fn depth_before_shader_sets_only_the_dxil_entry_flag() {
-    // Même programme, sans écriture UAV. Seul le bit 12 commande le test anticipé.
+    // Same program, without a UAV write. Only bit 12 controls the early test.
     let neighbors = (1 << 11) | (1 << 13);
     let plain = pixel(neighbors);
     let early = pixel(neighbors | (1 << 12));

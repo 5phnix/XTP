@@ -164,7 +164,7 @@ fn heap_program(words: &[u32]) -> crate::NativeProgram {
     )
 }
 
-/// Désassemblage DXIL par le SDK Windows, lorsqu'il est installé.
+/// DXIL disassembly by the Windows SDK, when it is installed.
 pub(super) fn disassembly(shader: &HostShader) -> Option<String> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dxc = match std::env::var_os("XTP_PC_DXC") {
@@ -172,7 +172,7 @@ pub(super) fn disassembly(shader: &HostShader) -> Option<String> {
         None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
     };
     if !dxc.exists() {
-        eprintln!("dxc.exe absent, désassemblage ignoré");
+        eprintln!("dxc.exe missing, disassembly skipped");
         return None;
     }
     let file = std::env::temp_dir().join(format!(

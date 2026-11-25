@@ -327,8 +327,8 @@ fn masks_read_whole_count_both_halves() {
 #[test]
 #[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn masked_double_sum_counts_both_halves() {
-    // Chaque lane fournit 0.0 ou 1.0 en double précision. Lire les lanes
-    // une par une donne un ordre de sommation indépendant des permutations.
+    // Each lane gives 0.0 or 1.0 in double precision. Reading the lanes one
+    // by one gives a summation order independent of the permutations.
     let mut body = vec![
         0x7d88_00a9, // vcc = (41 > v0)
         0x7e02_0280,
@@ -354,9 +354,9 @@ fn masked_double_sum_counts_both_halves() {
         0xd760_000a,
         0x0001_0105,
         0xd760_000b,
-        0x0001_0106, // lecture de la somme
+        0x0001_0106, // read of the sum
         0xbefe_040e,
-        0x7e04_1e0a, // restauration d’EXEC et conversion dans v2
+        0x7e04_1e0a, // restore of EXEC and conversion into v2
     ]);
     console_flow_case("masked double sum", &body, 64, |_| 41f32.to_bits());
 }
@@ -521,7 +521,7 @@ fn a_select_on_a_mask_held_as_a_number_runs_as_the_console() {
     });
 }
 
-/// Les groupes complets utilisent les lanes appariées pour les deux sortes de sélecteur.
+/// Full groups use the paired lanes for both kinds of selector.
 #[test]
 fn several_console_waves_choose_the_exchange_their_lane_reads_need() {
     let body = [
@@ -552,8 +552,8 @@ fn several_console_waves_choose_the_exchange_their_lane_reads_need() {
     assert!(emit_for(&program(&computed, 96), nvidia).is_err());
 }
 
-/// Lecture de la lane 40 de chaque wave console dans un groupe complet.
-/// Valeur attendue pour chaque thread :
+/// Read of lane 40 of each console wave in a full group.
+/// Expected value for each thread:
 /// - its own id (two and four console waves per group);
 /// - what it read from LDS, after an `s_barrier`, at the other wave of its
 ///   pair (t ^ 64), which that wave wrote before the barrier;
@@ -573,7 +573,7 @@ fn lane_reads_cross_halves_in_groups_of_several_console_waves() {
     }
     let lane31 = [own[0], 0x0001_3f00, own[2]];
     program_case(
-        "lane 31 dans 96 threads",
+        "lane 31 in 96 threads",
         &program(&lane31, 96),
         |t| (t & !63) + 31,
         true,
@@ -1721,8 +1721,8 @@ fn paired_lanes_share_lds_and_count_their_own_mask_bits() {
     );
 }
 
-/// Chaque nibble choisit une lane dans la rangée opposée. On conserve
-/// le motif lu et le résultat arrondi de deux opérations FP16 successives.
+/// Each nibble picks a lane in the opposite row. The test keeps the pattern
+/// read and the rounded result of two successive FP16 operations.
 #[test]
 #[ignore = "hardware: 32-lane waves (see hardware())"]
 fn paired_lanes_execute_a_half_precision_whole_wave_section() {
@@ -1739,9 +1739,9 @@ fn paired_lanes_execute_a_half_precision_whole_wave_section() {
         0xfedc_ba98,
         0xd778_0002,
         (13 << 18) | (12 << 9) | 257,
-        0x7e06_0302, // v3 = motif FP16 choisi
+        0x7e06_0302, // v3 = chosen FP16 pattern
         0x7e0c_02ff,
-        0x6800,      // v6 = 2048 en FP16
+        0x6800,      // v6 = 2048 in FP16
         0x6404_0d02, // v2 = v2 + v6
         0x6604_0d02, // v2 = v2 - v6
         0xD760_0009,
@@ -1750,12 +1750,12 @@ fn paired_lanes_execute_a_half_precision_whole_wave_section() {
         0x4A04_0409, // v_add_nc_u32 v2, s9, v2
         0x4a04_0702, // v2 += v3
     ];
-    paired_case("arrondi FP16 après permutation", &body, |t| {
+    paired_case("FP16 rounding after permutation", &body, |t| {
         let pick = if t & 8 == 0 { 7 - (t & 7) } else { t & 15 };
         let source = ((t & !15) ^ 16) + pick;
-        // x est dans [0,5 ; 0,57[ ou [2 ; 2,25[. Avec un pas de 2
-        // à 2048, les deux arrondis (au plus proche et vers zéro)
-        // donnent (2048 + x) - 2048 = 0 ou 2. Réassocier donnerait x.
+        // x is in [0.5, 0.57) or [2, 2.25). With a step of 2 at 2048,
+        // both roundings (to nearest and toward zero) give
+        // (2048 + x) - 2048 = 0 or 2. Reassociating would give x.
         let bits = if source & 32 == 0 { 0 } else { 0x4000 };
         let x = 0x3800 + source + ((source & 32) << 6);
         bits + 0x4000 + x
@@ -1783,8 +1783,8 @@ fn paired_case(label: &str, body: &[u32], want: impl Fn(u32) -> u32) {
     }
 }
 
-/// Le registre de la lane 40 vaut 140 dans la première wave. Il reste
-/// lisible par les lanes 0 à 39 dans la branche, même quand EXEC[40] vaut 0.
+/// The register of lane 40 is 140 in the first wave. It stays readable by
+/// lanes 0 to 39 in the branch, even when EXEC[40] is 0.
 const MASKED_READ: &[u32] = &[
     0x4a0a_00ff,
     100,         // v5 = 100 + id
@@ -1799,8 +1799,8 @@ const MASKED_READ: &[u32] = &[
     0x88fe_0a7e,
 ];
 
-/// Deux écritures successives par adresse, séparées seulement par waitcnt.
-/// L'échange des adresses entre demi-waves laisse 2 dans chaque case.
+/// Two successive writes per address, separated only by waitcnt.
+/// Swapping the addresses between half-waves leaves 2 in each slot.
 fn lds_two_writes(atomic: bool) -> Vec<u32> {
     let mut body = vec![
         0x3408_0082, // v4 = 4 * id
@@ -1819,7 +1819,7 @@ fn lds_two_writes(atomic: bool) -> Vec<u32> {
     }
     body.extend([0xbf8a_0000, 0xd8d8_0000, 0x0200_0004]);
     if atomic {
-        body.push(0x4a04_0d02); // 3 relu + 1 retourné
+        body.push(0x4a04_0d02); // 3 read back + 1 returned
     }
     body.extend([0xd760_0009, 0x0001_3f02, 0x7e04_0209]); // lane 31
     body
@@ -1828,11 +1828,11 @@ fn lds_two_writes(atomic: bool) -> Vec<u32> {
 #[test]
 fn partial_groups_refuse_divergent_exchanges_and_unordered_lds() {
     let even_lanes = [
-        0xbe89_0380, // s9 = 0 avant la branche
+        0xbe89_0380, // s9 = 0 before the branch
         0x3602_0081, // v1 = id & 1
         0x7d84_0280, // vcc = v1 == 0
         0xbe8a_246a,
-        0xbf88_0002, // reconvergence sans autre barrière
+        0xbf88_0002, // reconvergence without another barrier
         0xd760_0009,
         0x0001_3f00,
         0x88fe_0a7e,
@@ -1846,7 +1846,7 @@ fn partial_groups_refuse_divergent_exchanges_and_unordered_lds() {
     ] {
         assert!(emit_for(&program_lds(body, 96), HOSTS[0]).is_err());
     }
-    // Sans lecture de lane, les 32 Kio restent entièrement disponibles.
+    // Without a lane read, the full 32 KiB stay available.
     let mut p = program(IN_HALF, 128);
     let StageIo::Cs(io) = &mut p.io else {
         unreachable!()
@@ -1878,21 +1878,21 @@ fn whole_wave_read_of_an_incoming_vgpr_is_not_a_local_value() {
 #[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
 fn paired_reads_ignore_exec_and_lds_writes_keep_their_order() {
     program_case(
-        "lecture de la lane 40 masquée",
+        "masked read of lane 40",
         &program(MASKED_READ, 128),
         |t| if t & 63 < 40 { (t & !63) + 140 } else { 0 },
         true,
     );
     for atomic in [false, true] {
         program_case(
-            "deux écritures LDS",
+            "two LDS writes",
             &program_lds(&lds_two_writes(atomic), 128),
             |_| if atomic { 4 } else { 2 },
             true,
         );
     }
-    // Les lanes paires publient sous une garde, puis chaque lane lit
-    // l'adresse de la lane paire voisine de l'autre demi-wave, sans s_barrier.
+    // The even lanes publish under a guard, then each lane reads the address
+    // of the neighbouring even lane of the other half-wave, without s_barrier.
     let body = [
         0x3408_0082,
         0x3602_0081,
@@ -1907,11 +1907,11 @@ fn paired_reads_ignore_exec_and_lds_writes_keep_their_order() {
         0xd8d8_0000,
         0x0200_0005,
         0xd760_0009,
-        0x0001_0100, // base de la wave (lane 0)
+        0x0001_0100, // base of the wave (lane 0)
         0x4a04_0409,
     ];
     program_case(
-        "LDS entre lanes, sans barrière",
+        "LDS between lanes, without a barrier",
         &program_lds(&body, 128),
         |t| ((t & !1) ^ 32) + (t & !63),
         true,
@@ -1923,7 +1923,7 @@ fn paired_reads_ignore_exec_and_lds_writes_keep_their_order() {
 fn paired_exec_dwords_first_lane_and_partial_mbcnt() {
     let body = [
         0xbefe_0380, // exec_lo = 0
-        0xbeff_0388, // exec_hi = 8 : première lane active = 35
+        0xbeff_0388, // exec_hi = 8: first active lane = 35
         0x7e12_0500, // s9 = readfirstlane(v0)
         0xbefe_04c1, // exec = -1
         0xbe8a_03ff,
@@ -1936,7 +1936,7 @@ fn paired_exec_dwords_first_lane_and_partial_mbcnt() {
         0x0002_040b, // mbcnt_hi(s11, v2)
         0x4a04_0409,
     ];
-    paired_case("masques EXEC et mbcnt", &body, |t| {
+    paired_case("EXEC masks and mbcnt", &body, |t| {
         let below = (1u64 << (t & 63)) - 1;
         (t & !63) + 35 + (0x4000_000a_8000_0005 & below).count_ones()
     });
