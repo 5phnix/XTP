@@ -617,7 +617,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             && !staging.blank.load(Ordering::Acquire)
             && target.as_ref().is_none_or(|t| staging.copy_due(t));
         let runs = match &predicate {
-            Some(p) => p.decide(due, crate::timestamps::submissions()),
+            Some(p) => p.decide(due),
             None => true,
         };
         COPIES[usize::from(runs)].fetch_add(1, Ordering::Relaxed);
@@ -1644,9 +1644,6 @@ static PREDICATE_WORDS: OnceLock<Option<Predicates>> = OnceLock::new();
 pub(crate) struct Predicate {
     of: &'static Predicates,
     at: u32,
-    /// The submission being prepared (`timestamps::submissions`, plus one)
-    /// when the word was last set to run; 0: never.
-    ran_in: AtomicU64,
 }
 
 impl Predicate {
@@ -1671,11 +1668,7 @@ impl Predicate {
             once!("texture copy predicates ran out: copies run every time");
             return None;
         };
-        let p = Predicate {
-            of,
-            at,
-            ran_in: AtomicU64::new(0),
-        };
+        let p = Predicate { of, at };
         p.set(true);
         Some(p)
     }
@@ -1703,20 +1696,13 @@ impl Predicate {
         u64::from(self.at) * 8
     }
 
-    /// At the list's submission (`submission`: the submissions made
-    /// before it): its copy runs if `due`, or if it was let run earlier in
-    /// the same submission, which names the list twice. Both runs read the
-    /// one word, so the second decision must not take the copy from the
-    /// first (VIctory #1500, by A6thGraderFr, handles that case too).
-    /// Returns whether the copy runs.
-    pub(crate) fn decide(&self, due: bool, submission: u64) -> bool {
-        let this = submission + 1;
-        let runs = due || self.ran_in.load(Ordering::Relaxed) == this;
-        if runs {
-            self.ran_in.store(this, Ordering::Relaxed);
-        }
-        self.set(runs);
-        runs
+    /// At the list's submission: its copy runs if `due`. A submission that
+    /// names the list again runs it again only once this run has finished
+    /// (`Host::run_as`), so no other run reads the word meanwhile. Returns
+    /// whether the copy runs.
+    pub(crate) fn decide(&self, due: bool) -> bool {
+        self.set(due);
+        due
     }
 
     /// Before the list runs: whether its copy runs.
@@ -3253,14 +3239,14 @@ mod tests {
         let _ = other;
     }
 
-    /// A list named twice in one submission runs its copy in both runs if
-    /// the first needs it: both read its one predicate word. Submitted
-    /// again in a later submission, nothing changed, it does not: the
-    /// submissions are counted with timestamps off too (the default here).
+    /// A list named twice in one submission runs twice, the second run
+    /// once the first has finished (D3D12 message 553 otherwise, #45): the
+    /// first copies, the second finds the texture current and does not.
+    /// Submitted again in a later submission, nothing changed, it does not
+    /// either. The layer raises nothing.
     #[test]
-    fn a_list_named_twice_in_a_submission_copies() {
-        crate::testgpu::known_layer_errors(&[553], "#45");
-        let test = "texture::tests::a_list_named_twice_in_a_submission_copies";
+    fn a_list_named_twice_in_a_submission_copies_once() {
+        let test = "texture::tests::a_list_named_twice_in_a_submission_copies_once";
         let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
@@ -3291,17 +3277,17 @@ mod tests {
         list.close();
         host.execute(&[&list, &list]);
         host.drain();
-        assert_eq!(decided(&staging), [true, true, true]);
+        assert_eq!(decided(&staging), [true, true, false]);
         let read = read_back(host, texture, COPY_DEST);
         let texels: Vec<u8> = (0..16)
             .flat_map(|y| read[y * 256..y * 256 + 64].to_vec())
             .collect();
         assert!(texels.iter().all(|&b| b == 0x77), "{:x?}", &texels[..16]);
-        // The same recording in a submission of its own, the memory as it
-        // was: told from a second run of the last one by the count.
+        // The same recording in a submission of its own: nothing changed
+        // since the last run, so it does not copy either.
         host.execute(&[&list]);
         host.drain();
-        assert_eq!(decided(&staging), [true, true, true, false]);
+        assert_eq!(decided(&staging), [true, true, false, false]);
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
     }
