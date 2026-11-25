@@ -11,6 +11,9 @@
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
 //!    creation, during loading.
+//! 3. Beside them, the graphics and mesh pipelines' whole descriptions
+//!    ([`super::record`]), from which `xtp precook` makes them into the
+//!    library again after a translator change.
 //!
 //! All library calls are serialised: the interface does not promise that
 //! stores, loads and serialising may overlap.
@@ -28,6 +31,11 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
+}
+
+/// The folder the pipeline cache is kept in, once set.
+pub(crate) fn dir() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -69,6 +77,13 @@ fn library() -> Option<&'static Mutex<Library>> {
             library.map(Mutex::new)
         })
         .as_ref()
+}
+
+/// For tests: whether the host keeps pipelines in a library (it may have
+/// none).
+#[cfg(test)]
+pub(crate) fn available() -> bool {
+    library().is_some()
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -206,6 +221,7 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            recorded = super::record::kept(),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
