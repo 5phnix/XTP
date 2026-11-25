@@ -71,7 +71,7 @@ pub(crate) struct IndexView {
     pub(crate) format: u32,
 }
 
-/// Copies des vues liÃ©es quand une sortie manque. Le titre peut Ã©craser ses
+/// Copies des vues liées quand une sortie manque. Le titre peut écraser ses
 /// descripteurs ou changer de pipeline entre OMSetRenderTargets et le dessin.
 #[derive(Default)]
 struct IncompleteTargets {
@@ -128,7 +128,7 @@ impl IncompleteTargets {
             .depth
             .as_ref()
             .map(|(texture, desc)| host.dsv(texture, desc.as_ref()));
-        // SAFETY: ces vues viennent dâ€™Ãªtre recrÃ©Ã©es dans les tas CPU de lâ€™hÃ´te.
+        // SAFETY: ces vues viennent d’être recréées dans les tas CPU de l’hôte.
         unsafe {
             list.list.OMSetRenderTargets(
                 rtvs.len() as u32,
@@ -173,7 +173,7 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
-    // Racines validÃ©es avant le bridage, posÃ©es aprÃ¨s sa passe de calcul.
+    // Racines validées avant le bridage, posées après sa passe de calcul.
     pending_compute: Option<Vec<(u32, ComputeRoot)>>,
     host_heaps: [usize; 2],
     /// The host heap behind each key of [`State::host_heaps`] this
@@ -208,7 +208,7 @@ pub(crate) struct State {
     heap_textured: Vec<usize>,
     /// Root SRVs bound as one-view tables in this list: (view heap, title
     /// address, host copy, 0 for a view in place or [`State::writes`] + 1
-    /// for a copy of the list's own) â†’ slot.
+    /// for a copy of the list's own) → slot.
     root_srv_slots: std::collections::HashMap<(usize, u64, usize, u64), u32>,
     /// Une vue brute par segment de tampon et par tas pour cet enregistrement.
     root_uav_slots: std::collections::HashMap<(usize, usize, u64, u64), u32>,
@@ -235,7 +235,7 @@ enum ComputeRoot {
 impl ComputeRoot {
     fn set(self, list: &HostList, param: u32) {
         let l = &list.list;
-        // SAFETY: bind a validÃ© les ressources et la racine de ce pipeline.
+        // SAFETY: bind a validé les ressources et la racine de ce pipeline.
         unsafe {
             match self {
                 Self::Constants(v) => {
@@ -1970,8 +1970,8 @@ impl State {
     }
 
     /// Ported from Marvisak/VIctory#1077 (head 873548f) by DuarttBR.
-    /// Le dÃ©calage est celui de la vue liÃ©e, y compris pour un compteur
-    /// situÃ© Ã  4, 8 ou 12 octets du dÃ©but alignÃ©.
+    /// Le décalage est celui de la vue liée, y compris pour un compteur
+    /// situé à 4, 8 ou 12 octets du début aligné.
     fn root_uav(
         &mut self,
         list: &HostList,
@@ -1980,7 +1980,7 @@ impl State {
         let heap = self.host_heaps[0];
         let host = host_heap(heap).ok_or("a root UAV without a view heap")?;
         let copy = crate::shadow::find(address, 4).ok_or("a root UAV outside a title buffer")?;
-        // SAFETY: la copie possÃ¨de la ressource.
+        // SAFETY: la copie possède la ressource.
         let flags = unsafe { copy.buffer.GetDesc() }.Flags;
         if !flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
             return Err("a root UAV on a buffer without unordered access");
@@ -2012,7 +2012,7 @@ impl State {
     }
 
     /// Lie la copie qui contient la base. Le shader conserve l'index GPU et
-    /// l'identitÃ© du tampon, mÃªme pour une base dÃ©calÃ©e dans la copie.
+    /// l'identité du tampon, même pour une base décalée dans la copie.
     fn indexed_address_srv(
         &mut self,
         list: &HostList,
@@ -2432,7 +2432,7 @@ impl State {
             );
             let p =
                 crate::pipeline::host_pipeline(self.pipeline as This).ok_or(Unready::NoPipeline)?;
-            // SAFETY: la liste est ouverte et le pipeline mesh est liÃ©.
+            // SAFETY: la liste est ouverte et le pipeline mesh est lié.
             crate::indirect::direct(list, groups, p.group_base(), true, |[x, y, z]| unsafe {
                 l6.DispatchMesh(x, y, z)
             });
@@ -2955,7 +2955,7 @@ impl State {
 /// the title's draw, with whole rectangles, whose fourth corners the
 /// pipeline's geometry stage makes ([`crate::rectangles::geometry_stage`]).
 /// Its shader sees vertex ids from 0, the start left out, on the host as on
-/// the console (docs/analysis/drops.md Â§5.1.1).
+/// the console (docs/analysis/drops.md §5.1.1).
 fn rectangle_vertices(vertices: u32, first: u32, expanded: bool) -> (u32, u32) {
     let rects = vertices / 3;
     if expanded {
@@ -3079,8 +3079,8 @@ impl State {
                 self.probe_dropped(list, Some((arguments, len)));
             }
             if kind == DISPATCH {
-                // Le substitut de ray tracing utilise le nombre rÃ©el de commandes
-                // comme prÃ©dicat GPU. Lui seul a besoin du bridage en cas de rejet.
+                // Le substitut de ray tracing utilise le nombre réel de commandes
+                // comme prédicat GPU. Lui seul a besoin du bridage en cas de rejet.
                 let commands = if crate::rt_standin::active()
                     && crate::rt_standin::program(pipeline as This).is_some()
                 {
@@ -3204,7 +3204,7 @@ impl State {
             } else {
                 4
             };
-        // SAFETY: la passe a bornÃ© les commandes et leur nombre dans la mÃªme tranche.
+        // SAFETY: la passe a borné les commandes et leur nombre dans la même tranche.
         unsafe {
             if compute && std::mem::take(&mut self.dropped_dispatch) {
                 list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
@@ -3290,8 +3290,8 @@ impl State {
         )
     }
 
-    /// Valide les ressources du dessin avant le bridage, puis rÃ©tablit son PSO
-    /// aprÃ¨s les passes de calcul et exÃ©cute les rectangles dÃ©veloppÃ©s.
+    /// Valide les ressources du dessin avant le bridage, puis rétablit son PSO
+    /// après les passes de calcul et exécute les rectangles développés.
     fn rectangles_indirect(
         &mut self,
         list: &HostList,
@@ -3322,15 +3322,15 @@ impl State {
                 Ok(batch) => batch,
                 Err(why) if first == 0 => return Err(why),
                 Err(why) => {
-                    // Les premiers lots sont dÃ©jÃ  dans la liste. Le reste du
-                    // dessin aurait pu contribuer Ã  la requÃªte dâ€™occlusion.
+                    // Les premiers lots sont déjà dans la liste. Le reste du
+                    // dessin aurait pu contribuer à la requête d’occlusion.
                     self.occlusion.dropped_draw();
                     tracing::warn!(first, max, ?why, "dessin de rectangles partiel");
                     break;
                 }
             };
             self.host_roots[1] = 0;
-            // SAFETY: les passes de calcul ont remplacÃ© le PSO, les racines graphiques restent valides.
+            // SAFETY: les passes de calcul ont remplacé le PSO, les racines graphiques restent valides.
             unsafe { list.list.SetPipelineState(&pso) };
             self.host_pipeline = pso.as_raw() as usize;
             prepared.bind_vertices(list);
@@ -5522,7 +5522,7 @@ float4 ps(V v) : SV_Target { return v.color; }
 "#;
 
     /// A graphics pipeline standing in for a title's rectangle pipeline,
-    /// drawing into a [`SIDE`]Â² RGBA8 target of four cells side by side
+    /// drawing into a [`SIDE`]² RGBA8 target of four cells side by side
     /// (each a quarter of its width). With inputs: positions (R32G32_FLOAT)
     /// in slot 0, colors (R8G8B8A8_UNORM) in slot 1. Without: corners from
     /// the vertex id, in white: vertex `i` is corner `i % 3` (top left,
@@ -5895,7 +5895,7 @@ float4 ps(V v) : SV_Target { return v.color; }
         graphics.targets.NumRenderTargets = 2;
         graphics.targets.RTFormats[0] = DXGI_FORMAT(10);
         graphics.targets.RTFormats[1] = DXGI_FORMAT(28);
-        // DÃ©sactive le test de profondeur de cette sonde couleur.
+        // Désactive le test de profondeur de cette sonde couleur.
         #[repr(C)]
         struct Depth(u32, D3D12_DEPTH_STENCIL_DESC);
         let depth = Depth(
@@ -5936,7 +5936,7 @@ float4 ps(V v) : SV_Target { return v.color; }
             painter.bind(list.host());
             crate::testgpu::bind_indexed_heaps(host, list.host());
             let mut state = State::default();
-            // Les deux ordres de liaison doivent sÃ©lectionner la mÃªme variante.
+            // Les deux ordres de liaison doivent sélectionner la même variante.
             if typed {
                 state.set_pipeline(pipeline);
             }
@@ -5944,8 +5944,8 @@ float4 ps(V v) : SV_Target { return v.color; }
             state.set_pipeline(pipeline);
             state
                 .prepare(list.host(), false)
-                .expect("le dessin est prÃªt");
-            // SAFETY: le pipeline et les vues sont ceux sÃ©lectionnÃ©s par la prÃ©paration rÃ©elle.
+                .expect("le dessin est prêt");
+            // SAFETY: le pipeline et les vues sont ceux sélectionnés par la préparation réelle.
             unsafe { list.host().list.DrawInstanced(3, 1, 0, 0) };
             list.run();
             let image = read_back(host, tex, 4);
@@ -5962,8 +5962,8 @@ float4 ps(V v) : SV_Target { return v.color; }
         crate::object::slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
     }
 
-    /// RÃ©gression de la veille 343 : deux triangles passent dans la mÃªme sÃ©rie.
-    /// Une copie met Ã  zÃ©ro le compteur ou le nombre de sommets avant le troisiÃ¨me.
+    /// Régression de la veille 343 : deux triangles passent dans la même série.
+    /// Une copie met à zéro le compteur ou le nombre de sommets avant le troisième.
     #[test]
     fn a_copy_between_two_indirect_executions_of_the_same_run() {
         let test = "draw::tests::a_copy_between_two_indirect_executions_of_the_same_run";
@@ -6004,9 +6004,9 @@ float4 ps(V v) : SV_Target { return v.color; }
                 .unwrap();
                 assert_eq!(bounded.dispatched, execution != 1);
                 painter.bind(list);
-                // SAFETY: la signature de dessin lit la tranche et son compteur bornÃ©s.
+                // SAFETY: la signature de dessin lit la tranche et son compteur bornés.
                 unsafe {
-                    // MÃªme triangle, dÃ©calÃ© dans une cellule propre Ã  cet appel.
+                    // Même triangle, décalé dans une cellule propre à cet appel.
                     list.list.RSSetViewports(&[D3D12_VIEWPORT {
                         TopLeftX: (execution * SIDE / 4) as f32,
                         Width: SIDE as f32,
@@ -6162,7 +6162,7 @@ float4 ps(V v) : SV_Target { return v.color; }
     /// `SV_VertexID` leaves out the start vertex, and so does the console's
     /// v0; the start reaches a console program only through a user SGPR,
     /// which none of the title's vertex programs read (docs/analysis/drops.md
-    /// Â§5.1.1). They drew twice the vertices before: cells 0 to 3.
+    /// §5.1.1). They drew twice the vertices before: cells 0 to 3.
     #[test]
     fn indirect_rectangles_without_vertex_inputs_draw_their_first_triangles() {
         let _pool = crate::rectangles::POOL_TESTS
