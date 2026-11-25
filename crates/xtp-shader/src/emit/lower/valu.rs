@@ -235,7 +235,7 @@ impl<'a> Lower<'a> {
             }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
-                let x = self.src64(inst, 1)?;
+                let x = self.src64(inst, 1, name == "v_ashrrev_i64")?;
                 let i64t = self.s.m.int(64);
                 let k63 = self.s.m.i32(63);
                 let n = self.s.m.bin(c, Bin::And, n, k63);
@@ -246,12 +246,33 @@ impl<'a> Lower<'a> {
                     _ => Bin::AShr,
                 };
                 let r = self.s.m.bin(c, op, x, n);
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("a 64-bit result");
-                };
-                let (lo, hi) = self.split64(r);
-                self.write(inst, Reg::V(reg), lo, guard);
-                self.write(inst, Reg::V(reg + 1), hi, guard);
+                self.write64(inst, v.dst, r, guard)
+            }
+            "v_mad_i64_i32" | "v_mad_u64_u32" => {
+                if v.clamp || v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                let signed = name == "v_mad_i64_i32";
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let acc = self.src64(inst, 2, signed)?;
+                let product = self.wide_product(a, b, signed);
+                let sum = self.s.m.bin(c, Bin::Add, product, acc);
+                self.write64(inst, v.dst, sum, guard)?;
+                if let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    let mut carry = self.s.m.cmp(c, pred::IULT, sum, product);
+                    if signed {
+                        // Bit 64 of the exact sum also includes the two sign bits
+                        // (Marvisak/VIctory#171, 6b5e0b4, by n-romanovich).
+                        let signs = self.s.m.bin(c, Bin::Xor, product, acc);
+                        let i64t = self.s.m.int(64);
+                        let zero = self.s.m.int_const(i64t, 0);
+                        let sign = self.s.m.cmp(c, pred::SLT, signs, zero);
+                        carry = self.s.m.bin(c, Bin::Xor, carry, sign);
+                    }
+                    self.lane_bits.insert(w, carry);
+                }
                 Ok(())
             }
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
@@ -1053,17 +1074,24 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
-    pub(super) fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
+    /// The complete 32 × 32-bit product.
+    fn wide_product(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
         let ext = if signed { Cast::SExt } else { Cast::ZExt };
         let a = self.s.m.cast(c, ext, a, i64t);
         let b = self.s.m.cast(c, ext, b, i64t);
-        let m = self.s.m.bin(c, Bin::Mul, a, b);
+        self.s.flags |= flags::INT64;
+        self.s.m.bin(c, Bin::Mul, a, b)
+    }
+
+    /// The high dword of a 32 × 32-bit product.
+    pub(super) fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
+        let c = self.cur;
+        let m = self.wide_product(a, b, signed);
+        let i64t = self.s.m.int(64);
         let k32 = self.s.m.int_const(i64t, 32);
         let hi = self.s.m.bin(c, Bin::LShr, m, k32);
-        self.s.flags |= flags::INT64;
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
