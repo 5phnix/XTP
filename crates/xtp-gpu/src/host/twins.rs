@@ -286,6 +286,8 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             stale::pass(true);
             self.pass_plane(depth, twin);
+            #[cfg(feature = "diagnostics")]
+            probe::record(self, depth, twin, true);
             self.move_to(depth, state);
         }
         // SAFETY: an open list.
@@ -356,6 +358,8 @@ impl HostList {
             // Nothing of the title's is recorded after this: the pass may
             // leave its own pipeline and target set.
             self.pass_plane(depth, twin);
+            #[cfg(feature = "diagnostics")]
+            probe::record(self, depth, twin, false);
             self.move_to(depth, SHADER_RESOURCE);
         }
     }
@@ -521,6 +525,7 @@ pub(super) mod stale {
                 format!("{name}: {w} twin writes, reads {fr} fresh {sr} stale, targets {ft} fresh {st} stale")
             })
             .collect();
+        super::probe::log();
         tracing::info!(
             "depth planes from twins, per frame: {late:.2} late uses, uses of a stale plane \
              {reads:.2} read and {targets:.2} as target, passes {passes_now:.2} before a draw \
@@ -534,6 +539,258 @@ pub(super) mod stale {
             now[3],
             now[4],
         );
+    }
+}
+
+/// Diagnostics, `XTP_PLANE_PROBE=1`: in the frames the capture lists
+/// (`XTP_CAPTURE_FRAMES`, `XTP_CAPTURE_WORLD`), each depth plane's pass is
+/// followed by copies of the twin it drew (the material classes) and of the
+/// plane it drew into, read back once the frame line comes and the copies
+/// have had time to run (`log`, 3 s): the classes on both sides of the pass
+/// and the texels where they differ. A plane keeps what its last pass drew
+/// until the next one (draws test it without writing it), so this is what
+/// the lighting's "equal" rectangles test against.
+#[cfg(feature = "diagnostics")]
+mod probe {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    use super::{COPY_SOURCE, HostList, HostTexture, Twin, UNORDERED_ACCESS, host};
+
+    /// A pass's read-backs: subresource 0 of the twin and of the plane,
+    /// each a buffer and its row pitch.
+    struct Probe {
+        frame: u64,
+        /// Before a draw or dispatch (`planes_now`), or at the close.
+        now: bool,
+        /// The twin holds 16-bit steps (else floats); the plane is 24-bit
+        /// (else a float).
+        steps: bool,
+        unorm24: bool,
+        width: u32,
+        height: u32,
+        twin: (ID3D12Resource, u32),
+        plane: (ID3D12Resource, u32),
+        at: Instant,
+    }
+
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Probe {}
+
+    static PROBES: Mutex<Vec<Probe>> = Mutex::new(Vec::new());
+
+    /// The frame being recorded, if probed.
+    fn wanted() -> Option<u64> {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("XTP_PLANE_PROBE").is_ok_and(|v| v.trim() == "1")) {
+            return None;
+        }
+        let frame = crate::queue::presented() + 1;
+        crate::capture::listed(frame).then_some(frame)
+    }
+
+    /// Records into `list` the copy of subresource 0 of `texture` (in the
+    /// copy source state) into a read-back buffer of ours: the buffer and
+    /// its row pitch.
+    fn copy(list: &HostList, texture: &ID3D12Resource) -> Option<(ID3D12Resource, u32)> {
+        let host = host()?;
+        // SAFETY: a live texture.
+        let desc = unsafe { texture.GetDesc() };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0;
+        // SAFETY: a plain query for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let buffer = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a read-back buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .ok()?;
+        }
+        let readback = readback?;
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        // SAFETY: an open list; both live, the texture in the copy source
+        // state, the buffer as big as the footprint.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        list.keep(&readback);
+        Some((readback, footprint.Footprint.RowPitch))
+    }
+
+    /// After the pass that drew `twin`'s depth plane into `depth` (left in
+    /// the depth write state, the twin in unordered access): the copies of
+    /// both, if the frame is probed. The depth texture is left in the copy
+    /// source state, the twin in unordered access.
+    pub(super) fn record(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, now: bool) {
+        let Some(plane) = &twin.plane else { return };
+        let Some(frame) = wanted() else { return };
+        list.move_to(depth, COPY_SOURCE);
+        list.move_to(plane, COPY_SOURCE);
+        let copies = (copy(list, &plane.texture), copy(list, &depth.texture));
+        list.move_to(plane, UNORDERED_ACCESS);
+        let (Some(twin_copy), Some(plane_copy)) = copies else {
+            return;
+        };
+        // SAFETY: live textures.
+        let (of, steps) = unsafe { (depth.texture.GetDesc(), plane.texture.GetDesc()) };
+        PROBES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Probe {
+                frame,
+                now,
+                steps: steps.Format.0 == 53,
+                unorm24: of.Format.0 == 44,
+                width: of.Width as u32,
+                height: of.Height,
+                twin: twin_copy,
+                plane: plane_copy,
+                at: Instant::now(),
+            });
+    }
+
+    /// The bytes of a read-back buffer.
+    fn bytes(buffer: &ID3D12Resource) -> Option<Vec<u8>> {
+        // SAFETY: a live buffer.
+        let len = unsafe { buffer.GetDesc() }.Width as usize;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a read-back buffer whose copy has run (`log` waits); its
+        // mapping holds `len` bytes.
+        unsafe {
+            buffer.Map(0, None, Some(&mut data)).ok()?;
+            let bytes = std::slice::from_raw_parts(data.cast::<u8>(), len).to_vec();
+            buffer.Unmap(0, None);
+            Some(bytes)
+        }
+    }
+
+    /// The frame line's: one line per probe whose copies have had 3 s to
+    /// run.
+    pub(super) fn log() {
+        let ready: Vec<Probe> = {
+            let mut probes = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+            let (ready, waiting) = std::mem::take(&mut *probes)
+                .into_iter()
+                .partition(|p| p.at.elapsed() >= Duration::from_secs(3));
+            *probes = waiting;
+            ready
+        };
+        // The step the lighting and the pass multiply classes by.
+        let step = f64::from(f32::from_bits(0x3780_0080));
+        for p in ready {
+            let (Some(twin), Some(plane)) = (bytes(&p.twin.0), bytes(&p.plane.0)) else {
+                continue;
+            };
+            let (tp, pp) = (p.twin.1 as usize, p.plane.1 as usize);
+            let mut classes: HashMap<u32, u64> = HashMap::new();
+            let mut drawn: HashMap<u32, u64> = HashMap::new();
+            let (mut differ, mut texels) = (0u64, 0u64);
+            let word = |b: &[u8], at: usize| {
+                b.get(at..at + 4)
+                    .map_or(0, |w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            };
+            for y in 0..p.height as usize {
+                for x in 0..p.width as usize {
+                    let z = if p.unorm24 {
+                        f64::from(word(&plane, y * pp + x * 4) & 0xff_ffff)
+                            / f64::from(0xff_ffffu32)
+                    } else {
+                        f64::from(f32::from_bits(word(&plane, y * pp + x * 4)))
+                    };
+                    let (class, same) = if p.steps {
+                        let at = y * tp + x * 2;
+                        let c = twin
+                            .get(at..at + 2)
+                            .map_or(0, |w| u16::from_le_bytes([w[0], w[1]]));
+                        let est = (z / step).round();
+                        (u32::from(c), est == f64::from(c))
+                    } else {
+                        let bits = word(&twin, y * tp + x * 4);
+                        (
+                            (f64::from(f32::from_bits(bits)) / step).round() as u32,
+                            (z as f32).to_bits() == bits,
+                        )
+                    };
+                    *classes.entry(class).or_default() += 1;
+                    *drawn.entry((z / step).round() as u32).or_default() += 1;
+                    differ += u64::from(!same);
+                    texels += 1;
+                }
+            }
+            let top = |h: HashMap<u32, u64>| {
+                let mut h: Vec<_> = h.into_iter().collect();
+                h.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
+                h.truncate(8);
+                h
+            };
+            tracing::info!(
+                frame = p.frame,
+                when = if p.now {
+                    "before a draw or dispatch"
+                } else {
+                    "at the list's close"
+                },
+                size = format_args!("{}x{}", p.width, p.height),
+                differ,
+                texels,
+                "depth plane probe: classes in the twin (class: texels) {:?}, in the plane {:?}",
+                top(classes),
+                top(drawn),
+            );
+        }
     }
 }
 
