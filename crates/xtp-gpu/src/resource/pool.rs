@@ -1099,7 +1099,6 @@ mod tests {
             let want: Vec<u8> = (at..at + 64).map(|i| (i % 251) as u8).collect();
             assert_eq!(read[at..at + 64], want[..], "row {row}");
         }
-        assert_eq!(host.log_messages(), None);
     }
 
     /// Past the budget no heap is made and the texture is not placed (it is

@@ -1562,7 +1562,6 @@ mod tests {
         sample_in(host, resource, 2);
         assert_eq!(decided(&staging), [true, false, false, true, false]);
         assert!(texels().iter().all(|&b| b == 0x33));
-        assert_eq!(host.log_messages(), None);
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
     }
@@ -1705,7 +1704,6 @@ mod tests {
         assert_eq!(hashes(&staging), 3);
         assert_eq!(decided(&staging).last(), Some(&true));
         assert!(texels().iter().all(|&b| b == 0x66));
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
@@ -1985,7 +1983,6 @@ mod tests {
         sample_in(host, resource, 1);
         let texels = texels_of(host, texture);
         assert!(texels.iter().all(|&b| b == 0x22), "{:x?}", &texels[..16]);
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
@@ -2060,7 +2057,6 @@ mod tests {
         }
         assert_eq!(hashes(&staging), hashed);
         assert_eq!(staging.missed.load(Ordering::Relaxed), 1);
-        assert_eq!(host.log_messages(), None);
 
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);

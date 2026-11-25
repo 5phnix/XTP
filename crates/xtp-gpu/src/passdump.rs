@@ -2077,7 +2077,6 @@ mod tests {
                 assert!(near(t, want), "{t:?} at {x},{y}, want {want:?}");
             }
         }
-        assert_eq!(host.log_messages(), None);
         release(hdr);
         release(ids);
     }
@@ -2152,7 +2151,6 @@ mod tests {
         // Nothing is left: the read-back memory starts again.
         assert_eq!(dump.readback.used, 0);
         assert_eq!(dump.report(8), None);
-        assert_eq!(host.log_messages(), None);
         release(target);
     }
 }

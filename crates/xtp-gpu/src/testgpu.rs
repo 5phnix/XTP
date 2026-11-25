@@ -59,11 +59,12 @@ pub(crate) fn device(test: &str) -> Option<Gpu> {
 }
 
 /// A test's host device. With the D3D12 debug layer on
-/// (`XTP_D3D12_DEBUG=1` in a diagnostics build, as CI runs the GPU tests),
-/// dropping it fails the test with the errors the layer raised on the
-/// test's thread (named after the test), and with any it raised on other
-/// threads of ours meanwhile (exact when tests run one at a time,
-/// `--test-threads=1`).
+/// (`XTP_D3D12_DEBUG=1` in a diagnostics build, as CI's `gpu-debug-layer`
+/// job runs the GPU tests), dropping it fails the test with the errors the
+/// layer raised on the test's thread (named after the test), and with any
+/// it raised on other threads of ours meanwhile. When tests run one at a
+/// time (`RUST_TEST_THREADS=1`), it also fails on errors left by another
+/// test's thread, which then kept no guard.
 pub(crate) struct Gpu {
     host: &'static Host,
 }
@@ -157,12 +158,20 @@ fn is_test_thread(thread: &str) -> bool {
     thread.contains("::")
 }
 
-/// Takes the errors this thread raised, and those raised on threads that
-/// are no test's; known ones (see [`known_layer_errors`]) are reported on
-/// standard error instead.
+/// Whether tests run one at a time (`RUST_TEST_THREADS=1`): then errors of
+/// another test's thread are that test's, left without a guard.
+fn serial() -> bool {
+    std::env::var("RUST_TEST_THREADS").as_deref() == Ok("1")
+}
+
+/// Takes the errors this thread raised, those raised on threads that are
+/// no test's, and (run serially) those another test's thread left; known
+/// ones (see [`known_layer_errors`]) are reported on standard error
+/// instead.
 fn layer_errors() -> Vec<String> {
     let me = thread_name();
     let (known, issue) = KNOWN.with(|k| k.borrow().clone());
+    let serial = serial();
     let mut errors = lock(&LAYER_ERRORS);
     let (mut taken, mut tolerated) = (Vec::new(), 0);
     errors.retain(|e| {
@@ -178,18 +187,34 @@ fn layer_errors() -> Vec<String> {
                 e.text, e.id, e.thread
             ));
             false
+        } else if serial {
+            taken.push(format!(
+                "{} (message id {}, left by test {}, which kept no device guard)",
+                e.text, e.id, e.thread
+            ));
+            false
         } else {
             true
         }
     });
+    drop(errors);
     if tolerated > 0 {
         let _ = writeln!(
             std::io::stderr(),
             "KNOWN {me}: {tolerated} D3D12 debug layer error(s) with ids {known:?} ({issue})"
         );
+    } else if !known.is_empty() && WATCHING_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "KNOWN {me}: no D3D12 debug layer error with ids {known:?} this run; drop the \
+             allowance once {issue} is fixed"
+        );
     }
     taken
 }
+
+/// Whether the layer reports to us (see [`watch`]).
+static WATCHING_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Has the debug layer report its errors to [`LAYER_ERRORS`] as they are
 /// raised, on the thread that made the call, before the host moves them
@@ -197,12 +222,18 @@ fn layer_errors() -> Vec<String> {
 /// Whether it does: not when the layer was not asked for; an error when it
 /// was but cannot report to us (reported once, and a failure in strict
 /// mode, so a CI run cannot pass without the layer).
-fn watch(host: &Host) -> bool {
+pub(crate) fn watch(host: &Host) -> bool {
     static WATCHING: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
     let watching = WATCHING.get_or_init(|| {
-        let asked = cfg!(feature = "diagnostics") && std::env::var_os("XTP_D3D12_DEBUG").is_some();
-        if !asked {
+        if std::env::var_os("XTP_D3D12_DEBUG").is_none() {
             return Ok(false);
+        }
+        if !cfg!(feature = "diagnostics") {
+            return Err(
+                "XTP_D3D12_DEBUG is set but this build has no diagnostics feature, which the \
+                 layer needs (--features diagnostics)"
+                    .into(),
+            );
         }
         let Some(queue) = host.message_queue() else {
             return Err(
@@ -225,6 +256,7 @@ fn watch(host: &Host) -> bool {
             )
         }
         .map_err(|e| format!("no D3D12 message callback: {e}"))?;
+        WATCHING_ON.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     });
     match watching {
@@ -249,15 +281,19 @@ unsafe extern "system" fn on_message(
     description: windows::core::PCSTR,
     _context: *mut std::ffi::c_void,
 ) {
-    if severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0 || EXPECTING.with(|e| e.get()) {
-        return;
-    }
-    // SAFETY: the layer passes a NUL-terminated description.
-    let text = unsafe { description.to_string() }.unwrap_or_default();
-    lock(&LAYER_ERRORS).push(LayerError {
-        thread: thread_name(),
-        id: id.0,
-        text,
+    // A panic must not unwind into the layer (that aborts the run): one here
+    // loses the message, which the host's log still has.
+    let _ = std::panic::catch_unwind(|| {
+        if severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0 || EXPECTING.with(|e| e.get()) {
+            return;
+        }
+        // SAFETY: the layer passes a NUL-terminated description.
+        let text = unsafe { description.to_string() }.unwrap_or_default();
+        lock(&LAYER_ERRORS).push(LayerError {
+            thread: thread_name(),
+            id: id.0,
+            text,
+        });
     });
 }
 
@@ -634,6 +670,41 @@ mod tests {
         if let Err(failure) = skipped("a::test", "no adapter", true) {
             panic!("{failure}");
         }
+    }
+
+    /// GPU tests keep their device guard until they end: none writes
+    /// `device(..).is_none()`, which drops it at once and so escapes the
+    /// debug layer's check (`let Some(_gpu) = device(..) else { .. };`).
+    #[test]
+    fn gpu_tests_keep_their_device_guard() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let dropped = [".is_", "none()"].concat();
+        let mut found = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let code = !line.trim_start().starts_with("//");
+                if code && line.contains("device(") && line.contains(&dropped) {
+                    found.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(files.len() > 50, "found {} sources", files.len());
+        assert!(found.is_empty(), "keep the guard:\n{}", found.join("\n"));
     }
 
     /// With the debug layer on (CI's debug-layer step), a test that records

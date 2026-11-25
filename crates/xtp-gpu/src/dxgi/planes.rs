@@ -627,7 +627,6 @@ mod tests {
         assert!(near(at(1, 1), [153, 102, 0]), "{:?}", at(1, 1));
         // Elsewhere: the scene's red.
         assert!(near(at(6, 6), [255, 0, 0]), "{:?}", at(6, 6));
-        assert_eq!(host.log_messages(), None);
         for r in [scene, ui] {
             slot::<extern "system" fn(This) -> u32>(r, 0x10)(r);
         }

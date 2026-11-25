@@ -904,7 +904,6 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 8], pattern[at..at + 8], "row {row}");
         }
-        assert_eq!(host.log_messages(), None);
         release(depth);
     }
 
@@ -960,7 +959,6 @@ mod tests {
                 assert_eq!(stencils[row * 256 + x], want, "stencil at {x},{row}");
             }
         }
-        assert_eq!(host.log_messages(), None);
         release(depth);
     }
 }

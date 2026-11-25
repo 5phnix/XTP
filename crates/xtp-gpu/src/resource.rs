@@ -4192,7 +4192,6 @@ mod tests {
                 assert_eq!(texels[at..at + 4], [64, 128, 191, 255], "texel {x},{y}");
             }
         }
-        assert_eq!(host.log_messages(), None);
         for r in [other, target] {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
@@ -4428,7 +4427,6 @@ mod tests {
         // A texture of the target's own format over it is no such alias.
         let same = texture_at(address, &words(&texture(16, 16, R32_FLOAT, 1), [3, 4])).unwrap();
         assert!(!alias_copy(reads.host(), same));
-        assert_eq!(host.log_messages(), None);
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
     }
 
@@ -4491,7 +4489,6 @@ mod tests {
                 "texel {x},{y}"
             );
         }
-        assert_eq!(host.log_messages(), None);
         for r in [stand_in, target] {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }

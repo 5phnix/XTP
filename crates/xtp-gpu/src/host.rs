@@ -342,13 +342,20 @@ pub(crate) fn host() -> Option<&'static Host> {
 /// The host GPU, created on first use, or why there is none (tests print
 /// it when they skip: `crate::testgpu`).
 pub(crate) fn created() -> &'static Result<Host, String> {
-    HOST.get_or_init(|| {
+    let made = HOST.get_or_init(|| {
         let made = software().and_then(|software| create(software).map_err(|e| e.to_string()));
         if let Err(e) = &made {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
         }
         made
-    })
+    });
+    // In tests, the debug layer reports to `testgpu` from the device's first
+    // use on, whichever way a test reached it.
+    #[cfg(test)]
+    if let Ok(host) = made {
+        crate::testgpu::watch(host);
+    }
+    made
 }
 
 /// Whether the host device is made on the software adapter (WARP): in

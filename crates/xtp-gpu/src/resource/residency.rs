@@ -323,7 +323,6 @@ mod tests {
         host.execute(&[&list]);
         let texels = super::super::tests_support::read_back(host, &texture, 0x4);
         assert_eq!(texels[..4], [255, 0, 255, 255]);
-        assert_eq!(host.log_messages(), None);
     }
 
     /// Requests finish in any order, each on its own fence: one whose
