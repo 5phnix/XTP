@@ -573,8 +573,7 @@ struct Submission {
 static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 
 /// How many host submissions were made so far: while one is prepared, the
-/// number of those before it (`texture` tells a list named twice in one
-/// submission by it).
+/// number of those before it (`texture` counts its checks by it).
 pub(crate) fn submissions() -> u64 {
     SUBMISSIONS.load(Ordering::Acquire)
 }
@@ -583,11 +582,9 @@ pub(crate) fn submissions() -> u64 {
 /// timestamps are read once it has finished.
 pub(crate) fn submitted(queue: &ID3D12CommandQueue, runs: &[&HostList], value: u64, title: bool) {
     // Counted whether timestamps are on or not, so before the check below:
-    // `texture` tells a list named twice in one submission from one
-    // submitted again in a later one by this count
-    // (`texture::Predicate::decide`), and timestamps are off by default.
-    // Counted after it, the second submission would run a copy that is not
-    // due (`submissions_are_counted_with_timestamps_off`).
+    // `texture`'s diagnostics count its checks per submission by this count,
+    // and timestamps are off by default
+    // (`submissions_are_counted_with_timestamps_off`).
     SUBMISSIONS.fetch_add(1, Ordering::Release);
     if !on() {
         return;
@@ -1147,8 +1144,7 @@ mod tests {
     }
 
     /// Submissions are counted with timestamps off (the default) too:
-    /// `texture` tells a list named twice in one submission from one
-    /// submitted again in a later one by the count.
+    /// `texture`'s diagnostics count its checks per submission by the count.
     #[test]
     fn submissions_are_counted_with_timestamps_off() {
         if std::env::var_os("XTP_GPU_TIMESTAMPS").is_some() {

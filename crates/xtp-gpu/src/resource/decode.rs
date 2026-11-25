@@ -104,7 +104,7 @@ pub(super) fn recorded(
         let previous = to.content.swap(version, Ordering::Relaxed);
         let runs = predicate
             .as_ref()
-            .is_none_or(|p| p.decide(previous != version, crate::timestamps::submissions()));
+            .is_none_or(|p| p.decide(previous != version));
         #[cfg(test)]
         if runs {
             to.decode_count.fetch_add(1, Ordering::Relaxed);

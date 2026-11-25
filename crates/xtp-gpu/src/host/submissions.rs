@@ -919,3 +919,86 @@ fn a_list_of_ours_waits_for_its_submission_when_reset() {
     list.0.close();
     host.drain();
 }
+
+/// A list named more than once in a submission runs that many times, in
+/// order, each run finding what the one before wrote, with no layer error
+/// (D3D12 message 553: a list executed again before its previous execution
+/// finished). The list shifts four buffers along (`d = c`, `c = b`,
+/// `b = a`): `a`'s words reach `c` only through a first run's `b`, and `d`
+/// only through a second run's `c`. Ours and a title's alike.
+#[test]
+fn a_list_named_again_in_a_submission_runs_again_after_itself() {
+    let test = "host::submissions::a_list_named_again_in_a_submission_runs_again_after_itself";
+    let _serial = serial();
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
+    let kernel = Kernel::new(host);
+    let shifted = |runs: usize| {
+        let [a, b, c, d] = [(); 4].map(|()| TitleBuffer::new(256));
+        a.set_words(|i| 0xa000_0000 + i as u32);
+        let list = host.new_list().unwrap();
+        for (from, to) in [(&c, &d), (&b, &c), (&a, &b)] {
+            kernel.dispatch(&list, Pass::Copy, from.address(), to.address());
+        }
+        list.close();
+        let named = vec![&list; runs];
+        if runs == 2 {
+            host.execute(&named);
+        } else {
+            host.submit(&named);
+        }
+        host.drain();
+        assert!(!list.running());
+        (a.words(), [b.words(), c.words(), d.words()])
+    };
+    let zeros = vec![0; 64];
+    let (a, [b, c, d]) = shifted(2);
+    assert_eq!((&b, &c), (&a, &a), "the second run found the first's b");
+    assert_eq!(d, zeros, "two runs, not three");
+    let (a, [b, c, d]) = shifted(3);
+    assert_eq!((&b, &c, &d), (&a, &a, &a), "the third found the second's c");
+}
+
+/// The wait between the parts of a submission split before a list named
+/// again is outside the submission lock: while it waits for its first part,
+/// held on the GPU, another thread's submission goes in and returns. An
+/// earlier version waited under the lock, which stopped every other
+/// submission until the gate's timer.
+#[test]
+fn a_split_submission_waits_between_its_parts_outside_the_lock() {
+    let test = "host::submissions::a_split_submission_waits_between_its_parts_outside_the_lock";
+    let _serial = serial();
+    let Some(gpu) = device(test) else { return };
+    let host = gpu.host();
+    let [named, other] = [(); 2].map(|()| Shared(host.new_list().unwrap()));
+    named.get().close();
+    other.get().close();
+    let mut gate = Gate::close(host);
+    let (done, executed) = std::sync::mpsc::channel();
+    let (first_part, returned) = std::thread::scope(|s| {
+        let submitter = s.spawn(|| host.submit(&[named.get(), named.get()]));
+        // Its first part is in flight, held by the gate: the submitter waits
+        // for it before the second.
+        let started = std::time::Instant::now();
+        while !named.get().running() && started.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        let first_part = named.get().running();
+        s.spawn(|| {
+            host.execute(&[other.get()]);
+            let _ = done.send(());
+        });
+        let returned = executed.recv_timeout(std::time::Duration::from_secs(10));
+        let held = !submitter.is_finished();
+        gate.open();
+        submitter.join().unwrap();
+        (first_part, returned.is_ok() && held)
+    });
+    assert!(first_part, "the first part went in alone");
+    assert!(
+        returned,
+        "another submission returns while the split one waits"
+    );
+    host.drain();
+    assert!(!named.get().running() && !other.get().running());
+}
