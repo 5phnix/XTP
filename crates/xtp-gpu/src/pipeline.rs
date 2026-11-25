@@ -227,6 +227,8 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    #[cfg(windows)]
+    builder: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -341,12 +343,17 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+    HASHES.get_or_init(|| {
         let value = std::env::var("XTP_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    let hashes = skip_hashes();
     if hashes.is_empty() {
         return None;
     }
@@ -451,14 +458,18 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = {
+    let member = builder::member(&shaders);
+    #[cfg(windows)]
+    let builder = member.is_some();
+    #[cfg(windows)]
+    let host = member.unwrap_or_else(|| {
         let (graphics, stream) = graphics.unzip();
         Arc::new(make::Pending::new(
             shaders.clone(),
             graphics,
             stream.flatten(),
         ))
-    };
+    });
     #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
@@ -466,6 +477,8 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        builder,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -639,6 +652,14 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(windows)]
+mod builder;
+#[cfg(windows)]
+pub use builder::register_builder;
+#[cfg(windows)]
+pub(crate) fn builder_held(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder && !builder::admitted()
+}
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]

@@ -1739,6 +1739,10 @@ impl State {
     /// Runs a dispatch on the host; the first that runs after dropped ones
     /// starts with a barrier ([`State::dispatch_dropped`]).
     pub(crate) fn dispatch(&mut self, list: &HostList, [x, y, z]: [u32; 3], limits: [u32; 3]) {
+        if crate::pipeline::builder_held(self.pipeline as This) {
+            self.dispatch_dropped("BVH builder held".into());
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         crate::indirect::note_direct(list, self.pipeline, [x, y, z]);
         #[cfg(feature = "diagnostics")]
@@ -2366,6 +2370,9 @@ impl State {
             false
         };
         // Skip before the argument clamp can mutate the indirect buffer.
+        if kind == DISPATCH && crate::pipeline::builder_held(self.pipeline as This) {
+            return fail("BVH builder held".into());
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return fail(Unready::NoPipeline);

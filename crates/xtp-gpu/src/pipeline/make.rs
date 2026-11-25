@@ -357,6 +357,56 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+pub(super) fn start_builder(p: &Arc<Pending>) {
+    POOLS.start(p, EARLY);
+}
+
+/// Un seul verdict pour toute la session. Un refus suffit, même si d'autres
+/// compilations sont en cours. Le succès exige le dernier pipeline hôte.
+fn builder_verdict(states: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut ready = Some(true);
+    for state in states {
+        match state {
+            Some(false) => return Some(false),
+            None => ready = None,
+            Some(true) => {}
+        }
+    }
+    ready
+}
+
+pub(super) fn admit_builder<'a>(members: impl Iterator<Item = &'a Arc<Pending>> + Clone) -> bool {
+    let state = |p: &Arc<Pending>| p.made.get().map(Option::is_some);
+    // La première utilisation passe devant les autres compilations anticipées.
+    for p in members.clone() {
+        POOLS.start(p, URGENT);
+    }
+    let (lock, done) = &DONE;
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some(admitted) = builder_verdict(members.clone().map(state)) {
+            drop(guard);
+            let total = members.clone().count();
+            if admitted {
+                tracing::info!(members = total, "BVH builder admitted");
+            } else if let Some(p) = members.clone().find(|p| state(p) == Some(false)) {
+                tracing::warn!(members = total, refused = %p.shaders[0].hash, "BVH builder held");
+            }
+            return admitted;
+        }
+        guard = done.wait(guard).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+#[test]
+fn builder_requires_every_host_pipeline() {
+    let verdict = |states: &[Option<bool>]| builder_verdict(states.iter().copied());
+    assert_eq!(verdict(&[Some(true), None]), None);
+    assert_eq!(verdict(&[Some(true), None, Some(false)]), Some(false));
+    assert_eq!(verdict(&[Some(false), Some(true)]), Some(false));
+    assert_eq!(verdict(&[Some(true), Some(true)]), Some(true));
+}
+
 /// Waits for `p` while title frame `frame` has budget left for its kind.
 fn wait(p: &Pending, frames: &Frame, frame: u64, budget: Budget) {
     let kind = usize::from(p.compute());

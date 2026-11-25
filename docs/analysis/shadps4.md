@@ -249,6 +249,17 @@ ferme, la comparaison de `6e99955` et `1084cf6` avec
 les 26 698 programmes, entrée par entrée. Les 25 725 programmes traduits
 ont tous conservé la même empreinte DXIL.
 
+La veille 26 (item 362, VIctory #2118) signale qu'un constructeur exécuté
+en partie peut écrire une structure incomplète. Au chargement de la DLL,
+XTP inventorie ses conteneurs et reconnaît leurs copies par contenu. La
+première création d'un pipeline du constructeur lance la préparation de
+toute la bibliothèque. Avant le premier dispatch direct ou indirect, un
+seul refus bloque le constructeur pour la session, y compris les programmes
+déjà prêts. Le journal indique `BVH builder held` avec une empreinte
+refusée, ou `BVH builder admitted` quand tous les pipelines sont prêts.
+Pour le test RT A/B (`ffc6d315`), relever ce verdict sur le chemin A :
+avec `held`, la mesure ne représente pas un BVH construit par le GPU.
+
 **Image impact:** the largest dispatch count of all classes (223 a frame),
 but the builder only makes the ray-tracing structure. Nothing is lit by it
 until the trace programs of §3.2 translate too.

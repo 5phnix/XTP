@@ -1481,7 +1481,13 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
     {
         let pipeline = kept_pipeline(this);
-        let host = crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
+        // L'admission peut terminer la compilation du premier membre. Ses
+        // dimensions doivent être disponibles avant de convertir les threads.
+        let host = if crate::pipeline::builder_held(pipeline) {
+            None
+        } else {
+            crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute)
+        };
         let group = host.and_then(console_group);
         let threads = thread_count_flags();
         if flags & threads != 0 && flags & PARTIAL_GROUPS != 0 {
