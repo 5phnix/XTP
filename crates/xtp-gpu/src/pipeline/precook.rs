@@ -268,7 +268,7 @@ pub fn finish() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::pipeline) mod tests {
     use super::*;
 
     /// A container's stage is its translated program's; none without one.
@@ -309,7 +309,7 @@ mod tests {
     /// `source` compiled by FXC for `profile`, or, with no source, the
     /// translator's refusal. The translator is not this test's business
     /// (`apps/xtp/tests/precook.rs` translates a real program).
-    fn translated(
+    pub(in crate::pipeline) fn translated(
         stage: &'static str,
         kind: HwStage,
         source: Option<&str>,
