@@ -867,8 +867,10 @@ pub(crate) const OWN_VIEW_HEAP: usize = usize::MAX;
 #[cfg(windows)]
 const OWN_DYNAMIC: u32 = 1 << 14;
 
-/// XTP's own view heap (made on first use), for lists that bind no view
-/// heap of the title's but read root SRVs, which are bound as tables.
+/// XTP's own view heap (made on first use): bound in the view slot of a
+/// list that binds no hosted view heap of the title's, since a root
+/// signature that indexes the heaps directly needs both slots bound, and
+/// root SRVs are read through tables in it.
 #[cfg(windows)]
 pub(crate) fn own_view_heap() -> Option<&'static host::HostHeap> {
     static OWN: std::sync::OnceLock<Option<host::HostHeap>> = std::sync::OnceLock::new();
@@ -1539,13 +1541,22 @@ pub(crate) struct TestHeap(pub(crate) This);
 impl TestHeap {
     /// A heap of `count` view slots, made as the title makes one.
     pub(crate) fn views(count: u32) -> TestHeap {
+        Self::made(VIEWS_KIND, count)
+    }
+
+    /// A heap of `count` sampler slots, made as the title makes one.
+    pub(crate) fn samplers(count: u32) -> TestHeap {
+        Self::made(SAMPLERS, count)
+    }
+
+    fn made(kind: u32, count: u32) -> TestHeap {
         /// What newer titles pass, so that reading the placement stays
         /// inside the value.
         #[repr(C)]
         struct Extended(HeapDesc, Placement);
         let extended = Extended(
             HeapDesc {
-                kind: VIEWS_KIND,
+                kind,
                 count,
                 flags: SHADER_VISIBLE,
                 nodes: 0,
@@ -1557,7 +1568,7 @@ impl TestHeap {
         );
         let mut out = std::ptr::null();
         let made = create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut out);
-        assert_eq!(made, crate::object::S_OK, "a title view heap");
+        assert_eq!(made, crate::object::S_OK, "a title heap");
         TestHeap(out)
     }
 }

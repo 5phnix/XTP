@@ -745,7 +745,6 @@ mod tests {
         let pso = host_pipeline(title).expect("pipeline de rectangles");
         let target = Target::new(&gpu.host().device, 1);
         let list = TitleList::new();
-        crate::testgpu::bind_indexed_heaps(gpu.host(), list.host());
         target.bind(list.host(), &pso.root, &pso.pso);
         let indices = TitleBuffer::new(16);
         indices.set_words(|i| [0, 6, 7, 8][i]);
@@ -787,7 +786,6 @@ mod tests {
                 .expect("rectangle pipeline with depth bounds");
             let list = TitleList::new();
             let target = Target::new(&host.device, 1);
-            crate::testgpu::bind_indexed_heaps(host, list.host());
             target.bind(list.host(), &pso.root, &pso.pso);
             let depth = stored.map(|z| {
                 let title = committed(&depth_unordered(W.into(), H, 40));
@@ -1239,7 +1237,6 @@ mod tests {
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_STREAM_OUT,
             )]);
-            l.SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(None));
             l.SetGraphicsRootSignature(&root);
             l.SetPipelineState(&pso);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

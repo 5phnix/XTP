@@ -2901,7 +2901,7 @@ mod tests {
         let l = list.host();
         // The root signatures index both heaps directly: both are bound
         // before one is set.
-        crate::testgpu::bind_indexed_heaps(device, l);
+        crate::testgpu::bind_indexed_heaps(l);
         for (n, p) in pipelines.iter().enumerate() {
             dispatch(l, p, n as u32 + 1);
         }
@@ -2924,7 +2924,7 @@ mod tests {
         list.run();
         let list = TitleList::new();
         let l = list.host();
-        crate::testgpu::bind_indexed_heaps(device, l);
+        crate::testgpu::bind_indexed_heaps(l);
         dispatch(l, &pipelines[0], 2);
         list.run();
         // SAFETY: a plain device query.
