@@ -605,9 +605,18 @@ sampled every five seconds during gameplay.
 The candidate exceeds both targets. Preparation fell 28% by median.
 The 7% drop in median contention is small compared with the spread
 within each session. The runs used the same translator cache key
-(`923a98d358489409`): the reference precook populated the cache and
-the candidate found it up to date before entering the game. Both titles
+(`923a98d358489409`). The reference precook populated the cache and the
+candidate found it up to date before entering the game. Both runs
 exited normally after the full window. The first and last retained
 reports fell at +3.373 and +58.475 s for the reference, +2.192 and
 +57.266 s for the candidate. The runs sample different frames of the
 same save and provide one before/after pair.
+
+The separate copy-statistics line counted a median of 1,769 protection
+changes per frame on the reference and 1,657 on the candidate. It averages
+over all frames since the previous printed report and gives a count across
+sites. The time spent changing protections under `GUARDS` in `protect`,
+`protect_other_views`, `title_virtual_protect` and `readmap::Owners`
+remains unmeasured. The queued
+profiling run was withdrawn before it started to free the PC for lighting
+measurements.
