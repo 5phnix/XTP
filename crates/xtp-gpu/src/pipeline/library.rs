@@ -1276,12 +1276,7 @@ fn write_library(
 /// fails, or if that file is not known (a library that did not read back),
 /// and a file whose names are not written is read without them: what the
 /// names file says is always its library file's.
-fn write_names(
-    library: &RwLock<Library>,
-    place: &Place,
-    names: &Names,
-    file: Option<FileId>,
-) {
+fn write_names(library: &RwLock<Library>, place: &Place, names: &Names, file: Option<FileId>) {
     let l = library.read().unwrap_or_else(|e| e.into_inner());
     let file = {
         let mut known = l.file.lock().unwrap_or_else(|e| e.into_inner());
@@ -1292,8 +1287,7 @@ fn write_names(
         }
         *known
     };
-    let written =
-        file.map(|file| write_atomically(&place.names, names.text(&file).as_bytes()));
+    let written = file.map(|file| write_atomically(&place.names, names.text(&file).as_bytes()));
     match written {
         Some(Ok(())) => {}
         Some(Err(e)) => {
@@ -1607,9 +1601,9 @@ mod tests {
         // The early list not written: neither is the save.
         let good = dir.path().join("cache");
         assert!(matches!(
-            write_library(&library, &place(&good), true, |_| Err(std::io::Error::other(
-                "full"
-            ))),
+            write_library(&library, &place(&good), true, |_| Err(
+                std::io::Error::other("full")
+            )),
             Saved::Failed(_)
         ));
         assert_eq!(library.read().unwrap().added.load(Ordering::Relaxed), 2);
@@ -1662,7 +1656,8 @@ mod tests {
                 Saved::Nothing,
                 "gives way"
             );
-            let second = s.spawn(|| write_library(&library, &place(dir.path()), true, |_| Ok(false)));
+            let second =
+                s.spawn(|| write_library(&library, &place(dir.path()), true, |_| Ok(false)));
             go.wait();
             assert_eq!(first.join().unwrap(), Saved::Written);
             assert_eq!(
@@ -2048,7 +2043,10 @@ mod tests {
             [compacted.clone(), Lineage::own(A)]
         );
         let text = std::fs::read_to_string(dir.path().join(GENERATIONS_FILE)).unwrap();
-        assert!(text.starts_with(&format!("{GENERATIONS_FORMAT}\n")), "{text}");
+        assert!(
+            text.starts_with(&format!("{GENERATIONS_FORMAT}\n")),
+            "{text}"
+        );
         std::fs::write(
             dir.path().join(GENERATIONS_FILE),
             format!("{text}not a generation\n"),
@@ -2158,19 +2156,13 @@ mod tests {
             std::fs::read_to_string(&a.place.names).unwrap(),
             "its names"
         );
-        assert!(
-            !legacy.library.exists() && !legacy.names.exists(),
-            "moved"
-        );
+        assert!(!legacy.library.exists() && !legacy.names.exists(), "moved");
 
         // An older build wrote the file of before again meanwhile.
         save_as(&legacy, b"an older build's", "its names");
         let b = settle(d, B, GENERATIONS_KEPT, u64::MAX).unwrap();
         assert_eq!(b.lineage.from.as_deref(), Some(A));
-        assert_eq!(
-            std::fs::read(&legacy.library).unwrap(),
-            b"an older build's"
-        );
+        assert_eq!(std::fs::read(&legacy.library).unwrap(), b"an older build's");
     }
 
     /// Past `kept` generations or `budget` bytes of files, the least
