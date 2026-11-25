@@ -10,7 +10,7 @@ cbuffer Job : register(b0) {
     uint vertices; // its vertex count
     uint first;    // byte offset of its indices in the build's buffer
     uint offset;   // byte offset of its first index in the source window
-    uint pass;     // 0: clear the flag, 1: copy and check, 2: zero if flagged
+    uint step;     // 0: clear the flag, 1: copy and check, 2: zero if flagged
 };
 ByteAddressBuffer source : register(t0);
 RWByteAddressBuffer built : register(u0);
@@ -19,13 +19,13 @@ RWByteAddressBuffer built : register(u0);
 [numthreads(64, 1, 1)]
 void main(uint3 thread : SV_DispatchThreadID) {
     uint i = thread.x + thread.y * (65535 * 64);
-    if (pass == 0) {
+    if (step == 0) {
         if (i == 0) built.Store(0, 0);
         return;
     }
     if (i >= count) return;
     uint at = first + 4 * i;
-    if (pass == 1) {
+    if (step == 1) {
         uint index;
         if (wide != 0) {
             index = source.Load(offset + 4 * i);
