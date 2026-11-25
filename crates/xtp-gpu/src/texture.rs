@@ -2179,4 +2179,216 @@ mod tests {
         crate::watch::title_memory_remapped(view, N * STEP);
         let _ = other;
     }
+
+    /// A copy location as a title passes one (D3D12's layout): a resource,
+    /// the kind (0 a subresource index, 1 a placed footprint), then the
+    /// index or the footprint.
+    #[repr(C)]
+    struct Location {
+        resource: This,
+        kind: u32,
+        offset: u64,
+        format: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        row_pitch: u32,
+    }
+
+    /// A 2×2 RGBA8 block of `texel`s, in a title buffer (rows 256 bytes apart).
+    fn block_of(texel: u32) -> crate::testgpu::TitleBuffer {
+        let buffer = crate::testgpu::TitleBuffer::new(1 << 12);
+        buffer.set_words(|i| if i % 64 < 2 && i < 128 { texel } else { 0 });
+        buffer
+    }
+
+    /// Records, in `list` as the title does, the copy of `block` (a 2×2
+    /// block in a title buffer) to texel `(x, y)` of subresource 0 of `dst`.
+    fn copy_block(
+        list: &crate::testgpu::TitleList,
+        dst: This,
+        (x, y): (u32, u32),
+        block: &crate::testgpu::TitleBuffer,
+    ) {
+        let to = Location {
+            resource: dst,
+            kind: 0,
+            offset: 0,
+            format: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+            row_pitch: 0,
+        };
+        let from = Location {
+            resource: block.resource(),
+            kind: 1,
+            offset: 0,
+            format: 28,
+            width: 2,
+            height: 2,
+            depth: 1,
+            row_pitch: 256,
+        };
+        type Copy = extern "system" fn(
+            This,
+            *const Location,
+            u32,
+            u32,
+            u32,
+            *const Location,
+            *const [u32; 6],
+        );
+        let this = list.this();
+        crate::object::slot::<Copy>(this, 0x80)(this, &to, x, y, 0, &from, std::ptr::null());
+    }
+
+    /// The 16 texels of a 4×4 RGBA8 host copy, row by row.
+    fn texels_4x4(host: &crate::host::Host, texture: &ID3D12Resource) -> Vec<u32> {
+        let read = read_back(host, texture, COPY_DEST);
+        (0..16)
+            .map(|i| {
+                let at = (i / 4) * 256 + (i % 4) * 4;
+                u32::from_le_bytes(read[at..at + 4].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    /// A fresh 4×4 RGBA8 texture the title fills with `background`, once
+    /// its host copy is resident.
+    fn texture_4x4(background: u8) -> (This, &'static ID3D12Resource) {
+        let resource = committed(&sampled(4, 4, 28));
+        let started = Instant::now();
+        while crate::resource::host_resource(resource).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never resident");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (memory, desc) = crate::resource::texture_memory(resource).unwrap();
+        let size = crate::resource::texture_layout(&desc).unwrap().size as usize;
+        // SAFETY: the texture's own title memory, `size` bytes.
+        unsafe { memory.cast_mut().write_bytes(background, size) };
+        (resource, crate::resource::host_resource(resource).unwrap())
+    }
+
+    /// What native D3D12 holds after copies of 2×2 blocks of the given
+    /// texels at the given places, in submission order, over `background`.
+    fn expected(background: u32, copies: &[((u32, u32), u32)]) -> Vec<u32> {
+        let mut texels = vec![background; 16];
+        for &((x, y), texel) in copies {
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                texels[((y + dy) * 4 + x + dx) as usize] = texel;
+            }
+        }
+        texels
+    }
+
+    /// Texture writes follow submission order, not recording order
+    /// (watch.md item 263; reimplemented after andrewpozdnakov7-jpg's test
+    /// on VIctory #1891). A 4×4 RGBA8 texture the title fills with a
+    /// background; two lists copy overlapping 2×2 blocks, A at (0, 0) and
+    /// B at (1, 1), recorded A, B or B, A and submitted A, B or B, A:
+    /// native D3D12 keeps the background where neither copied and the
+    /// block submitted last where both did, whatever the recording order.
+    /// Then a list that samples the texture (its upload) and one that
+    /// copies A into it, in the four orders: sampling writes nothing, so
+    /// the texture ends as the background with A over it. Each case on a
+    /// texture of its own; the cases that differ from native are listed
+    /// together.
+    ///
+    /// Fails today, on WARP (2026-11-25): 4 of 4 two-copy cases lose the
+    /// background (a partial copy into a texture the title fills does not
+    /// first bring its title bytes: `list.rs` `copy_texture_region`), and
+    /// 3 of 4 sample-and-copy cases differ: `host_written` is set when a
+    /// copy is recorded, so a sampling list recorded after it never uploads
+    /// the background, and one recorded before it but submitted after
+    /// overwrites the copy with its first upload. VIctory #1934 (zondy1i)
+    /// resolves both at submission, in `list.rs`, `resource.rs`, `host.rs`
+    /// and here; until that is ported, run it with `--ignored`.
+    #[test]
+    #[ignore = "known failure, watch item 263 (VIctory #1891): the fix needs list.rs and resource.rs"]
+    fn texture_writes_follow_submission_order() {
+        use crate::testgpu::TitleList;
+        let test = "texture::tests::texture_writes_follow_submission_order";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        let (background, a, b) = (0x1111_1111u32, 0xaaaa_aaaa, 0xbbbb_bbbb);
+        let (block_a, block_b) = (block_of(a), block_of(b));
+        let mut wrong = Vec::new();
+        let release = |r: This| {
+            type Release = extern "system" fn(This) -> u32;
+            crate::object::slot::<Release>(r, 0x10)(r);
+        };
+        // Two copies.
+        for (recorded_a_first, submitted_a_first) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let (resource, texture) = texture_4x4(0x11);
+            let (la, lb) = (TitleList::new(), TitleList::new());
+            let mut record = [(&la, (0, 0), &block_a), (&lb, (1, 1), &block_b)];
+            if !recorded_a_first {
+                record.reverse();
+            }
+            for (list, at, block) in record {
+                copy_block(list, resource, at, block);
+            }
+            let (first, second) = if submitted_a_first {
+                (&la, &lb)
+            } else {
+                (&lb, &la)
+            };
+            first.run();
+            second.run();
+            let submitted = if submitted_a_first {
+                [((0, 0), a), ((1, 1), b)]
+            } else {
+                [((1, 1), b), ((0, 0), a)]
+            };
+            let got = texels_4x4(host, texture);
+            let want = expected(background, &submitted);
+            if got != want {
+                wrong.push(format!(
+                    "copies recorded {} submitted {}: {} of 16 as native, got {got:08x?}",
+                    if recorded_a_first { "A, B" } else { "B, A" },
+                    if submitted_a_first { "A, B" } else { "B, A" },
+                    got.iter().zip(&want).filter(|(g, w)| g == w).count()
+                ));
+            }
+            release(resource);
+        }
+        // A sampling list and a copying one.
+        for (recorded_s_first, submitted_s_first) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let (resource, texture) = texture_4x4(0x11);
+            let (ls, lc) = (TitleList::new(), TitleList::new());
+            let sample = || upload(ls.host(), resource, texture);
+            if recorded_s_first {
+                sample();
+                copy_block(&lc, resource, (0, 0), &block_a);
+            } else {
+                copy_block(&lc, resource, (0, 0), &block_a);
+                sample();
+            }
+            let (first, second) = if submitted_s_first {
+                (&ls, &lc)
+            } else {
+                (&lc, &ls)
+            };
+            first.run();
+            second.run();
+            let got = texels_4x4(host, texture);
+            let want = expected(background, &[((0, 0), a)]);
+            if got != want {
+                wrong.push(format!(
+                    "sample and copy recorded {} submitted {}: {} of 16 as native, got {got:08x?}",
+                    if recorded_s_first { "S, C" } else { "C, S" },
+                    if submitted_s_first { "S, C" } else { "C, S" },
+                    got.iter().zip(&want).filter(|(g, w)| g == w).count()
+                ));
+            }
+            release(resource);
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
 }
