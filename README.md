@@ -27,7 +27,7 @@ What each part does today and what it still needs:
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
 | Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog, text and SSML narration with installed Windows voices | Narration returns an empty WAVE for blank text or when Windows cannot produce audio. The dialog and relaunch are untested live |
+| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry, message and error dialogs, text and SSML narration with installed Windows voices | Narration returns an empty WAVE for blank text or when Windows cannot produce audio. The dialogs and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads with trigger rumble, keyboard, keyboard and mouse as a pad (keys by place, mouse as the right stick) | Trigger rumble and the mouse are untested in play |
@@ -186,6 +186,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_QUEUE_WAIT=0` | every build: a queue told to wait for a fence no signal has reached yet runs what it is given next at once, as before queues held it (to compare frame times); such waits are still counted on the `queue waits for fences so far` line |
 | `XTP_RT_STANDIN=1` | every build: the title's ray-tracing programs that do not translate yet (traced sun and local-light shadows, probe and irradiance-cache gathers, screen probes, reflections, particle collision) have their dropped dispatches' outputs cleared to "every ray missed" (shadow traces' textures lit; others as `XTP_RT_STANDIN_FILL=<program hash or role>[.<output>]=lit\|zero\|keep\|f:<v>\|u:<hex>;…` says); `ab[:<phase s>[:<settle s>]]` alternates off and on within one run; every build logs what each dropped trace would have written (`rt:` lines; docs/analysis/rt-standin.md) |
 | `XTP_FRAMES_IN_FLIGHT=ab[:<phase s>[:<settle s>]]` | every build: one frame in flight off (phase A) and on (phase B) in turn within one run, phases of 20 s by default, the first 3 s of each not measured; each frame-rate line is tagged with its phase and `cargo xtask play` ends with the median per phase (docs/dev/START_HERE.md, "A/B a switch"); `1` on, `0` or unset off |
+| `XTP_DIALOGS=auto` | every build: auto-dismisses `XGameUi` message and error dialogs without opening a window (message dialogs return `cancel_button`, error dialogs complete with `S_OK`; enabled automatically under `--autopilot`; does not affect text entry) |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder. The loader also prints the first 16 title C++ throws
