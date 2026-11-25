@@ -1,11 +1,12 @@
-# One game session under PIX on the PC: the title from a copy of the golden
-# data into the world, a one-frame GPU capture of a world frame, then the
-# title ends. Everything it writes goes to E:\xtp-data\pix\<Name>\, never
+# One game session under PIX (or RenderDoc) on the PC: the title from a copy
+# of the golden data into the world, a one-frame GPU capture of a world
+# frame, then the title ends. Everything it writes goes to E:\xtp-data\pix\<Name>\, never
 # into the repository (docs/analysis/pix-world-frame.md).
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\pix\capture-world.ps1 `
 #       -Name world-1 [-Worktree <XTP checkout with target\diag\xtp.exe>] [-Settle 8] `
-#       [-WorldDraws 900] [-WorldAfter 20] [-EnvPairs 'XTP_X=1;XTP_Y=2'] [-Detach]
+#       [-WorldDraws 900] [-WorldAfter 20] [-EnvPairs 'XTP_X=1;XTP_Y=2'] [-Detach] `
+#       [-With pix|renderdoc]
 #
 # - Waits for the PC's game slot as session.ps1 and cargo xtask play do: no
 #   live holder of E:\xtp-data\measure.lock and no game xtp.exe running. Then
@@ -16,16 +17,22 @@
 #   <run>\autopilot.txt (no exit: the capture ends the title), and runs the
 #   precook as cargo xtask play does (a copy of xtp.exe named xtp-precook.exe).
 # - Starts xtp.exe through xtp-pix (E:\xtp-data\pix\bin\xtp-pix.exe, built by
-#   tools\pix\build.ps1) for GPU capture, with the session environment of
+#   tools\pix\build.ps1) for GPU capture (or through xtp-rdoc with -With
+#   renderdoc), with the session environment of
 #   session.ps1: Series S, XTP_SKIP_INTRO=1, XTP_RAW_STRUCTURED=1, plus
 #   XTP_D3D12_DRED=1 (named host objects, a marker per draw and dispatch),
-#   XTP_CAPTURE=<run>\frames and XTP_CAPTURE_WORLD=<draws>:<after>:1:1, whose
-#   PNG says when the world draws. -Settle seconds later it takes the capture
-#   <run>\world.wpix (and the presented frame as world.png), then ends the
-#   title. Its audio is muted (E:\tools\stall-probe\mute-xtp.ps1).
-# - Lists the capture's events in <run>\events.tsv (no replay), then runs the
-#   walks listed in <run>\walks.txt (xtp-pix walk options, one walk a line),
-#   each stopped after -WalkMinutes, before it gives the slot back.
+#   XTP_CAPTURE=<run>\frames and XTP_CAPTURE_WORLD=<draws>:<after>:<count>:1,
+#   whose first PNG says when the world draws (with XTP_PASS_DUMP in
+#   -EnvPairs, the -WorldCount frames from it get XTP's own pass dump, in
+#   <run>\frames\passes-<n>.txt). -Settle seconds later it takes the capture
+#   <run>\world.wpix (world.rdc with RenderDoc; PIX also saves the presented
+#   frame as world.png), then ends the title. Its audio is muted
+#   (E:\tools\stall-probe\mute-xtp.ps1).
+# - With PIX, lists the capture's events in <run>\events.tsv (no replay).
+#   Then runs the walks listed in <run>\walks.txt (xtp-pix or xtp-rdoc walk
+#   options, one walk a line), each stopped after -WalkMinutes, before it
+#   gives the slot back. PIX replays only with Windows Developer Mode on;
+#   RenderDoc needs nothing.
 # - -Detach starts the whole thing outside the caller's process tree (WMI) and
 #   returns at once; <run>\done.txt holds the exit code at the end.
 param(
@@ -34,9 +41,11 @@ param(
     [int]$Settle = 8,
     [int]$WorldDraws = 900,
     [int]$WorldAfter = 20,
+    [int]$WorldCount = 1,
     [int]$Timeout = 900,
     [string]$EnvPairs = '',
-    [string]$Tool = 'E:\xtp-data\pix\bin\xtp-pix.exe',
+    [ValidateSet('pix', 'renderdoc')][string]$With = 'pix',
+    [string]$Tool = '',
     [int]$WalkMinutes = 20,
     [switch]$NoPrecook,
     [switch]$Detach
@@ -44,14 +53,17 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $Worktree) { $Worktree = (Resolve-Path (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..\..')).Path }
 $run = "E:\xtp-data\pix\$Name"
+$exe = if ($With -eq 'pix') { 'xtp-pix' } else { 'xtp-rdoc' }
+if (-not $Tool) { $Tool = "E:\xtp-data\pix\bin\$exe.exe" }
+$capture = if ($With -eq 'pix') { "$run\world.wpix" } else { "$run\world.rdc" }
 $lock = 'E:\xtp-data\measure.lock'
 
 if ($Detach) {
     New-Item -ItemType Directory -Force $run | Out-Null
     Remove-Item "$run\done.txt" -ErrorAction SilentlyContinue
     $flags = @("-Name '$Name'", "-Worktree '$Worktree'", "-Settle $Settle", "-WorldDraws $WorldDraws",
-        "-WorldAfter $WorldAfter", "-Timeout $Timeout", "-EnvPairs '$($EnvPairs -replace "'", "''")'", "-Tool '$Tool'",
-        "-WalkMinutes $WalkMinutes")
+        "-WorldAfter $WorldAfter", "-WorldCount $WorldCount", "-Timeout $Timeout", "-EnvPairs '$($EnvPairs -replace "'", "''")'", "-Tool '$Tool'",
+        "-WalkMinutes $WalkMinutes", "-With $With")
     if ($NoPrecook) { $flags += '-NoPrecook' }
     $wrapper = Join-Path $run 'detached.ps1'
     @"
@@ -106,7 +118,7 @@ while (-not $taken) {
     try {
         $fs = [System.IO.File]::Open($lock, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
         $w = New-Object System.IO.StreamWriter($fs)
-        $w.Write("$PID`nxtp-pix capture $Name`n")
+        $w.Write("$PID`n$exe capture $Name`n")
         $w.Close()
         $taken = $true
     } catch [System.IO.IOException] { Start-Sleep -Seconds 5 }
@@ -116,7 +128,7 @@ $muter = $null
 try {
     if (Get-Games) { throw 'a game xtp.exe started meanwhile' }
     $data = Join-Path $run 'data'
-    Remove-Item $data, "$run\frames", "$run\world.wpix", "$run\world.png" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $data, "$run\frames", $capture, "$run\world.png" -Recurse -Force -ErrorAction SilentlyContinue
     Copy-Item $golden $data -Recurse
     Copy-Item (Join-Path $Worktree 'autopilot\gameplay.txt') "$run\autopilot.txt"
     New-Item -ItemType Directory -Force "$run\frames" | Out-Null
@@ -127,7 +139,7 @@ try {
     # which the capture keeps: that is how a pass is tied to a program.
     $vars = [ordered]@{
         XTP_CONFIG = $config; XTP_DATA_DIR = $data; XTP_CONSOLE = 'series-s'; XTP_SKIP_INTRO = '1'
-        XTP_RAW_STRUCTURED = '1'; XTP_CAPTURE = "$run\frames"; XTP_CAPTURE_WORLD = "${WorldDraws}:${WorldAfter}:1:1"
+        XTP_RAW_STRUCTURED = '1'; XTP_CAPTURE = "$run\frames"; XTP_CAPTURE_WORLD = "${WorldDraws}:${WorldAfter}:${WorldCount}:1"
         XTP_D3D12_DRED = '1'; TMP = 'E:\xtp-data\tmp'; TEMP = 'E:\xtp-data\tmp'
     }
     foreach ($pair in ($EnvPairs -split ';' | Where-Object { $_ })) { $k, $v = $pair -split '=', 2; $vars[$k] = $v }
@@ -153,7 +165,9 @@ try {
         '-File', 'E:\tools\stall-probe\mute-xtp.ps1', '-Watch', "$($Timeout + 900)")
     $envArgs = ($vars.Keys | ForEach-Object { "--env $_=$($vars[$_])" }) -join ' '
     $toolCmd = "$Tool capture --exe $xtp --cwd $Worktree --args `"run $game --execute --autopilot $run\autopilot.txt --console series-s`" " +
-        "--trigger-dir $run\frames --settle-s $Settle --timeout-s $Timeout --out $run\world.wpix --log $run\xtp-pix.log $envArgs"
+        "--trigger-dir $run\frames --settle-s $Settle --timeout-s $Timeout --out $capture --log $run\$exe.log $envArgs"
+    # RenderDoc keeps copies of mapped memory; XTP maps gigabytes of it.
+    if ($With -eq 'renderdoc') { $toolCmd += ' --soft-memory-mb 6000' }
     $toolCmd | Set-Content "$run\capture.cmd.txt"
     Note "capture"
     cmd /c "$toolCmd > $run\capture.out.txt 2>&1"
@@ -162,8 +176,10 @@ try {
     Start-Sleep -Seconds 5
     foreach ($g in (Get-Games | Where-Object { $_.ExecutablePath -ieq $xtp })) { Stop-Process -Id $g.ProcessId -Force -ErrorAction SilentlyContinue }
     if ($code -eq 0) {
-        cmd /c "$Tool events $run\world.wpix $run\events.tsv > $run\events.out.txt 2>&1"
-        Note "events exit $LASTEXITCODE"
+        if ($With -eq 'pix') {
+            cmd /c "$Tool events $capture $run\events.tsv > $run\events.out.txt 2>&1"
+            Note "events exit $LASTEXITCODE"
+        }
         # Walks of the capture, still under the lock (a replay takes the GPU
         # and gigabytes of its memory): one per line of <run>\walks.txt, read
         # only now, so it can be written while the session waits or runs.
@@ -175,16 +191,16 @@ try {
             if ($k -ge $walks.Count) { break }
             $line = $walks[$k]
             $k++
-            # xtp-pix-walk.exe beside the tool, when there is one: a newer
+            # <tool>-walk.exe beside the tool, when there is one: a newer
             # build of the walk can be put there while the capture runs.
-            $walker = Join-Path (Split-Path $Tool) 'xtp-pix-walk.exe'
+            $walker = Join-Path (Split-Path $Tool) "$exe-walk.exe"
             if (-not (Test-Path $walker)) { $walker = $Tool }
             Note "walk $k : $line"
             $p = Start-Process -FilePath $walker -PassThru -WindowStyle Hidden -RedirectStandardOutput "$run\walk-$k.out.txt" -RedirectStandardError "$run\walk-$k.err.txt" `
-                -ArgumentList "walk $run\world.wpix $run\walk-$k.tsv $line --log $run\walk-$k.log"
+                -ArgumentList "walk $capture $run\walk-$k.tsv $line --log $run\walk-$k.log"
             if (-not $p.WaitForExit($WalkMinutes * 60000)) {
                 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-                Get-CimInstance Win32_Process -Filter "Name='WinPixEngineHost.exe'" | Where-Object { $_.ParentProcessId -eq $p.Id } |
+                Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'WinPixEngineHost.exe', 'renderdoccmd.exe' -and $_.ParentProcessId -eq $p.Id } |
                     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
                 Note "walk $k stopped after $WalkMinutes min"
             } else { Note "walk $k exit $($p.ExitCode)" }
@@ -193,6 +209,10 @@ try {
     if ($code) { exit $code }
 } finally {
     if ($muter -and -not $muter.HasExited) { Stop-Process -Id $muter.Id -Force -ErrorAction SilentlyContinue }
+    # A RenderDoc crash in a replay opens its crash dialog (qrenderdoc --crash):
+    # none stays on the desktop.
+    Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'qrenderdoc.exe', 'renderdoccmd.exe' -and $_.CommandLine -match '--crash' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     $holder = Get-Content $lock -TotalCount 1 -ErrorAction SilentlyContinue
     if ($holder -eq "$PID") { Remove-Item $lock -Force }
     Note "slot released"

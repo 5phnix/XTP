@@ -3,6 +3,7 @@
 //
 //   xtp-pix walk <file.wpix> <out.tsv> [--queue ID] [--from N] [--to N]
 //                [--each] [--inputs] [--accessed] [--depth-diff] [--max-views N]
+//                [--program HASH]... [--passes] [--adapter TEXT] [--no-replay]
 //
 // A pass is a run of consecutive draws or dispatches of one queue with the
 // same program (XTP's marker before them, else the pipeline state) and the
@@ -14,6 +15,13 @@
 // first): XTP's shaders index the descriptor heap directly, so without it
 // only render targets and depth are known. --depth-diff counts, for each
 // draw with a depth target, the depth texels that the draw changed.
+// --program (repeatable) keeps --each, --inputs and --depth-diff to the
+// events whose XTP marker names that program hash, and skips the per-pass
+// rows unless --passes is given too. --adapter replays on the first adapter
+// whose name holds TEXT ("Basic Render" for WARP), else on the default one.
+// --no-replay lists the passes, their views and their pipelines' depth
+// state without replaying (PIX replays only with Windows Developer Mode
+// on): no statistics then, and no UAVs reached through the heap.
 //
 // One row per measured view: the event, the pass, XTP's marker text, the
 // view (kind, binding, resource name, size, format) and the statistics of
@@ -22,149 +30,7 @@
 // first channel), mean and max of each channel, and the counts of texels
 // that are zero in every channel, NaN or infinite.
 
-struct Stats {
-    uint64_t n = 0, zero = 0, nan = 0, inf = 0;
-    double sum_lum = 0, max_lum = -INFINITY;
-    double sum[4] = {}, max[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
-    int channels = 0;
-};
-
-static float half_to_float(uint16_t h) {
-    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
-    float v;
-    if (e == 0) v = std::ldexp((float)m, -24);
-    else if (e == 31) v = m ? NAN : INFINITY;
-    else v = std::ldexp((float)(m | 1024), (int)e - 25);
-    return s ? -v : v;
-}
-
-// An unsigned float of e exponent bits (5) and m mantissa bits (R11G11B10).
-static float small_float(uint32_t bits, int mbits) {
-    uint32_t e = bits >> mbits, m = bits & ((1u << mbits) - 1);
-    if (e == 0) return std::ldexp((float)m, -14 - mbits);
-    if (e == 31) return m ? NAN : INFINITY;
-    return std::ldexp((float)(m | (1u << mbits)), (int)e - 15 - mbits);
-}
-
-static float srgb_to_linear(float c) {
-    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
-}
-
-// Texel size in bytes and channel count of the formats xtp-pix reads; 0 for
-// the others.
-static int texel_bytes(DXGI_FORMAT f, int& channels) {
-    switch (f) {
-    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT: channels = 4; return 16;
-    case DXGI_FORMAT_R32G32B32_FLOAT: channels = 3; return 12;
-    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16B16A16_UINT:
-        channels = 4; return 8;
-    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_UINT: channels = 2; return 8;
-    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: channels = 4; return 4;
-    case DXGI_FORMAT_R11G11B10_FLOAT: channels = 3; return 4;
-    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: channels = 3; return 4;
-    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_UINT:
-    case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-    case DXGI_FORMAT_B8G8R8X8_UNORM:
-        channels = 4; return 4;
-    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_UINT:
-    case DXGI_FORMAT_R16G16_SNORM:
-        channels = 2; return 4;
-    case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_D32_FLOAT:
-    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        channels = 1; return 4;
-    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: channels = 1; return 8;
-    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_UINT: channels = 2; return 2;
-    case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_D16_UNORM:
-        channels = 1; return 2;
-    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_A8_UNORM: channels = 1; return 1;
-    default: channels = 0; return 0;
-    }
-}
-
-static void decode(DXGI_FORMAT f, const uint8_t* p, float v[4]) {
-    v[0] = v[1] = v[2] = v[3] = 0;
-    auto u8 = [&](int i) { return p[i] / 255.0f; };
-    auto u16 = [&](int i) { uint16_t x; memcpy(&x, p + 2 * i, 2); return x; };
-    auto u32 = [&](int i) { uint32_t x; memcpy(&x, p + 4 * i, 4); return x; };
-    auto f32 = [&](int i) { float x; memcpy(&x, p + 4 * i, 4); return x; };
-    switch (f) {
-    case DXGI_FORMAT_R32G32B32A32_FLOAT: for (int i = 0; i < 4; i++) v[i] = f32(i); break;
-    case DXGI_FORMAT_R32G32B32A32_UINT: for (int i = 0; i < 4; i++) v[i] = (float)u32(i); break;
-    case DXGI_FORMAT_R32G32B32_FLOAT: for (int i = 0; i < 3; i++) v[i] = f32(i); break;
-    case DXGI_FORMAT_R16G16B16A16_FLOAT: for (int i = 0; i < 4; i++) v[i] = half_to_float(u16(i)); break;
-    case DXGI_FORMAT_R16G16B16A16_UNORM: for (int i = 0; i < 4; i++) v[i] = u16(i) / 65535.0f; break;
-    case DXGI_FORMAT_R16G16B16A16_UINT: for (int i = 0; i < 4; i++) v[i] = (float)u16(i); break;
-    case DXGI_FORMAT_R32G32_FLOAT: v[0] = f32(0); v[1] = f32(1); break;
-    case DXGI_FORMAT_R32G32_UINT: v[0] = (float)u32(0); v[1] = (float)u32(1); break;
-    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: {
-        uint32_t x = u32(0);
-        float k = f == DXGI_FORMAT_R10G10B10A2_UNORM ? 1.0f : 0.0f;
-        float s10 = k ? 1023.0f : 1.0f, s2 = k ? 3.0f : 1.0f;
-        v[0] = (x & 1023) / s10; v[1] = ((x >> 10) & 1023) / s10; v[2] = ((x >> 20) & 1023) / s10; v[3] = (x >> 30) / s2;
-        break;
-    }
-    case DXGI_FORMAT_R11G11B10_FLOAT: {
-        uint32_t x = u32(0);
-        v[0] = small_float(x & 2047, 6); v[1] = small_float((x >> 11) & 2047, 6); v[2] = small_float(x >> 22, 5);
-        break;
-    }
-    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: {
-        uint32_t x = u32(0);
-        float scale = std::ldexp(1.0f, (int)(x >> 27) - 15 - 9);
-        v[0] = (x & 511) * scale; v[1] = ((x >> 9) & 511) * scale; v[2] = ((x >> 18) & 511) * scale;
-        break;
-    }
-    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-        for (int i = 0; i < 4; i++) v[i] = f == DXGI_FORMAT_R8G8B8A8_UINT ? (float)p[i] : u8(i);
-        if (f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) for (int i = 0; i < 3; i++) v[i] = srgb_to_linear(v[i]);
-        break;
-    case DXGI_FORMAT_R8G8B8A8_SNORM: for (int i = 0; i < 4; i++) v[i] = std::max(-1.0f, (int8_t)p[i] / 127.0f); break;
-    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_UNORM:
-        v[0] = u8(2); v[1] = u8(1); v[2] = u8(0); v[3] = f == DXGI_FORMAT_B8G8R8X8_UNORM ? 1.0f : u8(3);
-        if (f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) for (int i = 0; i < 3; i++) v[i] = srgb_to_linear(v[i]);
-        break;
-    case DXGI_FORMAT_R16G16_FLOAT: v[0] = half_to_float(u16(0)); v[1] = half_to_float(u16(1)); break;
-    case DXGI_FORMAT_R16G16_UNORM: v[0] = u16(0) / 65535.0f; v[1] = u16(1) / 65535.0f; break;
-    case DXGI_FORMAT_R16G16_SNORM: v[0] = (int16_t)u16(0) / 32767.0f; v[1] = (int16_t)u16(1) / 32767.0f; break;
-    case DXGI_FORMAT_R16G16_UINT: v[0] = (float)u16(0); v[1] = (float)u16(1); break;
-    case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        v[0] = f32(0); break;
-    case DXGI_FORMAT_R32_UINT: v[0] = (float)u32(0); break;
-    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        v[0] = (u32(0) & 0xffffff) / 16777215.0f; break;
-    case DXGI_FORMAT_R8G8_UNORM: v[0] = u8(0); v[1] = u8(1); break;
-    case DXGI_FORMAT_R8G8_UINT: v[0] = p[0]; v[1] = p[1]; break;
-    case DXGI_FORMAT_R16_FLOAT: v[0] = half_to_float(u16(0)); break;
-    case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_D16_UNORM: v[0] = u16(0) / 65535.0f; break;
-    case DXGI_FORMAT_R16_UINT: v[0] = (float)u16(0); break;
-    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_A8_UNORM: v[0] = u8(0); break;
-    case DXGI_FORMAT_R8_UINT: v[0] = p[0]; break;
-    default: break;
-    }
-}
-
-// The format of a typeless texture's data, from the view's.
-static DXGI_FORMAT pick_format(DXGI_FORMAT data, DXGI_FORMAT view) {
-    int c;
-    if (texel_bytes(data, c)) return data;
-    if (texel_bytes(view, c)) return view;
-    switch (data) {
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
-    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_FLOAT;
-    case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
-    case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
-    case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
-    case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    default: return data;
-    }
-}
+#include "texels.h"
 
 struct Texels {
     PIX_TEXTURE_INFO info{};
@@ -174,40 +40,9 @@ struct Texels {
 };
 
 static void measure(const Texels& t, Stats& s) {
-    int channels = 0;
-    int size = texel_bytes(t.format, channels);
-    s.channels = channels;
-    if (!size) return;
-    const auto& fp = t.sub.PlacedSubresourceFootprint.Footprint;
-    UINT w = fp.Width, h = fp.Height, d = std::max<UINT>(fp.Depth, 1);
-    UINT pitch = fp.RowPitch;
-    for (UINT z = 0; z < d; z++)
-        for (UINT y = 0; y < h; y++) {
-            size_t row = (size_t)t.sub.PlacedSubresourceFootprint.Offset + ((size_t)z * h + y) * pitch;
-            for (UINT x = 0; x < w; x++) {
-                size_t at = row + (size_t)x * size;
-                if (at + size > t.bytes.size()) return;
-                float v[4];
-                decode(t.format, t.bytes.data() + at, v);
-                bool nan = false, inf = false, zero = true;
-                for (int c = 0; c < channels; c++) {
-                    if (std::isnan(v[c])) nan = true;
-                    else if (std::isinf(v[c])) inf = true;
-                    if (v[c] != 0) zero = false;
-                }
-                s.n++;
-                if (nan) { s.nan++; continue; }
-                if (inf) { s.inf++; continue; }
-                if (zero) s.zero++;
-                double lum = channels >= 3 ? 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2] : v[0];
-                s.sum_lum += lum;
-                s.max_lum = std::max(s.max_lum, lum);
-                for (int c = 0; c < channels; c++) {
-                    s.sum[c] += v[c];
-                    s.max[c] = std::max(s.max[c], (double)v[c]);
-                }
-            }
-        }
+    const auto& fp = t.sub.PlacedSubresourceFootprint;
+    measure_raw(t.format, t.bytes.data(), t.bytes.size(), fp.Footprint.Width, fp.Footprint.Height,
+                fp.Footprint.Depth, fp.Footprint.RowPitch, (size_t)fp.Offset, s);
 }
 
 // How many texels differ between two reads of one subresource.
@@ -392,6 +227,72 @@ static bool read_view(IPixGpuCaptureAnalysis* a, const View& v, const PIX_EVENT_
     return true;
 }
 
+// What a buffer view holds at an event: its size, how many of its 32-bit
+// words are zero, NaN or infinite as floats, the mean and max of the
+// finite ones, and its first words. Views reaching past 64 MiB of their
+// buffer are not read (XTP mirrors title memory in buffers of gigabytes).
+static std::string buffer_note(IPixGpuCaptureAnalysis* a, const View& v, const PIX_EVENT_INFO& e, bool before) {
+    UINT64 offset = 0, size = 0;
+    Com<IPixBufferResourceView> bv;
+    Com<IPixConstantBufferView> cv;
+    if (SUCCEEDED(v.view->QueryInterface(__uuidof(IPixBufferResourceView), bv.put_void())) && bv) {
+        offset = bv->GetBufferLocationOffset();
+        size = bv->GetSizeInBytes();
+    } else if (SUCCEEDED(v.view->QueryInterface(__uuidof(IPixConstantBufferView), cv.put_void())) && cv) {
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC* d = nullptr;
+        offset = cv->GetBufferLocationOffset();
+        if (SUCCEEDED(cv->GetDesc(&d)) && d) size = d->SizeInBytes;
+    } else {
+        return "buffer (no size)";
+    }
+    char buf[512];
+    if (offset + size > (64ull << 20) || size == 0) {
+        snprintf(buf, sizeof buf, "buffer at +%#llx, %llu bytes: not read", (unsigned long long)offset,
+                 (unsigned long long)size);
+        return buf;
+    }
+    PIX_GET_BUFFER_BYTES_PARAMETERS p{before, FALSE};
+    Com<IPixBlob> blob;
+    HRESULT hr = a->GetBufferBytesFromResourceView(v.view.p, &e, &p, __uuidof(IPixBlob), blob.put_void());
+    if (FAILED(hr) || !blob) {
+        snprintf(buf, sizeof buf, "buffer at +%#llx, %llu bytes: read failed 0x%08lx", (unsigned long long)offset,
+                 (unsigned long long)size, (unsigned long)hr);
+        return buf;
+    }
+    std::vector<uint8_t> bytes((size_t)blob->GetSizeBytes());
+    blob->GetData(bytes.size(), bytes.data());
+    // The blob covers the view's window; its own bytes are the last `size`.
+    size_t start = bytes.size() >= size ? bytes.size() - (size_t)size : 0;
+    uint64_t words = 0, zero = 0, nan = 0, inf = 0, finite = 0;
+    double sum = 0, mx = -INFINITY;
+    std::string head;
+    for (size_t at = start; at + 4 <= bytes.size(); at += 4) {
+        uint32_t u;
+        float f;
+        memcpy(&u, bytes.data() + at, 4);
+        memcpy(&f, &u, 4);
+        words++;
+        if (!u) zero++;
+        if (std::isnan(f)) nan++;
+        else if (std::isinf(f)) inf++;
+        else {
+            finite++;
+            sum += f;
+            mx = std::max(mx, (double)f);
+        }
+        if (words <= 8) {
+            char w[48];
+            snprintf(w, sizeof w, "%s%08x(%g)", words > 1 ? " " : "", u, f);
+            head += w;
+        }
+    }
+    snprintf(buf, sizeof buf, "buffer at +%#llx, %llu bytes: %llu words, %llu zero, %llu NaN, %llu inf; float mean %g max %g; first: %s",
+             (unsigned long long)offset, (unsigned long long)size, (unsigned long long)words, (unsigned long long)zero,
+             (unsigned long long)nan, (unsigned long long)inf, finite ? sum / finite : 0.0, finite ? mx : 0.0,
+             head.c_str());
+    return buf;
+}
+
 // Depth enable and write mask from a normalized pipeline state stream.
 static std::string depth_state(IPixPipelineState* pso) {
     if (!pso) return "";
@@ -489,6 +390,64 @@ static std::string marker_programs(const std::string& m) {
 
 static std::string trim(const std::string& s, size_t n) { return s.size() > n ? s.substr(0, n) + "..." : s; }
 
+static std::string unescape(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '&') {
+            size_t semi = s.find(';', i);
+            if (semi != std::string::npos && semi - i < 8) {
+                std::string ent = s.substr(i + 1, semi - i - 1);
+                char c = 0;
+                if (ent == "lt" || ent == "#60") c = '<';
+                else if (ent == "gt" || ent == "#62") c = '>';
+                else if (ent == "amp" || ent == "#38") c = '&';
+                else if (ent == "quot" || ent == "#34") c = '"';
+                else if (ent == "apos" || ent == "#39") c = '\'';
+                if (c) {
+                    out += c;
+                    i = semi;
+                    continue;
+                }
+            }
+        }
+        out += s[i];
+    }
+    return out;
+}
+
+// The leaf elements of PIX's XML call data: (tag, text) in order.
+static std::vector<std::pair<std::string, std::string>> leaves(const std::string& xml) {
+    std::vector<std::pair<std::string, std::string>> out;
+    size_t at = 0;
+    while ((at = xml.find('<', at)) != std::string::npos) {
+        size_t close = xml.find('>', at);
+        if (close == std::string::npos) break;
+        if (xml[at + 1] == '/') {
+            at = close + 1;
+            continue;
+        }
+        std::string tag = xml.substr(at + 1, close - at - 1);
+        size_t next = xml.find('<', close + 1);
+        if (next == std::string::npos) break;
+        std::string end = "</" + tag + ">";
+        if (xml.compare(next, end.size(), end) == 0) out.emplace_back(tag, unescape(xml.substr(close + 1, next - close - 1)));
+        at = close + 1;
+    }
+    return out;
+}
+
+// "Name(Tag=value, ...)" from a call's XML, without its `this`.
+static std::string compact_call(const std::string& name, const std::string& xml) {
+    std::string out = name + "(";
+    bool first = true;
+    for (auto& [tag, text] : leaves(xml)) {
+        if (tag == "this" || tag == "returnValue") continue;
+        out += (first ? "" : ", ") + tag + "=" + text;
+        first = false;
+    }
+    return out + ")";
+}
+
 static int walk(int argc, wchar_t** argv) {
     if (argc < 2) {
         logf("walk <file.wpix> <out.tsv> [--queue ID] [--from N] [--to N] [--each] [--inputs] [--accessed] [--depth-diff]");
@@ -497,7 +456,11 @@ static int walk(int argc, wchar_t** argv) {
     std::wstring file = argv[0], outp = argv[1];
     int queue_id = -1;
     UINT32 from = 0, to = UINT32_MAX;
-    bool each = false, inputs = false, accessed = false, depth_diff = false;
+    bool each = false, inputs = false, accessed = false, depth_diff = false, passes = false;
+    std::vector<std::string> only;
+    std::string adapter_text;
+    int flags = -1;
+    bool no_replay = false;
     size_t max_views = 64;
     for (int i = 2; i < argc; i++) {
         std::wstring a = argv[i];
@@ -510,6 +473,11 @@ static int walk(int argc, wchar_t** argv) {
         else if (a == L"--accessed") accessed = true;
         else if (a == L"--depth-diff") depth_diff = true;
         else if (a == L"--max-views") max_views = (size_t)_wtoi(next().c_str());
+        else if (a == L"--program") only.push_back(narrow(next().c_str()));
+        else if (a == L"--passes") passes = true;
+        else if (a == L"--adapter") adapter_text = narrow(next().c_str());
+        else if (a == L"--flags") flags = _wtoi(next().c_str());
+        else if (a == L"--no-replay") no_replay = true;
         else if (a == L"--log") _wfopen_s(&g_log, next().c_str(), L"a");
         else {
             logf("walk: unknown argument %s", narrow(a.c_str()).c_str());
@@ -523,6 +491,10 @@ static int walk(int argc, wchar_t** argv) {
     if (queues(doc.p, qs)) return 1;
 
     Com<IPixGpuCaptureAnalysis> analysis;
+    if (no_replay) {
+        accessed = false;
+        depth_diff = false;
+    } else {
     CHECK(doc->GetAnalysis(__uuidof(IPixGpuCaptureAnalysis), analysis.put_void()));
     PIX_CONNECTION_DESC_LOCAL local{PIX_CONNECTION_FLAG_LOCAL_NONE};
     PIX_CONNECTION_DESC cdesc{};
@@ -530,12 +502,33 @@ static int walk(int argc, wchar_t** argv) {
     cdesc.pLocal = &local;
     CHECK(analysis->Connect(&cdesc, nullptr));
     PIX_ANALYSIS_PARAMS params{PIX_ADAPTER_ID_DEFAULT, PIX_ANALYSIS_FLAG_NONE};
+    {
+        Com<IPixAdapters> adapters;
+        if (SUCCEEDED(analysis->GetAdapters(__uuidof(IPixAdapters), adapters.put_void())) && adapters) {
+            for (UINT64 k = 0; k < adapters->GetCount(); k++) {
+                PIX_ADAPTER ad{};
+                if (FAILED(adapters->GetAdapter(k, &ad))) continue;
+                std::string n = narrow(ad.Name);
+                bool pick = !adapter_text.empty() && n.find(adapter_text) != std::string::npos &&
+                            params.Adapter == PIX_ADAPTER_ID_DEFAULT;
+                if (pick) params.Adapter = ad.Id;
+                logf("adapter %llu: %s%s", (unsigned long long)ad.Id, n.c_str(), pick ? " (replay here)" : "");
+            }
+        }
+        if (!adapter_text.empty() && params.Adapter == PIX_ADAPTER_ID_DEFAULT) {
+            logf("no adapter named like %s", adapter_text.c_str());
+            return 1;
+        }
+        if (!adapter_text.empty()) params.Flags = PIX_ANALYSIS_FLAG_NONE | PIX_ANALYSIS_FLAG_IGNORE_INCOMPATIBILITIES;
+        if (flags >= 0) params.Flags = (PIX_ANALYSIS_FLAGS)flags;
+    }
     auto* anotes = new AnalysisNotes();
     logf("starting the analysis (replay)");
     CHECK(analysis->StartAnalysis(&params, anotes, nullptr));
     if (accessed) {
         logf("gathering the accessed resources (instrumented replay)");
         CHECK(analysis->GatherAccessedResources());
+    }
     }
 
     FILE* out = nullptr;
@@ -587,8 +580,13 @@ static int walk(int argc, wchar_t** argv) {
                 row(q, e, pass, call, programs, before ? "before" : "after", v, nullptr, nullptr, "over --max-views");
                 continue;
             }
+            if (!analysis) {
+                row(q, e, pass, call, programs, "bound", v, nullptr, nullptr, v.texture ? "texture" : "buffer");
+                continue;
+            }
             if (!v.texture) {
-                row(q, e, pass, call, programs, before ? "before" : "after", v, nullptr, nullptr, "buffer");
+                row(q, e, pass, call, programs, before ? "before" : "after", v, nullptr, nullptr,
+                    buffer_note(analysis.p, v, e, before));
                 continue;
             }
             Texels t;
@@ -621,7 +619,7 @@ static int walk(int argc, wchar_t** argv) {
         std::vector<View> last_views;
         std::string last_call;
         auto close_pass = [&]() {
-            if (open && !each) {
+            if (open && !each && (only.empty() || passes)) {
                 std::string programs;
                 for (size_t k = 0; k < pass_programs.size(); k++) programs += (k ? "," : "") + pass_programs[k];
                 if (pass_programs.size() >= 24) programs += ",...";
@@ -638,11 +636,9 @@ static int walk(int argc, wchar_t** argv) {
             std::string name = e.Name ? e.Name : "";
             std::string call = e.ApiCallData ? e.ApiCallData : "";
             if (xtp_marker(name)) { marker = name; continue; }
-            if (xtp_marker(call)) { marker = call; continue; }
-            if (call.find("SetMarker") != std::string::npos || name.find("SetMarker") != std::string::npos) {
-                size_t at = call.find('"');
-                std::string text = at == std::string::npos ? call : call.substr(at + 1);
-                if (xtp_marker(text)) marker = text;
+            if (name.find("SetMarker") != std::string::npos || name.find("Marker") != std::string::npos) {
+                for (auto& [tag, text] : leaves(call))
+                    if (xtp_marker(text)) marker = text;
                 continue;
             }
             if (!is_work(name)) continue;
@@ -665,7 +661,7 @@ static int walk(int argc, wchar_t** argv) {
                     v.type == PIX_RESOURCE_UNORDERED_ACCESS_VIEW)
                     key += "|" + std::to_string((unsigned long long)v.id) + ":" + std::to_string(v.subresource);
             if (key.empty()) key = "programs " + programs;
-            std::string label = trim(call.empty() ? name : call, 160) + " {" + trim(marker, 600) + "}";
+            std::string label = trim(compact_call(name, call), 300) + " {" + trim(marker, 600) + "}";
             if (!pso_name.empty()) label += " [" + pso_name + "; " + depth_state(pso.p) + "]";
             if (key != pass_key) {
                 close_pass();
@@ -679,8 +675,11 @@ static int walk(int argc, wchar_t** argv) {
             if (pass_programs.size() < 24 &&
                 std::find(pass_programs.begin(), pass_programs.end(), programs) == pass_programs.end())
                 pass_programs.push_back(programs);
-            if (inputs) measure_views(q, e, pass, label, programs, views, false, true);
-            if (depth_diff && name.rfind("Draw", 0) == 0) {
+            bool chosen = only.empty();
+            for (auto& h : only)
+                if (programs.find(h) != std::string::npos) chosen = true;
+            if (inputs && chosen) measure_views(q, e, pass, label, programs, views, false, true);
+            if (depth_diff && chosen && name.rfind("Draw", 0) == 0) {
                 for (auto& v : views) {
                     if (v.type != PIX_RESOURCE_DEPTH_STENCIL_VIEW) continue;
                     Texels a, b;
@@ -698,7 +697,7 @@ static int walk(int argc, wchar_t** argv) {
                     }
                 }
             }
-            if (each) measure_views(q, e, pass, label, programs, views, true, false);
+            if (each && chosen) measure_views(q, e, pass, label, programs, views, true, false);
             last = e;
             last_views = std::move(views);
             last_call = label;
@@ -708,8 +707,10 @@ static int walk(int argc, wchar_t** argv) {
         close_pass();
     }
     fclose(out);
-    analysis->StopAnalysis();
-    analysis->Disconnect();
+    if (analysis) {
+        analysis->StopAnalysis();
+        analysis->Disconnect();
+    }
     logf("walk done");
     return 0;
 }
