@@ -100,6 +100,8 @@ pub mod rect_gs;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
+mod smem_data_tests;
+#[cfg(all(test, windows))]
 mod smem_tests;
 #[cfg(all(test, windows))]
 mod split_tests;
