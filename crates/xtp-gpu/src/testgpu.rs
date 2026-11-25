@@ -42,29 +42,15 @@ fn adapter(value: Option<&str>) -> Option<Result<bool, String>> {
     })
 }
 
-// Les signatures du traducteur indexent directement les deux tas.
-pub(crate) fn bind_indexed_heaps(host: &Host, list: &HostList) {
-    let heaps = [
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-    ]
-    .map(|ty| {
-        // SAFETY: un descripteur suffit, les shaders de la sonde ne le lisent pas.
-        let heap: ID3D12DescriptorHeap = unsafe {
-            host.device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: ty,
-                    NumDescriptors: 1,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
-        }
-        .unwrap();
-        list.keep(&heap);
-        Some(heap)
-    });
-    // SAFETY: les deux tas sont visibles et retenus par la liste.
-    unsafe { list.list.SetDescriptorHeaps(&heaps) };
+/// Binds XTP's own view and sampler heaps on `list`: the translator's root
+/// signatures index both heaps directly, so both must be bound before one is
+/// set (debug layer message 1419).
+pub(crate) fn bind_indexed_heaps(list: &HostList) {
+    // SAFETY: an open list; XTP's own heaps live for the run.
+    unsafe {
+        list.list
+            .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(None));
+    }
 }
 
 /// The host device for the test named `test`, or `None` once the skip is

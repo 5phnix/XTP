@@ -274,6 +274,9 @@ fn card_pool(device: &ID3D12Device) -> Option<&'static Pool> {
 /// Actual local memory backing RT pages and heaps, including allocations
 /// still held by recordings. Concurrent heap creation reserves before D3D12.
 static RT_RESERVED: AtomicU64 = AtomicU64::new(0);
+/// Reserved bytes whose resource D3D12 is still making: not yet in the
+/// usage DXGI reports, so the headroom check adds them.
+static RT_PENDING: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct RtReservation(u64);
 
 fn fits_rt_budget(reserved: u64, size: u64, budget: u64, used: u64) -> bool {
@@ -283,35 +286,89 @@ fn fits_rt_budget(reserved: u64, size: u64, budget: u64, used: u64) -> bool {
         && size <= budget.saturating_sub(used).saturating_sub(headroom)
 }
 
+/// The RT memory cap before DXGI has ever reported a budget: an eighth of a
+/// 2 GiB card, as [`fits_rt_budget`] gives it, without the usage check.
+const UNREAD_RT_CAP: u64 = 256 << 20;
+
+/// Whether `size` more bytes fit the RT budget with `reserved` taken: by
+/// the DXGI reading `(budget, used)`, or by [`UNREAD_RT_CAP`] without one.
+fn fits_rt(reserved: u64, size: u64, reading: Option<(u64, u64)>) -> bool {
+    match reading {
+        Some((budget, used)) => fits_rt_budget(reserved, size, budget, used),
+        None => size <= UNREAD_RT_CAP.saturating_sub(reserved),
+    }
+}
+
+/// The local budget and usage to check against: this reading, kept as the
+/// last good one, or the last good one when DXGI cannot report (a failed
+/// query is no budget of 0). `None` before any reading.
+fn budget_reading(
+    reading: Option<(u64, u64)>,
+    last: &mut Option<(u64, u64)>,
+) -> Option<(u64, u64)> {
+    match reading {
+        Some(now) => {
+            *last = Some(now);
+            Some(now)
+        }
+        None => *last,
+    }
+}
+
 impl RtReservation {
+    /// Reserves `size` bytes of the RT budget and makes their resource with
+    /// `make`, outside the lock that orders reservations (D3D12 can take
+    /// milliseconds there). The reservation is given back if `make` fails.
     pub(crate) fn allocate<T>(
         device: &ID3D12Device,
         size: u64,
         make: impl FnOnce() -> Option<T>,
     ) -> Option<(T, Self)> {
-        static GROW: Mutex<()> = Mutex::new(());
-        let _grow = GROW.lock().unwrap_or_else(|e| e.into_inner());
-        let (budget, used) = crate::dxgi::video_memory(device).unwrap_or_default();
-        let granted = RT_RESERVED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-            fits_rt_budget(reserved, size, budget, used).then(|| reserved + size)
-        });
-        if let Err(reserved) = granted {
-            static REFUSED: AtomicU64 = AtomicU64::new(0);
-            let refused = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
-            if refused.is_power_of_two() {
-                tracing::warn!(
-                    size,
-                    reserved,
-                    budget,
-                    used,
-                    refused,
-                    "host DXR memory budget exhausted"
-                );
+        static GROW: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+        let reservation = {
+            let mut last = GROW.lock().unwrap_or_else(|e| e.into_inner());
+            let reading = crate::dxgi::video_memory(device);
+            if reading.is_none() {
+                static FAILED: AtomicU64 = AtomicU64::new(0);
+                let failed = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+                if failed.is_power_of_two() {
+                    tracing::warn!(
+                        failed,
+                        last = ?*last,
+                        cap = UNREAD_RT_CAP,
+                        "DXGI reports no local video memory budget: host DXR allocations use \
+                         the last reading, or a fixed cap before any"
+                    );
+                }
             }
-            return None;
-        }
-        let reservation = Self(size);
-        Some((make()?, reservation))
+            // Resources reserved but still being made are not in `used` yet.
+            let pending = RT_PENDING.load(Ordering::Acquire);
+            let reading = budget_reading(reading, &mut last)
+                .map(|(budget, used)| (budget, used.saturating_add(pending)));
+            let granted =
+                RT_RESERVED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                    fits_rt(reserved, size, reading).then(|| reserved + size)
+                });
+            if let Err(reserved) = granted {
+                static REFUSED: AtomicU64 = AtomicU64::new(0);
+                let refused = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                if refused.is_power_of_two() {
+                    tracing::warn!(
+                        size,
+                        reserved,
+                        budget_and_used = ?reading,
+                        refused,
+                        "host DXR memory budget exhausted: the allocation is refused"
+                    );
+                }
+                return None;
+            }
+            RT_PENDING.fetch_add(size, Ordering::AcqRel);
+            Self(size)
+        };
+        let made = make();
+        RT_PENDING.fetch_sub(size, Ordering::AcqRel);
+        Some((made?, reservation))
     }
 }
 
@@ -1313,7 +1370,11 @@ mod tests {
 
 #[cfg(test)]
 mod rt_budget_tests {
-    use super::fits_rt_budget;
+    use super::{
+        RT_PENDING, RtReservation, UNREAD_RT_CAP, budget_reading, fits_rt, fits_rt_budget,
+    };
+    use std::sync::atomic::Ordering;
+
     #[test]
     fn rt_budget_limits_physical_growth_and_leaves_local_headroom() {
         let mib = 1 << 20;
@@ -1321,5 +1382,42 @@ mod rt_budget_tests {
         assert!(!fits_rt_budget(497 * mib, 16 * mib, 8192 * mib, 0));
         assert!(!fits_rt_budget(0, 16 * mib, 1024 * mib, 945 * mib));
         assert!(!fits_rt_budget(0, 1, 0, 0));
+    }
+
+    #[test]
+    fn rt_budget_keeps_the_last_reading_when_dxgi_fails() {
+        let mut last = None;
+        assert_eq!(budget_reading(None, &mut last), None, "no reading yet");
+        assert_eq!(budget_reading(Some((8, 1)), &mut last), Some((8, 1)));
+        assert_eq!(budget_reading(None, &mut last), Some((8, 1)), "not 0");
+        assert_eq!(budget_reading(Some((9, 2)), &mut last), Some((9, 2)));
+        assert_eq!(last, Some((9, 2)));
+        // Before any reading, a fixed cap: not a budget of 0.
+        let mib = 1 << 20;
+        assert!(fits_rt(0, 16 * mib, None));
+        assert!(fits_rt(UNREAD_RT_CAP - mib, mib, None));
+        assert!(!fits_rt(UNREAD_RT_CAP - mib, 2 * mib, None));
+        assert!(!fits_rt(0, 16 * mib, Some((0, 0))), "a reading of 0 is 0");
+    }
+
+    /// The resource is made outside the lock: an allocation made from
+    /// inside another's `make` does not wait for it, and sees its bytes as
+    /// pending.
+    #[test]
+    fn rt_budget_makes_resources_outside_its_lock() {
+        let test = "host::buffers::rt_budget_tests::rt_budget_makes_resources_outside_its_lock";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let device = &gpu.host().device;
+        let (inner, outer) = RtReservation::allocate(device, 4096, || {
+            assert!(RT_PENDING.load(Ordering::Acquire) >= 4096);
+            RtReservation::allocate(device, 4096, || Some(7))
+        })
+        .expect("room for 8 KiB");
+        assert_eq!(inner.0, 7);
+        drop((inner, outer));
+        // A failed make gives its reservation back.
+        assert!(RtReservation::allocate(device, 4096, || None::<()>).is_none());
     }
 }

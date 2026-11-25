@@ -261,6 +261,10 @@ impl Drop for State {
 /// translator declares 64 KiB).
 const CBV_SPAN: u64 = 1 << 16;
 
+/// Bytes of each root CBV [`State::dump_at_submission`] logs.
+#[cfg(feature = "diagnostics")]
+const DUMPED_CBV_BYTES: u64 = 384;
+
 /// The way this CBV is filled and the last list write affecting its bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CbvInput {
@@ -678,11 +682,12 @@ fn picked_refresh(
 }
 
 /// The host heap behind a key of [`State::host_heaps`]: a title heap, or
-/// XTP's own view heap.
+/// XTP's own view or sampler heap.
 fn host_heap(key: usize) -> Option<&'static crate::descriptor::host::HostHeap> {
     match key {
         0 => None,
         crate::descriptor::OWN_VIEW_HEAP => crate::descriptor::own_view_heap(),
+        crate::descriptor::OWN_SAMPLER_HEAP => crate::descriptor::own_sampler_heap(),
         h => crate::descriptor::heap(h as This).host(),
     }
 }
@@ -752,6 +757,45 @@ fn note_root_srv(address: u64, copy: &crate::shadow::Shadow) {
             left,
             buffer = format_args!("{start:#x}+{len:#x}"),
             "a root SRV near its buffer's end: reads past it return zeros"
+        );
+    }
+}
+
+/// Logs a root SRV's one-view table (Watch 443, VIctory #1671): the bytes
+/// it views from `address` against those its host copy holds from there,
+/// to the end of the title buffer or of the 4 MiB window copy of memory
+/// outside every buffer. A table that stops before its copy's end is cut
+/// (counted at info): a shader reading past the cut reads zeros where the
+/// console reads the buffer. Past a window's end the title's memory goes
+/// on as well. Each table at debug level.
+fn note_root_srv_extent(address: u64, copy: &crate::shadow::Shadow, viewed: u64) {
+    let left = copy.left(address);
+    let start = address - copy.offset(address);
+    let len = copy.offset(address) + left;
+    if viewed < left {
+        counted!(
+            info,
+            address = format_args!("{address:#x}"),
+            viewed,
+            left,
+            copy = format_args!("{start:#x}+{len:#x}"),
+            "a root SRV's one-view table stops before its host copy's end: reads past it \
+             return zeros"
+        );
+    }
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let window = crate::shadow::holders(address).is_empty();
+        tracing::debug!(
+            address = format_args!("{address:#x}"),
+            viewed,
+            left,
+            copy = format_args!("{start:#x}+{len:#x}"),
+            holds = if window {
+                "a 4 MiB window"
+            } else {
+                "a title buffer"
+            },
+            "a root SRV's one-view table"
         );
     }
 }
@@ -1290,18 +1334,19 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
-    /// The heaps the host list is to have: the title's, with XTP's own view
-    /// heap in place of a view heap where the title binds none (or one
-    /// without a host heap) and the pipeline reads root SRVs (`root_srvs`),
-    /// which are bound as tables in a view heap; the console needs no heap
-    /// for root views. Once the list has XTP's heap, it keeps it until the
-    /// title binds a view heap.
-    fn wanted_heaps(&self, tabled: bool) -> [usize; 2] {
+    /// The heaps the host list is to have: the title's, with XTP's own in
+    /// place of each the title binds none of (or one without a host heap).
+    /// Pipelines' root signatures index both heaps directly, and D3D12 lets
+    /// such a root signature be set only once both are bound (debug layer
+    /// message 1419); root SRVs, bound as tables, also need a view heap.
+    fn wanted_heaps(&self) -> [usize; 2] {
         let mut wanted = self.heaps;
-        let title_views =
-            wanted[0] != 0 && crate::descriptor::heap(wanted[0] as This).host().is_some();
-        if !title_views && (tabled || self.host_heaps[0] == crate::descriptor::OWN_VIEW_HEAP) {
+        let hosted = |h: usize| h != 0 && crate::descriptor::heap(h as This).host().is_some();
+        if !hosted(wanted[0]) {
             wanted[0] = crate::descriptor::OWN_VIEW_HEAP;
+        }
+        if !hosted(wanted[1]) {
+            wanted[1] = crate::descriptor::OWN_SAMPLER_HEAP;
         }
         wanted
     }
@@ -1346,9 +1391,17 @@ impl State {
         if self.host_heaps == wanted && !replaced {
             return;
         }
-        let heaps: Vec<Option<ID3D12DescriptorHeap>> = heaps
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = wanted
             .into_iter()
-            .flatten()
+            .zip(heaps)
+            .filter_map(|(key, heap)| {
+                if key != 0 && heap.is_none() {
+                    // A root signature that indexes the heaps directly then
+                    // meets message 1419 again.
+                    once!(key, "no host descriptor heap to bind in a heap slot");
+                }
+                heap
+            })
             .map(|h| Some(h.clone()))
             .collect();
         heaps.iter().flatten().for_each(|h| list.keep(h));
@@ -1394,6 +1447,10 @@ impl State {
 
     fn bind_pipeline(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let l = &list.list;
+        // Heaps first: a root signature with directly indexed heaps must be
+        // set after them.
+        let wanted = self.wanted_heaps();
+        self.set_host_heaps(list, wanted);
         let root = p.root.as_raw() as usize;
         if (!compute || self.pending_compute.is_none())
             && self.host_roots[usize::from(compute)] != root
@@ -1479,28 +1536,9 @@ impl State {
         limits: [u32; 3],
     ) -> Result<(), &'static str> {
         let l = &list.list;
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
-        let root_uavs = p.stages.iter().any(|s| !s.root_uavs.is_empty());
         use xtp_shader::emit::{
             INDEXED_ADDRESS_SRV, PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV,
         };
-        let constant_reads = p.stages.iter().any(|s| {
-            s.translated().host.user_data.iter().any(|u| {
-                matches!(
-                    u.root,
-                    INDEXED_ADDRESS_SRV
-                        | PACKED_ADDRESS_SRV
-                        | SCALAR_ADDRESS_SRV
-                        | VECTOR_ADDRESS_SRV
-                )
-            })
-        });
-        let wanted = self.wanted_heaps(
-            constant_reads || root_uavs || root_srvs && crate::pipeline::host::bounded_root_srvs(),
-        );
-        self.set_host_heaps(list, wanted);
         list.decode_uses
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2289,6 +2327,7 @@ impl State {
             return Ok((host, slot));
         }
         note_root_srv(a, &s);
+        note_root_srv_extent(a, &s, bytes);
         let slot = if in_place {
             let slot = host.shared_raw(&s, offset, bytes);
             if let Some(slot) = slot {
@@ -2489,6 +2528,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.dump_at_submission(list, None);
         let _timed = crate::timestamps::command(list, crate::timestamps::What::Dispatch, Some(p));
         // SAFETY: an open list with everything set; the barrier names no
         // resource.
@@ -2591,6 +2632,108 @@ impl State {
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         text
+    }
+
+    /// Diagnostics (`XTP_DUMP_DISPATCH_INPUTS=<program hash>,...`, each
+    /// the start of a program's hash): for each dispatch of a matching
+    /// program, logs at its list's submission what title memory holds
+    /// then: the first [`DUMPED_CBV_BYTES`] bytes of each root CBV, and the
+    /// 12 bytes of group counts an indirect one reads at `arguments` (what
+    /// the CPU left there: a GPU writer runs after the submission). With
+    /// `XTP_D3D12_DRED`, the device-removed report names the dispatches in
+    /// flight by the same program and root addresses ([`State::op_text`]).
+    #[cfg(feature = "diagnostics")]
+    fn dump_at_submission(&self, list: &HostList, arguments: Option<u64>) {
+        static PROGRAMS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let programs = PROGRAMS.get_or_init(|| {
+            std::env::var("XTP_DUMP_DISPATCH_INPUTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        });
+        if programs.is_empty() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        for stage in &p.stages {
+            let program = stage.shader.hash.to_string();
+            if !programs.iter().any(|w| program.starts_with(w.as_str())) {
+                continue;
+            }
+            let mut reads: Vec<(String, u64, u64)> = Vec::new();
+            for &(slot, _) in &stage.root_cbvs {
+                if let Some(&Root::View(address)) = self.roots_ref(true).get(usize::from(slot)) {
+                    reads.push((format!("root CBV s{slot}"), address, DUMPED_CBV_BYTES));
+                }
+            }
+            // CBVs in descriptor tables: the bytes their views name.
+            let t = stage.translated();
+            for u in t.used.iter().filter(|u| u.kind == ResourceType::Cbv) {
+                if u.root != RootType::Table {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot))
+                else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(View::Constant(address, size)) = crate::descriptor::view(handle) {
+                    let what = format!("table CBV s{}+{}", u.slot, u.table_offset_dwords);
+                    let bytes = u64::from(size).clamp(4, DUMPED_CBV_BYTES);
+                    reads.push((what, address, bytes));
+                }
+            }
+            if let Some(at) = arguments {
+                reads.push(("indirect group counts".into(), at, 12));
+            }
+            // Inline constants: the user data the program reads, as set now.
+            let user_data: Vec<String> = t
+                .host
+                .user_data
+                .iter()
+                .map(|u| {
+                    let v = self.user_value(true, u.slot, u.root, u.dword);
+                    format!("u{}={v:#x}", u.index)
+                })
+                .collect();
+            tracing::info!(
+                program,
+                list = format_args!("{:#x}", list.list.as_raw() as usize),
+                user_data = user_data.join(" "),
+                "a dispatch's user data at its recording"
+            );
+            let host_list = list.list.as_raw() as usize;
+            list.defer_host((0, 0), move || {
+                for (what, address, len) in &reads {
+                    // Read through the kernel: unmapped pages read as zeros.
+                    let mut bytes = vec![0u8; *len as usize];
+                    crate::host::copy_mapped(
+                        bytes.as_mut_ptr(),
+                        *address as *const u8,
+                        bytes.len(),
+                        false,
+                    );
+                    let (words, _) = bytes.as_chunks::<4>();
+                    let words = words
+                        .iter()
+                        .map(|&w| format!("{:08x}", u32::from_le_bytes(w)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tracing::info!(
+                        program,
+                        list = format_args!("{host_list:#x}"),
+                        what,
+                        address = format_args!("{address:#x}"),
+                        words,
+                        "a dispatch's input at its submission"
+                    );
+                }
+            });
+        }
     }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
@@ -3407,6 +3550,10 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.dump_at_submission(list, Some(arguments));
+        }
         let _timed = crate::timestamps::command(
             list,
             crate::timestamps::What::Indirect(kind),
@@ -3829,7 +3976,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 pub(crate) mod tests {
     use super::*;
     use crate::descriptor::host::SHARED_CHUNK;
-    use crate::descriptor::{OWN_VIEW_HEAP, TestHeap};
+    use crate::descriptor::{OWN_SAMPLER_HEAP, OWN_VIEW_HEAP, TestHeap};
     use crate::host::Host;
     use crate::testgpu::{Kernel, Pass, TitleBuffer, TitleList, pattern};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -5473,9 +5620,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         state
     }
 
-    /// Sets the heaps a pipeline with root SRVs gets, as `bind` does.
+    /// Sets the heaps a pipeline gets (the title's, XTP's own where it binds
+    /// none), as `bind` does.
     fn heaps(state: &mut State, list: &HostList) {
-        let wanted = state.wanted_heaps(true);
+        let wanted = state.wanted_heaps();
         state.set_host_heaps(list, wanted);
     }
 
@@ -5567,9 +5715,81 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(got, bounded(1, 63));
     }
 
-    /// A list that binds no view heap reads its root SRVs through tables in
-    /// XTP's own heap (the console needs none for root views), and keeps
-    /// that heap for draws without root SRVs until the title binds one.
+    /// A root SRV's one-view table in place views the rest of its buffer,
+    /// not 4 MiB of it (Watch 443, VIctory #1671): a shader reading 6 MiB
+    /// past the SRV reads the buffer there, as on the console.
+    #[test]
+    fn root_srv_tables_read_past_4_mib() {
+        const FAR: usize = 6 << 20;
+        let test = "draw::tests::root_srv_tables_read_past_4_mib";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let near = Reader::new(host, ReaderView::TableSrv);
+        let source = format!(
+            "ByteAddressBuffer src : register(t0, space1);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(128, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    dst.Store(id.x * 4, src.Load({FAR} + id.x * 4));
+}}"
+        );
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("far root view test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the test kernel compiles");
+        let code = code.expect("compiled code");
+        // SAFETY: the code and the root signature (the near reader's: the
+        // same views) live through the call.
+        let pso = unsafe {
+            host.device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&near.root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.GetBufferPointer(),
+                        BytecodeLength: code.GetBufferSize(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let far = Reader {
+            root: near.root.clone(),
+            pso,
+        };
+        let heap = TestHeap::views(16);
+        let src = TitleBuffer::new(8 << 20);
+        src.set_words(pattern);
+        let list = TitleList::new();
+        let mut state = state(heap.0);
+        let got = far.read(&list, |l| {
+            heaps(&mut state, l);
+            table(&mut state, l, Some(src.address() + 16))
+        });
+        let want: Vec<u32> = (0..WORDS).map(|i| pattern(4 + FAR / 4 + i)).collect();
+        assert_eq!(got, want);
+    }
+
+    /// A list binds XTP's own heap in each slot the title binds no hosted
+    /// heap of (the console needs none for root views), both before a
+    /// directly indexed root signature; root SRVs are read through tables
+    /// in its own view heap. A title heap takes its slot over; setting the
+    /// heaps again with the same ones does nothing.
     #[test]
     fn lists_without_a_view_heap_use_xtps_own() {
         let test = "draw::tests::lists_without_a_view_heap_use_xtps_own";
@@ -5582,17 +5802,53 @@ void main(uint3 id : SV_DispatchThreadID) {
         src.set_words(pattern);
         let list = TitleList::new();
         let mut state = state(std::ptr::null());
-        assert_eq!(state.wanted_heaps(false), [0, 0]);
-        assert_eq!(state.wanted_heaps(true), [OWN_VIEW_HEAP, 0]);
+        // Without heaps of the title's, XTP's own: a root signature that
+        // indexes both heaps directly needs both bound.
+        assert_eq!(state.wanted_heaps(), [OWN_VIEW_HEAP, OWN_SAMPLER_HEAP]);
         let got = reader.read(&list, |l| {
             heaps(&mut state, l);
             table(&mut state, l, Some(src.address() + 64))
         });
         assert_eq!(got, bounded(16, WORDS));
-        assert_eq!(state.wanted_heaps(false), [OWN_VIEW_HEAP, 0], "kept");
+        assert_eq!(state.wanted_heaps(), [OWN_VIEW_HEAP, OWN_SAMPLER_HEAP]);
         let heap = TestHeap::views(16);
         state.set_heaps(&[heap.0]);
-        assert_eq!(state.wanted_heaps(true), [heap.0 as usize, 0]);
+        assert_eq!(state.wanted_heaps(), [heap.0 as usize, OWN_SAMPLER_HEAP]);
+    }
+
+    /// A title sampler heap takes the sampler slot and XTP's own view heap
+    /// the view one; with a view heap too, both are the title's. Setting the
+    /// same heaps again does nothing (the root signatures stay set), other
+    /// heaps reset them.
+    #[test]
+    fn title_sampler_heaps_take_their_slot() {
+        let test = "draw::tests::title_sampler_heaps_take_their_slot";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let views = TestHeap::views(16);
+        let samplers = TestHeap::samplers(16);
+        let (v, s) = (views.0 as usize, samplers.0 as usize);
+        let list = TitleList::new();
+        let mut state = State::default();
+        state.set_heaps(&[samplers.0]);
+        assert_eq!(state.wanted_heaps(), [OWN_VIEW_HEAP, s], "samplers alone");
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [OWN_VIEW_HEAP, s]);
+        state.set_heaps(&[views.0, samplers.0]);
+        assert_eq!(state.wanted_heaps(), [v, s], "views and samplers");
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [v, s]);
+        // The same heaps again: nothing is set, the root signatures stay.
+        state.host_roots = [1, 2];
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [v, s]);
+        assert_eq!(state.host_roots, [1, 2], "unchanged heaps");
+        // Other heaps: set, and the root signatures with them.
+        state.set_heaps(&[views.0]);
+        heaps(&mut state, list.host());
+        assert_eq!(state.host_heaps, [v, OWN_SAMPLER_HEAP]);
+        assert_eq!(state.host_roots, [0; 2], "changed heaps");
     }
 
     /// Root SRV views in place are shared across lists, by host copy and
@@ -6595,7 +6851,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                     .ClearRenderTargetView(host.rtv(tex, None), &[0.; 4], None);
             }
             painter.bind(list.host());
-            crate::testgpu::bind_indexed_heaps(host, list.host());
+            crate::testgpu::bind_indexed_heaps(list.host());
             let mut state = State::default();
             // Les deux ordres de liaison doivent sélectionner la même variante.
             if typed {

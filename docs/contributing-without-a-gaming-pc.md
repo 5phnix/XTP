@@ -301,6 +301,9 @@ the evidence.
 analysis docs already name many programs by hash, each in its own tables;
 one map makes all of them readable.
 
+The [shader role map](analysis/shader-roles.md) starts with the documented
+world-frame passes and their light chain.
+
 **How.**
 
 1. Start from the hashes in [light-chain.md](analysis/light-chain.md)

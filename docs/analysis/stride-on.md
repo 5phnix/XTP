@@ -1,12 +1,69 @@
 # Stride table and run-time buffer views
 
-**Keep both switches opt-in.** With both on, the PC captured substantially
-more geometry, but median frame time rose from 255 ms to 1,721 ms. The
-available table-only runs also lost frame rate and exhausted the raw view
-pool. No table-only world capture on the revised implementation establishes
-that it preserves the geometry gain at an acceptable frame time.
+**Keep both switches opt-in.** On the L4 after round 4b, table only lost
+the D3D12 device 35 s into gameplay. The off control also lost the device.
+With both enabled, a median frame took 8.03 s, including 4.15 s copying
+12.12 GB of buffers. The title then crashed. Earlier PC captures showed
+that the two switches together can recover geometry.
 
-## PC measurements
+## Round 4b on the L4
+
+Three separate diagnostics processes ran main `5018dd4`, which includes
+`41d6cbc`. Each used Series S, the same golden save, the gameplay
+autopilot, the L4 audio stopgap and a 600 s process limit. All set
+`XTP_SKIP_INTRO=1`, `XTP_RAW_STRUCTURED=1` and `XTP_TEXTURE_POOL=1`.
+Both feature switches were set explicitly in every process.
+
+| Gameplay measurement | Both off | Table only | Both on |
+|---|---:|---:|---:|
+| Frame-rate reports after handoff | 6 | 4 | 21 |
+| Median frame rate (fps) | 0.35 | 0.40 | 0.10 |
+| Median frame time (ms) | 2,776.4 | 2,518.8 | 8,034.6 |
+| Median refresh steps/frame | 3,596 | 2,419 | 266,205 |
+| Median host buffer copies (GB/frame) | 0.051 | 0.030 | 12.120 |
+| Median time in those copies (ms/frame) | 23.6 | 14.5 | 4,146.8 |
+| Peak raw-view slots in a heap (capacity 65,536) | Table disabled | <8,192 | 32,768–40,959 |
+| First failure after handoff | Device hung, 69 s | Device hung, 35 s | Access violation, ~206 s |
+
+Each median uses the host's periodic per-frame reports after the
+autopilot released control, including startup work still in progress.
+FPS is logged to one decimal before taking the median. The sessions
+ended at different points in the opening. Even in the first 30 s after
+handoff, median refresh steps/frame were 3,818, 2,419 and 226,949
+respectively (3, 4 and 2 reports). The both-on run peaked at 314,597
+steps/frame and 17.004 GB/frame. Bytes are decimal and count host
+buffer copies during preparation.
+
+The off and table-only processes exited with `DXGI_ERROR_DEVICE_REMOVED`
+and reason `DXGI_ERROR_DEVICE_HUNG`. The both-on crash log records a
+write to address zero at title RVA `0x23cf683`. None logged a raw-view
+refusal or the 45,000-instance pool assertion. Instance occupancy was
+not measured. The three local log folders under
+`E:\xtp-data\cloud-runs\` are `20261125-131529-game` (off),
+`20261125-131544-game` (table) and `20261125-131558-game` (both).
+
+The imagecheck trigger was `XTP_CAPTURE_WORLD=1000:22:3:3`, with
+`XTP_PASS_DUMP=0`, `XTP_PASS_INPUTS=1cd9bc634417a981` and the same
+three frame-probe hashes as [imagecheck](image-status.md#2-sessions).
+Only the control captured both lighting inputs. At frame 2807 (+25
+from the trigger), the 24 sampled rows of main depth (`s0+432`) and
+albedo (`s0+584`) at 1280 × 720 were both 0.0% nonzero.
+Table only never armed. Both on armed at frame 2362 and exited before
+the first requested capture (2384). These runs therefore provide no
+matched three-arm coverage comparison or seven-minute gameplay result.
+
+## Round 4b on the PC
+
+The both-on run `stall-stride4b-1` had one frame-rate report after the
+autopilot handed back control. It reported 953.6 ms/frame (1.0 fps),
+226,575 refresh steps/frame and 2.270 GB of host buffer copies/frame in
+346.4 ms. The step counter counts entries visited during submission.
+The copy counter measures bytes after overlapping refresh ranges are
+merged and also includes ordinary host buffer copies. The raw-view pool
+crossed 24,576 of 65,536 slots. It logs each eighth of capacity, so the
+last threshold gives a lower bound. The log ends 10 s after handoff.
+
+## Earlier PC measurements
 
 These are Series S runs on the RTX 4080 SUPER. The baseline is `imgsrc-1`
 with both switches off. `imagecheck-4` used both switches on at `c44a716`.
@@ -60,7 +117,7 @@ dropped 76 of `e30970f1727063fd`. In frame 621, the 162 drops in P245
 belong to ray-tracing structure builder programs. Its one dispatch of
 `48426bae580a080c` ran.
 
-## Table only and the default decision
+## Earlier table-only runs
 
 The earlier PC runs `stride-2` and `stride-2b` explicitly set table=1 and
 views=0 on `600e7f7`. They reported 2.1 and 2.5 fps (478 and 400 ms/frame),
@@ -77,10 +134,9 @@ and 8–17 GB copied per frame. All 65,536 raw view slots were in use about
 cost. The header, view-budget, remapped-table and retirement fixes from
 `6cc97dd7` landed on main in `a090f22`; these PC measurements predate them.
 
-The requested same-revision L4 comparison produced no game frames. The
+The earlier same-revision L4 comparison produced no game frames. The
 off and table-only launches of `244cf78` waited for the shared VM lock
 and were cancelled at handoff. The both-on launch was waiting for the
 off run to start. The initial PC control (`stride-5d4d8f-off1`) reached
 its 120 s limit before its first frame. Neither attempt provides a
-post-fix table-only measurement to support changing the default. The available captures also leave instance-pool
-occupancy and survival beyond seven minutes unverified.
+post-fix table-only measurement to support changing the default.
