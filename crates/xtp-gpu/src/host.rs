@@ -2847,6 +2847,10 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        // The frames' mode, and the A/B phase they ran in, before the clock
+        // moves on for the next ones (`xtp_core::ab`).
+        let ahead = if frames::ahead() { "on" } else { "off" };
+        let ab = xtp_core::ab::present(self.since);
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "xtp_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
@@ -2885,20 +2889,6 @@ impl Meter {
         let outside_ms = outside(ms, cpu + waited);
         let overlap_ms = overlapped(gpu, back_ms, waited);
         let longest_frame = std::mem::take(&mut self.longest).as_secs_f64() * 1000.0;
-        // The second's mode, before an A/B run switches it for the next.
-        let ahead = if frames::ahead() { "on" } else { "off" };
-        frames::measured(
-            std::time::Instant::now(),
-            frames::Second {
-                seconds: elapsed.as_secs_f64(),
-                frames,
-                gpu,
-                waited,
-                at_ends,
-                overlap: overlap_ms,
-                longest: longest_frame,
-            },
-        );
         let title = std::mem::replace(
             &mut *TITLE.lock().unwrap_or_else(|e| e.into_inner()),
             Submissions::new(),
@@ -2923,7 +2913,7 @@ impl Meter {
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
             tracing::info!(
-                "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
+                "{ab}{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB; {waited:.1} waiting for them \
                  ({at_ends:.1} at flips and presents), {overlap_ms:.1} overlapped; {outside_ms:.1} \

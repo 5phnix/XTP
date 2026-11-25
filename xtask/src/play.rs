@@ -5,6 +5,12 @@
 //! controls to the player once it hands them back. With `--measure`, ends
 //! the title after that many seconds of gameplay and prints a summary of
 //! its frame-rate lines.
+//!
+//! Before the title, under the session lock it holds, it runs `xtp
+//! precook` on the title's shader pack ([`precook`]), unless
+//! `--no-precook`: a session after a translator change then finds its
+//! translations and compute pipelines made, and one after none pays a few
+//! seconds for the check.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +37,8 @@ pub struct Options {
     pub script: Option<PathBuf>,
     pub exe: Option<PathBuf>,
     pub no_build: bool,
+    /// Start the title without `xtp precook` first.
+    pub no_precook: bool,
 }
 
 pub fn run(root: &Path, options: &Options) -> Result<()> {
@@ -75,6 +83,11 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
     let console = console(std::env::var("XTP_CONSOLE").ok().as_deref())?;
     let _session = Session::take()?;
     refuse_a_second_title()?;
+    if options.no_precook {
+        println!("play: no precook (--no-precook)");
+    } else {
+        precook(&xtp, &game)?;
+    }
     let run = cfg.cache_subdir("play")?.join(stamp(SystemTime::now()));
     let data = run.join("data");
     copy_dir(&golden, &data)?;
@@ -143,6 +156,58 @@ fn build(root: &Path) -> Result<()> {
         .status()
         .context("running cargo build")?;
     ensure!(status.success(), "cargo build failed ({status})");
+    Ok(())
+}
+
+/// The name the precook runs under, beside `xtp.exe` ([`precook`]).
+const PRECOOK_EXE: &str = "xtp-precook";
+
+/// `xtp precook` on the title's shader pack (`shaders.rpf` beside `game`),
+/// before the title and under the session lock this run holds (it passes
+/// `--lock-holder`), with this run's environment: the switches that change
+/// translation are read as the title will read them. It runs as a copy of
+/// `xtp` named [`PRECOOK_EXE`]: the same bytes, so the same translator and
+/// cache key, but no `xtp.exe` that session tools watching for the title
+/// would take for it (session.ps1 times its hard stop from the title's
+/// start). A precook that fails is reported, and the title starts with the
+/// cache as it is.
+fn precook(xtp: &Path, game: &Path) -> Result<()> {
+    let pack = game.with_file_name("shaders.rpf");
+    if !pack.is_file() {
+        println!("play: no {} to precook", pack.display());
+        return Ok(());
+    }
+    let exe = xtp.with_file_name(format!("{PRECOOK_EXE}{}", std::env::consts::EXE_SUFFIX));
+    if let Err(e) = std::fs::copy(xtp, &exe) {
+        println!(
+            "play: no precook: copying {} to {}: {e}; the title starts with the cache as it is",
+            xtp.display(),
+            exe.display()
+        );
+        return Ok(());
+    }
+    println!(
+        "play: precook of {} (--no-precook skips it)",
+        pack.display()
+    );
+    let started = Instant::now();
+    let status = Command::new(&exe)
+        .arg("precook")
+        .arg(&pack)
+        .args(["--lock-holder", &std::process::id().to_string()])
+        .stdin(Stdio::null())
+        .status();
+    let seconds = started.elapsed().as_secs_f64();
+    match status {
+        Ok(status) if status.success() => println!("play: precook done in {seconds:.0} s"),
+        Ok(status) => println!(
+            "play: precook failed ({status}) after {seconds:.0} s; the title starts with the \
+             cache as it is"
+        ),
+        Err(e) => {
+            println!("play: precook did not start ({e}); the title starts with the cache as it is")
+        }
+    }
     Ok(())
 }
 
@@ -319,6 +384,8 @@ impl Outcome {
             (None, None) => lines.push("gameplay not reached".into()),
         }
         lines.extend(summary(&self.frame_rates));
+        // In an A/B run (`XTP_*=ab`), the same figures per arm.
+        lines.extend(xtp_core::ab::summary(&self.frame_rates, &FIGURES));
         lines.push(match self.code {
             Some(code) => format!("title exit code {code}"),
             None => "title ended without an exit code".into(),
@@ -430,25 +497,27 @@ fn after(line: &str, label: &str) -> Option<f64> {
 /// Reads one figure of a frame-rate line.
 type Figure = fn(&str) -> Option<f64>;
 
+/// The figures of a frame-rate line the end table gives.
+const FIGURES: [(&str, Figure); 7] = [
+    ("fps", |l| before(l, " fps,")),
+    ("ms/frame", |l| before(l, " ms/frame")),
+    ("ms preparing", |l| before(l, " preparing")),
+    ("ms on the GPU", |l| before(l, " on the GPU")),
+    ("ms copying back", |l| before(l, " copying back")),
+    ("draws/frame", |l| before(l, " draws/frame")),
+    ("dropped/frame", |l| after(l, "dropped ")),
+];
+
 /// Median, lowest and highest of each figure of the frame-rate lines.
 fn summary(lines: &[String]) -> Vec<String> {
     if lines.is_empty() {
         return vec!["no frame-rate line in gameplay (one comes every 5 s)".into()];
     }
-    let figures: [(&str, Figure); 7] = [
-        ("fps", |l| before(l, " fps,")),
-        ("ms/frame", |l| before(l, " ms/frame")),
-        ("ms preparing", |l| before(l, " preparing")),
-        ("ms on the GPU", |l| before(l, " on the GPU")),
-        ("ms copying back", |l| before(l, " copying back")),
-        ("draws/frame", |l| before(l, " draws/frame")),
-        ("dropped/frame", |l| after(l, "dropped ")),
-    ];
     let mut out = vec![format!(
         "{} frame-rate lines in gameplay (median, lowest, highest):",
         lines.len()
     )];
-    for (name, read) in figures {
+    for (name, read) in FIGURES {
         let mut values: Vec<f64> = lines.iter().filter_map(|l| read(l)).collect();
         if values.is_empty() {
             continue;
@@ -532,6 +601,57 @@ mod tests {
         outcome.see(&stop, Duration::from_secs(125));
         assert_eq!(outcome.stopped.as_deref(), Some(stop.as_str()));
         assert_eq!(outcome.report()[0], format!("autopilot stopped: {stop}"));
+    }
+
+    /// Frame-rate lines tagged with their A/B phase (`xtp_core::ab`): the
+    /// end table adds the median per arm of those past settling.
+    #[test]
+    fn play_gives_an_ab_runs_medians_per_arm() {
+        let tagged = |tag: &str, fps: &str| {
+            WORLD
+                .replace("xtp_gpu::host: ", &format!("xtp_gpu::host: {tag} "))
+                .replace("1.4 fps", &format!("{fps} fps"))
+        };
+        let mut outcome = Outcome {
+            gameplay: Some(Duration::from_secs(30)),
+            ..Outcome::default()
+        };
+        for (tag, fps) in [
+            ("[A/B A0 settling]", "9.0"),
+            ("[A/B A0]", "1.4"),
+            ("[A/B A0]", "1.2"),
+            ("[A/B B1 settling]", "9.0"),
+            ("[A/B B1]", "2.1"),
+        ] {
+            outcome.see(&tagged(tag, fps), Duration::from_secs(40));
+        }
+        assert_eq!(outcome.frame_rates.len(), 5);
+        let report = outcome.report();
+        let at = report
+            .iter()
+            .position(|l| l.starts_with("A/B, median per arm"))
+            .expect("an A/B table");
+        assert_eq!(
+            report[at],
+            "A/B, median per arm of the frame lines past settling (2 A, 1 B; 2 settling left out):"
+        );
+        assert_eq!(
+            report[at + 2],
+            "  fps                   1.4      2.1   +50.0%"
+        );
+        assert_eq!(
+            report[at + 3],
+            "  ms/frame            714.3    714.3    +0.0%"
+        );
+        // Seven figures, then the exit code.
+        assert_eq!(report.len(), at + 2 + 7 + 1);
+        // Without tags, no A/B table.
+        let plain = Outcome {
+            gameplay: Some(Duration::from_secs(30)),
+            frame_rates: vec![WORLD.into()],
+            ..Outcome::default()
+        };
+        assert!(!plain.report().iter().any(|l| l.starts_with("A/B")));
     }
 
     #[test]

@@ -116,6 +116,11 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    /// The program reads the host's runtime stride table.
+    pub stride_table: bool,
+    /// Buffers read (and written) through view-heap slots the program
+    /// picks at run time ([`super::RUN_TIME_READS`], [`super::RUN_TIME_WRITES`]).
+    pub run_time_buffers: u8,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -245,6 +250,11 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Runtime stride table entries read in a DXIL block, by the
+    /// descriptor's load (`descriptor::Entry`).
+    entries: HashMap<(usize, Site, u8), descriptor::Entry>,
+    /// [`Lowered::run_time_buffers`] so far.
+    run_time_buffers: u8,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -280,6 +290,13 @@ struct Lower<'a> {
     flat_group: Option<[u32; 3]>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
+    /// Split, in a group of several console waves, each lane on its own
+    /// path: lane reads at a constant lane go through group-shared memory
+    /// (see `Lower::new`).
+    group_reads: bool,
+    /// The group-shared memory of those lane reads
+    /// ([`Self::group_read_lane`]).
+    lane_slots: Option<V>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -443,6 +460,7 @@ impl<'a> Lower<'a> {
         });
         let mut console_lanes = false;
         let mut split = false;
+        let mut group_reads = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
         let mut flat_group = None;
@@ -548,6 +566,26 @@ impl<'a> Lower<'a> {
                 && !x.target.runs(64)
                 && x.target.runs(32)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            // A group of several console waves, which the console flow does
+            // not take (its waves need not branch alike to meet at one
+            // barrier), whose only reads of other lanes outside the half are
+            // lane reads at a lane fixed in the code: the same two halves,
+            // each lane on its own path, the lane reads through group-shared
+            // memory between group barriers every thread that has not ended
+            // reaches, and its LDS ordered by its own barriers
+            // ([`lanes::group_reads_meet`]).
+            group_reads = console_lanes
+                && !split
+                && x.native.wave64
+                && !x.target.runs(64)
+                && x.target.runs(32)
+                && cs.threads.iter().product::<u32>() > 64
+                && !masks_held
+                && !insts().any(|i| i.name() == "v_readfirstlane_b32")
+                && insts().filter(|&i| whole(i)).all(lanes::constant_lane_read)
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
+                && lanes::group_reads_meet(p);
+            split |= group_reads;
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half) or to share LDS in
             // the console's instruction order: the console flow, for a group
@@ -687,6 +725,8 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            entries: HashMap::new(),
+            run_time_buffers: 0,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -701,6 +741,8 @@ impl<'a> Lower<'a> {
             console_flat: None,
             flat_group,
             xchg: None,
+            group_reads,
+            lane_slots: None,
             flat: None,
             no_barrier,
             uniform: None,
@@ -865,10 +907,14 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let stride_table = self.s.stride_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             flow: match (self.console_cf, self.split) {
                 (false, false) => "per lane",
+                (false, true) if self.group_reads => {
+                    "per lane in halves, lane reads through group-shared memory"
+                }
                 (false, true) => "per lane in halves",
                 (true, false) => "console flow",
                 (true, true) => "console flow in halves",
@@ -876,6 +922,8 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            stride_table,
+            run_time_buffers: self.run_time_buffers,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -935,6 +983,9 @@ impl<'a> Lower<'a> {
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
+            Fields::Valu(_) if self.group_reads && name == "v_readlane_b32" => {
+                self.group_lane_read(inst)
+            }
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
             Fields::Image { .. } => self.image(inst, b, i),

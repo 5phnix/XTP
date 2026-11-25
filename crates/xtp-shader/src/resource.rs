@@ -279,6 +279,22 @@ enum Term {
     Value(Value),
 }
 
+/// How many steps deep [`Tracer::code_base`] and [`Tracer::code_high`]
+/// follow an address in the code.
+const CODE_DEPTH: u32 = 4;
+
+/// What the additions computing a value hold as their base
+/// ([`Tracer::code_base`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeBase {
+    /// None: an index, a constant.
+    None,
+    /// The low dword of this `s_getpc_b64`, once.
+    Code(Value),
+    /// A root parameter, two bases, or more steps than followed.
+    Other,
+}
+
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
 struct Sum {
@@ -515,6 +531,18 @@ impl<'a> Tracer<'a> {
         if let Some(s) = self.first_lane_folded(v) {
             return s;
         }
+        // A table in the code that paths reach each from an `s_getpc_b64`
+        // and join before one access, or whose address is read from the
+        // first lane of a value the lanes may hold differently: the join, or
+        // the read, is the computed term, and counts the table's base itself
+        // ([`Self::counts_code`]).
+        if let Some(pc) = self.code_join(v, CODE_DEPTH).or_else(|| self.code_lane(v)) {
+            return Sum {
+                base: Some(pc),
+                offset: 0,
+                dynamic: Some(v),
+            };
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
@@ -531,6 +559,155 @@ impl<'a> Tracer<'a> {
             offset: x.offset.wrapping_add(y.offset),
             dynamic: x.dynamic.or(y.dynamic),
         }
+    }
+
+    /// Ported from fxceless's VIctory fork (commit 578d459, `code_join`),
+    /// with its paths checked as sums. A join `v` whose every incoming
+    /// value is an address in the code (an `s_getpc_b64` low dword plus
+    /// terms of no other base, [`Self::code_base`]): the `s_getpc_b64` of
+    /// the first. Each path may take a table of its own: BTP 6's fog
+    /// reconstruction reads its sample offsets from one of two tables, by
+    /// the sample's number ("refused, the lit frame was multiplied by a fog
+    /// transmittance nothing had written", in the fork). The emitter gives
+    /// each `s_getpc_b64` its offset in the code as its value, so the join
+    /// is the byte in the code whichever table a path took. A VGPR join
+    /// holds each lane's own path's address on the console too; an SGPR
+    /// join, the scalar of the path the lane took, as structurisation
+    /// assumes for every scalar.
+    fn code_join(&self, v: Value, depth: u32) -> Option<Value> {
+        let (b, i) = self.phis[v.0 as usize]?;
+        if depth == 0 {
+            return None;
+        }
+        let mut pc = None;
+        for &a in &self.p.blocks[b].phis[i].args {
+            match self.vorigin(a) {
+                Term::Value(x) if x == v => {}
+                t => match self.code_base(t, depth - 1) {
+                    CodeBase::Code(x) => pc = pc.or(Some(x)),
+                    CodeBase::None | CodeBase::Other => return None,
+                },
+            }
+        }
+        pc
+    }
+
+    /// The `v_readfirstlane_b32` result `v`, read from an address in the
+    /// code that the lanes may hold differently ([`Self::code_base`]): the
+    /// `s_getpc_b64` it adds to. The fork (same commit) takes each lane's
+    /// own address there, which the console reads only for its first lane;
+    /// here the read itself is the computed term, as the emitter computes
+    /// it, every lane with the first lane's address. Where a guard narrows
+    /// the read in the per-lane form, the host's first lane may be one the
+    /// console's EXEC leaves out: not taken.
+    fn code_lane(&self, v: Value) -> Option<Value> {
+        let src = self.first_lane_source(v)?;
+        let (b, i) = self.defs[v.0 as usize]?;
+        if self.lanes?.guards[b][i].is_some() {
+            return None;
+        }
+        match self.code_base(self.vorigin(src), CODE_DEPTH) {
+            CodeBase::Code(pc) => Some(pc),
+            CodeBase::None | CodeBase::Other => None,
+        }
+    }
+
+    /// Whether the computed term `d` counts a table's base itself: a join
+    /// or a first-lane read of addresses in the code ([`Self::code_join`],
+    /// [`Self::code_lane`]), which [`Self::sum`] gives as the computed term
+    /// of a sum with that table's base.
+    fn counts_code(&self, d: Value) -> bool {
+        self.code_join(d, CODE_DEPTH).is_some() || self.code_lane(d).is_some()
+    }
+
+    /// What the additions computing `t` hold as their base, `depth`
+    /// additions deep, as [`Self::sum`] counts bases: a root parameter's
+    /// first dword, or an `s_getpc_b64` low dword, also through a
+    /// first-lane read and through a join of addresses in the code. Two
+    /// bases, or one past `depth`, are [`CodeBase::Other`].
+    fn code_base(&self, t: Term, depth: u32) -> CodeBase {
+        let Term::Value(x) = t else {
+            return CodeBase::None;
+        };
+        if self.getpc(x).is_some() {
+            return CodeBase::Code(x);
+        }
+        if let Some(reg) = self.inputs[x.0 as usize] {
+            return match self.param_of(reg) {
+                Some((_, 0)) => CodeBase::Other,
+                _ => CodeBase::None,
+            };
+        }
+        if depth == 0 {
+            return CodeBase::Other;
+        }
+        if let Some(src) = self.first_lane_source(x) {
+            return self.code_base(self.vorigin(src), depth - 1);
+        }
+        if self.phis[x.0 as usize].is_some() {
+            return match self.code_join(x, depth - 1) {
+                Some(pc) => CodeBase::Code(pc),
+                None => CodeBase::None,
+            };
+        }
+        let Some([a, b]) = self
+            .sop2(x, &["s_add_u32", "s_add_i32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.vadd(x))
+        else {
+            return CodeBase::None;
+        };
+        match (self.code_base(a, depth - 1), self.code_base(b, depth - 1)) {
+            (CodeBase::Code(pc), CodeBase::None) | (CodeBase::None, CodeBase::Code(pc)) => {
+                CodeBase::Code(pc)
+            }
+            (CodeBase::None, CodeBase::None) => CodeBase::None,
+            _ => CodeBase::Other,
+        }
+    }
+
+    /// `t` has the shape of a table address's high half in the code: an
+    /// `s_getpc_b64` high dword, an addition with carry to one
+    /// (`s_addc_u32`, `v_add_co_ci_u32`), a join of such, or a first-lane
+    /// read of one; `depth` steps deep. The paths of a join may carry into
+    /// different tables' high halves. Only the shape counts: no lowering
+    /// uses a code address's high half.
+    fn code_high(&self, t: Term, depth: u32) -> bool {
+        let Term::Value(x) = t else {
+            return false;
+        };
+        if self
+            .def(x)
+            .is_some_and(|i| i.name() == "s_getpc_b64" && i.writes.get(1).is_some_and(|w| w.1 == x))
+        {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        if let Some((b, i)) = self.phis[x.0 as usize] {
+            return self.p.blocks[b].phis[i].args.iter().all(|&a| {
+                let t = self.vorigin(a);
+                t == Term::Value(x) || self.code_high(t, depth - 1)
+            });
+        }
+        if let Some(src) = self.first_lane_source(x) {
+            return self.code_high(self.vorigin(src), depth - 1);
+        }
+        if let Some((_, [a, b])) = self.sop2(x, &["s_addc_u32"]) {
+            return self.code_high(a, depth - 1) || self.code_high(b, depth - 1);
+        }
+        let Some(inst) = self.def(x) else {
+            return false;
+        };
+        let Fields::Valu(f) = &inst.fields else {
+            return false;
+        };
+        inst.name() == "v_add_co_ci_u32"
+            && f.src[..2.min(f.src.len())].iter().any(|o| {
+                self.vterm(inst, o)
+                    .is_some_and(|t| self.code_high(t, depth - 1))
+            })
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -645,16 +822,26 @@ impl<'a> Tracer<'a> {
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
-            // A table in the code: the base is the next instruction's offset.
+            // A table in the code: the base is the next instruction's offset,
+            // unless the computed term counts it already (a join or a
+            // first-lane read of addresses in the code, whose high half may
+            // be joined or read from the first lane too).
+            let counted = s.dynamic.is_some_and(|d| self.counts_code(d));
             let high = pc.writes.get(1).map(|w| w.1);
-            if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
+            if !self.high_half(hi, high)
+                && !high.is_some_and(|h| self.carried(hi, h))
+                && !(counted && self.code_high(hi, CODE_DEPTH))
+            {
                 return Err("an address with an untracked high half");
             }
+            let first = if counted {
+                0
+            } else {
+                pc.machine.offset as u32 + 4
+            };
             return Ok(Address {
                 param: CODE,
-                offset: (pc.machine.offset as u32 + 4)
-                    .wrapping_add(s.offset)
-                    .wrapping_add(extra.offset),
+                offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
@@ -892,20 +1079,147 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
+        let edge = |j: usize| -> Vec<Term> {
+            words
+                .iter()
+                .map(|w| match phi_of(w) {
+                    Some((_, i)) => self.origin(phis[i].args[j]),
+                    None => *w,
+                })
+                .collect()
+        };
         let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
-                let edge: Vec<Term> = words
-                    .iter()
-                    .map(|w| match phi_of(w) {
-                        Some((_, i)) => self.origin(phis[i].args[j]),
-                        None => *w,
-                    })
-                    .collect();
-                self.classify(&edge, joins, known)
-            })
+            .map(|j| self.classify(&edge(j), joins, known))
             .collect::<Result<_, _>>();
+        let source = match args {
+            Ok(args) => Ok(Source::Phi { block, args }),
+            // An edge holds no descriptor. With one edge left that the lanes
+            // reading the descriptor can have come by, it is what the
+            // registers hold on that one, if lowering can name it where it
+            // is read: a wave that took another edge has no such lane left
+            // (an arm under the copy of EXEC the program started with,
+            // `s_and_saveexec` of it, where the console compiler set a
+            // sampler's constants; what the registers held before the arm
+            // is what the skipping edge joins in).
+            Err(e) => match self.only_edge(block, known) {
+                Some((j, conditions)) => {
+                    let n = known.len();
+                    known.extend(conditions);
+                    let one = self.classify(&edge(j), joins, known);
+                    known.truncate(n);
+                    match one {
+                        Ok(source) if self.anywhere(&source) => Ok(source),
+                        _ => Err(e),
+                    }
+                }
+                None => Err(e),
+            },
+        };
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        source.map(Some)
+    }
+
+    /// The one forward edge into the join `block`, by its index in the
+    /// block's predecessors, that lanes satisfying `known` can have taken,
+    /// with what holds in the lanes that take it; `None` unless the lanes'
+    /// paths ([`Structured`]) rule out every other edge, and at loop
+    /// headers.
+    ///
+    /// Ported from fxceless's VIctory fork (commit 578d459) by fxceless:
+    /// `only_edge`, `anywhere` and their use when an edge of a join holds
+    /// no descriptor ([`Self::phi`]). Here the lanes that take the edge
+    /// are known while its dwords are traced, and a load's base must come
+    /// from the entry ([`Self::anywhere`]).
+    fn only_edge(&self, block: usize, known: &mut Known) -> Option<(usize, Known)> {
+        let lanes = self.lanes?;
+        let preds = &self.p.blocks[block].preds;
+        if preds.len() < 2 || preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+            return None;
+        }
+        let mut only = None;
+        for (j, &q) in preds.iter().enumerate() {
+            let mut edge = vec![(lanes.reach[q], true)];
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = lanes.exits[q]
+                && taken != not_taken
+            {
+                edge.push((when, taken == block));
+            }
+            let n = known.len();
+            known.extend(edge.iter().copied());
+            let taken = lanes.bools.meet(known);
+            known.truncate(n);
+            if taken && only.replace((j, edge)).is_some() {
+                return None;
+            }
+        }
+        only
+    }
+
+    /// Whether lowering can make a handle for `source` in any block: its
+    /// heap index comes from root parameters and constants alone. A table
+    /// offset the code computes exists only where the load is; so does a
+    /// load's base unless it is an input or a constant through moves, which
+    /// lowering gives the input's own value (computed in the entry block).
+    fn anywhere(&self, source: &Source) -> bool {
+        match source {
+            Source::Constant(_) => true,
+            Source::Built { address, .. } => address.dynamic.is_none(),
+            Source::Loaded { load, .. } => {
+                let inst = self.inst(*load);
+                let Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } = &inst.fields
+                else {
+                    return false;
+                };
+                let entry = |op: &Operand| match *op {
+                    Operand::Scalar { code: NULL, .. }
+                    | Operand::Const(_)
+                    | Operand::Literal(_) => true,
+                    Operand::Scalar { code, .. } => {
+                        inst.read(Reg::S(code)).is_some_and(|v| self.entry_value(v))
+                    }
+                    _ => false,
+                };
+                entry(base)
+                    && entry(soffset)
+                    && self
+                        .smem_address(inst, base, *offset, soffset)
+                        .is_ok_and(|a| a.dynamic.is_none())
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is an input or a constant, through scalar moves.
+    fn entry_value(&self, mut v: Value) -> bool {
+        for _ in 0..MAX_ROUNDS {
+            if self.inputs[v.0 as usize].is_some() {
+                return true;
+            }
+            let Some(inst) = self.def(v) else {
+                return false;
+            };
+            if !matches!(inst.name(), "s_mov_b32" | "s_mov_b64" | "s_movk_i32") {
+                return false;
+            }
+            let Some(k) = inst.writes.iter().position(|w| w.1 == v) else {
+                return false;
+            };
+            match copy_source(inst, k) {
+                Some(Moved::Value(s)) => v = s,
+                Some(Moved::Const(_)) => return true,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -1943,6 +2257,144 @@ pub(crate) mod tests {
         );
     }
 
+    /// A wave64 compute program that builds a sampler's constants in s[0:3]
+    /// in an arm entered by `guard` (an `s_and_saveexec_b64 s[20:21], ...`
+    /// skipped by `s_cbranch_execz`) and samples with it after the arm.
+    /// Before the arm s[0:3] hold two lane masks: what the edge that skips
+    /// the arm joins in.
+    fn sampler_built_in_an_arm(guard: u32) -> Result<Resources, ShaderError> {
+        let words = [
+            0xBEA8_047E, // s_mov_b64 s[40:41], exec
+            0xBEFE_0A7E, // s_wqm_b64 exec, exec
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF40C_0106,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[12:13], null
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0: lanes 0 to 4
+            0xBE80_046A, // s_mov_b64 s[0:1], vcc
+            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+            guard,
+            0xBF88_0006, // s_cbranch_execz -> 0x50
+            0x7E26_02F2, // v_mov_b32 v19, 1.0
+            0xB000_0092, // s_movk_i32 s0, 0x92
+            0xBE81_03FF,
+            0x00C0_0000, // s_mov_b32 s1, 0xc00000
+            0xBE82_0BA8, // s_brev_b32 s2, 40
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBEFE_0414, // 0x50: s_mov_b64 exec, s[20:21]
+            0xF09C_0108,
+            0x0001_0102, // image_sample_lz v1, v[2:3], s[4:11], s[0:3]
+            S_ENDPGM,
+        ];
+        wave64_compute(&words)
+    }
+
+    /// The same shape for the image descriptor: s[4:11] hold lane masks
+    /// before an arm under the starting EXEC that loads them from the table
+    /// at s[12:13] (`arm`: the load, after what else the arm does to the
+    /// base), the sampler's constants set before the access.
+    fn image_loaded_in_an_arm(arm: &[u32]) -> Result<Resources, ShaderError> {
+        let skip = 0xBF88_0000 | arm.len() as u32;
+        let mut words = vec![
+            0xBEA8_047E, // s_mov_b64 s[40:41], exec
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0
+            0xBE84_046A, // s_mov_b64 s[4:5], vcc
+            0xBE86_046A, // s_mov_b64 s[6:7], vcc
+            0xBE88_046A, // s_mov_b64 s[8:9], vcc
+            0xBE8A_046A, // s_mov_b64 s[10:11], vcc
+            0xBE94_2428, // s_and_saveexec_b64 s[20:21], s[40:41]
+            skip,        // s_cbranch_execz over the arm
+        ];
+        words.extend(arm);
+        words.extend([
+            0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+            0xB000_0092, // s_movk_i32 s0, 0x92
+            0xBE81_03FF,
+            0x00C0_0000, // s_mov_b32 s1, 0xc00000
+            0xBE82_0BA8, // s_brev_b32 s2, 40
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF09C_0108,
+            0x0001_0102, // image_sample_lz v1, v[2:3], s[4:11], s[0:3]
+            S_ENDPGM,
+        ]);
+        wave64_compute(&words)
+    }
+
+    /// `words` as a wave64 compute program whose table is at s9, traced.
+    fn wave64_compute(words: &[u32]) -> Result<Resources, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let st = lanes(&p);
+        assert!(st.is_some(), "the program structures");
+        track(&p, &[param(Table, 9, 1)], HwStage::Cs, st.as_ref())
+    }
+
+    const S_LOAD_IMAGE: [u32; 2] = [0xF40C_0106, 0xFA00_0000]; // s_load_dwordx8 s[4:11], s[12:13], null
+
+    /// The arm runs under the copy of EXEC the program started with, which
+    /// every lane's bit is set in: the wave skips it only when no lane is
+    /// left that would run it, and no lane takes the edge that skips it.
+    /// The sampler is its constants (`2da4beb386509b77` at 0x4d0, refused
+    /// as "neither loaded nor built" before: docs/analysis/world-black.md
+    /// §8.4). Under a per-lane compare instead, lanes 5 and up skip the arm
+    /// and sample with the lane masks: refused still.
+    #[test]
+    fn a_sampler_built_under_the_starting_exec_is_its_constants() {
+        // s_and_saveexec_b64 s[20:21], s[40:41]
+        let r = sampler_built_in_an_arm(0xBE94_2428).unwrap();
+        let samplers: Vec<_> = r
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Sampler)
+            .collect();
+        assert_eq!(samplers.len(), 1, "{:?}", r.descriptors);
+        assert_eq!(
+            samplers[0].source,
+            Source::Constant(vec![0x92, 0x00C0_0000, 0x1400_0000, 0])
+        );
+        // s_and_saveexec_b64 s[20:21], s[0:1]: lanes 0 to 4
+        match sampler_built_in_an_arm(0xBE94_2400) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "a descriptor neither loaded nor built");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    /// The image descriptor of such an arm is its load when the load's
+    /// address comes from the entry (the table's own SGPRs). Moved by an
+    /// addition in the arm, the base exists only where the arm ran, so the
+    /// load cannot be named at the access: refused still.
+    #[test]
+    fn an_image_loaded_under_the_starting_exec_is_its_load() {
+        let r = image_loaded_in_an_arm(&S_LOAD_IMAGE).unwrap();
+        let images: Vec<_> = r
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+            .collect();
+        assert_eq!(images.len(), 1, "{:?}", r.descriptors);
+        let Source::Loaded { load, first: 0 } = images[0].source else {
+            panic!("{:?}", images[0].source)
+        };
+        let address = r.scalar.iter().find(|s| s.0 == load).unwrap().1;
+        assert_eq!(address, at(0, 0));
+        let moved = [0x800C_C00C, S_LOAD_IMAGE[0], S_LOAD_IMAGE[1]]; // s_add_u32 s12, s12, 64
+        match image_loaded_in_an_arm(&moved) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "a descriptor neither loaded nor built");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
     #[test]
     fn descriptors_selected_by_scc_are_traced_per_outcome() {
         // Two buffer descriptors loaded from the table at s9 and one
@@ -2070,9 +2522,12 @@ pub(crate) mod tests {
         assert!(a.dynamic.is_some(), "the index stays a computed term");
     }
 
+    /// Same, but the index is each lane's own input (v0 is never set): the
+    /// console reads the first lane's entry for every lane, so the address
+    /// is the first lane's read itself, not each lane's index (the fork's
+    /// `first_lane` arm takes the lane's index; see `code_lane`).
     #[test]
-    fn a_first_lane_read_of_a_per_lane_code_table_address_is_refused_by_name() {
-        // Same, but the index is lane 0's own input (v0 is never set).
+    fn a_first_lane_read_of_a_per_lane_code_table_address_is_the_first_lanes() {
         let words = [
             0xBE80_1F00, // s_getpc_b64 s[0:1]
             0x8000_FF00,
@@ -2089,17 +2544,7 @@ pub(crate) mod tests {
             0xFA00_0000, // s_load_dword s6, s[2:3], null
             S_ENDPGM,
         ];
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
-        assert_eq!(
-            err,
-            ShaderError::Unsupported {
-                // the s_load_dword, at byte 44
-                offset: 44,
-                what: "an address read from the first lane of a per-lane value"
-            }
-        );
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// A table in the code read in a loop whose counter (v7) the exit test
@@ -2143,22 +2588,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_loop_counter_with_a_per_lane_exit_is_refused_by_name() {
-        // v_cmp_gt_u32 vcc_lo, v0, v7: lanes leave at their own count.
-        let code: Vec<u8> = code_table_loop(0x7D88_0F00)
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-        let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
-        assert_eq!(
-            err,
-            ShaderError::Unsupported {
-                // the s_load_dword, at byte 48
-                offset: 48,
-                what: "an address read from the first lane of a per-lane value"
-            }
-        );
+    fn a_loop_counter_with_a_per_lane_exit_is_read_from_the_first_lane() {
+        // v_cmp_gt_u32 vcc_lo, v0, v7: lanes leave at their own count, so
+        // the counter is per lane and the address the first lane's read.
+        assert!(read_from_the_first_lane(&code_table_loop(0x7D88_0F00)));
     }
 
     const PER_LANE_FIRST_LANE: &str = "an address read from the first lane of a per-lane value";
@@ -2207,6 +2640,188 @@ pub(crate) mod tests {
         }
     }
 
+    /// Whether the code table address of `words` ([`code_table_trace`]) is
+    /// read from the first lane: its computed term is the
+    /// `v_readfirstlane_b32` result, which counts the table's base (offset
+    /// 0), as for an index the lanes may hold differently (`code_lane`).
+    /// The tests of the uniformity rules below see each rule through it:
+    /// an index proven uniform stays the computed term instead, at the
+    /// table's offset, and the lanes compute it from its operands.
+    fn read_from_the_first_lane(words: &[u32]) -> bool {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = lanes(&p).expect("the program structures");
+        let r = track(&p, &[], HwStage::Cs, Some(&st)).unwrap();
+        let (_, a) = r.scalar.iter().find(|s| s.1.param == CODE).unwrap();
+        let first_lane = |v: Value| {
+            p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                i.name() == "v_readfirstlane_b32" && i.writes.first().is_some_and(|w| w.1 == v)
+            })
+        };
+        a.offset == 0 && a.dynamic.is_some_and(first_lane)
+    }
+
+    /// Where a guard narrows the first-lane read itself (here `v_cmpx`, no
+    /// branch), the host's first lane may be one the console's EXEC leaves
+    /// out: a per-lane index is refused there, as before `code_lane`.
+    #[test]
+    fn a_first_lane_read_under_a_guard_of_a_per_lane_address_is_refused() {
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7DA8_0085, // v_cmpx_gt_u32 exec_lo, 5, v0
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ];
+        let text = decoded(&words);
+        assert_eq!(text[6], "v_cmpx_gt_u32 exec_lo, 5, v0", "{text:#?}");
+        // the s_load_dword, at byte 48
+        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(48));
+    }
+
+    /// The text of the wave32 program of `words`.
+    fn decoded(words: &[u32]) -> Vec<String> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.text(false))
+            .collect()
+    }
+
+    /// Ported from fxceless's VIctory fork (commit 578d459,
+    /// `two_paths_into_one_code_table_load`): two paths add an index to one
+    /// table in the code and meet before one load (BTP 6's hair strands).
+    /// The join is the computed term, which counts the table's base
+    /// (offset 0): the emitter gives `s_getpc_b64` its offset in the code.
+    #[test]
+    fn two_paths_into_one_code_table_load() {
+        let words = [
+            0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+            0x8002_FF02,
+            0x0000_0040, // s_add_u32 s2, s2, 0x40
+            0x8203_8003, // s_addc_u32 s3, s3, 0
+            0xBF06_8001, // 0x10: s_cmp_eq_u32 s1, 0
+            0xBF85_0005, // 0x14: s_cbranch_scc1 -> 0x2c
+            0xD70F_0457,
+            0x0000_054A, // 0x18: v_add_co_u32 v87, s4, v74, s2
+            0xD528_0458,
+            0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+            0xBF82_0004, // 0x28: s_branch -> 0x3c
+            0xD70F_0457,
+            0x0000_054B, // 0x2c: v_add_co_u32 v87, s4, v75, s2
+            0xD528_0458,
+            0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+            0xDC34_8000,
+            0x577D_0057, // 0x3c: global_load_dwordx2 v[87:88], v[87:88], off
+            S_ENDPGM,
+        ];
+        let text = decoded(&words);
+        assert_eq!(text[4], "s_cbranch_scc1 label_002C", "{text:#?}");
+        assert_eq!(text[7], "s_branch label_003C", "{text:#?}");
+        let r = track_words(&words, &[], HwStage::Cs);
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset), (CODE, 0));
+        assert!(a.dynamic.is_some(), "the join is the computed term");
+    }
+
+    /// The fog's form: each path takes a table of its own (two
+    /// `s_getpc_b64`, two offsets) before one load. The join counts each
+    /// path's base; its high half is a join of the two tables' high halves.
+    /// With one path's address not in the code (an SGPR input that is no
+    /// root parameter), the join is no table address and is refused as
+    /// before.
+    #[test]
+    fn two_tables_in_the_code_joined_before_one_load() {
+        let words = |other_base: u32| -> Vec<u32> {
+            vec![
+                0xBF06_8001, // 0x00: s_cmp_eq_u32 s1, 0
+                0xBF85_0009, // 0x04: s_cbranch_scc1 -> 0x2c
+                0xBE82_1F00, // 0x08: s_getpc_b64 s[2:3]
+                0x8002_FF02,
+                0x0000_0040, // s_add_u32 s2, s2, 0x40
+                0x8203_8003, // s_addc_u32 s3, s3, 0
+                0xD70F_0457,
+                0x0000_054A, // 0x18: v_add_co_u32 v87, s4, v74, s2
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0xBF82_0008, // 0x28: s_branch -> 0x4c
+                0xBE82_1F00, // 0x2c: s_getpc_b64 s[2:3]
+                0x8002_FF02,
+                0x0000_0080, // s_add_u32 s2, s2, 0x80
+                0x8203_8003, // s_addc_u32 s3, s3, 0
+                0xD70F_0457,
+                other_base, // 0x3c: v_add_co_u32 v87, s4, v75, s2 (or s5)
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0xDC34_8000,
+                0x577D_0057, // 0x4c: global_load_dwordx2 v[87:88], v[87:88], off
+                S_ENDPGM,
+            ]
+        };
+        let text = decoded(&words(0x0000_054B));
+        assert_eq!(text[1], "s_cbranch_scc1 label_002C", "{text:#?}");
+        assert_eq!(text[7], "s_branch label_004C", "{text:#?}");
+        assert_eq!(text[11], "v_add_co_u32 v87, s4, v75, s2", "{text:#?}");
+        let r = track_words(&words(0x0000_054B), &[], HwStage::Cs);
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset), (CODE, 0));
+        assert!(a.dynamic.is_some(), "the join is the computed term");
+        // v_add_co_u32 v87, s4, v75, s5: s5 is no table.
+        let text = decoded(&words(0x0000_0B4B));
+        assert_eq!(text[11], "v_add_co_u32 v87, s4, v75, s5", "{text:#?}");
+        let code: Vec<u8> = words(0x0000_0B4B)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                // the global load, at byte 76
+                offset: 76,
+                what: "an address from a phi"
+            }
+        );
+    }
+
+    /// Ported from fxceless's VIctory fork (commit 578d459,
+    /// `a_code_table_address_taken_from_the_first_lane`, BTP 6's
+    /// average-luminance downsample, whose output the exposure reads): an
+    /// address into a table in the code computed per lane and read from the
+    /// first lane. The fork takes each lane's index as the computed term;
+    /// the console reads the first lane's entry for every lane, so here the
+    /// computed term is the first lane's read itself.
+    #[test]
+    fn a_code_table_address_taken_from_the_first_lane() {
+        let words = [
+            0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+            0xD70F_0457,
+            0x0000_054A, // v_add_co_u32 v87, s4, v74, s2
+            0xD528_0458,
+            0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+            0x7E0C_0557, // v_readfirstlane_b32 s6, v87
+            0x7E0E_0558, // v_readfirstlane_b32 s7, v88
+            0xF400_0203,
+            0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
+            S_ENDPGM,
+        ];
+        assert!(read_from_the_first_lane(&words));
+    }
+
     #[test]
     fn a_code_table_index_every_lane_sets_alike_is_traced() {
         // v_mov_b32 v7, 3
@@ -2220,7 +2835,7 @@ pub(crate) mod tests {
     /// per-lane form: the lanes the `s_and_saveexec` left out skip the write
     /// and reach the join with the old v7. (VIctory#1231 took the branch as
     /// uniform. The write runs under a narrowed EXEC in the console flow,
-    /// which refuses it too: the execz rule alone is pinned by
+    /// which makes it per lane too: the execz rule alone is pinned by
     /// `a_scalar_set_on_one_side_of_an_execz_skip_is_per_lane`.)
     #[test]
     fn a_value_joined_after_an_execz_skip_is_per_lane() {
@@ -2232,13 +2847,14 @@ pub(crate) mod tests {
             0x7E0E_0283, // v_mov_b32 v7, 3
             0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8 (the join)
         ]);
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(68));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// The same with a scalar: s9 is 3 in the lanes the `s_and_saveexec`
     /// let in and 0 in the others, which skip the block on their own EXEC
     /// bit. In the console flow the wave skips the block or not as one and
-    /// s9 is uniform, so only the per-lane rule for execz refuses this.
+    /// s9 is uniform, so only the per-lane rule for execz makes the address
+    /// the first lane's read.
     /// (VIctory#1231 took the branch as uniform and traced it.)
     #[test]
     fn a_scalar_set_on_one_side_of_an_execz_skip_is_per_lane() {
@@ -2251,12 +2867,12 @@ pub(crate) mod tests {
             0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8 (the join)
             0x7E0E_0209, // v_mov_b32 v7, s9
         ]);
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(72));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// A write under EXEC narrowed by a per-lane compare, without a branch:
     /// lanes 0 to 4 hold 3, the others 0. (VIctory#1231 took it as uniform
-    /// because its old value is. The console flow refuses it too; the
+    /// because its old value is. The console flow makes it per lane too; the
     /// per-lane rule alone is pinned by `uniform::tests`.)
     #[test]
     fn a_guarded_write_of_a_uniform_value_is_per_lane() {
@@ -2267,7 +2883,7 @@ pub(crate) mod tests {
             0x7E0E_0283, // v_mov_b32 v7, 3
             0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
         ]);
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(64));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// The review's program: s5 decides whether every lane runs the write
@@ -2299,7 +2915,7 @@ pub(crate) mod tests {
             0xFA00_0000, // s_load_dword s6, s[2:3], null
             S_ENDPGM,
         ];
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(64));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// An SDWA move of a word keeps the high half of v7, each lane's own
@@ -2312,7 +2928,7 @@ pub(crate) mod tests {
             0x7E0E_02F9,
             0x0006_1408, // v_mov_b32_sdwa v7, v8 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
         ]);
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(56));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// EXEC named as an operand is a lane mask read as a number, which the
@@ -2324,7 +2940,7 @@ pub(crate) mod tests {
         let words = code_table_at_v7(&[
             0x7E0E_027E, // v_mov_b32 v7, exec_lo
         ]);
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(48));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// A carry-in is read lane by lane: from a mask copied out of an SGPR,
@@ -2338,7 +2954,7 @@ pub(crate) mod tests {
             0xD528_6A07,
             0x01AA_0E80, // v_add_co_ci_u32 v7, vcc_lo, 0, v7, vcc_lo
         ]);
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// The other half of that rule: a branch on VCC copied from an SGPR.
@@ -2370,7 +2986,7 @@ pub(crate) mod tests {
             0xBF87_FFF2, // s_cbranch_vccnz loop
             S_ENDPGM,
         ];
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(48));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// A DPP move reads another lane's v8; the first lane of each row has
@@ -2383,7 +2999,7 @@ pub(crate) mod tests {
             0x7E0E_02FA,
             0xFF01_1108, // v_mov_b32_dpp v7, v8 row_shr:1 row_mask:0xf bank_mask:0xf
         ]);
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// A code table read in a block only lanes 0 to 4 enter, at index v7:
@@ -2417,7 +3033,8 @@ pub(crate) mod tests {
     /// Per lane, only lanes 0 to 4 enter the block and all of them set v7
     /// alike (to s9). In the console flow every lane runs it, and lanes 5 to
     /// 31 keep their own v7, load other dwords into s6 and read them after
-    /// the join: the claim must hold in both lowerings, so it is refused.
+    /// the join: the claim must hold in both lowerings, so the address is
+    /// the first lane's read, which both lowerings compute.
     #[test]
     fn a_code_table_index_set_under_a_narrowed_exec_is_per_lane_in_the_console_flow() {
         // v_mov_b32 v7, s9
@@ -2425,7 +3042,7 @@ pub(crate) mod tests {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         assert!(crate::structure::structure_console(&p).is_ok());
-        assert_eq!(code_table_trace(&words).unwrap_err(), per_lane_refusal(60));
+        assert!(read_from_the_first_lane(&words));
     }
 
     /// The same with a constant index: the first active lane computed the

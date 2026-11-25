@@ -139,6 +139,24 @@ try {
     }
     $sync = ((Get-Date) - $t0).TotalSeconds
 
+    # 4b. Disk room. Six slots' incremental caches fill the 110 GB disk in a
+    # few hours of busy deliveries (2026-11-24: "os error 112" on every
+    # build). Under 20 GB free, the incremental caches of the other slots
+    # that have been idle for 10 minutes go; the deps they built stay.
+    try {
+        if ((Get-PSDrive -Name $Root.Substring(0, 1)).Free -lt 20GB) {
+            foreach ($other in Get-ChildItem (Join-Path $Root 'w') -Directory -ErrorAction SilentlyContinue) {
+                if ($other.FullName -ieq $slotDir) { continue }
+                foreach ($profile in Get-ChildItem (Join-Path $other.FullName 'target') -Directory -ErrorAction SilentlyContinue) {
+                    $inc = Join-Path $profile.FullName 'incremental'
+                    if ((Test-Path $inc) -and (Get-Item $inc).LastWriteTime -lt (Get-Date).AddMinutes(-10)) {
+                        Remove-Item $inc -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+    } catch { Write-FarmErr "disk room: $($_.Exception.Message)" }
+
     # 5. The cargo commands.
     $envs = Get-FarmBuildEnv $req.env
     $cwd = $slotDir
