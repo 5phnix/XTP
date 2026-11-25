@@ -1051,6 +1051,9 @@ impl Drop for DynamicLease {
 /// Work a list runs as it closes ([`HostList::at_close`]).
 type Closing = Box<dyn FnOnce(&HostList) + Send>;
 
+/// Work a list runs at each of its submissions ([`HostList::at_submit`]).
+type Submitting = std::sync::Arc<dyn Fn(&HostList) + Send + Sync>;
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1086,6 +1089,8 @@ struct Deferred {
     refresh_epoch: u64,
     /// Work the list runs as it closes ([`HostList::at_close`]).
     closing: Vec<Closing>,
+    /// Work the list runs at each submission ([`HostList::at_submit`]).
+    submitting: Vec<Submitting>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1441,6 +1446,7 @@ impl Host {
             crate::readmap::save_copy_back_map();
         }
         for list in runs {
+            list.submitting();
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -2543,6 +2549,22 @@ impl HostList {
     /// order given; dropped with the recording if it never closes.
     pub(crate) fn at_close(&self, work: impl FnOnce(&HostList) + Send + 'static) {
         self.deferred().closing.push(Box::new(work));
+    }
+
+    /// Runs `work` at each submission of the list until it is reset, before
+    /// its steps; what `work` defers runs after them, and at the
+    /// submissions after this one too.
+    pub(crate) fn at_submit(&self, work: impl Fn(&HostList) + Send + Sync + 'static) {
+        self.deferred().submitting.push(std::sync::Arc::new(work));
+    }
+
+    /// Runs what the recording asked to run at each submission
+    /// ([`HostList::at_submit`]), the list's lock let go meanwhile.
+    fn submitting(&self) {
+        let work = self.deferred().submitting.clone();
+        for work in work {
+            work(self);
+        }
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date

@@ -1648,7 +1648,7 @@ impl State {
                 let used = PickedUse::default();
                 self.picked_uses.push((heap, used.clone()));
                 let (start, closing) = (title.start, used.clone());
-                let made = std::ptr::from_ref(host) as usize;
+                let made = title.hold();
                 list.at_close(move |list| {
                     let writes = {
                         let used = closing.lock().unwrap_or_else(|e| e.into_inner());
@@ -1659,13 +1659,20 @@ impl State {
                     };
                     // The same title heap, still there (as while the
                     // recording used it), with the same host heap.
-                    if !crate::descriptor::live_heap(heap) {
-                        return;
-                    }
-                    let host = crate::descriptor::heap(heap as This).host();
-                    if let Some(host) = host.filter(|h| std::ptr::from_ref(*h) as usize == made) {
-                        picked_refresh(list, host, start, &closing, writes);
-                    }
+                    // Held for the whole sweep: its release waits, and a heap
+                    // made since at its address is another (Codex review of
+                    // a090f22, P1). Then again at each of the list's
+                    // submissions, for the views the title writes between
+                    // its close and its submission (point 6).
+                    let sweep = move |list: &HostList| {
+                        made.with(|title| {
+                            if let Some(host) = title.host() {
+                                picked_refresh(list, host, start, &closing, writes);
+                            }
+                        });
+                    };
+                    sweep(list);
+                    list.at_submit(sweep);
                 });
                 used
             }
@@ -4238,6 +4245,151 @@ void main(uint3 id : SV_DispatchThreadID) {
             want[8 * l + 4] = 201 + 4 * l as u32;
         }
         assert_eq!(out.words()[..32], want, "slot 3 made and read");
+        crate::descriptor::host::RUN_TIME_VIEWS_TEST.set(None);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The root signature (user data, heaps indexed directly) and pipeline
+    /// of `picking_program`'s shader `cs`.
+    fn picking_pipeline(
+        host: &Host,
+        cs: &xtp_shader::emit::HostShader,
+    ) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let params = [D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: xtp_shader::emit::USER_DATA_SPACE,
+                    Num32BitValues: cs.user_data_dwords(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        }];
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 1,
+                    pParameters: params.as_ptr(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+                },
+            },
+        };
+        // SAFETY: the descriptions point at live data; the blob is read
+        // before it goes.
+        unsafe {
+            let mut blob: Option<ID3DBlob> = None;
+            D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).unwrap();
+            let blob = blob.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: cs.dxil.as_ptr().cast(),
+                        BytecodeLength: cs.dxil.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        }
+    }
+
+    /// Codex review of a090f22, point 6: a list recorded a dispatch that
+    /// picks slot 3 and closed; the title then wrote a buffer view there
+    /// and submitted the list with nothing else sweeping. The view waited
+    /// null and the dispatch read zeros. The list sweeps as it is
+    /// submitted: the view is made and its bytes refreshed for it.
+    #[test]
+    fn views_written_between_a_lists_close_and_its_submission_are_made_for_it() {
+        let test =
+            "draw::tests::views_written_between_a_lists_close_and_its_submission_are_made_for_it";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        crate::descriptor::host::RUN_TIME_VIEWS_TEST.set(Some(true));
+        let host = gpu.host();
+        let cs = picking_program();
+        let (root, pso) = picking_pipeline(host, &cs);
+        let heap = TestHeap::views(8);
+        let title = crate::descriptor::heap(heap.0);
+        assert!(title.host().is_some(), "a host heap");
+        let (slots, out) = (TitleBuffer::new(1 << 12), TitleBuffer::new(1 << 12));
+        let (a, b) = (TitleBuffer::new(1 << 12), TitleBuffer::new(1 << 12));
+        slots.set_words(|i| [2, 3].get(i).copied().unwrap_or(0));
+        a.set_words(|i| 100 + i as u32);
+        b.set_words(|i| 200 + i as u32);
+        // Format, buffer, (mapping,) first element, count, stride, flags.
+        let srv = |format, count, stride, flags| {
+            let mut w = [0u32; 10];
+            (w[0], w[1], w[2], w[6], w[7], w[8]) = (format, 1, 0x1688, count, stride, flags);
+            w
+        };
+        let mut uav = [0u32; 10];
+        (uav[1], uav[4], uav[5]) = (1, 32, 32);
+        let at = |i: u64| title.start + i * 32;
+        let null = std::ptr::null();
+        crate::descriptor::create_srv(null, slots.resource(), &srv(39, 1024, 0, 1), at(0));
+        crate::descriptor::create_uav(null, out.resource(), null, &uav, at(1));
+        crate::descriptor::create_srv(null, a.resource(), &srv(0, 64, 16, 0), at(2));
+        out.set_words(|_| 0);
+        let list = TitleList::new();
+        let l = list.host();
+        let mut state = state(heap.0);
+        heaps(&mut state, l);
+        // The list's only pick: slot 3 holds no view yet.
+        state.picked_buffers(l, "test");
+        out.shadow().gpu_writes(l, out.address(), 1 << 12);
+        l.keep(&root);
+        l.keep(&pso);
+        let zeros = vec![0u32; cs.user_data_dwords() as usize];
+        // SAFETY: an open list with the heap and every root argument set;
+        // what it names outlives the run.
+        unsafe {
+            l.list.SetComputeRootSignature(&root);
+            l.list.SetPipelineState(&pso);
+            l.list
+                .SetComputeRoot32BitConstants(0, zeros.len() as u32, zeros.as_ptr().cast(), 0);
+            l.list.Dispatch(2, 1, 1);
+        }
+        drop(state);
+        // The title's close, then its view creation at slot 3, then its
+        // submission (as `TitleList::run`, without the close).
+        let close = crate::object::slot::<extern "system" fn(This) -> crate::object::HRESULT>;
+        assert_eq!(close(list.this(), 0x48)(list.this()), crate::object::S_OK);
+        crate::descriptor::create_srv(null, b.resource(), &srv(0, 64, 16, 0), at(3));
+        assert_eq!(title.host().unwrap().waiting(), 1, "slot 3 waits, null");
+        host.submit(&[l]);
+        host.drain();
+        assert_eq!(title.host().unwrap().waiting(), 0, "made at the submission");
+        // Group g, lane l reads dword 4 l + 1 of its view and stores it at
+        // dword 8 l + 4 g.
+        let mut want = [0u32; 32];
+        for l in 0..4 {
+            want[8 * l] = 101 + 4 * l as u32;
+            want[8 * l + 4] = 201 + 4 * l as u32;
+        }
+        assert_eq!(out.words()[..32], want, "slot 3 made and read");
+        // Submitted again, the list reads what the title wrote since (what
+        // the dispatch writes as before goes back to no title memory: the
+        // output is left as it is).
+        b.set_words(|i| 300 + i as u32);
+        host.submit(&[l]);
+        host.drain();
+        for l in 0..4 {
+            want[8 * l + 4] = 301 + 4 * l as u32;
+        }
+        assert_eq!(out.words()[..32], want, "refreshed at each submission");
         crate::descriptor::host::RUN_TIME_VIEWS_TEST.set(None);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
