@@ -537,6 +537,23 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // An unused rasterizer input can be omitted. Keeping the front face
+        // beside a live interpolated float would either give it an undefined
+        // mode (which crashes the AMD compiler) or change the float's mode.
+        if self.pixel
+            && let Some(id) = self
+                .inputs
+                .iter()
+                .position(|e| e.kind == 13 && e.usage == 0)
+            && let Some(row) = self.inputs[id].row
+            && self
+                .inputs
+                .iter()
+                .any(|e| e.row == Some(row) && e.usage != 0 && e.interp > 1)
+        {
+            self.m.remove_pixel_input(id, self.inputs.len());
+            self.inputs.remove(id);
+        }
         one_mode_per_row(&mut self.inputs, self.pixel);
         one_mode_per_row(&mut self.outputs, false);
         one_mode_per_row(&mut self.prims, false);
