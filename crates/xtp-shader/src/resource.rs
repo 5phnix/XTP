@@ -355,9 +355,76 @@ struct Tracer<'a> {
 /// its negation where not.
 type Known = Vec<(Bool, bool)>;
 
+/// One way back from a VGPR value in [`Tracer::scalar_copies`]'s walk:
+/// what holds in the lanes that come by it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+struct LanePath {
+    /// The sides of the branches it came through, and what flags hold
+    /// there ([`Flag`]): small conditions.
+    sides: Known,
+    /// What lanes know entering the blocks it came through.
+    reaches: Known,
+    /// Whether the conditions of the lanes that access the descriptor hold
+    /// on it too: not past a back edge.
+    access: bool,
+    /// Flags those conditions test whose value on the path is not known yet.
+    flags: Vec<Flag>,
+}
+
+/// A compare of a VGPR with a constant whose lane bit the conditions of
+/// the access test (`v_cmp_eq_u32 vcc, 1, v8` with `v8` a flag the paths
+/// set): where the walk reaches a constant value of the VGPR, it knows the
+/// bit. The lanes' paths do not follow VGPRs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Flag {
+    /// The lane's bit of the compare's result ([`Atom::Lane`]).
+    bit: Bool,
+    /// The VGPR as the path has it so far (renamed through joins).
+    value: Value,
+    op: Cmp,
+    signed: bool,
+    constant: u32,
+    /// The VGPR is the compare's first operand.
+    flag_first: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Cmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Flag {
+    /// The compare's result where the VGPR holds `x`.
+    fn holds(&self, x: u32) -> bool {
+        let (a, b) = if self.flag_first {
+            (x, self.constant)
+        } else {
+            (self.constant, x)
+        };
+        let order = if self.signed {
+            (a as i32).cmp(&(b as i32))
+        } else {
+            a.cmp(&b)
+        };
+        match self.op {
+            Cmp::Eq => order.is_eq(),
+            Cmp::Ne => order.is_ne(),
+            Cmp::Lt => order.is_lt(),
+            Cmp::Le => order.is_le(),
+            Cmp::Gt => order.is_gt(),
+            Cmp::Ge => order.is_ge(),
+        }
+    }
+}
+
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
-/// How many VGPR values [`Tracer::scalar_copies`] follows.
+/// How many steps (a VGPR value on one path) [`Tracer::scalar_copies`] takes.
 const MAX_COPIES: usize = 1024;
 
 impl<'a> Tracer<'a> {
@@ -1178,7 +1245,10 @@ impl<'a> Tracer<'a> {
     /// edge must be one the wave takes whenever such a lane does: a jump,
     /// or a branch the whole wave takes alike. Not one side of a per-lane
     /// branch (an `s_cbranch_execz` over an arm that other lanes of the
-    /// wave run, rewriting the registers before these lanes read them).
+    /// wave run, rewriting the registers before these lanes read them), nor
+    /// the end of a path that such a branch leaves on the way there
+    /// ([`Self::wave_comes_by`]: the same skip to a block that jumps to the
+    /// join, while the arm jumps there too).
     fn only_edge(&self, block: usize, known: &mut Known) -> Option<(usize, Known)> {
         let lanes = self.lanes?;
         let preds = &self.p.blocks[block].preds;
@@ -1197,11 +1267,7 @@ impl<'a> Tracer<'a> {
                 && taken != not_taken
             {
                 edge.push((when, taken == block));
-                per_lane = lanes
-                    .bools
-                    .support(when)
-                    .iter()
-                    .any(|a| !matches!(a, Atom::Uniform(_)));
+                per_lane = self.per_lane_branch(when);
             }
             let n = known.len();
             known.extend(edge.iter().copied());
@@ -1211,10 +1277,130 @@ impl<'a> Tracer<'a> {
                 return None;
             }
         }
-        match only? {
-            (_, _, true) => None,
-            (j, edge, false) => Some((j, edge)),
+        let (j, edge, per_lane) = only?;
+        let n = known.len();
+        known.extend(edge.iter().copied());
+        let wave = !per_lane && self.wave_comes_by(block, preds[j], known);
+        known.truncate(n);
+        wave.then_some((j, edge))
+    }
+
+    /// Whether lanes may take a branch on `when` differently within a wave:
+    /// it tests something other than SCC values.
+    fn per_lane_branch(&self, when: Bool) -> bool {
+        self.lanes.is_some_and(|lanes| {
+            lanes
+                .bools
+                .support(when)
+                .iter()
+                .any(|a| !matches!(a, Atom::Uniform(_)))
+        })
+    }
+
+    /// Whether a wave whose lanes satisfying `known` come into `block` from
+    /// its predecessor `q` came by that edge itself, as its SGPRs did. Its
+    /// path and theirs part only at per-lane branches on the way, from
+    /// `block`'s immediate dominator on: there a lane with its bit of the
+    /// tested mask set takes the wave along (the side an `s_cbranch_execz`
+    /// or `_vccz` does not take, the one an `s_cbranch_execnz` or `_vccnz`
+    /// takes), and a lane with its bit clear may see the wave take the
+    /// other side. So wherever these lanes may take the side a lane of the
+    /// wave can leave them on, every path from the other side must come
+    /// into `block` from `q` too. For a branch on SCC either side may be
+    /// the wave's. Paths here take back edges too: a wave sent round a loop
+    /// by other lanes can come into `block` from elsewhere a pass later.
+    fn wave_comes_by(&self, block: usize, q: usize, known: &Known) -> bool {
+        let Some(lanes) = self.lanes else {
+            return false;
+        };
+        let blocks = &self.p.blocks;
+        let order = crate::ir::reverse_postorder(blocks);
+        let idom = crate::ir::idoms(blocks, &order, &self.rpo);
+        let Some(&top) = idom.get(block).filter(|&&d| d != usize::MAX) else {
+            return false;
+        };
+        // The blocks that lead to `to`, not through `block`.
+        let leading = |to: usize| {
+            let mut seen = vec![false; blocks.len()];
+            let mut stack = vec![to];
+            while let Some(x) = stack.pop() {
+                if x == block || std::mem::replace(&mut seen[x], true) {
+                    continue;
+                }
+                stack.extend(&blocks[x].preds);
+            }
+            seen
+        };
+        let to_q = leading(q);
+        let mut to_block = vec![false; blocks.len()];
+        for &p in &blocks[block].preds {
+            for (x, on) in leading(p).into_iter().enumerate() {
+                to_block[x] |= on;
+            }
         }
+        // Whether a path from `s` comes into `block` from another block.
+        let elsewhere = |s: usize| {
+            let mut seen = vec![false; blocks.len()];
+            let mut stack = vec![s];
+            while let Some(y) = stack.pop() {
+                if y == q || !to_block[y] || std::mem::replace(&mut seen[y], true) {
+                    continue;
+                }
+                let next = blocks[y].exit.successors();
+                if next.contains(&block) {
+                    return true;
+                }
+                stack.extend(next);
+            }
+            false
+        };
+        // The blocks on the paths from the dominator to `block`.
+        let mut region = vec![false; blocks.len()];
+        let mut stack = vec![top];
+        while let Some(x) = stack.pop() {
+            if x == block || !to_block[x] || std::mem::replace(&mut region[x], true) {
+                continue;
+            }
+            stack.extend(blocks[x].exit.successors());
+        }
+        for x in (0..blocks.len()).filter(|&x| region[x]) {
+            let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = lanes.exits[x]
+            else {
+                continue;
+            };
+            if taken == not_taken || !self.per_lane_branch(when) {
+                continue;
+            }
+            // Whether these lanes may leave `x` towards `q` over one side.
+            let lanes_take = |side: bool| {
+                let s = if side { taken } else { not_taken };
+                let leads = if s == block { x == q } else { to_q[s] };
+                let mut all = known.clone();
+                all.extend([(lanes.reach[x], true), (when, side)]);
+                leads && lanes.bools.meet(&all)
+            };
+            // The side a lane with its bit set takes the wave to.
+            let along = match blocks[x].insts.last().map(|i| i.name()) {
+                Some("s_cbranch_execz" | "s_cbranch_vccz") => Some(false),
+                Some("s_cbranch_execnz" | "s_cbranch_vccnz") => Some(true),
+                _ => None,
+            };
+            for wave in [true, false] {
+                if along.is_some_and(|a| a != wave) || !lanes_take(!wave) {
+                    continue;
+                }
+                let s = if wave { taken } else { not_taken };
+                let apart = if s == block { x != q } else { elsewhere(s) };
+                if apart {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Whether lowering can make a handle for `source` in any block: its
@@ -1574,37 +1760,41 @@ impl<'a> Tracer<'a> {
     /// those loads, and the loop takes every lane in one pass (its proof is
     /// [`Self::waterfall`]'s).
     ///
-    /// What else the VGPRs held on other paths (numbers the code computed,
-    /// SGPR numbers it copied, entry values) is not that descriptor: the
-    /// compiler's value is undefined there, and the register holds what it
-    /// held for another variable. Refused: a VGPR that may hold a copy of
-    /// other dwords or of another address's, a constant copied from an SGPR
-    /// (an immediate sampler on one path), a descriptor fetched per lane
-    /// ([`Self::fetched`]'s form), or a load whose base is not a root
-    /// parameter's SGPR (the handle is made where the descriptor is used,
-    /// from the load's base).
-    // shortcut: if a lane reached the access with a number there (the
-    // console would read a descriptor made of it), it takes the loads'
-    // descriptor instead.
+    /// Every definition that reaches the VGPRs on a path an accessing lane
+    /// can have come by must be such a copy ([`Self::scalar_copies`]): what
+    /// they hold on other paths (numbers the code computed for another
+    /// variable) no accessing lane reads. Refused: a VGPR that may hold
+    /// anything else there (a number, an entry value, a constant, a bit
+    /// operation on an SGPR, which can keep another descriptor's bits), a
+    /// copy of other dwords or of another address's, a constant copied
+    /// from an SGPR (an immediate sampler on one path), a descriptor
+    /// fetched per lane ([`Self::fetched`]'s form), or a load whose base is
+    /// not a root parameter's SGPR (the handle is made where the
+    /// descriptor is used, from the load's base).
     // Ported from fxceless's VIctory fork (commit 578d459) by fxceless
     // (`lane_copies`, `scalar_copies`, `base_from_entry`). Here: a fallback
     // where the per-path trace fails; the old value of a VGPR write is
-    // followed where an accessing lane may keep it ([`Self::runs`]),
-    // whatever the instruction (the fork follows it for moves alone,
-    // always); constant copies refuse.
+    // followed where an accessing lane may keep it, whatever the
+    // instruction (the fork follows it for moves alone, always); constant
+    // copies refuse; the fork's numbers on other paths are taken as no
+    // descriptor only where no accessing lane comes by them (the review of
+    // meshdata's landing: one copy of A per dword was enough, and lanes
+    // that ORed B's dwords with 0 into the VGPRs read A's handle).
     fn lane_copies(&self, lanes: &[Value], known: &Known) -> Option<Source> {
         let mut loads: Vec<Site> = Vec::new();
         let mut first = None;
+        let start = self.lane_path(known);
         for (k, &v) in lanes.iter().enumerate() {
-            let mut found = false;
-            for copy in self.scalar_copies(v, known)? {
+            let copies = self.scalar_copies(v, &start, known)?;
+            if copies.is_empty() {
+                return None;
+            }
+            for copy in copies {
                 let Term::Value(c) = copy else { return None };
-                let Some(site) = self.defs[c.0 as usize] else {
-                    continue;
-                };
+                let site = self.defs[c.0 as usize]?;
                 let load = self.inst(site);
                 if !load.name().starts_with("s_load_dword") {
-                    continue;
+                    return None;
                 }
                 // Dword k of the operand is dword `first + k` of each load.
                 let dword = load.writes.iter().position(|w| w.1 == c)?;
@@ -1615,10 +1805,6 @@ impl<'a> Tracer<'a> {
                 if !loads.contains(&site) {
                     loads.push(site);
                 }
-                found = true;
-            }
-            if !found {
-                return None;
             }
         }
         let address = |site: Site| {
@@ -1647,61 +1833,276 @@ impl<'a> Tracer<'a> {
     }
 
     /// The SGPR dwords (as origins) that `v_mov_b32` and `v_cndmask_b32`
-    /// copy into VGPR value `v`, through joins and VGPR moves; the old value
-    /// of any VGPR write that some lane in `known` (those that access the
-    /// descriptor) may reach with its EXEC bit clear, since it keeps that
-    /// value. None where the VGPR may hold a descriptor fetched per lane from
-    /// memory, or past [`MAX_COPIES`] values.
-    fn scalar_copies(&self, v: Value, known: &Known) -> Option<Vec<Term>> {
-        let (mut seen, mut work, mut out) = (std::collections::HashSet::new(), vec![v], Vec::new());
-        while let Some(v) = work.pop() {
-            if !seen.insert(v) {
-                continue;
-            }
+    /// copy into VGPR value `v`, through joins and VGPR moves, on each path
+    /// that lanes in `known` (those that access the descriptor) can have
+    /// come by ([`LanePath`], from `start`: [`Self::lane_path`]); with the
+    /// old value of any VGPR write such a lane may reach with its EXEC bit
+    /// clear, since it keeps that value. None where any other definition
+    /// reaches `v` on such a path (a number the code computed, an entry
+    /// value, a constant, a load), or past [`MAX_COPIES`] steps.
+    fn scalar_copies(&self, v: Value, start: &LanePath, known: &Known) -> Option<Vec<Term>> {
+        let mut seen = std::collections::HashSet::new();
+        let (mut work, mut out) = (vec![(v, start.clone())], Vec::new());
+        while let Some((v, path)) = work.pop() {
             if seen.len() > MAX_COPIES {
                 return None;
             }
-            if let Some((b, i)) = self.phis[v.0 as usize] {
-                work.extend(&self.p.blocks[b].phis[i].args);
+            if !seen.insert((v, path.clone())) {
                 continue;
             }
-            // An entry value.
-            let Some(inst) = self.def(v) else { continue };
-            let name = inst.name();
-            if name.starts_with("global_load") || name.starts_with("flat_load") {
-                return None;
+            if let Some((b, i)) = self.phis[v.0 as usize] {
+                let args = &self.p.blocks[b].phis[i].args;
+                for (j, &a) in args.iter().enumerate() {
+                    if let Some(next) = self.lane_edge(&path, b, j, known) {
+                        work.push((a, next));
+                    }
+                }
+                continue;
             }
+            // An entry value is no copy.
+            let site = self.defs[v.0 as usize]?;
+            let inst = self.inst(site);
+            let &(reg, _) = inst.writes.iter().find(|w| w.1 == v)?;
             // Where a lane that accesses the descriptor may have its EXEC
             // bit clear, it keeps the old value.
-            if let Some(&(reg, _)) = inst.writes.iter().find(|w| w.1 == v)
-                && matches!(reg, Reg::V(_))
-                && (self.lanes.is_none() || self.runs(self.defs[v.0 as usize]?, known).is_err())
-            {
-                work.extend(inst.read(reg));
+            if self.may_skip(site, &path, known) {
+                work.push((inst.read(reg)?, path.clone()));
             }
             let Fields::Valu(f) = &inst.fields else {
-                continue;
+                return None;
             };
-            let sources = match name {
-                "v_mov_b32" => 1,
-                "v_cndmask_b32" => 2,
-                // A number the code computed.
-                _ => continue,
-            };
-            if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
-                continue;
+            if f.abs != 0
+                || f.neg != 0
+                || f.clamp
+                || f.omod != 0
+                || f.sdwa.is_some()
+                || f.dpp.is_some()
+            {
+                return None;
             }
-            for op in f.src.iter().take(sources) {
-                match *op {
-                    Operand::Vector { reg, .. } => work.extend(inst.read(Reg::V(reg))),
+            // The operands copied, each with what holds where it is picked.
+            let picked = match (inst.name(), &f.src[..]) {
+                ("v_mov_b32", [src, ..]) => vec![(*src, None)],
+                ("v_cndmask_b32", [clear, set, rest @ ..]) => {
+                    let bit = match rest {
+                        [Operand::Scalar { code, .. }] => inst
+                            .read(Reg::S(*code))
+                            .and_then(|m| self.lanes?.masks.get(&m).copied()),
+                        _ => None,
+                    };
+                    vec![
+                        (*clear, bit.map(|b| (b, false))),
+                        (*set, bit.map(|b| (b, true))),
+                    ]
+                }
+                // A number the code computed.
+                _ => return None,
+            };
+            for (op, side) in picked {
+                let mut path = path.clone();
+                if let Some(side) = side {
+                    path.sides.push(side);
+                    if !self.feasible(&path, known) {
+                        continue;
+                    }
+                }
+                match op {
+                    Operand::Vector { reg, .. } => work.push((inst.read(Reg::V(reg))?, path)),
                     Operand::Scalar { code, .. } if code != NULL => {
                         out.push(self.origin(inst.read(Reg::S(code))?));
                     }
-                    _ => {}
+                    _ => return None,
                 }
             }
         }
         Some(out)
+    }
+
+    /// The start of [`Self::scalar_copies`]'s walk: the lanes in `known`,
+    /// and the VGPR flags their conditions compare with a constant.
+    fn lane_path(&self, known: &Known) -> LanePath {
+        let mut path = LanePath {
+            access: true,
+            ..LanePath::default()
+        };
+        let Some(lanes) = self.lanes else {
+            return path;
+        };
+        let mut seen = std::collections::HashSet::new();
+        let atoms = known
+            .iter()
+            .flat_map(|&(b, _)| lanes.bools.support(b))
+            .filter(|&a| seen.insert(a));
+        for atom in atoms {
+            if let Atom::Lane(c) = atom
+                && let Some(bit) = lanes.bools.var(atom)
+                && let Some(flag) = self.flag(c, bit)
+            {
+                match self.flag_constant(flag.value) {
+                    Some(x) => path.sides.push((bit, flag.holds(x))),
+                    None => path.flags.push(flag),
+                }
+            }
+        }
+        path
+    }
+
+    /// The compare writing `c` if it tests a VGPR against a constant
+    /// (`v_cmp_eq_u32 vcc, 1, v8`): the lane's bit of it is `bit`.
+    fn flag(&self, c: Value, bit: Bool) -> Option<Flag> {
+        let inst = self.def(c)?;
+        if inst.writes.first()?.1 != c {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+            return None;
+        }
+        let rest = inst.name().strip_prefix("v_cmp_")?;
+        let (op, ty) = rest.split_once('_')?;
+        let op = match op {
+            "eq" => Cmp::Eq,
+            "ne" => Cmp::Ne,
+            "lt" => Cmp::Lt,
+            "le" => Cmp::Le,
+            "gt" => Cmp::Gt,
+            "ge" => Cmp::Ge,
+            _ => return None,
+        };
+        let signed = match ty {
+            "u32" => false,
+            "i32" => true,
+            _ => return None,
+        };
+        let constant = |o: &Operand| match *o {
+            Operand::Const(k) => inline(k),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let vgpr = |o: &Operand| match *o {
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+            _ => None,
+        };
+        let [a, b] = f.src.get(..2)? else {
+            return None;
+        };
+        let (value, constant, flag_first) = match (constant(a), vgpr(b), vgpr(a), constant(b)) {
+            (Some(k), Some(x), _, _) => (x, k, false),
+            (_, _, Some(x), Some(k)) => (x, k, true),
+            _ => return None,
+        };
+        Some(Flag {
+            bit,
+            value,
+            op,
+            signed,
+            constant,
+            flag_first,
+        })
+    }
+
+    /// The constant VGPR value `v` holds in every lane that comes by its
+    /// definition: a `v_mov_b32` of a constant that no such lane skips.
+    fn flag_constant(&self, v: Value) -> Option<u32> {
+        let (b, i) = self.defs[v.0 as usize]?;
+        let inst = self.inst((b, i));
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if inst.name() != "v_mov_b32"
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+            || self.lanes?.guards[b][i].is_some()
+        {
+            return None;
+        }
+        match self.vterm(inst, f.src.first()?)? {
+            Term::Const(x) => Some(x),
+            Term::Value(_) => None,
+        }
+    }
+
+    /// `path` taken back over edge `j` into `block`, a join, if lanes in
+    /// `known` can have come by it. Past a back edge the walk is in an
+    /// earlier pass, which what lanes knew later says nothing of.
+    fn lane_edge(
+        &self,
+        path: &LanePath,
+        block: usize,
+        j: usize,
+        known: &Known,
+    ) -> Option<LanePath> {
+        let Some(lanes) = self.lanes else {
+            return Some(path.clone());
+        };
+        let q = self.p.blocks[block].preds[j];
+        if self.rpo[q] >= self.rpo[block] {
+            return Some(LanePath::default());
+        }
+        let mut next = path.clone();
+        next.reaches.push((lanes.reach[q], true));
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = lanes.exits[q]
+            && taken != not_taken
+        {
+            next.sides.push((when, taken == block));
+        }
+        // A flag joined here holds what the edge brings.
+        for mut flag in std::mem::take(&mut next.flags) {
+            if let Some((b, i)) = self.phis[flag.value.0 as usize]
+                && b == block
+            {
+                flag.value = self.p.blocks[b].phis[i].args[j];
+            }
+            match self.flag_constant(flag.value) {
+                Some(x) => next.sides.push((flag.bit, flag.holds(x))),
+                None => next.flags.push(flag),
+            }
+        }
+        self.feasible(&next, known).then_some(next)
+    }
+
+    /// Whether some lane in `known` can have come by `path`. Asked of the
+    /// path's own branch sides first: what no lane satisfies needs no
+    /// more, and `meet` answers yes when its search grows too large, as
+    /// with a late block's reach in a long program (the sampler loop at
+    /// 0x5780 of 903776ba469c8bac, whose per-path trace fails so).
+    fn feasible(&self, path: &LanePath, known: &Known) -> bool {
+        let Some(lanes) = self.lanes else {
+            return true;
+        };
+        if !lanes.bools.meet(&path.sides) {
+            return false;
+        }
+        let mut all = path.sides.clone();
+        all.extend_from_slice(&path.reaches);
+        if path.access {
+            all.extend_from_slice(known);
+        }
+        lanes.bools.meet(&all)
+    }
+
+    /// Whether a lane that comes by `path` may skip the vector instruction
+    /// at `site` (its EXEC bit clear there), keeping what the registers held
+    /// before. Without the lanes' paths, any may.
+    fn may_skip(&self, site: Site, path: &LanePath, known: &Known) -> bool {
+        let Some(lanes) = self.lanes else {
+            return true;
+        };
+        let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1)) else {
+            return false;
+        };
+        let mut skips = path.clone();
+        skips.sides.push((guard, false));
+        skips.reaches.push((lanes.reach[site.0], true));
+        self.feasible(&skips, known)
     }
 
     /// Whether the scalar load at `site` has no register offset and takes
@@ -2507,7 +2908,12 @@ pub(crate) mod tests {
     /// Before the arm s[0:3] hold two lane masks: what the edge that skips
     /// the arm joins in.
     fn sampler_built_in_an_arm(guard: u32) -> Result<Resources, ShaderError> {
-        let words = [
+        sampler_built_in_an_arm_after(guard, &[])
+    }
+
+    /// [`sampler_built_in_an_arm`] with `first` at the start of the arm.
+    fn sampler_built_in_an_arm_after(guard: u32, first: &[u32]) -> Result<Resources, ShaderError> {
+        let mut words = vec![
             0xBEA8_047E, // s_mov_b64 s[40:41], exec
             0xBEFE_0A7E, // s_wqm_b64 exec, exec
             0xBE8C_0309, // s_mov_b32 s12, s9
@@ -2521,18 +2927,21 @@ pub(crate) mod tests {
             0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
             0xBEFE_0402, // s_mov_b64 exec, s[2:3]
             guard,
-            0xBF88_0006, // s_cbranch_execz -> 0x50
+            0xBF88_0006 + first.len() as u32, // s_cbranch_execz -> the join
+        ];
+        words.extend(first);
+        words.extend([
             0x7E26_02F2, // v_mov_b32 v19, 1.0
             0xB000_0092, // s_movk_i32 s0, 0x92
             0xBE81_03FF,
             0x00C0_0000, // s_mov_b32 s1, 0xc00000
             0xBE82_0BA8, // s_brev_b32 s2, 40
             0xBE83_0380, // s_mov_b32 s3, 0
-            0xBEFE_0414, // 0x50: s_mov_b64 exec, s[20:21]
+            0xBEFE_0414, // the join: s_mov_b64 exec, s[20:21]
             0xF09C_0108,
             0x0001_0102, // image_sample_lz v1, v[2:3], s[4:11], s[0:3]
             S_ENDPGM,
-        ];
+        ]);
         wave64_compute(&words)
     }
 
@@ -2612,17 +3021,33 @@ pub(crate) mod tests {
         }
     }
 
-    /// The relecture of task present (Codex, point 5): even lanes run an arm
-    /// that rewrites the sampler loaded from the table at s1 (dword 0 from
-    /// dword 1: no descriptor the trace can name), and the odd lanes sample
-    /// with it in the else arm. Those lanes skip the even lanes' arm, but
-    /// the sampler is in SGPRs: a wave with an even lane ran that arm, and
-    /// the console samples with the rewritten dwords. So the join's edge
-    /// that skips the arm, the only one the odd lanes take, is not what the
-    /// registers hold there: refused, not the loaded sampler.
+    /// A per-lane branch inside such an arm, before the constants, parts a
+    /// wave's path from its lanes' for a while: the wave runs the inner arm
+    /// if lanes 0 to 4 do, and lanes 5 and up skip it. Both sides come
+    /// back before the constants, so the wave still comes into the join
+    /// from the arm's end, as every lane does: the constants still.
     #[test]
-    fn a_descriptor_rewritten_in_an_arm_other_lanes_run_is_not_the_skipped_ones() {
-        let words = [
+    fn a_per_lane_branch_inside_the_arm_keeps_the_constants() {
+        let inner = [
+            0xBE96_246A, // s_and_saveexec_b64 s[22:23], vcc: lanes 0 to 4
+            0xBF88_0001, // s_cbranch_execz over the next word
+            0x7E26_02F4, // v_mov_b32 v19, 2.0
+            0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        ];
+        // s_and_saveexec_b64 s[20:21], s[40:41]
+        let r = sampler_built_in_an_arm_after(0xBE94_2428, &inner).unwrap();
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler);
+        assert_eq!(
+            sampler.unwrap().source,
+            Source::Constant(vec![0x92, 0x00C0_0000, 0x1400_0000, 0])
+        );
+    }
+
+    /// The program of the relecture of task present's point 5 (below): even
+    /// lanes run an arm that rewrites s8 of the sampler loaded from the
+    /// table at s1, odd lanes sample with s[8:11] in the else arm.
+    fn rewritten_in_an_arm() -> Vec<u32> {
+        vec![
             0xBE84_0300, // s_mov_b32 s4, s0
             0xBE85_0380, // s_mov_b32 s5, 0
             0xBE86_0301, // s_mov_b32 s6, s1
@@ -2653,9 +3078,69 @@ pub(crate) mod tests {
             0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
             0x887E_147E, // 0x70: s_or_b32 exec_lo, exec_lo, s20
             S_ENDPGM,
-        ];
+        ]
+    }
+
+    /// The relecture of task present (Codex, point 5): even lanes run an arm
+    /// that rewrites the sampler loaded from the table at s1 (dword 0 from
+    /// dword 1: no descriptor the trace can name), and the odd lanes sample
+    /// with it in the else arm. Those lanes skip the even lanes' arm, but
+    /// the sampler is in SGPRs: a wave with an even lane ran that arm, and
+    /// the console samples with the rewritten dwords. So the join's edge
+    /// that skips the arm, the only one the odd lanes take, is not what the
+    /// registers hold there: refused, not the loaded sampler.
+    #[test]
+    fn a_descriptor_rewritten_in_an_arm_other_lanes_run_is_not_the_skipped_ones() {
+        let words = rewritten_in_an_arm();
         assert_eq!(refusal(&words, false), "a descriptor changed after loading");
         // Without the rewrite, the join takes the load on both edges.
+        let mut kept = words;
+        kept[19] = 0xBF80_0000; // s_nop 0
+        let r = waterfall(&kept, false).unwrap();
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler);
+        assert!(
+            matches!(sampler.unwrap().source, Source::Loaded { first: 0, .. }),
+            "{:?}",
+            r.descriptors
+        );
+    }
+
+    /// The same arm with its edges split (the review of meshdata's landing,
+    /// P1): the skip goes to a block of its own (an `s_nop`) that falls
+    /// into the join, and the arm ends with a jump to the join. Both edges
+    /// into the join are jumps, and the odd lanes come by the skip's block
+    /// alone; but a wave gets there only when no even lane runs the arm,
+    /// and one with an even lane runs it and jumps past that block. So the
+    /// odd lanes of a mixed wave read the rewritten s8: refused as with the
+    /// direct edge. Without the rewrite, the load still.
+    #[test]
+    fn a_descriptor_rewritten_in_an_arm_is_not_what_a_split_skip_brings() {
+        let mut words = rewritten_in_an_arm();
+        assert_eq!(words[18..20], [0xBF88_0001, 0xBE88_0309]);
+        words.splice(
+            18..20,
+            [
+                0xBF88_0002, // s_cbranch_execz -> 0x54
+                0xBE88_0309, // s_mov_b32 s8, s9
+                0xBF82_0001, // s_branch -> 0x58
+                0xBF80_0000, // 0x54: s_nop 0
+            ],
+        );
+        // 0x58: s_or_saveexec_b32 s20, s20, the join.
+        assert_eq!(words[22], 0xBE94_3D14);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let join = block_at(&words, 0x58);
+        assert_eq!(p.blocks[join].preds.len(), 2);
+        let st = lanes(&p).unwrap();
+        assert!(
+            p.blocks[join]
+                .preds
+                .iter()
+                .all(|&q| matches!(st.exits[q], LaneExit::Jump(_))),
+            "both edges into the join are jumps"
+        );
+        assert_eq!(refusal(&words, false), "a descriptor changed after loading");
         let mut kept = words;
         kept[19] = 0xBF80_0000; // s_nop 0
         let r = waterfall(&kept, false).unwrap();
@@ -3956,6 +4441,9 @@ pub(crate) mod tests {
         Constant,
         /// A copy of entry 0 with dwords 0 and 1 swapped.
         Swapped,
+        /// Entry 1's dwords, each ORed with 0 (`v_or_b32_e64 v4, s32, 0`):
+        /// the same bits, by an instruction that is no move.
+        OredOtherEntry,
     }
 
     /// A buffer descriptor kept per lane in VGPRs, as the console compiler
@@ -3966,27 +4454,50 @@ pub(crate) mod tests {
     /// The lanes whose flag is set run a waterfall loop over v[4:7] that
     /// loads dword `lane` of the buffer, and store it to the UAV at dword 16
     /// of the table at s0. Which lanes hold numbers is told by the flag, a
-    /// VGPR the lanes' paths do not follow.
+    /// VGPR the lanes' paths do not follow. (The offsets in the comments
+    /// are those of the one-word copies.)
     pub(crate) fn kept_per_lane(second: SecondArm) -> Vec<u32> {
-        let (load, copies): (&[u32], [u32; 4]) = match second {
-            // s_load_dwordx4 s[32:35], s[4:5], 0x0 or 0x20
-            SecondArm::SameEntry => (&[0xF408_0802, 0xFA00_0000], [0x20, 0x21, 0x22, 0x23]),
-            SecondArm::OtherEntry => (&[0xF408_0802, 0xFA00_0020], [0x20, 0x21, 0x22, 0x23]),
-            // s_mov_b32 s32, 0x5a; s_nop 0
-            SecondArm::Constant => (&[0xBEA0_03FF, 0x0000_005A], [0x20, 0x21, 0x22, 0x23]),
-            SecondArm::Swapped => (&[0xF408_0802, 0xFA00_0000], [0x21, 0x20, 0x22, 0x23]),
+        kept_per_lane_flagged(second, 0)
+    }
+
+    /// [`kept_per_lane`] with v8 set to `flag` before the arms: with 1, the
+    /// lanes that take neither arm run the loop too, over their numbers.
+    fn kept_per_lane_flagged(second: SecondArm, flag: u32) -> Vec<u32> {
+        // v_mov_b32 v4..v7, the second arm's SGPRs
+        let moves = |sgprs: [u32; 4]| -> Vec<u32> {
+            (0..4)
+                .map(|k| 0x7E08_0200 | (k << 17) | sgprs[k as usize])
+                .collect()
         };
+        let (load, copies): (&[u32], Vec<u32>) = match second {
+            // s_load_dwordx4 s[32:35], s[4:5], 0x0 or 0x20
+            SecondArm::SameEntry => (&[0xF408_0802, 0xFA00_0000], moves([0x20, 0x21, 0x22, 0x23])),
+            SecondArm::OtherEntry => (&[0xF408_0802, 0xFA00_0020], moves([0x20, 0x21, 0x22, 0x23])),
+            // s_mov_b32 s32, 0x5a; s_nop 0
+            SecondArm::Constant => (&[0xBEA0_03FF, 0x0000_005A], moves([0x20, 0x21, 0x22, 0x23])),
+            SecondArm::Swapped => (&[0xF408_0802, 0xFA00_0000], moves([0x21, 0x20, 0x22, 0x23])),
+            // v_or_b32_e64 v(4 + k), s(32 + k), 0
+            SecondArm::OredOtherEntry => (
+                &[0xF408_0802, 0xFA00_0020],
+                (0..4)
+                    .flat_map(|k| [0xD51C_0004 + k, 0x0001_0020 + k])
+                    .collect(),
+            ),
+        };
+        // The second arm after its s_cbranch_execz: the load, the wait, the
+        // copies and the flag; then the end of the arm's own mask.
+        let arm = load.len() as u32 + 1 + copies.len() as u32 + 1;
         let mut words = vec![
             0xBE84_0300, // s_mov_b32 s4, s0
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0A02,
-            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
-            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
-            0x7E08_0D00, // v_cvt_f32_u32 v4, v0
-            0x7E0A_0D00, // v_cvt_f32_u32 v5, v0
-            0x7E0C_0D00, // v_cvt_f32_u32 v6, v0
-            0x7E0E_0D00, // v_cvt_f32_u32 v7, v0
-            0x7E10_0280, // v_mov_b32 v8, 0
+            0xFA00_0040,                // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x3420_0082,                // v_lshlrev_b32 v16, 2, v0
+            0x7E08_0D00,                // v_cvt_f32_u32 v4, v0
+            0x7E0A_0D00,                // v_cvt_f32_u32 v5, v0
+            0x7E0C_0D00,                // v_cvt_f32_u32 v6, v0
+            0x7E0E_0D00,                // v_cvt_f32_u32 v7, v0
+            0x7E10_0200 | (128 + flag), // v_mov_b32 v8, 0 (or `flag`)
             0xD4C4_001E,
             0x0002_0098, // v_cmp_gt_u32_e64 s30, 24, v0
             0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
@@ -3995,23 +4506,22 @@ pub(crate) mod tests {
             0x8914_147E, // s_xor_b32 s20, exec_lo, s20
             0xBF88_0008, // s_cbranch_execz -> 0x64
             0xF408_0602,
-            0xFA00_0000, // s_load_dwordx4 s[24:27], s[4:5], 0x0
-            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-            0x7E08_0218, // v_mov_b32 v4, s24
-            0x7E0A_0219, // v_mov_b32 v5, s25
-            0x7E0C_021A, // v_mov_b32 v6, s26
-            0x7E0E_021B, // v_mov_b32 v7, s27
-            0x7E10_0281, // v_mov_b32 v8, 1
-            0xBE94_3D14, // 0x64: s_or_saveexec_b32 s20, s20
-            0x897E_147E, // s_xor_b32 exec_lo, exec_lo, s20
-            0xBF88_000B, // s_cbranch_execz -> 0x9c
-            0xBE9F_3C1E, // s_and_saveexec_b32 s31, s30
-            0xBF88_0008, // s_cbranch_execz -> 0x98
+            0xFA00_0000,             // s_load_dwordx4 s[24:27], s[4:5], 0x0
+            0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+            0x7E08_0218,             // v_mov_b32 v4, s24
+            0x7E0A_0219,             // v_mov_b32 v5, s25
+            0x7E0C_021A,             // v_mov_b32 v6, s26
+            0x7E0E_021B,             // v_mov_b32 v7, s27
+            0x7E10_0281,             // v_mov_b32 v8, 1
+            0xBE94_3D14,             // 0x64: s_or_saveexec_b32 s20, s20
+            0x897E_147E,             // s_xor_b32 exec_lo, exec_lo, s20
+            0xBF88_0000 | (arm + 3), // s_cbranch_execz -> 0x9c
+            0xBE9F_3C1E,             // s_and_saveexec_b32 s31, s30
+            0xBF88_0000 | arm,       // s_cbranch_execz -> 0x98
         ];
         words.extend(load);
         words.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
-        // v_mov_b32 v4..v7, the second arm's SGPRs
-        words.extend((0..4).map(|k| 0x7E08_0200 | (k << 17) | copies[k as usize]));
+        words.extend(copies);
         words.extend([
             0x7E10_0281, // v_mov_b32 v8, 1
             0x887E_1F7E, // 0x98: s_or_b32 exec_lo, exec_lo, s31
@@ -4047,10 +4557,12 @@ pub(crate) mod tests {
     /// [`kept_per_lane`]: the lanes that take the loop came by one of the
     /// arms (their flag is set), but the lanes' paths do not tell, so the
     /// per-path trace finds the numbers of the lanes that took neither.
-    /// Every copy is of the same dwords of loads from one address: the
-    /// descriptor is the first load, and the loop is a proven waterfall
-    /// over it (one pass). Not where the second arm copies another entry,
-    /// a constant, or the same entry's dwords in another order.
+    /// Walked back path by path with the flag, the numbers come with a
+    /// flag of 0, which no lane in the loop has: every definition there is
+    /// a copy of the same dwords of loads from one address, the descriptor
+    /// is the first load, and the loop is a proven waterfall over it (one
+    /// pass). Not where the second arm copies another entry, a constant, or
+    /// the same entry's dwords in another order.
     #[test]
     fn a_descriptor_kept_per_lane_in_vgprs_is_its_load() {
         let r = waterfall(&kept_per_lane(SecondArm::SameEntry), false).unwrap();
@@ -4080,6 +4592,28 @@ pub(crate) mod tests {
                 "a descriptor read from the first lane of computed VGPRs"
             );
         }
+    }
+
+    /// The review of meshdata's landing (P1): lanes 0 to 15 copy entry 0
+    /// (A), lanes 16 to 23 load entry 1 (B) and OR each of its dwords with
+    /// 0 into v[4:7], which keeps B's bits, and set the flag. One copy of A
+    /// per dword was enough before, and the OR was taken for a number: the
+    /// loop read A's handle, and lane 16 116 instead of B's 216. Every
+    /// definition on the paths of the lanes in the loop must be a copy of
+    /// A: refused. So with A copied in both arms, where the lanes that take
+    /// neither have their flag set too and run the loop over their numbers.
+    #[test]
+    fn a_descriptor_kept_per_lane_with_other_bits_on_one_path_is_refused() {
+        let ored = kept_per_lane(SecondArm::OredOtherEntry);
+        assert!(ored.contains(&0xD51C_0004), "v_or_b32_e64 v4, s32, 0");
+        assert_eq!(
+            refusal(&ored, false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+        assert_eq!(
+            refusal(&kept_per_lane_flagged(SecondArm::SameEntry, 1), false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
     }
 
     #[test]

@@ -836,6 +836,13 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            #[cfg(feature = "diagnostics")]
+            crate::meshstat::read(
+                crate::meshstat::What::Vertex { stride: v.stride },
+                &shadow,
+                v.address,
+                u64::from(v.size),
+            );
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -854,6 +861,13 @@ impl State {
                 return Err("index buffer outside title buffers".into());
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            #[cfg(feature = "diagnostics")]
+            crate::meshstat::read(
+                crate::meshstat::What::Index { format: v.format },
+                &shadow,
+                v.address,
+                u64::from(v.size),
+            );
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1010,6 +1024,8 @@ impl State {
                         }
                         continue;
                     };
+                    #[cfg(feature = "diagnostics")]
+                    crate::meshstat::root_view(address);
                     if tabled {
                         self.root_srv_table(list, Some(address), param, compute)?;
                         continue;
@@ -1616,6 +1632,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::indirect::note_direct(list, self.pipeline, [x, y, z]);
         #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(list, self.pipeline, crate::meshstat::Op::Dispatch);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             self.dispatch_dropped(Unready::NoPipeline);
             return;
@@ -1625,7 +1643,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            self.rt_dropped(list);
+            self.rt_dropped(list, crate::rt_standin::Work::Groups([x, y, z]));
             self.dispatch_dropped(Unready::NoPipeline);
             return;
         };
@@ -1652,6 +1670,8 @@ impl State {
             });
         };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        meshes.ran();
     }
 
     /// Counts a dispatch that does not run; the next one of the list that
@@ -1672,29 +1692,35 @@ impl State {
         dropped("dispatch", self.pipeline, why);
     }
 
-    /// A dispatch, direct or indirect, dropped for want of a host pipeline:
-    /// if it runs one of the title's trace programs ([`crate::rt_standin`]),
-    /// what its program writes through unordered access is handed over as
-    /// the title's compute tables and root views hold it now, to be counted
-    /// and (its switch on) cleared to "every ray missed". A clear binds
-    /// XTP's own view heap: the next draw or dispatch binds the title's.
-    fn rt_dropped(&mut self, list: &HostList) {
+    /// A dispatch, direct or indirect, dropped for want of a host pipeline,
+    /// which would have run `work`: if it runs one of the title's trace
+    /// programs ([`crate::rt_standin`]), it is counted, and with the
+    /// stand-in on, what its program writes through unordered access is
+    /// handed over as the title's compute tables (in the bound heaps only)
+    /// and root views hold it now, to be cleared to "every ray missed". A
+    /// clear binds XTP's own view heap: the next draw or dispatch binds the
+    /// title's.
+    fn rt_dropped(&mut self, list: &HostList, work: crate::rt_standin::Work) {
         let Some(program) = crate::rt_standin::program(self.pipeline as This) else {
             return;
         };
         use crate::rt_standin::Bound;
-        let bound: Vec<Bound> = program
-            .writes()
-            .map(|u| match (u.root, self.compute.get(usize::from(u.slot))) {
-                (RootType::Table, Some(Root::Table(table))) => {
-                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
-                        .map_or(Bound::Unset, Bound::View)
-                }
-                (RootType::Descriptor, Some(Root::View(address))) => Bound::Root(*address),
-                _ => Bound::Unset,
-            })
-            .collect();
-        if crate::rt_standin::dropped(list, &program, &bound) {
+        let bound = || {
+            program
+                .writes()
+                .map(|u| match (u.root, self.compute.get(usize::from(u.slot))) {
+                    (RootType::Table, Some(Root::Table(table))) => {
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        self.heap_of(handle)
+                            .and_then(|_| crate::descriptor::view(handle))
+                            .map_or(Bound::Unset, Bound::View)
+                    }
+                    (RootType::Descriptor, Some(Root::View(address))) => Bound::Root(*address),
+                    _ => Bound::Unset,
+                })
+                .collect()
+        };
+        if crate::rt_standin::dropped(list, &program, work, bound) {
             self.forget_host();
         }
     }
@@ -1744,6 +1770,16 @@ impl State {
             self.trace("mesh", groups[0], 0);
             crate::indirect::note_direct(list, self.pipeline, groups);
         }
+        #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(
+            list,
+            self.pipeline,
+            crate::meshstat::Op::Mesh {
+                groups: groups[0]
+                    .saturating_mul(groups[1])
+                    .saturating_mul(groups[2]),
+            },
+        );
         let ran = self.prepare_for(list, false, true).and_then(|()| {
             let l6 = list
                 .list
@@ -1765,6 +1801,10 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
             Ok(())
         });
+        #[cfg(feature = "diagnostics")]
+        if ran.is_ok() {
+            meshes.ran();
+        }
         if let Err(why) = ran {
             dropped("mesh dispatch", self.pipeline, why);
         }
@@ -2011,6 +2051,12 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(
+            list,
+            self.pipeline,
+            crate::meshstat::Op::Draw { vertices, first },
+        );
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false).and_then(|()| {
             if rects {
@@ -2038,6 +2084,8 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            meshes.ran();
         }
         if let Err(why) = ran {
             dropped("draw", self.pipeline, why);
@@ -2113,6 +2161,12 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(
+            list,
+            self.pipeline,
+            crate::meshstat::Op::Indexed { indices, first },
+        );
         let ran = if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
             Err(INDEXED_RECTANGLES.into())
@@ -2134,6 +2188,8 @@ impl State {
                         .DrawIndexedInstanced(indices, instances, first, base, first_instance)
                 };
                 DRAWN.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                meshes.ran();
             }
             Err(why) => dropped("indexed draw", self.pipeline, why),
         }
@@ -2190,6 +2246,12 @@ impl State {
         if max == 0 {
             return true;
         }
+        #[cfg(feature = "diagnostics")]
+        let mut meshes = crate::meshstat::start(
+            list,
+            self.pipeline,
+            crate::meshstat::Op::Indirect { kind, stride, max },
+        );
         let pipeline = self.pipeline;
         // Counted in `list` (its indirect drops); here only why.
         let fail = |why: Unready| {
@@ -2218,11 +2280,21 @@ impl State {
             },
             None => None,
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::meshstat::{What, read};
+            read(What::Args, &args, arguments, len);
+            if let Some((s, at)) = &counter {
+                read(What::Count, s, *at, 4);
+            }
+        }
         if kind == DRAW && self.topology == RECTANGLES {
             let rects = (&args, arguments);
             return match self.indirect_rectangles(list, (stride, max), rects, &counter) {
                 Ok(()) => {
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    meshes.ran();
                     true
                 }
                 Err(why) => fail(why),
@@ -2274,7 +2346,10 @@ impl State {
         };
         if let Err(why) = ran {
             if kind == DISPATCH && why == Unready::NoPipeline {
-                self.rt_dropped(list);
+                // The rewrite above left the count of its commands that run
+                // a group at the start of the expanded arguments.
+                let count = expanded.as_ref().map(|(buffer, _)| (buffer.clone(), 0));
+                self.rt_dropped(list, crate::rt_standin::Work::Commands(count));
             }
             return fail(why);
         }
@@ -2348,6 +2423,8 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        meshes.ran();
         true
     }
 }
@@ -2555,6 +2632,12 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+        }
+        #[cfg(feature = "diagnostics")]
+        if u.kind == ResourceType::Uav {
+            crate::meshstat::wrote(&shadow, address, len);
+        } else {
+            crate::meshstat::read(crate::meshstat::What::View, &shadow, address, len);
         }
     }
     match (view, u.kind) {

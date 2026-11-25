@@ -89,6 +89,58 @@ try {
     Remove-Item -Force -LiteralPath $so, $se -ErrorAction SilentlyContinue
 }
 
+# The VM side's disk cleanup (vm\FarmVm.ps1, in a scope of its own: its
+# helpers must not replace this side's), on a farm root in a temporary
+# folder. s1 is the job's own slot; s2 has a running job (its lock held)
+# and an incremental folder whose date says idle for an hour, as the slots
+# whose caches were deleted under their builds on 2026-11-25; s3 had its
+# last job an hour ago, s4 a minute ago.
+$vr = Join-Path $env:TEMP "$marker-vm"
+try {
+    & {
+        . (Join-Path $PSScriptRoot 'vm\FarmVm.ps1')
+        foreach ($d in 'locks', 'state') { New-Item -ItemType Directory -Force -Path (Join-Path $vr $d) | Out-Null }
+        foreach ($s in 's1', 's2', 's3', 's4') {
+            foreach ($d in 'target\debug\incremental\xtp_shader-0\s-0', 'target\debug\deps') {
+                New-Item -ItemType Directory -Force -Path (Join-Path $vr "w\$s\$d") | Out-Null
+            }
+            [IO.File]::WriteAllText((Join-Path $vr "w\$s\target\debug\incremental\xtp_shader-0\s-0\query-cache.bin"), 'x')
+            [IO.File]::WriteAllText((Join-Path $vr "w\$s\target\debug\deps\xtp_shader.rlib"), 'x')
+        }
+        (Get-Item -LiteralPath (Join-Path $vr 'w\s2\target\debug\incremental')).LastWriteTime = (Get-Date).AddHours(-1)
+        foreach ($s in 's2', 's3') { Set-FarmSlotUsed $vr $s; (Get-Item -LiteralPath (Join-Path $vr "state\$s.used")).LastWriteTime = (Get-Date).AddHours(-1) }
+        Set-FarmSlotUsed $vr 's4'
+        $held = Open-FarmSlotLock $vr 's2'
+        try {
+            Assert-Farm ($null -ne $held -and $null -eq (Open-FarmSlotLock $vr 's2')) 'VM cleanup: a slot lock held by a job cannot be taken'
+            $gone = @(Clear-FarmSlotCaches -Root $vr -Current 's1' -MinFreeGb 0)
+            $inc = { param($s) Test-Path -LiteralPath (Join-Path $vr "w\$s\target\debug\incremental") }
+            Assert-Farm (-not (& $inc 's1') -and -not (& $inc 's3') -and -not (& $inc 's4')) 'VM cleanup: incremental caches go in the job''s slot and in free slots'
+            Assert-Farm ((& $inc 's2') -and $gone.Count -eq 3) 'VM cleanup: the slot with a running job keeps its cache, whatever its date'
+            foreach ($s in 's1', 's2', 's3', 's4') { New-Item -ItemType Directory -Force -Path (Join-Path $vr "w\$s\target\debug\incremental\x") | Out-Null }
+            # Short of room (a threshold no disk meets): whole target folders.
+            $gone = @(Clear-FarmSlotCaches -Root $vr -Current 's1' -MinFreeGb 1e12)
+            $tgt = { param($s) Test-Path -LiteralPath (Join-Path $vr "w\$s\target\debug\deps\xtp_shader.rlib") }
+            Assert-Farm (-not (& $tgt 's3') -and $gone -contains (Join-Path $vr 'w\s3\target')) 'VM cleanup: short of room, a free slot without a job for 30 minutes loses its target folder'
+            Assert-Farm ((& $tgt 's1') -and (& $tgt 's2') -and (& $tgt 's4')) 'VM cleanup: never the job''s own slot, a slot with a running job, or one used a minute ago'
+        } finally {
+            if ($held) { $held.Dispose() }
+        }
+        $fake = Join-Path $vr 'farm-env.json'
+        [IO.File]::WriteAllText($fake, '{"CARGO_HOME":"C:\\farm\\cargo","RUSTUP_HOME":"C:\\farm\\rustup","PathPrepend":[]}')
+        $saved = $script:Root
+        $script:Root = $vr
+        try {
+            $be = Get-FarmBuildEnv ([pscustomobject]@{ CARGO_INCREMENTAL = '1'; XTP_PAIRS = 'a' })
+        } finally {
+            $script:Root = $saved
+        }
+        Assert-Farm ($be['CARGO_INCREMENTAL'] -eq '0' -and $be['XTP_PAIRS'] -eq 'a') "VM builds: no incremental compilation, even if the client asks for it (got '$($be['CARGO_INCREMENTAL'])')"
+    }
+} finally {
+    Remove-Item -Recurse -Force -LiteralPath $vr -ErrorAction SilentlyContinue
+}
+
 # --- live -------------------------------------------------------------------
 
 if ($Live) {

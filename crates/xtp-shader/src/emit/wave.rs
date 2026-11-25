@@ -74,8 +74,8 @@ impl Op {
 pub(crate) enum Sym {
     Unknown,
     K(u32),
-    /// The lane's own value of a VGPR value from before the section.
-    Own(Value),
+    /// VGPR avant la section et indice de sa lane source.
+    Lane(Value, u32),
     /// A uniform value from before the section.
     Uni(Value),
     /// Mot haut du nombre de lanes sélectionnées parmi `lanes`, en f64.
@@ -366,7 +366,7 @@ fn simulate(
                     Some(x) => vec
                         .get(&x)
                         .cloned()
-                        .unwrap_or_else(|| (0..wave).map(|_| Sym::Own(x)).collect()),
+                        .unwrap_or_else(|| (0..wave).map(|l| Sym::Lane(x, l)).collect()),
                     None => one(Sym::Unknown),
                 },
                 Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
@@ -512,13 +512,15 @@ fn simulate(
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) => Sym::Red {
-                            op: None,
-                            src: x,
-                            mask: m,
-                            ident,
-                            lanes: 1 << l,
-                        },
+                        (Sym::K(ident), Some(Sym::Lane(x, lane)), Some(m)) if lane == l as u32 => {
+                            Sym::Red {
+                                op: None,
+                                src: x,
+                                mask: m,
+                                ident,
+                                lanes: 1 << l,
+                            }
+                        }
                         _ => Sym::Unknown,
                     })
                     .collect()
@@ -669,7 +671,7 @@ fn shapes(
     let single = |s: Sym| match s {
         Sym::CountHi { mask, lanes } if lanes == all => Some(Shape::CountHi(mask)),
         Sym::K(k) => Some(Shape::K(k)),
-        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
             op: Some(op),
             src,
@@ -709,11 +711,21 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     {
         return Some(Shape::Masked(m.0, m.1, m.2));
     }
+    // Une copie de VGPR garde la valeur locale seulement si chaque lane
+    // reçoit sa propre source, y compris après DPP ou une lecture scalaire.
+    if let Sym::Lane(v, _) = first
+        && lanes
+            .iter()
+            .enumerate()
+            .all(|(l, &s)| s == Sym::Lane(v, l as u32))
+    {
+        return Some(Shape::Value(v));
+    }
     if lanes.iter().all(|&s| s == first) {
         return match first {
             Sym::CountHi { mask, lanes } if lanes == all => Some(Shape::CountHi(mask)),
             Sym::K(k) => Some(Shape::K(k)),
-            Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
+            Sym::Uni(x) => Some(Shape::Value(x)),
             Sym::Red {
                 op: Some(op),
                 src,

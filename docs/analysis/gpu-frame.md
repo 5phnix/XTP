@@ -24,6 +24,9 @@ measures the 3D world with the lit scene (task N6, the 30 fps plan's step
   light loop bounded by data (1 ms per execution for a few thousand
   pixels), then a family of vertex-transform compute programs (about
   24 ms). `XTP_DXIL_OPT=1` gives no measurable GPU gain on this GPU.
+  These historical timings predate the structured-buffer fix. For the
+  light loop with structured reads enabled, see the trip counts and
+  per-command timings in §10.11.
 
 - **The GPU works about a third of the frame.** GPU timestamps
   (`XTP_GPU_TIMESTAMPS=1`, new, §3.1) put the world frame's GPU work at 91 ms
@@ -989,3 +992,190 @@ legacy multiply and per-load handles.**
 - Pipeline statistics: §10.3. Both sessions ran with them; their own
   cost is not separated (§10.2).
 
+### 10.11 N6b. The bounds of the pixel light loop
+
+With the ordinary guard, the target visits **0.548 mask words and
+1.451 light bits per pixel invocation** in the HDR world session.
+Every one of its 95 measured frames had **zero guard exits across all
+programs**. The intact pair takes 58–200 µs per command on L4.
+Globally lowering the limit to 256 cuts work in five other
+programs and gives a slower median host frame. Keep the existing
+guard and the CPU-uploaded light range.
+
+In the Series S capture `stride-3e/passes-730.txt`, the draw with
+`pixel b37565055f2f7d3b` reads the light-index ranges from the SRV at
+dword 144 of user-data table 8 (t51). Its producer is the title CPU.
+Pass 559 copies 4,098 bytes from upload memory into the 4,100-byte view.
+The pixel shader indexes the first 1,024 elements by depth and reads the
+last element separately for a depth test. Capture addresses are specific
+to this frame.
+
+The cell mask comes from a different SRV, at dword 624. Its size fits
+40 × 23 tiles × 32 depth slices × 13 dwords per cell. P561 clears it
+with `compute a7eeed0646be1ab7`. P563 draws the light volumes with
+`pixel 5ad3a82b1c3cc63a` and all three draws run. P560 produces the
+40 × 23 depth texture that selects a cell. The dropped dispatches in
+that pass cannot account for the CPU upload that sets the loop bounds.
+
+For each wave the translated shader reduces the first index by unsigned
+minimum and the last by unsigned maximum over participating lanes. A
+lane enters when its cell mask is nonzero and the first word is at or
+below the last word. The outer loop visits
+`(last >> 5) - (first >> 5) + 1` words, including both endpoints.
+The inner loop visits the set bits in the wave's combined, range-masked
+word, at most 32 visits per word. The upload size is consistent with
+two 16-bit indices per element and a final 16-bit depth value. Unsigned
+16-bit indices would allow up to 2,048 outer visits. The capture records
+the view extent. The translator declares the typed load as float4 and
+bitcasts its results, so the input size alone cannot establish the trip
+count on the GPU. A separate WARP fixture bound an `R16G16_UINT` SRV
+and ran the translated two-channel load with a four-byte stride. It
+returned both integer endpoints exactly for `(0x8011, 0xfffe)`,
+`(31, 32)` and `(0, 0xffff)`. That verifies
+the load for a known view format. The pass dump does not record the
+format bound in the captured draw.
+
+Watch item 202(c) covers two independent guards. A forward edge into a
+loop initializes its counter, so re-entering the inner loop grants a
+fresh allowance. The separate budget starts at shader entry and charges
+every taken back edge across nested loops. Both light loops have the
+ordinary limit of 16,384 per entry, with a shared budget of 1,048,576
+back edges per invocation on the reference build `471711d`.
+
+The initial L4 run and the timings in §10.7 predate the structured-buffer
+fix. The N6b reference and comparisons below use the same translator tree
+(`84ef72b`) with `XTP_RAW_STRUCTURED=1` on every Series S run.
+
+The private counter build splits the failed-limit edge of each translated
+loop after lowering, including edges into the barrier drain. Only that
+edge increments the shader's dword. Three separate dwords count
+non-helper lanes at pixel entry, at the outer word visit and at the
+inner bit visit for `b37565055f2f7d3b`. A fourth counts returns to the
+next outer word. The host reads cumulative counters after the present
+fence and subtracts the previous sample. This keeps shader exits through
+the normal condition out of the limit count. A WARP fixture with both
+conditional and unconditional back edges counted one when one lane hit
+its limit, and zero when all lanes completed.
+
+The 32-lane survey ran with `XTP_RAW_STRUCTURED=1` and validated every
+translation, both with the counter disabled and with it enabled. Of
+26,698 programs, the same 25,446 translated and the same 25,375 passed
+DXIL validation. The probe changed 7,558 translated outputs. All 71
+existing validation refusals were mesh shaders exceeding the output-size
+limit. The WARP shader suite on the reference tree had 339 passes,
+37 ignored and zero failures.
+
+Measurements use Series S, golden data, and 60 seconds after the
+autopilot confirms the world. GPU commands are timed with the counter
+disabled. Only timestamp windows wholly inside that interval enter the
+comparison. XTP prints the 25 most expensive programs in each window.
+When the target is listed, multiply its reported ms/frame and
+commands/frame by the number of queried frames, then divide total time
+by total commands. A missing row has unknown cost.
+
+On L4, the first counter session recorded **zero guard exits in each of
+98 consecutive world frames** (2778–2875), across all instrumented
+programs. The outer loop ran in 34 frames. Its lanes visited 1,640,520
+words and returned for another word 570,848 times, giving 1,069,672
+entrants. They visited 3,953,762 light bits. That is **1.534 words and
+3.696 light bits per lane entering the loop**. Individual frame means
+ranged from 1.00 to 2.34 words and 1.00 to 6.80 bits per entrant.
+The first probe placed the pixel-entry counter at console offset zero,
+a NOP discarded by the translator. The L4 capture therefore supports
+these conditional means only. Its two world captures showed a dim
+frame and a black one.
+
+The corrected L4 probe increments the pixel denominator at generated
+shader entry, before any title instruction. It also samples the
+cell-header predicate and the unsigned word-range comparison. At the
+default limit, frames 2751–2845 gave 2,560,426 pixel entries, 1,765,492
+lanes reaching the header test and 942,168 entering the outer loop
+(36.8% of all entries). They visited 1,403,070 words and 3,715,874
+bits, or **1.489 words and 3.944 bits per outer entrant**. Frame 2829
+alone recorded 108,264 pixel entries, 146,894 words, 387,340 bits and
+zero guard exits. The counter timestamps are excluded from the timing
+comparison because the probe adds GPU atomics and drains each present.
+
+The 4080 reference used the ordinary loop limit and skipped downstream
+fog compute `577248728544d74b`. The pair appeared in 4 of 11 full world
+windows, covering 62 listed frames. At 209 mesh and 1,128 PS invocations
+per command it took 46 µs. At about 945–968 mesh and 1,634–1,657 PS
+invocations it took 135–147 µs. The other window took 95 µs. Across
+the four windows the pair took 115.5 µs/command and 4.06 ms/frame.
+Both ordinary composite captures were black, even with structured
+reads enabled. These are GPU timestamps for draws prior to composition.
+An attempted counter run on the PC reached its 150-second stop before
+the title image was mapped. It contributed no frames. Both corrected
+counter sessions ran on L4.
+
+The L4 timing pair kept the same binary, skipped the same downstream
+fog dispatch and displayed the 1280 × 720 RGBA16F target at ×1,000,
+as in `stride-3e`. Capture 3264 of the reference shows a car beneath
+overhead lines. Capture 3294 shows street lights and cables. The HDR
+scale clips bright pixels but lets us verify that geometry reached the
+target. At the default limit the pair took 112 µs for 271 mesh and
+457 PS invocations per command, 193 µs for 946 mesh and 1,571 PS
+invocations, and 58 µs for 191 mesh and 999 PS invocations.
+
+| L4 setting | Listed / full windows | Listed frames | Commands/frame | µs/command | Pair ms/frame |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Default limit, HDR target | 5 / 10 | 41 | 47.38 | 122.28 | 5.794 |
+| Limit 256, same HDR target | 3 / 11 | 23 | 34.48 | 64.25 | 2.216 |
+| Cell header forced to zero at translation, ordinary present | 5 / 11 | 34 | 57.42 | 49.67 | 2.852 |
+
+Each listed window in the 256 run was under 100 µs (60–67 µs). At
+about 190 mesh invocations/command the two runs gave 58 and 60 µs.
+At 899 mesh and 1,716 PS invocations/command the 256 run gave 67 µs.
+The captures show different scene samples and the selected windows
+have different dispatch counts. The median whole-GPU time across
+all full windows was 215.8 ms/frame at default and 210.5 at 256.
+The median host frame time went from **666.8 to 754.1 ms/frame** over
+nine complete reporting intervals in each session. Median submitted
+draw counts were 2,930 and 1,553 per frame respectively, with 668 and
+992 drops for missing pipelines. These runs show no wall-frame gain.
+
+The corrected entry probe at limit 256 counted 2,318,668 pixel entries
+in 97 world frames (2768–2864). The target visited **0.582 words and
+1.554 light bits per pixel entry**, or 1.530 and 4.086 per lane that
+entered the loop. It never exited at an XTP guard. The global setting
+stopped **70,166 lanes across five other shaders**.
+Per frame the count ranged from zero to 65,536 (median 39). There were
+38 frames with zero affected programs, 27 with one and 32 with two.
+
+| Stage | Program | Guard exits in the 97 frames |
+| --- | --- | ---: |
+| Pixel | `a467d848ace5810d` | 65,536, all in frame 2777 |
+| Compute | `776d835da5ffa646` | 2,147 |
+| Compute | `87df99711607dd60` | 1,524 |
+| Compute | `8bbcbda6008eaa37` | 513 |
+| Compute | `915ed81ea580a276` | 446 |
+
+The empty-cell control removes the initial mask load and lets the driver
+eliminate the light path. Its 49.67 µs includes the mesh and the rest
+of the pixel shader. It changes lighting and the work the compiler
+generates, so subtracting it from the reference would not measure time
+spent executing the loops alone.
+
+The 100 µs threshold is reachable with the ordinary guard in the
+lighter windows. The heavier windows include more mesh work, more
+shaded pixels, and a data-dependent number of light bits. A visited
+bit can enter the 1,916-instruction lighting body described in §10.7.
+The GPU timestamps bracket both stages together. The counts establish
+natural loop termination, but they do not apportion the remaining
+time among mesh work, the lighting body and its memory accesses.
+
+The run folders under `E:\xtp-data\runs` use the prefix
+`cxlightloop-`. `L4-view-A` and `L4-view-B` hold the HDR timing pair,
+`L4-lit-count` the first ordinary-limit counts, and `L4-lit-empty`
+the empty-cell control. `L4-view-count-default` and
+`L4-view-count256` hold the corrected HDR counter sessions and their
+`world-counters.csv` files. The 4080 reference is in
+`E:\xtp-data\cache\play\20261125-040546\run.log`.
+`lit-survey` contains the per-program JSON and comparisons.
+`lit-method` holds SHA-256 binary hashes, WARP logs, the run scripts,
+`world-times.py` and `count-world.py`. The latter writes one CSV row per
+world frame, including frames with zero hits and per-shader hit counts.
+The Git bundles in that folder apply to `84ef72b2`. `counter.bundle`
+reproduces the first probe, `entry-counter.bundle` the corrected probe,
+`empty-cell.bundle` the compiler control and `range-warp.bundle` both
+WARP fixtures.
