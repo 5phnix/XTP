@@ -84,6 +84,8 @@
 //!   console never exports them).
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod buffer16_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod desc_data_tests;
