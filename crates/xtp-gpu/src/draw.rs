@@ -2247,10 +2247,17 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return fail(Unready::NoPipeline);
         }
-        if kind == INDEXED && self.topology == RECTANGLES {
+        let indexed_rect = kind == INDEXED && self.topology == RECTANGLES;
+        let indexed_expansion = if indexed_rect {
             #[cfg(feature = "diagnostics")]
             crate::list::cuts::INDIRECT_RECT.fetch_add(1, Ordering::Relaxed);
-        }
+            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+                return fail(Unready::NoPipeline);
+            };
+            p.inputs.iter().any(|e| !e.per_instance)
+        } else {
+            false
+        };
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             return fail("arguments outside title buffers".into());
@@ -2262,10 +2269,6 @@ impl State {
             },
             None => None,
         };
-        let indexed_expansion = kind == INDEXED
-            && self.topology == RECTANGLES
-            && crate::pipeline::host_pipeline(self.pipeline as This)
-                .is_some_and(|p| p.inputs.iter().any(|e| !e.per_instance));
         if self.topology == RECTANGLES && (kind == DRAW || indexed_expansion) {
             let rects = (&args, arguments);
             return match self.indirect_rectangles(
@@ -2276,6 +2279,10 @@ impl State {
                 indexed_expansion,
             ) {
                 Ok(()) => {
+                    #[cfg(feature = "diagnostics")]
+                    if indexed_rect {
+                        crate::list::cuts::INDIRECT_RECT_RECORDED.fetch_add(1, Ordering::Relaxed);
+                    }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -2397,6 +2404,10 @@ impl State {
         if let Some(c) = separate_count {
             crate::indirect::done(list, c);
         }
+        #[cfg(feature = "diagnostics")]
+        if indexed_rect {
+            crate::list::cuts::INDIRECT_RECT_RECORDED.fetch_add(1, Ordering::Relaxed);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2477,7 +2488,15 @@ impl State {
         bind(self, list)?;
         prepared.bind_vertices(list);
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("rectangles max {max}"), false));
+        list.note_op(|| {
+            let text = match arguments.0 {
+                Records::Title(_, at) => format!("indirect rectangles max {max} at {at:#x}"),
+                Records::Direct([indices, instances, ..]) => {
+                    format!("indexed rectangles {indices}x{instances}")
+                }
+            };
+            self.op_text(text, false)
+        });
         let _timed = crate::timestamps::command(
             list,
             crate::timestamps::What::Rectangles,

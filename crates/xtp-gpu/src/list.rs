@@ -2145,6 +2145,7 @@ pub(crate) mod cuts {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     pub(crate) static MULTI: AtomicU64 = AtomicU64::new(0);
     pub(crate) static INDEXED_RECT: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static INDIRECT_RECT_RECORDED: AtomicU64 = AtomicU64::new(0);
     pub(crate) static INDIRECT_RECT: AtomicU64 = AtomicU64::new(0);
     pub(crate) static TOPOLOGIES: AtomicU64 = AtomicU64::new(0);
     pub(crate) static POPS_SHADERS: AtomicU64 = AtomicU64::new(0);
@@ -2161,6 +2162,7 @@ pub(crate) mod cuts {
             multi = MULTI.load(Relaxed),
             indexed_rect = INDEXED_RECT.load(Relaxed),
             indirect_indexed_rect = INDIRECT_RECT.load(Relaxed),
+            indirect_indexed_rect_recorded = INDIRECT_RECT_RECORDED.load(Relaxed),
             topology_sets = TOPOLOGIES.load(Relaxed),
             scratch_growth = GROWTH.load(Relaxed),
             missing_rtv = MISSING_TARGET.load(Relaxed),

@@ -926,10 +926,19 @@ fn take_scratch<'a>(
         s.args = Some(Buffer::new(args_growth(have, args_len), "arguments")?);
     }
     if vertices_len > s.vertices.as_ref().map_or(0, |v| v.len) {
-        s.vertices = Some(Buffer::new(vertices_len, "vertices")?);
-        #[cfg(feature = "diagnostics")]
-        if vertices_len > SCRATCH_BYTES {
-            crate::list::cuts::GROWTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(larger) = Buffer::new(vertices_len, "vertices") {
+            s.vertices = Some(larger);
+            #[cfg(feature = "diagnostics")]
+            if vertices_len > SCRATCH_BYTES {
+                crate::list::cuts::GROWTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else if s.vertices.is_none() {
+            // The upper bound includes overlap between records. A much smaller
+            // draw can still fit the normal scratch under memory pressure.
+            if vertices_len <= SCRATCH_BYTES {
+                return None;
+            }
+            s.vertices = Some(Buffer::new(SCRATCH_BYTES, "vertices")?);
         }
     }
     for b in [&mut s.vertices, &mut s.args].into_iter().flatten() {
@@ -1102,9 +1111,6 @@ pub(crate) fn expand(
     } else {
         needed.clamp(SCRATCH_BYTES, u64::from(u32::MAX - 15))
     };
-    let Some((capacity, layouts)) = scratch_layout(&strides, bytes) else {
-        return Err("rectangle vertices larger than the scratch");
-    };
     let Some(passes) = shaders() else {
         return Err("no rectangle expander");
     };
@@ -1113,6 +1119,9 @@ pub(crate) fn expand(
     let Some(scratch) = take_scratch(list, held, COUNTER_BYTES + records_len, bytes) else {
         return Err("no scratch for rectangles");
     };
+    let available = scratch.vertices.as_ref().map_or(0, |v| v.len).min(bytes);
+    let (capacity, layouts) =
+        scratch_layout(&strides, available).ok_or("rectangle vertices larger than the scratch")?;
     let (Some(args_buffer), vertices_buffer) = (scratch.args.as_mut(), scratch.vertices.as_mut())
     else {
         return Err("no scratch for rectangles");
