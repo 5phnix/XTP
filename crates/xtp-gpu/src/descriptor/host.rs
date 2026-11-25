@@ -3052,6 +3052,12 @@ impl TextureQueue {
         order
     }
 
+    /// How many slots are due at `frame`: those [`TextureQueue::due`] hands
+    /// out and those past its `max`.
+    fn due_count(&self, frame: u64) -> usize {
+        self.waiting.values().filter(|w| w.due <= frame).count()
+    }
+
     /// The waiting entry of `index`, if it is still the write the pass was
     /// handed.
     fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
@@ -3201,6 +3207,20 @@ pub(crate) struct TexturePass {
     /// the clock; at the opening cutscene's half a frame a second, the
     /// fork's 120 frames were four minutes).
     pub(crate) most: u64,
+    /// Slots due for their first upload past those in `due` (a backlog of
+    /// more than [`PASS_SLOTS`]): left for later passes all the same.
+    pub(crate) backlog: u64,
+}
+
+impl TexturePass {
+    /// The due slots this pass leaves for later passes, `counts` being what
+    /// it did: those it was handed and left, and those it was not handed.
+    /// Before, only the first, and a pass that did all of the 4,096 it was
+    /// handed took the next back to the base budget with more due (Codex's
+    /// review of db37732, 4).
+    pub(crate) fn left(&self, counts: &PassCounts) -> u64 {
+        counts.left + self.backlog
+    }
 }
 
 /// What one pass over the textures shaders pick by index did, for the log
@@ -3368,6 +3388,13 @@ impl HostHeap {
         }
         let clock = self.clock(frame);
         let due = q.due(clock, PASS_SLOTS);
+        // Counted (a walk of the waiting slots) only when the pass is
+        // handed as many as it takes.
+        let backlog = if due.len() == PASS_SLOTS {
+            q.due_count(clock).saturating_sub(due.len()) as u64
+        } else {
+            0
+        };
         let served = q.next_served(PASS_SLOTS, |index| {
             self.tabled_within(index, clock, TABLED_CHECKS)
         });
@@ -3377,6 +3404,7 @@ impl HostHeap {
             due,
             served,
             most,
+            backlog,
         })
     }
 
@@ -3415,7 +3443,8 @@ impl HostHeap {
     pub(crate) fn texture_pass_done(&self, pass: &TexturePass, counts: PassCounts) {
         // A pass that left due slots for later passes leaves a backlog: the
         // next one may spend more ([`PASS_LOADING`]).
-        LOADING.store(loading_after(counts.left), Ordering::Relaxed);
+        // Those it was not handed count too ([`TexturePass::left`]).
+        LOADING.store(loading_after(pass.left(&counts)), Ordering::Relaxed);
         let now = std::time::Instant::now();
         let mut w = PASS_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
         let began = *w.began.get_or_insert(now);
@@ -4798,6 +4827,48 @@ mod tests {
         assert_eq!((spent, left), (60 * MIB, 2));
         assert!(loading_after(left), "slots left: more");
         assert!(!loading_after(0), "none left: back to the base");
+    }
+
+    /// Slots due past those a pass is handed ([`PASS_SLOTS`]) are a backlog
+    /// all the same: a pass that did all it was handed leaves them, and the
+    /// next spends more. Before, only the slots it was handed and left
+    /// counted, and the next went back to the base with slots due (Codex's
+    /// review of db37732, 4).
+    #[test]
+    fn texture_slots_due_past_those_a_pass_is_handed_are_a_backlog() {
+        use std::time::Instant;
+        let test =
+            "descriptor::host::tests::texture_slots_due_past_those_a_pass_is_handed_are_a_backlog";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let frame = 300;
+        let n = PASS_SLOTS as u32 + 2;
+        let heap = HostHeap::new(false, n + 1).expect("a host heap");
+        for index in 1..=n {
+            heap.queue_slot(index, Some((u64::from(index), false)), frame);
+        }
+        let pass = heap.texture_pass_at(frame, Instant::now()).expect("a pass");
+        assert_eq!((pass.due.len(), pass.backlog), (PASS_SLOTS, 2));
+        // All it was handed uploaded: two left all the same.
+        let all = PassCounts {
+            looked: PASS_SLOTS as u64,
+            uploaded: PASS_SLOTS as u64,
+            ..PassCounts::default()
+        };
+        assert_eq!(pass.left(&all), 2);
+        assert!(loading_after(pass.left(&all)));
+        // Fewer due than a pass takes: no backlog.
+        let few = HostHeap::new(false, 8).expect("a host heap");
+        few.queue_slot(1, Some((1, false)), frame);
+        let pass = few.texture_pass_at(frame, Instant::now()).expect("a pass");
+        assert_eq!((pass.due.len(), pass.backlog), (1, 0));
+        let one = PassCounts {
+            looked: 1,
+            uploaded: 1,
+            ..PassCounts::default()
+        };
+        assert!(!loading_after(pass.left(&one)));
     }
 
     /// `XTP_PASS_STAGING`: MiB of staging limit, at most 4 GiB; anything
