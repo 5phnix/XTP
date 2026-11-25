@@ -222,7 +222,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects).run() {
+        match Lower::new(parts, &bad, numeric_selects).and_then(Lower::run) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -486,7 +486,11 @@ impl<'a> Lower<'a> {
         self.s.m.bin(entry, super::bitcode::Bin::Add, id, offset)
     }
 
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        numeric_selects: bool,
+    ) -> Result<Self, Stop> {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -611,23 +615,23 @@ impl<'a> Lower<'a> {
                 && !x.target.runs(64)
                 && x.target.runs(32)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
-            // A group of several console waves, which the console flow does
-            // not take (its waves need not branch alike to meet at one
-            // barrier), whose only reads of other lanes outside the half are
-            // lane reads at a lane fixed in the code: the same two halves,
-            // each lane on its own path, the lane reads through group-shared
-            // memory between group barriers every thread that has not ended
-            // reaches, and its LDS ordered by its own barriers
-            // ([`lanes::group_reads_meet`]).
+            // Une dernière wave incomplète peut échanger par LDS si chaque
+            // thread publie sa valeur et si la lane source existe partout.
             group_reads = console_lanes
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && cs.threads.iter().product::<u32>() > 64
+                && threads > 64
+                && !threads.is_multiple_of(64)
+                // Le dernier groupe physique de 32 publie aussi tous ses indices.
+                && threads.is_multiple_of(32)
+                && reads_whole
                 && !masks_held
                 && !insts().any(|i| i.name() == "v_readfirstlane_b32")
-                && insts().filter(|&i| whole(i)).all(lanes::constant_lane_read)
+                && insts()
+                    .filter(|&i| whole(i))
+                    .all(|i| lanes::present_lane_read(i, threads))
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 && lanes::group_reads_meet(p);
             split |= group_reads;
@@ -689,6 +693,12 @@ impl<'a> Lower<'a> {
                 split = x.native.wave64 && !x.target.runs(64);
             }
             if x.console_cf && split && threads > 64 {
+                if !threads.is_multiple_of(64) {
+                    return Err(unsupported(
+                        0,
+                        "paired lanes require complete console waves",
+                    ));
+                }
                 // Each physical lane carries console lanes i and i+32. One
                 // physical wave therefore follows one console program counter.
                 group_reads = false;
@@ -747,7 +757,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Lower {
+        Ok(Lower {
             s,
             x,
             bad,
@@ -851,7 +861,7 @@ impl<'a> Lower<'a> {
                 }
                 reads
             },
-        }
+        })
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -961,6 +971,8 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        #[cfg(debug_assertions)]
+        self.s.m.assert_paired_branches();
         let group_base = self.group_base_row.map(|row| {
             // La rangée suivante reste libre même si des constantes du titre sont déportées.
             let offset = self.s.user_data.next_multiple_of(4);
