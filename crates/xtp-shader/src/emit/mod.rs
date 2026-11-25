@@ -102,11 +102,15 @@ pub mod rect_gs;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
+mod smem_data_tests;
+#[cfg(all(test, windows))]
 mod smem_tests;
 #[cfg(all(test, windows))]
 mod split_tests;
 #[cfg(all(test, windows))]
 mod stride_tests;
+#[cfg(test)]
+mod userdata_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -329,7 +333,7 @@ impl HostShader {
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
-    /// Dword in the user-data buffer (the console's user-data index).
+    /// Dword in the host user-data buffer. Spilled root arguments are packed.
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
@@ -488,8 +492,8 @@ pub fn translate_program_for(
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())
-        .map_err(|e| (Step::Resources, e))?;
+    let res =
+        resource::track_native(&p, native, st.as_ref().ok()).map_err(|e| (Step::Resources, e))?;
     let io = io::raise(&p, native).map_err(|e| (Step::Io, e))?;
     let st = st.map_err(|e| (Step::Structure, e))?;
     emit_for(c, native, &p, &st, &io, &res, target).map_err(|e| (Step::Emit, e))

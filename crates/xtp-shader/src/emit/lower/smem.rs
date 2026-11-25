@@ -36,6 +36,11 @@ const SAME_SCALAR_DEPTH: u32 = 8;
 
 impl<'a> Lower<'a> {
     pub(super) fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        // Each result already has its own root-parameter binding in params.
+        // get() materializes it on first use, including after an SGPR overwrite.
+        if self.x.res.spill_loads.binary_search(&site).is_ok() {
+            return Ok(());
+        }
         let Fields::Smem {
             data,
             offset,
