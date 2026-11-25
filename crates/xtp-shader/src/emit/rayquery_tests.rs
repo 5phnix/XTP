@@ -943,7 +943,17 @@ mod warp {
         let Some(dev) = device(host)? else {
             return Ok(None);
         };
-        let (root, pso) = host.compute_pipeline(cs)?;
+        let root = host
+            .root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])
+            .map_err(|e| format!("root signature: {e}"))?;
+        let pso = host.compute_pipeline_with(&root, &cs.dxil).map_err(|e| {
+            format!(
+                "pipeline (wave size {:?}): {e}
+{}",
+                cs.wave_size(),
+                super::super::last_module_summary()
+            )
+        })?;
         // SAFETY: D3D12 calls with descriptions that outlive them;
         // resources stay alive until the fence says the GPU is done.
         unsafe {
