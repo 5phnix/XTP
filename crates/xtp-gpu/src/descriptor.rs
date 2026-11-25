@@ -273,7 +273,11 @@ fn note_call(slot: Option<(&Heap, u32)>, key: u64) {
 /// them: `XTP_HEAP_SYNC=1` does, `ab` in turns within the run
 /// ([`xtp_core::ab`]: phase A not, B does). Off by default: counting alone
 /// took 6.7 to 9.9 ms a frame in the world (session faces-1, Series S, 24
-/// to 34 submissions a frame).
+/// to 34 submissions a frame), and the mirror 12 to 35 ms a frame for 15,000
+/// to 48,000 copied slots, with frames of 1.7 to 7.1 s at bursts of 68,000
+/// (session faces2-on). The textures it queues for the pass over textures
+/// shaders pick by index waited there for video memory (28,000 to 36,000
+/// due, none uploaded), so no image was seen to gain yet.
 #[cfg(windows)]
 fn heap_sync() -> &'static xtp_core::ab::Switch<bool> {
     static SWITCH: std::sync::OnceLock<xtp_core::ab::Switch<bool>> = std::sync::OnceLock::new();
