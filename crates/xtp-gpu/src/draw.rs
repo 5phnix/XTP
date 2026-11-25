@@ -845,6 +845,24 @@ impl State {
     /// and depth bounds alone.
     fn after_our_pass(&mut self, list: &HostList) {
         self.forget_host();
+        // `forget_host` notes no heap, which `bind_host_heaps` takes for
+        // what the title wants when it binds none: the pass's own heap
+        // stayed. With a key no heap has, the next bind sets the heaps it
+        // wants, none included.
+        self.host_heaps = [AFTER_OUR_PASS; 2];
+        // No topology since the list's reset: none again, as before the
+        // pass (a draw then draws nothing).
+        if self.topology == 0 {
+            // SAFETY: an open list.
+            unsafe { list.list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(0)) };
+        }
+        // The pass may come before a dispatch, under a compute pipeline:
+        // the views of missing targets set below then have its formats,
+        // and the next draw makes them again for its own pipeline. Before,
+        // the draw's own cache still named that pipeline and kept them.
+        if let Some(saved) = &mut self.incomplete_targets {
+            saved.pipeline = usize::MAX;
+        }
         // The pass leaves a triangle list: what the console's own
         // topologies are drawn as too (`set_topology`).
         if !matches!(
@@ -1184,6 +1202,8 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
+            // The draw's pipeline is set: no pass of ours before its depth.
+            list.twin_target();
             list.twin_use(self.depth as This, false, true);
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
         }
@@ -1466,6 +1486,15 @@ impl State {
                         l.SetGraphicsRootDescriptorTable(param, handle);
                     }
                 }
+            }
+            // XTP_DIAG_DIR_LIGHT: a directional light colour of ours written
+            // into the light record the deferred lighting reads, before the
+            // op (`frameprobe::dir_light`); before the probe, which then
+            // shows it.
+            #[cfg(feature = "diagnostics")]
+            if crate::frameprobe::dir_light_on() {
+                let tables = self.probe_tables(&t.used, &made, compute);
+                crate::frameprobe::dir_light(list, &tables);
             }
             // XTP_FRAME_PROBE: what the stage reads through its tables, and
             // the host copies' bytes just before the op (`frameprobe`).
@@ -3622,6 +3651,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             crate::passdump::written(list, *resource as This);
             crate::resource::decode::bound_uav(list, *resource as This);
             list.twin_use(*resource as This, true, true);
+            // Which twin the view writes, of a depth-stencil texture's two.
+            list.twin_view_written(*resource as This, view);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
@@ -3677,6 +3708,11 @@ const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
+
+/// `State::host_heaps` after a pass of ours: no heap's key, which is 0, a
+/// title heap's address or `OWN_VIEW_HEAP` (all ones), so that the next
+/// bind sets the heaps it wants (`State::after_our_pass`).
+const AFTER_OUR_PASS: usize = 1;
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
@@ -6203,6 +6239,86 @@ float4 ps(V v) : SV_Target { return v.color; }
                 "slot 1 overwritten (typed null: {typed})"
             );
         }
+        crate::object::slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
+    }
+
+    /// A depth plane's pass of ours before a dispatch (`State::after_our_pass`),
+    /// under a compute pipeline, sets the title's targets again, a missing
+    /// one as a null view in a format of no graphics pipeline's: the next
+    /// draw, under the graphics pipeline that had them, makes them again
+    /// for its own formats (R16G16B16A16 for slot 0 here, where a null
+    /// view made for no pipeline is RGBA8). Before, the draw's cache still
+    /// named its pipeline and kept the pass's views (Codex review of
+    /// 05db757, point 6).
+    #[test]
+    fn missing_targets_are_made_again_for_the_draw_after_our_pass() {
+        use crate::resource::tests_support::{committed, target};
+        let test = "draw::tests::missing_targets_are_made_again_for_the_draw_after_our_pass";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let null = std::ptr::null();
+        use xtp_shader::{
+            HwStage,
+            emit::{HostShader, rect_gs::probe},
+        };
+        let shader = |name, stage, dxil| {
+            crate::pipeline::test_shader(
+                name,
+                HostShader {
+                    stage,
+                    dxil,
+                    group_base: None,
+                    user_data: vec![],
+                    samplers: vec![],
+                    static_samplers: vec![],
+                    root_cbvs: vec![],
+                    root_srvs: vec![],
+                    root_uavs: vec![],
+                    stride_table: false,
+                    run_time_buffers: 0,
+                },
+            )
+        };
+        let vs = probe::vertex(
+            &[[-1., -1., 0., 1.], [-1., 3., 0., 1.], [3., -1., 0., 1.]],
+            &[[1.; 4]; 3],
+            &[1; 3],
+        );
+        let mut graphics = crate::pipeline::host::GraphicsState::default();
+        graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        graphics.targets.NumRenderTargets = 2;
+        graphics.targets.RTFormats[0] = DXGI_FORMAT(10);
+        graphics.targets.RTFormats[1] = DXGI_FORMAT(28);
+        let pipeline = crate::pipeline::test_graphics_pipeline(
+            vec![
+                shader("vertex", HwStage::Vs, vs),
+                shader("pixel", HwStage::Ps, probe::pixel()),
+            ],
+            graphics,
+            &[0, 1],
+        );
+        let title = committed(&target(u64::from(SIDE), SIDE, 28));
+        let list = TitleList::new();
+        let mut records = [[0u64; 16]; 2];
+        let handles = records.each_mut().map(|slot| slot.as_mut_ptr() as u64);
+        // Slot 0 has no view of the title's: missing.
+        crate::descriptor::create_rtv(null, title, null.cast(), handles[1]);
+        let mut state = State::default();
+        state.set_pipeline(pipeline);
+        state.set_targets(list.host(), &handles, 0);
+        let saved = |state: &State| state.incomplete_targets.as_ref().map(|s| s.pipeline);
+        assert_eq!(saved(&state), Some(pipeline as usize));
+        // A dispatch's pipeline (none of graphics), and our pass before it.
+        state.set_pipeline(null);
+        state.after_our_pass(list.host());
+        assert_ne!(
+            saved(&state),
+            Some(pipeline as usize),
+            "the draw under the pipeline would keep the pass's views"
+        );
+        drop(list);
+        crate::object::slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
         crate::object::slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
     }
 
