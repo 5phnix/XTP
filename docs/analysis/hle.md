@@ -177,7 +177,7 @@ Legend: ✔ implemented and tested, ◐ partial, ✘ missing, — not needed.
 | Speech synthesis | ✔ Windows voices, text and SSML to 48 kHz PCM | → PC runtime | 4 / — | Done (R6) |
 | Closed captions, high contrast | ✔ Windows settings and title override | ✔ `accessibility.rs` | 5 / 3 | Done (R7) |
 | XError callback and options | ✘ class absent | ✔ | — / — | After xcl, if the title asks (R9) |
-| Relaunch (`XLaunchNewGame`), restart on crash | ◐ relaunch untested live | ✔ both | 4 (lifecycle) / — | Verify (R10) |
+| Relaunch (`XLaunchNewGame`), restart on crash | ◐ `XLaunchRestartOnCrash` tested; `XLaunchNewGame` untested live | ✔ both | 9 (lifecycle + `restart_on_crash`) / — | Partial (R10) |
 | HDR, URIs, deferrals, screenshots | ✔ | ◐ | 1 / — | Keep XTP |
 
 ### 4.3 Audio
@@ -372,17 +372,24 @@ shows the title calls them.
   completes as cancelled.
 - **Depends on:** R1, optional.
 
-### R10. Relaunch and restart on crash, live — S
+### R10. Relaunch and restart on crash, live — S (restart-on-crash done; live relaunch untested)
 - **Goal:** confirm `XLaunchNewGame` (wait for the old process, start again
-  with the arguments) on the real title, and add `XLaunchRestartOnCrash`
-  (record the arguments; the crash reporter relaunches once).
-- **Files:** `crates/xtp-hle/src/modules/xgame.rs`, `modules/lifecycle.rs`,
-  `apps/xtp/src/run.rs` (relaunch path).
+  with the arguments) on the real title. `XLaunchRestartOnCrash` (record the
+  arguments; relaunch once on a fatal unhandled SEH exception) is done.
+  The title's filter can resume execution. Under `--autopilot`, an armed
+  restart is logged and skipped. After a successful spawn, the crashing
+  process exits with code 1 and the replacement waits for it to exit.
+  Starting a title shutdown clears the pending restart before suspend
+  routines run.
+- **Files:** `crates/xtp-hle/src/modules/{xgame,lifecycle,kernel}.rs`,
+  `crates/xtp-loader/src/crash.rs`, `apps/xtp/src/run.rs`.
 - **xcl ref:** `hle/xgameruntime/api.rs` `XLaunchNewGame`,
   `XLaunchRestartOnCrash`.
 - **Acceptance:** a child-process test (pattern of the save crash test):
   a probe calling restart-on-crash then faulting is started a second time
-  with the recorded arguments, and only once.
+  with the recorded arguments, and only once. The probe also covers a title
+  filter resuming execution, an unattended run keeping its original exit,
+  and a fault in a suspend routine during shutdown.
 - **Depends on:** —
 
 ### R7. Closed captions and high contrast — S (done)
@@ -510,7 +517,7 @@ shows the title calls them.
 | 8 | A1 Opus check | S | — |
 | 9 | I2 mouse as right stick | M | I1 |
 | 10 | R5 message/error dialogs (done) | M | (R1) |
-| 11 | R10 relaunch, restart on crash | S | — |
+| 11 | R10 relaunch and restart on crash (restart tested, live relaunch pending) | S | — |
 | 12 | R7 closed captions, high contrast (done) | S | — |
 | 13 | R6 speech synthesis (done) | M | — |
 | 14 | I3 trigger rumble | M | — |

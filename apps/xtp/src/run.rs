@@ -257,6 +257,7 @@ pub fn run(
         return Ok(());
     }
     xtp_loader::report_crashes();
+    xtp_hle::modules::lifecycle::install_crash_restart(autopilot.is_some());
     xtp_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     xtp_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
