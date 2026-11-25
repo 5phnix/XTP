@@ -158,8 +158,8 @@ structured program, `SharedMemoryBarrierPass`, `LowerWave64BallotPass`
 ### 3.1 "an address in an SGPR that is no root parameter" (34 compute)
 
 **XTP.** `resource.rs` 909 (`why_no_base`): the address's computed term
-is an entry SGPR that holds no root parameter. All 34 refuse at code
-offsets 0x2c to 0x40, at the start of the program. **None of the 34 is in
+is an entry SGPR that holds no root parameter. All 34 originally refused
+at the first reads of the table. **None of the 34 is in
 the title's shader pack**, while every other program refused in the
 session is. With the fork's measurement (fxceless's VIctory fork, `578d459`,
 `victory-shader/src/spill.rs`: "every compute program of the console's

@@ -209,7 +209,17 @@ fn overwriting_the_pointer_stops_recognition_at_the_next_load() {
         ],
     ]
     .concat();
-    let result = track(&native(&code, vec![param(RootType::Constants, 16, 2, 3)]));
+    let r = track(&native(&code, vec![param(RootType::Constants, 16, 2, 3)])).unwrap();
+    assert_eq!(r.spill_loads.len(), 1);
+    assert_eq!(r.constant_reads.values().next().unwrap().slot, 3);
+    // Deux constantes de paramètres distincts ne forment pas une adresse liée.
+    let result = track(&native(
+        &code,
+        vec![
+            param(RootType::Constants, 16, 1, 3),
+            param(RootType::Constants, 17, 1, 4),
+        ],
+    ));
     assert!(matches!(
         result,
         Err(ShaderError::Unsupported { offset: 20, .. })
