@@ -2108,14 +2108,67 @@ pub(crate) const PASS_CHECKING: std::time::Duration = std::time::Duration::from_
 /// wait for their next turn.
 pub(crate) const PASS_HASHING: u64 = 4 << 20;
 
-/// The bytes of staging buffers past which a pass uploads no texture for
-/// the first time (tables' textures counted): each one is upload memory
-/// of its texture's size, held for as long as the texture lives, and the
-/// world's heap holds views of some 32,000 textures. Those past it wait
-/// (logged once). It was 3 GiB: reached in the first world session
-/// (heaptex-A, PC, 2026-11-25), beside the title's own memory, it left the
-/// PC's memory nearly full.
+/// The bytes of staging buffers that live past which a pass uploads no
+/// texture for the first time (tables' textures counted): each one is
+/// upload memory of its texture's size, and the world's heap holds views
+/// of some 32,000 textures. Those past it wait (logged once). It was
+/// 3 GiB: reached in the first world session (heaptex-A, PC, 2026-11-25),
+/// beside the title's own memory, it left the PC's memory nearly full.
+/// Staging buffers were then held for their texture's whole life, so this
+/// one filled for good as the world loaded (imgsrc, §11.2 of
+/// `docs/analysis/pix-world-frame.md`: 14,000 to 19,000 slots waiting,
+/// null); now each goes once its last copy ran and no upload of it was
+/// recorded for [`RELEASE_IDLE`] passes (`texture::release_staging`), and
+/// is made again for its next upload.
 pub(crate) const PASS_STAGING: u64 = 1 << 30;
+
+/// Passes without an upload recorded after which a staging buffer no list
+/// holds goes: a texture sampled at every frame keeps its own.
+const RELEASE_IDLE: u64 = 2;
+
+/// Textures a pass looks at for staging buffers to release, in turns from
+/// where the last one stopped (the world has some 30,000).
+const RELEASE_LOOKS: usize = 4096;
+
+/// How many times its base budget of bytes (`XTP_HEAP_TEXTURES`) a pass
+/// may stage while the one before spent all of its base budget: a backlog,
+/// as when the world loads (thousands of slots waiting). Within the
+/// staging limit and the video memory share all the same, each texture
+/// checked with its bytes; back to the base once a pass spends less.
+pub(crate) const PASS_LOADING: u64 = 4;
+
+/// The most `XTP_PASS_STAGING` may set: 4 GiB of upload memory beside the
+/// title's own already takes a large share of the PC's memory.
+const PASS_STAGING_MOST: u64 = 4 << 30;
+
+/// The staging limit in force: [`PASS_STAGING`], or `XTP_PASS_STAGING`
+/// (MiB, at most [`PASS_STAGING_MOST`]) for an A/B of the limit. Read once.
+pub(crate) fn pass_staging() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let limit = pass_staging_of(std::env::var("XTP_PASS_STAGING").ok().as_deref());
+        if limit != PASS_STAGING {
+            tracing::warn!(
+                mib = limit >> 20,
+                "XTP_PASS_STAGING: staging limit of the textures picked by index"
+            );
+        }
+        limit
+    })
+}
+
+/// [`pass_staging`] for the switch's value: a number of MiB, at most
+/// [`PASS_STAGING_MOST`]; anything else (or none) gives [`PASS_STAGING`].
+fn pass_staging_of(value: Option<&str>) -> u64 {
+    match value.map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(mib)) if mib > 0 => (mib << 20).min(PASS_STAGING_MOST),
+        Some(_) => {
+            tracing::warn!("XTP_PASS_STAGING is not a number of MiB: the default limit");
+            PASS_STAGING
+        }
+        None => PASS_STAGING,
+    }
+}
 
 /// The share of its local video memory budget (percent) past which a pass
 /// makes no host texture for a first upload: in heaptex-A the passes made
@@ -2140,15 +2193,21 @@ pub(crate) fn video_room(memory: Option<(u64, u64)>) -> u64 {
 
 /// The bytes of staging buffers a pass may make for its next texture, with
 /// `staged` bytes of them there are and `spent` of its `budget` spent by
-/// the pass so far: within [`PASS_STAGING`] and the budget; the first of a
-/// pass may take more than the budget (it would never fit otherwise).
+/// the pass so far: within the staging limit ([`pass_staging`]) and the
+/// budget; the first of a pass may take more than the budget (it would
+/// never fit otherwise).
 pub(crate) fn staging_room(staged: u64, spent: u64, budget: u64) -> u64 {
+    staging_room_within(pass_staging(), staged, spent, budget)
+}
+
+/// [`staging_room`] under the staging limit `limit`.
+fn staging_room_within(limit: u64, staged: u64, spent: u64, budget: u64) -> u64 {
     let pass = if spent == 0 {
         u64::MAX
     } else {
         budget.saturating_sub(spent)
     };
-    PASS_STAGING.saturating_sub(staged).min(pass)
+    limit.saturating_sub(staged).min(pass)
 }
 
 /// Makes the staging buffer of `resource` (host copy `texture`) for an
@@ -2169,7 +2228,7 @@ pub(crate) fn stage_for_pass(
     let made = crate::texture::stage(resource, texture, staging_room(staged, *spent, budget));
     match made {
         Staged::Ready(bytes) => *spent += bytes,
-        Staged::NoRoom(bytes) if bytes > PASS_STAGING.saturating_sub(staged) => {
+        Staged::NoRoom(bytes) if bytes > pass_staging().saturating_sub(staged) => {
             counts.full = 1;
             once!(
                 mib = staged >> 20,
@@ -2182,14 +2241,42 @@ pub(crate) fn stage_for_pass(
 }
 
 /// The bytes a frame's pass stages for first uploads of textures shaders
-/// pick by index (`XTP_HEAP_TEXTURES`, MiB, 64 by default: the detiling at
-/// submission is about a millisecond per MiB); `None` when it is 0, `off`
-/// or `false`: no pass, as before (such textures stay as they were made,
-/// and placed ones null). Read once.
+/// pick by index: the base budget ([`heap_textures_base`]), or
+/// [`PASS_LOADING`] times it while the passes spend all of it (a backlog).
+/// `None`: no pass.
 pub(crate) fn heap_textures_budget() -> Option<u64> {
+    heap_textures_base().map(|base| pass_budget(base, LOADING.load(Ordering::Relaxed)))
+}
+
+/// The base budget of a frame's pass (`XTP_HEAP_TEXTURES`, MiB, 64 by
+/// default: the detiling at submission is about a millisecond per MiB);
+/// `None` when it is 0, `off` or `false`: no pass, as before (such
+/// textures stay as they were made, and placed ones null). Read once.
+fn heap_textures_base() -> Option<u64> {
     static BUDGET: OnceLock<Option<u64>> = OnceLock::new();
     *BUDGET
         .get_or_init(|| heap_textures_budget_of(std::env::var("XTP_HEAP_TEXTURES").ok().as_deref()))
+}
+
+/// Whether the last pass spent its whole base budget ([`PASS_LOADING`]).
+/// One for the process: the title's view heap is the one with passes.
+static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The bytes a pass may stage: `base`, or [`PASS_LOADING`] times it while
+/// `loading`.
+fn pass_budget(base: u64, loading: bool) -> u64 {
+    if loading {
+        base.saturating_mul(PASS_LOADING)
+    } else {
+        base
+    }
+}
+
+/// Whether the pass after one that staged `spent` bytes of a `base` budget
+/// may spend more: it spent all of the base (a pass raised to more that
+/// spends less than the base goes back to it).
+fn loading_after(base: u64, spent: u64) -> bool {
+    base > 0 && spent >= base
 }
 
 /// [`heap_textures_budget`] for the switch's value.
@@ -2654,9 +2741,14 @@ impl HostHeap {
 
     /// The work of a pass over the textures shaders pick from this heap by
     /// index, once a frame by the first list that asks (`draw.rs`
-    /// `heap_textures`); `None` for the others, and in sampler heaps.
+    /// `heap_textures`); `None` for the others, and in sampler heaps. A
+    /// pass first releases the staging buffers no list holds any more
+    /// (`texture::release_staging`): the staging limit is on those that
+    /// live.
     pub(crate) fn texture_pass(&self) -> Option<TexturePass> {
-        self.texture_pass_at(pass_frame(), std::time::Instant::now())
+        let pass = self.texture_pass_at(pass_frame(), std::time::Instant::now())?;
+        crate::texture::release_staging(RELEASE_IDLE, RELEASE_LOOKS);
+        Some(pass)
     }
 
     /// [`HostHeap::texture_pass`] at the title's frame `frame` and `now`.
@@ -2717,6 +2809,10 @@ impl HostHeap {
     /// Counts what `pass` did; every [`PASS_LOG`], logs the passes since
     /// the last line per pass (a pass a frame), and the queue.
     pub(crate) fn texture_pass_done(&self, pass: &TexturePass, counts: PassCounts) {
+        // A pass that spent its whole base budget leaves a backlog: the
+        // next one may spend more ([`PASS_LOADING`]).
+        let base = heap_textures_base().unwrap_or(0);
+        LOADING.store(loading_after(base, counts.bytes), Ordering::Relaxed);
         let now = std::time::Instant::now();
         let mut w = PASS_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
         let began = *w.began.get_or_insert(now);
@@ -2751,6 +2847,7 @@ impl HostHeap {
         let (budget, usage) = host()
             .and_then(|h| crate::dxgi::video_memory(&h.device))
             .unwrap_or_default();
+        let (released, released_bytes) = crate::texture::released_total();
         tracing::info!(
             passes = window.passes,
             seconds = now.saturating_duration_since(began).as_secs(),
@@ -2772,6 +2869,10 @@ impl HostHeap {
             tabled_writes = TABLED_WRITES[0].load(Ordering::Relaxed),
             tabled_out = TABLED_WRITES[1].load(Ordering::Relaxed),
             staging_mib = crate::texture::staged_total() >> 20,
+            staging_limit_mib = pass_staging() >> 20,
+            released,
+            released_mib = released_bytes >> 20,
+            budget_mib = heap_textures_budget().unwrap_or(0) >> 20,
             video_mib = usage >> 20,
             video_budget_mib = budget >> 20,
             "textures shaders pick by index, per pass (a frame)"
@@ -4035,11 +4136,46 @@ mod tests {
         let left = video_room(Some((100 * MIB, 84 * MIB)));
         assert_eq!(left, MIB);
         assert!(64 * MIB > left, "a 64 MiB texture waits");
-        assert_eq!(staging_room(0, 0, 64 * MIB), PASS_STAGING, "the first");
-        assert_eq!(staging_room(0, 60 * MIB, 64 * MIB), 4 * MIB);
-        assert_eq!(staging_room(0, 64 * MIB, 64 * MIB), 0);
-        assert_eq!(staging_room(PASS_STAGING - MIB, 0, 64 * MIB), MIB);
-        assert_eq!(staging_room(PASS_STAGING + MIB, 0, 64 * MIB), 0);
+        let room = |staged, spent, budget| staging_room_within(PASS_STAGING, staged, spent, budget);
+        assert_eq!(room(0, 0, 64 * MIB), PASS_STAGING, "the first");
+        assert_eq!(room(0, 60 * MIB, 64 * MIB), 4 * MIB);
+        assert_eq!(room(0, 64 * MIB, 64 * MIB), 0);
+        assert_eq!(room(PASS_STAGING - MIB, 0, 64 * MIB), MIB);
+        assert_eq!(room(PASS_STAGING + MIB, 0, 64 * MIB), 0);
+        // A raised limit (XTP_PASS_STAGING) leaves room past the default.
+        assert_eq!(
+            staging_room_within(4 * GB, PASS_STAGING + MIB, 0, 64 * MIB),
+            3 * GB - MIB
+        );
+    }
+
+    /// A pass that spends its whole base budget leaves a backlog: the next
+    /// may spend `PASS_LOADING` times as much, and the passes go back to
+    /// the base once one spends less than it.
+    #[test]
+    fn passes_spend_more_while_a_backlog_waits() {
+        const MIB: u64 = 1 << 20;
+        let base = 64 * MIB;
+        assert_eq!(pass_budget(base, false), base);
+        assert_eq!(pass_budget(base, true), PASS_LOADING * base);
+        assert!(loading_after(base, base), "spent it all");
+        assert!(loading_after(base, 3 * base), "raised, more than the base");
+        assert!(!loading_after(base, base - 1), "less: back to the base");
+        assert!(!loading_after(0, 0), "no pass");
+    }
+
+    /// `XTP_PASS_STAGING`: MiB of staging limit, at most 4 GiB; anything
+    /// else, the default.
+    #[test]
+    fn staging_limits_read_as_mib_up_to_four_gib() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(pass_staging_of(None), PASS_STAGING);
+        assert_eq!(pass_staging_of(Some(" 2048 ")), 2048 * MIB);
+        assert_eq!(pass_staging_of(Some("4096")), 4096 * MIB);
+        assert_eq!(pass_staging_of(Some("65536")), PASS_STAGING_MOST, "capped");
+        for other in ["0", "much", ""] {
+            assert_eq!(pass_staging_of(Some(other)), PASS_STAGING, "{other:?}");
+        }
     }
 
     /// Where frames do not advance (a title that does not wait for them), a

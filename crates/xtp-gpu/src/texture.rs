@@ -51,6 +51,14 @@
 //! `docs/analysis/gpu-frame.md`). `XTP_TEXTURE_PREDICATION=0` runs every
 //! list's copy, as before.
 //!
+//! A staging buffer goes once no list holds it (the lists that copied from
+//! it ran and were reset) and no upload of it was recorded for a couple of
+//! passes ([`release_staging`]); what was detiled and copied is kept, and
+//! the next upload makes the buffer again, detiling and copying only what
+//! changed (or for a host copy not known to hold it). Before, a staging
+//! buffer lived as long as its texture, and the world's thousands filled
+//! the staging limit of the textures picked by index for good.
+//!
 //! Textures read through descriptor tables are brought up to date by the
 //! draws that read them. Directly indexed views are not known per draw:
 //! the textures shaders pick from the view heap by an index they compute
@@ -102,12 +110,24 @@ macro_rules! once {
 }
 
 /// A texture's upload state: the staging buffer laid out as the host
-/// texture's subresources, and what was last detiled.
+/// texture's subresources, and what was last detiled. The buffer goes once
+/// no list holds the state any more (its last copy ran) and is made again
+/// for the next upload ([`release_staging`]); what was detiled and copied
+/// is kept, so that an unchanged texture is neither detiled nor copied
+/// again.
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
-    /// Its bytes.
+    /// The staging buffer; `None` once released.
+    upload: Mutex<Option<Upload>>,
+    /// The buffer holds nothing detiled: made (again), nothing detiled
+    /// into it since. No copy reads it then.
+    blank: AtomicBool,
+    /// The next check detiles the memory whatever its watch, guards or
+    /// hash say: a blank buffer a copy is due from.
+    force: AtomicBool,
+    /// [`SWEEPS`] when its last upload was recorded.
+    recorded: AtomicU64,
+    /// The staging buffer's bytes.
     size: u64,
-    data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: xtp_formats::texture::Layout,
@@ -180,9 +200,34 @@ unsafe impl Sync for Staging {}
 /// Staging states by title resource, in the order the safety net walks.
 static STAGING: Mutex<Option<BTreeMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
-/// The bytes of the staging buffers in [`STAGING`] (upload memory held for
-/// as long as their textures live).
+/// The bytes of the staging buffers that live (upload memory): counted
+/// when one is made, until it is destroyed ([`Upload`]'s drop), whether its
+/// texture's state is in [`STAGING`] or only held by lists.
 static STAGED: AtomicU64 = AtomicU64::new(0);
+
+/// A texture's staging buffer and its mapping, counted in [`STAGED`] while
+/// it lives.
+struct Upload {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    size: u64,
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        STAGED.fetch_sub(self.size, Ordering::Relaxed);
+    }
+}
+
+/// Calls of [`release_staging`] so far: the clock of [`Staging::recorded`].
+static SWEEPS: AtomicU64 = AtomicU64::new(0);
+
+/// Staging buffers released so far: count and bytes.
+static RELEASED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The resource [`release_staging`] looked at last: the next call goes on
+/// after it.
+static RELEASE_CURSOR: Mutex<usize> = Mutex::new(0);
 
 /// Room for a check's snapshot of texture memory, kept at the largest
 /// changed so far.
@@ -264,7 +309,8 @@ fn load_before_write(list: &HostList, resource: This, texture: &ID3D12Resource) 
 
 /// At the submission of a GPU write into `resource`'s host copy: the host
 /// has its contents from now on, and its staging buffer is not needed any
-/// more (the lists holding it keep it until they are reset).
+/// more (the lists holding it keep it until they are reset; its bytes leave
+/// [`STAGED`] then).
 fn host_owned(resource: usize) {
     GPU_WRITTEN
         .lock()
@@ -277,21 +323,19 @@ fn host_owned(resource: usize) {
         .as_mut()
         .and_then(|map| map.remove(&resource));
     if let Some(gone) = gone {
-        STAGED.fetch_sub(gone.size, Ordering::Relaxed);
         gone.host_owned.store(true, Ordering::Relaxed);
     }
 }
 
-/// The title released a resource.
+/// The title released a resource (its staging buffer goes once the lists
+/// holding it are reset).
 pub(crate) fn forget(resource: usize) {
     let gone = STAGING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
         .and_then(|map| map.remove(&resource));
-    if let Some(gone) = gone {
-        STAGED.fetch_sub(gone.size, Ordering::Relaxed);
-    }
+    drop(gone);
     let mut set = GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -320,9 +364,16 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if gpu_written(resource as usize) || !list.first_use(resource as usize) {
         return false;
     }
+    // Made again if it was released: this list holds it from now on.
     let Ok(staging) = staging(resource, texture) else {
         return false;
     };
+    let Some(buffer) = staging.buffer() else {
+        return false;
+    };
+    staging
+        .recorded
+        .store(SWEEPS.load(Ordering::Relaxed), Ordering::Relaxed);
     // The host copy `texture` is: what the copy writes (the list holds it
     // through its state below).
     let target = crate::resource::host_copy(resource)
@@ -332,6 +383,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     crate::list::ensure_state(list, resource, COPY_DEST);
     // Without a predicate (none left, or predication off) the copy runs.
     let predicate = target.as_ref().and_then(|_| Predicate::take());
+    // A buffer made again after a release holds nothing: an unchanged
+    // texture whose host copy has what was detiled last needs neither a
+    // detiling nor a copy (decided at submission), any other gets one.
+    if staging.blank.load(Ordering::Acquire)
+        && (predicate.is_none() || !staging.holds(target.as_ref()))
+    {
+        staging.force.store(true, Ordering::Release);
+    }
     let timed = crate::timestamps::command(list, crate::timestamps::What::TextureUpload, None);
     if let Some(p) = &predicate {
         // SAFETY: an open list; the predicate's buffer lives for the run.
@@ -340,14 +399,15 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                 .SetPredication(&p.of.buffer, p.offset(), D3D12_PREDICATION_OP_EQUAL_ZERO)
         };
     }
-    // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
+    // The staging buffer lives as long as `staging` holds it, and it is
+    // not released while the deferred refresh below holds `staging`, until
+    // the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -380,7 +440,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -403,7 +463,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // submitted before it put there.
     let (bytes, key) = (staging.size, resource as usize);
     list.defer_host((0, 0), move || {
-        let due = !gpu_written(key) && target.as_ref().is_none_or(|t| staging.copy_due(t));
+        // Not from a buffer that holds nothing detiled (its memory was not
+        // mapped at the check).
+        let due = !gpu_written(key)
+            && !staging.blank.load(Ordering::Acquire)
+            && target.as_ref().is_none_or(|t| staging.copy_due(t));
         let runs = match &predicate {
             Some(p) => p.decide(due, crate::timestamps::submissions()),
             None => true,
@@ -488,11 +552,13 @@ pub(crate) fn memory_change(resource: This) -> Change {
     Change::Unknown(staging.layout.size)
 }
 
-/// The bytes of `resource`'s staging buffer, if it has one (tests).
+/// The bytes of `resource`'s staging buffer, if it has one now (tests).
 #[cfg(test)]
 pub(crate) fn staged_bytes(resource: This) -> Option<u64> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()?.get(&(resource as usize)).map(|s| s.size)
+    let staging = map.as_ref()?.get(&(resource as usize))?;
+    let upload = staging.upload.lock().unwrap_or_else(|e| e.into_inner());
+    upload.as_ref().map(|u| u.size)
 }
 
 /// What came of making a texture's staging buffer ([`stage`]).
@@ -538,9 +604,79 @@ pub(crate) fn staged_at(resource: usize, address: u64) -> bool {
         .is_some_and(|s| s.memory as u64 == address)
 }
 
-/// The bytes of every staging buffer there is.
+/// The bytes of every staging buffer that lives.
 pub(crate) fn staged_total() -> u64 {
     STAGED.load(Ordering::Relaxed)
+}
+
+/// Staging buffers released by [`release_staging`] so far: count and bytes.
+pub(crate) fn released_total() -> (u64, u64) {
+    let [count, bytes] = RELEASED.each_ref().map(|a| a.load(Ordering::Relaxed));
+    (count, bytes)
+}
+
+/// Releases the staging buffers that no list holds any more and whose
+/// texture had no upload recorded in the last `idle` calls, looking at up
+/// to `looks` textures from where the last call stopped. A list holds its
+/// textures' staging states until it is reset, and one reset while it runs
+/// until its submission has run: a state held by nothing but [`STAGING`]
+/// is read by no submission, so its buffer can go (its last copy ran, the
+/// fence passed). What was detiled and copied is kept: the next upload
+/// makes the buffer again ([`staging_within`]), and detiles and copies
+/// only if the memory changed or another host copy needs it. Returns the
+/// buffers released and their bytes, which leave [`staged_total`]. Once a
+/// pass over the textures picked by index (`descriptor::host`).
+///
+/// Ported from fxceless/victory-fork (578d459) by fxceless: its
+/// `texture::let_go_idle` lets go of a staging state held by no list
+/// (`Arc::strong_count`) and counts the bytes that live by their drop.
+/// Changed here: only the buffer goes, not what was detiled and copied
+/// (the fork's next upload detiles and copies again, and here a pass's
+/// look at a served texture would find one without a state changed:
+/// `memory_change`); idle is counted in calls, a pass each, not 10 s and
+/// 4 frames (a world loading leaves gigabytes waiting for room); a call
+/// looks at `looks` textures in turns, and the buffers are destroyed out
+/// of the map's lock.
+pub(crate) fn release_staging(idle: u64, looks: usize) -> (u64, u64) {
+    release_staging_of(idle, looks, |_| true)
+}
+
+/// [`release_staging`] for the resources `of` takes (tests: other tests'
+/// textures are in the same map).
+fn release_staging_of(idle: u64, looks: usize, of: impl Fn(usize) -> bool) -> (u64, u64) {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let now = SWEEPS.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut gone = Vec::new();
+    {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_ref() else {
+            return (0, 0);
+        };
+        let mut cursor = RELEASE_CURSOR.lock().unwrap_or_else(|e| e.into_inner());
+        let after = map.range((Excluded(*cursor), Unbounded));
+        let before = map.range(..=*cursor);
+        for (&resource, s) in after.chain(before).take(looks.min(map.len())) {
+            *cursor = resource;
+            // Under the map's lock: a state held by the map alone gets no
+            // other holder meanwhile (every one is taken from the map).
+            if Arc::strong_count(s) != 1
+                || now.saturating_sub(s.recorded.load(Ordering::Relaxed)) < idle
+                || !of(resource)
+            {
+                continue;
+            }
+            if let Some(upload) = s.upload.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                gone.push(upload);
+            }
+        }
+    }
+    let bytes: u64 = gone.iter().map(|u| u.size).sum();
+    let count = gone.len() as u64;
+    RELEASED[0].fetch_add(count, Ordering::Relaxed);
+    RELEASED[1].fetch_add(bytes, Ordering::Relaxed);
+    // Destroyed out of the map's lock: each one is a call into the runtime.
+    drop(gone);
+    (count, bytes)
 }
 
 /// The bytes of title memory a texture the title placed itself takes, by
@@ -1135,6 +1271,63 @@ impl Staging {
         (start, start + self.layout.size as usize)
     }
 
+    /// The staging buffer, if it has one now.
+    fn buffer(&self) -> Option<ID3D12Resource> {
+        let upload = self.upload.lock().unwrap_or_else(|e| e.into_inner());
+        upload.as_ref().map(|u| u.buffer.clone())
+    }
+
+    /// The staging buffer's mapping, if it has one now.
+    fn mapped(&self) -> Option<*mut u8> {
+        let upload = self.upload.lock().unwrap_or_else(|e| e.into_inner());
+        upload.as_ref().map(|u| u.data)
+    }
+
+    /// Whether host copy `target` holds what was detiled last, as decided
+    /// at the submissions so far (a copy into it from that detiling ran or
+    /// was found not needed).
+    fn holds(&self, target: Option<&Weak<crate::resource::HostTexture>>) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        let written = self.written.load(Ordering::Acquire);
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        copied
+            .as_ref()
+            .is_some_and(|(w, t)| *w == written && Weak::ptr_eq(t, target))
+    }
+
+    /// Makes its staging buffer again if it was released, within `room`
+    /// bytes: the bytes made (0 if it had one). The new one is blank.
+    fn make_upload(&self, room: u64) -> Result<u64, Staged> {
+        let mut upload = self.upload.lock().unwrap_or_else(|e| e.into_inner());
+        if upload.is_some() {
+            return Ok(0);
+        }
+        if self.size > room {
+            return Err(Staged::NoRoom(self.size));
+        }
+        let host = host().ok_or(Staged::NotNow)?;
+        let Some((buffer, data)) = host.upload_buffer(self.size) else {
+            once!(
+                size = self.size,
+                "no upload memory for a texture's staging buffer made again: asked again at its next upload"
+            );
+            return Err(Staged::NotNow);
+        };
+        crate::host::name(&buffer, || {
+            format!("staging of title memory {:?} (made again)", self.memory)
+        });
+        STAGED.fetch_add(self.size, Ordering::Relaxed);
+        *upload = Some(Upload {
+            buffer,
+            data,
+            size: self.size,
+        });
+        self.blank.store(true, Ordering::Release);
+        Ok(self.size)
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all). `before_write` runs
     /// just before the staging buffer is overwritten: an earlier
@@ -1155,6 +1348,12 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
+        // A blank buffer a copy is due from (`upload`): detiled whatever the
+        // memory's checks say, as at its first check.
+        if self.force.swap(false, Ordering::AcqRel) {
+            last.asked = 0;
+            last.hash = None;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let submission = crate::timestamps::submissions();
@@ -1302,12 +1501,24 @@ impl Staging {
         due
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
+    /// Detiles `tiled` (the texture's memory) into the staging buffer, which
+    /// is not blank from then on (a subresource that could not be detiled
+    /// stays as it was, as before buffers were released).
     fn detile(&self, tiled: &[u8]) {
-        if let Some(convert) = self.convert {
-            self.detile_converted(tiled, convert);
+        // A list holding this state holds the buffer: there is one.
+        let Some(data) = self.mapped() else {
             return;
+        };
+        match self.convert {
+            Some(convert) => self.detile_converted(tiled, convert, data),
+            None => self.detile_plain(tiled, data),
         }
+        self.blank.store(false, Ordering::Release);
+    }
+
+    /// [`Staging::detile`] into `data`, the mapped staging buffer, in the
+    /// host format.
+    fn detile_plain(&self, tiled: &[u8], data: *mut u8) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1322,9 +1533,8 @@ impl Staging {
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
             // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
+            let linear =
+                unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -1338,8 +1548,9 @@ impl Staging {
 
 impl Staging {
     /// As [`Staging::detile`], into a stand-in format: each subresource
-    /// detiled in the title's format, then converted row by row.
-    fn detile_converted(&self, tiled: &[u8], convert: Convert) {
+    /// detiled in the title's format, then converted row by row into
+    /// `data`, the mapped staging buffer.
+    fn detile_converted(&self, tiled: &[u8], convert: Convert, data: *mut u8) {
         let (from, to) = convert.bytes();
         let mut title = Vec::new();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
@@ -1362,7 +1573,7 @@ impl Staging {
                 // staging buffer, `width` texels of the host format.
                 let row = unsafe {
                     std::slice::from_raw_parts_mut(
-                        self.data.add(footprint.Offset as usize + line * host_pitch),
+                        data.add(footprint.Offset as usize + line * host_pitch),
                         width * to,
                     )
                 };
@@ -1398,7 +1609,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Result<Arc<Staging>, Sta
 }
 
 /// [`staging`], made only within `room` bytes ([`Staged::NoRoom`] past
-/// them), with the bytes made (0 if it was there).
+/// them), with the bytes made (0 if it was there). A state whose staging
+/// buffer was released ([`release_staging`]) gets one again, blank.
 fn staging_within(
     resource: This,
     texture: &ID3D12Resource,
@@ -1407,7 +1619,8 @@ fn staging_within(
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(BTreeMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
-        return Ok((s.clone(), 0));
+        let made = s.make_upload(room)?;
+        return Ok((s.clone(), made));
     }
     let (memory, desc) = crate::resource::texture_memory(resource).ok_or(Staged::Never)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -1488,9 +1701,15 @@ fn staging_within(
         "a texture the title fills gets a staging buffer"
     );
     let s = Arc::new(Staging {
-        buffer,
+        upload: Mutex::new(Some(Upload {
+            buffer,
+            data,
+            size: total,
+        })),
+        blank: AtomicBool::new(true),
+        force: AtomicBool::new(false),
+        recorded: AtomicU64::new(SWEEPS.load(Ordering::Relaxed)),
         size: total,
-        data,
         footprints,
         rows,
         layout,
@@ -1637,7 +1856,11 @@ mod tests {
 
     /// The decisions made for `staging` so far, in order.
     fn decided(staging: &Arc<Staging>) -> Vec<bool> {
-        let key = staging.id;
+        decided_id(staging.id)
+    }
+
+    /// The decisions made so far for the staging state of id `key`.
+    fn decided_id(key: u64) -> Vec<bool> {
         DECIDED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1709,7 +1932,12 @@ mod tests {
         // The memory did not change: the next list's copy is skipped on
         // the GPU, so what is in the staging buffer does not get through.
         // SAFETY: the mapped staging buffer, `size` bytes; nothing runs.
-        unsafe { staging.data.write_bytes(0x22, staging.size as usize) };
+        unsafe {
+            staging
+                .mapped()
+                .unwrap()
+                .write_bytes(0x22, staging.size as usize)
+        };
         sample_in(host, resource, 1);
         assert_eq!(decided(&staging), [true, false, false]);
         assert!(
@@ -2521,7 +2749,14 @@ mod tests {
             let sub = (slice * staging.mips + mip) as usize;
             let offset = staging.footprints[sub].Offset as usize;
             // SAFETY: the mapped staging buffer; nothing writes it now.
-            let texel = unsafe { staging.data.add(offset).cast::<u32>().read_unaligned() };
+            let texel = unsafe {
+                staging
+                    .mapped()
+                    .unwrap()
+                    .add(offset)
+                    .cast::<u32>()
+                    .read_unaligned()
+            };
             assert_eq!(texel, 0x7777_7777, "{case}: subresource {sub}");
             assert_eq!(memory_change(resource), Change::No, "{case}: clean again");
             type Release = extern "system" fn(This) -> u32;
@@ -2670,6 +2905,93 @@ mod tests {
         host.drain();
         assert_eq!(stage(resource, texture, u64::MAX), Staged::Host);
         assert_eq!(staged_bytes(resource), None);
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+    }
+
+    /// A staging buffer goes once no list holds its texture's state (the
+    /// lists that copied from it ran and were reset: the fence passed) and
+    /// no upload of it was recorded for `idle` sweeps, not before; its
+    /// bytes are counted released. Its next upload makes it again, blank:
+    /// unchanged memory is neither detiled nor copied (the host copy has
+    /// its bytes), a change is detiled and copied as before, and a host
+    /// copy not known to hold the bytes gets them detiled and copied.
+    #[test]
+    fn staging_buffers_go_once_their_last_copy_ran() {
+        let test = "texture::tests::staging_buffers_go_once_their_last_copy_ran";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        if !predication() {
+            return;
+        }
+        const IDLE: u64 = 1000;
+        let (resource, texture) = texture_4x4(0x11);
+        let key = resource as usize;
+        // Other tests' textures are in the same map: only this one goes.
+        let sweep = || release_staging_of(IDLE, usize::MAX, |r| r == key);
+        // Sweeps until it goes: the buffers and bytes released.
+        let sweep_out = || {
+            let mut released = (0, 0);
+            for _ in 0..=IDLE {
+                let (n, b) = sweep();
+                released = (released.0 + n, released.1 + b);
+            }
+            released
+        };
+        let state = || {
+            let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+            map.as_ref().unwrap().get(&key).unwrap().clone()
+        };
+        let id = staging(resource, texture).unwrap().id;
+        let bytes = staged_bytes(resource).expect("a staging buffer");
+        let (memory, _) = crate::resource::texture_memory(resource).unwrap();
+        let size = state().layout.size as usize;
+
+        // Recorded and not run: the list holds it, however long it waits.
+        let list = host.new_list().unwrap();
+        upload(&list, resource, texture);
+        list.close();
+        assert_eq!(sweep_out(), (0, 0), "held by a list");
+        assert_eq!(staged_bytes(resource), Some(bytes));
+        host.execute(&[&list]);
+        host.drain();
+        drop(list);
+        assert_eq!(decided_id(id), [true]);
+        // Held by nothing once a list that sampled it lately ran and went,
+        // its last upload recorded within `IDLE` sweeps: kept; then
+        // released.
+        sample_in(host, resource, 1);
+        assert_eq!(decided_id(id), [true, false]);
+        assert_eq!(sweep(), (0, 0), "recorded lately");
+        assert_eq!(sweep_out(), (1, bytes), "released");
+        assert_eq!(staged_bytes(resource), None);
+
+        // Unchanged: made again, neither detiled nor copied.
+        let written = state().written.load(Ordering::Acquire);
+        sample_in(host, resource, 1);
+        assert_eq!(staged_bytes(resource), Some(bytes), "made again");
+        assert_eq!(decided_id(id), [true, false, false]);
+        assert_eq!(state().written.load(Ordering::Acquire), written);
+        assert!(state().blank.load(Ordering::Acquire));
+        assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x1111_1111));
+
+        // Changed: detiled and copied.
+        // SAFETY: the texture's own title memory, `size` bytes.
+        unsafe { memory.cast_mut().write_bytes(0x33, size) };
+        sample_in(host, resource, 1);
+        assert_eq!(decided_id(id), [true, false, false, true]);
+        assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x3333_3333));
+
+        // Released again; a host copy not known to hold the last detiling
+        // (no copy decided into it) gets it detiled and copied.
+        assert_eq!(sweep_out(), (1, bytes), "released again");
+        *state().copied.lock().unwrap() = None;
+        sample_in(host, resource, 1);
+        assert_eq!(decided_id(id), [true, false, false, true, true]);
+        assert!(!state().blank.load(Ordering::Acquire));
+        assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x3333_3333));
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
     }
