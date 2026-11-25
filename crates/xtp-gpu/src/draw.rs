@@ -692,6 +692,45 @@ fn note_root_srv(address: u64, copy: &crate::shadow::Shadow) {
     }
 }
 
+/// Logs a root SRV's one-view table (Watch 443, VIctory #1671): the bytes
+/// it views from `address` against those its host copy holds from there,
+/// to the end of the title buffer or of the 4 MiB window copy of memory
+/// outside every buffer. A table that stops before its copy's end is cut
+/// (counted at info): a shader reading past the cut reads zeros where the
+/// console reads the buffer. Past a window's end the title's memory goes
+/// on as well. Each table at debug level.
+fn note_root_srv_extent(address: u64, copy: &crate::shadow::Shadow, viewed: u64) {
+    let left = copy.left(address);
+    let start = address - copy.offset(address);
+    let len = copy.offset(address) + left;
+    if viewed < left {
+        counted!(
+            info,
+            address = format_args!("{address:#x}"),
+            viewed,
+            left,
+            copy = format_args!("{start:#x}+{len:#x}"),
+            "a root SRV's one-view table stops before its host copy's end: reads past it \
+             return zeros"
+        );
+    }
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let window = crate::shadow::holders(address).is_empty();
+        tracing::debug!(
+            address = format_args!("{address:#x}"),
+            viewed,
+            left,
+            copy = format_args!("{start:#x}+{len:#x}"),
+            holds = if window {
+                "a 4 MiB window"
+            } else {
+                "a title buffer"
+            },
+            "a root SRV's one-view table"
+        );
+    }
+}
+
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
@@ -2225,6 +2264,7 @@ impl State {
             return Ok((host, slot));
         }
         note_root_srv(a, &s);
+        note_root_srv_extent(a, &s, bytes);
         let slot = if in_place {
             let slot = host.shared_raw(&s, offset, bytes);
             if let Some(slot) = slot {
@@ -5489,6 +5529,76 @@ void main(uint3 id : SV_DispatchThreadID) {
             table(&mut state, l, Some(out.address() + 4))
         });
         assert_eq!(got, bounded(1, 63));
+    }
+
+    /// A root SRV's one-view table in place views the rest of its buffer,
+    /// not 4 MiB of it (Watch 443, VIctory #1671): a shader reading 6 MiB
+    /// past the SRV reads the buffer there, as on the console.
+    #[test]
+    fn root_srv_tables_read_past_4_mib() {
+        const FAR: usize = 6 << 20;
+        let test = "draw::tests::root_srv_tables_read_past_4_mib";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let near = Reader::new(host, ReaderView::TableSrv);
+        let source = format!(
+            "ByteAddressBuffer src : register(t0, space1);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(128, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    dst.Store(id.x * 4, src.Load({FAR} + id.x * 4));
+}}"
+        );
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("far root view test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the test kernel compiles");
+        let code = code.expect("compiled code");
+        // SAFETY: the code and the root signature (the near reader's: the
+        // same views) live through the call.
+        let pso = unsafe {
+            host.device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&near.root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.GetBufferPointer(),
+                        BytecodeLength: code.GetBufferSize(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let far = Reader {
+            root: near.root.clone(),
+            pso,
+        };
+        let heap = TestHeap::views(16);
+        let src = TitleBuffer::new(8 << 20);
+        src.set_words(pattern);
+        let list = TitleList::new();
+        let mut state = state(heap.0);
+        let got = far.read(&list, |l| {
+            heaps(&mut state, l);
+            table(&mut state, l, Some(src.address() + 16))
+        });
+        let want: Vec<u32> = (0..WORDS).map(|i| pattern(4 + FAR / 4 + i)).collect();
+        assert_eq!(got, want);
     }
 
     /// A list that binds no view heap reads its root SRVs through tables in
