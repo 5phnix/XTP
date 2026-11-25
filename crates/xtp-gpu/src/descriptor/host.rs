@@ -2133,10 +2133,10 @@ const RELEASE_IDLE: u64 = 2;
 const RELEASE_LOOKS: usize = 4096;
 
 /// How many times its base budget of bytes (`XTP_HEAP_TEXTURES`) a pass
-/// may stage while the one before spent all of its base budget: a backlog,
-/// as when the world loads (thousands of slots waiting). Within the
-/// staging limit and the video memory share all the same, each texture
-/// checked with its bytes; back to the base once a pass spends less.
+/// may stage while the one before left due slots for later passes: a
+/// backlog, as when the world loads (thousands of slots waiting). Within
+/// the staging limit and the video memory share all the same, each texture
+/// checked with its bytes; back to the base once a pass leaves none.
 pub(crate) const PASS_LOADING: u64 = 4;
 
 /// The most `XTP_PASS_STAGING` may set: 4 GiB of upload memory beside the
@@ -2163,7 +2163,9 @@ pub(crate) fn pass_staging() -> u64 {
 /// [`PASS_STAGING_MOST`]; anything else (or none) gives [`PASS_STAGING`].
 fn pass_staging_of(value: Option<&str>) -> u64 {
     match value.map(str::trim).map(str::parse::<u64>) {
-        Some(Ok(mib)) if mib > 0 => (mib << 20).min(PASS_STAGING_MOST),
+        // Bounded in MiB before the shift: from 2^44 MiB on, it wrapped to
+        // 0 (Codex's review of c44a716, 5).
+        Some(Ok(mib)) if mib > 0 => mib.min(PASS_STAGING_MOST >> 20) << 20,
         Some(_) => {
             tracing::warn!("XTP_PASS_STAGING is not a number of MiB: the default limit");
             PASS_STAGING
@@ -2244,7 +2246,7 @@ pub(crate) fn stage_for_pass(
 
 /// The bytes a frame's pass stages for first uploads of textures shaders
 /// pick by index: the base budget ([`heap_textures_base`]), or
-/// [`PASS_LOADING`] times it while the passes spend all of it (a backlog).
+/// [`PASS_LOADING`] times it while the passes leave due slots (a backlog).
 /// `None`: no pass.
 pub(crate) fn heap_textures_budget() -> Option<u64> {
     heap_textures_base().map(|base| pass_budget(base, LOADING.load(Ordering::Relaxed)))
@@ -2260,7 +2262,7 @@ fn heap_textures_base() -> Option<u64> {
         .get_or_init(|| heap_textures_budget_of(std::env::var("XTP_HEAP_TEXTURES").ok().as_deref()))
 }
 
-/// Whether the last pass spent its whole base budget ([`PASS_LOADING`]).
+/// Whether the last pass left due slots for later passes ([`PASS_LOADING`]).
 /// One for the process: the title's view heap is the one with passes.
 static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -2274,11 +2276,15 @@ fn pass_budget(base: u64, loading: bool) -> u64 {
     }
 }
 
-/// Whether the pass after one that staged `spent` bytes of a `base` budget
-/// may spend more: it spent all of the base (a pass raised to more that
-/// spends less than the base goes back to it).
-fn loading_after(base: u64, spent: u64) -> bool {
-    base > 0 && spent >= base
+/// Whether the pass after one that left `left` due slots for later passes
+/// (by its budgets of bytes and time, staging or video memory) may spend
+/// more: slots still wait (a pass raised to more that leaves none goes
+/// back to the base). Before, it was whether the pass spent all of its
+/// base: one whose next texture did not fit in what was left (six 10 MiB
+/// staging buffers of 64 MiB, the seventh refused) kept the next at the
+/// base, slots waiting (Codex's review of c44a716, 4).
+fn loading_after(left: u64) -> bool {
+    left > 0
 }
 
 /// [`heap_textures_budget`] for the switch's value.
@@ -2811,10 +2817,9 @@ impl HostHeap {
     /// Counts what `pass` did; every [`PASS_LOG`], logs the passes since
     /// the last line per pass (a pass a frame), and the queue.
     pub(crate) fn texture_pass_done(&self, pass: &TexturePass, counts: PassCounts) {
-        // A pass that spent its whole base budget leaves a backlog: the
+        // A pass that left due slots for later passes leaves a backlog: the
         // next one may spend more ([`PASS_LOADING`]).
-        let base = heap_textures_base().unwrap_or(0);
-        LOADING.store(loading_after(base, counts.bytes), Ordering::Relaxed);
+        LOADING.store(loading_after(counts.left), Ordering::Relaxed);
         let now = std::time::Instant::now();
         let mut w = PASS_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
         let began = *w.began.get_or_insert(now);
@@ -4151,19 +4156,30 @@ mod tests {
         );
     }
 
-    /// A pass that spends its whole base budget leaves a backlog: the next
-    /// may spend `PASS_LOADING` times as much, and the passes go back to
-    /// the base once one spends less than it.
+    /// A pass that leaves due slots for later passes leaves a backlog: the
+    /// next may spend `PASS_LOADING` times as much, and the passes go back
+    /// to the base once one leaves none. One whose next texture did not
+    /// fit in what was left of the base (six 10 MiB staging buffers of
+    /// 64 MiB, the seventh refused) leaves some: before, the rule was the
+    /// base spent, which its 60 MiB were not (Codex's review of c44a716, 4).
     #[test]
     fn passes_spend_more_while_a_backlog_waits() {
         const MIB: u64 = 1 << 20;
         let base = 64 * MIB;
         assert_eq!(pass_budget(base, false), base);
         assert_eq!(pass_budget(base, true), PASS_LOADING * base);
-        assert!(loading_after(base, base), "spent it all");
-        assert!(loading_after(base, 3 * base), "raised, more than the base");
-        assert!(!loading_after(base, base - 1), "less: back to the base");
-        assert!(!loading_after(0, 0), "no pass");
+        // Eight 10 MiB textures due, staged as a pass does.
+        let (mut spent, mut left) = (0, 0);
+        for _ in 0..8 {
+            if 10 * MIB <= staging_room_within(PASS_STAGING, spent, spent, base) {
+                spent += 10 * MIB;
+            } else {
+                left += 1;
+            }
+        }
+        assert_eq!((spent, left), (60 * MIB, 2));
+        assert!(loading_after(left), "slots left: more");
+        assert!(!loading_after(0), "none left: back to the base");
     }
 
     /// `XTP_PASS_STAGING`: MiB of staging limit, at most 4 GiB; anything
@@ -4175,6 +4191,16 @@ mod tests {
         assert_eq!(pass_staging_of(Some(" 2048 ")), 2048 * MIB);
         assert_eq!(pass_staging_of(Some("4096")), 4096 * MIB);
         assert_eq!(pass_staging_of(Some("65536")), PASS_STAGING_MOST, "capped");
+        // From 2^44 MiB on: bounded before the shift, not wrapped to 0
+        // (Codex's review of c44a716, 5).
+        assert_eq!(
+            pass_staging_of(Some("17592186044416")),
+            PASS_STAGING_MOST
+        );
+        assert_eq!(
+            pass_staging_of(Some(&u64::MAX.to_string())),
+            PASS_STAGING_MOST
+        );
         for other in ["0", "much", ""] {
             assert_eq!(pass_staging_of(Some(other)), PASS_STAGING, "{other:?}");
         }
