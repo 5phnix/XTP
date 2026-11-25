@@ -4231,8 +4231,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         let list = TitleList::new();
         let mut state = State::default();
         assert!(!state.dropped_dispatch);
-        state.dispatch(list.host(), 1, 1, 1);
-        state.dispatch(list.host(), 1, 1, 1);
+        state.dispatch(list.host(), [1; 3], [0; 3]);
+        state.dispatch(list.host(), [1; 3], [0; 3]);
         assert!(state.dropped_dispatch, "marked");
         state.reset(std::ptr::null());
         assert!(!state.dropped_dispatch, "gone with the reset");

@@ -476,6 +476,60 @@ impl<'a> Lower<'a> {
                 },
             })
         };
+        if typed
+            && let Some((desc, _)) = built
+            && used.is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
+        {
+            // La vue hôte reste brute. Les canaux de 32 bits conservent
+            // leur représentation pour FLOAT, UINT et SINT.
+            let (bits, numeric) =
+                buffer_format(format.unwrap_or(desc.format)).ok_or("a root buffer format")?;
+            if d16 || desc.dst_sel != [4, 5, 6, 7] || bits.iter().any(|&n| n != 32) {
+                return Err("a packed or swizzled typed root view");
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err(name);
+            };
+            if store && count as usize != bits.len() {
+                return Err("a partial typed root store");
+            }
+            let view = raw_view(self)?;
+            let RawView::Built { handle, .. } = view else {
+                unreachable!()
+            };
+            let width = bits.len() as u32 * 4;
+            let (byte, valid) = self.raw_coordinate(view, address, width);
+            let enabled = guard.map_or(valid, |g| self.s.m.bin(self.cur, Bin::And, g, valid));
+            let values = if store {
+                self.vgprs(inst, data.as_ref().unwrap(), count as u8)?
+            } else {
+                Vec::new()
+            };
+            let xs = self.guarded_values(Some(enabled), |l| {
+                let mut xs = Vec::new();
+                for k in 0..count {
+                    let delta = l.s.m.i32(k * 4);
+                    let at = l.s.m.bin(l.cur, Bin::Add, byte, delta);
+                    if store {
+                        l.raw_store_dword(handle, at, values[k as usize]);
+                    } else if k < bits.len() as u32 {
+                        xs.push(l.raw_dword(handle, at));
+                    } else {
+                        let one = if numeric == Numeric::Float {
+                            1f32.to_bits()
+                        } else {
+                            1
+                        };
+                        xs.push(l.s.m.i32(if k == 3 { one } else { 0 }));
+                    }
+                }
+                Ok(xs)
+            })?;
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         if halfword {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err(name);

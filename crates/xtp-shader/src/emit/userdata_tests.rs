@@ -1,4 +1,4 @@
-//! Tables synthétiques de paramètres déportés. Cas de réécriture des registres :
+//! Tables synthÃ©tiques de paramÃ¨tres dÃ©portÃ©s. Cas de rÃ©Ã©criture des registres :
 //! Ported from Marvisak/VIctory#489 (head fe7210e) by louketa.
 
 use super::{HostShader, translate_program};
@@ -277,35 +277,13 @@ fn phi_merges_reloads_only_for_the_same_spilled_descriptor() {
     assert!(track(&native(&code, layout())).is_err());
 }
 
-/// Ported from fxceless's VIctory fork #646 (head 170c24269) by mynzjerko.
-/// Une barrière sépare le comptage d'EXEC de l'écriture dans la vue racine.
 #[cfg(windows)]
-#[test]
-fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
-    use super::host::{Dispatch, Host, Root, View};
-    let words = [
-        PTR.as_slice(),
-        &[
-            0xF404_0201,
-            0xFA00_0000, // s[8:9] reçoit l'adresse de l'UAV.
-            0xBE8A_03C1,
-            0xBE8B_03FF,
-            0x3101_4FAC,
-            0xBE86_107E, // s6 reçoit la population d'EXEC.
-            0xBF8A_0000,
-            0x3402_0082,
-            0x7E04_0206,
-            0xE070_1000,
-            0x8002_0201,
-            END,
-        ],
-    ]
-    .concat();
-    let mut n = native(&words, vec![param(RootType::Descriptor, 16, 2, 3)]);
-    n.wave64 = true;
+fn root_uav_program(words: &[u32], threads: [u32; 3], wave64: bool) -> NativeProgram {
+    let mut n = native(words, vec![param(RootType::Descriptor, 16, 2, 3)]);
+    n.wave64 = wave64;
     n.io = StageIo::Cs(ComputeIo {
         rsrc2: 4 << 1,
-        threads: [64, 1, 1],
+        threads,
     });
     n.used.push(UsedResource {
         kind: ResourceType::Uav,
@@ -317,9 +295,37 @@ fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
         user_data: 16,
         slot: 3,
     });
+    n
+}
+
+/// Ported from fxceless's VIctory fork #646 (head 170c24269) by mynzjerko.
+/// Une barriÃ¨re sÃ©pare le comptage d'EXEC de l'Ã©criture dans la vue racine.
+#[cfg(windows)]
+#[test]
+fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
+    use super::host::{Dispatch, Host, Root, View};
+    let words = [
+        PTR.as_slice(),
+        &[
+            0xF404_0201,
+            0xFA00_0000, // s[8:9] reÃ§oit l'adresse de l'UAV.
+            0xBE8A_03C1,
+            0xBE8B_03FF,
+            0x3101_4FAC,
+            0xBE86_107E, // s6 reÃ§oit la population d'EXEC.
+            0xBF8A_0000,
+            0x3402_0082,
+            0x7E04_0206,
+            0xE070_1000,
+            0x8002_0201,
+            END,
+        ],
+    ]
+    .concat();
+    let n = root_uav_program(&words, [64, 1, 1], true);
     let bytes = crate::dxbc::build(&[]);
     let c = Container::parse(&bytes).unwrap();
-    let Ok(host) = Host::new(true) else { return };
+    let Ok(host) = Host::new(false) else { return };
     for lanes in [32, 64] {
         let target = super::Target {
             lanes_min: lanes,
@@ -372,4 +378,61 @@ fn partial_group_counts_lanes_and_preserves_the_end_of_the_root_uav() {
             assert_eq!(out[0], expected, "wave {lanes}, limit {limit}");
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn root_halfword_crosses_a_dword_and_typed_access_preserves_its_value() {
+    use super::host::{Dispatch, Host, Root, View};
+    let words = [
+        PTR.as_slice(),
+        &[
+            0xF404_0201,
+            0xFA00_0000,
+            0xBE8A_03C1,
+            0xBE8B_03FF,
+            0x3101_4FAC,
+            0x7E04_02FF,
+            0x12AB,
+            0xE068_0003,
+            0x8002_0200, // Demi-mot à l'octet 3.
+            0xE028_0003,
+            0x8002_0300,
+            0xE010_000C,
+            0x8002_0300, // Écriture et lecture au format R32_UINT.
+            0xE000_000C,
+            0x8002_0400,
+            0xE070_0010,
+            0x8002_0400,
+            END,
+        ],
+    ]
+    .concat();
+    let n = root_uav_program(&words, [1; 3], false);
+    let bytes = crate::dxbc::build(&[]);
+    let cs = translate_program(&Container::parse(&bytes).unwrap(), &n).unwrap();
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&cs).unwrap();
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(vec![0; cs.user_data_dwords() as usize])),
+                    (
+                        1,
+                        Root::Table {
+                            sampler: false,
+                            index: 0,
+                        },
+                    ),
+                ],
+                views: &[View::RawUav(6)],
+                samplers: &[],
+                groups: [1; 3],
+            },
+        )
+        .unwrap();
+    assert_eq!(out[0], [0xAB00_0000, 0x12, 0, 0x12AB, 0x12AB, 0]);
 }
