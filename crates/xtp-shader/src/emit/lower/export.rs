@@ -1,5 +1,5 @@
 //! Exports (`exp`): colours, depth, positions, parameters, mesh vertices
-//! and primitives, 16-bit outputs. Backlog S3 (conditional exports), G2.
+//! and primitives, 16-bit outputs. Backlog G2.
 
 use std::collections::HashMap;
 
@@ -57,13 +57,14 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
+        if guard.is_some() && !mesh && !self.s.pixel {
+            return Err("a conditional export");
+        }
         let c = self.cur;
         if let Some(g) = guard
-            && !mesh
+            && self.s.pixel
+            && e.done
         {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
             let t = self.s.m.bool(true);
             let kill = self.s.m.bin(c, Bin::Xor, g, t);
             self.s
@@ -194,8 +195,9 @@ impl<'a> Lower<'a> {
         {
             return Err("a 16-bit output the stage data does not mark");
         }
-        // A mesh lane writes its own vertex or primitive, where it exports.
-        let at = if mesh {
+        // Only a pixel's final export discards inactive lanes. Earlier stores
+        // are conditional and their inactive lanes may export again later.
+        let at = if !self.s.pixel || !e.done {
             self.begin_guarded(guard)
         } else {
             None

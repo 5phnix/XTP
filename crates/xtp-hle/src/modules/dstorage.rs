@@ -1174,6 +1174,14 @@ impl Destination<'_> {
         fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
     ) -> Result<(), HRESULT> {
         let request = self.request;
+        // Where each request writes (with this module at debug), to follow a
+        // destination to the host copies that read it (`XTP_FULL_REFRESH`).
+        tracing::debug!(
+            destination = format_args!("{:#x}", request.destination as usize),
+            len,
+            pages = ?&self.pages[..self.pages.len().min(4)],
+            "dstorage: destination written"
+        );
         if request.options & PAGE_DESTINATION == 0 {
             // Raw reads land through the kernel, which does not fault into
             // the GPU side's guard on title buffers: open them, and hold

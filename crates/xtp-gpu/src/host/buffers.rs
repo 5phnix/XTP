@@ -21,6 +21,11 @@
 //! past one heap's worth of spare room. A buffer larger than a heap gets a
 //! heap of its own, made on the asking thread. `XTP_BUFFER_POOL=0` brings
 //! back the committed buffers.
+//!
+//! The card's own memory has a pool too ([`Kind::Card`]), for the copies of
+//! big title buffers that live there ([`crate::shadow::cards`]). It is
+//! started only when those are on, so a run without them reserves no
+//! memory on the card.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +46,11 @@ pub(crate) enum Kind {
     /// list uploads. In the generic read state; its bytes are the caller's
     /// to write.
     Upload,
+    /// The card's own memory (a default heap), which shaders read and write
+    /// without going through PCIe and the CPU cannot map: the card side of
+    /// big title buffers' copies. Starts in the common state; its bytes are
+    /// undefined until the caller's GPU work writes them.
+    Card,
 }
 
 /// The placement unit of buffers.
@@ -213,6 +223,10 @@ unsafe impl Sync for Pool {}
 /// The pools, System then Upload.
 static POOLS: OnceLock<[Pool; 2]> = OnceLock::new();
 
+/// The pool of the card's memory, started with the others when copies of
+/// big title buffers go to the card ([`crate::shadow::cards`]).
+static CARDS: OnceLock<Pool> = OnceLock::new();
+
 /// Whether buffers come from the pools: unless `XTP_BUFFER_POOL=0`.
 fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -230,20 +244,22 @@ pub(crate) fn start(device: &ID3D12Device) {
         return;
     }
     let mut made = false;
+    let new = |kind| Pool {
+        kind,
+        device: device.clone(),
+        state: Mutex::default(),
+        changed: Condvar::new(),
+        waited: Default::default(),
+    };
     let pools = POOLS.get_or_init(|| {
         made = true;
-        [Kind::System, Kind::Upload].map(|kind| Pool {
-            kind,
-            device: device.clone(),
-            state: Mutex::default(),
-            changed: Condvar::new(),
-            waited: Default::default(),
-        })
+        [Kind::System, Kind::Upload].map(new)
     });
     if !made {
         return;
     }
-    for pool in pools {
+    let cards = crate::shadow::cards().then(|| CARDS.get_or_init(|| new(Kind::Card)));
+    for pool in pools.iter().chain(cards) {
         let spawned = std::thread::Builder::new()
             .name(format!("xtp-gpu-{:?}-buffers", pool.kind).to_lowercase())
             .spawn(move || pool.reserve());
@@ -253,19 +269,75 @@ pub(crate) fn start(device: &ID3D12Device) {
     }
 }
 
-/// A buffer of `size` bytes of `kind`, mapped, placed in a pool's heap;
-/// `None` without pools (the caller makes a committed one).
+/// A buffer of `size` bytes of `kind`, mapped (but a [`Kind::Card`] one,
+/// which the CPU cannot map: its pointer is null), placed in a pool's
+/// heap; `None` without pools (the caller makes a committed one).
 pub(crate) fn buffer(kind: Kind, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-    let pool = &POOLS.get()?[kind as usize];
+    let pool = match kind {
+        Kind::Card => CARDS.get()?,
+        kind => &POOLS.get()?[kind as usize],
+    };
     pool.place(size)
+}
+
+/// A buffer of `size` bytes in the card's memory ([`Kind::Card`]): placed
+/// in the card's pool when it runs, else committed (made on this thread).
+/// `None` if it cannot be made.
+pub(crate) fn card_buffer(device: &ID3D12Device, size: u64) -> Option<ID3D12Resource> {
+    if let Some((buffer, _)) = buffer(Kind::Card, size) {
+        return Some(buffer);
+    }
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = buffer_desc(size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation with a valid description.
+    let made = unsafe {
+        device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
+    };
+    match made {
+        Ok(()) => buffer,
+        Err(e) => {
+            tracing::warn!(error = %e, size, "no buffer in the card's memory");
+            None
+        }
+    }
+}
+
+/// A buffer's description: `size` bytes (at least 1), `flags`.
+fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size.max(1),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
+        ..Default::default()
+    }
 }
 
 /// For the frame-rate line: per pool, heaps, MiB reserved and used, and
 /// the title's waits for room (count, ms) since the last call.
 pub(crate) fn summary() -> Option<String> {
     let pools = POOLS.get()?;
-    let parts: Vec<String> = pools
+    let mut parts: Vec<String> = pools
         .iter()
+        .chain(CARDS.get())
         .map(|p| {
             let s = p.lock();
             let (reserved, free) = (s.reserved(), s.free());
@@ -281,6 +353,7 @@ pub(crate) fn summary() -> Option<String> {
             )
         })
         .collect();
+    parts.extend(crate::shadow::card_summary());
     Some(parts.join("; "))
 }
 
@@ -299,6 +372,10 @@ impl Pool {
             },
             Kind::Upload => D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            },
+            Kind::Card => D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
                 ..Default::default()
             },
         }
@@ -435,7 +512,7 @@ impl Pool {
             dirty,
         } = self.room(len)?;
         let (state, flags) = match self.kind {
-            Kind::System => (
+            Kind::System | Kind::Card => (
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ),
@@ -458,13 +535,16 @@ impl Pool {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: a buffer placed in our heap, in a range of its own;
-        // mapped as committed ones are.
+        // mapped as committed ones are (but in the card's memory, which
+        // cannot be).
         let made = unsafe {
             self.device
                 .CreatePlacedResource(&heap, offset, &desc, state, None, &mut buffer)
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))?;
+                    if self.kind != Kind::Card {
+                        b.Map(0, None, Some(&mut data))?;
+                    }
                     let lease = Lease::interface(self, id, offset, len);
                     b.SetPrivateDataInterface(&LEASE, &lease)
                 })
@@ -670,9 +750,10 @@ mod tests {
     #[test]
     fn pooled_buffers_are_placed_zeroed_and_given_back() {
         let test = "host::buffers::tests::pooled_buffers_are_placed_zeroed_and_given_back";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if !enabled() {
             return;
         }
@@ -735,9 +816,10 @@ mod tests {
     #[test]
     fn the_reserve_thread_makes_room_and_releases_spare_heaps() {
         let test = "host::buffers::tests::the_reserve_thread_makes_room_and_releases_spare_heaps";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let pool: &'static Pool = Box::leak(Box::new(Pool {
             kind: Kind::Upload,
             device: host.device.clone(),
@@ -771,9 +853,10 @@ mod tests {
     fn committed_buffers_come_back_with_xtp_buffer_pool_0() {
         const CHILD: &str = "XTP_TEST_BUFFER_POOL_OFF";
         let test = "host::buffers::tests::committed_buffers_come_back_with_xtp_buffer_pool_0";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let (shared, data) = host.shared_buffer(256).expect("a shared buffer");
         let (upload, _) = host.upload_buffer(256).expect("an upload buffer");
         if std::env::var_os(CHILD).is_some() {
@@ -800,5 +883,253 @@ mod tests {
         );
         assert!(out.status.success(), "the child: {stdout}{stderr}");
         assert!(stdout.contains("1 passed"), "{stdout}");
+    }
+
+    /// Runs `body` on the host device in a process of its own (the test
+    /// binary again, with this test alone), where title buffers of 1 MiB
+    /// or more get their copy in the card's memory, 3 MiB of them at most
+    /// (`shadow::cards`; the limits are read once per process).
+    fn with_cards(test: &str, body: impl FnOnce(&'static crate::host::Host)) {
+        const CHILD: &str = "XTP_TEST_CARD_BUFFERS";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        if std::env::var_os(CHILD).is_some() {
+            body(host);
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("XTP_CARD_BUFFERS", "1")
+            .env("XTP_CARD_BUFFERS_MIN_MB", "1")
+            .env("XTP_CARD_BUFFERS_MB", "3")
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{test} in a process of its own: {stdout}\n{stderr}"
+        );
+    }
+
+    /// Byte offsets in a 2 MiB title buffer: what a test's passes read,
+    /// what the first writes, where the second copies it (pages of their
+    /// own, the last 256 bytes before a page's end).
+    const SCRATCH: u64 = 0;
+    const OUT: u64 = 1 << 16;
+    const COPY: u64 = (3 << 16) - crate::testgpu::KERNEL_BYTES;
+
+    /// The 64 words of title memory at byte offset `at` of `buffer`.
+    fn words(buffer: &crate::testgpu::TitleBuffer, at: u64) -> Vec<u32> {
+        buffer.words()[at as usize / 4..][..64].to_vec()
+    }
+
+    /// What shaders write to a copy in the card's memory goes back to title
+    /// memory after the GPU ran, and only that: no snapshot is taken, the
+    /// title's bytes around stay. A later pass reads the first's output on
+    /// the card, and a GPU copy's destination goes back too.
+    #[test]
+    fn a_shader_write_to_a_copy_on_the_card_goes_back() {
+        use crate::testgpu::{Kernel, Pass, TitleBuffer, pattern};
+        let test = "host::buffers::tests::a_shader_write_to_a_copy_on_the_card_goes_back";
+        with_cards(test, |host| {
+            // The GPU copy within one buffer (`shadow::copy`).
+            crate::testgpu::known_layer_errors(&[538], "#45");
+            let kernel = Kernel::new(host);
+            let big = TitleBuffer::new(2 << 20);
+            big.set_words(|i| 0x7e00_0000 + i as u32);
+            let shadow = big.shadow();
+            assert!(shadow.carded(), "a copy in the card's memory");
+            let at = big.address();
+            let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
+            kernel.dispatch(&first, Pass::Fill, at + SCRATCH, at + OUT);
+            first.close();
+            kernel.dispatch(&second, Pass::Copy, at + OUT, at + COPY);
+            // A GPU copy of 256 bytes of the first's output, page 5.
+            assert!(crate::shadow::copy(&second, at + (5 << 16), at + OUT, 256));
+            second.close();
+            host.execute(&[&first]);
+            assert_eq!(shadow.snapshots(), 0, "no snapshot of a copy on the card");
+            host.execute(&[&second]);
+            host.drain();
+            let want: Vec<u32> = (0..64).map(pattern).collect();
+            assert_eq!(words(&big, OUT), want, "the shaders' write went back");
+            assert_eq!(words(&big, COPY), want, "the second read it on the card");
+            assert_eq!(words(&big, 5 << 16), want, "and so did the GPU copy");
+            let title = big.words();
+            for word in [OUT / 4 - 1, OUT / 4 + 64, COPY / 4 - 1, (5 << 14) + 64] {
+                assert_eq!(
+                    title[word as usize],
+                    0x7e00_0000 + word as u32,
+                    "word {word}"
+                );
+            }
+        });
+    }
+
+    /// A title write into what shaders write, made while the GPU runs them,
+    /// is kept (the three-way merge, with the copy's CPU side as its
+    /// "before"), and the next pass reads it on the card; the shaders'
+    /// other bytes go back.
+    #[test]
+    fn a_title_write_while_the_gpu_runs_is_kept_on_a_copy_on_the_card() {
+        use crate::testgpu::{Kernel, Pass, TitleBuffer, pattern};
+        let test =
+            "host::buffers::tests::a_title_write_while_the_gpu_runs_is_kept_on_a_copy_on_the_card";
+        with_cards(test, |host| {
+            let kernel = Kernel::new(host);
+            let big = TitleBuffer::new(2 << 20);
+            assert!(big.shadow().carded());
+            let at = big.address();
+            let first = host.new_list().unwrap();
+            kernel.dispatch(&first, Pass::Fill, at + SCRATCH, at + OUT);
+            first.close();
+            let mut gate = crate::host::submissions::Gate::close(host);
+            host.execute(&[&first]);
+            // The GPU holds the submission: the title writes word 5 of what
+            // the shaders write, and the word past it.
+            let word = |i: u64, value: u32| {
+                // SAFETY: the buffer's own title memory.
+                unsafe {
+                    ((at + OUT) as *mut u32)
+                        .add(i as usize)
+                        .write_volatile(value)
+                };
+            };
+            word(5, 0x5555_5555);
+            word(64, 0x6666_6666);
+            gate.open();
+            host.drain();
+            let mut want: Vec<u32> = (0..64).map(pattern).collect();
+            want[5] = 0x5555_5555;
+            assert_eq!(
+                words(&big, OUT),
+                want,
+                "the title's word kept, the GPU's back"
+            );
+            assert_eq!(big.words()[(OUT / 4 + 64) as usize], 0x6666_6666);
+            let second = host.new_list().unwrap();
+            kernel.dispatch(&second, Pass::Copy, at + OUT, at + COPY);
+            second.close();
+            host.execute(&[&second]);
+            host.drain();
+            assert_eq!(words(&big, COPY), want, "the title's word reached the card");
+        });
+    }
+
+    /// One word the GPU changes in a piece of 64 KiB is found, wherever it
+    /// is in the piece (each of the 256 threads of the card's compare takes
+    /// other words of it: the shaders are declared to write the whole
+    /// piece), and a pass that writes what the bytes held already leaves a
+    /// title write made meanwhile.
+    #[test]
+    fn one_word_the_gpu_changes_is_found_anywhere_in_a_piece() {
+        use crate::testgpu::{KERNEL_BYTES, Kernel, Pass, TitleBuffer, pattern};
+        let test = "host::buffers::tests::one_word_the_gpu_changes_is_found_anywhere_in_a_piece";
+        with_cards(test, |host| {
+            let kernel = Kernel::new(host);
+            let big = TitleBuffer::new(2 << 20);
+            let shadow = big.shadow();
+            assert!(shadow.carded());
+            let at = big.address();
+            let piece = at + (1 << 20);
+            // Words at the piece's start, in its middle (across the 256th
+            // step), at its end: each 256 bytes hold the fill's words but
+            // one, which the fill changes.
+            let places = [0, 0x10, 0x7ff0, 0x8100, (1 << 16) - KERNEL_BYTES];
+            for (n, &place) in places.iter().enumerate() {
+                let dst = piece + place;
+                let odd = (n * 13) % 64;
+                // SAFETY: the buffer's own title memory.
+                unsafe {
+                    for i in 0..64 {
+                        let value = if i == odd { 0 } else { pattern(i) };
+                        (dst as *mut u32).add(i).write_volatile(value);
+                    }
+                }
+                let list = host.new_list().unwrap();
+                kernel.dispatch(&list, Pass::Fill, at + SCRATCH, dst);
+                shadow.gpu_writes(&list, piece, 1 << 16);
+                list.close();
+                let before = changed();
+                host.execute(&[&list]);
+                host.drain();
+                let want: Vec<u32> = (0..64).map(pattern).collect();
+                assert_eq!(words(&big, dst - at), want, "word {odd} at {place:#x}");
+                assert_eq!(changed(), before + (1 << 16), "the piece found changed");
+            }
+            // The fill's words already at 16 KiB in the piece: the GPU
+            // writes what they hold, and the title writes word 3 meanwhile.
+            let dst = piece + 0x4000;
+            // SAFETY: the buffer's own title memory.
+            unsafe {
+                for i in 0..64 {
+                    (dst as *mut u32).add(i).write_volatile(pattern(i));
+                }
+            }
+            let list = host.new_list().unwrap();
+            kernel.dispatch(&list, Pass::Fill, at + SCRATCH, dst);
+            list.close();
+            let before = changed();
+            let mut gate = crate::host::submissions::Gate::close(host);
+            host.execute(&[&list]);
+            // SAFETY: the buffer's own title memory.
+            unsafe { (dst as *mut u32).add(3).write_volatile(7) };
+            gate.open();
+            host.drain();
+            let mut want: Vec<u32> = (0..64).map(pattern).collect();
+            want[3] = 7;
+            assert_eq!(words(&big, dst - at), want);
+            assert_eq!(changed(), before, "nothing the GPU changed");
+        });
+    }
+
+    /// Bytes of pieces the card found changed so far in this process.
+    fn changed() -> usize {
+        crate::shadow::CARD_CHANGED.load(Ordering::Relaxed)
+    }
+
+    /// A title buffer past the card's budget for copies keeps its copy in
+    /// system memory (snapshot and compare on the CPU, as before), next to
+    /// one in the card's memory; both bring back what their shaders write.
+    #[test]
+    fn a_buffer_past_the_cards_budget_keeps_its_copy_in_system_memory() {
+        use crate::testgpu::{Kernel, Pass, TitleBuffer, pattern};
+        let test =
+            "host::buffers::tests::a_buffer_past_the_cards_budget_keeps_its_copy_in_system_memory";
+        with_cards(test, |host| {
+            let kernel = Kernel::new(host);
+            let (a, b) = (TitleBuffer::new(2 << 20), TitleBuffer::new(2 << 20));
+            let (on_card, in_memory) = (a.shadow(), b.shadow());
+            assert!(on_card.carded(), "the first fits in the budget of 3 MiB");
+            assert!(!in_memory.carded(), "the second does not");
+            let list = host.new_list().unwrap();
+            for buffer in [&a, &b] {
+                let at = buffer.address();
+                kernel.dispatch(&list, Pass::Fill, at + SCRATCH, at + OUT);
+            }
+            list.close();
+            host.execute(&[&list]);
+            host.drain();
+            assert_eq!(on_card.snapshots(), 0);
+            assert_eq!(in_memory.snapshots(), 1, "the old way: a snapshot mirror");
+            let want: Vec<u32> = (0..64).map(pattern).collect();
+            assert_eq!(words(&a, OUT), want);
+            assert_eq!(words(&b, OUT), want);
+            // The budget is given back with the copy.
+            drop((on_card, in_memory, list));
+            drop((a, b));
+            host.drain();
+            let c = TitleBuffer::new(2 << 20);
+            assert!(
+                c.shadow().carded(),
+                "room again once the first copy is gone"
+            );
+        });
     }
 }

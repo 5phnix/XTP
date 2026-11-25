@@ -153,6 +153,7 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const RASTER_ORDERED: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
     pub const BARYCENTRICS: u64 = 1 << 22;
@@ -187,6 +188,7 @@ pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
+    pub ordered_uavs: bool,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     /// A mesh shader's per-primitive outputs.
@@ -272,6 +274,7 @@ impl Shader {
                 res_ret,
             },
             pixel,
+            ordered_uavs: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
@@ -497,7 +500,12 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let mut kind = props.0;
+        if self.ordered_uavs && kind & 0x1000 != 0 {
+            self.flags |= flags::RASTER_ORDERED;
+            kind |= 0x2000; // DxilResourceProperties::IsROV
+        }
+        self.annotate(block, h, kind, props.1)
     }
 
     /// The finished container.
@@ -791,6 +799,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::RASTER_ORDERED != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
