@@ -3,7 +3,9 @@
 mod allocation;
 mod dispatch;
 pub(crate) use allocation::ResultBuffer;
-pub use dispatch::dispatch_descriptor_tlas;
+pub use dispatch::{
+    IndirectTlas, dispatch_descriptor_tlas, dispatch_indirect_tlas, prepare_indirect_tlas,
+};
 pub(crate) mod compaction;
 mod instances;
 #[cfg(feature = "diagnostics")]
@@ -440,7 +442,11 @@ pub(crate) fn release_buffer(owner: Option<usize>, start: u64, end: u64) {
 /// # Safety
 /// `list` is a live title command list.
 pub unsafe fn host_tlas(list: *const Object, title_tlas: u64) -> Option<u64> {
-    let list = crate::list::host_list(list)?;
+    host_tlas_in(crate::list::host_list(list)?, title_tlas)
+}
+
+/// [`host_tlas`] for the host recording itself.
+pub(crate) fn host_tlas_in(list: &HostList, title_tlas: u64) -> Option<u64> {
     let entry = registry().structures.get(&title_tlas)?.clone();
     entry.instances.as_ref()?;
     if !entry.producer.available(&list.rt_recording()) {
@@ -449,6 +455,106 @@ pub unsafe fn host_tlas(list: *const Object, title_tlas: u64) -> Option<u64> {
     entry.retain(list);
     // SAFETY: the list owns this resource until the GPU has finished the recording.
     Some(entry.result.gpu())
+}
+
+/// A TLAS with nothing to hit, valid for this recording: every ray misses
+/// it, as on the console with an empty structure. A trace binds it where no
+/// TLAS is published: the program still runs and writes its misses (a null
+/// root SRV instead removed the WARP device). Its one instance has mask 0,
+/// which no ray's mask selects, over a real BLAS of one triangle: WARP
+/// divided by zero building a TLAS of no instance, and faulted on an
+/// instance of a null BLAS. One is built once and shared once its recording
+/// has reached the queue; until then a recording builds its own here.
+fn empty_tlas(rec: &Recorder<'_>) -> Option<Arc<ResultBuffer>> {
+    /// The TLAS and the BLAS its instance names, which must outlive it.
+    static EMPTY: Mutex<Option<(Structure, Arc<ResultBuffer>)>> = Mutex::new(None);
+    let mut shared = EMPTY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((tlas, blas)) = shared.as_ref()
+        && tlas.producer.available(&rec.list.rt_recording())
+    {
+        rec.list.keep_rt_result(blas);
+        rec.list.keep_rt_result(&tlas.result);
+        return Some(tlas.result.clone());
+    }
+    let built = (|| {
+        // Three vertices at the origin, then the instance record.
+        let (vertices, data) = rec.list.scratch(36)?;
+        let (instance, record) = rec.list.scratch(64)?;
+        // SAFETY: 36 bytes of this recording's upload memory.
+        unsafe { std::ptr::write_bytes(data, 0, 36) };
+        let geometry = Geometry {
+            Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+            Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+            Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                    Transform3x4: 0,
+                    IndexFormat: DXGI_FORMAT_UNKNOWN,
+                    VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                    IndexCount: 0,
+                    VertexCount: 3,
+                    IndexBuffer: 0,
+                    VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                        StartAddress: vertices,
+                        StrideInBytes: 12,
+                    },
+                },
+            },
+        };
+        let blas = rec.build(
+            &Inputs {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE,
+                NumDescs: 1,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    pGeometryDescs: &geometry,
+                },
+            },
+            None,
+            false,
+        )?;
+        let address = blas.result.gpu();
+        // An identity transform, ID and mask 0, the BLAS address last.
+        let words: [u32; 16] = std::array::from_fn(|i| match i {
+            0 | 5 | 10 => 1f32.to_bits(),
+            14 => address as u32,
+            15 => (address >> 32) as u32,
+            _ => 0,
+        });
+        // SAFETY: 64 bytes of this recording's upload memory, 256-byte aligned.
+        unsafe { record.cast::<[u32; 16]>().write(words) };
+        // The BLAS build's trailing barrier orders it before this one.
+        let tlas = rec.build(
+            &Inputs {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE,
+                NumDescs: 1,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    InstanceDescs: instance,
+                },
+            },
+            None,
+            true,
+        )?;
+        Some((tlas, blas.result))
+    })();
+    let Some((tlas, blas)) = built else {
+        tracing::warn!("no empty TLAS: traces without a published TLAS are dropped");
+        return None;
+    };
+    // Recordings that took an earlier one keep it; later ones wait for this
+    // one's recording, which a recording that is never submitted cannot block.
+    let result = tlas.result.clone();
+    *shared = Some((tlas, blas));
+    Some(result)
+}
+
+/// The GPU address of an empty TLAS ([`empty_tlas`]) for `list`, to bind
+/// where a trace has no TLAS: every ray misses. Its build may be recorded
+/// here, so call it before binding the trace's PSO and root arguments.
+pub(crate) fn empty_tlas_in(list: &HostList) -> Option<u64> {
+    Some(empty_tlas(&Recorder::new(list)?)?.gpu())
 }
 
 /// Compatibility name for the recording-scoped lookup.
@@ -460,9 +566,14 @@ pub use host_tlas as host_tlas_for_list;
 /// # Safety
 /// `list` is a live title command list and `handle` is a readable title descriptor slot.
 pub unsafe fn descriptor_tlas(list: *const Object, handle: u64) -> Option<u64> {
-    let address = descriptor_address(handle)?;
-    // SAFETY: the caller supplied the live list that records this descriptor's consumer.
-    unsafe { host_tlas_for_list(list, address) }
+    descriptor_tlas_in(crate::list::host_list(list)?, handle)
+}
+
+/// [`descriptor_tlas`] for the host recording itself: the TLAS pinned for
+/// `list`, once its producer is recorded there or submitted. `handle` is a
+/// readable title descriptor slot.
+pub(crate) fn descriptor_tlas_in(list: &HostList, handle: u64) -> Option<u64> {
+    host_tlas_in(list, descriptor_address(handle)?)
 }
 
 fn descriptor_address(handle: u64) -> Option<u64> {
@@ -528,18 +639,56 @@ unsafe fn build_one(
             }
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
                 let (inputs, map) = instances::rewrite(&recorder, title_list, &inputs)?;
-                Some(Structure {
+                let built = Structure {
                     instances: Some(map),
                     ..recorder.build(&inputs, reuse, ordered || inputs.NumDescs != 0)?
-                })
+                };
+                // The empty TLAS traces fall back to, made before they bind
+                // their state.
+                let _ = empty_tlas(&recorder);
+                Some(built)
             }
             _ => None,
         }
     })();
+    if built.is_none() {
+        let top = desc.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+        refused(if top { Refused::Tlas } else { Refused::Blas }, dst);
+    }
     if let Some(list) = crate::list::host_list(title_list) {
         generation.submit(list, built.clone());
     }
     registry().finish(dst, generation.generation, built)
+}
+
+/// What the host could not record at a title address.
+#[derive(Clone, Copy)]
+enum Refused {
+    Blas,
+    Tlas,
+    Copy,
+}
+
+/// Logs a build or copy the host could not record, at powers of two of
+/// each kind. Its title address then holds no structure in queue order:
+/// an instance of a BLAS there is inactive, and a trace of a TLAS there
+/// runs with a null one, where every ray misses.
+fn refused(what: Refused, address: u64) {
+    static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let refused = COUNTS[what as usize].fetch_add(1, Ordering::Relaxed) + 1;
+    if refused.is_power_of_two() {
+        let what = match what {
+            Refused::Blas => "BLAS build",
+            Refused::Tlas => "TLAS build (its traces run with a null TLAS: every ray misses)",
+            Refused::Copy => "structure copy",
+        };
+        tracing::warn!(
+            address = format_args!("{address:#x}"),
+            refused,
+            "host DXR {what} refused: its title address holds no structure (the budget, input \
+             and extent warnings before it say why)"
+        );
+    }
 }
 
 /// Rebuilds a rehydrated title entry and optionally samples its inputs on the GPU.
@@ -645,6 +794,9 @@ impl Builder {
                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode),
             )
         })();
+        if copied.is_none() {
+            refused(Refused::Copy, dst);
+        }
         if let Some(list) = crate::list::host_list(list) {
             generation.submit(list, copied.clone());
         }

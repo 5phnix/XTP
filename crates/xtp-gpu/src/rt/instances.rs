@@ -95,7 +95,22 @@ fn pipeline(device: &ID3D12Device5) -> Option<&'static Rewrite> {
 }
 
 fn make_pipeline(device: &ID3D12Device5) -> Option<Rewrite> {
-    let source = include_bytes!("instances.hlsl");
+    let (root, pso) = compute_pass(device, include_bytes!("instances.hlsl"), s!("rt_instances"))?;
+    let signature = dispatch::signature(&root, 1, 20)?;
+    Some(Rewrite {
+        root,
+        pso,
+        signature,
+    })
+}
+
+/// A compute pass of ours: `source`, HLSL with its root signature, compiled
+/// as `name` for shader model 5.1.
+pub(super) fn compute_pass(
+    device: &ID3D12Device5,
+    source: &[u8],
+    name: windows::core::PCSTR,
+) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors = None;
     // SAFETY: the compiler reads this static source and writes the two local blob pointers.
@@ -103,7 +118,7 @@ fn make_pipeline(device: &ID3D12Device5) -> Option<Rewrite> {
         D3DCompile(
             source.as_ptr().cast(),
             source.len(),
-            s!("rt_instances"),
+            name,
             None,
             None,
             s!("main"),
@@ -120,7 +135,7 @@ fn make_pipeline(device: &ID3D12Device5) -> Option<Rewrite> {
             let bytes = unsafe {
                 std::slice::from_raw_parts(errors.GetBufferPointer().cast(), errors.GetBufferSize())
             };
-            tracing::warn!(%error, "instance rewrite shader: {}", String::from_utf8_lossy(bytes));
+            tracing::warn!(%error, "host DXR pass shader: {}", String::from_utf8_lossy(bytes));
         }
         return None;
     }
@@ -141,12 +156,7 @@ fn make_pipeline(device: &ID3D12Device5) -> Option<Rewrite> {
                 ..Default::default()
             })
             .ok()?;
-        let signature = dispatch::signature(&root, 1)?;
-        Some(Rewrite {
-            root,
-            pso,
-            signature,
-        })
+        Some((root, pso))
     }
 }
 

@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 use xtp_shader::emit::{
-    LOOP_COUNTER_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE,
+    LOOP_COUNTER_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, TLAS_REGISTER, USER_DATA_SPACE,
 };
 
 use super::{Shader, Translated};
@@ -510,6 +510,76 @@ fn blend_without(
 pub(crate) fn bounded_root_srvs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("XTP_ROOT_SRV_DIRECT").is_none())
+}
+
+/// Whether the root SRV at `slot` of a translated shader is a one-view
+/// table (bound with a descriptor table) rather than a root descriptor:
+/// with [`bounded_root_srvs`], every slot but the RayQuery TLAS
+/// ([`TLAS_REGISTER`]), which always stays a root SRV. Its trace dispatch
+/// passes the host TLAS as an indirect root SRV argument
+/// ([`crate::rt::dispatch_descriptor_tlas`]), which a table cannot take,
+/// and an acceleration structure has no byte range for a view to bound.
+pub(crate) fn root_srv_in_table(slot: u8) -> bool {
+    slot != TLAS_REGISTER && bounded_root_srvs()
+}
+
+/// The root parameter of a translated shader's root view at `slot` of
+/// `kind` (a root CBV, SRV or UAV in [`ROOT_CBV_SPACE`]): a one-view table
+/// for root UAVs and the root SRVs [`root_srv_in_table`] names (its range
+/// pushed to `ranges`, which must outlive the parameter), else a root
+/// descriptor.
+#[expect(
+    clippy::vec_box,
+    reason = "a table parameter points at its range, which must stay in place as the vector grows"
+)]
+pub(crate) fn root_view(
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    slot: u8,
+    visibility: D3D12_SHADER_VISIBILITY,
+    ranges: &mut Vec<Box<D3D12_DESCRIPTOR_RANGE1>>,
+) -> D3D12_ROOT_PARAMETER1 {
+    if kind == D3D12_ROOT_PARAMETER_TYPE_UAV
+        || kind == D3D12_ROOT_PARAMETER_TYPE_SRV && root_srv_in_table(slot)
+    {
+        // A one-view table: the view's size bounds the reads, which a root
+        // descriptor leaves unbounded.
+        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
+                D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+            } else {
+                D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+            },
+            NumDescriptors: 1,
+            BaseShaderRegister: u32::from(slot),
+            RegisterSpace: ROOT_CBV_SPACE,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            OffsetInDescriptorsFromTableStart: 0,
+        }));
+        // The box keeps the range in place when the vector grows.
+        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last().expect("pushed");
+        return D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: range,
+                },
+            },
+            ShaderVisibility: visibility,
+        };
+    }
+    D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: u32::from(slot),
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: visibility,
+    }
 }
 
 /// One stage of a host pipeline and where its bindings go.
@@ -1050,50 +1120,8 @@ impl HostPipeline {
                 ),
             ] {
                 for &slot in slots {
-                    if kind == D3D12_ROOT_PARAMETER_TYPE_UAV
-                        || kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs()
-                    {
-                        // A one-view table: the view's size bounds the reads,
-                        // which a root descriptor leaves unbounded.
-                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
-                                D3D12_DESCRIPTOR_RANGE_TYPE_UAV
-                            } else {
-                                D3D12_DESCRIPTOR_RANGE_TYPE_SRV
-                            },
-                            NumDescriptors: 1,
-                            BaseShaderRegister: u32::from(slot),
-                            RegisterSpace: ROOT_CBV_SPACE,
-                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                            OffsetInDescriptorsFromTableStart: 0,
-                        }));
-                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
-                        out.push((slot, params.len() as u32));
-                        params.push(D3D12_ROOT_PARAMETER1 {
-                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                                    NumDescriptorRanges: 1,
-                                    pDescriptorRanges: range,
-                                },
-                            },
-                            ShaderVisibility: visibility,
-                        });
-                        continue;
-                    }
                     out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
+                    params.push(root_view(kind, slot, visibility, &mut ranges));
                 }
             }
             if t.stride_table {
@@ -1509,7 +1537,7 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         .to_vec()
 }
 
-fn root_signature(
+pub(crate) fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],

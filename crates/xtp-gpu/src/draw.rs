@@ -1441,6 +1441,18 @@ impl State {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .begin_bind();
+        // A trace's empty TLAS, its fallback where no title root view sets
+        // it: built (when it must be) before the pipeline's state is bound.
+        let empty_tlas = p
+            .stages
+            .iter()
+            .any(|s| {
+                s.root_srvs
+                    .iter()
+                    .any(|r| r.0 == xtp_shader::emit::TLAS_REGISTER)
+            })
+            .then(|| crate::rt::empty_tlas_in(list))
+            .flatten();
         self.bind_pipeline(list, p, compute);
         let picked = p
             .stages
@@ -1567,13 +1579,26 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let tabled = srv && crate::pipeline::host::root_srv_in_table(slot);
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // An unset table is undefined: a null view instead.
                         if tabled {
                             self.root_srv_table(list, None, param, compute)?;
+                        }
+                        // The RayQuery TLAS, a root SRV no title root view
+                        // sets: an empty TLAS, where every ray misses, unless
+                        // the trace binds the host's (a null root SRV removed
+                        // the WARP device).
+                        if srv && slot == xtp_shader::emit::TLAS_REGISTER {
+                            let gpu = empty_tlas.ok_or("no empty TLAS for a trace")?;
+                            if compute {
+                                self.compute_root(list, param, ComputeRoot::Srv(gpu));
+                            } else {
+                                // SAFETY: an open list; the list keeps the TLAS.
+                                unsafe { l.SetGraphicsRootShaderResourceView(param, gpu) };
+                            }
                         }
                         continue;
                     };
