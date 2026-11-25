@@ -1248,10 +1248,9 @@ impl<'a> Lower<'a> {
             .all(|&a| self.dead_at_join(a, seen))
     }
 
-    /// Whether no lane that enters join `b` from `pred` reads `reg`, from
-    /// the join on, before writing it again: what the register held on that
-    /// edge is then no value the program uses, and the join may take an
-    /// undefined one there.
+    /// Whether no lane that enters join `b` from `pred` makes what `reg`
+    /// held on that edge matter: what the register held there is then no
+    /// value the program uses, and the join may take an undefined one.
     ///
     /// Per lane, a path follows only the branches the lane can take with
     /// what it knows ([`Path`]): what holds on entering `pred` and its
@@ -1259,11 +1258,24 @@ impl<'a> Lower<'a> {
     /// join's phis take on that edge (a flag VGPR that is 0 on the mask's
     /// edge and that the program tests before reading the register), and a
     /// comparison already decided on the path made again of the same
-    /// values. Vector instructions whose guard cannot hold do not run. Back
-    /// to the join, an indirect jump, or a search of more than
+    /// values. Vector instructions whose guard cannot hold do not run.
+    ///
+    /// The value may flow into scalar ALU operations: what they write is
+    /// then tainted too, until written again. Taint ends the proof where
+    /// anything else reads it (a vector instruction, memory, a message, an
+    /// EXEC write), and at a branch whose way it can change: one whose
+    /// condition, with what the lane knows, takes both ways and tests a
+    /// tainted atom. The material and character pixel programs
+    /// (f23ac5187c49056a, the `PedTextured` family) test the register at
+    /// the join beside a flag (`flag && word != 0`) whose side alone
+    /// decides the branch on the edge where the word is a descriptor's.
+    ///
+    /// Back at the join (a loop), the lane goes on without the join's
+    /// constants. An indirect jump, or a search of more than
     /// [`UNREAD_STEPS`] blocks: no proof. In the console flow (branches
-    /// taken wave-wide) every successor is followed and every instruction
-    /// runs, and only a scalar instruction's write ends a path.
+    /// taken wave-wide) every successor is followed, every instruction
+    /// runs, any read ends the proof, and only a scalar instruction's write
+    /// ends a path.
     fn unread_on_edge(&self, reg: Reg, pred: usize, b: usize) -> bool {
         let (p, st) = (self.x.p, self.x.st);
         let per_lane = !self.console_cf;
@@ -1275,18 +1287,24 @@ impl<'a> Lower<'a> {
             .iter()
             .filter_map(|phi| Some((phi.value, self.word_of(phi.args[n])?)))
             .collect();
+        let none = HashMap::new();
         // What lanes entering `pred` know, and its branch to the join.
         // Over a back edge it holds for the iteration that ends.
-        let mut known = Vec::new();
+        let mut start = Taint {
+            known: Vec::new(),
+            regs: vec![reg],
+            values: Vec::new(),
+            fresh: true,
+        };
         if per_lane && self.rpo[b] > self.rpo[pred] {
-            let none = HashMap::new();
             let entry = Path {
                 joined: &none,
                 at: pred,
                 from: None,
                 known: &[],
+                tainted: &[],
             };
-            known = self.learn(&entry, st.reach[pred], true);
+            start.known = self.learn(&entry, st.reach[pred], true);
             if let LaneExit::Branch {
                 when,
                 taken,
@@ -1296,19 +1314,20 @@ impl<'a> Lower<'a> {
             {
                 let more = self.learn(
                     &Path {
-                        known: &known,
+                        known: &start.known,
                         ..entry
                     },
                     when,
                     taken == b,
                 );
-                known.extend(more);
+                start.known.extend(more);
             }
         }
-        // What a lane knows entering each block by each edge: on all the
-        // paths there found so far, so it only shrinks as the search goes.
-        let mut knows: HashMap<(usize, usize), Vec<(Atom, bool)>> = HashMap::new();
-        knows.insert((pred, b), known);
+        // What a lane knows entering each block by each edge, and what is
+        // tainted there, over all the paths found so far: the facts only
+        // shrink and the taint only grows as the search goes on.
+        let mut states: HashMap<(usize, usize), Taint> = HashMap::new();
+        states.insert((pred, b), start);
         let mut work = vec![(pred, b)];
         let mut steps = 0;
         'paths: while let Some((from, at)) = work.pop() {
@@ -1316,26 +1335,76 @@ impl<'a> Lower<'a> {
             if steps > UNREAD_STEPS {
                 return false;
             }
-            let known = knows[&(from, at)].clone();
+            let mut t = states[&(from, at)].clone();
+            let block = &p.blocks[at];
+            // A phi of the register a path holds tainted is tainted on it
+            // (the join's own was tainted at the start).
+            if let Some(k) = block.preds.iter().position(|&q| q == from) {
+                for phi in &block.phis {
+                    if (t.regs.contains(&phi.reg) || t.values.contains(&phi.args[k]))
+                        && !t.values.contains(&phi.value)
+                    {
+                        t.values.push(phi.value);
+                    }
+                }
+            }
+            let known = t.known.clone();
+            let values = t.values.clone();
             let path = Path {
-                joined: &joined,
+                joined: if t.fresh { &joined } else { &none },
                 at,
                 from: Some(from),
                 known: &known,
+                tainted: &values,
             };
-            for (i, inst) in p.blocks[at].insts.iter().enumerate() {
+            let last = block.insts.len().saturating_sub(1);
+            for (i, inst) in block.insts.iter().enumerate() {
                 let guard = if per_lane { st.guards[at][i] } else { None };
                 let (runs, skips) = guard.map_or((true, false), |g| self.outcomes(g, &path));
-                if runs && inst.read(reg).is_some() {
-                    return false;
-                }
                 let scalar = matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. });
-                if inst.write(reg).is_some() && !skips && (per_lane || scalar) {
-                    continue 'paths;
+                if runs
+                    && inst
+                        .reads
+                        .iter()
+                        .any(|(r, v)| t.regs.contains(r) || t.values.contains(v))
+                {
+                    let writes_exec = inst
+                        .writes
+                        .iter()
+                        .any(|w| matches!(w.0, Reg::S(c) if c == EXEC || c == EXEC + 1));
+                    let branch = i == last
+                        && matches!(inst.fields, Fields::Sopp { .. })
+                        && inst.name().starts_with("s_cbranch_");
+                    if per_lane && branch {
+                        // The block's exit decides with the condition.
+                    } else if per_lane && matches!(inst.fields, Fields::Sop { .. }) && !writes_exec
+                    {
+                        for &(r, v) in &inst.writes {
+                            if !t.regs.contains(&r) {
+                                t.regs.push(r);
+                            }
+                            if !t.values.contains(&v) {
+                                t.values.push(v);
+                            }
+                        }
+                        continue;
+                    } else {
+                        return false;
+                    }
+                }
+                if !skips && (per_lane || scalar) {
+                    t.regs.retain(|r| inst.write(*r).is_none());
                 }
             }
-            let next: Vec<(usize, Option<(Bool, bool)>)> = match (st.exits[at], &p.blocks[at].exit)
-            {
+            if t.regs.is_empty() {
+                continue 'paths;
+            }
+            let values = t.values.clone();
+            let path = Path {
+                tainted: &values,
+                ..path
+            };
+            let next: Vec<(usize, Option<(Bool, bool)>)> = match (st.exits[at], &block.exit) {
                 (_, Exit::Indirect) | (LaneExit::Indirect, _) => return false,
                 (
                     LaneExit::Branch {
@@ -1346,6 +1415,9 @@ impl<'a> Lower<'a> {
                     _,
                 ) if per_lane && taken != not_taken => {
                     let (can, cannot) = self.outcomes(when, &path);
+                    if can && cannot && self.tests_taint(when, &values) {
+                        return false;
+                    }
                     let mut next = Vec::new();
                     if can {
                         next.push((taken, Some((when, true))));
@@ -1358,29 +1430,30 @@ impl<'a> Lower<'a> {
                 (_, exit) => exit.successors().into_iter().map(|t| (t, None)).collect(),
             };
             for (to, branch) in next {
-                if to == b {
-                    return false;
-                }
+                let mut next = Taint {
+                    known: Vec::new(),
+                    regs: t.regs.clone(),
+                    values: t.values.clone(),
+                    // Back at the join, its phis are the next iteration's.
+                    fresh: t.fresh && to != b,
+                };
                 // Over a back edge the loop redefines what the lane knew.
-                let mut k = Vec::new();
                 if self.rpo[to] > self.rpo[at] {
-                    k.clone_from(&known);
+                    next.known.clone_from(&known);
                     if let Some((when, holds)) = branch {
                         let more = self.learn(&path, when, holds);
-                        k.extend(more);
+                        next.known.extend(more);
                     }
                     // Knowing less only adds paths.
-                    let over = k.len().saturating_sub(MAX_KNOWN);
-                    k.drain(..over);
+                    let over = next.known.len().saturating_sub(MAX_KNOWN);
+                    next.known.drain(..over);
                 }
-                match knows.get_mut(&(at, to)) {
+                match states.get_mut(&(at, to)) {
                     None => {
-                        knows.insert((at, to), k);
+                        states.insert((at, to), next);
                     }
                     Some(old) => {
-                        let len = old.len();
-                        old.retain(|f| k.contains(f));
-                        if old.len() == len {
+                        if !old.merge(&next) {
                             continue;
                         }
                     }
@@ -1389,6 +1462,16 @@ impl<'a> Lower<'a> {
             }
         }
         true
+    }
+
+    /// Whether `b` tests an atom of a tainted value ([`Self::unread_on_edge`]).
+    fn tests_taint(&self, b: Bool, tainted: &[Value]) -> bool {
+        self.x
+            .st
+            .bools
+            .support(b)
+            .into_iter()
+            .any(|a| atom_of(a).is_some_and(|v| tainted.contains(&v)))
     }
 
     /// The atoms that `b` holding as `holds` decides on `path`, which it
@@ -1400,7 +1483,9 @@ impl<'a> Lower<'a> {
         }
         let mut out = Vec::new();
         for atom in atoms {
-            if self.atom_value(atom, path).is_some() {
+            if self.atom_value(atom, path).is_some()
+                || atom_of(atom).is_some_and(|v| path.tainted.contains(&v))
+            {
                 continue;
             }
             for value in [false, true] {
@@ -1470,6 +1555,9 @@ impl<'a> Lower<'a> {
     /// two constants, or the same comparison of the same values as an atom
     /// known there.
     fn atom_value(&self, atom: Atom, path: &Path) -> Option<bool> {
+        if atom_of(atom).is_some_and(|v| path.tainted.contains(&v)) {
+            return None;
+        }
         if let Some(&(_, v)) = path.known.iter().find(|k| k.0 == atom) {
             return Some(v);
         }
@@ -1567,6 +1655,9 @@ impl<'a> Lower<'a> {
         {
             x = phi.args[block.preds.iter().position(|&q| q == from)?];
         }
+        if path.tainted.contains(&x) {
+            return None;
+        }
         Some(
             match path.joined.get(&x).copied().or_else(|| self.word_of(x)) {
                 Some(k) => Op::Word(k),
@@ -1602,6 +1693,64 @@ struct Path<'p> {
     from: Option<usize>,
     /// Atoms that what the lane passed decides, since the last back edge.
     known: &'p [(Atom, bool)],
+    /// Values derived from the edge's (`unread_on_edge`): their atoms and
+    /// operands are not known.
+    tainted: &'p [Value],
+}
+
+/// The IR value an atom is of, if any.
+fn atom_of(a: Atom) -> Option<Value> {
+    match a {
+        Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) | Atom::Quad(v) | Atom::Opaque(v) => {
+            Some(v)
+        }
+        Atom::Constant(_) => None,
+    }
+}
+
+/// A path's state in [`Lower::unread_on_edge`], merged over the paths that
+/// enter a block by the same edge.
+#[derive(Clone)]
+struct Taint {
+    /// What the lane knows ([`Path::known`]).
+    known: Vec<(Atom, bool)>,
+    /// Registers holding the edge's value or one derived from it.
+    regs: Vec<Reg>,
+    /// Those values.
+    values: Vec<Value>,
+    /// Whether the join's constants still hold (not back at the join).
+    fresh: bool,
+}
+
+impl Taint {
+    /// Adds what another path brings (fewer facts, more taint): whether it
+    /// changed.
+    fn merge(&mut self, other: &Taint) -> bool {
+        let was = (
+            self.known.len(),
+            self.regs.len(),
+            self.values.len(),
+            self.fresh,
+        );
+        self.known.retain(|f| other.known.contains(f));
+        for &r in &other.regs {
+            if !self.regs.contains(&r) {
+                self.regs.push(r);
+            }
+        }
+        for &v in &other.values {
+            if !self.values.contains(&v) {
+                self.values.push(v);
+            }
+        }
+        self.fresh &= other.fresh;
+        was != (
+            self.known.len(),
+            self.regs.len(),
+            self.values.len(),
+            self.fresh,
+        )
+    }
 }
 
 /// A lane's bit or an SCC as a comparison ([`Lower::condition`]).
@@ -2047,19 +2196,107 @@ mod tests {
         let mut words = DESCRIPTOR_JOIN;
         words[17] = S_NOP;
         words[18] = S_NOP;
+        // [`FLAG_AND_WORD`] with the flag -1 on both edges: on the
+        // descriptor's, whether the branch skips the store depends on s8.
+        let mut beside = FLAG_AND_WORD;
+        beside[5] = 0x7E0A_02C1; // v_mov_b32 v5, -1
+        for words in [&words[..], &beside[..]] {
+            let mut p = descriptor_join(ResourceType::Srv);
+            p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let r = emit_for(&p, crate::emit::Target::ANY);
+            assert!(
+                matches!(
+                    r,
+                    Err(crate::ShaderError::Unsupported {
+                        what: "a descriptor's address or format read as data",
+                        ..
+                    })
+                ),
+                "{r:?}"
+            );
+        }
+    }
+
+    /// [`DESCRIPTOR_JOIN`] in the form of the material and character pixel
+    /// programs (0xb9b18de at 0x1100): a flag v5 (0 on the descriptor's
+    /// edge, -1 on the data's), and at the join the joined s8 tested beside
+    /// it, `flag && s8 != 0` as masks (`s_xor`, `s_cmp` + `s_cselect`,
+    /// `s_or`, then `s_cbranch_vccnz` past the store). On the descriptor's
+    /// edge the flag alone takes the branch, whatever s8 holds: the dword
+    /// is dead there and the program translates; both edges give what the
+    /// console does (on WARP), as [`DESCRIPTOR_JOIN`] does.
+    const FLAG_AND_WORD: [u32; 30] = [
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0009, // s_cbranch_scc1 -> 0x44
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2000,
+        0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x8003_0204, // buffer_store_dword v2, v4, s[12:15], 0 offen
+        0xBF82_0002, // s_branch -> 0x4c
+        0xBE88_0385, // 0x44: s_mov_b32 s8, 5
+        0x7E0A_02C1, // v_mov_b32 v5, -1
+        0x7D84_0AC1, // 0x4c: v_cmp_eq_u32 vcc_lo, -1, v5
+        0x8906_C16A, // s_xor_b32 s6, vcc_lo, -1
+        0xBF06_8008, // s_cmp_eq_u32 s8, 0
+        0x8507_807E, // s_cselect_b32 s7, exec_lo, 0
+        0x8806_0706, // s_or_b32 s6, s6, s7
+        0x876A_067E, // s_and_b32 vcc_lo, exec_lo, s6
+        0xBF87_0003, // s_cbranch_vccnz -> 0x74
+        0x7E06_0208, // v_mov_b32 v3, s8
+        0xE070_1000,
+        0x8003_0304, // buffer_store_dword v3, v4, s[12:15], 0 offen
+        S_ENDPGM,    // 0x74
+    ];
+
+    #[test]
+    fn a_descriptor_dword_tested_beside_a_deciding_flag_is_dead_on_its_edge() {
         let mut p = descriptor_join(ResourceType::Srv);
-        p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let r = emit_for(&p, crate::emit::Target::ANY);
-        assert!(
-            matches!(
-                r,
-                Err(crate::ShaderError::Unsupported {
-                    what: "a descriptor's address or format read as data",
-                    ..
-                })
-            ),
-            "{r:?}"
-        );
+        p.code = FLAG_AND_WORD.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let cs = emit_for(&p, crate::emit::Target::ANY).unwrap();
+        #[cfg(windows)]
+        {
+            use crate::emit::host::{Dispatch, Host, Root, Stride, View};
+            let Ok(host) = Host::new(true) else {
+                eprintln!("no WARP device; skipped");
+                return;
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let data: Vec<u32> = (0..32).map(|t| 1000 + t).collect();
+            let views = [
+                View::Buffer {
+                    data: &data,
+                    stride: Stride::Structured(4),
+                },
+                View::RawUav(32),
+            ];
+            for (choice, want) in [(0, vec![5; 32]), (1, data.clone())] {
+                let mut user = vec![0; (cs.user_data_dwords() as usize).max(2)];
+                user[1] = choice;
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(user))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(out[0], want, "s1 = {choice}");
+            }
+        }
     }
 
     /// The same join with entry 0 a constant buffer: its descriptor's
