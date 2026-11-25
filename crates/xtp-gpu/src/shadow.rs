@@ -1516,6 +1516,10 @@ pub(super) fn copy_instruction(ip: usize) -> bool {
 /// into title memory fell back to the kernel's ([`write_title`]), which
 /// fails on a block a refresh guarded again meanwhile: the GPU's bytes
 /// were lost without a word.
+///
+/// Une page de garde du titre (`PAGE_GUARD`) que la copie lit perd sa garde
+/// à ce premier accès : [`guard_again`] la remet avant que la copie
+/// s’arrête, comme la copie du noyau la laissait.
 unsafe extern "system" fn stopped(
     info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {
@@ -1575,6 +1579,20 @@ unsafe extern "system" fn stopped(
     } else {
         0
     };
+    if record.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION
+        && record.NumberParameters >= 2
+        && record.ExceptionInformation[0] == 0
+    {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // Une lecture : le système a retiré la garde du titre, elle est
+        // remise avant la fin de la copie. (Une écriture la retire, comme
+        // `WriteProcessMemory`.) L’erreur du thread fautif reste la sienne.
+        // SAFETY: simples lecture et écriture de l’erreur de ce thread.
+        let error = unsafe { GetLastError() };
+        guard_again(at);
+        // SAFETY: comme ci-dessus.
+        unsafe { SetLastError(error) };
+    }
     if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
         && record.NumberParameters >= 2
         && record.ExceptionInformation[0] == WRITE
@@ -1614,14 +1632,54 @@ unsafe extern "system" fn stopped(
 fn install() {
     use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
     static HANDLER: std::sync::Once = std::sync::Once::new();
-    // SAFETY: a handler that only moves past the copy's instruction, opens
-    // a guarded block as the guard's own handler does, or lets an access to
-    // a page the census guarded go on.
+    // SAFETY: a handler that only moves past the copy's instruction (la
+    // garde d’une page du titre qu’elle a atteinte remise), opens a guarded
+    // block as the guard's own handler does, or lets an access to a page
+    // the census guarded go on.
     HANDLER.call_once(|| unsafe {
         #[cfg(any(test, feature = "diagnostics"))]
         census::find_our_image();
         AddVectoredExceptionHandler(1, Some(stopped));
     });
+}
+
+/// Remet la garde (`PAGE_GUARD`) de la page de 4 Kio de `at`, qu’une lecture
+/// directe vient de consommer ([`stopped`]). La garde appartient au titre :
+/// garde de pile d’un de ses threads (sans elle, la pile ne grandit plus et
+/// déborde plus tard), ou son propre suivi d’accès. `ReadProcessMemory`
+/// échoue sur une page gardée sans retirer la garde
+/// (`fills_leave_guard_pages_guarded`). `WriteProcessMemory`, lui, écrit la
+/// page et retire la garde : une écriture directe ([`write_title`]) fait de
+/// même (`writes_treat_guard_pages_as_the_kernel_does`). Idée de VIctory
+/// #1010 (TG0000).
+///
+/// Entre la faute et la remise, un accès du titre à la page n’est pas
+/// signalé (le suivant l’est). Une protection que le titre pose entre la
+/// requête et la remise est rétablie.
+fn guard_again(at: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || info.Protect & PAGE_GUARD != 0 {
+        // Démappée, ou déjà gardée à nouveau (par le titre, ou par une
+        // autre copie qui l’a atteinte aussi).
+        return;
+    }
+    let protect = |protection: u32| {
+        let mut old = 0;
+        // SAFETY: seule la protection de cette page change ; l’appel échoue
+        // si elle a disparu entre-temps.
+        (unsafe { VirtualProtect(at as *const _, 1, protection, &mut old) } != 0).then_some(old)
+    };
+    if let Some(old) = protect(info.Protect | PAGE_GUARD)
+        && old & !PAGE_GUARD != info.Protect
+    {
+        protect(old);
+    }
 }
 
 /// Whether `at` is committed memory that can be written now.
@@ -1700,16 +1758,22 @@ unsafe fn try_copy(dst: *mut u8, src: *const u8, len: usize) -> usize {
 
 /// Remplit la mémoire d’upload par lectures directes (TG0000, VIctory #1010).
 /// Le gestionnaire de XTP reprend après une page illisible et conserve les
-/// octets lisibles de part et d’autre, même si le début n’est pas aligné.
+/// octets lisibles de part et d’autre, même si le début n’est pas aligné
+/// ([`read_title`] : pages de garde laissées gardées, copies en retour en
+/// attente lues). Avec `XTP_SHADOW_ONCE=0`, la copie du noyau.
 ///
 /// # Safety
 ///
 /// `dst` désigne `len` octets accessibles en écriture, réservés à la liste
 /// et disjoints de la source. Les pages lisibles de `src` appartiennent au titre.
 pub(super) unsafe fn fill_upload(dst: *mut u8, src: usize, len: usize) {
+    // Les modes de mesure gardent leur copie brute, absente ou noyau, et
+    // `XTP_SHADOW_ONCE=0` celle du noyau d’avant W1 ([`plain`]).
     #[cfg(feature = "diagnostics")]
-    if crate::copystat::mode() != 0 {
-        // Les modes de mesure gardent leur copie brute, absente ou noyau.
+    let measured = crate::copystat::mode() != 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let measured = false;
+    if measured || !plain() {
         crate::host::copy_mapped(dst, src as *const u8, len, false);
         return;
     }
@@ -1730,7 +1794,25 @@ pub(super) unsafe fn fill_upload(dst: *mut u8, src: usize, len: usize) {
 /// Copies title memory `[src, src + len)` into memory of ours at `dst`
 /// with plain loads; what cannot be read is left as zeros (as the kernel's
 /// copy did). Returns the bytes zeroed.
+///
+/// Ce qui est engagé mais que la copie directe n’a pu lire passe par la
+/// copie du noyau ([`crate::host::read_into`]), comme avant 0751149 : une
+/// vue de copie en retour encore en attente que le gestionnaire n’a pas
+/// ouverte (verrou des gardes empoisonné : `crate::watch::read_fault`
+/// renonce) est épinglée puis relue, au lieu de zéros. Une page gardée
+/// (garde remise par [`stopped`]) ou interdite donne des zéros, comme
+/// avec le noyau, qui laisse sa garde en place.
+///
+/// Un remplissage ne mêle pas d’octets d’avant et d’après la fusion d’une
+/// copie en retour quand une faute le coupe : avant lui, l’étape attend la
+/// fin, copie en retour comprise, des soumissions dont le GPU écrit sa
+/// plage (`Batch::settle`), et une publication venue d’une autre ne change
+/// pas les octets de cette plage (`crate::readmap::Owners::publish` ne
+/// change que ce que son GPU a écrit). Seule une écriture du titre pendant
+/// la copie pourrait l’y changer, avec la copie du noyau aussi.
 fn read_title(dst: *mut u8, src: usize, len: usize) -> usize {
+    #[cfg(test)]
+    tests::TITLE_READS.set(tests::TITLE_READS.get() + 1);
     let (mut at, mut zeros) = (0, 0);
     while at < len {
         // SAFETY: our memory, `len` bytes; title memory a fault leaves alone.
@@ -1739,10 +1821,14 @@ fn read_title(dst: *mut u8, src: usize, len: usize) -> usize {
         if left == 0 {
             break;
         }
-        let n = out_of_reach(src + at, false).min(left);
-        // SAFETY: inside our memory.
-        unsafe { dst.add(at).write_bytes(0, n) };
-        zeros += n;
+        let (n, committed) = reach(src + at, false);
+        let n = n.min(left);
+        // SAFETY: inside our memory, which nothing else references meanwhile.
+        let piece = unsafe { std::slice::from_raw_parts_mut(dst.add(at), n) };
+        if !(committed && crate::host::read_into((src + at) as *const u8, piece)) {
+            piece.fill(0);
+            zeros += n;
+        }
         at += n;
     }
     zeros
@@ -1819,6 +1905,12 @@ fn read_pieces(src: usize, dst: &mut [u8]) -> Vec<(usize, usize)> {
 /// otherwise) to the end of its 4 KiB page. One query per region out of
 /// reach: the kernel's copy tried each 4 KiB page of it.
 fn out_of_reach(at: usize, write: bool) -> usize {
+    reach(at, write).0
+}
+
+/// [`out_of_reach`], et si ces octets sont engagés (la requête a échoué :
+/// pas plus qu’une page de 4 Kio, prise pour engagée).
+fn reach(at: usize, write: bool) -> (usize, bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
@@ -1827,18 +1919,20 @@ fn out_of_reach(at: usize, write: bool) -> usize {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    let reachable = info.State == MEM_COMMIT
+    let committed = info.State == MEM_COMMIT;
+    let reachable = committed
         && if write {
             can_write(info.Protect)
         } else {
             info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
         };
     if n == 0 || reachable {
-        return page_end;
+        return (page_end, true);
     }
-    (info.BaseAddress as usize + info.RegionSize)
+    let end = (info.BaseAddress as usize + info.RegionSize)
         .saturating_sub(at)
-        .max(page_end)
+        .max(page_end);
+    (end, committed)
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it cannot be
@@ -4179,6 +4273,8 @@ mod tests {
             const { std::cell::RefCell::new(None) };
         /// The plain reads [`read_pieces`] made on this thread.
         pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Les copies directes que [`read_title`] a faites sur ce thread.
+        pub(super) static TITLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The write-watch askings refreshes made on this thread.
         pub(super) static ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// How far short of the faulting byte the next fault at the copy's
@@ -4205,6 +4301,11 @@ mod tests {
     /// handlers are the process's, and the guard's own tests count the
     /// guarded blocks (they hold a lock of theirs for it).
     fn alone(test: &str, body: impl FnOnce()) {
+        alone_with(test, &[], body);
+    }
+
+    /// [`alone`], le processus du test ayant en plus les variables `vars`.
+    fn alone_with(test: &str, vars: &[(&str, &str)], body: impl FnOnce()) {
         const CHILD: &str = "XTP_SHADOW_TEST_ALONE";
         if std::env::var_os(CHILD).is_some() {
             body();
@@ -4213,6 +4314,7 @@ mod tests {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([test, "--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
+            .envs(vars.iter().copied())
             .output()
             .unwrap();
         let (stdout, stderr) = (
@@ -4870,6 +4972,526 @@ mod tests {
                 .iter()
                 .all(|&b| b == 0x5a)
         );
+    }
+
+    /// `pages` pages de 4 Kio à nous, l’octet `i` valant [`pattern`]`(i)`.
+    fn kernel_pages(pages: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        // SAFETY: une réservation neuve, à nous.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                pages * KERNEL_PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        for i in 0..pages * KERNEL_PAGE {
+            // SAFETY: la mémoire du test.
+            unsafe { ((at + i) as *mut u8).write(pattern(i)) };
+        }
+        at
+    }
+
+    /// L’octet `i` des pages de [`kernel_pages`].
+    fn pattern(i: usize) -> u8 {
+        (i * 31 + i / 256 + 1) as u8
+    }
+
+    /// Libère des pages de [`kernel_pages`].
+    fn free_pages(at: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: une réservation du test, que plus rien n’utilise.
+        assert_ne!(unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// La protection de la page de 4 Kio de `at`, `PAGE_GUARD` compris.
+    fn protection(at: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        assert_ne!(n, 0);
+        info.Protect
+    }
+
+    /// Donne `protection` à la page de 4 Kio de `at`.
+    fn set_protection(at: usize, protection: u32) {
+        use windows_sys::Win32::System::Memory::VirtualProtect;
+        let mut old = 0;
+        // SAFETY: une page du test.
+        let done = unsafe { VirtualProtect(at as *const _, KERNEL_PAGE, protection, &mut old) };
+        assert_ne!(done, 0);
+    }
+
+    /// Si les remplissages de ce processus lisent directement (sinon, par la
+    /// copie du noyau).
+    fn plain_fills() -> bool {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            return false;
+        }
+        plain()
+    }
+
+    /// Une page de garde du titre qu’un remplissage atteint reste gardée,
+    /// avec son autre protection, et le remplissage en reçoit ce que la
+    /// copie du noyau en donne (des zéros pour la page, dont le noyau laisse
+    /// la garde), où que la plage tombe sur elle. De même pour un
+    /// rafraîchissement et pour les lectures d’une copie en retour. Ported
+    /// from VIctory#1010 (79c9b93) by TG0000 (`guard_pages_stay_guarded`).
+    #[test]
+    fn fills_leave_guard_pages_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+        };
+        const P: usize = KERNEL_PAGE;
+        for other in [PAGE_READWRITE, PAGE_READONLY, PAGE_EXECUTE_READ] {
+            for (start, len) in [
+                (P, 1),
+                (P + 2000, 1),
+                (P + 2000, 100),
+                (2 * P - 1, 1),
+                (P - 1, 2),
+                (P - 7, 16),
+                (P - 500, 1000),
+                (2 * P - 8, 64),
+                (0, 3 * P),
+            ] {
+                let case = format!("protection {other:#x}, octets {start}+{len}");
+                let at = kernel_pages(3);
+                let guarded = other | PAGE_GUARD;
+                set_protection(at + P, guarded);
+                let src = at + start;
+                let mut kernel = vec![0xeeu8; len];
+                crate::host::copy_mapped(kernel.as_mut_ptr(), src as *const u8, len, false);
+                assert_eq!(protection(at + P), guarded, "le noyau: {case}");
+                let mut filled = vec![0xeeu8; len];
+                TITLE_READS.set(0);
+                // SAFETY: le vecteur couvre la destination.
+                unsafe { fill_upload(filled.as_mut_ptr(), src, len) };
+                assert_eq!(TITLE_READS.get(), usize::from(plain_fills()), "{case}");
+                assert_eq!(protection(at + P), guarded, "le remplissage: {case}");
+                assert!(filled == kernel, "comme la copie du noyau: {case}");
+                for (i, &b) in filled.iter().enumerate() {
+                    let i = start + i;
+                    let want = if (P..2 * P).contains(&i) {
+                        0
+                    } else {
+                        pattern(i)
+                    };
+                    assert_eq!(b, want, "octet {i}: {case}");
+                }
+                let mut read = vec![0xeeu8; len];
+                let guarded_bytes = (start + len).min(2 * P).saturating_sub(start.max(P));
+                assert_eq!(read_title(read.as_mut_ptr(), src, len), guarded_bytes);
+                assert!(read == kernel, "un rafraîchissement: {case}");
+                assert!(!read_whole(src, &mut read));
+                let _ = read_pieces(src, &mut read);
+                assert_eq!(protection(at + P), guarded, "une copie en retour: {case}");
+                free_pages(at);
+            }
+        }
+    }
+
+    /// Une écriture dans la mémoire du titre fait d’une page de garde ce
+    /// qu’en fait la copie du noyau (`WriteProcessMemory`) : elle écrit la
+    /// page et en retire la garde (vu sur la ferme et sur le PC). Seule une
+    /// lecture la remet ([`guard_again`]).
+    #[test]
+    fn writes_treat_guard_pages_as_the_kernel_does() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READWRITE};
+        const P: usize = KERNEL_PAGE;
+        for (start, len) in [(P, 1), (P - 7, 16), (2 * P - 8, 64), (0, 3 * P)] {
+            let ours = vec![0x5au8; len];
+            let [direct, kernel] = [(); 2].map(|_| kernel_pages(3));
+            for at in [direct, kernel] {
+                set_protection(at + P, PAGE_READWRITE | PAGE_GUARD);
+            }
+            write_title(direct + start, ours.as_ptr(), len);
+            crate::host::write_mapped((kernel + start) as *mut u8, ours.as_ptr(), len);
+            let guards = [direct, kernel].map(|at| protection(at + P));
+            for at in [direct, kernel] {
+                set_protection(at + P, PAGE_READWRITE);
+            }
+            let written = |at: usize| title(at, 3 * P).iter().filter(|&&b| b == 0x5a).count();
+            assert_eq!(
+                (guards[0], written(direct)),
+                (guards[1], written(kernel)),
+                "(protection, octets écrits) directs, puis du noyau: {start}+{len}"
+            );
+            assert!(title(direct, 3 * P) == title(kernel, 3 * P));
+            free_pages(direct);
+            free_pages(kernel);
+        }
+    }
+
+    /// Deux threads remplissent depuis la même page de garde : aucun
+    /// n’arrête le processus, et la page est gardée quand ils ont fini.
+    /// (L’un peut lire les octets de la page entre la faute de l’autre et la
+    /// remise de la garde.) Ported from VIctory#1010 (79c9b93) by TG0000.
+    #[test]
+    fn two_fills_of_a_guard_page() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READWRITE};
+        let at = kernel_pages(1);
+        set_protection(at, PAGE_READWRITE | PAGE_GUARD);
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    let mut to = [0u8; 256];
+                    for _ in 0..2000 {
+                        // SAFETY: `to` a la place.
+                        unsafe { fill_upload(to.as_mut_ptr(), at + 64, to.len()) };
+                        std::hint::black_box(&to);
+                    }
+                });
+            }
+        });
+        assert_eq!(protection(at), PAGE_READWRITE | PAGE_GUARD);
+        free_pages(at);
+    }
+
+    /// Le titre se sert d’une page de garde (il l’arme, et un accès lui est
+    /// signalé une fois) pendant que des remplissages l’atteignent : ses
+    /// accès lui sont signalés, sauf ceux qui tombent juste après la faute
+    /// d’un remplissage, et la page finit gardée. Ported from VIctory#1010
+    /// (79c9b93) by TG0000.
+    #[test]
+    fn a_guard_page_the_title_touches_meanwhile() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+        use windows_sys::Win32::Foundation::STATUS_GUARD_PAGE_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+            EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READWRITE};
+        static PAGE_AT: AtomicUsize = AtomicUsize::new(0);
+        static REPORTED: AtomicUsize = AtomicUsize::new(0);
+        /// Le gestionnaire du titre : ses propres accès à sa page de garde.
+        unsafe extern "system" fn title(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched.
+            let (r, c) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
+            let ours = r.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION
+                && r.NumberParameters >= 2
+                && r.ExceptionInformation[1] / KERNEL_PAGE * KERNEL_PAGE == PAGE_AT.load(Relaxed)
+                && !copy_instruction(c.Rip as usize);
+            if ours {
+                REPORTED.fetch_add(1, Relaxed);
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            }
+        }
+        let at = kernel_pages(1);
+        PAGE_AT.store(at, Relaxed);
+        // SAFETY: retiré plus bas ; il ne prend que les fautes de sa page.
+        let handler = unsafe { AddVectoredExceptionHandler(1, Some(title)) };
+        let stop = AtomicBool::new(false);
+        let mut touches = 0;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut to = [0u8; 64];
+                while !stop.load(Relaxed) {
+                    // SAFETY: `to` a la place.
+                    unsafe { fill_upload(to.as_mut_ptr(), at + 64, to.len()) };
+                    std::hint::black_box(&to);
+                    for _ in 0..2000 {
+                        std::hint::spin_loop();
+                    }
+                }
+            });
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while std::time::Instant::now() < until {
+                set_protection(at, PAGE_READWRITE | PAGE_GUARD);
+                // SAFETY: une page engagée ; sa garde va au gestionnaire du titre.
+                std::hint::black_box(unsafe { (at as *const u8).read_volatile() });
+                touches += 1;
+            }
+            stop.store(true, Relaxed);
+        });
+        // SAFETY: le gestionnaire ajouté plus haut.
+        unsafe { RemoveVectoredExceptionHandler(handler) };
+        let reported = REPORTED.load(Relaxed);
+        println!("{reported} des {touches} accès du titre signalés");
+        assert!(reported > 0);
+        set_protection(at, PAGE_READWRITE | PAGE_GUARD);
+        let mut to = [0xeeu8; 64];
+        // SAFETY: `to` a la place.
+        unsafe { fill_upload(to.as_mut_ptr(), at, to.len()) };
+        assert_eq!(to, [0; 64], "des zéros, comme le noyau");
+        assert_eq!(protection(at), PAGE_READWRITE | PAGE_GUARD);
+        free_pages(at);
+    }
+
+    /// Un remplissage vide ne lit ni n’écrit rien, même depuis une page
+    /// illisible ou gardée, ou l’adresse 0, vers une destination factice.
+    #[test]
+    fn an_empty_fill_touches_nothing() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE};
+        let at = kernel_pages(2);
+        set_protection(at, PAGE_NOACCESS);
+        set_protection(at + KERNEL_PAGE, PAGE_READWRITE | PAGE_GUARD);
+        let nowhere = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        for src in [0, at, at + 100, at + KERNEL_PAGE, at + KERNEL_PAGE + 100] {
+            // SAFETY: rien à écrire.
+            unsafe { fill_upload(nowhere, src, 0) };
+        }
+        assert_eq!(protection(at + KERNEL_PAGE), PAGE_READWRITE | PAGE_GUARD);
+        free_pages(at);
+    }
+
+    /// `XTP_SHADOW_ONCE=0` ramène la copie du noyau d’avant W1 pour les
+    /// remplissages aussi : aucune copie directe, les octets du noyau. Dans
+    /// un processus à lui, où la variable est lue à nouveau.
+    #[test]
+    fn fills_take_the_kernels_copy_with_shadow_once_off() {
+        use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+        let test = "shadow::tests::fills_take_the_kernels_copy_with_shadow_once_off";
+        alone_with(test, &[("XTP_SHADOW_ONCE", "0")], || {
+            assert!(!once() && !plain());
+            let at = kernel_pages(3);
+            set_protection(at + KERNEL_PAGE, PAGE_NOACCESS);
+            let (start, len) = (0x40, 3 * KERNEL_PAGE - 0x80);
+            let mut filled = vec![0xeeu8; len];
+            TITLE_READS.set(0);
+            // SAFETY: le vecteur couvre la destination.
+            unsafe { fill_upload(filled.as_mut_ptr(), at + start, len) };
+            assert_eq!(TITLE_READS.get(), 0, "aucune copie directe");
+            for (i, &b) in filled.iter().enumerate() {
+                let i = start + i;
+                let unreadable = (KERNEL_PAGE..2 * KERNEL_PAGE).contains(&i);
+                assert_eq!(b, if unreadable { 0 } else { pattern(i) }, "octet {i}");
+            }
+        });
+    }
+
+    /// Un remplissage lit une copie en retour encore en attente (vues sans
+    /// accès jusqu’au premier toucher) par le gestionnaire, sans apprendre sa
+    /// clé (`crate::watch::read_fault`, `learn` faux) : les octets du GPU, pas
+    /// des zéros. De même à cheval sur deux pages en attente ; pendant que
+    /// d’autres copies en retour publient à côté de sa plage (les octets de
+    /// la plage ne changent pas : pas de mélange d’avant et d’après une
+    /// fusion) ; verrou des gardes tenu par un autre thread (le remplissage
+    /// l’attend) ; et verrou empoisonné (la copie du noyau épingle la page et
+    /// la relit). Dans un processus à lui : la consultation des vues de xmem
+    /// est la sienne.
+    #[test]
+    fn fills_read_pending_copy_backs_whatever_the_guards_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let test = "shadow::tests::fills_read_pending_copy_backs_whatever_the_guards_lock";
+        /// Ce que fait la prochaine consultation des vues, verrou des gardes
+        /// tenu : 1 le garder 200 ms, 2 paniquer (il est alors empoisonné).
+        static NEXT: AtomicU8 = AtomicU8::new(0);
+        static HELD: AtomicBool = AtomicBool::new(false);
+        static LEFT: AtomicBool = AtomicBool::new(false);
+        /// Les adresses de blocs qui montrent la même page, comme l’index de
+        /// xmem.
+        static SAME: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        fn other_views(range: std::ops::Range<usize>, out: &mut Vec<(usize, usize)>) {
+            match NEXT.swap(0, SeqCst) {
+                1 => {
+                    HELD.store(true, SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    LEFT.store(true, SeqCst);
+                }
+                2 => panic!("une panique, verrou des gardes tenu"),
+                _ => {}
+            }
+            for &(a, b) in SAME.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                for (at, other) in [(a, b), (b, a)] {
+                    if range.contains(&at) {
+                        out.push((at, other));
+                    }
+                }
+            }
+        }
+        alone(test, || {
+            let Some(gpu) = crate::testgpu::device(test) else {
+                return;
+            };
+            let host = gpu.host();
+            let local = tempfile::tempdir().unwrap();
+            crate::configure_copy_back(Some(local.path().join("fills.v1")));
+            // Avant celle du montage : la première posée reste.
+            crate::watch::set_alias_lookup(other_views);
+            let elsewhere = kernel_pages(PAGE / KERNEL_PAGE);
+            crate::watch::tests::with_physical_views(|at, alias, _private| {
+                SAME.lock()
+                    .unwrap()
+                    .extend((0..4).map(|k| (at + k * PAGE, alias + k * PAGE)));
+                register(1, at as u64, (4 * PAGE) as u64);
+                let s = find(at as u64, (4 * PAGE) as u64).unwrap();
+                s.update(at, 4 * PAGE);
+                let publish = |address: usize, byte: u8| {
+                    let id = submission();
+                    s.writing_by(id, address, PAGE, 123);
+                    s.set_host(address + 7, 1, byte);
+                    s.copy_back(id, address, PAGE)
+                };
+                let fill = |from: usize, len: usize| {
+                    let mut bytes = vec![0xeeu8; len];
+                    // SAFETY: le vecteur couvre la destination.
+                    unsafe { fill_upload(bytes.as_mut_ptr(), from, len) };
+                    bytes
+                };
+                // `len` octets à zéro, sauf `byte` à l’index `at`.
+                let one = |len: usize, at: usize, byte: u8| {
+                    let mut bytes = vec![0u8; len];
+                    bytes[at] = byte;
+                    bytes
+                };
+
+                assert_eq!(publish(at + PAGE, 0xa1), 0, "en attente");
+                assert!(fill(at + PAGE, PAGE) == one(PAGE, 7, 0xa1));
+                assert_eq!(
+                    publish(at + PAGE, 0xa2),
+                    0,
+                    "un remplissage n’apprend pas la clé"
+                );
+                assert!(
+                    fill(alias + PAGE, PAGE) == one(PAGE, 7, 0xa2),
+                    "l’autre vue"
+                );
+
+                // À cheval sur deux pages en attente.
+                assert_eq!(publish(at, 0x51), 0);
+                assert_eq!(publish(at + PAGE, 0xa3), 0);
+                assert!(fill(at + 16, PAGE) == one(PAGE, PAGE - 16 + 7, 0xa3));
+
+                // D’autres copies en retour publient à côté de la plage
+                // `[at + 16, at + PAGE + 4)` pendant qu’elle est remplie.
+                let done = AtomicBool::new(false);
+                let mut fills = 0;
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        for i in 0..200u8 {
+                            publish(at + usize::from(i % 2) * PAGE, i | 1);
+                        }
+                        done.store(true, SeqCst);
+                    });
+                    while !done.load(SeqCst) {
+                        assert!(fill(at + 16, PAGE - 12) == vec![0; PAGE - 12]);
+                        fills += 1;
+                    }
+                });
+                println!("{fills} remplissages pendant 200 publications");
+
+                // Verrou des gardes tenu par un autre thread : le
+                // remplissage l’attend.
+                assert_eq!(publish(at + 2 * PAGE, 0xb1), 0);
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        NEXT.store(1, SeqCst);
+                        crate::watch::title_memory_remapped(elsewhere, PAGE);
+                    });
+                    while !HELD.load(SeqCst) {
+                        std::thread::yield_now();
+                    }
+                    let held = !LEFT.load(SeqCst);
+                    assert!(fill(at + 2 * PAGE, PAGE) == one(PAGE, 7, 0xb1));
+                    assert!(!held || LEFT.load(SeqCst), "fini une fois le verrou rendu");
+                });
+
+                // Verrou des gardes empoisonné : le gestionnaire renonce, la
+                // copie du noyau épingle la page et la relit.
+                assert_eq!(publish(at + 3 * PAGE, 0xc1), 0);
+                NEXT.store(2, SeqCst);
+                let poisoned = std::panic::catch_unwind(|| {
+                    crate::watch::title_memory_remapped(elsewhere, PAGE);
+                });
+                assert!(poisoned.is_err());
+                assert!(
+                    fill(at + 3 * PAGE, PAGE) == one(PAGE, 7, 0xc1),
+                    "pas des zéros"
+                );
+                SAME.lock().unwrap().clear();
+                host.drain();
+                unregister(1, at as u64);
+            });
+        });
+    }
+
+    /// Mesure (`--ignored --nocapture`) : des remplissages de tailles
+    /// courantes, par la copie du noyau (`ReadProcessMemory`, avant
+    /// 0751149) puis par lectures directes, vers de la mémoire en cache, de
+    /// la mémoire combinée en écriture (`PAGE_WRITECOMBINE`, comme le tas
+    /// d’upload d’un GPU discret) et un tampon d’upload de l’appareil de
+    /// test. VIctory #1010 prévient que `rep movsb` vers de la mémoire
+    /// combinée en écriture est lent sur certains processeurs.
+    #[test]
+    #[ignore = "benchmark"]
+    fn fills_cost() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_WRITECOMBINE, VirtualAlloc,
+        };
+        const LEN: usize = 4 << 20;
+        let test = "shadow::tests::fills_cost";
+        let gpu = crate::testgpu::device(test);
+        let src = kernel_pages(LEN / KERNEL_PAGE);
+        let mut cached = vec![0u8; LEN];
+        // SAFETY: une réservation neuve, à nous, jamais libérée.
+        let combined = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE | PAGE_WRITECOMBINE,
+            )
+        } as *mut u8;
+        assert!(!combined.is_null());
+        let upload = gpu
+            .as_ref()
+            .and_then(|gpu| gpu.host().upload_buffer(LEN as u64));
+        let mut destinations = vec![
+            ("en cache", cached.as_mut_ptr()),
+            ("combinée en écriture", combined),
+        ];
+        if let Some((_, data)) = &upload {
+            destinations.push(("tampon d’upload", *data));
+        }
+        println!(
+            "BENCH {}; remplissages directs : {}",
+            std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default(),
+            plain()
+        );
+        for (name, dst) in destinations {
+            for size in [64usize, 256, 1024, 4096, 64 << 10] {
+                let count = ((32 << 20) / size).clamp(2_000, 200_000);
+                let mut ns = [0f64; 2];
+                for (k, kernel) in [true, false].into_iter().enumerate() {
+                    let mut best = f64::MAX;
+                    for _ in 0..5 {
+                        let started = std::time::Instant::now();
+                        for i in 0..count {
+                            let at = (i * size * 7) % (LEN - size) / 64 * 64;
+                            // SAFETY: dans les deux zones de LEN octets.
+                            let (to, from) = (unsafe { dst.add(at) }, src + at);
+                            if kernel {
+                                crate::host::copy_mapped(to, from as *const u8, size, false);
+                            } else {
+                                read_title(to, from, size);
+                            }
+                        }
+                        best = best.min(started.elapsed().as_secs_f64() * 1e9 / count as f64);
+                    }
+                    ns[k] = best;
+                }
+                println!(
+                    "BENCH {name:>22}, {size:>6} o : noyau {:>9.0} ns ({:>5.2} Go/s), \
+                     direct {:>9.0} ns ({:>5.2} Go/s), gain x{:.1}",
+                    ns[0],
+                    size as f64 / ns[0],
+                    ns[1],
+                    size as f64 / ns[1],
+                    ns[0] / ns[1]
+                );
+            }
+        }
+        drop(upload);
     }
 
     /// The copy-back's scans by 8 bytes find what the byte loop found: the
