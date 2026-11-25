@@ -32,8 +32,8 @@
 //! for draws and dispatches, the output of a UAV clear or of the
 //! FidelityFX stand-in's upscale. `<width>` leaves narrower outputs
 //! unsampled (0 or empty: every one). Each sample is [`ROWS`] rows across
-//! the texture (a depth texture is copied whole, as D3D12 asks), read back
-//! at the present; the read-back memory is [`BUDGET`] bytes a frame.
+//! each depth slice of subresource zero, read back at the present.
+//! The read-back memory is [`BUDGET`] bytes a frame.
 //!
 //! `XTP_PASS_INPUTS=<program hash>` also samples the textures bound by
 //! each matching op just before it runs. Volume samples are reported by
@@ -915,6 +915,7 @@ struct Dump {
     readback: Readback,
     /// The narrowest output sampled.
     width: u64,
+    input_program: Option<&'static str>,
 }
 
 impl Dump {
@@ -930,6 +931,7 @@ impl Dump {
                 failed: false,
             },
             width,
+            input_program: input_program(),
         }
     }
 
@@ -946,6 +948,14 @@ impl Dump {
         }
     }
 
+    fn binding(&mut self, list: &HostList, resource: usize, slot: u8, offset: u32) {
+        let bindings = &mut self.open.entry(key(list)).or_default().bindings;
+        let binding = (resource, Out::Binding(slot, offset));
+        if !bindings.contains(&binding) {
+            bindings.push(binding);
+        }
+    }
+
     /// An op about to be recorded in `list`: a new pass if it writes other
     /// outputs than the pass before, whose outputs are sampled first.
     fn op(&mut self, device: &ID3D12Device, list: &HostList, text: &str) {
@@ -953,6 +963,7 @@ impl Dump {
             open,
             readback,
             width,
+            input_program,
             ..
         } = self;
         let r = open.entry(key(list)).or_default();
@@ -998,7 +1009,7 @@ impl Dump {
         let mut before = Vec::new();
         if shader_op {
             let bindings = r.bindings.drain(..);
-            if input_program().is_some_and(|hash| programs(text).contains(&hash)) {
+            if input_program.is_some_and(|hash| programs(text).contains(&hash)) {
                 before.extend(bindings.map(|(r, how)| snapshot(readback, device, list, r, how, 0)));
             }
         }
@@ -1326,7 +1337,7 @@ fn sample(
     };
     const COPY_SOURCE: u32 = 0x800;
     let before = list.transition(resource, COPY_SOURCE);
-    let mut rows = Vec::with_capacity(ys.len());
+    let mut rows = Vec::with_capacity(ys.len() * f.Depth as usize);
     // SAFETY: an open list; a live texture (the list holds its host copy)
     // and our read-back buffer; every copy inside the bytes reserved.
     unsafe {
@@ -1888,16 +1899,9 @@ pub(crate) fn binding(list: &HostList, resource: This, slot: u8, offset: u32) {
         return;
     }
     CURRENT.set(key(list));
-    let mut guard = dump();
-    let r = guard
+    dump()
         .get_or_insert_with(|| Dump::new(BUDGET, dump_width()))
-        .open
-        .entry(key(list))
-        .or_default();
-    let binding = (resource as usize, Out::Binding(slot, offset));
-    if !r.bindings.contains(&binding) {
-        r.bindings.push(binding);
-    }
+        .binding(list, resource as usize, slot, offset);
 }
 
 /// `readable`: a texture the op being prepared in `list` binds for
@@ -2189,14 +2193,14 @@ mod tests {
         let texture = crate::resource::host_resource(resource).unwrap();
         let list = host.new_list().unwrap();
         crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
-        for (z, value) in [0.0, 1.0].into_iter().enumerate() {
+        let clear = |z: u32, value: f32| {
             let view = D3D12_RENDER_TARGET_VIEW_DESC {
                 Format: DXGI_FORMAT_R8_UNORM,
                 ViewDimension: D3D12_RTV_DIMENSION_TEXTURE3D,
                 Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
                     Texture3D: D3D12_TEX3D_RTV {
                         MipSlice: 0,
-                        FirstWSlice: z as u32,
+                        FirstWSlice: z,
                         WSize: 1,
                     },
                 },
@@ -2204,25 +2208,38 @@ mod tests {
             let rtv = host.rtv(texture, Some(&view));
             // SAFETY: the RTV covers one slice of this target on the open list.
             unsafe { list.list.ClearRenderTargetView(rtv, &[value; 4], None) };
-        }
+        };
+        clear(0, 0.0);
+        clear(1, 1.0);
         let mut dump = Dump::new(4096, 0);
+        dump.input_program = Some("0123456789abcdef");
+        dump.binding(&list, resource as usize, 1, 16);
         dump.written(&list, resource as usize);
         dump.op(&host.device, &list, "alias copy while preparing a table");
-        dump.op(&host.device, &list, "dispatch 1x1x1");
+        dump.op(&host.device, &list, "dispatch 1x1x1 | 0123456789abcdef:");
+        clear(1, 0.0);
         dump.closed(&host.device, &list);
         list.close();
         host.execute(&[&list]);
         dump.submitted(&[&list]);
         host.drain();
         let text = dump.report(1).unwrap();
+        let (outputs, ops) = text.split_once("== Ops").unwrap();
         for expected in [
+            "s1+16 ",
+            "before it: lit 50.0%",
             "slice 0: lit 0.0%",
             "slice 1: lit 100.0%",
             "texel (2,1,0): [0.0] bytes [00]",
             "texel (2,1,1): [1.0] bytes [ff]",
         ] {
-            assert!(text.contains(expected), "{text}");
+            assert!(ops.contains(expected), "{ops}");
         }
+        assert!(outputs.contains("slice 1: lit 0.0%"), "{outputs}");
+        assert!(
+            outputs.contains("texel (2,1,1): [0.0] bytes [00]"),
+            "{outputs}"
+        );
         release(resource);
     }
 
