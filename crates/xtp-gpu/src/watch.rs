@@ -1169,6 +1169,11 @@ pub unsafe extern "system" fn title_virtual_protect(
     previous: *mut u32,
 ) -> i32 {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    // No plain read of title memory runs over the range until the call is
+    // made, and reads forget what they learned of its pages: a guard the
+    // title puts on now is never met by one (`crate::shadow::title_changing`,
+    // first: it waits for reads, which may wait for the guards' lock).
+    let _reads = crate::shadow::title_changing(address as usize, len);
     let range = blocks(address as usize, len);
     let mut g = settled(range.clone());
     if len != 0 {
@@ -1218,6 +1223,10 @@ pub unsafe extern "system" fn title_virtual_protect(
 /// are opened with it. The runtime forgets it in its index once it is
 /// gone, before the report after.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Reads of title memory forget what they learned of its pages, once the
+    // reads under way are done (`crate::shadow::title_changing`; before the
+    // guards' lock, which reads may wait for).
+    drop(crate::shadow::title_changing(at, len));
     crate::resource::memory_remapped(at, len);
     let range = blocks(at, len);
     let mut lock = settled(range.clone());
