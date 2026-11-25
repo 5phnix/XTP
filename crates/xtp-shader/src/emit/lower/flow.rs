@@ -7,7 +7,9 @@
 //! back edge goes through a latch of its own that sends a lane at the limit
 //! to the abort block (Marvisak/VIctory#1483). Where a group barrier can
 //! follow a loop, the lanes that end keep passing group barriers until
-//! every thread of the group has ended ([`Drain`]).
+//! every thread of the group has ended ([`Drain`]). With
+//! `XTP_SHADER_LOOP_COUNT` a lane stopped so first adds itself to its
+//! pipeline's loop-limit counter (`Lower::count_exit`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -807,19 +809,33 @@ impl<'a> Lower<'a> {
         latch
     }
 
-    /// The block a lane stopped by [`LOOP_LIMIT`](super::LOOP_LIMIT) leaves
+    /// The block a lane stopped by [`LOOP_LIMIT`](super::LOOP_LIMIT) (or by
+    /// a spin wait's or a counted loop's limit, or by the budget) leaves
     /// through, from DXIL block `from`: where lanes drain (`passed`, the
     /// barriers it has passed), [`Self::drain_from`]; elsewhere the end of
-    /// the program (a pixel discards).
-    // shortcut: limit hits are not reported to the host.
+    /// the program (a pixel discards). With [`crate::emit::loop_count`] the
+    /// lane counts itself there first ([`Self::count_exit`]); without it,
+    /// limit hits are not reported to the host, and the block is as it was.
     pub(super) fn abort_block(&mut self, from: usize, passed: Option<V>) -> usize {
         if let Some(n) = passed {
-            return self.drain_from(from, n);
+            if !crate::emit::loop_count() {
+                return self.drain_from(from, n);
+            }
+            // Lanes that end normally drain too: the count goes on an edge
+            // of its own.
+            let exit = self.s.m.new_block();
+            self.count_exit(exit);
+            let drain = self.drain_from(exit, n);
+            self.s.m.terminate(exit, Term::Br(drain));
+            return exit;
         }
         if let Some(a) = self.abort {
             return a;
         }
         let a = self.s.m.new_block();
+        if crate::emit::loop_count() {
+            self.count_exit(a);
+        }
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s
@@ -828,6 +844,32 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(a, Term::Ret);
         self.abort = Some(a);
         a
+    }
+
+    /// In DXIL block `block`, which only lanes stopped at a limit or at the
+    /// budget enter: an atomic add of those lanes to the first dword of the
+    /// loop-limit counter (`u0` in
+    /// [`LOOP_COUNTER_SPACE`](crate::emit::LOOP_COUNTER_SPACE)), which the
+    /// host points at the pipeline's own counter. Each lane adds 1: a host
+    /// lane that carries two console lanes (paired lanes) runs the atomic
+    /// once for each, as every atomic of the paired flow. In the console
+    /// flow every lane of a stopped wave counts, active in the console's
+    /// EXEC or not; a pixel's helper lanes write no UAV, so they do not.
+    fn count_exit(&mut self, block: usize) {
+        let h = self.s.loop_counter_handle(block);
+        let i32t = self.s.t.i32;
+        let lanes = self.s.m.i32(1);
+        // Add (0), at byte 0.
+        let (add, at) = (self.s.m.i32(0), self.s.m.i32(0));
+        let undef = self.s.m.undef(i32t);
+        self.s.op(
+            block,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, add, at, undef, undef, lanes],
+        );
     }
 
     /// Whether the program's lanes drain ([`Drain`]): a compute or mesh
@@ -2397,5 +2439,236 @@ mod tests {
             ),
             "{r:?}"
         );
+    }
+
+    /// A divergent loop: each lane counts v1 up to `bound` (v0, the thread
+    /// id, by default) and leaves once v1 >= it (an exit mask, EXEC
+    /// narrowed each round). `barrier` adds an `s_barrier` after the loop,
+    /// so that the lanes of a group drain ([`super::Drain`]).
+    fn divergent_loop(bound: Option<u32>, barrier: bool) -> Vec<u32> {
+        let mut words = vec![
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_02FF, // v_mov_b32 v2, literal
+            bound.unwrap_or(0),
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0x4A02_0281, // loop: v_add_nc_u32 v1, 1, v1
+            0x7D8C_0101, // v_cmp_ge_u32 vcc_lo, v1, v0
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+        ];
+        if bound.is_some() {
+            words[5] = 0x7D8C_0501; // v_cmp_ge_u32 vcc_lo, v1, v2
+        }
+        if barrier {
+            words.push(0xBF8A_0000); // s_barrier
+        }
+        words.push(S_ENDPGM);
+        words
+    }
+
+    /// A pixel (else vertex) program of `words` with no inputs or outputs.
+    fn graphics(words: &[u32], pixel: bool) -> crate::NativeProgram {
+        crate::NativeProgram {
+            stage: if pixel {
+                crate::HwStage::Ps
+            } else {
+                crate::HwStage::Vs
+            },
+            io: if pixel {
+                StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    rsrc2: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                }
+            } else {
+                StageIo::Vs {
+                    inputs: vec![],
+                    outputs: vec![],
+                }
+            },
+            ..compute(words, false)
+        }
+    }
+
+    /// `native` translated for any host, with the loop-limit counter on
+    /// (`count`) or as the switch says.
+    fn translated(native: &crate::NativeProgram, count: bool) -> crate::emit::HostShader {
+        let emit = || emit_for(native, crate::emit::Target::ANY).expect("translates");
+        if count {
+            crate::emit::with_loop_count(emit)
+        } else {
+            emit()
+        }
+    }
+
+    /// `XTP_SHADER_LOOP_COUNT`: set to anything but `0` or nothing.
+    #[test]
+    fn the_loop_count_switch_is_off_unless_set_to_something_but_0() {
+        use std::ffi::OsStr;
+        assert!(!crate::emit::parse_loop_count(None));
+        assert!(!crate::emit::parse_loop_count(Some(OsStr::new(""))));
+        assert!(!crate::emit::parse_loop_count(Some(OsStr::new("0"))));
+        assert!(crate::emit::parse_loop_count(Some(OsStr::new("1"))));
+        // On for the translations in its scope only, and off again after.
+        let before = crate::emit::loop_count();
+        assert!(crate::emit::with_loop_count(crate::emit::loop_count));
+        assert_eq!(crate::emit::loop_count(), before);
+    }
+
+    /// With the counter, a program whose loop can stop at a limit declares
+    /// it (a raw UAV at `u0` in its space, in `PSV0`) and calls one atomic,
+    /// in the compute, pixel and vertex stages, with lanes that drain or
+    /// not. Without it, nothing of the counter is there. A program without
+    /// a limited loop is the same with the switch on or off.
+    #[test]
+    fn a_limited_loop_declares_the_loop_counter_only_behind_the_switch() {
+        if crate::emit::loop_count() {
+            eprintln!("XTP_SHADER_LOOP_COUNT is set: the switch's off side is not checked");
+            return;
+        }
+        let looping = [
+            ("compute", compute(&divergent_loop(None, false), false)),
+            (
+                "compute, draining",
+                compute(&divergent_loop(None, true), false),
+            ),
+            ("pixel", graphics(&divergent_loop(Some(100), false), true)),
+            ("vertex", graphics(&divergent_loop(Some(100), false), false)),
+        ];
+        for (what, native) in &looping {
+            let off = translated(native, false);
+            let on = translated(native, true);
+            assert!(!off.loop_counter(), "{what}: declared without the switch");
+            assert!(on.loop_counter(), "{what}: not declared with the switch");
+            assert_ne!(off.dxil, on.dxil, "{what}");
+            // Off, the translation is the one before the switch was set.
+            assert_eq!(translated(native, false).dxil, off.dxil, "{what}");
+        }
+        let straight = compute(&[0x7E02_0280, S_ENDPGM], false);
+        let (off, on) = (translated(&straight, false), translated(&straight, true));
+        assert!(!on.loop_counter());
+        assert_eq!(off.dxil, on.dxil, "no limited loop: nothing to count");
+    }
+
+    /// The validator, where one is installed, takes the counted programs
+    /// (the counter's binding and atomic, the drain's extra edge), and
+    /// `dxc -dumpbin` shows the compute ones' one atomic add of 1 to byte 0
+    /// of the counter's handle, which binds `u0` in its space.
+    #[cfg(windows)]
+    #[test]
+    fn the_loop_counter_validates_and_adds_one_per_stopped_lane() {
+        let mut validator = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        let looping = [
+            ("compute", compute(&divergent_loop(None, false), false)),
+            (
+                "compute, draining",
+                compute(&divergent_loop(None, true), false),
+            ),
+            ("pixel", graphics(&divergent_loop(Some(100), false), true)),
+            ("vertex", graphics(&divergent_loop(Some(100), false), false)),
+        ];
+        for (what, native) in &looping {
+            let mut on = translated(native, true);
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut on.dxil)
+                    .unwrap_or_else(|e| panic!("{what}: validation: {e}"));
+            }
+            // dxc -dumpbin stops with an internal error (0x80aa0018) on
+            // these pixel and vertex programs without outputs, counted or
+            // not: the validator alone checks them.
+            if native.stage != crate::HwStage::Cs {
+                continue;
+            }
+            let Some(listing) = crate::emit::shader::tests::listing(&on) else {
+                continue;
+            };
+            let atomics: Vec<&str> = listing
+                .lines()
+                .filter(|l| l.contains("call i32 @dx.op.atomicBinOp.i32("))
+                .collect();
+            assert_eq!(atomics.len(), 1, "{what}: {atomics:?}");
+            // Opcode 78, add (0), at byte 0, 1 lane.
+            assert!(
+                atomics[0].contains("(i32 78, %dx.types.Handle")
+                    && atomics[0].contains(", i32 0, i32 0, i32 undef, i32 undef, i32 1)"),
+                "{what}: {}",
+                atomics[0]
+            );
+            let space = crate::emit::LOOP_COUNTER_SPACE;
+            assert!(
+                listing.contains(&format!(
+                    "@dx.op.createHandleFromBinding(i32 217, %dx.types.ResBind {{ i32 0, i32 0, i32 {space}, i8 1 }}"
+                )),
+                "{what}: the counter's binding"
+            );
+        }
+    }
+
+    /// In the console flow with paired lanes (a wave64 group of 128 threads
+    /// on a host of 32-lane waves), each physical lane carries two console
+    /// lanes and runs every atomic once for each, the counter's too: each
+    /// copy adds 1, so a group the limit stops whole adds its 128 console
+    /// lanes, not 256. The validator, where one is installed, takes it; the
+    /// listing (`dxc -dumpbin`) shows the two adds of 1.
+    #[cfg(windows)]
+    #[test]
+    fn paired_lanes_add_one_per_console_lane_to_the_loop_counter() {
+        // Lane t loops t + 1 times and counts the exit mask inside the loop:
+        // a lane mask read as data, which takes the console flow.
+        let words = [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE8A_0480, // s_mov_b64 s[10:11], 0
+            0x4A02_0281, // 8: v_add_nc_u32 v1, 1, v1
+            0x7D88_0101, // v_cmp_gt_u32 vcc, v1, v0
+            0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+            0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+            0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+            0xBF89_FFFA, // s_cbranch_execnz -> 8
+            0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+            0x7E04_0209, // v_mov_b32 v2, s9
+            S_ENDPGM,
+        ];
+        let native = crate::emit::tests::compute_of(&words, true, 128);
+        let wave32 = crate::emit::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+            stride_table: false,
+        };
+        let mut on = crate::emit::with_loop_count(|| emit_for(&native, wave32))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let summary = crate::emit::last_module_summary();
+        assert!(
+            summary.ends_with("console flow with paired lanes"),
+            "{summary}"
+        );
+        assert!(on.loop_counter());
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut on.dxil)
+                .unwrap_or_else(|e| panic!("validation: {e}"));
+        }
+        let Some(listing) = crate::emit::shader::tests::listing(&on) else {
+            return;
+        };
+        let atomics: Vec<&str> = listing
+            .lines()
+            .filter(|l| l.contains("call i32 @dx.op.atomicBinOp.i32("))
+            .collect();
+        // One per console lane of the pair, each an add (0) of 1 at byte 0.
+        assert_eq!(atomics.len(), 2, "{atomics:?}");
+        for atomic in &atomics {
+            assert!(
+                atomic.contains(", i32 0, i32 0, i32 undef, i32 undef, i32 1)"),
+                "{atomic}"
+            );
+        }
     }
 }

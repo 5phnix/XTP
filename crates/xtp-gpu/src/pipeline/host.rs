@@ -12,7 +12,9 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
-use xtp_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+use xtp_shader::emit::{
+    LOOP_COUNTER_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE,
+};
 
 use super::{Shader, Translated};
 use crate::host::host;
@@ -632,6 +634,12 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// With `XTP_SHADER_LOOP_COUNT`, where a shader of it counts the lanes
+    /// stopped at a loop's limit or budget: the root parameter of the
+    /// counter (a root UAV, `u0` in [`LOOP_COUNTER_SPACE`], for every
+    /// stage) and the pipeline's slot, whose counter (16-byte aligned)
+    /// draws and dispatches bind there (`crate::loopstat`).
+    pub(crate) loop_counter: Option<(u32, u32)>,
 }
 
 /// Pipelines that got no host pipeline since the start, by reason.
@@ -1124,6 +1132,27 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // XTP_SHADER_LOOP_COUNT: a shader that counts the lanes it stops at a
+        // limit writes the pipeline's counter, a root UAV all stages see
+        // (`crate::loopstat`).
+        let mut loop_counter = None;
+        if translations.iter().any(|t| t.host.loop_counter()) {
+            let Some(slot) = crate::loopstat::slot(&format!("{shaders:?}")) else {
+                return refuse("its loop-limit counter has no buffer", shaders);
+            };
+            loop_counter = Some((params.len() as u32, slot));
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: LOOP_COUNTER_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some()) {
                 Ok(root) => root,
@@ -1182,6 +1211,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                loop_counter,
             });
         }
         let Some(g) = g else {
@@ -1227,6 +1257,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                loop_counter,
             });
         }
 
@@ -1383,6 +1414,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            loop_counter,
         })
     }
 }
@@ -2718,6 +2750,166 @@ mod tests {
             || unsafe { host.device.CreateComputePipelineState(&desc) },
         );
         made.is_err()
+    }
+
+    /// `XTP_SHADER_LOOP_COUNT` end to end (S12): a compute program whose
+    /// lanes 0 to 4 loop past the loop limit, translated with the counter,
+    /// gets the counter's root UAV and a slot, and each group it runs adds
+    /// the 5 lanes the limit stops to that slot's counter. Translated
+    /// without the counter, its pipeline has neither.
+    ///
+    /// Four pipelines of it take four slots, each residue modulo 4 for
+    /// consecutive ones: each binds its counter at a 16-byte aligned
+    /// address, which the debug layer checks of a raw view's
+    /// (`XTP_D3D12_DEBUG=1`), and counts its own groups alone. A snapshot
+    /// recorded between two lists, as the present's list records one
+    /// (`loopstat::record`), holds what the lists before it counted, not
+    /// what the list after it adds to the live counters.
+    #[test]
+    fn a_loop_counter_counts_the_lanes_a_limit_stops() {
+        use crate::testgpu::TitleList;
+        use xtp_shader::native::{ComputeIo, StageIo};
+        let test = "pipeline::host::tests::a_loop_counter_counts_the_lanes_a_limit_stops";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let device = gpu.host();
+        // Lane t loops to 1, or past any limit where t < 5. The loop steps
+        // by a register, so it is no counted loop: the general limit.
+        let words = [
+            0x7E02_0280u32, // v_mov_b32 v1, 0
+            0x7E0A_0281,    // v_mov_b32 v5, 1
+            0x7E08_0281,    // v_mov_b32 v4, 1
+            0x7E0C_02FF,
+            0x7FFF_FFFF, // v_mov_b32 v6, 0x7fffffff
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0
+            0x0208_0D04, // v_cndmask_b32 v4, v4, v6, vcc_lo
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0x4A02_0305, // loop: v_add_nc_u32 v1, v5, v1
+            0x7D8C_0901, // v_cmp_ge_u32 vcc_lo, v1, v4
+            0x8808_086A, // s_or_b32 s8, vcc_lo, s8
+            0x8A7E_087E, // s_andn2_b32 exec_lo, exec_lo, s8
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+            0xBF81_0000, // s_endpgm
+        ];
+        let (container, template) = crate::shader_cache::wave64_program(false);
+        let native = xtp_shader::NativeProgram {
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            ..template
+        };
+        let translate = || {
+            xtp_shader::emit::translate_program(&container, &native)
+                .unwrap_or_else(|(step, e)| panic!("{}: {e}", step.name()))
+        };
+        let pipeline = |host: xtp_shader::emit::HostShader, hash: &str| {
+            let shader = Arc::new(Shader {
+                stage: "compute",
+                hash: hash.into(),
+                container: Vec::new(),
+                native: std::sync::OnceLock::new(),
+                translated: std::sync::OnceLock::from(Some(Translated {
+                    host,
+                    used: Vec::new(),
+                    wave64: false,
+                })),
+            });
+            HostPipeline::new(&[shader], None).expect("a pipeline")
+        };
+        if !xtp_shader::emit::loop_count() {
+            let plain = translate();
+            assert!(!plain.loop_counter());
+            assert_eq!(pipeline(plain, "loop-count-off").loop_counter, None);
+        }
+        let counting = xtp_shader::emit::with_loop_count(translate);
+        assert!(counting.loop_counter());
+        let pipelines: Vec<HostPipeline> = (0..4)
+            .map(|n| pipeline(counting.clone(), &format!("loop-count-on-{n}")))
+            .collect();
+        let slots: Vec<u32> = pipelines
+            .iter()
+            .map(|p| p.loop_counter.expect("the counter's root parameter").1)
+            .collect();
+        let distinct: std::collections::HashSet<u32> = slots.iter().copied().collect();
+        assert_eq!(distinct.len(), 4, "one slot per pipeline: {slots:?}");
+        let counted = || -> Vec<u32> {
+            slots
+                .iter()
+                .map(|&slot| crate::loopstat::counted(slot).expect("the counters"))
+                .collect()
+        };
+        // Runs `groups` groups of `p` in `l`, its counter bound as the draw
+        // state binds it.
+        let dispatch = |l: &crate::host::HostList, p: &HostPipeline, groups: u32| {
+            let (param, slot) = p.loop_counter.expect("the counter's root parameter");
+            let at = crate::loopstat::address(slot).expect("the slot's address");
+            assert_eq!(at % 16, 0, "slot {slot}: a raw view's address");
+            l.keep(&p.root);
+            l.keep(&p.pso);
+            let user = p.stages[0].user_data;
+            let zeros = vec![0u32; user.map_or(0, |(_, n)| n as usize)];
+            // SAFETY: an open list; live objects kept until it is reset;
+            // the counters live for good.
+            unsafe {
+                l.list.SetComputeRootSignature(&p.root);
+                l.list.SetPipelineState(&p.pso);
+                if let Some((param, n)) = user {
+                    l.list
+                        .SetComputeRoot32BitConstants(param, n, zeros.as_ptr().cast(), 0);
+                }
+                l.list.SetComputeRootUnorderedAccessView(param, at);
+                l.list.Dispatch(groups, 1, 1);
+            }
+        };
+        let before = counted();
+        let list = TitleList::new();
+        let l = list.host();
+        // The root signatures index both heaps directly: both are bound
+        // before one is set.
+        crate::testgpu::bind_indexed_heaps(device, l);
+        for (n, p) in pipelines.iter().enumerate() {
+            dispatch(l, p, n as u32 + 1);
+        }
+        list.run();
+        // SAFETY: a plain device query.
+        assert!(unsafe { device.device.GetDeviceRemovedReason() }.is_ok());
+        let after = counted();
+        for n in 0..4 {
+            assert_eq!(
+                after[n].wrapping_sub(before[n]),
+                5 * (n as u32 + 1),
+                "slot {}, of slots {slots:?}",
+                slots[n]
+            );
+        }
+        // The snapshot, then more lanes stopped after it.
+        let list = TitleList::new();
+        let snapshot = crate::loopstat::snapshot_in(device, &list.host().list)
+            .expect("a snapshot of the counters");
+        list.run();
+        let list = TitleList::new();
+        let l = list.host();
+        crate::testgpu::bind_indexed_heaps(device, l);
+        dispatch(l, &pipelines[0], 2);
+        list.run();
+        // SAFETY: a plain device query.
+        assert!(unsafe { device.device.GetDeviceRemovedReason() }.is_ok());
+        let copied: Vec<u32> = slots
+            .iter()
+            .map(|&slot| snapshot.counted(slot).expect("copied"))
+            .collect();
+        assert_eq!(copied, after, "the snapshot: slots {slots:?}");
+        let live = counted();
+        assert_eq!(live[0].wrapping_sub(after[0]), 10, "slot {}", slots[0]);
+        assert_eq!(live[1..], after[1..], "slots {slots:?}");
     }
 }
 

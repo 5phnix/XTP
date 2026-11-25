@@ -239,6 +239,11 @@ impl<W> Timeline<W> {
     /// wrote some of the overlap since the copy took it. Otherwise the copy
     /// already holds what the refresh would bring, and the GPU's writes
     /// reach it in queue order.
+    ///
+    /// This check tracks earlier writers. If a queued CBV copy still reads
+    /// this host copy, a later submission's CPU refresh of dirty title
+    /// bytes can reach it before that GPU read. Ordering such refreshes
+    /// would require checking in-flight readers of the dirty range too.
     pub(crate) fn refresh_conflict(
         &self,
         copy: usize,
