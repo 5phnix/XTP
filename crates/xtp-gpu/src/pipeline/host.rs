@@ -1250,6 +1250,7 @@ mod tests {
                 let native = super::super::Native {
                     used: Vec::new(),
                     wave64,
+                    threads: None,
                 };
                 let translated = Translated {
                     host: host.clone(),
@@ -1299,6 +1300,7 @@ mod tests {
                 native: std::sync::OnceLock::from(Ok(super::super::Native {
                     used: Vec::new(),
                     wave64: true,
+                    threads: None,
                 })),
                 translated: std::sync::OnceLock::new(),
             })
