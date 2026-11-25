@@ -72,22 +72,51 @@ fn no_tlas(address: u64) {
     }
 }
 
+/// Counts a trace whose title descriptor names no TLAS the decoder can
+/// read (empty, or not a raytracing or buffer SRV) and logs it, at powers
+/// of two: it runs with the empty TLAS, every ray missing, and still
+/// writes its output.
+fn unreadable(handle: u64) {
+    static UNREADABLE: AtomicU64 = AtomicU64::new(0);
+    let traces = UNREADABLE.fetch_add(1, Ordering::Relaxed) + 1;
+    if traces.is_power_of_two() {
+        tracing::warn!(
+            handle = format_args!("{handle:#x}"),
+            traces,
+            "a trace's TLAS descriptor names no TLAS: it runs with an empty TLAS, every ray              missing"
+        );
+    }
+}
+
+/// The title address of the TLAS the descriptor at `handle` names, or 0
+/// (none: the empty TLAS) when it names none ([`unreadable`]).
+fn trace_address(handle: u64) -> u64 {
+    descriptor_address(handle).unwrap_or_else(|| {
+        unreadable(handle);
+        0
+    })
+}
+
 /// Writes the GPU address of the TLAS published at title `address` in
 /// queue order to the two words at `mapped` when the recording is
-/// submitted, or that of an empty TLAS ([`empty_tlas`]). The recording
-/// retains the TLAS it binds and that generation's BLAS. `None` without
-/// an empty TLAS.
+/// submitted, or that of an empty TLAS ([`empty_tlas`]), as for address 0.
+/// The recording retains the TLAS it binds, that generation's BLAS and its
+/// stand-in BLAS. `None` without an empty TLAS.
 fn bind_at_submission(rec: &Recorder<'_>, address: u64, mapped: usize) -> Option<()> {
-    let empty = empty_tlas(rec)?;
-    let slot = registry().trace_slot(address);
+    let (empty, _) = empty_tlas(rec)?;
+    let slot = if address == 0 {
+        Slot::default()
+    } else {
+        registry().trace_slot(address)
+    };
     let retained = Mutex::new(None);
     rec.list.defer_host((0, 0), move || {
         let tlas = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let binding = tlas.and_then(|s| Some((s.result, s.instances?.current())));
+        let binding = tlas.and_then(|s| Some((s.result, s.instances?.current(), s.holds)));
         let gpu = binding
             .as_ref()
-            .map_or_else(|| empty.gpu(), |(r, _)| r.gpu());
-        if binding.is_none() {
+            .map_or_else(|| empty.gpu(), |(r, ..)| r.gpu());
+        if binding.is_none() && address != 0 {
             no_tlas(address);
         }
         // SAFETY: two aligned words in the recording's private upload. Replay
@@ -99,7 +128,8 @@ fn bind_at_submission(rec: &Recorder<'_>, address: u64, mapped: usize) -> Option
 }
 
 /// Dispatches a trace with this descriptor's TLAS at its place in submission
-/// order, or an empty TLAS where none is published: every ray misses.
+/// order, or an empty TLAS where none is published or the descriptor names
+/// none: every ray misses, and the program still writes its output.
 /// The caller sets the remaining root parameters and the compute PSO first.
 /// The empty TLAS is built with the title's TLAS builds; failing that, here.
 ///
@@ -113,13 +143,10 @@ pub unsafe fn dispatch_descriptor_tlas(
     param: u32,
     groups: [u32; 3],
 ) -> bool {
-    let Some(address) = descriptor_address(handle) else {
-        return false;
-    };
     let Some(list) = crate::list::host_list(title_list) else {
         return false;
     };
-    dispatch(list, address, root, param, groups).is_some()
+    dispatch(list, trace_address(handle), root, param, groups).is_some()
 }
 
 pub(super) fn dispatch(
@@ -157,9 +184,14 @@ pub struct IndirectTlas {
 /// in submission order (an empty one when none: every ray misses) and the
 /// title's groups as the GPU wrote them, clamped to D3D12's limit.
 ///
-/// It records a compute pass of its own: call it before binding the
-/// trace's PSO and root parameters, then [`dispatch_indirect_tlas`].
-/// `None` if the arguments are outside title memory or misaligned.
+/// It records a compute pass of its own, which sets a compute root
+/// signature and pipeline: call it before binding the trace's PSO and root
+/// parameters, then [`dispatch_indirect_tlas`]. A caller that keeps the
+/// root signature and pipeline it bound last (the draw state) forgets them
+/// after this, so that it binds the trace's again (this cannot: that
+/// caller holds the list's draw state). `None` if the arguments are outside
+/// title memory or misaligned. A descriptor that names no TLAS gives the
+/// empty one, as in [`dispatch_descriptor_tlas`].
 ///
 /// # Safety
 /// The title list and descriptor slot are live.
@@ -169,9 +201,13 @@ pub unsafe fn prepare_indirect_tlas(
     (arguments, stride, records): (u64, u32, u32),
     count: Option<u64>,
 ) -> Option<IndirectTlas> {
-    let address = descriptor_address(handle)?;
     let recorder = Recorder::new(crate::list::host_list(title_list)?)?;
-    compose(&recorder, address, (arguments, stride, records), count)
+    compose(
+        &recorder,
+        trace_address(handle),
+        (arguments, stride, records),
+        count,
+    )
 }
 
 /// Runs the trace commands [`prepare_indirect_tlas`] composed.
@@ -228,7 +264,11 @@ fn compose(
     let bytes = COMMANDS_AT + u64::from(records) * u64::from(INDIRECT_STRIDE);
     let commands = buffer(rec, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
     bind_at_submission(rec, address, mapped as usize)?;
-    // Both title inputs move to the UAV state once, even in one buffer.
+    // Both title inputs go back to the common state once, even in one
+    // buffer. They need no transition to the UAV state the pass reads them
+    // in: a buffer in the common state is promoted to it, and one a title
+    // shader wrote earlier in the submission already is (a barrier from the
+    // common state would then name the wrong state).
     let mut inputs = vec![args.buffer.clone()];
     if let Some((shadow, _)) = &counter
         && shadow.buffer.as_raw() != args.buffer.as_raw()
@@ -237,12 +277,7 @@ fn compose(
     }
     let common = D3D12_RESOURCE_STATE_COMMON;
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    let mut before = vec![uav_barrier()];
-    before.extend(
-        inputs
-            .iter()
-            .map(|b| crate::host::transition(b, common, uav)),
-    );
+    let before = [uav_barrier()];
     let mut after: Vec<_> = inputs
         .iter()
         .map(|b| crate::host::transition(b, uav, common))
@@ -254,6 +289,12 @@ fn compose(
     ));
     let gpu = args.gpu(arguments);
     let shape = [records, stride, u32::from(counter.is_some())];
+    #[cfg(feature = "diagnostics")]
+    rec.list.note_op(|| {
+        format!(
+            "host DXR trace commands: {records} records of {stride} bytes at title address              {arguments:#x}, count at {count:#x?}, TLAS at title address {address:#x}"
+        )
+    });
     // SAFETY: each root view covers the shader's checked range. The global
     // barrier orders the title's GPU writers of the arguments before the
     // pass; the recording retains its inputs and output.
