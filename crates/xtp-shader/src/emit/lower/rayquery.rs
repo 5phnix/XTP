@@ -73,11 +73,12 @@ pub(crate) enum Kind {
     /// The committed hit's t, or the ray's t-max on a miss (as the walk
     /// leaves it: t-max only shrinks on a hit).
     ///
-    /// Accepted difference at the ends of the ray (measured on WARP,
-    /// `rayquery_tests`): the console's walk keeps a triangle at
-    /// 0 <= t < t-max, DXR at t-min < t <= t-max. A hit exactly at t-min (a
-    /// ray leaving a surface) counts on the console and not on the host; a
-    /// hit exactly at t-max counts on the host and not on the console.
+    /// Accepted difference at the ends of the ray: the console's walk keeps
+    /// a triangle at 0 <= t < t-max, DXR at t-min < t < t-max (the DXR
+    /// specification, "Ray extents"). A hit exactly at t-min (a ray leaving
+    /// a surface) counts on the console and not on the host. At t-max both
+    /// leave it out by their rules; WARP keeps it (measured in
+    /// `rayquery_tests`), which the rule leaves to the implementation.
     T,
     /// An iteration count that the code after the walk only compares with
     /// the walk's cap: 0 on the host, which has no cap (section 9). A walk
@@ -210,7 +211,11 @@ fn next_value(p: &Program) -> u32 {
 ///
 /// * the walk is every block whose offset is in `site.header..site.exit`;
 ///   it must be entered only at its header, from one block outside it,
-///   and left only to the block at `site.exit`;
+///   and left only to the block at `site.exit`, which its header reaches;
+///   no path of it may end the program (`Exit::End`, `Exit::Indirect`);
+/// * it may read memory, intersect, branch and keep a stack in LDS that
+///   nothing outside it touches; any other effect (a store, an atomic, a
+///   message...) refuses the splice, since the query does not have it;
 /// * the empty-structure check (`site.skip`), one conditional branch
 ///   outside the walk to the skip path, becomes a jump to its other side,
 ///   which must lead to the walk; the skip path goes with the walk;
@@ -247,6 +252,35 @@ pub(crate) fn splice(mut p: Program, site: &Site) -> Result<Program, Why> {
         .iter()
         .map(|b| (site.header..site.exit).contains(&b.offset))
         .collect();
+    // A walk that ends the program, or jumps through registers, does not
+    // go on to its exit on every path: the query would.
+    if p.blocks
+        .iter()
+        .zip(&walk)
+        .any(|(b, &w)| w && matches!(b.exit, Exit::End | Exit::Indirect))
+    {
+        return Err("a ray-tracing walk with a path that ends the program");
+    }
+    // What the walk does besides its registers must be what the query
+    // leaves out: reads, and LDS the code outside it never touches.
+    let lds = |i: &Inst| match &i.fields {
+        Fields::Ds { .. } => true,
+        Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => *lds,
+        _ => false,
+    };
+    let lds_outside = p
+        .blocks
+        .iter()
+        .zip(&walk)
+        .any(|(b, &w)| !w && b.insts.iter().any(lds));
+    for i in p.blocks.iter().zip(&walk).filter(|w| *w.1).flat_map(|w| &w.0.insts) {
+        let name = i.name();
+        let control = name.starts_with("s_cbranch") || name == "s_branch";
+        let local = matches!(i.fields, Fields::Ds { gds: false, .. }) && !lds_outside;
+        if !(pure(i) || control || local || name.starts_with("image_bvh")) {
+            return Err("a ray-tracing walk with a memory effect the query does not have");
+        }
+    }
     if let Some(skip) = site.skip {
         let path = one(skip)?;
         let checks: Vec<usize> = (0..p.blocks.len())
@@ -298,6 +332,10 @@ pub(crate) fn splice(mut p: Program, site: &Site) -> Result<Program, Why> {
             walked[b] = true;
             todo.extend(p.blocks[b].exit.successors());
         }
+    }
+    let leaves = (0..p.blocks.len()).any(|b| walked[b] && p.blocks[b].exit.successors().contains(&exit));
+    if !leaves {
+        return Err("a ray-tracing walk whose header never reaches its exit");
     }
     let at_entry = |reg: u8| {
         value_at_end(&p, pre, Reg::V(reg))

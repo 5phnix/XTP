@@ -340,6 +340,52 @@ fn rayquery_refuses_sites_that_do_not_fit_the_walk() {
     );
 }
 
+/// [`PROGRAM`] with its words from byte offset `at` replaced by `words`.
+fn patched(native: &NativeProgram, at: usize, words: &[u32]) -> NativeProgram {
+    let mut n = native.clone();
+    for (k, w) in words.iter().enumerate() {
+        n.code[at + 4 * k..at + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    n
+}
+
+/// A walk with a path that does not go on to its exit is refused (Codex
+/// review of c83e996, point 1): the query would go on to it.
+#[test]
+fn rayquery_refuses_walks_that_do_not_always_reach_their_exit() {
+    // The loop's way out ends the program (0xcc: s_endpgm).
+    let ends = patched(&native(), 0xcc, &[0xBF81_0000]);
+    assert_eq!(
+        splice(ir(&ends), &SITE).err(),
+        Some("a ray-tracing walk with a path that ends the program")
+    );
+    // The loop never leaves (0xc8: s_branch 0x8c): only the skip path
+    // reaches the exit.
+    let never = patched(&native(), 0xc8, &[0xBF82_FFF0]);
+    assert_eq!(
+        splice(ir(&never), &SITE).err(),
+        Some("a ray-tracing walk whose header never reaches its exit")
+    );
+}
+
+/// A walk with an effect the query does not have is refused (Codex review
+/// of c83e996, point 2); a stack in LDS is no such effect while nothing
+/// outside the walk touches LDS.
+#[test]
+fn rayquery_refuses_walks_with_effects_the_query_lacks() {
+    let effect = Some("a ray-tracing walk with a memory effect the query does not have");
+    // A store in the loop (0xb4: buffer_store_dword v1, v19, s[12:15], 0
+    // offen, in place of the hit's v_cndmask_b32).
+    let store = patched(&native(), 0xb4, &[0xE070_1000, 0x8003_0113]);
+    assert_eq!(splice(ir(&store), &SITE).err(), effect);
+    // A push on a stack in LDS (0xb4: ds_write_b32 v13, v14).
+    let stack = patched(&native(), 0xb4, &[0xD834_0000, 0x0000_0E0D]);
+    assert!(splice(ir(&stack), &SITE).is_ok());
+    // ... which the code after the walk reads (0xd8: ds_read_b32 v1, v0).
+    let read = patched(&stack, 0xd8, &[0xD8D8_0000, 0x0100_0000]);
+    assert_eq!(splice(ir(&read), &SITE).err(), effect);
+}
+
 /// Without a site the program is not spliced: the walk stays, and the
 /// translation refuses it as before (no program changes until a walk is
 /// proven).
@@ -485,10 +531,14 @@ mod world {
         // t-min (WARP: C at 2), where the console's walk takes it (t >= 0:
         // 0.04 there; `rayquery::Kind::T`).
         ([1.0, 1.0, 5.0], Z, 100.0, Some(2.0)),
-        // A at t = t-max: DXR keeps a hit at t-max (WARP), where the
-        // console's walk leaves it out (t < t-max: FLT_MAX there).
+        // A at t = t-max ([`AT_T_MAX`]): DXR's rule leaves it out
+        // (t-min < t < t-max), as the console's walk does (t < t-max);
+        // WARP keeps it (5.04 there). Either is taken.
         ([1.0, 1.0, 0.0], Z, 5.0, Some(5.0)),
     ];
+
+    /// The ray of [`RAYS`] whose hit is at its t-max.
+    pub const AT_T_MAX: usize = 14;
 }
 
 #[cfg(windows)]
@@ -911,9 +961,15 @@ fn rayquery_spliced_program_traces_on_warp() {
         .iter()
         .zip(&expected)
         .enumerate()
-        .filter(|&(_, (&got, want))| match want {
-            None => got != f32::MAX.to_bits(),
-            Some(t) => (f32::from_bits(got) - (t + 0.04)).abs() > 1e-4 * t.max(1.0),
+        .filter(|&(n, (&got, want))| {
+            let missed = got == f32::MAX.to_bits();
+            let g = f32::from_bits(got);
+            match want {
+                _ if n % world::RAYS.len() == world::AT_T_MAX && missed => false,
+                None => !missed,
+                // A NaN is no hit, whatever its distance.
+                Some(t) => !g.is_finite() || (g - (t + 0.04)).abs() > 1e-4 * t.max(1.0),
+            }
         })
         .map(|(n, (&got, want))| {
             let want = want.map_or(f32::MAX, |t| t + 0.04);
