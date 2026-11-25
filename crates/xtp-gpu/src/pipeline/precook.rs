@@ -14,12 +14,16 @@
 //!   which stores it into the host pipeline library as a first dispatch
 //!   does; [`finish`] saves the library.
 //! - Graphics and mesh pipelines need the title's graphics state as well,
-//!   which only a session sees: sessions keep each one's description
-//!   ([`super::record`]), and [`replay`] makes it again as the session
-//!   did, by the same function with the same shaders and state, into the
-//!   same library entry. A description whose shaders do not translate any
-//!   more is refused at once, as in a session. The file of descriptions is
-//!   rewritten here once it grows past its bound (`record::compact`).
+//!   which only a session sees: sessions keep the description of each one
+//!   the title creates ([`super::record`]), and [`replay`] makes it again as
+//!   the session did, by the same function with the same shaders and state,
+//!   into the same library entry. A description whose shaders do not
+//!   translate any more is refused at once, as in a session. The file of
+//!   descriptions is rewritten here once it grows past its bound
+//!   (`record::compact`).
+//! - The pack's effects ([`super::effects`]) name the shaders of each pass,
+//!   not its state: their shader sets ([`ShaderSet`]) say how much of the
+//!   title the kept descriptions cover ([`Recorded::shader_sets`]).
 //! - What a whole pass depends on besides the pack and the translator, for
 //!   the precook's note: the kept descriptions and the library file
 //!   ([`cache`]).
@@ -199,6 +203,8 @@ pub fn rebuild_library() -> bool {
 /// once, ready to make again ([`replay`]).
 pub struct Recorded {
     pipelines: Vec<Description>,
+    /// The shader sets of the descriptions that read back, each once.
+    pub shader_sets: HashSet<ShaderSet>,
     /// Kept descriptions that are not made again: the entries that do not
     /// read back, those whose state does not decode, those whose
     /// containers are not kept, and repeats (descriptions this build reads
@@ -228,6 +234,18 @@ pub struct Recorded {
 struct Description {
     shaders: Vec<Arc<Shader>>,
     state: GraphicsState,
+}
+
+/// A pipeline's shader set: its containers' BLAKE3, in order, whatever
+/// their stages (the pack's effects put a mesh program in the vertex
+/// list).
+pub type ShaderSet = Vec<[u8; 32]>;
+
+/// The shader set of `containers`.
+pub fn shader_set<'a>(containers: impl IntoIterator<Item = &'a [u8; 32]>) -> ShaderSet {
+    let mut set: ShaderSet = containers.into_iter().copied().collect();
+    set.sort_unstable();
+    set
 }
 
 // SAFETY: the graphics state's input elements point into its own names,
@@ -260,6 +278,7 @@ impl Recorded {
     fn none() -> Recorded {
         Recorded {
             pipelines: Vec::new(),
+            shader_sets: HashSet::new(),
             damaged: 0,
             missing: 0,
             repeated: 0,
@@ -312,6 +331,8 @@ fn recorded_in(dir: &std::path::Path, at: u64, to: u64) -> Result<Recorded, Stri
     out.damaged = file.damaged;
     let mut seen = HashSet::new();
     for kept in &file.pipelines {
+        out.shader_sets
+            .insert(shader_set(kept.shaders.iter().map(|(_, hash)| hash)));
         let Some(state) = kept.stream.state() else {
             out.damaged += 1;
             continue;
