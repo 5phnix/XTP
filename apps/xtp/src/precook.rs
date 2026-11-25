@@ -31,13 +31,10 @@
 //!   one whose library file is gone or smaller than noted passes again,
 //!   as does `--force`. The host rejects the pipeline library after a
 //!   driver update, which the note does not see: `--force` then.
-//! - Generations: after a translator change (the note's key is another),
-//!   or once the library file passes `LIBRARY_REBUILD_BYTES` (since the
-//!   pass the note is of, or to twice its size then), the pass makes the
-//!   library a new generation, which holds what it makes and nothing of the
-//!   translators before (`xtp_gpu::pipeline::precook`). This is looked at
-//!   before the note: a library that grew past its bound makes a whole
-//!   pass even when the note still holds.
+//! - A translator change reuses the pipeline library in place. Entries are
+//!   keyed by the host DXIL, root signature and state. Once the library
+//!   exceeds `LIBRARY_REBUILD_BYTES`, a new generation drops unused entries
+//!   on crossing the bound, doubling in size or changing translator.
 //! - The note says the kept descriptions that were made again: the file as
 //!   the precook read it, not as it is at the end, which a session may
 //!   have added to meanwhile (the next precook makes those).
@@ -392,20 +389,18 @@ impl Note {
         (note.text() == text).then_some(note)
     }
 
-    /// Why this pass makes the pipeline library a new generation, if it does
-    /// (with pipelines only): another translator than the one `found`
-    /// notes, or a library file past `bound` that grew past it since that
-    /// pass, or to twice its size then. A library already past the bound
-    /// after a new generation holds the title's pipelines of this
-    /// translator: making it again would not shrink it.
+    /// An oversized library is compacted when it crosses the bound, doubles
+    /// or changes translator. Below the bound a new translator can load
+    /// matching entries directly and append any changed pipelines.
     fn new_generation(&self, found: Option<&Note>, bound: u64) -> Option<&'static str> {
         let now = self.pipelines.as_ref()?.library;
-        if found.is_some_and(|f| f.key != self.key) {
-            return Some("another translator");
+        if now <= bound {
+            return None;
         }
         let then = found.and_then(|f| f.pipelines.as_ref()).map(|c| c.library);
-        (now > bound && then.is_none_or(|then| then <= bound || now >= then.saturating_mul(2)))
-            .then_some("past its bound")
+        (found.is_some_and(|f| f.key != self.key)
+            || then.is_none_or(|then| then <= bound || now >= then.saturating_mul(2)))
+        .then_some("past its bound")
     }
 
     /// What this pass has to do after the one `found` notes: nothing if it
@@ -1346,10 +1341,9 @@ mod tests {
         assert_eq!(Note::parse(&format!("{text}more\n")), None);
     }
 
-    /// A new generation for another translator, or for a library that grew
-    /// past its bound, whatever the rest of the note says (a session that
-    /// adds compute pipelines alone leaves the note as it was); not for one
-    /// that a new generation left past the bound, until it doubles.
+    /// Crossing the size bound triggers compaction even if the note holds.
+    /// An already oversized library is compacted again when its size doubles
+    /// or the translation key changes.
     #[test]
     fn a_library_past_its_bound_is_made_again_before_the_note_holds() {
         let note = |key: &str, library| Note {
@@ -1370,14 +1364,17 @@ mod tests {
             Some("past its bound"),
             "looked at first"
         );
-        assert_eq!(
-            note("j", 10).new_generation(Some(&then), bound),
-            Some("another translator")
-        );
+        let changed = note("j", bound);
+        assert_eq!(changed.plan(Some(&then)), Plan::Whole);
+        assert_eq!(changed.new_generation(Some(&then), bound), None);
         assert_eq!(grown.new_generation(None, bound), Some("past its bound"));
         // A new generation that is past the bound by itself.
         let big = note("k", 3000);
         assert_eq!(note("k", 3500).new_generation(Some(&big), bound), None);
+        assert_eq!(
+            note("j", 3000).new_generation(Some(&big), bound),
+            Some("past its bound")
+        );
         assert_eq!(
             note("k", 6000).new_generation(Some(&big), bound),
             Some("past its bound")

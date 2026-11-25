@@ -33,8 +33,7 @@
 //!   fails is made again by the next one.
 //! - Generations: a library cannot drop an entry, and every translator
 //!   change adds a name for each pipeline whose code changed, beside the
-//!   old one. `xtp precook` therefore makes a new generation when the
-//!   translator changed or the file grew past a bound ([`rebuild`]): the
+//!   old one. `xtp precook` compacts oversized files ([`rebuild`]): the
 //!   library starts empty, what it asks for is taken from the generation
 //!   before when that has it (loaded there, stored here) and made
 //!   otherwise, and the save replaces the file with the new generation
