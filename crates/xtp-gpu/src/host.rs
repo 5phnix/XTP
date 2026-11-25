@@ -1266,6 +1266,9 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// The memory values the list waits for, in recorded order: its queue
+    /// submits it once they are met (`queue::wait32`, `queue::wait64`).
+    value_waits: Vec<crate::queue::ValueWait>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     indirect_writers: crate::indirect::Writers,
@@ -2970,6 +2973,46 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// A memory value the list waits for (`queue::wait32`,
+    /// `queue::wait64`), noted with where it was recorded: after work, and
+    /// after how many of the list's own bottom-of-pipe writes.
+    pub(crate) fn defer_value_wait(&self, mut wait: crate::queue::ValueWait) {
+        let pipelines = !self
+            .pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        let states = !self
+            .states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        let mut deferred = self.deferred();
+        wait.writes_before = deferred.writes.len() as u32;
+        wait.work_before =
+            pipelines || states || !deferred.copies.is_empty() || wait.writes_before > 0;
+        deferred.value_waits.push(wait);
+    }
+
+    /// The memory values the list waits for, in recorded order.
+    pub(crate) fn value_waits(&self) -> Vec<crate::queue::ValueWait> {
+        self.deferred().value_waits.clone()
+    }
+
+    /// The values the list's bottom-of-pipe writes store once it has run
+    /// (timestamps left out): address, value, bytes.
+    pub(crate) fn value_writes(&self) -> Vec<(u64, u64, u8)> {
+        let deferred = self.deferred();
+        let values = deferred
+            .writes
+            .iter()
+            .filter_map(|&(at, what, bytes)| match what {
+                crate::queue::Written::Value(v) => Some((at as u64, v, bytes as u8)),
+                _ => None,
+            });
+        values.collect()
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is

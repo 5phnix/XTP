@@ -2632,11 +2632,6 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
-
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
@@ -2746,8 +2741,8 @@ const METHODS: [(usize, *const ()); 54] = [
     (68, depth_bounds as *const ()),              // 0x220 OMSetDepthBoundsX
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
-    (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (71, crate::queue::wait32 as *const ()),      // 0x238, 32 bits
+    (72, crate::queue::wait64 as *const ()),      // 0x240, 64 bits
     (73, depth_order as *const ()),               // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
