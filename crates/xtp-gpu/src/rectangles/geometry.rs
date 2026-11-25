@@ -1482,12 +1482,12 @@ mod tests {
             (
                 crate::rectangles::Records::Title(&args_copy, args.address()),
                 16,
-                1,
+                0..1,
             ),
             None,
             None,
             None,
-            Default::default(),
+            &mut Default::default(),
         )
         .expect("expanded");
         target.bind(list.host(), &root, &pso);

@@ -2925,40 +2925,51 @@ impl State {
             Records::Direct(_) => Default::default(),
         };
         let pso = bind(self, list)?;
-        let prepared = self.expand_rectangles(list, inputs, (stride, max), arguments, writes)?;
-        self.host_roots[1] = 0;
-        // SAFETY: les passes de calcul ont remplacé le PSO, les racines graphiques restent valides.
-        unsafe { list.list.SetPipelineState(&pso) };
-        self.host_pipeline = pso.as_raw() as usize;
-        prepared.bind_vertices(list);
-        #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            let text = match arguments.0 {
-                Records::Title(_, at) => format!("indirect rectangles max {max} at {at:#x}"),
-                Records::Direct([indices, instances, ..]) => {
-                    format!("indexed rectangles {indices}x{instances}")
-                }
+        let mut batches = crate::rectangles::Batches::new(writes);
+        let mut first = 0;
+        while first < max {
+            let prepared = self.expand_rectangles(
+                list,
+                inputs,
+                (stride, first..max),
+                arguments,
+                &mut batches,
+            )?;
+            self.host_roots[1] = 0;
+            // SAFETY: les passes de calcul ont remplacé le PSO, les racines graphiques restent valides.
+            unsafe { list.list.SetPipelineState(&pso) };
+            self.host_pipeline = pso.as_raw() as usize;
+            prepared.bind_vertices(list);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                let text = match arguments.0 {
+                    Records::Title(_, at) => format!("indirect rectangles max {max} at {at:#x}"),
+                    Records::Direct([indices, instances, ..]) => {
+                        format!("indexed rectangles {indices}x{instances}")
+                    }
+                };
+                self.op_text(text, false)
+            });
+            let _timed = crate::timestamps::command(
+                list,
+                crate::timestamps::What::Rectangles,
+                crate::pipeline::host_pipeline(self.pipeline as This),
+            );
+            // SAFETY: an open list with everything set; the arguments and their
+            // count are the list's own, in the indirect argument state (records
+            // past the title's count do not run); the signature is cached.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    prepared.max,
+                    &prepared.args,
+                    prepared.offset,
+                    &prepared.args,
+                    prepared.count_offset,
+                )
             };
-            self.op_text(text, false)
-        });
-        let _timed = crate::timestamps::command(
-            list,
-            crate::timestamps::What::Rectangles,
-            crate::pipeline::host_pipeline(self.pipeline as This),
-        );
-        // SAFETY: an open list with everything set; the arguments and their
-        // count are the list's own, in the indirect argument state (records
-        // past the title's count do not run); the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                prepared.max,
-                &prepared.args,
-                prepared.offset,
-                &prepared.args,
-                prepared.count_offset,
-            )
-        };
+            first += prepared.max;
+        }
         Ok(())
     }
 
@@ -2969,9 +2980,9 @@ impl State {
         &mut self,
         list: &HostList,
         inputs: &[crate::pipeline::host::Input],
-        (stride, max): (u32, u32),
+        (stride, range): (u32, std::ops::Range<u32>),
         (records, counter, index): RectangleArguments,
-        writes: crate::indirect::Writes,
+        batches: &mut crate::rectangles::Batches,
     ) -> Result<crate::rectangles::Prepared, Unready> {
         let vertices = self.vertex.map(|v| (v.address, v.size, v.stride));
         self.recording.lease(list);
@@ -2980,15 +2991,15 @@ impl State {
             &mut self.own.rects,
             inputs,
             &vertices,
-            (records, stride, max),
+            (records, stride, range.clone()),
             index,
             counter,
-            if matches!(records, Records::Title(..)) {
+            if range.start == 0 && matches!(records, Records::Title(..)) {
                 self.own.indirect_samples.next(list, self.pipeline)
             } else {
                 None
             },
-            writes,
+            batches,
         )?)
     }
 }
@@ -5341,9 +5352,9 @@ float4 ps(V v) : SV_Target { return v.color; }
             .expand_rectangles(
                 list.host(),
                 &painter_inputs(),
-                (16, 1),
+                (16, 0..1),
                 (Records::Title(&args_copy, args.address()), None, None),
-                Default::default(),
+                &mut Default::default(),
             )
             .expect("expanded");
         let scratch = prepared.args.clone();
