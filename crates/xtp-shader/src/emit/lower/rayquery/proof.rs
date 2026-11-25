@@ -256,9 +256,16 @@ struct Exit {
     regs: Vec<(u8, Kind, [u32; LANES])>,
 }
 
+/// What builds a world from the rays at a walk's header (lane, ray).
+pub(crate) type Build<'a> = dyn FnMut(&[(usize, Ray)], &mut Rng) -> World + 'a;
+
 /// One world played both ways: the guest's exit and stores, the spliced
 /// program's answers and stores.
 pub(crate) struct Played {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the tests build their WARP scene from it")
+    )]
     pub world: World,
     guest_exit: Option<Exit>,
     entry_exec: u32,
@@ -331,10 +338,10 @@ impl<'a> Prover<'a> {
         group: u32,
         root: Root,
         plant: &HashMap<u64, u32>,
-        build: &mut dyn FnMut(&[(usize, Ray)], &mut Rng) -> World,
+        build: &mut Build,
     ) -> Result<Played, Failure> {
         let site = self.site;
-        let mut rng = Rng::new(mix(seed.wrapping_add(0x574F_524C_44)));
+        let mut rng = Rng::new(mix(seed.wrapping_add(0x0057_4F52_4C44)));
         let mut budget = BUDGET;
         let err = |why| Failure {
             seed,

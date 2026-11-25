@@ -349,9 +349,9 @@ impl Aabb {
             max: [f64::NEG_INFINITY; 3],
         };
         for p in points {
-            for k in 0..3 {
-                b.min[k] = b.min[k].min(p[k]);
-                b.max[k] = b.max[k].max(p[k]);
+            for ((lo, hi), x) in b.min.iter_mut().zip(&mut b.max).zip(p) {
+                *lo = lo.min(x);
+                *hi = hi.max(x);
             }
         }
         b
@@ -413,7 +413,7 @@ impl Aabb {
 enum Node {
     Box {
         kids: [u32; 4],
-        bounds: [Option<Aabb>; 4],
+        bounds: Box<[Option<Aabb>; 4]>,
     },
     Leaf(Vec<Tri>),
     Instance,
@@ -512,7 +512,10 @@ impl Builder<'_> {
         for (k, &kid) in kids.iter().enumerate() {
             self.put(unit, 4 * k as u64, kid);
         }
-        let node = Node::Box { kids, bounds };
+        let node = Node::Box {
+            kids,
+            bounds: Box::new(bounds),
+        };
         self.layout
             .nodes
             .insert(self.base + 64 * u64::from(unit), node);
@@ -653,7 +656,7 @@ impl Layout {
                     b.base + 64 * u64::from(cycle),
                     Node::Box {
                         kids: [cycle_pointer, u32::MAX, u32::MAX, u32::MAX],
-                        bounds: [Some(cycle_bounds), None, None, None],
+                        bounds: Box::new([Some(cycle_bounds), None, None, None]),
                     },
                 );
                 let root_pointer = root << 3 | BOX;
@@ -665,7 +668,12 @@ impl Layout {
                     b.base + 64 * u64::from(root),
                     Node::Box {
                         kids,
-                        bounds: [Some(inner_bounds.padded()), Some(cycle_bounds), None, None],
+                        bounds: Box::new([
+                            Some(inner_bounds.padded()),
+                            Some(cycle_bounds),
+                            None,
+                            None,
+                        ]),
                     },
                 );
                 b.parents.push((inner, root_pointer));

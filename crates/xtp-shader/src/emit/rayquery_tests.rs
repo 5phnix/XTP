@@ -388,8 +388,8 @@ fn patched(native: &NativeProgram, at: usize, words: &[u32]) -> NativeProgram {
 /// review of c83e996, point 1): the query would go on to it.
 #[test]
 fn rayquery_refuses_walks_that_do_not_always_reach_their_exit() {
-    // The loop's way out ends the program (0xcc: s_endpgm).
-    let ends = patched(&native(), 0xcc, &[0xBF81_0000]);
+    // The skip path ends the program (0xd0: s_endpgm).
+    let ends = patched(&native(), 0xd0, &[0xBF81_0000]);
     assert_eq!(
         splice(ir(&ends), &SITE).err(),
         Some("a ray-tracing walk with a path that ends the program")
@@ -598,11 +598,14 @@ mod warp {
         e.to_string()
     }
 
-    /// BLASes of non-indexed triangles, and instances over them:
-    /// object-to-world rows, id, mask, hit-group contribution, flags, BLAS.
+    /// An instance: object-to-world rows, id, mask, hit-group
+    /// contribution, flags, BLAS.
+    pub type Placed = ([[f32; 4]; 3], u32, u8, u32, u8, usize);
+
+    /// BLASes of non-indexed triangles, and instances over them.
     pub struct Scene {
         pub blases: Vec<Vec<[[f32; 3]; 3]>>,
-        pub instances: Vec<([[f32; 4]; 3], u32, u8, u32, u8, usize)>,
+        pub instances: Vec<Placed>,
     }
 
     /// A view in the heap, by slot: raw bytes, or the raw output of `n`
@@ -1253,9 +1256,9 @@ fn family_a_text() -> String {
     v_mov_b32 v1, lit(0x7f7fffff)
     v_cmpx_ne_u32 exec_lo, 0, v2
     s_cbranch_execz @store
-    v_lshlrev_b32 v2, 5, v0
-    buffer_load_dwordx4 v[1:4], v2, s[4:7], 0 offen
-    buffer_load_dwordx3 v[5:7], v2, s[4:7], 0 offen offset:16
+    v_lshlrev_b32 v14, 5, v0
+    buffer_load_dwordx4 v[1:4], v14, s[4:7], 0 offen
+    buffer_load_dwordx3 v[5:7], v14, s[4:7], 0 offen offset:16
     // The structure: its base over 256, its root at +0x30.
     s_lshr_b64 s[20:21], s[12:13], 8
     s_mov_b32 s22, s20

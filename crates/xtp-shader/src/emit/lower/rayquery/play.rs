@@ -180,6 +180,7 @@ fn int_compare(op: &str, signed: bool) -> Option<fn(u32, u32) -> bool> {
 }
 
 fn float_compare(op: &str) -> Option<fn(f32, f32) -> bool> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
     Some(match op {
         "f" => |_, _| false,
         "tru" | "t" => |_, _| true,
@@ -187,16 +188,17 @@ fn float_compare(op: &str) -> Option<fn(f32, f32) -> bool> {
         "eq" => |a, b| a == b,
         "le" => |a, b| a <= b,
         "gt" => |a, b| a > b,
-        "lg" => |a, b| a < b || a > b,
+        "lg" => |a, b| a.partial_cmp(&b).is_some_and(|o| o != Equal),
         "ge" => |a, b| a >= b,
         "o" => |a, b| !a.is_nan() && !b.is_nan(),
         "u" => |a, b| a.is_nan() || b.is_nan(),
-        "nge" => |a, b| !(a >= b),
-        "nlg" => |a, b| !(a < b || a > b),
-        "ngt" => |a, b| !(a > b),
-        "nle" => |a, b| !(a <= b),
+        // Unordered (a NaN) or the negation of the ordered compare.
+        "nge" => |a, b| a.partial_cmp(&b).is_none_or(|o| o == Less),
+        "nlg" => |a, b| a.partial_cmp(&b).is_none_or(|o| o == Equal),
+        "ngt" => |a, b| a.partial_cmp(&b).is_none_or(|o| o != Greater),
+        "nle" => |a, b| a.partial_cmp(&b).is_none_or(|o| o == Greater),
         "neq" => |a, b| a != b,
-        "nlt" => |a, b| !(a < b),
+        "nlt" => |a, b| a.partial_cmp(&b).is_none_or(|o| o != Less),
         _ => return None,
     })
 }
@@ -816,7 +818,7 @@ impl<'a> Machine<'a> {
                         }
                     };
                     let at = base.wrapping_add(i64::from(*offset) as u64);
-                    if at % 4 != 0 {
+                    if !at.is_multiple_of(4) {
                         return Err("an unaligned global access in the play");
                     }
                     for k in 0..dwords {
@@ -1161,7 +1163,7 @@ impl<'a> Machine<'a> {
                 return Err("an out-of-bounds buffer access in the play");
             }
             let at = base + index * stride + offset;
-            if at % 4 != 0 {
+            if !at.is_multiple_of(4) {
                 return Err("an unaligned buffer access in the play");
             }
             for k in 0..dwords {
@@ -1192,7 +1194,7 @@ impl<'a> Machine<'a> {
         let size = w.lds.len();
         let at = |address: u32, add: u32| -> Result<usize, Why> {
             let at = address.wrapping_add(add) as usize;
-            if at % 4 != 0 || at / 4 >= size {
+            if !at.is_multiple_of(4) || at / 4 >= size {
                 return Err("an LDS access out of bounds or unaligned in the play");
             }
             Ok(at / 4)
