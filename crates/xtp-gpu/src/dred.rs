@@ -78,8 +78,14 @@ pub(crate) fn report(device: &ID3D12Device, runs: &[&HostList]) -> String {
         if dred.GetPageFaultAllocationOutput2(&mut fault).is_ok() && fault.PageFaultVA != 0 {
             let va = fault.PageFaultVA;
             for (what, head) in [
-                ("allocations at the fault", fault.pHeadExistingAllocationNode),
-                ("freed allocations at the fault", fault.pHeadRecentFreedAllocationNode),
+                (
+                    "allocations at the fault",
+                    fault.pHeadExistingAllocationNode,
+                ),
+                (
+                    "freed allocations at the fault",
+                    fault.pHeadRecentFreedAllocationNode,
+                ),
             ] {
                 let found = allocations(head, va);
                 if !found.is_empty() {
@@ -133,17 +139,20 @@ impl Crumbs {
             let contexts = if p.pBreadcrumbContexts.is_null() {
                 Vec::new()
             } else {
-                std::slice::from_raw_parts(p.pBreadcrumbContexts, p.BreadcrumbContextsCount as usize)
-                    .iter()
-                    .map(|c| {
-                        let text = if c.pContextString.is_null() {
-                            String::new()
-                        } else {
-                            c.pContextString.to_string().unwrap_or_default()
-                        };
-                        (c.BreadcrumbIndex, text)
-                    })
-                    .collect()
+                std::slice::from_raw_parts(
+                    p.pBreadcrumbContexts,
+                    p.BreadcrumbContextsCount as usize,
+                )
+                .iter()
+                .map(|c| {
+                    let text = if c.pContextString.is_null() {
+                        String::new()
+                    } else {
+                        c.pContextString.to_string().unwrap_or_default()
+                    };
+                    (c.BreadcrumbIndex, text)
+                })
+                .collect()
             };
             let name = (!p.pCommandListDebugNameW.is_null())
                 .then(|| p.pCommandListDebugNameW.to_string().unwrap_or_default());
@@ -438,7 +447,10 @@ mod tests {
             op_name(D3D12_AUTO_BREADCRUMB_OP_COPYRAYTRACINGACCELERATIONSTRUCTURE),
             "copy acceleration structure"
         );
-        assert_eq!(op_name(D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH), "dispatch mesh");
+        assert_eq!(
+            op_name(D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH),
+            "dispatch mesh"
+        );
         assert_eq!(op_name(D3D12_AUTO_BREADCRUMB_OP_SETPROGRAM), "set program");
         assert_eq!(op_name(D3D12_AUTO_BREADCRUMB_OP(77)), "op 77");
     }
@@ -449,7 +461,9 @@ mod tests {
         // the GPU finished the first four commands.
         let list = crumbs(
             4,
-            &[MARKER, DISPATCH, MARKER, DISPATCH, BARRIER, MARKER, DISPATCH],
+            &[
+                MARKER, DISPATCH, MARKER, DISPATCH, BARRIER, MARKER, DISPATCH,
+            ],
         );
         let text = lists_text(&[list]);
         assert_eq!(
