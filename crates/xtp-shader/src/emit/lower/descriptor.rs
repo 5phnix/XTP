@@ -269,6 +269,24 @@ impl<'a> Lower<'a> {
         sampler: bool,
         marked: bool,
     ) -> Result<V, Why> {
+        // Nested joins can reload the same view on every path. Rebuild its
+        // address from the root table, which dominates the final access.
+        if args.iter().any(|arg| matches!(arg, Source::Phi { .. }))
+            && let Some((param, offset)) = self.common_table_address(args)
+        {
+            let Val::I32(base) = self.user(param, 0) else {
+                return Err("a descriptor outside the heaps");
+            };
+            let delta = self.s.m.i32(offset);
+            let addr = self.s.m.bin(self.cur, Bin::Add, base, delta);
+            let shift = self.s.m.i32(if sampler { 4 } else { 5 });
+            let index = self.s.m.bin(self.cur, Bin::LShr, addr, shift);
+            return Ok(if marked {
+                index
+            } else {
+                self.unmarked(index, sampler)
+            });
+        }
         let mut incoming = Vec::new();
         for (&q, arg) in self.x.p.blocks[block].preds.iter().zip(args) {
             if self.block[q].is_none() {
@@ -287,6 +305,31 @@ impl<'a> Lower<'a> {
         let phi = self.s.m.phi(join, self.s.t.i32);
         self.s.m.set_phi(phi, incoming);
         Ok(phi)
+    }
+
+    /// The byte in the root table shared by every incoming load, if any.
+    fn common_table_address(&self, args: &[Source]) -> Option<(usize, u32)> {
+        let mut common = None;
+        for arg in args {
+            let address = match arg {
+                Source::Loaded { load, first } => {
+                    let a = self.scalar.get(load)?;
+                    if a.dynamic.is_some()
+                        || self.x.native.layout.get(a.param)?.root != RootType::Table
+                    {
+                        return None;
+                    }
+                    (a.param, a.offset.wrapping_add(4 * u32::from(*first)))
+                }
+                Source::Phi { args, .. } => self.common_table_address(args)?,
+                _ => return None,
+            };
+            if common.is_some_and(|prev| prev != address) {
+                return None;
+            }
+            common = Some(address);
+        }
+        common
     }
 
     /// The heap index of a descriptor of two picked by SCC (uniform);
