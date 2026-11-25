@@ -738,6 +738,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
+    pub(crate) clamps: Mutex<crate::indirect::Runs>,
     /// The host fence value of its last submission (0: none): it is not
     /// dropped before that one has finished.
     last: AtomicU64,
@@ -980,6 +981,7 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    indirect_writers: crate::indirect::Writers,
 }
 
 /// A list a submission in flight names.
@@ -1199,6 +1201,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 writer: AtomicU64::new(0),
                 budget: Mutex::default(),
+                clamps: Mutex::default(),
                 last: AtomicU64::new(0),
                 fresh_after: AtomicU64::new(0),
                 ours: std::sync::atomic::AtomicBool::new(false),
@@ -2109,6 +2112,7 @@ impl HostList {
             }
             allocator.clone()
         };
+        *self.clamps.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // New ones: a submission in flight keeps its own (`Recorded`).
         *self.pipelines.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
@@ -2259,7 +2263,10 @@ impl HostList {
     /// What a submission of the list keeps of its recording.
     fn recorded(&self) -> Recorded {
         #[cfg(feature = "diagnostics")]
-        let dispatch_samples = self.deferred().dispatch_samples.clone();
+        let (dispatch_samples, meshes) = {
+            let deferred = self.deferred();
+            (deferred.dispatch_samples.clone(), deferred.meshes.clone())
+        };
         Recorded {
             #[cfg(feature = "diagnostics")]
             dispatch_samples,
@@ -2271,7 +2278,7 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             notes: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             #[cfg(feature = "diagnostics")]
-            meshes: self.deferred().meshes.clone(),
+            meshes,
         }
     }
 
@@ -2340,7 +2347,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred().copies.push(Step::GpuWrite(
+        let mut deferred = self.deferred();
+        deferred.indirect_writers.record(&shadow.buffer, true);
+        deferred.copies.push(Step::GpuWrite(
             shadow.clone(),
             address,
             len,
@@ -2357,7 +2366,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        deferred.indirect_writers.record(&shadow.buffer, false);
+        deferred
             .copies
             .push(Step::GpuCopy(shadow.clone(), address, len));
     }
@@ -2370,9 +2381,23 @@ impl HostList {
         address: usize,
         bytes: usize,
     ) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        deferred.indirect_writers.record(&shadow.buffer, false);
+        deferred
             .copies
             .push(Step::GpuWord(shadow.clone(), address, bytes));
+    }
+
+    pub(crate) fn unknown_buffer_write(&self) {
+        self.deferred().indirect_writers.unknown();
+    }
+
+    pub(crate) fn indirect_writes(
+        &self,
+        args: &ID3D12Resource,
+        count: Option<&ID3D12Resource>,
+    ) -> crate::indirect::Writes {
+        self.deferred().indirect_writers.before(args, count)
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -2436,7 +2461,7 @@ impl HostList {
 
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
+    pub(crate) fn budget(&self) -> Option<ID3D12Resource> {
         let made = self
             .budget
             .lock()
@@ -2461,8 +2486,7 @@ impl HostList {
                 (0, 0),
             ));
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some(buffer)
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -2597,6 +2621,9 @@ impl HostList {
                     } else {
                         batch.settle_shaders(shadow, *address, *len);
                     }
+                    // Le bridage ou le titre peut avoir lu la destination avant la
+                    // copie. Installer ses données initiales avant de la marquer occupée.
+                    batch.flush_before_copy(shadow, *address, *len);
                     shadow.copying(batch.submission, *address, *len);
                     moved(Moved::GpuCopy, *len);
                     continue;
@@ -2735,16 +2762,35 @@ impl Batch<'_> {
         self.textures.clear();
     }
 
+    fn flush_before_copy(
+        &mut self,
+        dst: &std::sync::Arc<crate::shadow::Shadow>,
+        at: usize,
+        len: usize,
+    ) {
+        let end = at.saturating_add(len);
+        if let Some(i) = self.refreshes.iter().position(|(shadow, from, to)| {
+            std::sync::Arc::ptr_eq(shadow, dst) && *from < end && at < *to
+        }) {
+            let (shadow, from, to) = self.refreshes.swap_remove(i);
+            Self::refresh(&shadow, from, to);
+        }
+    }
+
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            Self::refresh(&shadow, from, to);
         }
+    }
+
+    fn refresh(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 }
 

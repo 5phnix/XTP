@@ -2009,8 +2009,7 @@ mod state {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, [x, y, z], [0; 3]));
     }
-    /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
-    /// programs take `x` groups only.
+    /// Le GPU hôte exécute la grille XYZ sur un axe, celui que lit MeshGroup.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
         with_state(this, |list, s| s.dispatch_mesh(list, [x, y, z]));
