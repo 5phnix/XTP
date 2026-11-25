@@ -96,6 +96,8 @@ mod input_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 #[cfg(all(test, windows))]
+mod lightloop_tests;
+#[cfg(all(test, windows))]
 mod limits_tests;
 #[cfg(all(test, windows))]
 mod loop_limit_tests;
