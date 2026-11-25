@@ -4142,7 +4142,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 pub(crate) fn unregister(resource: usize, start: u64) {
     let removed = buffers().remove(&(start, resource));
     if let Some(entry) = removed {
-        crate::rt::release_buffer(resource, start, entry.end);
+        crate::rt::release_buffer(Some(resource), start, entry.end);
     }
 }
 

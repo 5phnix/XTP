@@ -304,12 +304,12 @@ impl Registry {
     }
 }
 
-pub(crate) fn release_buffer(resource: usize, start: u64, end: u64) {
+pub(crate) fn release_buffer(owner: Option<usize>, start: u64, end: u64) {
     let mut table = registry();
     let released: Vec<_> = table
         .structures
         .range(start..end)
-        .filter(|(_, s)| s.owner == Some(resource))
+        .filter(|(_, s)| s.owner == owner)
         .map(|(&address, _)| address)
         .collect();
     for address in released {
@@ -342,6 +342,30 @@ pub unsafe fn host_tlas_for_list(list: *const Object, title_tlas: u64) -> Option
     entry.retain(list);
     // SAFETY: the list owns this resource until the GPU has finished the recording.
     Some(unsafe { entry.result.GetGPUVirtualAddress() })
+}
+
+/// Resolves one title descriptor slot and retains the TLAS for this dispatch.
+/// Call separately for every slot, including distinct offsets in one descriptor table.
+///
+/// # Safety
+/// `list` is a live title command list and `handle` is a readable title descriptor slot.
+pub unsafe fn descriptor_tlas(list: *const Object, handle: u64) -> Option<u64> {
+    use crate::descriptor::{View, host::buffer_range, view};
+    let view = view(handle)?;
+    let words = match &view {
+        View::Shader(_, Some(words)) => &words[..],
+        View::Placed(false, _, words) => &words[..],
+        _ => return None,
+    };
+    let address = match D3D12_SRV_DIMENSION(words[1] as i32) {
+        D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE => {
+            u64::from(words[4]) | u64::from(words[5]) << 32
+        }
+        D3D12_SRV_DIMENSION_BUFFER => buffer_range(&view)?.0,
+        _ => return None,
+    };
+    // SAFETY: the caller supplied the live list that records this descriptor's consumer.
+    unsafe { host_tlas_for_list(list, address) }
 }
 
 /// Mirrors a title build and invalidates an older destination on failure.
@@ -448,13 +472,17 @@ pub unsafe fn copy(list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
 
 fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u64> {
     let end = address.checked_add(bytes)?;
-    if address == 0
-        || !address.is_multiple_of(alignment)
-        || bytes == 0
-        || !crate::shadow::holders(address)
-            .iter()
-            .any(|&(base, len)| end <= base + len)
-    {
+    if address == 0 || !address.is_multiple_of(alignment) || bytes == 0 {
+        return None;
+    }
+    let holders = crate::shadow::holders(address);
+    if holders.is_empty() {
+        // The streaming allocator also passes plain title memory. Reject gaps
+        // before asking for the same loose shadow the title's GPU writers use.
+        if !readable(address, end) {
+            return None;
+        }
+    } else if !holders.iter().any(|&(base, len)| end <= base + len) {
         return None;
     }
     let shadow = crate::shadow::find(address, bytes)?;
@@ -464,6 +492,40 @@ fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u6
     }
     shadow.refresh(list, address, bytes);
     Some(gpu)
+}
+
+fn readable(mut address: u64, end: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        VirtualQuery,
+    };
+    while address < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: VirtualQuery inspects the address without dereferencing it and fills this local.
+        let size = unsafe { VirtualQuery(address as _, &mut info, size_of_val(&info)) };
+        if size == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & PAGE_GUARD != 0
+            || !matches!(
+                info.Protect & 0xff,
+                PAGE_READONLY
+                    | PAGE_READWRITE
+                    | PAGE_WRITECOPY
+                    | PAGE_EXECUTE_READ
+                    | PAGE_EXECUTE_READWRITE
+                    | PAGE_EXECUTE_WRITECOPY
+            )
+        {
+            return false;
+        }
+        let next = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+        if next <= address {
+            return false;
+        }
+        address = next;
+    }
+    true
 }
 
 unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {

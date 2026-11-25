@@ -63,11 +63,13 @@ pub(super) unsafe fn record(list: &HostList, desc: &Build) -> Option<()> {
     };
     // SAFETY: this is a new, eight-byte-aligned mapped allocation of 16 bytes.
     unsafe { mapped.cast::<[u64; 2]>().write([0; 2]) };
-    for (at, address, bytes) in [
-        (0, tri.VertexBuffer.StartAddress, 8),
-        (8, tri.IndexBuffer, 6),
+    let vertices = u64::from(tri.VertexCount - 1) * tri.VertexBuffer.StrideInBytes + 8;
+    let indices = u64::from(tri.IndexCount) * 2;
+    for (at, address, bytes, range) in [
+        (0, tri.VertexBuffer.StartAddress, 8, vertices),
+        (8, tri.IndexBuffer, 6, indices),
     ] {
-        let shadow = crate::shadow::existing(address, bytes)?;
+        let shadow = crate::shadow::existing(address, range)?;
         let offset = shadow.offset(address);
         let common = D3D12_RESOURCE_STATE_COMMON;
         let source = D3D12_RESOURCE_STATE_COPY_SOURCE;

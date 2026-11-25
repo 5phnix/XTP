@@ -239,6 +239,21 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         assert_ne!(a, b);
         assert_eq!(host_tlas(first.address()), Some(a));
         assert_eq!(host_tlas(second.address()), Some(b));
+        let mut table = [0u64; 20];
+        for (offset, address, expected) in [(0x60, first.address(), a), (0x80, second.address(), b)]
+        {
+            let slot = table.as_mut_ptr().cast::<u8>().add(offset) as u64;
+            let mut desc = [0u32; 10];
+            desc[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+            desc[4] = address as u32;
+            desc[5] = (address >> 32) as u32;
+            crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &desc, slot);
+            assert_eq!(descriptor_tlas(list.this(), slot), Some(expected));
+        }
+        assert_eq!(
+            descriptor_tlas(list.this(), table.as_ptr() as u64 + 0x60),
+            Some(a)
+        );
         let released = first.address();
         drop((blas, cloned, first, second));
         assert_eq!(host_tlas(released), None);
