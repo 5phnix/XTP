@@ -188,17 +188,36 @@ const SAMPLERS: u32 = 1;
 const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
-/// start, end, heap.
+/// start, end, heap, and a hold on it. Work that finds a heap here and may
+/// run while the title releases it (giving a list's slots back, the frame
+/// line's count, the look for records copied in as bytes) uses it through
+/// the hold, taken under this lock and used after it: never by its address
+/// alone, whose last release may be taking its box back meanwhile
+/// (stride4c, Codex review of stride4b, P1: the entry goes only in the
+/// heap's drop, once the box is rebuilt).
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize, HeapHold)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Holds on the registered heaps `keep` takes by address, taken under the
+/// registry's lock ([`SHADER_HEAPS`]) and used after it.
+#[cfg(windows)]
+fn registered(keep: impl Fn(usize) -> bool) -> Vec<(usize, HeapHold)> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        .filter(|e| keep(e.2))
+        .map(|e| (e.2, e.3.clone()))
+        .collect()
+}
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let &(_, _, at) = heaps
+    let &(_, _, at, _) = heaps
         .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))?;
+        .find(|&&(start, end, ..)| (start..end).contains(&handle))?;
     // SAFETY: registered heaps are live (removed when dropped).
     let heap = unsafe { &*(at as *const Heap) };
     Some((heap, heap.index(handle)?))
@@ -506,32 +525,17 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     // Held, not the registry's lock: a heap's release waits for its look,
     // and a heap made since at the same address is another.
-    let holds: Vec<HeapHold> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(test)]
-        let tests = LOOKED_AT_BY_TESTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        heaps
-            .iter()
-            .filter(|&&(_, _, at)| {
-                #[cfg(test)]
-                if tests.contains(&at) {
-                    return false;
-                }
-                // SAFETY: registered heaps are live (removed when dropped).
-                unsafe { &*(at as *const Heap) }.watched.is_some()
-            })
-            // SAFETY: as above.
-            .map(|&(_, _, at)| unsafe { &*(at as *const Heap) }.hold())
-            .collect()
-    };
-    if holds.is_empty() {
-        return;
-    }
+    #[cfg(test)]
+    let tests = LOOKED_AT_BY_TESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    #[cfg(test)]
+    let holds = registered(|at| !tests.contains(&at));
+    #[cfg(not(test))]
+    let holds = registered(|_| true);
     let mut found = Copies::default();
-    for hold in holds {
+    for (_, hold) in holds {
         hold.with(|heap| heap.look_for_copies(&mut found));
     }
     let mut synced = SYNCED.lock().unwrap_or_else(|e| e.into_inner());
@@ -769,24 +773,20 @@ pub(crate) fn take_synced(frames: f64) -> HeapSyncLine {
     if !heap_sync_used() {
         return line;
     }
-    for &(_, _, at) in SHADER_HEAPS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-    {
-        // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
-        let Some(Some(host)) = heap.host.get() else {
-            continue;
-        };
-        if heap.watched.is_none() {
-            // In XTP's own memory: the title may copy records into it as
-            // well, and no write watch shows it.
-            line.unplaced += u64::from(heap.desc.count);
-        } else {
-            // Past the host heap (a capped one): no host slot to make.
-            line.past += u64::from(heap.desc.count.saturating_sub(host.count()));
-        }
+    for (_, hold) in registered(|_| true) {
+        hold.with(|heap| {
+            let Some(Some(host)) = heap.host.get() else {
+                return;
+            };
+            if heap.watched.is_none() {
+                // In XTP's own memory: the title may copy records into it
+                // as well, and no write watch shows it.
+                line.unplaced += u64::from(heap.desc.count);
+            } else {
+                // Past the host heap (a capped one): no host slot to make.
+                line.past += u64::from(heap.desc.count.saturating_sub(host.count()));
+            }
+        });
     }
     line
 }
@@ -1123,45 +1123,54 @@ pub(crate) fn give_back(held: &mut Held) {
         .collect();
     keys.sort_unstable();
     keys.dedup();
-    // Held throughout: a heap's drop waits for it, so a live one stays so.
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    // Each heap held while its slots go back: its release waits, and finds
+    // them given back; one released before is passed over.
+    let holds = registered(|at| keys.contains(&at));
     for key in keys {
-        let (host, life) = if key == OWN_VIEW_HEAP {
-            (own_view_heap(), None)
-        } else if heaps.iter().any(|&(_, _, h)| h == key) {
-            // SAFETY: registered heaps are live (removed when dropped).
-            let heap = unsafe { &*(key as *const Heap) };
-            (heap.host.get().and_then(Option::as_ref), Some(&heap.life))
-        } else {
-            (None, None)
-        };
-        let Some(host) = host else { continue };
-        // Taken from the heap at the address now, or of no heap known.
-        let ours = |taken: Option<&Option<HeapHold>>| match (taken.and_then(Option::as_ref), life) {
-            (Some(taken), Some(life)) => std::sync::Arc::ptr_eq(&taken.0, life),
-            _ => true,
-        };
-        let ranges: Vec<(u32, u32)> = held
-            .ranges
-            .iter()
-            .enumerate()
-            .filter(|&(i, r)| r.0 == key && ours(held.range_heaps.get(i)))
-            .map(|(_, &(_, first, n))| (first, n))
-            .collect();
-        host.release_all(&ranges);
-        let shared: Vec<u32> = held
-            .shared
-            .iter()
-            .enumerate()
-            .filter(|&(i, s)| s.0 == key && ours(held.shared_heaps.get(i)))
-            .map(|(_, s)| s.1)
-            .collect();
-        host.give_back(&shared);
+        let hold = holds.iter().find(|(at, _)| *at == key).map(|(_, h)| h);
+        if key == OWN_VIEW_HEAP {
+            if let Some(host) = own_view_heap() {
+                give_back_to(held, key, host, None);
+            }
+        } else if let Some(hold) = hold {
+            hold.with(|heap| {
+                if let Some(Some(host)) = heap.host.get() {
+                    give_back_to(held, key, host, Some(hold));
+                }
+            });
+        }
     }
     held.ranges.clear();
     held.shared.clear();
     held.range_heaps.clear();
     held.shared_heaps.clear();
+}
+
+/// [`give_back`] of what `held` took from the host heap `host` behind
+/// `key`, held by `life` (none for XTP's own view heap).
+#[cfg(windows)]
+fn give_back_to(held: &Held, key: usize, host: &host::HostHeap, life: Option<&HeapHold>) {
+    // Taken from the heap at the address now, or of no heap known.
+    let ours = |taken: Option<&Option<HeapHold>>| match (taken.and_then(Option::as_ref), life) {
+        (Some(taken), Some(life)) => taken == life,
+        _ => true,
+    };
+    let ranges: Vec<(u32, u32)> = held
+        .ranges
+        .iter()
+        .enumerate()
+        .filter(|&(i, r)| r.0 == key && ours(held.range_heaps.get(i)))
+        .map(|(_, &(_, first, n))| (first, n))
+        .collect();
+    host.release_all(&ranges);
+    let shared: Vec<u32> = held
+        .shared
+        .iter()
+        .enumerate()
+        .filter(|&(i, s)| s.0 == key && ours(held.shared_heaps.get(i)))
+        .map(|(_, s)| s.1)
+        .collect();
+    host.give_back(&shared);
 }
 
 #[cfg(windows)]
@@ -1175,7 +1184,7 @@ impl Drop for Heap {
             *self.life.heap.write().unwrap_or_else(|e| e.into_inner()) = 0;
         }
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, h)| h != at);
+        heaps.retain(|&(_, _, h, _)| h != at);
     }
 }
 
@@ -1718,7 +1727,7 @@ pub(crate) extern "system" fn create_heap(
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.push((start, start + size, at));
+        heaps.push((start, start + size, at, heap.hold()));
     }
     #[cfg(not(windows))]
     let _ = visible;
@@ -2191,6 +2200,52 @@ mod tests {
         );
         assert_eq!(release_asked(hold.clone()), (None, 0), "the last");
         assert!(hold.with(|_| ()).is_none());
+    }
+
+    /// stride4c, Codex review of stride4b, P1, the rest of it: work that
+    /// finds a heap in the registry (giving a list's slots back, the frame
+    /// line's count, the look for records copied in as bytes) used it by its
+    /// address under the registry's lock, which the heap's drop takes only
+    /// once its last release has rebuilt the box. It now holds the heap
+    /// through the registry: slots given back while the last release runs
+    /// wait for it, then find the heap gone and leave it alone.
+    #[cfg(windows)]
+    #[test]
+    fn slots_given_back_during_the_last_release_wait_and_find_the_heap_gone() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let test = "descriptor::tests::slots_given_back_during_the_last_release_wait_and_find_the_heap_gone";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let made = TestHeap::views(8);
+        let this = made.0;
+        // The last release below is the test's own.
+        std::mem::forget(made);
+        let slot = heap(this).host().expect("a host heap").dynamic(1);
+        let slot = slot.expect("a dynamic slot");
+        let mut lease = Held::default();
+        lease.add_range(this as usize, slot, 1);
+        let giver = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let (spawned, finished) = (giver.clone(), done.clone());
+        RELEASE_BETWEEN.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                let waited = finished.clone();
+                let thread = std::thread::spawn(move || {
+                    give_back(&mut lease);
+                    waited.store(true, Ordering::SeqCst);
+                    lease
+                });
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(!finished.load(Ordering::SeqCst), "the give-back waits");
+                *spawned.lock().unwrap() = Some(thread);
+            }));
+        });
+        assert_eq!(release(this), 0, "the last release");
+        let thread = giver.lock().unwrap().take().expect("given back meanwhile");
+        let lease = thread.join().expect("the giving thread");
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(lease, Held::default(), "emptied, the heap passed over");
     }
 
     /// A record across a page's start or end is looked at from either page;
