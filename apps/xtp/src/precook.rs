@@ -655,6 +655,8 @@ struct Replay {
 struct PackSets {
     effects: usize,
     passes: usize,
+    /// Passes that name programs not in the pack.
+    outside: usize,
     draws: usize,
     sets: HashSet<Vec<[u8; 32]>>,
 }
@@ -664,6 +666,8 @@ struct PackSets {
 struct Coverage {
     effects: usize,
     passes: usize,
+    /// Passes that name programs not in the pack.
+    outside: usize,
     /// The passes that draw, and their distinct shader sets.
     draws: usize,
     sets: usize,
@@ -679,6 +683,7 @@ impl Coverage {
         Coverage {
             effects: pack.effects,
             passes: pack.passes,
+            outside: pack.outside,
             draws: pack.draws,
             sets: pack.sets.len(),
             kept: covered,
@@ -727,6 +732,7 @@ fn pack_effects(data: &[u8]) -> Result<PackSets, String> {
     Ok(PackSets {
         effects: read.effects.len(),
         passes: read.passes.len(),
+        outside: read.passes.iter().filter(|p| p.outside).count(),
         draws,
         sets,
     })
@@ -1110,10 +1116,12 @@ fn replay_lines(r: &Replay) -> String {
         Some(Ok(c)) => {
             let _ = writeln!(
                 o,
-                "effects      {} effects, {} passes: {} draw, with {} shader sets; the kept \
-                 descriptions have {} of them ({:.1} %), and {} sets no pass names",
+                "effects      {} effects, {} passes ({} name programs not in the pack): {} \
+                 draw, with {} shader sets; the kept descriptions have {} of them ({:.1} %), \
+                 and {} sets no pass names",
                 c.effects,
                 c.passes,
+                c.outside,
                 c.draws,
                 c.sets,
                 c.kept,
@@ -1390,6 +1398,7 @@ mod tests {
         let pack = PackSets {
             effects: 2,
             passes: 5,
+            outside: 1,
             draws: 4,
             sets: [set(1, 2), set(1, 3), set(4, 5)].into_iter().collect(),
         };

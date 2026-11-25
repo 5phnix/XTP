@@ -41,6 +41,8 @@
 //!   uses, in order, are the file's sections, in order (in the title's
 //!   pack the vertex, pixel, geometry and compute lists; lists 3 and 4 are
 //!   empty everywhere, their stages unknown).
+//! - A pass that names a program past its effect's list names one that is
+//!   not in the pack ([`Pass::outside`]).
 
 use std::ops::Range;
 
@@ -98,6 +100,11 @@ pub struct Pass {
     pub effect: usize,
     /// Each list's program: its record, in the records given to [`read`].
     pub programs: [Option<usize>; LISTS],
+    /// It names programs its effect does not list: they are not in the
+    /// pack (in the title's, 18 effects list no programs at all, among them
+    /// the `_bvh8` variants of the ray-tracing ones, while their 670
+    /// passes name some), and [`Pass::programs`] holds none.
+    pub outside: bool,
 }
 
 impl Pass {
@@ -206,19 +213,18 @@ fn file(
             let first = out.passes.len();
             for bytes in &e.passes[at..at + count] {
                 let mut programs = [None; LISTS];
+                let mut outside = false;
                 for (l, program) in programs.iter_mut().enumerate() {
                     let position = usize::from(bytes[l]);
                     if position == 0 {
                         continue;
                     }
-                    let (Some(i), Some(s)) = (e.lists[l].get(position - 1), &section[l]) else {
-                        return Err(format!(
-                            "effect {}: a pass names program {position} of list {l}, which has {}",
-                            e.name,
-                            e.lists[l].len()
-                        ));
+                    let Some(&i) = e.lists[l].get(position - 1) else {
+                        outside = true;
+                        continue;
                     };
-                    if *i >= s.len() {
+                    let s = section[l].as_ref().expect("a used list has its section");
+                    if i >= s.len() {
                         return Err(format!(
                             "effect {}: list {l} names program {i} of a section of {}",
                             e.name,
@@ -229,7 +235,8 @@ fn file(
                 }
                 out.passes.push(Pass {
                     effect: index,
-                    programs,
+                    programs: if outside { [None; LISTS] } else { programs },
+                    outside,
                 });
             }
             at += count;
@@ -532,6 +539,13 @@ mod tests {
             &[("only", &[[1, 0, 0, 0, 0, 1]])],
             96,
         );
+        // Programs that are not in the pack.
+        p.effect(
+            "elsewhere",
+            [&[], &[], &[], &[], &[], &[]],
+            &[("away", &[[1, 2, 0, 0, 0, 0]])],
+            96,
+        );
         p.bytes.extend([0; 64]);
         p.file();
         p.section(1); // vertex: record 7
@@ -546,7 +560,7 @@ mod tests {
 
         let e = read(&p.bytes, &p.records).unwrap();
         let names: Vec<&str> = e.effects.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["blit", "other", "ui"]);
+        assert_eq!(names, ["blit", "other", "elsewhere", "ui"]);
         let blit = &e.effects[0];
         let techniques: Vec<(&str, Range<usize>)> = blit
             .techniques
@@ -566,11 +580,15 @@ mod tests {
                 [Some(2), None, None, None, None, None],
                 [None, None, None, None, None, Some(6)],
                 [Some(1), None, None, None, None, Some(5)],
+                [None; LISTS],
                 [Some(7), None, None, None, None, None],
             ]
         );
         assert!(e.passes[0].draws() && !e.passes[3].draws());
-        assert_eq!(e.passes[5].effect, 2);
+        let outside: Vec<bool> = e.passes.iter().map(|p| p.outside).collect();
+        assert_eq!(outside, [false, false, false, false, false, true, false]);
+        assert!(!e.passes[5].draws());
+        assert_eq!(e.passes[6].effect, 3);
     }
 
     /// A list naming a program past its section, or more sections than
