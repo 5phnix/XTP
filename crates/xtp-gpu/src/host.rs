@@ -1440,10 +1440,6 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        #[cfg(feature = "diagnostics")]
-        for sample in p.recorded.iter().flat_map(|r| r.rt_samples.iter()) {
-            sample.report();
-        }
         // `XTP_MESH_STATS`: what the draws read, against title memory.
         #[cfg(feature = "diagnostics")]
         crate::meshstat::submitting(runs, batch.submission);
@@ -1827,6 +1823,10 @@ impl Host {
         // same big ranges dozens of times).
         #[cfg(feature = "diagnostics")]
         for sample in p.recorded.iter().flat_map(|r| r.dispatch_samples.iter()) {
+            sample.report();
+        }
+        #[cfg(feature = "diagnostics")]
+        for sample in p.recorded.iter().flat_map(|r| r.rt_samples.iter()) {
             sample.report();
         }
         // `XTP_MESH_STATS`: what the draws read, as the GPU left it.
