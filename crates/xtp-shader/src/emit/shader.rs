@@ -150,6 +150,7 @@ impl RawWindow {
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    pub const FORCE_EARLY_DEPTH_STENCIL: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;

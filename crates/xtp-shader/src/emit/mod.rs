@@ -813,13 +813,8 @@ mod tests {
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
-    /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
-    /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
-    /// output signature has SV_StencilRef, and the feature bit
-    /// D3D_SHADER_FEATURE_STENCIL_REF (0x200) in SFI0; the validator checks
-    /// both against the module.
-    #[test]
-    fn a_stencil_export_declares_the_stencil_ref_feature() {
+    /// A pixel shader exporting depth and stencil, translated with the given hardware controls.
+    fn depth_stencil_export(db_shader_control: u32) -> HostShader {
         let words = [
             0x7E00_02F2u32, // v_mov_b32 v0, 1.0
             0x7E02_0285,    // v_mov_b32 v1, 5
@@ -838,7 +833,7 @@ mod tests {
                 inputs: vec![],
                 input_addr: 0,
                 rsrc2: 0,
-                db_shader_control: 0,
+                db_shader_control,
                 patches: vec![],
             },
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -871,10 +866,35 @@ mod tests {
         ) {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
+        out
+    }
+
+    #[test]
+    fn a_stencil_export_declares_the_stencil_ref_feature() {
+        let out = depth_stencil_export(0);
         let host = Container::parse(&out.dxil).unwrap();
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    #[test]
+    fn depth_before_shader_changes_the_dxil_entry_even_with_depth_exports() {
+        let plain = depth_stencil_export(0);
+        let early = depth_stencil_export(1 << 12);
+        let other = depth_stencil_export(1 << 11);
+        assert_eq!(plain.dxil, other.dxil);
+        let plain = Container::parse(&plain.dxil).unwrap();
+        let early = Container::parse(&early.dxil).unwrap();
+        // ForceEarlyDepthStencil is an entry flag, with no SFI0 feature bit.
+        assert_ne!(
+            plain.part(FourCC::DXIL).unwrap().data,
+            early.part(FourCC::DXIL).unwrap().data
+        );
+        assert_eq!(
+            plain.part(FourCC::SFI0).unwrap().data,
+            early.part(FourCC::SFI0).unwrap().data
+        );
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
