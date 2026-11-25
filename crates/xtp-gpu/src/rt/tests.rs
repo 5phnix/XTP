@@ -1039,3 +1039,99 @@ fn rt_invalid_blas_inputs_are_refused_before_their_build() {
     }
     assert!(translate(&unindexed), "three vertices without indices");
 }
+
+thread_local! {
+    /// Set by a test to refuse the title's structures on its own thread,
+    /// as `XTP_RT_BUILDS=0` does for a whole run ([`builds_on`]).
+    pub(super) static BUILDS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The title's builds refused on this thread until dropped.
+struct BuildsOff;
+
+impl BuildsOff {
+    fn new() -> BuildsOff {
+        BUILDS_OFF.set(true);
+        BuildsOff
+    }
+}
+
+impl Drop for BuildsOff {
+    fn drop(&mut self) {
+        BUILDS_OFF.set(false);
+    }
+}
+
+#[test]
+fn rt_builds_switch_is_off_only_at_zero() {
+    assert!(builds_asked(None));
+    assert!(builds_asked(Some("1")));
+    assert!(!builds_asked(Some("0")));
+    assert!(!builds_asked(Some(" 0 ")));
+}
+
+/// With the title's structures off (`XTP_RT_BUILDS=0`), its BLAS and TLAS
+/// builds, rehydrations and copies are refused, and the empty TLAS is
+/// still made: a trace of the title's TLAS runs on it and every ray misses,
+/// as on the console with an empty structure (under 4a0cdb3 the switch
+/// dropped the empty TLAS too, and with it every trace).
+#[test]
+fn rt_builds_off_keeps_the_empty_tlas_and_traces_miss() {
+    let test = "rt_builds_off_keeps_the_empty_tlas_and_traces_miss";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    let _off = BuildsOff::new();
+    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+    vertices.set_words(|i| POSITIONS[i].to_bits());
+    indices.set_words(|i| [1 << 16, 2][i]);
+    let (blas, tlas, copy) = (
+        TitleBuffer::new(1024),
+        TitleBuffer::new(1024),
+        TitleBuffer::new(1024),
+    );
+    let instances = instances_of(&[blas.address()]);
+    let geometry = geometry(&vertices, &indices);
+    let blas_build = Build {
+        DestAccelerationStructureData: blas.address(),
+        Inputs: blas_input(&geometry),
+        ..Default::default()
+    };
+    let producer = TitleList::new();
+    // SAFETY: the title list and every buffer the descriptions name are live.
+    unsafe {
+        assert!(!Builder.build(producer.this(), &blas_build), "a BLAS build");
+        assert!(
+            !Builder.build(producer.this(), &tlas_desc(tlas.address(), &instances)),
+            "a TLAS build"
+        );
+        assert!(!rehydrate(producer.this(), &blas_build), "a rehydration");
+        assert!(
+            !Builder.copy(
+                producer.this(),
+                copy.address(),
+                tlas.address(),
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0
+            ),
+            "a copy"
+        );
+    }
+    producer.run();
+    for at in [&blas, &tlas, &copy] {
+        assert!(
+            !registry().structures.contains_key(&at.address()),
+            "no structure at a refused address"
+        );
+    }
+    let list = TitleList::new();
+    assert!(empty_tlas_in(list.host()).is_some(), "the empty TLAS");
+    if !rays {
+        list.run();
+        return;
+    }
+    let slot = Descriptor::new(tlas.address());
+    let out = unwritten();
+    trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
+    list.run();
+    assert_eq!(out.words(), MISSES, "the trace ran on the empty TLAS");
+}

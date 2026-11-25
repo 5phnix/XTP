@@ -145,29 +145,41 @@ struct Recorder<'a> {
     list: &'a HostList,
 }
 
-/// Whether the host records DXR work: the title's acceleration structure
-/// builds, copies and rehydrations, the empty TLAS and the trace commands.
-/// `XTP_RT_BUILDS=0` turns it all off, a diagnostic for sessions that do
-/// not test ray tracing: the title's structures are then refused, and
-/// traces that need a TLAS are dropped. Default: on.
+/// Whether the host mirrors the title's acceleration structure builds,
+/// copies and rehydrations. `XTP_RT_BUILDS=0` refuses them all, a
+/// diagnostic for sessions that do not test ray tracing (one of these
+/// builds hung the GPU in a DRED session). The empty TLAS and the trace
+/// commands stay: a trace then binds the empty TLAS and every ray misses,
+/// as on the console with an empty structure. Default: on.
 fn builds_on() -> bool {
+    #[cfg(test)]
+    if tests::BUILDS_OFF.get() {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("XTP_RT_BUILDS").map_or(true, |v| v.trim() != "0");
+        let on = builds_asked(std::env::var("XTP_RT_BUILDS").ok().as_deref());
         if !on {
             tracing::warn!(
-                "XTP_RT_BUILDS=0: no host DXR work is recorded (the title's acceleration                  structures are refused, traces that need a TLAS are dropped)"
+                "XTP_RT_BUILDS=0: the title's acceleration structure builds, copies and \
+                 rehydrations are refused; traces bind an empty TLAS (every ray misses)"
             );
         }
         on
     })
 }
 
+/// Whether `XTP_RT_BUILDS`'s value leaves the title's builds on: anything
+/// but `0`.
+fn builds_asked(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
 impl<'a> Recorder<'a> {
+    /// A recorder of host DXR work into `list`, whatever `XTP_RT_BUILDS`
+    /// says: the empty TLAS and the trace commands are recorded either way
+    /// ([`builds_on`] gates the title's builds, copies and rehydrations).
     fn new(list: &'a HostList) -> Option<Self> {
-        if !builds_on() {
-            return None;
-        }
         Some(Self {
             device: device(crate::host::made()?)?,
             commands: list.list.cast().ok()?,
