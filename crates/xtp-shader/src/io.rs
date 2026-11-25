@@ -187,15 +187,22 @@ pub struct Io {
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
-    /// Compute: how many SGPRs the hardware initializes
-    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
+    /// Number of defined entry SGPRs when the stage layout is known.
     pub initialized_sgprs: Option<u8>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
-    raise_inputs(p, native, false)
+    match raise_inputs(p, native, false) {
+        Err(ShaderError::Unsupported {
+            what:
+                "an interpolation without its first half"
+                | "interpolation halves of different attributes",
+            ..
+        }) => raise_inputs(p, native, true),
+        result => result,
+    }
 }
 
 /// On a live read of a folded first half, evaluate the two instructions
@@ -668,10 +675,14 @@ mod tests {
     }
 
     #[test]
-    fn unpaired_or_unknown_interpolation_fails() {
+    fn a_second_half_accepts_an_arbitrary_accumulator_but_needs_its_attribute() {
         // p2 alone: its old dst is no p1's result.
         let lone = program(&[0xC809_0001, S_ENDPGM]); // v_interp_p2_f32 v2, v1, attr0.x
-        assert!(raise(&lone, &pixel(vec![TEXCOORD], 2)).is_err());
+        let io = raise(&lone, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert!(matches!(
+            &io.interps[..],
+            [((0, 0), Interp::Weighted { .. })]
+        ));
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());

@@ -180,7 +180,7 @@ impl NativeProgram {
             }
         }
         if self.io.pops() {
-            skip_ordered_wait(&mut code, self.wave64);
+            skip_ordered_wait(&mut code, self.wave64, self.vgprs);
         }
         code
     }
@@ -189,21 +189,39 @@ impl NativeProgram {
 /// Host rasterizer-ordered UAVs serialize overlapping pixels. Bypass the
 /// console's collision test only when both paths lead to the same ordered
 /// section and the skipped block only polls SRC_POPS_EXITING_WAVE_ID.
-fn skip_ordered_wait(code: &mut [u8], wave64: bool) {
+fn skip_ordered_wait(code: &mut [u8], wave64: bool, vgprs: u16) {
     use crate::gfx10::{Fields, Operand};
-    let Ok(insts) = crate::gfx10::decode(code) else {
+    use crate::ir::Exit;
+    let Ok(p) = crate::ir::build(code, wave64, vgprs) else {
         return;
     };
-    for w in insts.windows(5) {
-        let [gate, sleep, add, cmp, back] = w else {
-            unreachable!()
+    for gate in &p.blocks {
+        let Exit::Branch {
+            taken: section,
+            not_taken: wait,
+        } = gate.exit
+        else {
+            continue;
         };
-        if gate.words != [0xbf87_0004] // s_cbranch_vccnz past the poll
-            || back.words != [0xbf84_fffc] // s_cbranch_scc0 to sleep
-            || back.offset != gate.offset + 16
-            || sleep.name() != Some("s_sleep")
-            || add.name() != Some("s_add_i32")
-            || cmp.name() != Some("s_cmp_lt_u32")
+        let poll = &p.blocks[wait];
+        let Some(branch) = gate.insts.last() else {
+            continue;
+        };
+        let [add, cmp, back] = poll.insts.as_slice() else {
+            continue;
+        };
+        // s_sleep is omitted from the IR. Insist on the four contiguous
+        // instructions so the skipped path contains only the polling loop.
+        let at = branch.machine.offset;
+        if branch.machine.words != [0xbf87_0004]
+            || back.machine.words != [0xbf84_fffc]
+            || back.machine.offset != at + 16
+            || code[at + 6..at + 8] != 0xbf8eu16.to_le_bytes()
+            || poll.exit
+                != (Exit::Branch {
+                    taken: wait,
+                    not_taken: section,
+                })
         {
             continue;
         }
@@ -211,16 +229,43 @@ fn skip_ordered_wait(code: &mut [u8], wave64: bool) {
             dst: Some(dst),
             src,
             ..
-        } = add.fields(wave64)
+        } = &add.fields
         else {
             continue;
         };
-        let Fields::Sop { src: compared, .. } = cmp.fields(wave64) else {
+        let Fields::Sop { src: compared, .. } = &cmp.fields else {
             continue;
         };
-        if src.first() == Some(&Operand::Const(239)) && compared.get(1) == Some(&dst) {
-            code[gate.offset..gate.offset + 4].copy_from_slice(&0xbf82_0004u32.to_le_bytes());
+        if !matches!(
+            dst,
+            Operand::Scalar {
+                code: 0..=105,
+                dwords: 1
+            }
+        ) || add.name() != "s_add_i32"
+            || src.first() != Some(&Operand::Const(239))
+            || cmp.name() != "s_cmp_lt_u32"
+            || compared.get(1) != Some(dst)
+        {
+            continue;
         }
+        // Raster order cannot supply the poll's scratch SGPR or SCC as
+        // shader data. Both must be overwritten before their next read.
+        let dead = |&(reg, _): &_| {
+            for i in &p.blocks[section].insts {
+                if i.read(reg).is_some() {
+                    return false;
+                }
+                if i.write(reg).is_some() {
+                    return true;
+                }
+            }
+            p.blocks[section].exit == Exit::End
+        };
+        if !add.writes.iter().chain(&cmp.writes).all(dead) {
+            continue;
+        }
+        code[at..at + 4].copy_from_slice(&0xbf82_0004u32.to_le_bytes());
     }
 }
 

@@ -46,7 +46,11 @@ fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
 }
 
 fn pixel_rsrc(words: &[u32], input_addr: u32, rsrc2: u32) -> Result<HostShader, ShaderError> {
-    let native = NativeProgram {
+    emit_pixel(&native_pixel(words, input_addr, rsrc2))
+}
+
+fn native_pixel(words: &[u32], input_addr: u32, rsrc2: u32) -> NativeProgram {
+    NativeProgram {
         stage: HwStage::Ps,
         wave64: false,
         vgprs: 8,
@@ -69,7 +73,10 @@ fn pixel_rsrc(words: &[u32], input_addr: u32, rsrc2: u32) -> Result<HostShader, 
             patches: vec![],
         },
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
+    }
+}
+
+fn emit_pixel(native: &NativeProgram) -> Result<HostShader, ShaderError> {
     let mut target = element("SV_Target", 16, 0);
     target.usage = 15;
     let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
@@ -79,8 +86,8 @@ fn pixel_rsrc(words: &[u32], input_addr: u32, rsrc2: u32) -> Result<HostShader, 
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, &native)?;
-    emit(&c, &native, &p, &st, &io, &res)
+    let io = io::raise(&p, native)?;
+    emit(&c, native, &p, &st, &io, &res)
 }
 
 /// The translation's `SFI0` features and `ISG1` rows.
@@ -356,4 +363,95 @@ fn conditional_pixel_export_keeps_the_lane_for_later_exports() {
     let out = pixel(&words, PERSP_CENTER).unwrap();
     assert!(!crate::emit::last_module_summary().contains("discard"));
     validate(&out);
+}
+
+/// The ordered section writes through a heap UAV. Without the collision
+/// SGPR the same loop has no known host wait. Reading its counter after
+/// the join must also keep the original loop.
+#[test]
+fn ordered_pixel_wait_is_replaced_only_when_its_results_are_dead() {
+    use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+    let words = [
+        0xbf06_8004, // s_cmp_eq_u32 s4 (collision wave ID), 0
+        0x85ea_807e, // s_cselect_b64 vcc, exec, 0
+        0xbf87_0004, // skip the wait if vcc is set
+        0xbf8e_0001, // s_sleep
+        0x8106_04ef, // s_add_i32 s6, src_pops_exiting_wave_id, s4
+        0xbf0a_0605, // s_cmp_lt_u32 s5, s6
+        0xbf84_fffc, // s_cbranch_scc0 back to sleep
+        0x8106_8080, // s_add_i32 s6, 0, 0 (overwrites scratch and SCC)
+        0xbe81_0380, // s_mov_b32 s1, 0 (table high)
+        0xf40c_0200,
+        0xfa00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+        0xbf8c_0000,
+        0xf020_0f08,
+        0x0002_0402, // image_store v[4:7], v[2:3], s[8:15]
+        0xbf90_0007, // MSG_ORDERED_PS_DONE
+        0xf800_180f,
+        0,
+        S_ENDPGM,
+    ];
+    let pops = 1 << 25 | 3 << 1;
+    let mut n = native_pixel(&words, 0, pops);
+    n.wave64 = true;
+    n.layout.push(RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 1,
+    });
+    n.used.push(UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 0,
+        slot: 1,
+    });
+    assert_eq!(&n.patched_code()[8..12], &0xbf82_0004u32.to_le_bytes());
+    let shader = emit_pixel(&n).unwrap();
+    assert_ne!(parts(&shader).0 & 0x1000, 0);
+    validate(&shader);
+    // Preserve a counter used to compute shader data.
+    n.code[28..32].copy_from_slice(&0x8106_8006u32.to_le_bytes());
+    assert_eq!(n.patched_code(), n.code);
+    let plain = native_pixel(&words, 0, 3 << 1);
+    assert_eq!(plain.patched_code(), plain.code);
+}
+
+#[test]
+fn a_mask_on_a_skipped_pixel_data_edge_is_dead_only_behind_its_flag() {
+    let words = [
+        0xbf06_8008, // s_cmp_eq_u32 s8, 0 (a temporary on entry)
+        0xbf84_0004, // s_cbranch_scc0 to data
+        0x7d84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xbe82_046a, // s_mov_b64 s[2:3], vcc
+        0x7e04_0280, // v_mov_b32 v2, 0 (no data)
+        0xbf82_0002,
+        0xbe83_0387, // s_mov_b32 s3, 7
+        0x7e04_02c1, // v_mov_b32 v2, -1 (data valid)
+        0x7d84_04c1, // v_cmp_eq_u32 vcc, -1, v2
+        0x8aea_6a7e, // s_andn2_b64 vcc, exec, vcc
+        0xbf87_0001, // skip read if data invalid
+        0x7e06_0203, // v_mov_b32 v3, s3
+        0xf800_180f,
+        0x0303_0303,
+        S_ENDPGM,
+    ];
+    let mut n = native_pixel(&words, PERSP_CENTER, 0);
+    n.wave64 = true;
+    validate(&emit_pixel(&n).unwrap());
+    // The mask edge now reaches the read. Its wave64 high word is real data.
+    n.code[4 * 4..5 * 4].copy_from_slice(&0x7e04_02c1u32.to_le_bytes());
+    assert!(matches!(
+        emit_pixel(&n),
+        Err(ShaderError::Unsupported {
+            what: "a lane mask read as data",
+            ..
+        })
+    ));
 }
