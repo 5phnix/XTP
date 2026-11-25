@@ -43,8 +43,9 @@ static MAP: OnceLock<Mutex<Map>> = OnceLock::new();
 pub fn configure_copy_back(path: Option<PathBuf>) {
     // Opt-in (`XTP_READMAP=1`) until the title's own WriteFile/fwrite of a
     // pending page is handled: those kernel reads don't fault, so they would
-    // fail with ERROR_NOACCESS (Claude review of bdc9263, 2026-11-25).
-    if std::env::var("XTP_READMAP").as_deref() != Ok("1") {
+    // fail with ERROR_NOACCESS (Claude review of bdc9263, 2026-11-25). Unit
+    // tests turn it on through this call.
+    if !cfg!(test) && std::env::var("XTP_READMAP").as_deref() != Ok("1") {
         return;
     }
     // The census installs independent one-shot guards on the same pages.
