@@ -94,6 +94,7 @@ const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 const RECORD_SIZE: u64 = 0x54;
 const RECORD_FLAGS: usize = 0x14;
 const FLAG_WAVE32: u32 = 1 << 5;
+const RECORD_FLOAT_MODE: usize = 0x44;
 const RECORD_REGS: usize = 0x50;
 const RECORD_LAYOUT: usize = 0x28;
 const RECORD_USED: usize = 0x30;
@@ -153,6 +154,8 @@ pub struct NativeProgram {
     pub stage: HwStage,
     /// Runs as 64 lanes per wave (else 32); sizes lane masks.
     pub wave64: bool,
+    /// Bits 0 à 7 de MODE à l’entrée du programme (arrondis et dénormalisés).
+    pub float_mode: u8,
     /// VGPRs the program uses (v0 up to this), the bound of indexed access.
     pub vgprs: u16,
     /// Where the root signature's parameters arrive (user SGPRs).
@@ -543,6 +546,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         out.push(NativeProgram {
             stage,
             wave64: u32_at(record, RECORD_FLAGS)? & FLAG_WAVE32 == 0,
+            float_mode: record[RECORD_FLOAT_MODE],
             vgprs,
             layout,
             used,
@@ -717,6 +721,7 @@ mod tests {
             payload.extend_from_slice(&[0; 4]);
             payload.extend_from_slice(&flags.to_le_bytes());
             payload.resize(record as usize + RECORD_REGS, 0);
+            payload[record as usize + RECORD_FLOAT_MODE] = 0xe1;
             payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
             payload.extend_from_slice(&empty_stage_data());
             payload.extend_from_slice(code);
@@ -768,6 +773,7 @@ mod tests {
                 NativeProgram {
                     stage: HwStage::Vs,
                     wave64: true,
+                    float_mode: 0xe1,
                     vgprs: 28,
                     layout: vec![],
                     used: vec![],
@@ -780,6 +786,7 @@ mod tests {
                 NativeProgram {
                     stage: HwStage::Ps,
                     wave64: false,
+                    float_mode: 0xe1,
                     vgprs: 28,
                     layout: vec![],
                     used: vec![],

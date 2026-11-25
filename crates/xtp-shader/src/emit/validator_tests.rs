@@ -418,6 +418,7 @@ fn a_console_row_of_a_flat_channel_and_others_validates() {
     let native = NativeProgram {
         stage: crate::HwStage::Ps,
         wave64: false,
+        float_mode: 0,
         vgprs: 4,
         layout: vec![],
         used: vec![],

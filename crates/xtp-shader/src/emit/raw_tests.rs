@@ -201,6 +201,7 @@ fn program(access: &[u32], kind: Kind, uav: bool) -> NativeProgram {
     NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 8,
         layout: vec![RootParam {
             root: RootType::Table,

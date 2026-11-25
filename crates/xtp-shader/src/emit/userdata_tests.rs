@@ -29,6 +29,7 @@ fn native(words: &[u32], layout: Vec<RootParam>) -> NativeProgram {
             threads: [1, 1, 1],
         }),
         wave64: false,
+        float_mode: 0,
         vgprs: 8,
         used: vec![],
         layout,

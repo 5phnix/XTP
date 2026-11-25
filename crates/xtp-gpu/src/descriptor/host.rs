@@ -3842,6 +3842,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
+            float_mode: 0,
             vgprs: 4,
             layout: vec![
                 param(RootType::Constants, 4, 0, 0),

@@ -80,6 +80,7 @@ fn program(wave: u32, lane: u32, joined_latch: bool) -> crate::NativeProgram {
     crate::NativeProgram {
         stage: crate::HwStage::Cs,
         wave64,
+        float_mode: 0,
         vgprs: 8,
         layout: vec![RootParam {
             root: RootType::Table,
