@@ -30,6 +30,25 @@ fn validates(what: &str, container: &[u8]) {
     }
 }
 
+/// The validator the tests use knows the version the modules declare
+/// (`dx.valver` 1.6, `Shader::finish`): an older one would refuse every
+/// module, a newer one checks them by 1.6's rules. Its version and path
+/// are printed, since the checks of every test depend on them.
+#[test]
+fn the_validator_knows_the_declared_version() {
+    let path = Validator::default_path();
+    let v = match Validator::load(path.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("SKIPPED: {e}");
+            return;
+        }
+    };
+    let version = v.version().expect("IDxcVersionInfo");
+    eprintln!("dxil.dll {path:?}: validator {}.{}", version.0, version.1);
+    assert!(version >= (1, 6), "validator {version:?}");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn el(
     name: &str,
