@@ -20,6 +20,7 @@
                     title for -Seconds in the VM's desktop session, from the
                     golden data folder if the VM has one (see vm\run-game.ps1)
     -DeviceCheck    the D3D12 adapters and what they support
+    -Status         show lock holders and queued requests on a running VM
 
   Which code (for -Check, -Cargo and -Game's build):
     default         origin/main of the VM's clone (or -Ref <commit|branch>)
@@ -67,6 +68,7 @@ param(
     [Parameter(ParameterSetName = 'Game', Mandatory)] [switch]$Game,
     [Parameter(ParameterSetName = 'Tests', Mandatory)] [switch]$GpuTests,
     [Parameter(ParameterSetName = 'Device', Mandatory)] [switch]$DeviceCheck,
+    [Parameter(ParameterSetName = 'Status', Mandatory)] [switch]$Status,
     [Parameter(ParameterSetName = 'Tests')] [string[]]$Packages = @('xtp-shader', 'xtp-gpu'),
     [Parameter(ParameterSetName = 'Tests')] [ValidateSet('hardware', 'warp')] [string]$Adapter = 'hardware',
     [Parameter(ParameterSetName = 'Tests')] [int]$TestTimeout = 300,
@@ -92,6 +94,16 @@ param(
 )
 . "$PSScriptRoot\common.ps1"
 $cfg = Get-XtpCloudConfig $Config
+if ($Status) {
+    $zone = Get-XtpVmZone $cfg
+    if (-not $zone) { throw "No VM named $($cfg.vm) in $($cfg.project)." }
+    $state = Get-XtpVmStatus $cfg $zone
+    if ($state -ne 'RUNNING') { Write-Output "$($cfg.vm) is $state"; return }
+    # Read even an older deployment without uploading tools over an active run.
+    $queueScript = Get-Content -LiteralPath "$PSScriptRoot\vm\lock-queue.ps1" -Raw
+    Invoke-XtpVm -Cfg $cfg -Zone $zone -Script ($queueScript + "`nShow-XtpLockStatus")
+    return
+}
 $what = $PSCmdlet.ParameterSetName.ToLowerInvariant()
 $out = Join-Path $cfg.localLogDir ("{0}-{1}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $what)
 New-Item -ItemType Directory -Force -Path $out | Out-Null
