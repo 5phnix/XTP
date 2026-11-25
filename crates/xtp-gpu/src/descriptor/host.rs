@@ -1738,7 +1738,8 @@ impl HostHeap {
     }
 
     /// XTP's own view heap of `dynamic` dynamic slots and no title slots,
-    /// for lists that bind no view heap but read root SRVs.
+    /// bound in the view slot of lists that bind no hosted view heap of the
+    /// title's (root SRVs are read through tables in it).
     pub(crate) fn own(dynamic: u32) -> Option<Self> {
         let host = host()?;
         let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -1756,6 +1757,32 @@ impl HostHeap {
             Ok(heap) => Self::from_heap(heap, kind, false, 0, dynamic, 0),
             Err(e) => {
                 tracing::warn!(error = %e, dynamic, "no view heap of XTP's own");
+                None
+            }
+        }
+    }
+
+    /// XTP's own sampler heap: a few null samplers, bound so that a root
+    /// signature indexing the sampler heap directly may be set in a list
+    /// that binds no sampler heap of the title's.
+    pub(crate) fn own_samplers() -> Option<Self> {
+        const SLOTS: u32 = 16;
+        let host = host()?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        // SAFETY: plain heap creation.
+        let made = unsafe {
+            host.device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: SLOTS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+        };
+        match made {
+            Ok(heap) => Self::from_heap(heap, kind, true, 0, SLOTS, 0),
+            Err(e) => {
+                tracing::warn!(error = %e, "no sampler heap of XTP's own");
                 None
             }
         }
@@ -6230,7 +6257,6 @@ mod tests {
     /// load at 4 and the store at 8 are past the element: 0, dropped).
     #[test]
     fn a_translated_program_reads_and_writes_through_the_heaps_table() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::{TitleBuffer, TitleList};
         let test = "descriptor::host::tests::a_translated_program_reads_and_writes_through_the_heaps_table";
         let Some(gpu) = crate::testgpu::device(test) else {
@@ -6270,7 +6296,10 @@ mod tests {
             // SAFETY: an open list with every root argument set; the heap
             // and its table outlive the run.
             unsafe {
-                l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.list
+                    .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                        &heap.heap,
+                    )));
                 l.list.SetComputeRootSignature(&root);
                 l.list.SetPipelineState(&pso);
                 l.list.SetComputeRoot32BitConstants(
@@ -6365,7 +6394,10 @@ mod tests {
         // SAFETY: an open list with every root argument set; the heap and
         // its table outlive the run.
         unsafe {
-            l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.list
+                .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                    &heap.heap,
+                )));
             l.list.SetComputeRootSignature(root);
             l.list.SetPipelineState(pso);
             l.list
@@ -6384,7 +6416,6 @@ mod tests {
     /// table's entries, anything else as no view (loads 0, stores dropped).
     #[test]
     fn stride_table_reads_stay_inside_the_table_and_tell_remapped_slots() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::TitleBuffer;
         let test = "descriptor::host::tests::stride_table_reads_stay_inside_the_table_and_tell_remapped_slots";
         let Some(gpu) = crate::testgpu::device(test) else {
@@ -6516,7 +6547,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: an open list; live objects kept until it is reset; the
         // slot is in the heap set on it.
         unsafe {
-            l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.list
+                .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                    &heap.heap,
+                )));
             l.list.SetComputeRootSignature(root);
             l.list.SetPipelineState(pso);
             l.list
@@ -6719,7 +6753,6 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// to the copy, and the program reads what the title wrote last.
     #[test]
     fn views_read_through_the_table_only_are_refreshed_for_picks() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::TitleBuffer;
         let test =
             "descriptor::host::tests::views_read_through_the_table_only_are_refreshed_for_picks";
@@ -6911,7 +6944,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: an open list; live objects kept until it is reset; the
         // slot is in the heap set on it.
         unsafe {
-            l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.list
+                .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                    &heap.heap,
+                )));
             l.list.SetComputeRootSignature(&root);
             l.list.SetPipelineState(&pso);
             l.list
@@ -7169,7 +7205,10 @@ void main() {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 )]);
-                l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.list
+                    .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(
+                        &heap.heap,
+                    )));
                 l.list.SetComputeRootSignature(&root);
                 l.list.SetPipelineState(&pso);
                 l.list
@@ -7392,7 +7431,6 @@ void main() {
     /// table is submitted: its dispatch reads and writes through it.
     #[test]
     fn a_remapped_slot_gets_a_raw_view_once_one_comes_back() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use crate::testgpu::{TitleBuffer, TitleList};
         let test = "descriptor::host::tests::a_remapped_slot_gets_a_raw_view_once_one_comes_back";
         let Some(gpu) = crate::testgpu::device(test) else {
