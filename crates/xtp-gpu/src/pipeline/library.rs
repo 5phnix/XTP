@@ -49,11 +49,22 @@
 //!   change that alters few programs still finds every other pipeline by
 //!   name. [`GENERATIONS_FILE`] lists them, most recently opened first;
 //!   past [`GENERATIONS_KEPT`] of them or [`GENERATIONS_BYTES`] of files,
-//!   the least recently opened go (never the current one).
+//!   the least recently opened go (never the current one). A file linked
+//!   from another counts its bytes again (the budget errs on the safe
+//!   side). The one file of before generations (`host-pipelines.bin`)
+//!   becomes the first generation made. The list also says what a
+//!   generation holds besides its translator's pipelines (seeded from
+//!   another, or compacted, and its size then: [`Lineage`]), from which
+//!   `xtp precook` decides its next compaction. Every write of a library
+//!   file replaces it by a rename, so a generation linked from another
+//!   never changes the other's file. The list is changed by one thread at a
+//!   time in a process; two processes of different translators on one
+//!   cache at once could each let the other's generation go: sessions and
+//!   precooks on a machine run one at a time.
 //! - The names the library holds: D3D12 cannot list them, so every save
-//!   writes them beside the file ([`NAMES_FILE`]), with the file's size and
-//!   BLAKE3, which the next process checks before it trusts them. A library
-//!   read without them (an older file, or one saved by a process that died
+//!   writes them beside the file (`host-pipelines-<id>.names`, [`Place`]),
+//!   with the file's size and BLAKE3, which the next process checks before
+//!   it trusts them. A library read without them (an older file, or one saved by a process that died
 //!   before writing them) learns them as they load.
 //! - The precook does not load a pipeline the library is known to hold
 //!   ([`without_loading`]): its work is to have each pipeline in the file,
@@ -267,8 +278,10 @@ struct Names {
     complete: bool,
 }
 
-/// The names file beside the library, and its first line. Version 2 marks
-/// broken names ([`Names::broken`]); version 1, which did not, is read too.
+/// The names file beside the one library file of before generations
+/// ([`LIBRARY_FILE`]; a generation's is [`Place::names`]), and the first
+/// line of a names file. Version 2 marks broken names ([`Names::broken`]);
+/// version 1, which did not, is read too.
 const NAMES_FILE: &str = "host-pipelines.names";
 const NAMES_FORMAT: &str = "xtp pipeline names 2";
 const NAMES_FORMAT_1: &str = "xtp pipeline names 1";
@@ -589,7 +602,7 @@ static GENERATIONS: Mutex<()> = Mutex::new(());
 struct Settled {
     place: Place,
     lineage: Lineage,
-    /// The generations that went, least recently opened first.
+    /// The generations that went, most recently opened first.
     evicted: Vec<String>,
 }
 
@@ -775,6 +788,7 @@ fn current() -> Option<&'static (Place, Lineage)> {
 pub(crate) fn generation() -> Option<Lineage> {
     current().map(|(_, lineage)| lineage.clone())
 }
+
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -782,6 +796,10 @@ const EARLY_MAX: usize = 8192;
 /// late.
 static OPENED: AtomicBool = AtomicBool::new(false);
 static REBUILD: AtomicBool = AtomicBool::new(false);
+/// The library was opened as a new generation ([`new_generation`]): what
+/// it saves holds this translator's pipelines alone ([`record_compaction`]),
+/// even when the file before was rejected or empty.
+static REBUILT: AtomicBool = AtomicBool::new(false);
 
 fn library() -> Option<&'static RwLock<Library>> {
     static LIBRARY: OnceLock<Option<RwLock<Library>>> = OnceLock::new();
@@ -796,7 +814,9 @@ fn library() -> Option<&'static RwLock<Library>> {
                 .unwrap_or_default();
             let names = place.and_then(|p| std::fs::read_to_string(&p.names).ok());
             let library = if REBUILD.load(Ordering::SeqCst) {
-                new_generation(&device, blob, names.as_deref())
+                let library = new_generation(&device, blob, names.as_deref());
+                REBUILT.store(library.is_some(), Ordering::SeqCst);
+                library
             } else {
                 open(&device, blob, names.as_deref())
             };
@@ -1149,16 +1169,10 @@ pub(crate) fn save(now: bool) -> Saved {
         tracing::warn!(error = %e, "host pipeline library not saved");
     }
     // A new generation written: the list says it holds its translator's
-    // pipelines alone now, and its size.
-    let rebuilt = || {
-        library
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .previous
-            .is_some()
-    };
+    // pipelines alone now, and its size (the last save's, a precook's
+    // final one, is the one that stays).
     if let (Saved::Written, Some(bytes)) = (&saved, library_bytes)
-        && rebuilt()
+        && REBUILT.load(Ordering::SeqCst)
         && let Err(e) = record_compaction(
             dir,
             &lineage.id,
@@ -1423,6 +1437,14 @@ pub(crate) fn note_used(key: &str) {
 mod tests {
     use super::*;
 
+    /// A generation's id, for the tests that save into a folder.
+    const ID: &str = "0123456789abcdef";
+
+    /// Generation [`ID`]'s files in `dir`.
+    fn place(dir: &Path) -> Place {
+        Place::of(dir, ID)
+    }
+
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
@@ -1578,14 +1600,14 @@ mod tests {
         let not_a_folder = dir.path().join("pipelines");
         std::fs::write(&not_a_folder, b"in the way").unwrap();
         assert!(matches!(
-            write_library(&library, &not_a_folder, true, |_| Ok(true)),
+            write_library(&library, &place(&not_a_folder), true, |_| Ok(true)),
             Saved::Failed(_)
         ));
         assert_eq!(library.read().unwrap().added.load(Ordering::Relaxed), 2);
         // The early list not written: neither is the save.
         let good = dir.path().join("cache");
         assert!(matches!(
-            write_library(&library, &good, true, |_| Err(std::io::Error::other(
+            write_library(&library, &place(&good), true, |_| Err(std::io::Error::other(
                 "full"
             ))),
             Saved::Failed(_)
@@ -1593,17 +1615,17 @@ mod tests {
         assert_eq!(library.read().unwrap().added.load(Ordering::Relaxed), 2);
         let mut size = None;
         assert_eq!(
-            write_library(&library, &good, true, |bytes| {
+            write_library(&library, &place(&good), true, |bytes| {
                 size = bytes;
                 Ok(true)
             }),
             Saved::Written
         );
         assert_eq!(library.read().unwrap().added.load(Ordering::Relaxed), 0);
-        let written = std::fs::metadata(good.join(LIBRARY_FILE)).unwrap().len();
+        let written = std::fs::metadata(place(&good).library).unwrap().len();
         assert_eq!(Some(written as usize), size);
         assert_eq!(
-            write_library(&library, &good, true, |_| Ok(false)),
+            write_library(&library, &place(&good), true, |_| Ok(false)),
             Saved::Nothing,
             "nothing new"
         );
@@ -1627,7 +1649,7 @@ mod tests {
         let (inside, go) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
         std::thread::scope(|s| {
             let first = s.spawn(|| {
-                write_library(&library, dir.path(), true, |_| {
+                write_library(&library, &place(dir.path()), true, |_| {
                     inside.wait();
                     go.wait();
                     Ok(true)
@@ -1636,11 +1658,11 @@ mod tests {
             inside.wait();
             // The first is between its write and its count.
             assert_eq!(
-                write_library(&library, dir.path(), false, |_| Ok(true)),
+                write_library(&library, &place(dir.path()), false, |_| Ok(true)),
                 Saved::Nothing,
                 "gives way"
             );
-            let second = s.spawn(|| write_library(&library, dir.path(), true, |_| Ok(false)));
+            let second = s.spawn(|| write_library(&library, &place(dir.path()), true, |_| Ok(false)));
             go.wait();
             assert_eq!(first.join().unwrap(), Saved::Written);
             assert_eq!(
@@ -1666,10 +1688,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let saved = |library: &RwLock<Library>| {
             assert_eq!(
-                write_library(library, dir.path(), true, |_| Ok(true)),
+                write_library(library, &place(dir.path()), true, |_| Ok(true)),
                 Saved::Written
             );
-            std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap()
+            std::fs::read(place(dir.path()).library).unwrap()
         };
         let old = RwLock::new(open(&device, Vec::new(), None).unwrap());
         assert_eq!(ask(&old, &host.device, &a, "a"), Source::Made);
@@ -1786,11 +1808,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            write_library(&library, dir.path(), true, |_| Ok(true)),
+            write_library(&library, &place(dir.path()), true, |_| Ok(true)),
             Saved::Written
         );
-        let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
-        let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
+        let blob = std::fs::read(place(dir.path()).library).unwrap();
+        let text = std::fs::read_to_string(place(dir.path()).names).unwrap();
         assert_eq!(Names::read(&text, &blob), Some((held, FileId::of(&blob))));
         let reopened = RwLock::new(open(&device, blob, Some(&text)).unwrap());
         let other =
@@ -1824,11 +1846,11 @@ mod tests {
         let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
         assert_eq!(ask(&library, &host.device, &a, name_a), Source::Made);
         assert_eq!(
-            write_library(&library, dir.path(), true, |_| Ok(true)),
+            write_library(&library, &place(dir.path()), true, |_| Ok(true)),
             Saved::Written
         );
-        let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
-        let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
+        let blob = std::fs::read(place(dir.path()).library).unwrap();
+        let text = std::fs::read_to_string(place(dir.path()).names).unwrap();
 
         // Read with its names: held, so not loaded; another is made. (The
         // count is the process's: other tests' precooks, the replay's,
@@ -1862,13 +1884,13 @@ mod tests {
         );
         // Nothing added: the save writes the names learned alone, for the
         // file as it is.
-        std::fs::remove_file(dir.path().join(NAMES_FILE)).unwrap();
+        std::fs::remove_file(place(dir.path()).names).unwrap();
         assert_eq!(
-            write_library(&unnamed, dir.path(), true, |_| Ok(false)),
+            write_library(&unnamed, &place(dir.path()), true, |_| Ok(false)),
             Saved::Nothing
         );
-        let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
-        let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
+        let blob = std::fs::read(place(dir.path()).library).unwrap();
+        let text = std::fs::read_to_string(place(dir.path()).names).unwrap();
         let (learned, _) = Names::read(&text, &blob).expect("the file's names");
         assert_eq!(
             (learned.held, learned.complete),
@@ -1894,10 +1916,10 @@ mod tests {
         let name = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
         let dir = tempfile::tempdir().unwrap();
         let saved = |library: &RwLock<Library>| {
-            let wrote = write_library(library, dir.path(), true, |_| Ok(true));
+            let wrote = write_library(library, &place(dir.path()), true, |_| Ok(true));
             assert!(!matches!(wrote, Saved::Failed(_)), "{wrote:?}");
-            let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
-            let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
+            let blob = std::fs::read(place(dir.path()).library).unwrap();
+            let text = std::fs::read_to_string(place(dir.path()).names).unwrap();
             (blob, text)
         };
         // The library's entry of the name is another description's.
@@ -1962,5 +1984,244 @@ mod tests {
         assert_eq!(found, Source::Library);
         assert_eq!(ask(&next, &host.device, &a, name), Source::Library);
         assert!(next.read().unwrap().names().broken.is_empty(), "mended");
+    }
+
+    const A: &str = "aaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbb";
+    const C: &str = "cccccccccccccccc";
+    const D: &str = "dddddddddddddddd";
+    const E: &str = "eeeeeeeeeeeeeeee";
+
+    /// Saves `bytes` as `place`'s library file and `names` as its names,
+    /// the way a save does: by a rename over the file (never through a
+    /// link).
+    fn save_as(place: &Place, bytes: &[u8], names: &str) {
+        write_atomically(&place.library, bytes).unwrap();
+        write_atomically(&place.names, names.as_bytes()).unwrap();
+    }
+
+    fn ids(list: &[Lineage]) -> Vec<&str> {
+        list.iter().map(|g| g.id.as_str()).collect()
+    }
+
+    /// A generation's line in the list reads back as it was written; a line
+    /// that is none is refused, and so is the whole list then.
+    #[test]
+    fn generation_lines_read_back() {
+        let own = Lineage::own(ID);
+        let from = Lineage {
+            from: Some(B.into()),
+            ..Lineage::own(ID)
+        };
+        let legacy = Lineage {
+            from: Some(LEGACY.into()),
+            ..Lineage::own(ID)
+        };
+        let compacted = Lineage {
+            compacted: Some(3 << 30),
+            ..Lineage::own(ID)
+        };
+        for g in [&own, &from, &legacy, &compacted] {
+            assert_eq!(Lineage::parse(&g.line()).as_ref(), Some(g), "{}", g.line());
+        }
+        assert_eq!(own.line(), format!("{ID} own"));
+        assert_eq!(from.line(), format!("{ID} from {B}"));
+        assert_eq!(compacted.line(), format!("{ID} compacted {}", 3u64 << 30));
+        for bad in [
+            String::new(),
+            ID.to_owned(),
+            format!("{ID} own more"),
+            format!("{} own", ID.to_uppercase()),
+            format!("{ID}0 own"),
+            format!("{ID} from elsewhere"),
+            format!("{ID} from"),
+            format!("{ID} compacted many"),
+            format!("{ID} compacted"),
+            format!("{ID} lost"),
+        ] {
+            assert_eq!(Lineage::parse(&bad), None, "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_generations(dir.path(), &[compacted.clone(), Lineage::own(A)]).unwrap();
+        assert_eq!(
+            read_generations(dir.path()),
+            [compacted.clone(), Lineage::own(A)]
+        );
+        let text = std::fs::read_to_string(dir.path().join(GENERATIONS_FILE)).unwrap();
+        assert!(text.starts_with(&format!("{GENERATIONS_FORMAT}\n")), "{text}");
+        std::fs::write(
+            dir.path().join(GENERATIONS_FILE),
+            format!("{text}not a generation\n"),
+        )
+        .unwrap();
+        assert_eq!(read_generations(dir.path()), [], "damaged");
+        std::fs::write(
+            dir.path().join(GENERATIONS_FILE),
+            text.replace(GENERATIONS_FORMAT, "xtp pipeline generations 0"),
+        )
+        .unwrap();
+        assert_eq!(read_generations(dir.path()), [], "another version");
+    }
+
+    /// A translation key with no generation starts from the last one opened:
+    /// its file linked (or copied) and its names file copied, so that it
+    /// finds every pipeline whose translations did not change by its name.
+    /// Saving the new generation replaces its own file only.
+    #[test]
+    fn a_new_generation_starts_from_the_last_one_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let a = settle(d, A, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(a.lineage, Lineage::own(A), "nothing to start from");
+        assert_eq!(a.place, Place::of(d, A));
+        assert!(!a.place.library.exists());
+        save_as(&a.place, b"A's pipelines", "A's names");
+
+        let b = settle(d, B, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(b.lineage.from.as_deref(), Some(A));
+        assert_eq!(std::fs::read(&b.place.library).unwrap(), b"A's pipelines");
+        assert_eq!(
+            std::fs::read_to_string(&b.place.names).unwrap(),
+            "A's names"
+        );
+        assert_eq!(read_generations(d), [b.lineage.clone(), Lineage::own(A)]);
+
+        save_as(&b.place, b"A's and B's pipelines", "B's names");
+        assert_eq!(std::fs::read(&a.place.library).unwrap(), b"A's pipelines");
+        assert_eq!(
+            std::fs::read_to_string(&a.place.names).unwrap(),
+            "A's names"
+        );
+
+        // A third starts from B, the last opened, not A.
+        let c = settle(d, C, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(c.lineage.from.as_deref(), Some(B));
+        assert_eq!(
+            std::fs::read(&c.place.library).unwrap(),
+            b"A's and B's pipelines"
+        );
+        assert_eq!(ids(&read_generations(d)), [C, B, A]);
+        // Opened again, a generation keeps what it was.
+        let again = settle(d, C, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(again.lineage, c.lineage);
+    }
+
+    /// A, then B (whose translator differs: compacted to its own pipelines),
+    /// then A again: A opens its own file as it left it, with its names, and
+    /// makes nothing. Before generations, the one file held B's pipelines
+    /// alone by then, and A's were all made again.
+    #[test]
+    fn a_translator_back_finds_its_own_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let a = settle(d, A, GENERATIONS_KEPT, u64::MAX).unwrap();
+        save_as(&a.place, b"A's pipelines", "A's names");
+        record_compaction(d, A, 13, 5).unwrap();
+        let a_then = read_generations(d)[0].clone();
+        assert_eq!(a_then.compacted, Some(13));
+
+        let b = settle(d, B, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(b.lineage.from.as_deref(), Some(A));
+        // B's precook compacts it: B's pipelines alone, below the bound.
+        save_as(&b.place, b"B's", "B's names");
+        record_compaction(d, B, 3, 5).unwrap();
+        assert_eq!(read_generations(d), [Lineage::own(B), a_then.clone()]);
+
+        let back = settle(d, A, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(back.lineage, a_then, "its own, as it was");
+        assert_eq!(
+            std::fs::read(&back.place.library).unwrap(),
+            b"A's pipelines"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&back.place.names).unwrap(),
+            "A's names"
+        );
+        assert_eq!(back.evicted, Vec::<String>::new());
+        assert_eq!(read_generations(d), [a_then, Lineage::own(B)]);
+        assert_eq!(std::fs::read(&b.place.library).unwrap(), b"B's");
+    }
+
+    /// The one library file of before generations becomes the first
+    /// generation made (moved, with its names); once there are generations,
+    /// a new one starts from them, and the file of before is left alone.
+    #[test]
+    fn the_file_of_before_becomes_the_first_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let legacy = Place::legacy(d);
+        save_as(&legacy, b"the one file", "its names");
+        let a = settle(d, A, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(a.lineage.from.as_deref(), Some(LEGACY));
+        assert_eq!(std::fs::read(&a.place.library).unwrap(), b"the one file");
+        assert_eq!(
+            std::fs::read_to_string(&a.place.names).unwrap(),
+            "its names"
+        );
+        assert!(
+            !legacy.library.exists() && !legacy.names.exists(),
+            "moved"
+        );
+
+        // An older build wrote the file of before again meanwhile.
+        save_as(&legacy, b"an older build's", "its names");
+        let b = settle(d, B, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(b.lineage.from.as_deref(), Some(A));
+        assert_eq!(
+            std::fs::read(&legacy.library).unwrap(),
+            b"an older build's"
+        );
+    }
+
+    /// Past `kept` generations or `budget` bytes of files, the least
+    /// recently opened go, files and names; the current one stays whatever
+    /// its size. A listed generation whose file is gone leaves the list, and
+    /// a file the list does not hold counts as the oldest.
+    #[test]
+    fn the_least_recently_opened_generations_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let hundred = [7u8; 100];
+        for id in [A, B, C, D] {
+            let s = settle(d, id, 10, u64::MAX).unwrap();
+            save_as(&s.place, &hundred, "names");
+        }
+        assert_eq!(ids(&read_generations(d)), [D, C, B, A]);
+
+        // By count: E (from D) and two more.
+        let e = settle(d, E, 3, u64::MAX).unwrap();
+        assert_eq!(e.lineage.from.as_deref(), Some(D));
+        assert_eq!(e.evicted, [B, A]);
+        assert_eq!(ids(&read_generations(d)), [E, D, C]);
+        for id in [A, B] {
+            let gone = Place::of(d, id);
+            assert!(!gone.library.exists() && !gone.names.exists(), "{id}");
+        }
+        assert!(Place::of(d, C).library.exists());
+
+        // By bytes: 250 hold the current one and one more.
+        let c = settle(d, C, 10, 250).unwrap();
+        assert_eq!(c.evicted, [D]);
+        assert_eq!(ids(&read_generations(d)), [C, E]);
+
+        // The current one stays, past the budget alone.
+        let e = settle(d, E, 10, 50).unwrap();
+        assert_eq!(e.evicted, [C]);
+        assert_eq!(ids(&read_generations(d)), [E]);
+        assert!(Place::of(d, E).library.exists());
+
+        // A file the list does not hold (written while the list was lost):
+        // listed, as the oldest. A listed generation whose file is gone:
+        // dropped.
+        save_as(&Place::of(d, A), &hundred, "names");
+        write_generations(d, &[Lineage::own(E), Lineage::own(B)]).unwrap();
+        let e = settle(d, E, 10, u64::MAX).unwrap();
+        assert_eq!(e.evicted, Vec::<String>::new());
+        assert_eq!(ids(&read_generations(d)), [E, A]);
+        // A damaged list: the files are listed again.
+        std::fs::write(d.join(GENERATIONS_FILE), "damaged").unwrap();
+        let a = settle(d, A, 10, u64::MAX).unwrap();
+        assert_eq!(a.lineage, Lineage::own(A));
+        assert_eq!(ids(&read_generations(d)), [A, E]);
     }
 }
