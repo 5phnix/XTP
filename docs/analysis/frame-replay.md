@@ -227,9 +227,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File E:\tools\stall-probe\queue-s
     `recording: done`;
   - `E:\xtp-data\replay\night-1\summary.txt` ends with `error: none`;
   - `info.txt` there has `window=<n-1>` and `last=<n+2>`;
-  - `E:\xtp-data\pix\replay-1\` has `frame-<n>.png`, `passes-<n+…>.txt` and
-    `probe-<n>.txt` for the same frames (`XTP_CAPTURE_WORLD`'s log line
-    `world capture armed` gives the first).
+  - `E:\xtp-data\pix\replay-1\` has `frame-<n>.png`, `passes-<n>.txt` and
+    `probe-<n>.txt` for the three recorded frames (`XTP_CAPTURE_WORLD`'s
+    log line `world capture armed` gives the first).
 
 ### 4.3 Replay three times
 
