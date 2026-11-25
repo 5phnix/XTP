@@ -1729,11 +1729,8 @@ fn hold_until_done(overlapped: usize, buffer: impl Send + 'static) {
     IO_PENDING_CHANGED.notify_one();
 }
 
-/// Lets go of the destinations of the overlapped reads that completed: the
-/// kernel replaces the `OVERLAPPED`'s status (its first field,
-/// `STATUS_PENDING` meanwhile) when it completes one. Read with
-/// `ReadProcessMemory`: the title may free the structure once its read is
-/// done, and one that cannot be read is taken as done.
+/// Windows remplace STATUS_PENDING dans le premier champ de l'OVERLAPPED
+/// à la fin de l'E/S. Le titre peut ensuite libérer cette structure.
 fn finish_overlapped_io() {
     const STATUS_PENDING: usize = 0x103;
     let mut pending = PENDING_IO.lock().unwrap_or_else(|e| e.into_inner());
@@ -1826,6 +1823,21 @@ pub extern "C" fn fwrite(buffer: *const u8, size: usize, count: usize, stream: F
     host!("ucrtbase.dll", "fwrite": extern "C" fn(*const u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     )
+}
+
+#[cfg(test)]
+pub(super) fn check_fwrite_from(buffer: *const u8, len: usize, expected: u8) {
+    let file = host!("ucrtbase.dll", "tmpfile": extern "C" fn() -> File)();
+    assert!(!file.is_null());
+    assert_eq!(fwrite(buffer, 1, len, file), len);
+    host!("ucrtbase.dll", "rewind": extern "C" fn(File))(file);
+    let mut bytes = vec![0; len];
+    assert_eq!(fread(bytes.as_mut_ptr(), 1, len, file), len);
+    assert!(bytes.iter().all(|&byte| byte == expected));
+    assert_eq!(
+        host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(file),
+        0
+    );
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.

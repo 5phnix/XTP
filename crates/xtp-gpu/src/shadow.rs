@@ -1500,6 +1500,10 @@ thread_local! {
     static OPENED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+pub(super) fn copy_instruction(ip: usize) -> bool {
+    ip == &raw const xtp_gpu_try_copy_moving as usize
+}
+
 /// The copy's vectored handler: a fault at its `rep movsb` ends the copy
 /// (the instruction after it returns what was left), the address that
 /// faulted noted in [`FAULT`]. It looks at nothing else.
@@ -1548,7 +1552,10 @@ unsafe extern "system" fn stopped(
     if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
         && record.NumberParameters >= 2
         && record.ExceptionInformation[0] == 0
-        && crate::watch::read_fault(record.ExceptionInformation[1])
+        && crate::watch::read_fault(
+            record.ExceptionInformation[1],
+            !copy_instruction(context.Rip as usize),
+        )
     {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -1579,8 +1586,7 @@ unsafe extern "system" fn stopped(
         // unmapped meanwhile, as the guard's handler knows.
         // SAFETY: plain reads and writes of this thread's last error.
         let error = unsafe { GetLastError() };
-        crate::watch::writing(at, 1);
-        let opened = writable(at);
+        let opened = crate::watch::write_fault(at, false);
         // SAFETY: as above.
         unsafe { SetLastError(error) };
         if opened {
@@ -4437,6 +4443,8 @@ mod tests {
                 let mut byte = [0; 1];
                 assert!(crate::host::read_into((alias + PAGE + 7) as _, &mut byte));
                 assert_eq!(byte, [0xa1]);
+                // Une lecture interne ne doit pas rendre le prochain résultat immédiat.
+                assert_eq!(publish(at + PAGE, 0xa2), 0);
                 assert_eq!(publish(at + 2 * PAGE, 0xb1), 0);
                 // A DirectStorage destination is pinned before the first
                 // byte is written, including writes that restore old values.

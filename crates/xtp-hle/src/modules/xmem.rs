@@ -2126,7 +2126,7 @@ mod tests {
     #[test]
     fn pending_copy_back_through_title_imports() {
         use std::io::{Read, Seek};
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::{AsRawHandle, AsRawSocket};
 
         const CHILD: &str = "XTP_TEST_PENDING_IMPORTS";
         if std::env::var_os(CHILD).is_none() {
@@ -2150,7 +2150,7 @@ mod tests {
         assert!(map_alias(alias as u64, at as u64, PAGE as u64));
         let publish = |writer, value| {
             assert_eq!(
-                xtp_gpu::publish_copy_back_for_test(at as usize, &mut [value; 4], writer),
+                xtp_gpu::publish_copy_back_for_test(at as usize, &mut vec![value; PAGE], writer),
                 Some(0)
             );
             assert_eq!(
@@ -2177,6 +2177,20 @@ mod tests {
         let mut bytes = [0; 4];
         file.read_exact(&mut bytes).unwrap();
         assert_eq!(bytes, [0x5a; 4]);
+
+        publish(6, 0x64);
+        crate::modules::files::check_fwrite_from(alias.cast(), PAGE, 0x64);
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        publish(7, 0x83);
+        assert_eq!(
+            crate::modules::net::send(client.as_raw_socket() as usize, alias.cast(), 4, 0),
+            4
+        );
+        server.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [0x83; 4]);
 
         publish(2, 0xc1);
         // SAFETY: les deux vues désignent la même page du titre.
