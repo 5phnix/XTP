@@ -2069,6 +2069,9 @@ impl State {
         let len = s.left(address).min(CBV_SPAN);
         let gpu = s.gpu(address);
         if !gpu.is_multiple_of(256) {
+            if let Some(gpu) = self.gpu_cbv_fill(list, address, len) {
+                return Some(gpu);
+            }
             // The memory goes with the recording.
             self.recording.lease(list);
             return self.own.upload_fill(list, address, len);
@@ -2099,6 +2102,17 @@ impl State {
         let copied = unsafe { buffer.GetGPUVirtualAddress() } + at;
         self.cbv_copies.insert(key, copied);
         Some(copied)
+    }
+
+    fn gpu_cbv_fill(&mut self, list: &HostList, address: u64, len: u64) -> Option<u64> {
+        let shadow = crate::host::host()?.fill_source(address, len)?;
+        let (buffer, at) = self
+            .own
+            .gpu_copy(list, &shadow.buffer, shadow.offset(address), len)?;
+        self.recording.lease(list);
+        shadow.refresh(list, address, len);
+        // SAFETY: the recording holds the aligned chunk until its lists finish.
+        Some(unsafe { buffer.GetGPUVirtualAddress() } + at)
     }
 
     /// Runs a dispatch on the host; the first that runs after dropped ones
@@ -2432,6 +2446,10 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(gpu) = self.gpu_cbv_fill(list, address, u64::from(size)) {
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some(gpu) = list.scratch_fill(address, u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -4822,6 +4840,54 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut c = state(heap.0);
         heaps(&mut c, la.host());
         assert_eq!(slot(&mut c, &la, Some(16)), first);
+    }
+
+    #[test]
+    fn a_cbv_fill_reads_an_in_flight_shaders_output_on_the_gpu() {
+        use crate::host::submissions::{Gate, serial, watched};
+        let _serial = serial();
+        let Some(gpu) =
+            crate::testgpu::device("a_cbv_fill_reads_an_in_flight_shaders_output_on_the_gpu")
+        else {
+            return;
+        };
+        let host = gpu.host();
+        let reader = Reader::new(host, true);
+        let kernel = Kernel::new(host);
+        let first = host.new_list().unwrap();
+        let second = host.new_list().unwrap();
+        let base = watched(4 << 20) as u64;
+        let address = base + 16; // A valid title CBV, misaligned on the host.
+        let shadow = crate::shadow::find(base, CBV_SPAN + 16).unwrap();
+        shadow.refresh(&first, base, crate::watch::PAGE as u64);
+        kernel.dispatch(&first, Pass::Fill, base + 2 * CBV_SPAN, address);
+        first.close();
+        let (out, data) = host.shared_buffer(WORDS as u64 * 4).unwrap();
+        let mut state = state(std::ptr::null());
+        let mut gate = Gate::close(host);
+        host.execute(&[&first]);
+        heaps(&mut state, &second);
+        let cbv = state.root_cbv(&second, address).unwrap();
+        assert_eq!(state.own.copied, CBV_SPAN);
+        // SAFETY: live pipeline and buffers until both lists have finished.
+        unsafe {
+            second.list.SetComputeRootSignature(&reader.root);
+            second.list.SetPipelineState(&reader.pso);
+            second.list.SetComputeRootConstantBufferView(0, cbv);
+            second
+                .list
+                .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            second.list.Dispatch(1, 1, 1);
+        }
+        second.close();
+        host.execute(&[&second]);
+        assert!(first.running() && second.running());
+        gate.open();
+        host.drain();
+        // SAFETY: the GPU is done writing the mapped result.
+        let got = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), WORDS) };
+        assert_eq!(&got[..64], (0..64).map(pattern).collect::<Vec<_>>());
+        assert_eq!(&got[64..], [0; WORDS - 64]);
     }
 
     /// A root CBV reads its 64 KiB inside memory the list holds: in place
