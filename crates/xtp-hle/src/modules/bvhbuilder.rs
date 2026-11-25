@@ -124,7 +124,7 @@ extern "system" fn copy(this: Object, list: Object, dst: u64, src: u64, mode: i3
     );
     copy::original()(this, list, dst, src, mode);
     // SAFETY: the DLL receives this same live title list.
-    unsafe { xtp_gpu::rt::copy(list.cast(), dst, src, mode) };
+    unsafe { xtp_gpu::rt::Builder.copy(list.cast(), dst, src, mode) };
 }
 
 // Une frame est échantillonnée à l'entrée. L'identifiant relie les lignes même si
@@ -282,9 +282,10 @@ extern "system" fn build(this: Object, list: Object, count: u32, entries: *const
     }
     build::original()(this, list, count, entries);
     if !entries.is_null() {
-        for i in 0..count {
-            // SAFETY: these CPU descriptors and the list belong to the current call.
-            unsafe { xtp_gpu::rt::build(list.cast(), &(*entries.add(i as usize)).build) };
+        // SAFETY: the title supplies count live entries and records no intervening list commands.
+        unsafe {
+            let entries = std::slice::from_raw_parts(entries, count as usize);
+            xtp_gpu::rt::Builder.build_batch(list.cast(), entries.iter().map(|entry| &entry.build));
         }
     }
 }

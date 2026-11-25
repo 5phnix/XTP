@@ -189,7 +189,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         let producer = TitleList::new();
         let mut original = blas_input(&geometry);
         original.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
-        assert!(build(
+        assert!(Builder.build(
             producer.this(),
             &Build {
                 DestAccelerationStructureData: blas.address(),
@@ -204,7 +204,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             .unwrap()
             .load(Ordering::Acquire);
         assert!(bytes > 0);
-        assert!(copy(
+        assert!(Builder.copy(
             cloning.this(),
             compacted.address(),
             blas.address(),
@@ -214,18 +214,18 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             width(&registry().structures[&compacted.address()].result),
             bytes
         );
-        assert!(copy(
+        assert!(Builder.copy(
             cloning.this(),
             cloned.address(),
             compacted.address(),
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0
         ));
         assert!(host_tlas(cloned.address()).is_none());
-        assert!(build(list.this(), &tlas_desc(first.address())));
+        assert!(Builder.build(list.this(), &tlas_desc(first.address())));
         let mut updated = blas_input(&changed);
         updated.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE
             | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(1 << 24);
-        assert!(build(
+        assert!(Builder.build(
             list.this(),
             &Build {
                 DestAccelerationStructureData: cloned.address(),
@@ -234,7 +234,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
                 ..Default::default()
             }
         ));
-        assert!(build(list.this(), &tlas_desc(second.address())));
+        assert!(Builder.build(list.this(), &tlas_desc(second.address())));
         let a = host_tlas_for_list(list.this(), first.address()).unwrap();
         let b = host_tlas_for_list(list.this(), second.address()).unwrap();
         assert_ne!(a, b);

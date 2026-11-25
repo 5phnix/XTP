@@ -134,7 +134,12 @@ impl<'a> Recorder<'a> {
         })
     }
 
-    fn build(&self, inputs: &Inputs, reuse: Option<Arc<ID3D12Resource>>) -> Option<Structure> {
+    fn build(
+        &self,
+        inputs: &Inputs,
+        reuse: Option<Arc<ID3D12Resource>>,
+        ordered: bool,
+    ) -> Option<Structure> {
         let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
         // SAFETY: the caller owns all geometry descriptions for this call.
         unsafe {
@@ -179,7 +184,9 @@ impl<'a> Recorder<'a> {
         // SAFETY: all GPU ranges are owned by this recording. The global barriers order prior
         // geometry writers, scratch reuse on the host queue and subsequent reads of the result.
         unsafe {
-            self.commands.ResourceBarrier(&[uav_barrier()]);
+            if !ordered {
+                self.commands.ResourceBarrier(&[uav_barrier()]);
+            }
             self.commands.BuildRaytracingAccelerationStructure(
                 &Build {
                     Inputs: *inputs,
@@ -400,7 +407,7 @@ pub unsafe fn descriptor_tlas(list: *const Object, handle: u64) -> Option<u64> {
 ///
 /// # Safety
 /// `title_list` is a live title list and the active CPU arrays follow the builder ABI.
-pub unsafe fn build(title_list: *const Object, desc: &Build) -> bool {
+unsafe fn build_one(title_list: *const Object, desc: &Build, ordered: bool) -> bool {
     let dst = desc.DestAccelerationStructureData;
     let reuse = {
         let mut table = registry();
@@ -442,14 +449,14 @@ pub unsafe fn build(title_list: *const Object, desc: &Build) -> bool {
                     },
                     ..inputs
                 };
-                recorder.build(&inputs, reuse)
+                recorder.build(&inputs, reuse, ordered)
             }
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
                 let map = registry().blas_map()?;
                 let inputs = instances::rewrite(&recorder, title_list, &inputs, &map)?;
                 Some(Structure {
                     instances: Some(map),
-                    ..recorder.build(&inputs, reuse)?
+                    ..recorder.build(&inputs, reuse, ordered || inputs.NumDescs != 0)?
                 })
             }
             _ => None,
@@ -464,7 +471,7 @@ pub unsafe fn build(title_list: *const Object, desc: &Build) -> bool {
 /// The title list and CPU arrays obey the same contract as `build`.
 pub unsafe fn rehydrate(list: *const Object, desc: &Build) -> bool {
     // SAFETY: the caller supplies the same live inputs required by build.
-    let recorded = unsafe { build(list, desc) };
+    let recorded = unsafe { Builder.build(list, desc) };
     #[cfg(feature = "diagnostics")]
     if probe::enabled() {
         let sampled = recorded
@@ -477,27 +484,60 @@ pub unsafe fn rehydrate(list: *const Object, desc: &Build) -> bool {
     recorded
 }
 
-/// Mirrors a clone or compact copy across title builders.
-///
-/// # Safety
-/// `list` is a live title list.
-pub unsafe fn copy(list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
-    let copied = (|| {
-        if dst == 0 {
-            return None;
+/// A title builder records into the address space shared by every builder on the host device.
+#[derive(Default)]
+pub struct Builder;
+
+impl Builder {
+    /// Mirrors a single title build.
+    ///
+    /// # Safety
+    /// `list` is a live title command list and the CPU geometry arrays are valid for the call.
+    pub unsafe fn build(&self, list: *const Object, desc: &Build) -> bool {
+        // SAFETY: the caller supplies the list and geometry arrays.
+        unsafe { build_one(list, desc, false) }
+    }
+
+    /// Records a contiguous batch. The preceding build's final UAV barrier also
+    /// orders scratch reuse and AS dependencies for the following entry.
+    ///
+    /// # Safety
+    /// The list and descriptors obey the single-build contract. No external GPU commands
+    /// may be recorded into the list while iterating the batch.
+    pub unsafe fn build_batch<'a>(
+        &self,
+        list: *const Object,
+        descs: impl Iterator<Item = &'a Build>,
+    ) {
+        let mut ordered = false;
+        for desc in descs {
+            // SAFETY: the batch supplies live inputs. Only a completed build leaves a trailing barrier.
+            ordered = unsafe { build_one(list, desc, ordered) };
         }
-        let source = registry().structures.get(&src)?.clone();
-        let recorder = Recorder::new(crate::list::host_list(list)?)?;
-        if !source.producer.available(&recorder.list.rt_recording()) {
-            return None;
-        }
-        source.retain(recorder.list);
-        recorder.copy_structure(
-            &source,
-            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode),
-        )
-    })();
-    registry().replace(dst, copied)
+    }
+
+    /// Mirrors a clone or compact copy across title builders.
+    ///
+    /// # Safety
+    /// `list` is a live title list.
+    pub unsafe fn copy(&self, list: *const Object, dst: u64, src: u64, mode: i32) -> bool {
+        let copied = (|| {
+            if dst == 0 {
+                return None;
+            }
+            let source = registry().structures.get(&src)?.clone();
+            let recorder = Recorder::new(crate::list::host_list(list)?)?;
+            if !source.producer.available(&recorder.list.rt_recording()) {
+                return None;
+            }
+            source.retain(recorder.list);
+            recorder.copy_structure(
+                &source,
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode),
+            )
+        })();
+        registry().replace(dst, copied)
+    }
 }
 
 fn range(list: &HostList, address: u64, bytes: u64, alignment: u64) -> Option<u64> {
