@@ -2555,6 +2555,9 @@ impl HostList {
                 // wrote is told from the copy's bytes, which it would change.
                 Step::GpuCopy(shadow, address, len) => {
                     batch.settle_shaders(shadow, *address, *len);
+                    // Le bridage ou le titre peut avoir lu la destination avant la
+                    // copie. Installer ses données initiales avant de la marquer occupée.
+                    batch.flush_before_copy(shadow, *address, *len);
                     shadow.copying(batch.submission, *address, *len);
                     moved(Moved::GpuCopy, *len);
                     continue;
@@ -2689,16 +2692,35 @@ impl Batch<'_> {
         self.textures.clear();
     }
 
+    fn flush_before_copy(
+        &mut self,
+        dst: &std::sync::Arc<crate::shadow::Shadow>,
+        at: usize,
+        len: usize,
+    ) {
+        let end = at.saturating_add(len);
+        if let Some(i) = self.refreshes.iter().position(|(shadow, from, to)| {
+            std::sync::Arc::ptr_eq(shadow, dst) && *from < end && at < *to
+        }) {
+            let (shadow, from, to) = self.refreshes.swap_remove(i);
+            Self::refresh(&shadow, from, to);
+        }
+    }
+
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            Self::refresh(&shadow, from, to);
         }
+    }
+
+    fn refresh(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 }
 
