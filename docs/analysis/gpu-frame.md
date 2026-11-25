@@ -377,9 +377,14 @@ page-mapping drains **13.7** (2.0–32.6), finishing at submission 1.3, and
   only if the host copy has not got the staging buffer's current contents
   (`Staging::copy_due`: a count of detilings, and the count and the host
   copy, held weakly, the last copy gave). So the first list after a change
-  copies and the others' copies are skipped by the GPU. A list named twice
-  in one submission reads one word: a second decision there keeps the copy
-  the first let run. Without a free word, or with
+  copies and the others' copies are skipped by the GPU. If a submission
+  names a list again, `Host::run_as` splits before that repeat and settles the
+  first part before submitting the next, so the list can run again without
+  D3D12 message 553. This releases the host submission lock, but the title
+  queue's line lock and, for held submissions, `release_held`'s global lock
+  remain held. Diagnostics log cumulative `submission split totals`
+  (calls, split waits and microseconds waiting) beside each frame line to
+  measure the cost. Without a free word, or with
   `XTP_TEXTURE_PREDICATION=0`, the copy runs as before.
 - Tests (WARP, `texture::tests`): a texture copied by the first of two
   lists and not the second, then not at all while its memory does not
@@ -389,8 +394,8 @@ page-mapping drains **13.7** (2.0–32.6), finishing at submission 1.3, and
   real section view not hashed nor copied without a write, then hashed,
   detiled and copied after a CPU write and after a write through another
   view that the writer reports; a copy into another host copy is due; a
-  list named twice in one submission copies in both runs (fails without
-  the rule above).
+  list named twice in one submission copies once across both runs: the repeat
+  skips the copy after the first run (fails without the split above).
 
 ### 7.2 Before and after
 
@@ -452,9 +457,9 @@ the same two things another way:
 | when a copy runs | once per change, in one list of its own run before the submission's lists (`Host::record_uploads`), with the textures moved to the copy destination there | once per change, by the first list after it: every list records its copy under a predicate, set at submission |
 | what stays per list | nothing: lists record no copy and no copy-destination round trip | the copy-destination round trip, `SetPredication` twice and the skipped copy: 1.8 ms of GPU a frame for about 320 recordings (B3) |
 | bookkeeping | detilings counted per staging buffer, the count the host copy last got | the same, plus which host copy got it |
-| a list named twice | handled | handled, after reading #1500 (credited in the code) |
+| a list named twice | handled | split before each repeat; counted once on the frame line, with all parts' lists and times added at the last part |
 | textures in views | still hashed whole at every check, on up to 8 threads (one per 4 MiB) at the batch's refresh points | not hashed unless a guard reports a write (ds-guards made that sound in XTP) |
-| files | `host.rs` (`Batch`, `run_as`, `Step::Texture`), `texture.rs` | `texture.rs` only |
+| files | `host.rs` (`Batch`, `run_as`, `Step::Texture`), `texture.rs` | `texture.rs`, `host.rs` (repeated-list splitting) |
 
 #1500's layout saves the per-list round trip and the skipped copies, about
 1.8 ms of GPU a frame here, but needs `run_as` and `Batch` reordered in
