@@ -1727,8 +1727,11 @@ fn paired_lanes_share_lds_and_count_their_own_mask_bits() {
 #[ignore = "hardware: 32-lane waves (see hardware())"]
 fn paired_lanes_execute_a_half_precision_whole_wave_section() {
     let body = [
-        0x4A02_00FF,
-        0x3C00,      // v_add_nc_u32 v1, 0x3c00, v0
+        0x3608_00a0, // v4 = id & 32
+        0x3408_0886, // v4 <<= 6
+        0x4a02_00ff,
+        0x3800,
+        0x4a02_0901, // v1 = 0x3800 + id + ((id & 32) << 6)
         0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
         0xbe8c_03ff,
         0x0123_4567,
@@ -1750,9 +1753,12 @@ fn paired_lanes_execute_a_half_precision_whole_wave_section() {
     paired_case("arrondi FP16 après permutation", &body, |t| {
         let pick = if t & 8 == 0 { 7 - (t & 7) } else { t & 15 };
         let source = ((t & !15) ^ 16) + pick;
-        // (2048 + 1) - 2048 = 0, mais le successeur FP16 de 1 donne 2.
-        let bits = if source == 0 { 0 } else { 0x4000 };
-        bits + 0x4000 + 0x3c00 + source
+        // x est dans [0,5 ; 0,57[ ou [2 ; 2,25[. Avec un pas de 2
+        // à 2048, les deux arrondis (au plus proche et vers zéro)
+        // donnent (2048 + x) - 2048 = 0 ou 2. Réassocier donnerait x.
+        let bits = if source & 32 == 0 { 0 } else { 0x4000 };
+        let x = 0x3800 + source + ((source & 32) << 6);
+        bits + 0x4000 + x
     });
 }
 
