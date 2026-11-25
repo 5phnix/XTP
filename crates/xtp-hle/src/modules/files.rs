@@ -719,6 +719,13 @@ fn unmapped(path: &[u16]) -> bool {
         return false;
     }
     tracing::warn!(path = %text, "unmapped console path");
+    // Diagnostics: `XTP_UNMAPPED_CALLERS` (any value) adds the return
+    // addresses above, as module+rva: which file function the title called
+    // with the path, and from where (docs/analysis/lighting-sources.md).
+    #[cfg(feature = "diagnostics")]
+    if std::env::var_os("XTP_UNMAPPED_CALLERS").is_some() {
+        tracing::info!(path = %text, callers = super::kernel::callers(), "unmapped console path: callers");
+    }
     true
 }
 

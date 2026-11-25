@@ -153,6 +153,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    trace_opened(file, &name);
     put(out, file)
 }
 
@@ -489,6 +490,7 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = Instant::now();
         let result = execute(&mut job.read, &mut worker);
+        trace_done(&job.read, &result);
         worker.trim();
         let finishing = Instant::now();
         lanes = scheduler.lock();
@@ -1405,6 +1407,109 @@ static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<10> as *const (),   // 0x50 (2020: error record)
     missing::<11> as *const (),   // 0x58 (2020: queue info)
 ]);
+
+// The read trace (diagnostics): one line per finished request.
+
+/// `XTP_DSTORAGE_TRACE`: `1` logs every finished request; any other value
+/// logs those whose source contains it, ASCII case ignored (a file's path,
+/// say `common.rpf`, or `memory` for requests that read memory). Unset or
+/// empty: off. For finding which archive reads the title makes, and where
+/// their data lands (the lighting's time-of-day data, docs/analysis/
+/// lighting-sources.md).
+fn trace_filter() -> Option<&'static str> {
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            std::env::var("XTP_DSTORAGE_TRACE")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty())
+        })
+        .as_deref()
+}
+
+/// The paths of the files the title opened, by file object, for the trace.
+fn traced_files() -> MutexGuard<'static, HashMap<usize, String>> {
+    static FILES: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+    FILES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Remembers the path of a file object, while the trace is on.
+fn trace_opened(file: *mut c_void, path: &str) {
+    if trace_filter().is_some() {
+        traced_files().insert(file as usize, path.to_owned());
+    }
+}
+
+/// Whether the trace's `filter` keeps a request whose source is `source`.
+fn trace_keeps(filter: &str, source: &str) -> bool {
+    filter == "1" || source.to_ascii_lowercase().contains(filter)
+}
+
+/// Logs a request that has run, before its completion is signalled: its
+/// source and offset, its sizes and options, the title's name for it, its
+/// destination, how it ended and, for a destination at an address, the
+/// first bytes written there.
+fn trace_done(read: &Read, result: &Result<(), HRESULT>) {
+    let Some(filter) = trace_filter() else {
+        return;
+    };
+    let request = &read.request;
+    let source = if request.options & MEMORY_SOURCE != 0 {
+        format!("memory {:#x}", request.source as usize)
+    } else {
+        traced_files()
+            .get(&(request.source as usize))
+            .cloned()
+            .unwrap_or_else(|| format!("file object {:#x}", request.source as usize))
+    };
+    if !trace_keeps(filter, &source) {
+        return;
+    }
+    let pages = request.options & PAGE_DESTINATION != 0;
+    let destination = if pages {
+        format!(
+            "pages from {:#x} (+{:#x})",
+            read.pages.first().copied().unwrap_or(0) * PAGE,
+            request.page_offset & 0xffff
+        )
+    } else {
+        format!("{:#x}", request.destination as usize)
+    };
+    let head = match result {
+        Ok(()) if !pages && !request.destination.is_null() => {
+            let n = (request.destination_size as usize).min(16);
+            // SAFETY: the request has just written its destination, which
+            // the title keeps until the completion this precedes.
+            let bytes = unsafe { std::slice::from_raw_parts(request.destination.cast::<u8>(), n) };
+            bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        _ => String::new(),
+    };
+    let result = match result {
+        Ok(()) => "ok".to_owned(),
+        Err(hr) => format!("{:#010x}", *hr as u32),
+    };
+    tracing::info!(
+        source,
+        offset = format_args!("{:#x}", request.offset),
+        source_size = request.source_size,
+        destination_size = request.destination_size,
+        options = format_args!("{:#x}", request.options),
+        name = text(request.name),
+        destination,
+        result,
+        head,
+        "dstorage: read"
+    );
+}
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -2454,5 +2559,16 @@ mod tests {
         }
         free(&a);
         free(&b);
+    }
+
+    /// The read trace keeps every request for `1`, else those whose source
+    /// contains the filter (the filter is lower case, the path need not be).
+    #[test]
+    fn the_read_trace_keeps_the_sources_its_filter_names() {
+        assert!(trace_keeps("1", r"G:\data.rpf"));
+        assert!(trace_keeps("common.rpf", r"G:\COMMON.RPF"));
+        assert!(trace_keeps("memory", "memory 0x140400000"));
+        assert!(!trace_keeps("common.rpf", r"G:\levels.rpf"));
+        assert!(!trace_keeps("common.rpf", "memory 0x140400000"));
     }
 }
