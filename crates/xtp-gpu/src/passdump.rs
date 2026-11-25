@@ -956,9 +956,17 @@ impl Dump {
             ..
         } = self;
         let r = open.entry(key(list)).or_default();
-        let uavs = std::mem::take(&mut r.pending);
+        // Preparing a table may itself record an alias copy on this list.
+        // Only the draw or dispatch consumes the bindings prepared for it.
+        let kind = kind_of(text);
+        let shader_op = matches!(kind, Kind::Compute | Kind::Graphics);
+        let uavs = if shader_op {
+            std::mem::take(&mut r.pending)
+        } else {
+            Vec::new()
+        };
         let unordered = uavs.iter().map(|&u| (u, Out::Unordered));
-        let outputs: Option<Vec<(usize, Out)>> = match kind_of(text) {
+        let outputs: Option<Vec<(usize, Out)>> = match kind {
             Kind::Compute => Some(unordered.collect()),
             Kind::Graphics => Some(
                 r.targets
@@ -987,15 +995,13 @@ impl Dump {
             _ if r.passes.is_empty() => r.passes.push(Pass::default()),
             _ => {}
         }
-        let bindings = std::mem::take(&mut r.bindings);
-        let before = if input_program().is_some_and(|hash| programs(text).contains(&hash)) {
-            bindings
-                .into_iter()
-                .map(|(resource, how)| snapshot(readback, device, list, resource, how, 0))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut before = Vec::new();
+        if shader_op {
+            let bindings = r.bindings.drain(..);
+            if input_program().is_some_and(|hash| programs(text).contains(&hash)) {
+                before.extend(bindings.map(|(r, how)| snapshot(readback, device, list, r, how, 0)));
+            }
+        }
         let buffers = small_buffers(text)
             .into_iter()
             .map(|(address, len)| {
@@ -2201,6 +2207,7 @@ mod tests {
         }
         let mut dump = Dump::new(4096, 0);
         dump.written(&list, resource as usize);
+        dump.op(&host.device, &list, "alias copy while preparing a table");
         dump.op(&host.device, &list, "dispatch 1x1x1");
         dump.closed(&host.device, &list);
         list.close();
