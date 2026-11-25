@@ -213,6 +213,7 @@ fn native_in(words: &[u32], group: [u32; 3]) -> NativeProgram {
     NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 32,
         layout: vec![table(0, 1), table(1, 2), table(2, 3)],
         used: vec![
@@ -1233,6 +1234,7 @@ fn a_level_query_of_an_array_leaves_the_slice_out() {
     n.io = StageIo::Ps {
         inputs: vec![],
         input_addr: 1 << 1,
+        rsrc2: 0,
         db_shader_control: 0,
         patches: vec![],
     };
@@ -1518,6 +1520,7 @@ mod atomic64 {
         NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
+            float_mode: 0,
             vgprs: 32,
             layout: vec![table(0, 1), table(1, 2)],
             used: vec![used(0, 1, 8), used(1, 2, 4)],

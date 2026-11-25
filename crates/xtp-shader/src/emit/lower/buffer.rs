@@ -3,7 +3,7 @@
 //! R3 (structured buffers of unknown stride: through the host's runtime
 //! stride table, [`Lower::runtime_access`]).
 
-use super::descriptor::UNKNOWN_STRIDE;
+use super::descriptor::{Entry, UNKNOWN_STRIDE};
 use super::{Lower, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
@@ -11,6 +11,74 @@ use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Reg};
 use crate::native::{ResourceType, UsedResource};
 use crate::resource::{CODE, Source};
+
+/// GFX10 buffer resource control fields (RDNA2 ISA, table 37).
+/// SWIZZLE_ENABLE and STRIDE are in word 1, the other fields in word 3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BufferDescriptor {
+    pub stride: u32,
+    pub swizzle_enable: bool,
+    pub add_tid_enable: bool,
+    pub dst_sel: [u8; 4],
+    pub format: u8,
+    /// Number of contiguous indices (8, 16, 32 or 64).
+    pub index_stride: u32,
+    pub oob_select: BufferOob,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BufferOob {
+    Structured,
+    Index,
+    Nonempty,
+    Raw,
+}
+
+impl BufferDescriptor {
+    pub(super) fn decode(word1: u32, word3: u32) -> Self {
+        Self {
+            stride: (word1 >> 16) & 0x3fff,
+            swizzle_enable: word1 & (1 << 31) != 0,
+            add_tid_enable: word3 & (1 << 23) != 0,
+            dst_sel: std::array::from_fn(|k| ((word3 >> (3 * k)) & 7) as u8),
+            format: ((word3 >> 12) & 0x7f) as u8,
+            index_stride: 8 << ((word3 >> 21) & 3),
+            oob_select: match (word3 >> 28) & 3 {
+                0 => BufferOob::Structured,
+                1 => BufferOob::Index,
+                2 => BufferOob::Nonempty,
+                _ => BufferOob::Raw,
+            },
+        }
+    }
+}
+
+/// A raw view with the range information available at the access site.
+#[derive(Clone, Copy)]
+enum RawView {
+    Table(Entry),
+    Structured {
+        handle: V,
+        stride: u32,
+    },
+    Built {
+        handle: V,
+        stride: u32,
+        records: u32,
+        mode: BufferOob,
+    },
+}
+
+/// The scalar offset moves the base. Only the VGPR and instruction
+/// offsets (and the component being transferred) are within the element.
+#[derive(Clone, Copy)]
+struct BufferAddress {
+    index: Option<V>,
+    within: V,
+    scalar: Option<V>,
+    base: u32,
+    dynamic_base: Option<V>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Numeric {
@@ -271,31 +339,63 @@ impl<'a> Lower<'a> {
             l.i32_of(v)
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
-        let mut off = self.s.m.i32(u32::from(*offset));
-        if *offen {
-            let o = vaddr(self, u8::from(*idxen))?;
-            off = self.s.m.bin(c, Bin::Add, off, o);
-        }
-        if !matches!(
-            soffset,
-            Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-        ) {
-            let so = self.operand(inst, soffset)?;
-            off = self.s.m.bin(c, Bin::Add, off, so);
-        }
         let src = self
             .descriptors
             .get(&(site, false))
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
-        let (base, extra) = self.built_offset(src)?;
-        if base != 0 {
-            let b = self.s.m.i32(base);
-            off = self.s.m.bin(c, Bin::Add, off, b);
+        let built = match src {
+            Source::Built { bits, words, .. } => {
+                Some((BufferDescriptor::decode(*bits, words[1]), words[0]))
+            }
+            _ => None,
+        };
+        let add_tid = built.is_some_and(|(d, _)| d.add_tid_enable);
+        let index = if add_tid {
+            let lane = self.buffer_lane();
+            Some(index.map_or(lane, |i| self.s.m.bin(c, Bin::Add, i, lane)))
+        } else {
+            index
+        };
+        let raw = !typed
+            && !used.is_some_and(|r| r.kind == ResourceType::Cbv)
+            && (built.is_some() && (crate::emit::raw_structured() || add_tid)
+                || self.through_table(index, used, src)?
+                || (index.is_some() && crate::emit::raw_structured()));
+        let mut within = self.s.m.i32(u32::from(*offset));
+        if *offen {
+            let o = vaddr(self, u8::from(*idxen))?;
+            within = if raw {
+                self.raw_add(within, o)
+            } else {
+                self.s.m.bin(c, Bin::Add, within, o)
+            };
         }
-        if let Some(x) = extra {
-            off = self.s.m.bin(c, Bin::Add, off, x);
+        let scalar = match soffset {
+            Operand::Scalar { code: NULL, .. } | Operand::Const(128) => None,
+            _ => Some(self.operand(inst, soffset)?),
+        };
+        let (base, dynamic_base) = self.built_offset(src)?;
+        let address = BufferAddress {
+            index,
+            within,
+            scalar,
+            base,
+            dynamic_base,
+        };
+        let mut off = within;
+        if !raw {
+            if let Some(so) = scalar {
+                off = self.s.m.bin(c, Bin::Add, off, so);
+            }
+            if base != 0 {
+                let b = self.s.m.i32(base);
+                off = self.s.m.bin(c, Bin::Add, off, b);
+            }
+            if let Some(x) = dynamic_base {
+                off = self.s.m.bin(c, Bin::Add, off, x);
+            }
         }
         // Lanes outside EXEC run a load too where nothing branches them away
         // (every lane in the console flow; under a guard in the per-lane
@@ -315,8 +415,12 @@ impl<'a> Lower<'a> {
                 let c = l.cur;
                 let byte = match index {
                     Some(i) => {
-                        let sixteen = l.s.m.i32(16);
-                        let rows = l.s.m.bin(c, Bin::Mul, i, sixteen);
+                        let stride = l.s.m.i32(
+                            built
+                                .filter(|(d, _)| d.add_tid_enable)
+                                .map_or(16, |(d, _)| d.stride),
+                        );
+                        let rows = l.s.m.bin(c, Bin::Mul, i, stride);
                         l.s.m.bin(c, Bin::Add, rows, off)
                     }
                     None => off,
@@ -337,30 +441,33 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        let raw_view = |l: &mut Self| -> Result<RawView, Why> {
+            Ok(match built {
+                Some((desc, records)) => {
+                    if desc.swizzle_enable {
+                        return Err("a swizzled raw buffer descriptor");
+                    }
+                    let handle = l.handle(site, src, false, (11 | u, 0))?;
+                    RawView::Built {
+                        handle,
+                        stride: desc.stride,
+                        records,
+                        mode: desc.oob_select,
+                    }
+                }
+                _ if l.raw_through_table(src) => {
+                    l.note_run_time(src, 11 | u);
+                    RawView::Table(l.stride_entry(src)?)
+                }
+                _ => RawView::Structured {
+                    handle: l.handle(site, src, false, (11 | u, 0))?,
+                    stride: used.map_or(0, |r| r.stride),
+                },
+            })
+        };
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            /// How the atomic reaches the buffer.
-            enum Route {
-                /// A handle and its coordinates.
-                View(V, [V; 3]),
-                /// A raw handle and an element of a known stride.
-                Element(V, V),
-                /// The runtime stride table.
-                Table,
-            }
-            let route = match index {
-                _ if self.through_table(index, used, src)? => Route::Table,
-                Some(index) if crate::emit::raw_structured() => {
-                    Route::Element(self.handle(site, src, false, (11 | u, 0))?, index)
-                }
-                Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    Route::View(h, [index, off, iu])
-                }
-                None => Route::View(self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
-            };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
             };
@@ -393,16 +500,17 @@ impl<'a> Lower<'a> {
             };
             let at = self.begin_guarded(guard);
             // Out of range the console returns 0.
-            let done = match route {
-                Route::View(h, coords) => Ok(vec![atomic_op(self, h, coords)]),
-                Route::Element(h, index) => {
-                    self.element_access(h, index, off, 4, used, |l, h, byte| {
+            let done = if raw {
+                raw_view(self).and_then(|view| {
+                    self.raw_components(view, address, 11 | u, 1, |l, h, byte, _| {
                         Ok(vec![atomic_op(l, h, [byte, iu, iu])])
                     })
-                }
-                Route::Table => self.runtime_access(src, index, off, 4, 11 | u, |l, h, byte| {
-                    Ok(vec![atomic_op(l, h, [byte, iu, iu])])
-                }),
+                })
+            } else {
+                let coords = index.map_or([off, iu, iu], |index| [index, off, iu]);
+                let props = index.map_or((11 | u, 0), |_| (12 | u, used.map_or(0, |r| r.stride)));
+                self.handle(site, src, false, props)
+                    .map(|h| vec![atomic_op(self, h, coords)])
             };
             let r = match done {
                 Ok(r) => r[0],
@@ -454,36 +562,14 @@ impl<'a> Lower<'a> {
                 (69, "bufferStore.f32")
             } else {
                 match index {
-                    _ if self.through_table(index, used, src)? => {
-                        // The store in a block of its own under the guard:
-                        // made only where the table's range checks pass.
-                        let mask = (1u8 << count) - 1;
+                    _ if raw => {
                         let at = self.begin_guarded(guard);
-                        let done = self.runtime_access(
-                            src,
-                            index,
-                            off,
-                            4 * count,
-                            11 | u,
-                            |l, h, byte| {
-                                l.raw_store(h, byte, &vals, mask);
+                        let done = raw_view(self).and_then(|view| {
+                            self.raw_components(view, address, 11 | u, count, |l, h, byte, k| {
+                                l.raw_store_dword(h, byte, vals[k]);
                                 Ok(Vec::new())
-                            },
-                        );
-                        self.end_guarded(at, &[]);
-                        return done.map(|_| ());
-                    }
-                    Some(index) if crate::emit::raw_structured() => {
-                        // The same, made only where the element's range
-                        // checks pass.
-                        let h = self.handle(site, src, false, (11 | u, 0))?;
-                        let mask = (1u8 << count) - 1;
-                        let at = self.begin_guarded(guard);
-                        let done =
-                            self.element_access(h, index, off, 4 * count, used, |l, h, byte| {
-                                l.raw_store(h, byte, &vals, mask);
-                                Ok(Vec::new())
-                            });
+                            })
+                        });
                         self.end_guarded(at, &[]);
                         return done.map(|_| ());
                     }
@@ -516,7 +602,6 @@ impl<'a> Lower<'a> {
         };
         // (What can stop the load is checked before its guarded block.)
         let stride = used.map_or(0, |u| u.stride);
-        let mut runtime = false;
         match *format {
             Some(_) if index.is_some() => return Err("a typed-format load by index"),
             Some(_) => {}
@@ -528,7 +613,7 @@ impl<'a> Lower<'a> {
                     self.s.flags |= flags::TYPED_UAV_LOADS;
                 }
             }
-            None => runtime = self.through_table(index, used, src)?,
+            None => {}
         }
         let xs = self.guarded_load(lane_guard, |l| {
             if let Some(f) = *format {
@@ -560,22 +645,10 @@ impl<'a> Lower<'a> {
                 let mask = l.s.m.i8((1u8 << count) - 1);
                 let align = l.s.m.i32(4);
                 let (h, coords) = match index {
-                    _ if runtime => {
-                        // Loads where the table's range checks fail read 0.
-                        return l.runtime_access(
-                            src,
-                            index,
-                            off,
-                            4 * count,
-                            11 | u,
-                            |l, h, byte| Ok(l.raw_dwords(h, byte, count)),
-                        );
-                    }
-                    Some(index) if crate::emit::raw_structured() => {
-                        // Loads where the element's range checks fail read 0.
-                        let h = l.handle(site, src, false, (11 | u, 0))?;
-                        return l.element_access(h, index, off, 4 * count, used, |l, h, byte| {
-                            Ok(l.raw_dwords(h, byte, count))
+                    _ if raw => {
+                        let view = raw_view(l)?;
+                        return l.raw_components(view, address, 11 | u, count, |l, h, byte, _| {
+                            Ok(vec![l.raw_dword(h, byte)])
                         });
                     }
                     Some(index) => (l.handle(site, src, false, (12 | u, stride))?, [index, off]),
@@ -645,113 +718,189 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The byte of `off` in element `index` of a buffer of the known stride
-    /// of `used`, for a raw handle ([`crate::emit::raw_structured`]), and
-    /// whether an access of `width` bytes there passes the console's range
-    /// checks of a structured view, as the stride table's do
-    /// ([`Self::runtime_view`]): inside the element (`off + width <=
-    /// stride`), and at an element whose bytes lie below 2^32, so `index *
-    /// stride` cannot wrap to a byte inside the view. An element past the
-    /// view's count is past the raw view's bytes (the host's raw view holds
-    /// the structured one's elements and no more), where the raw handle's
-    /// bounds check reads 0 and drops writes, as the console does.
-    fn element_byte(
-        &mut self,
-        index: V,
-        off: V,
-        width: u32,
-        used: Option<&UsedResource>,
-    ) -> (V, V) {
-        let c = self.cur;
-        let s = used.map_or(0, |u| u.stride);
-        debug_assert!(s >= 4 && s.is_multiple_of(4), "a known stride");
-        let stride = self.s.m.i32(s);
-        let at = self.s.m.bin(c, Bin::Mul, index, stride);
-        let byte = self.s.m.bin(c, Bin::Add, at, off);
-        // Elements below 2^32 / stride end at or below 2^32.
-        let elements = self.s.m.i32(((1u64 << 32) / u64::from(s.max(1))) as u32);
-        let in_range = self.s.m.cmp(c, pred::IULT, index, elements);
-        // `off` below the stride first, so `off + width` cannot wrap.
-        let width = self.s.m.i32(width);
-        let end = self.s.m.bin(c, Bin::Add, off, width);
-        let starts = self.s.m.cmp(c, pred::IULT, off, stride);
-        let ends = self.s.m.cmp(c, pred::IULE, end, stride);
-        let inside = self.s.m.bin(c, Bin::And, starts, ends);
-        let valid = self.s.m.bin(c, Bin::And, in_range, inside);
-        (byte, valid)
-    }
-
-    /// Runs `access` (with the raw handle `h` and the byte in its view) for
-    /// an access of `width` bytes at byte `off` of element `index` of a
-    /// buffer of the known stride of `used`, in the lanes where it passes
-    /// the range checks of [`Self::element_byte`]; what it gives is 0 in the
-    /// others, which access nothing (a load reads 0, a store or an atomic
-    /// is dropped, as on the console).
-    fn element_access(
-        &mut self,
-        h: V,
-        index: V,
-        off: V,
-        width: u32,
-        used: Option<&UsedResource>,
-        access: impl FnOnce(&mut Self, V, V) -> Result<Vec<V>, Why>,
-    ) -> Result<Vec<V>, Why> {
-        let (byte, valid) = self.element_byte(index, off, width, used);
-        let at = self.begin_guarded(Some(valid));
-        let xs = match access(self, h, byte) {
-            Ok(xs) => xs,
-            Err(why) => {
-                self.end_guarded(at, &[]);
-                return Err(why);
+    /// GFX10 ADD_TID_ENABLE uses the lane within the console wave. For
+    /// compute, derive it from the same group numbering as the thread ID,
+    /// including both halves of a wave64 on a narrower host.
+    fn buffer_lane(&mut self) -> V {
+        let mask = self.s.m.i32(self.wave() - 1);
+        let flat = if self.s.mesh.is_some() {
+            self.mesh_thread()
+        } else if self.s.threads.is_some() {
+            if self.console_lanes {
+                self.console_flat()
+            } else {
+                self.s.op(
+                    self.s.entry,
+                    "flattenedThreadIdInGroup.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    96,
+                    &[],
+                )
             }
+        } else {
+            self.s.flags |= flags::WAVE_OPS;
+            self.lane_index()
         };
-        let zero = self.s.m.i32(0);
-        let pairs: Vec<(V, V)> = xs.iter().map(|&x| (x, zero)).collect();
-        Ok(self.end_guarded(at, &pairs))
+        self.s.m.bin(self.cur, Bin::And, flat, mask)
     }
 
-    /// Stores `vals` (up to four dwords, those of `mask`) in raw buffer `h`
-    /// from byte `byte`.
-    fn raw_store(&mut self, h: V, byte: V, vals: &[V], mask: u8) {
-        let iu = self.s.m.undef(self.s.t.i32);
-        let mut args = vec![h, byte, iu];
-        args.extend(vals);
-        args.resize(3 + 4, iu);
-        args.push(self.s.m.i8(mask));
-        args.push(self.s.m.i32(4));
-        let void = self.s.t.void;
+    /// MUBUF checks DWORDX2/3/4 one component at a time (ISA section 8.1.5).
+    fn raw_components(
+        &mut self,
+        view: RawView,
+        address: BufferAddress,
+        props: u32,
+        count: u32,
+        mut access: impl FnMut(&mut Self, V, V, usize) -> Result<Vec<V>, Why>,
+    ) -> Result<Vec<V>, Why> {
+        let mut out = Vec::new();
+        for k in 0..count {
+            let delta = self.s.m.i32(4 * k);
+            let within = self.raw_add(address.within, delta);
+            let (byte, valid) = self.raw_coordinate(view, BufferAddress { within, ..address }, 4);
+            let xs = self.guarded_values(Some(valid), |l| {
+                let h = match view {
+                    RawView::Table(e) => {
+                        l.s.heap_handle(l.cur, e.raw, false, e.nonuniform, (props, 0))
+                    }
+                    RawView::Structured { handle, .. } | RawView::Built { handle, .. } => handle,
+                };
+                access(l, h, byte, k as usize)
+            })?;
+            out.extend(xs);
+        }
+        Ok(out)
+    }
+
+    /// Saturate an overflowing byte address. No complete dword fits at
+    /// u32::MAX, so a later component or base displacement cannot wrap
+    /// an invalid access back to the start of the view.
+    fn raw_add(&mut self, a: V, b: V) -> V {
+        let zero = self.s.m.i32(0);
+        if a == zero {
+            return b;
+        }
+        if b == zero {
+            return a;
+        }
+        let c = self.cur;
+        let sum = self.s.m.bin(c, Bin::Add, a, b);
+        let carry = self.s.m.cmp(c, pred::IULT, sum, a);
+        let max = self.s.m.i32(u32::MAX);
+        self.s.m.select(c, carry, max, sum)
+    }
+
+    /// Whether all `width` bytes from `byte` fit, including near 2^32.
+    fn fits(&mut self, byte: V, width: u32, size: V) -> V {
+        let c = self.cur;
+        let width = self.s.m.i32(width);
+        let room = self.s.m.cmp(c, pred::IUGE, size, width);
+        let last = self.s.m.bin(c, Bin::Sub, size, width);
+        let inside = self.s.m.cmp(c, pred::IULE, byte, last);
+        self.s.m.bin(c, Bin::And, room, inside)
+    }
+
+    fn raw_coordinate(&mut self, view: RawView, a: BufferAddress, width: u32) -> (V, V) {
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let index = a.index.unwrap_or(zero);
+        let displaced = a.scalar.map_or(a.within, |so| self.raw_add(a.within, so));
+        if let RawView::Table(e) = view {
+            let four = self.s.m.i32(4);
+            let raw = self.s.m.cmp(c, pred::EQ, e.stride, zero);
+            let element = self.s.m.select(c, raw, four, e.stride);
+            let size = self.s.m.bin(c, Bin::Mul, e.count, element);
+            let mut byte = displaced;
+            let mut valid = self.s.m.bool(true);
+            if a.index.is_some() {
+                let at = self.s.m.bin(c, Bin::Mul, index, e.stride);
+                byte = self.raw_add(at, displaced);
+                let in_count = self.s.m.cmp(c, pred::IULT, index, e.count);
+                let inside = self.fits(a.within, width, e.stride);
+                let structured = self.s.m.bin(c, Bin::And, in_count, inside);
+                valid = self.s.m.bin(c, Bin::Or, raw, structured);
+            }
+            let fits = self.fits(byte, width, size);
+            valid = self.s.m.bin(c, Bin::And, valid, fits);
+            return (self.s.m.bin(c, Bin::Add, byte, e.bias), valid);
+        }
+
+        // The host supplies a D3D view for a heap descriptor. For a
+        // descriptor assembled by the program its GFX10 words are known,
+        // including NUM_RECORDS and OOB_SELECT (RDNA2 ISA section 8.1.5).
+        let (stride, records, mode) = match view {
+            RawView::Structured { stride, .. } => (stride, None, BufferOob::Structured),
+            RawView::Built {
+                stride,
+                records,
+                mode,
+                ..
+            } => (stride, Some(records), mode),
+            RawView::Table(_) => unreachable!(),
+        };
+        let stride_v = self.s.m.i32(stride);
+        let records_v = self.s.m.i32(records.unwrap_or(u32::MAX));
+        let in_count = self.s.m.cmp(c, pred::IULT, index, records_v);
+        let in_bounds = match mode {
+            BufferOob::Structured => {
+                let inside = if records.is_some() {
+                    self.s.m.cmp(c, pred::IULT, a.within, stride_v)
+                } else {
+                    self.fits(a.within, width, stride_v)
+                };
+                self.s.m.bin(c, Bin::And, in_count, inside)
+            }
+            BufferOob::Index => in_count,
+            BufferOob::Nonempty => self.s.m.bool(records != Some(0)),
+            BufferOob::Raw => self.fits(displaced, width, records_v),
+        };
+        let max_index = self
+            .s
+            .m
+            .i32(u32::MAX.checked_div(stride).unwrap_or(u32::MAX));
+        let no_wrap = self.s.m.cmp(c, pred::IULE, index, max_index);
+        let valid = self.s.m.bin(c, Bin::And, in_bounds, no_wrap);
+        let at = self.s.m.bin(c, Bin::Mul, index, stride_v);
+        let mut byte = self.raw_add(at, displaced);
+        let base = self.s.m.i32(a.base);
+        byte = self.raw_add(byte, base);
+        if let Some(extra) = a.dynamic_base {
+            byte = self.raw_add(byte, extra);
+        }
+        let last = self.s.m.i32(u32::MAX - (width - 1));
+        let fits = self.s.m.cmp(c, pred::IULE, byte, last);
+        (byte, self.s.m.bin(c, Bin::And, valid, fits))
+    }
+
+    fn raw_store_dword(&mut self, h: V, byte: V, value: V) {
+        let undef = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
         self.s.op(
             self.cur,
             "rawBufferStore.i32",
             Attr::NoUnwind,
-            void,
+            self.s.t.void,
             140,
-            &args,
+            &[h, byte, undef, value, undef, undef, undef, mask, align],
         );
     }
 
-    /// `count` dwords of raw buffer `h` from byte `byte` (one load).
-    fn raw_dwords(&mut self, h: V, byte: V, count: u32) -> Vec<V> {
-        let c = self.cur;
-        let (iu, mask, align) = (
-            self.s.m.undef(self.s.t.i32),
-            self.s.m.i8((1u8 << count) - 1),
-            self.s.m.i32(4),
-        );
+    fn raw_dword(&mut self, h: V, byte: V) -> V {
+        let undef = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
         let r = self.s.op(
-            c,
+            self.cur,
             "rawBufferLoad.f32",
             Attr::ReadOnly,
             self.s.t.res_ret,
             139,
-            &[h, byte, iu, mask, align],
+            &[h, byte, undef, mask, align],
         );
-        (0..count)
-            .map(|k| {
-                let x = self.s.m.extract(c, r, k);
-                self.as_int(x)
-            })
-            .collect()
+        let x = self.s.m.extract(self.cur, r, 0);
+        self.as_int(x)
     }
 
     /// Whether a raw access of `src`'s buffer (an untyped load, store or
@@ -775,7 +924,7 @@ impl<'a> Lower<'a> {
     /// view the runtime stride table names for `src`'s slot, in the lanes
     /// where an access of `width` bytes at byte `off` (of element `index`,
     /// or by offset alone) passes the table's range checks
-    /// ([`Self::runtime_view`]); what it gives is 0 in the others. `props`
+    /// ([`Self::raw_coordinate`]); what it gives is 0 in the others. `props`
     /// are the raw handle's (11, with the UAV bit for unordered access). The
     /// caller's guard, if any, is around it: nothing is read for a lane
     /// that must not access.
@@ -788,22 +937,21 @@ impl<'a> Lower<'a> {
         props: u32,
         access: impl FnOnce(&mut Self, V, V) -> Result<Vec<V>, Why>,
     ) -> Result<Vec<V>, Why> {
-        let (e, byte, valid) = self.runtime_view(src, index, off, width)?;
-        self.note_run_time(src, props);
-        let at = self.begin_guarded(Some(valid));
-        let h = self
-            .s
-            .heap_handle(self.cur, e.raw, false, e.nonuniform, (props, 0));
-        let xs = match access(self, h, byte) {
-            Ok(xs) => xs,
-            Err(why) => {
-                self.end_guarded(at, &[]);
-                return Err(why);
-            }
+        let e = self.stride_entry(src)?;
+        let address = BufferAddress {
+            index,
+            within: off,
+            scalar: None,
+            base: 0,
+            dynamic_base: None,
         };
-        let zero = self.s.m.i32(0);
-        let pairs: Vec<(V, V)> = xs.iter().map(|&x| (x, zero)).collect();
-        Ok(self.end_guarded(at, &pairs))
+        let (byte, valid) = self.raw_coordinate(RawView::Table(e), address, width);
+        self.note_run_time(src, props);
+        self.guarded_values(Some(valid), |l| {
+            let h =
+                l.s.heap_handle(l.cur, e.raw, false, e.nonuniform, (props, 0));
+            access(l, h, byte)
+        })
     }
 
     /// The dwords `load` gives, computed only in lanes where `guard` holds
@@ -819,6 +967,15 @@ impl<'a> Lower<'a> {
         if guard.is_some() {
             GUARDED_LOADS.with(|n| n.set(n.get() + 1));
         }
+        self.guarded_values(guard, load)
+    }
+
+    /// Return zero for each value in lanes where the operation was skipped.
+    fn guarded_values(
+        &mut self,
+        guard: Option<V>,
+        load: impl FnOnce(&mut Self) -> Result<Vec<V>, Why>,
+    ) -> Result<Vec<V>, Why> {
         let at = self.begin_guarded(guard);
         match load(self) {
             Ok(xs) => {
@@ -927,7 +1084,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 thread_local! {
-    /// Loads [`Lower::guarded_load`] put under a guard on this thread.
+    /// Loads [`Lower::guarded_load`] put under an EXEC guard on this thread.
     static GUARDED_LOADS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -958,6 +1115,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
+            float_mode: 0,
             vgprs: 32,
             layout: vec![RootParam {
                 root: RootType::Table,
@@ -1030,5 +1188,40 @@ mod tests {
             0xBF81_0000, // s_endpgm
         ];
         assert_eq!(guarded_loads(&uniform), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::{BufferDescriptor, BufferOob};
+
+    #[test]
+    fn raw_buffer_descriptor_fields_use_their_isa_bits() {
+        for (k, oob_select) in [
+            BufferOob::Structured,
+            BufferOob::Index,
+            BufferOob::Nonempty,
+            BufferOob::Raw,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let k = k as u32;
+            let word3 = (k << 28) | (k << 21) | (0x52 << 12) | 0xfac;
+            assert_eq!(
+                BufferDescriptor::decode(0xc00c_ffff, word3 | 0xc980_0000),
+                BufferDescriptor {
+                    stride: 12,
+                    swizzle_enable: true,
+                    add_tid_enable: true,
+                    dst_sel: [4, 5, 6, 7],
+                    format: 0x52,
+                    index_stride: 8 << k,
+                    oob_select,
+                }
+            );
+        }
+        assert!(!BufferDescriptor::decode(1 << 30, u32::MAX).swizzle_enable);
+        assert!(!BufferDescriptor::decode(u32::MAX, !(1 << 23)).add_tid_enable);
     }
 }

@@ -51,10 +51,13 @@ pub(crate) struct Pending {
     /// Set by the call that made it, once what that call counts is in
     /// place ([`Pending::make`]).
     finished: AtomicBool,
-    /// What identifies it across runs (shader containers and state), and
-    /// whether a draw has used it yet.
-    key: String,
+    /// What identifies it across runs (shader containers and state:
+    /// [`key`]), and whether a draw has used it yet.
+    pub(crate) key: String,
     used: AtomicBool,
+    /// The graphics state as the title's stream gave it, kept for the
+    /// precook once a worker has made the pipeline ([`super::record`]).
+    pub(crate) stream: Option<super::record::Stream>,
     /// Why the host refused it, once it has (diagnostics).
     #[cfg(feature = "diagnostics")]
     refusal: OnceLock<String>,
@@ -79,29 +82,43 @@ const CHEAP: usize = 0;
 const HEAVY: usize = 1;
 const POOL_NAMES: [&str; 2] = ["cheap", "heavy"];
 
+/// What identifies a title pipeline of `shaders` and `graphics` across
+/// runs: its early key (its description is kept under a key of its own,
+/// `super::record`'s).
+pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    let mut key = blake3::Hasher::new();
+    for s in shaders {
+        key.update(s.stage.as_bytes());
+        key.update(s.hash.as_bytes());
+    }
+    key.update(
+        graphics
+            .map(|g| g.describe())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    key.finalize().to_hex()[..32].to_owned()
+}
+
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
-        for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
-        }
-        key.update(
-            graphics
-                .as_ref()
-                .map(|g| g.describe())
-                .unwrap_or_default()
-                .as_bytes(),
-        );
+    /// A title pipeline of `shaders`, with the graphics state `graphics`
+    /// read from the title's `stream` (none for a compute pipeline or a
+    /// plain description).
+    pub(crate) fn new(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        stream: Option<super::record::Stream>,
+    ) -> Pending {
         Pending {
+            key: key(&shaders, graphics.as_deref()),
             shaders,
             graphics,
             queued: AtomicU8::new(IDLE),
             pool: AtomicU8::new(CHEAP as u8),
             made: OnceLock::new(),
             finished: AtomicBool::new(false),
-            key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            stream,
             #[cfg(feature = "diagnostics")]
             refusal: OnceLock::new(),
         }
@@ -141,8 +158,15 @@ impl Pending {
             counted();
             self.finished.store(true, Ordering::Release);
             let (lock, done) = &DONE;
-            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let held = lock.lock().unwrap_or_else(|e| e.into_inner());
             done.notify_all();
+            drop(held);
+            // Once the title can draw with it: kept for the precook, made
+            // or not (a translator that refuses its shaders today may take
+            // them tomorrow). Compute pipelines are the pack's.
+            if let (Some(stream), false) = (&self.stream, self.compute()) {
+                super::record::made(&self.shaders, stream);
+            }
         }
         first
     }
@@ -871,7 +895,7 @@ mod tests {
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
-        let p = Arc::new(Pending::new(Vec::new(), None));
+        let p = Arc::new(Pending::new(Vec::new(), None, None));
         assert!(ready(&p).is_none());
         // Queued for a first use, or taken by a worker already.
         assert!(p.queued.load(Ordering::Relaxed) >= URGENT);
@@ -883,7 +907,7 @@ mod tests {
     /// later uses in that frame drop at once, the next frame waits again.
     #[test]
     fn waits_stop_at_the_frames_budget() {
-        let never = Pending::new(Vec::new(), None);
+        let never = Pending::new(Vec::new(), None, None);
         let frames = Frame::new();
         let budget = Budget([Duration::from_millis(30), Duration::from_millis(60)]);
         let timed = |frame| {
@@ -963,7 +987,7 @@ mod tests {
     /// made (and counted) once.
     #[test]
     fn early_then_used_is_made_once() {
-        let p = Arc::new(Pending::new(Vec::new(), None));
+        let p = Arc::new(Pending::new(Vec::new(), None, None));
         POOLS.start(&p, EARLY);
         POOLS.start(&p, URGENT);
         POOLS.start(&p, EARLY);
@@ -979,7 +1003,7 @@ mod tests {
     /// again once taken (VIctory #546's test).
     #[test]
     fn first_uses_come_first_and_each_pipeline_once() {
-        let pending = || Arc::new(Pending::new(Vec::new(), None));
+        let pending = || Arc::new(Pending::new(Vec::new(), None, None));
         let (earlier, promoted, used) = (pending(), pending(), pending());
         let mut queues = Queues::new();
         assert_eq!(queues.push(&earlier, EARLY), Some(true));
@@ -1004,7 +1028,7 @@ mod tests {
     /// more, unless that program is known to be refused.
     #[test]
     fn large_programs_make_heavy_pipelines() {
-        let pipeline = |shaders: Vec<Arc<Shader>>| Pending::new(shaders, None);
+        let pipeline = |shaders: Vec<Arc<Shader>>| Pending::new(shaders, None, None);
         let small = program("vertex", HEAVY_BYTES - 1);
         let large = program("pixel", HEAVY_BYTES);
         assert!(!heavy(&pipeline(vec![small.clone()])));
@@ -1047,7 +1071,7 @@ mod tests {
     fn a_pipeline_waiting_for_a_translation_is_passed_over() {
         let large = program("compute", HEAVY_BYTES);
         let small = program("vertex", 64);
-        let pending = |shaders: Vec<Arc<Shader>>| Arc::new(Pending::new(shaders, None));
+        let pending = |shaders: Vec<Arc<Shader>>| Arc::new(Pending::new(shaders, None, None));
         let (first, twin, other) = (
             pending(vec![large.clone()]),
             pending(vec![large.clone()]),
@@ -1186,12 +1210,12 @@ mod tests {
     #[test]
     fn a_cheap_pipeline_does_not_wait_behind_a_heavy_one() {
         let test = "pipeline::make::tests::a_cheap_pipeline_does_not_wait_behind_a_heavy_one";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let pipeline = |extra, salt, held| {
             let (shader, release) = compute(extra, salt, held);
-            (Arc::new(Pending::new(vec![shader], None)), release)
+            (Arc::new(Pending::new(vec![shader], None, None)), release)
         };
         let frames = Frame::new();
 

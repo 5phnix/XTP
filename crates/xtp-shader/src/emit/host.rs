@@ -15,6 +15,71 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    /// In this crate's tests, the GPU turn the device holds until it is
+    /// dropped (after the device: fields drop in order).
+    #[cfg(test)]
+    _turn: gpu_turn::Turn,
+}
+
+/// One GPU test at a time in this crate's tests, however a test gets its
+/// device: each [`Host`] holds a turn from its creation to its drop. Two
+/// tests driving WARP at once end the test process now and then with an
+/// access violation inside d3d10warp.dll (about one full run in a hundred
+/// on the build farm, 2026-11-25: `raw_tests` and `stride_tests` dispatches,
+/// which hold `valu_tests::ONE_AT_A_TIME`, beside `smem_tests` ones, which
+/// did not). A thread may hold several turns at once (a device per
+/// adapter); other threads wait for all of them to be dropped.
+#[cfg(test)]
+mod gpu_turn {
+    use std::sync::{Condvar, Mutex, PoisonError};
+    use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
+
+    /// The thread whose devices hold the turn, and how many they are.
+    static HOLDER: Mutex<Option<(ThreadId, usize)>> = Mutex::new(None);
+    static FREED: Condvar = Condvar::new();
+    /// Far longer than any test's GPU work: a device left on a thread that
+    /// never ends (a dispatch that never finishes) fails the tests that
+    /// wait for it instead of hanging the test binary.
+    const PATIENCE: Duration = Duration::from_secs(600);
+
+    pub(super) struct Turn(());
+
+    pub(super) fn take() -> Turn {
+        let me = std::thread::current().id();
+        let since = Instant::now();
+        let mut holder = HOLDER.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            match *holder {
+                None => *holder = Some((me, 1)),
+                Some((t, n)) if t == me => *holder = Some((t, n + 1)),
+                Some(_) => {
+                    let Some(left) = PATIENCE.checked_sub(since.elapsed()) else {
+                        drop(holder);
+                        panic!("no GPU turn in {PATIENCE:?}: another test still holds a device");
+                    };
+                    holder = FREED
+                        .wait_timeout(holder, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                    continue;
+                }
+            }
+            return Turn(());
+        }
+    }
+
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            let mut holder = HOLDER.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((t, n)) = *holder {
+                *holder = (n > 1).then_some((t, n - 1));
+                if holder.is_none() {
+                    FREED.notify_all();
+                }
+            }
+        }
+    }
 }
 
 /// What the stage declares that a pipeline must match.
@@ -160,6 +225,8 @@ impl Host {
     }
 
     fn create(warp: bool, adapter: Option<IDXGIAdapter>) -> Result<Self, String> {
+        #[cfg(test)]
+        let turn = gpu_turn::take();
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
@@ -190,7 +257,11 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            Ok(Host {
+                device,
+                #[cfg(test)]
+                _turn: turn,
+            })
         }
     }
 
@@ -658,6 +729,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
             crate::native::HwStage::Vs
         },
         dxil: s.finish(),
+        group_base: None,
         user_data: Vec::new(),
         samplers: Vec::new(),
         static_samplers: Vec::new(),

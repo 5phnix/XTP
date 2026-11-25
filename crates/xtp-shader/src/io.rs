@@ -187,14 +187,31 @@ pub struct Io {
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
-    /// Compute: how many SGPRs the hardware initializes
-    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
+    /// Number of defined entry SGPRs when the stage layout is known.
     pub initialized_sgprs: Option<u8>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
+    match raise_inputs(p, native, false) {
+        Err(ShaderError::Unsupported {
+            what:
+                "an interpolation without its first half"
+                | "interpolation halves of different attributes",
+            ..
+        }) => raise_inputs(p, native, true),
+        result => result,
+    }
+}
+
+/// On a live read of a folded first half, evaluate the two instructions
+/// independently. Ported from fxceless's VIctory fork (commit 578d459) by fxceless.
+pub(crate) fn raise_inputs(
+    p: &Program,
+    native: &NativeProgram,
+    separate: bool,
+) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
@@ -343,6 +360,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
+                        ("v_interp_p1_f32" | "v_interp_p2_f32", _) if separate => {
+                            io.interps.push((site, Interp::Weighted { attribute }));
+                        }
                         ("v_interp_p1_f32", _) => {}
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
@@ -363,6 +383,10 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
+                    "v_interp_p1ll_f16" | "v_interp_p2_f16" if separate => {
+                        let attribute = attribute(inst, &v.src[0])?;
+                        io.interps.push((site, Interp::Weighted { attribute }));
+                    }
                     "v_interp_p1ll_f16" => {}
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
@@ -578,12 +602,14 @@ mod tests {
         NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
+            float_mode: 0,
             vgprs: 256,
             layout: vec![],
             used: vec![],
             io: StageIo::Ps {
                 inputs,
                 input_addr,
+                rsrc2: 0,
                 db_shader_control: 0,
                 patches: Vec::<ExportPatch>::new(),
             },
@@ -650,10 +676,14 @@ mod tests {
     }
 
     #[test]
-    fn unpaired_or_unknown_interpolation_fails() {
+    fn a_second_half_accepts_an_arbitrary_accumulator_but_needs_its_attribute() {
         // p2 alone: its old dst is no p1's result.
         let lone = program(&[0xC809_0001, S_ENDPGM]); // v_interp_p2_f32 v2, v1, attr0.x
-        assert!(raise(&lone, &pixel(vec![TEXCOORD], 2)).is_err());
+        let io = raise(&lone, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert!(matches!(
+            &io.interps[..],
+            [((0, 0), Interp::Weighted { .. })]
+        ));
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
@@ -694,6 +724,7 @@ mod tests {
             let native = NativeProgram {
                 stage: HwStage::Ms,
                 wave64: true,
+                float_mode: 0,
                 vgprs: 256,
                 layout: vec![],
                 used: vec![],

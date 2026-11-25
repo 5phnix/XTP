@@ -76,6 +76,19 @@ try {
 $left = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { "$($_.CommandLine)" -like "*$marker-b*" })
 Assert-Farm ($left.Count -eq 0) 'the program that stopped taking stdin is gone'
 
+# Output to files (shader surveys): stdout and stderr each in its own.
+$so = Join-Path $env:TEMP "$marker.out"
+$se = Join-Path $env:TEMP "$marker.err"
+try {
+    $r = Invoke-FarmProcess -FilePath $ps -NoStdin -StdoutFile $so -StderrFile $se -ArgumentList @('-NoProfile', '-Command',
+        "[Console]::Out.WriteLine('to-out'); [Console]::Error.WriteLine('to-err'); exit 3")
+    $o = [IO.File]::ReadAllText($so).Trim()
+    $e = [IO.File]::ReadAllText($se).Trim()
+    Assert-Farm ($r.ExitCode -eq 3 -and $o -eq 'to-out' -and $e -eq 'to-err') "stdout and stderr to files (exit $($r.ExitCode), out '$o', err '$e')"
+} finally {
+    Remove-Item -Force -LiteralPath $so, $se -ErrorAction SilentlyContinue
+}
+
 # --- live -------------------------------------------------------------------
 
 if ($Live) {

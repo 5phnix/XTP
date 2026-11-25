@@ -42,7 +42,11 @@ use std::time::{Duration, Instant};
 /// and those that still run an A/B of their own until they move onto this
 /// module (`XTP_SNAPSHOT_MIRRORS`, by copystat lines). A switch read
 /// through [`switch`] is added here.
-pub const SWITCHES: &[&str] = &["XTP_FRAMES_IN_FLIGHT", "XTP_SNAPSHOT_MIRRORS"];
+pub const SWITCHES: &[&str] = &[
+    "XTP_FRAMES_IN_FLIGHT",
+    "XTP_SNAPSHOT_MIRRORS",
+    "XTP_RT_STANDIN",
+];
 
 /// Switches read once, when shaders are translated or pipelines made,
 /// which cannot alternate within a run: what a phase translated or made

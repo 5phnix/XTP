@@ -66,6 +66,7 @@ fn lowered_with(
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0,
         vgprs: 8,
         layout: vec![
             param(RootType::Constants, 4, 0, 0),
@@ -110,6 +111,7 @@ fn shader(words: &[u32], uav: u32, io: ComputeIo) -> HostShader {
     HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
+        group_base: l.group_base,
         user_data: l.user_data,
         samplers: l.samplers,
         static_samplers: Vec::new(),
@@ -480,8 +482,8 @@ fn reads_past_the_view_or_its_element_read_zero() {
         for (index, off, want) in [
             (0, 0, [dword(0, 0), dword(0, 0), dword(0, 4)]),
             (3, 4, [dword(3, 4), dword(3, 4), dword(3, 8)]),
-            // The last dword of the last element: one dword fits, two not.
-            (3, 8, [dword(3, 8), 0, 0]),
+            // The last dword of the last element: only the first component fits.
+            (3, 8, [dword(3, 8), dword(3, 8), 0]),
             // Past the count: the buffer's next bytes are not read.
             (4, 0, [0, 0, 0]),
             // Past the element: not the next element's first dword.
@@ -566,12 +568,19 @@ fn views_chosen_by_a_loaded_heap_index() {
     let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
     // Slot 2: three elements of 12 bytes; slot 3: four of 16 bytes from
     // element 1; their raw views in slots 4 and 5. Slot 1, written: four
-    // elements of 32 bytes, its raw view in slot 6. (Slot 0 is read by a
-    // scalar load, not through the table.)
+    // elements of 32 bytes, its raw view in slot 6. Slot 0, read by a
+    // scalar load, is read through the table too: its two dwords raw in
+    // place, as the host's table names a raw view.
     let (raw_a, entry_a) = raw_view_of(2, 4, (0, 3, 12));
     let (raw_b, entry_b) = raw_view_of(3, 5, (1, 4, 16));
     let (raw_out, entry_out) = raw_view_of(1, 6, (0, 4, 32));
-    let entries = [StrideEntry::NONE, entry_out, entry_a, entry_b];
+    let index = StrideEntry {
+        stride: 0,
+        raw_slot: Some(0),
+        bias: 0,
+        count: 2,
+    };
+    let entries = [index, entry_out, entry_a, entry_b];
     // Lane `l` reads [l, 4]: of the first view dwords 1, 4, 7 and (past its
     // three elements) nothing, of the second 5, 9, 13, 17; group g stores
     // it at [l, 16 g], dword 8 l + 4 g.
@@ -730,6 +739,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
     let cs = HostShader {
         stage: HwStage::Cs,
         dxil: plain.dxil,
+        group_base: plain.group_base,
         user_data: plain.user_data,
         samplers: plain.samplers,
         static_samplers: Vec::new(),
@@ -750,6 +760,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
         HostShader {
             stage: HwStage::Cs,
             dxil: l.dxil,
+            group_base: l.group_base,
             user_data: l.user_data,
             samplers: l.samplers,
             static_samplers: Vec::new(),

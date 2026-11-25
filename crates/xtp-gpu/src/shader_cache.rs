@@ -278,6 +278,7 @@ pub(crate) fn wave64_program(
     let native = xtp_shader::NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
+        float_mode: 0,
         vgprs: 8,
         // A UAV table in user SGPR 0; the group id in s1.
         layout: vec![RootParam {
@@ -306,7 +307,8 @@ pub(crate) fn wave64_program(
 /// A translation's entry: this, then [`encode`]'s words. 2: with whether it
 /// reads the runtime stride table (VIctory #193) and the buffers it reads
 /// through slots picked at run time.
-const MAGIC: &[u8; 4] = b"VSH2";
+/// Version 3 ajoute la base XYZ des dispatches fractionnés.
+const MAGIC: &[u8; 4] = b"VSH3";
 /// A refusal's entry: this, then the text's length (little endian, 4 bytes),
 /// then a checksum of the text (4 bytes), then the error's text (UTF-8). The
 /// length tells a cut-short entry from a shorter error, and the checksum
@@ -422,6 +424,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     }
     word(&mut out, u32::from(s.stride_table));
     word(&mut out, u32::from(s.run_time_buffers));
+    word(&mut out, s.group_base.unwrap_or(u32::MAX));
     out
 }
 
@@ -484,7 +487,13 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         _ => return None,
     };
     let run_time_buffers = u8::try_from(r.word()?).ok()?;
+    let group_base = match r.word()? {
+        u32::MAX => None,
+        n if n <= 60 && n.is_multiple_of(4) => Some(n),
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
+        group_base,
         stage,
         dxil,
         user_data,
@@ -568,6 +577,7 @@ mod tests {
             root_srvs: vec![0, 3],
             stride_table: true,
             run_time_buffers: 3,
+            group_base: Some(12),
         }
     }
 

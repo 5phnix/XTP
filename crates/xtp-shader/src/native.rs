@@ -35,6 +35,7 @@
 //!             mask, u8 attribute (v_interp `attr`), u8 default, u8 second
 //!             row (of a packed pair), u8 parameter slot, u8 flags (bit 0
 //!             flat, 1 linear, 3 fp16, 4 fp16 packed); E+0x124 u32 count
+//!     E+0x128 u32 SPI_SHADER_PGM_RSRC2_PS,
 //!     E+0x134 u32 SPI_PS_INPUT_ADDR, E+0x138 u32 DB_SHADER_CONTROL
 //!     E+0x148 u32 export patch size (dwords), E+0x14c 8 patches, one per
 //!             MRT: u32 code offset (dwords, -1 none), then the export code
@@ -94,6 +95,7 @@ const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 const RECORD_SIZE: u64 = 0x54;
 const RECORD_FLAGS: usize = 0x14;
 const FLAG_WAVE32: u32 = 1 << 5;
+const RECORD_FLOAT_MODE: usize = 0x44;
 const RECORD_REGS: usize = 0x50;
 const RECORD_LAYOUT: usize = 0x28;
 const RECORD_USED: usize = 0x30;
@@ -153,6 +155,8 @@ pub struct NativeProgram {
     pub stage: HwStage,
     /// Runs as 64 lanes per wave (else 32); sizes lane masks.
     pub wave64: bool,
+    /// Bits 0 à 7 de MODE à l’entrée du programme (arrondis et dénormalisés).
+    pub float_mode: u8,
     /// VGPRs the program uses (v0 up to this), the bound of indexed access.
     pub vgprs: u16,
     /// Where the root signature's parameters arrive (user SGPRs).
@@ -178,7 +182,93 @@ impl NativeProgram {
                 }
             }
         }
+        if self.io.pops() {
+            skip_ordered_wait(&mut code, self.wave64, self.vgprs);
+        }
         code
+    }
+}
+
+/// Host rasterizer-ordered UAVs serialize overlapping pixels. Bypass the
+/// console's collision test only when both paths lead to the same ordered
+/// section and the skipped block only polls SRC_POPS_EXITING_WAVE_ID.
+fn skip_ordered_wait(code: &mut [u8], wave64: bool, vgprs: u16) {
+    use crate::gfx10::{Fields, Operand};
+    use crate::ir::Exit;
+    let Ok(p) = crate::ir::build(code, wave64, vgprs) else {
+        return;
+    };
+    for gate in &p.blocks {
+        let Exit::Branch {
+            taken: section,
+            not_taken: wait,
+        } = gate.exit
+        else {
+            continue;
+        };
+        let poll = &p.blocks[wait];
+        let Some(branch) = gate.insts.last() else {
+            continue;
+        };
+        let [add, cmp, back] = poll.insts.as_slice() else {
+            continue;
+        };
+        // s_sleep is omitted from the IR. Insist on the four contiguous
+        // instructions so the skipped path contains only the polling loop.
+        let at = branch.machine.offset;
+        if branch.machine.words != [0xbf87_0004]
+            || back.machine.words != [0xbf84_fffc]
+            || back.machine.offset != at + 16
+            || code[at + 6..at + 8] != 0xbf8eu16.to_le_bytes()
+            || poll.exit
+                != (Exit::Branch {
+                    taken: wait,
+                    not_taken: section,
+                })
+        {
+            continue;
+        }
+        let Fields::Sop {
+            dst: Some(dst),
+            src,
+            ..
+        } = &add.fields
+        else {
+            continue;
+        };
+        let Fields::Sop { src: compared, .. } = &cmp.fields else {
+            continue;
+        };
+        if !matches!(
+            dst,
+            Operand::Scalar {
+                code: 0..=105,
+                dwords: 1
+            }
+        ) || add.name() != "s_add_i32"
+            || src.first() != Some(&Operand::Const(239))
+            || cmp.name() != "s_cmp_lt_u32"
+            || compared.get(1) != Some(dst)
+        {
+            continue;
+        }
+        // Raster order cannot supply the poll's scratch SGPR or SCC as
+        // shader data. Both must be overwritten before their next read.
+        let dead = |&(reg, _): &_| {
+            for i in &p.blocks[section].insts {
+                if i.read(reg).is_some() {
+                    return false;
+                }
+                if i.write(reg).is_some() {
+                    return true;
+                }
+            }
+            p.blocks[section].exit == Exit::End
+        };
+        if !add.writes.iter().chain(&cmp.writes).all(dead) {
+            continue;
+        }
+        code[at..at + 4].copy_from_slice(&0xbf82_0004u32.to_le_bytes());
     }
 }
 
@@ -262,12 +352,31 @@ pub enum StageIo {
         inputs: Vec<PsInput>,
         /// `SPI_PS_INPUT_ADDR`: which system values arrive in VGPRs.
         input_addr: u32,
+        /// `SPI_SHADER_PGM_RSRC2_PS`: user SGPR count and optional system inputs.
+        rsrc2: u32,
         /// `DB_SHADER_CONTROL`: depth export, kill.
         db_shader_control: u32,
         patches: Vec<ExportPatch>,
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+}
+
+impl StageIo {
+    /// LOAD_COLLISION_WAVEID enables primitive-ordered pixel shading.
+    pub(crate) fn pops(&self) -> bool {
+        matches!(self, Self::Ps { rsrc2, .. } if rsrc2 & (1 << 25) != 0)
+    }
+
+    /// On entry the primitive mask follows user data. Only infer undefined
+    /// registers for the plain layout, without optional hardware SGPRs.
+    pub(crate) fn ps_initialized_sgprs(&self) -> Option<u8> {
+        let Self::Ps { rsrc2, .. } = *self else {
+            return None;
+        };
+        let user = (rsrc2 >> 1 & 31) | (rsrc2 >> 22 & 32);
+        (rsrc2 & ((3 << 25) | 0xc1) == 0).then_some(user as u8 + 1)
+    }
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -543,6 +652,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         out.push(NativeProgram {
             stage,
             wave64: u32_at(record, RECORD_FLAGS)? & FLAG_WAVE32 == 0,
+            float_mode: record[RECORD_FLOAT_MODE],
             vgprs,
             layout,
             used,
@@ -606,6 +716,7 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     Ok(StageIo::Ps {
         inputs,
         input_addr: u32_at(data, PS_INPUT_ADDR)?,
+        rsrc2: u32_at(data, 0x128)?,
         db_shader_control: u32_at(data, PS_DB_SHADER_CONTROL)?,
         patches,
     })
@@ -717,6 +828,7 @@ mod tests {
             payload.extend_from_slice(&[0; 4]);
             payload.extend_from_slice(&flags.to_le_bytes());
             payload.resize(record as usize + RECORD_REGS, 0);
+            payload[record as usize + RECORD_FLOAT_MODE] = 0xe1;
             payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
             payload.extend_from_slice(&empty_stage_data());
             payload.extend_from_slice(code);
@@ -768,6 +880,7 @@ mod tests {
                 NativeProgram {
                     stage: HwStage::Vs,
                     wave64: true,
+                    float_mode: 0xe1,
                     vgprs: 28,
                     layout: vec![],
                     used: vec![],
@@ -780,12 +893,14 @@ mod tests {
                 NativeProgram {
                     stage: HwStage::Ps,
                     wave64: false,
+                    float_mode: 0xe1,
                     vgprs: 28,
                     layout: vec![],
                     used: vec![],
                     io: StageIo::Ps {
                         inputs: vec![],
                         input_addr: 0,
+                        rsrc2: 0,
                         db_shader_control: 0,
                         patches: vec![],
                     },

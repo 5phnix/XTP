@@ -153,6 +153,7 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const RASTER_ORDERED: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
     pub const BARYCENTRICS: u64 = 1 << 22;
@@ -187,6 +188,7 @@ pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
+    pub ordered_uavs: bool,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     /// A mesh shader's per-primitive outputs.
@@ -272,6 +274,7 @@ impl Shader {
                 res_ret,
             },
             pixel,
+            ordered_uavs: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
@@ -497,11 +500,19 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let mut kind = props.0;
+        if self.ordered_uavs && kind & 0x1000 != 0 {
+            self.flags |= flags::RASTER_ORDERED;
+            kind |= 0x2000; // DxilResourceProperties::IsROV
+        }
+        self.annotate(block, h, kind, props.1)
     }
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        one_mode_per_row(&mut self.inputs, self.pixel);
+        one_mode_per_row(&mut self.outputs, false);
+        one_mode_per_row(&mut self.prims, false);
         let threads = self
             .threads
             .map_or(String::new(), |[x, y, z]| format!("threads {x}x{y}x{z}, "));
@@ -755,6 +766,10 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
+        // Validator 1.6: the parts (ISG1, OSG1, PSV0 runtime info version
+        // 2) are written as it writes them. Validators 1.8 and 1.9 check
+        // such a module by its rules; declared 1.8, they want PSV0 version 3
+        // and other signature parts (they refuse every module otherwise).
         self.m.named_md("dx.valver", vec![version]);
         // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
@@ -784,6 +799,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::RASTER_ORDERED != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
@@ -885,5 +903,75 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Whether dxil.dll refuses the interpolation modes of row `row`: DXIL
+/// packs one mode per row, that of the row's first element (in element
+/// order), and refuses a later element of another mode, undefined (0)
+/// included, once the row has a defined one ("interpolation mode that
+/// differs from another element packed into the same row").
+fn row_conflict(elements: &[SigElement], row: u32) -> bool {
+    let mut mode = 0;
+    for e in elements.iter().filter(|e| e.row == Some(row)) {
+        if mode != 0 && e.interp != mode {
+            return true;
+        }
+        mode = e.interp;
+    }
+    false
+}
+
+/// Gives the elements packed into one row interpolation modes dxil.dll
+/// takes together, in the rows where it would refuse theirs
+/// ([`row_conflict`]).
+///
+/// Rows are the console's, packed by its own rules: an attribute row holds
+/// a flat channel beside interpolated ones (`v_interp_mov` reads P0 of any
+/// channel). The modes are DXC's defaults by type (`emit_for`), except for
+/// the pixel inputs a program reads, whose reads chose theirs. Those are
+/// kept (`reads`: the inputs of a pixel shader). The others do not change
+/// what a program computes (an output: the next stage's inputs say how it
+/// is interpolated; an input nothing reads), so they take the mode of the
+/// row's read elements; else constant where the row holds an integer (DXIL
+/// wants integers constant or undefined), else the mode of the row's first
+/// element. An integer beside a read element of another mode is made
+/// undefined, which dxil.dll takes only before the row's other elements;
+/// a row read with two modes is left as it is (dxil.dll refuses it: its
+/// reads would have to be lowered otherwise).
+pub(crate) fn one_mode_per_row(elements: &mut [SigElement], reads: bool) {
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let int = |e: &SigElement| e.comp != 9;
+    let kept = |e: &SigElement| reads && e.usage != 0 && e.interp != 0;
+    for row in rows {
+        if !row_conflict(elements, row) {
+            continue;
+        }
+        let in_row: Vec<usize> = (0..elements.len())
+            .filter(|&i| elements[i].row == Some(row))
+            .collect();
+        let mut read = in_row
+            .iter()
+            .map(|&i| &elements[i])
+            .filter(|e| kept(e))
+            .map(|e| e.interp);
+        let mode = match read.next() {
+            Some(m) if read.all(|r| r == m) => m,
+            Some(_) => continue,
+            None if in_row.iter().any(|&i| int(&elements[i])) => 1,
+            None => in_row
+                .iter()
+                .map(|&i| elements[i].interp)
+                .find(|&m| m != 0)
+                .unwrap_or(1),
+        };
+        for &i in &in_row {
+            let e = &mut elements[i];
+            if !kept(e) {
+                e.interp = if int(e) && mode != 1 { 0 } else { mode };
+            }
+        }
     }
 }

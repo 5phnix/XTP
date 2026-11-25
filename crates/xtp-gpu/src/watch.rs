@@ -716,6 +716,23 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     KernelWrite { id, pages }
 }
 
+/// For diagnostics (`XTP_FULL_REFRESH`): at how many other addresses the
+/// title shows the physical page of the 64 KiB block holding `at`, by the
+/// runtime's index of its views ([`set_alias_lookup`]); 0 without it. Read
+/// only; no guard lock is taken.
+pub(crate) fn views_of(at: usize) -> usize {
+    let Some(lookup) = ALIAS_LOOKUP.get() else {
+        return 0;
+    };
+    let block = at / BLOCK * BLOCK;
+    let mut pairs = Vec::new();
+    lookup(block..block + BLOCK, &mut pairs);
+    pairs
+        .iter()
+        .filter(|&&(a, other)| a == block && other != block)
+        .count()
+}
+
 /// Whether some block of view memory is guarded now, without the guards'
 /// lock (see `GUARDED`): if not, a write needs no [`writing`], and the
 /// runtime need not look up where the physical pages it wrote show.
@@ -1241,9 +1258,9 @@ pub(crate) mod tests {
     #[test]
     fn a_host_copy_through_one_view_takes_writes_through_another() {
         let test = "watch::tests::a_host_copy_through_one_view_takes_writes_through_another";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let _serial = serial();
         let section = section(1);
         let (a, b) = (view_of(section, 1), view_of(section, 1));

@@ -61,6 +61,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) depth_bounds: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -341,13 +342,20 @@ pub(crate) fn host() -> Option<&'static Host> {
 /// The host GPU, created on first use, or why there is none (tests print
 /// it when they skip: `crate::testgpu`).
 pub(crate) fn created() -> &'static Result<Host, String> {
-    HOST.get_or_init(|| {
+    let made = HOST.get_or_init(|| {
         let made = software().and_then(|software| create(software).map_err(|e| e.to_string()));
         if let Err(e) = &made {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
         }
         made
-    })
+    });
+    // In tests, the debug layer reports to `testgpu` from the device's first
+    // use on, whichever way a test reached it.
+    #[cfg(test)]
+    if let Ok(host) = made {
+        crate::testgpu::watch(host);
+    }
+    made
 }
 
 /// Whether the host device is made on the software adapter (WARP): in
@@ -420,6 +428,15 @@ fn create(software: bool) -> windows::core::Result<Host> {
             D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+        let depth_bounds = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS2,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+            && options.DepthBoundsTestSupported.as_bool();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -444,9 +461,14 @@ fn create(software: bool) -> windows::core::Result<Host> {
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         // Heaps for buffers, made from now on by threads of their own.
         buffers::start(&device);
-        tracing::info!(synchronous = sync_submit(), "host D3D12 device ready");
+        tracing::info!(
+            synchronous = sync_submit(),
+            depth_bounds,
+            "host D3D12 device ready"
+        );
         Ok(Host {
             device,
+            depth_bounds,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -663,6 +685,7 @@ pub(crate) struct HostList {
     /// Swapped for a fresh one when the list is reset while it runs.
     allocator: Mutex<ID3D12CommandAllocator>,
     pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) bounds_list: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -722,6 +745,8 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// next recording afresh without taking them from it.
 #[derive(Clone, Default)]
 struct Recorded {
+    #[cfg(feature = "diagnostics")]
+    dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
     #[cfg(feature = "diagnostics")]
     notes: std::sync::Arc<Vec<Note>>,
@@ -898,6 +923,8 @@ impl Drop for DynamicLease {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    #[cfg(feature = "diagnostics")]
+    dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1122,6 +1149,11 @@ impl Host {
             });
             Ok(HostList {
                 allocator: Mutex::new(allocator),
+                bounds_list: if self.depth_bounds {
+                    Some(list.cast()?)
+                } else {
+                    None
+                },
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -1247,6 +1279,17 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Copies of big title buffers in the card's memory
+        // (`shadow::cards_around`): what their CPU side took goes up first,
+        // and what the shaders wrote is found on the card after the lists,
+        // in the same submission. (With `XTP_FULL_REFRESH=<n>`, a
+        // diagnostic, every host copy is taken whole there first.)
+        let (cards_first, cards_last) = crate::shadow::cards_around(batch.submission);
+        if let Some(first) = cards_first {
+            lists.insert(0, Some(first));
+            firsts.iter_mut().skip(1).for_each(|at| *at += 1);
+        }
+        lists.extend(cards_last.map(Some));
         let (mut pending, touches) = Pending::of(runs, batch.submission);
         // Preparing, without the waits for earlier submissions (counted as
         // waiting).
@@ -1578,6 +1621,10 @@ impl Host {
         // from their snapshot, each byte once per submission, however many
         // dispatches declared ranges over it (the world's passes declare the
         // same big ranges dozens of times).
+        #[cfg(feature = "diagnostics")]
+        for sample in p.recorded.iter().flat_map(|r| r.dispatch_samples.iter()) {
+            sample.report();
+        }
         let copying = std::time::Instant::now();
         for (shadow, address, len) in &p.copied {
             let written = shadow.write_back(p.submission, *address, *len);
@@ -1734,6 +1781,13 @@ impl Host {
             }
         }
         text
+    }
+
+    /// The debug layer's message queue (`XTP_D3D12_DEBUG=1` in a
+    /// diagnostics build), for tests to fail on its errors.
+    #[cfg(test)]
+    pub(crate) fn message_queue(&self) -> Option<&ID3D12InfoQueue> {
+        self.messages.as_ref()
     }
 
     /// Moves the debug layer's messages into our log; returns the first
@@ -2145,6 +2199,8 @@ impl HostList {
     /// What a submission of the list keeps of its recording.
     fn recorded(&self) -> Recorded {
         Recorded {
+            #[cfg(feature = "diagnostics")]
+            dispatch_samples: self.deferred().dispatch_samples.clone(),
             pipelines: self
                 .pipelines
                 .lock()
@@ -2153,6 +2209,11 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             notes: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dispatch_sample(&self, sample: crate::indirect::Sample) {
+        std::sync::Arc::make_mut(&mut self.deferred().dispatch_samples).push(sample);
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -2902,6 +2963,12 @@ impl Meter {
             .take(frames, 8);
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(
+                pipelines = crate::pipeline::host::BOUNDED_PIPELINES.load(Ordering::Relaxed),
+                lists = crate::list::BOUNDED_LISTS.load(Ordering::Relaxed),
+                "title depth bounds"
+            );
             tracing::info!(
                 "{ab}{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -2922,6 +2989,8 @@ impl Meter {
                 longest_lists = title.longest_lists,
                 making = crate::pipeline::making()
             );
+            #[cfg(feature = "diagnostics")]
+            crate::indirect::log_counts();
             crate::device::log_frame();
             if let Some(pools) = buffers::summary() {
                 tracing::info!("buffer heaps: {pools}");

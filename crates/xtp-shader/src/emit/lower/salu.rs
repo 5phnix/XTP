@@ -11,6 +11,51 @@ use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Inst, Reg};
 
 impl<'a> Lower<'a> {
+    /// A write of MODE's float bits that a lowering reads (`s_round_mode`,
+    /// `s_denorm_mode`, `s_setreg*` of `HW_REG_MODE`; `ir::float_mode_field`):
+    /// the register's new value, which `v_cvt_f32_f64` reads. What the translation cannot follow (an f32
+    /// rounding other than to nearest even, a mode computed at run time
+    /// reaching float instructions, denormal modes that change, MODE bits
+    /// that differ by path at a conversion) is refused before lowering,
+    /// with its cause (`ir::float_modes`). The program's mode on entry is
+    /// the record's float mode byte (`native.rs`, record +0x44): 0xC0 in
+    /// every one of the 606 records read so far (nearest even, f32
+    /// denormals flushed, f16 and f64 ones kept), as FLOAT_MODE is; no
+    /// measurement on the console confirms the byte.
+    // shortcut: a 16- or 64-bit rounding other than to nearest even (BTP
+    // 6's pixel programs set round toward zero before 16-bit interpolation)
+    // is followed here but not applied: 16-bit results are rounded to
+    // nearest even, at most one f16 ulp from the console's. Those bits are
+    // not followed here (`ir::float_mode_field`: what no lowering reads);
+    // `ir::float_modes_of` counts the programs it concerns (the survey's
+    // `f16 rounding` line).
+    pub(super) fn set_float_mode(&mut self, inst: &Inst) -> Result<(), Why> {
+        let (offset, mask) =
+            crate::ir::float_mode_field(inst.name(), &inst.fields).ok_or("a float mode field")?;
+        let old = self.i32_of(inst.read(Reg::FloatMode).ok_or("the previous float mode")?)?;
+        let source = match &inst.fields {
+            Fields::Sopp { imm } => self.s.m.i32(u32::from(*imm)),
+            Fields::Sop { src, .. } => self.operand(inst, &src[0])?,
+            _ => unreachable!(),
+        };
+        let value =
+            if let (Some(a), Some(b)) = (self.s.m.int_value(old), self.s.m.int_value(source)) {
+                self.s
+                    .m
+                    .i32((a as u32 & !mask) | ((b as u32) << offset & mask))
+            } else {
+                let shift = self.s.m.i32(offset);
+                let bits = self.s.m.bin(self.cur, Bin::Shl, source, shift);
+                let keep = self.s.m.i32(!mask);
+                let mask = self.s.m.i32(mask);
+                let old = self.s.m.bin(self.cur, Bin::And, old, keep);
+                let bits = self.s.m.bin(self.cur, Bin::And, bits, mask);
+                self.s.m.bin(self.cur, Bin::Or, old, bits)
+            };
+        self.set(inst.write(Reg::FloatMode), Val::I32(value));
+        Ok(())
+    }
+
     pub(super) fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
         let Fields::Sop { dst, src, imm } = &inst.fields else {
             unreachable!()
@@ -35,8 +80,13 @@ impl<'a> Lower<'a> {
             "s_setreg_imm32_b32" | "s_setreg_b32" | "s_swappc_b64" | "s_version"
         ) || name.starts_with("s_waitcnt")
         {
-            // shortcut: the float MODE register is not modelled; s_swappc_b64 is the
-            // vertex fetch call, whose results arrive as inputs.
+            // A MODE write of bits a lowering reads is `set_float_mode`'s;
+            // `ir::float_modes` has checked every MODE write (refused, or
+            // the f16 and f64 rounding counted) before lowering.
+            // shortcut: the other hardware registers an `s_setreg*` writes
+            // (the scratch base, MODE's trap and debug enables) have nothing
+            // to set on the host; s_swappc_b64 is the vertex fetch call,
+            // whose results arrive as inputs.
             return Err("a register the emitter does not model");
         }
         if name == "s_getpc_b64" {
@@ -46,9 +96,12 @@ impl<'a> Lower<'a> {
             // counter is that instruction's offset in the code, high dword 0,
             // so a join of paths into tables in the code, or a first-lane read
             // of such an address, is the byte in the code (resource tracking
-            // gives either as the computed term, `Tracer::counts_code`).
-            // shortcut: a program that uses the counter otherwise, as data,
-            // computes with that offset where the console has the address.
+            // gives either as the computed term, `Tracer::counts_code`). A
+            // read as data uses the same space of code offsets, from the
+            // program's start, as the tables' addresses.
+            // shortcut: the console's counter is the instruction's absolute
+            // address; a program that compares it or keeps its high dword
+            // as a number reads an offset and 0 instead.
             let code = dst_code.ok_or("a missing operand")?;
             let at = self.s.m.i32(inst.machine.offset as u32 + 4);
             let z = self.s.m.i32(0);
@@ -562,6 +615,7 @@ mod tests {
         NativeProgram {
             stage: crate::HwStage::Cs,
             wave64: false,
+            float_mode: 0,
             vgprs: 8,
             layout: vec![RootParam {
                 root: RootType::Table,

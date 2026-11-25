@@ -69,6 +69,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_with_mode(body, 0)
+}
+
+pub(super) fn build_valu_cs_with_mode(body: &[u32], float_mode: u8) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -86,6 +90,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode,
         vgprs: 8,
         layout: vec![
             RootParam {
@@ -146,6 +151,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
+        group_base: lowered.group_base,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
@@ -174,7 +180,7 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
-fn run_cases(
+pub(super) fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),

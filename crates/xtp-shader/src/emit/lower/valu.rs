@@ -1,6 +1,6 @@
 //! Vector ALU: the dispatch of VOP1/VOP2/VOP3/VOPC and DPP, float and
 //! conversion operations and their helpers. Backlog S4 (non-fused
-//! `v_mad_f32`), S5 (f64), S3 (`v_cvt_f32_f64`), M1 (`v_cndmask_b32` on
+//! `v_mad_f32`), S5 (f64), M1 (`v_cndmask_b32` on
 //! an untracked mask).
 
 use super::mask::{LANE_MASK, MaskData};
@@ -13,6 +13,152 @@ use crate::ir::{EXEC, Inst, Reg};
 const TWO_PI: f32 = std::f32::consts::TAU;
 
 impl<'a> Lower<'a> {
+    /// Source double précision, avec l’expansion propre aux littéraux flottants.
+    fn double_words(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("a 64-bit source with SDWA or DPP");
+        }
+        let op = v.src.get(k).ok_or("a missing operand")?;
+        let zero = self.s.m.i32(0);
+        let (lo, mut hi) = match *op {
+            Operand::Vector { reg, .. } | Operand::Scalar { code: reg, .. }
+                if !matches!(
+                    op,
+                    Operand::Scalar {
+                        code: crate::gfx10::NULL,
+                        ..
+                    }
+                ) =>
+            {
+                let high_reg = if matches!(op, Operand::Vector { .. }) {
+                    Reg::V(reg + 1)
+                } else {
+                    Reg::S(reg + 1)
+                };
+                (
+                    self.operand(inst, op)?,
+                    self.i32_of(inst.read(high_reg).ok_or("an unread high word")?)?,
+                )
+            }
+            Operand::Literal(bits) => (zero, self.s.m.i32(bits)),
+            Operand::Const(248) => (self.s.m.i32(0x6dc9_c882), self.s.m.i32(0x3fc4_5f30)),
+            Operand::Const(n @ 240..=247) => {
+                let f = f32::from_bits(crate::resource::inline(n).unwrap());
+                (zero, self.s.m.i32((f64::from(f).to_bits() >> 32) as u32))
+            }
+            Operand::Const(193..=208) => (self.operand(inst, op)?, self.s.m.i32(u32::MAX)),
+            _ => (self.operand(inst, op)?, zero),
+        };
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.i32(0x7fff_ffff);
+            hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.i32(1 << 31);
+            hi = self.s.m.bin(self.cur, Bin::Xor, hi, sign);
+        }
+        Ok((lo, hi))
+    }
+
+    /// La conversion en entiers de 32 bits garde la charge utile des NaN et
+    /// applique MODE même sur un hôte dépourvu d’opérations en double précision.
+    fn narrow_double(&mut self, lo: V, hi: V, mode: V) -> V {
+        let c = self.cur;
+        let m = &mut self.s.m;
+        let imm = |m: &mut crate::emit::bitcode::Module, op, x, k| {
+            let k = m.i32(k);
+            m.bin(c, op, x, k)
+        };
+        let zero = m.i32(0);
+        let one = m.i32(1);
+        let sign = imm(m, Bin::And, hi, 0x8000_0000);
+        let mag = imm(m, Bin::And, hi, 0x7fff_ffff);
+        let exp = imm(m, Bin::LShr, mag, 20);
+        let fraction = imm(m, Bin::And, hi, 0x000f_ffff);
+
+        // 23 bits de fraction, puis trois bits pour l’arrondi. Le dernier
+        // vaut un si un des bits moins significatifs était non nul.
+        let top = imm(m, Bin::Shl, fraction, 6);
+        let low = imm(m, Bin::LShr, lo, 26);
+        let frac = m.bin(c, Bin::Or, top, low);
+        let lost = imm(m, Bin::And, lo, (1 << 26) - 1);
+        let sticky = m.cmp(c, pred::NE, lost, zero);
+        let sticky = m.cast(c, Cast::ZExt, sticky, self.s.t.i32);
+        let sig = m.bin(c, Bin::Or, frac, sticky);
+        let normal = m.cmp(c, pred::NE, exp, zero);
+        let implicit = m.i32(1 << 26);
+        let implicit = m.select(c, normal, implicit, zero);
+        let sig = m.bin(c, Bin::Or, sig, implicit);
+        let dp_denorm = imm(m, Bin::And, mode, 1 << 6);
+        let preserve = m.cmp(c, pred::NE, dp_denorm, zero);
+        let keep = m.bin(c, Bin::Or, normal, preserve);
+        let sig = m.select(c, keep, sig, zero);
+
+        // 897 = 1023 - 126, exposant du plus petit f32 normal en notation
+        // f64. Un décalage de 27 suffit pour ne garder que le bit collant.
+        let min_exp = m.i32(897);
+        let subnormal = m.cmp(c, pred::IULT, exp, min_exp);
+        let delta = m.bin(c, Bin::Sub, min_exp, exp);
+        let cap = m.i32(27);
+        let large = m.cmp(c, pred::IUGT, delta, cap);
+        let shift = m.select(c, large, cap, delta);
+        let shift = m.select(c, subnormal, shift, zero);
+        let shifted = m.bin(c, Bin::LShr, sig, shift);
+        let back = m.bin(c, Bin::Shl, shifted, shift);
+        let sticky = m.cmp(c, pred::NE, back, sig);
+        let sticky = m.cast(c, Cast::ZExt, sticky, self.s.t.i32);
+        let aligned = m.bin(c, Bin::Or, shifted, sticky);
+        let mant = imm(m, Bin::LShr, aligned, 3);
+        let tail = imm(m, Bin::And, aligned, 7);
+
+        let odd = imm(m, Bin::And, mant, 1);
+        let tail_odd = m.bin(c, Bin::Or, tail, odd);
+        let half = m.i32(4);
+        let nearest = m.cmp(c, pred::IUGT, tail_odd, half);
+        let round = imm(m, Bin::And, mode, 3);
+        let even = m.cmp(c, pred::EQ, round, zero);
+        let negative = m.cmp(c, pred::NE, sign, zero);
+        let two = m.i32(2);
+        let away_mode = m.select(c, negative, two, one);
+        let away = m.cmp(c, pred::EQ, round, away_mode);
+        let inexact = m.cmp(c, pred::NE, tail, zero);
+        let directed = m.bin(c, Bin::And, away, inexact);
+        let increment = m.select(c, even, nearest, directed);
+        let increment = m.cast(c, Cast::ZExt, increment, self.s.t.i32);
+        let rounded = m.bin(c, Bin::Add, mant, increment);
+        let exp32 = m.bin(c, Bin::Sub, exp, min_exp);
+        let exp32 = m.select(c, subnormal, zero, exp32);
+        let bias = imm(m, Bin::Shl, exp32, 23);
+        let finite = m.bin(c, Bin::Add, bias, rounded);
+
+        let inf = m.i32(0x7f80_0000);
+        let max = m.i32(0x7f7f_ffff);
+        let to_inf = m.bin(c, Bin::Or, even, away);
+        let overflow = m.select(c, to_inf, inf, max);
+        let max_exp = m.i32(1023 + 127);
+        let too_large = m.cmp(c, pred::IUGT, exp, max_exp);
+        let finite = m.select(c, too_large, overflow, finite);
+        let min_normal = m.i32(0x0080_0000);
+        let tiny = m.cmp(c, pred::IULT, finite, min_normal);
+        let sp_denorm = imm(m, Bin::And, mode, 1 << 5);
+        let flush = m.cmp(c, pred::EQ, sp_denorm, zero);
+        let flush = m.bin(c, Bin::And, flush, tiny);
+        let finite = m.select(c, flush, zero, finite);
+
+        let payload = imm(m, Bin::LShr, frac, 3);
+        let nan = imm(m, Bin::Or, payload, 0x7fc0_0000);
+        let fraction_bits = m.bin(c, Bin::Or, fraction, lo);
+        let is_nan = m.cmp(c, pred::NE, fraction_bits, zero);
+        let special = m.select(c, is_nan, nan, inf);
+        let exp_all = m.i32(0x7ff);
+        let all_ones = m.cmp(c, pred::EQ, exp, exp_all);
+        let bits = m.select(c, all_ones, special, finite);
+        m.bin(c, Bin::Or, bits, sign)
+    }
+
     pub(super) fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -68,6 +214,20 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_cvt_f32_f64" => {
+                let (lo, hi) = self.double_words(inst, 0)?;
+                let mode = self.i32_of(
+                    inst.read(Reg::FloatMode)
+                        .ok_or("a conversion's float mode")?,
+                )?;
+                let bits = self.narrow_double(lo, hi, mode);
+                if v.omod == 0 && !v.clamp {
+                    int(self, bits)
+                } else {
+                    let result = self.as_float(bits);
+                    float(self, result)
+                }
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;

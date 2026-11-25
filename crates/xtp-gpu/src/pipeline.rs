@@ -238,6 +238,20 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn dispatch_hash(this: This) -> Option<String> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let shader = p
+        .shaders
+        .iter()
+        .find(|s| matches!(s.stage, "mesh" | "compute" | "vertex"))
+        .or_else(|| p.shaders.first())?;
+    Some(shader.hash.clone())
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
@@ -263,6 +277,20 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// The compute program of a title pipeline, made or not (`None` for a null
+/// pipeline or a graphics one): how [`crate::rt_standin`] tells a dropped
+/// dispatch's program, which has no host pipeline to ask.
+#[cfg(windows)]
+pub(crate) fn compute_shader<'a>(this: This) -> Option<&'a Shader> {
+    if this.is_null() {
+        return None;
+    }
+    match pipeline(this).shaders.as_slice() {
+        [shader] if shader.stage == "compute" => Some(shader),
+        _ => None,
+    }
 }
 
 /// Host pipelines queued and not made yet.
@@ -417,13 +445,20 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
-    #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] graphics: Option<(Box<host::GraphicsState>, Option<record::Stream>)>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = {
+        let (graphics, stream) = graphics.unzip();
+        Arc::new(make::Pending::new(
+            shaders.clone(),
+            graphics,
+            stream.flatten(),
+        ))
+    };
     #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
@@ -548,6 +583,9 @@ pub(crate) extern "system" fn create_stream(
     let mut shaders = Vec::new();
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
+    // The subobjects as the title gave them, kept for the precook.
+    #[cfg(windows)]
+    let mut kept = record::Capture::new();
     let mut at = 0;
     while at + 8 <= desc.size {
         // SAFETY: inside the stream the title passes.
@@ -558,6 +596,8 @@ pub(crate) extern "system" fn create_stream(
                 at,
                 "pipeline subobject of unknown size; the rest is ignored"
             );
+            #[cfg(windows)]
+            kept.unknown();
             break;
         };
         if let Some(stage) = stage {
@@ -566,16 +606,17 @@ pub(crate) extern "system" fn create_stream(
             shaders.extend(copy(stage, code));
         }
         #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
+        // SAFETY: a whole subobject of this kind and size lies at `at`.
         unsafe {
-            graphics.read(kind, desc.stream.add(at))
+            graphics.read(kind, desc.stream.add(at));
+            kept.take(kind, desc.stream.add(at), size);
         };
         at += size;
     }
     hand_out(
         shaders,
         #[cfg(windows)]
-        Some(Box::new(graphics)),
+        Some((Box::new(graphics), kept.finish())),
         iid,
         out,
     )
@@ -606,6 +647,8 @@ mod library;
 mod make;
 #[cfg(windows)]
 pub mod precook;
+#[cfg(windows)]
+mod record;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

@@ -2,11 +2,11 @@
 //! the console address, root descriptors, per-lane and waterfall forms)
 //! and the used-resource entry that says its kind. Backlog R4 (per-lane
 //! descriptor long tail), R3 (strides from `used_kind`, else from the
-//! host's runtime stride table: [`Lower::runtime_view`]).
+//! host's runtime stride table: [`Lower::stride_entry`]).
 
 use super::{Lower, Val, Why};
 use crate::emit::StrideEntry;
-use crate::emit::bitcode::{Attr, Bin, V, pred};
+use crate::emit::bitcode::{Attr, Bin, V};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Reg};
 use crate::native::{ResourceType, RootType, UsedResource};
@@ -169,18 +169,24 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                // Portage de VIctory #1477, commit 2286e038, par geiyiliyabumo.
+                // Le filtre de chaque registre statique est fixé dès le premier accès.
+                let comparison = props.0 & 0x8000 != 0;
+                let slot = self.samplers.iter().enumerate().position(|(n, w)| {
+                    *w == words && (self.s.cmp_samplers >> n & 1 != 0) == comparison
+                });
+                let n = match slot {
                     Some(n) => n,
                     None => {
+                        let n = self.samplers.len();
+                        if n >= u64::BITS as usize {
+                            return Err("more than 64 immediate sampler slots");
+                        }
                         self.samplers.push(words);
-                        self.samplers.len() - 1
+                        self.s.cmp_samplers |= u64::from(comparison) << n;
+                        n
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -354,59 +360,6 @@ impl<'a> Lower<'a> {
             self.entries.insert(k, e);
         }
         Ok(e)
-    }
-
-    /// Where an access of `width` bytes at byte `off` of element `index` of
-    /// `src`'s buffer goes through the runtime stride table: the entry for
-    /// its slot, the byte in the raw view that entry names, and whether the
-    /// access is made at all. The byte is `index * stride + off` past the
-    /// raw view's bias; `off` alone for a raw view (as the console reads a
-    /// descriptor of no stride) and for an access by offset alone (no
-    /// `index`: the view's bytes from its start).
-    ///
-    /// It is made with the console's range checks, and only then: through
-    /// a buffer view (an entry of zeros names none), and by element at an
-    /// element below the view's count and inside the element (`off + width
-    /// <= stride`), by offset inside the view's bytes. Where they fail the
-    /// console reads 0 and drops writes; here the access is not made, so
-    /// neither the bytes the raw view holds before the view (its bias) nor
-    /// the next element are reached, and `index * stride` cannot wrap (the
-    /// count times the stride fits the view).
-    pub(super) fn runtime_view(
-        &mut self,
-        src: &Source,
-        index: Option<V>,
-        off: V,
-        width: u32,
-    ) -> Result<(Entry, V, V), Why> {
-        let e = self.stride_entry(src)?;
-        let c = self.cur;
-        let (zero, four, width) = (self.s.m.i32(0), self.s.m.i32(4), self.s.m.i32(width));
-        let end = self.s.m.bin(c, Bin::Add, off, width);
-        let raw = self.s.m.cmp(c, pred::EQ, e.stride, zero);
-        // The view's bytes: its count of elements (of dwords for a raw view;
-        // the host keeps the product inside the raw view, under 2^30). `off`
-        // below them first, so `off + width` cannot wrap.
-        let element = self.s.m.select(c, raw, four, e.stride);
-        let size = self.s.m.bin(c, Bin::Mul, e.count, element);
-        let starts = self.s.m.cmp(c, pred::IULT, off, size);
-        let ends = self.s.m.cmp(c, pred::IULE, end, size);
-        let by_byte = self.s.m.bin(c, Bin::And, starts, ends);
-        let Some(index) = index else {
-            let byte = self.s.m.bin(c, Bin::Add, off, e.bias);
-            return Ok((e, byte, by_byte));
-        };
-        // Structured or typed: the element, then the bytes in it.
-        let in_count = self.s.m.cmp(c, pred::IULT, index, e.count);
-        let starts = self.s.m.cmp(c, pred::IULT, off, e.stride);
-        let ends = self.s.m.cmp(c, pred::IULE, end, e.stride);
-        let inside = self.s.m.bin(c, Bin::And, starts, ends);
-        let by_element = self.s.m.bin(c, Bin::And, in_count, inside);
-        let valid = self.s.m.select(c, raw, by_byte, by_element);
-        let at = self.s.m.bin(c, Bin::Mul, index, e.stride);
-        let at = self.s.m.bin(c, Bin::Add, at, off);
-        let byte = self.s.m.bin(c, Bin::Add, at, e.bias);
-        Ok((e, byte, valid))
     }
 
     /// Whether accesses of `src`'s buffer by offset alone go through the

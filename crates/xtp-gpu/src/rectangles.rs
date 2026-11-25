@@ -967,6 +967,7 @@ pub(crate) fn expand(
     vertices: &[(u64, u32, u32); 32],
     (args, arguments, stride, max): (&Arc<Shadow>, u64, u32, u32),
     count: Option<(&Arc<Shadow>, u64)>,
+    stats: Option<u64>,
 ) -> Result<Prepared, &'static str> {
     if stride < 16 || !stride.is_multiple_of(4) || !args.gpu(arguments).is_multiple_of(4) {
         return Err("rectangle records short or not 4-byte aligned");
@@ -1061,7 +1062,14 @@ pub(crate) fn expand(
         s.shadow.refresh(list, s.address, u64::from(s.size));
     }
     let src_args = args.gpu(arguments);
-    if !crate::indirect::clamp_uav(list, src_args, (0, stride, max)) {
+    if !crate::indirect::rewrite(
+        list,
+        src_args,
+        (0, stride, max),
+        count.map(|(s, at)| s.gpu(at)),
+        None,
+        stats,
+    ) {
         return Err("not bounded (no clamp)");
     }
 
@@ -1289,9 +1297,9 @@ mod tests {
     #[test]
     fn the_rectangle_expander_builds() {
         let test = "rectangles::tests::the_rectangle_expander_builds";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         assert!(shaders().is_some());
     }
 
@@ -1543,9 +1551,9 @@ mod tests {
     fn expansion_on_the_gpu_matches_the_cpus() {
         let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let test = "rectangles::tests::expansion_on_the_gpu_matches_the_cpus";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let source = rectangle_vertices();
         let (args, args_copy) = title_records(&[
             [6, 1, 0, 0],
@@ -1570,6 +1578,7 @@ mod tests {
                 &bound,
                 (&args_copy, args.address(), 16, 5),
                 Some((&count_copy, count.address())),
+                None,
             )
             .expect("expanded")
         };
@@ -1622,9 +1631,9 @@ mod tests {
     fn a_buffer_of_three_vertices_draws_its_rectangle() {
         let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let test = "rectangles::tests::a_buffer_of_three_vertices_draws_its_rectangle";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let source = rectangle_vertices()[..3 * STRIDE].to_vec();
         let (vertices, copy) = title_bytes(3 * STRIDE, &source);
         // SAFETY: a live buffer.
@@ -1645,6 +1654,7 @@ mod tests {
             &inputs,
             &bound,
             (&args_copy, args.address(), 16, 1),
+            None,
             None,
         )
         .expect("expanded");
@@ -1673,9 +1683,9 @@ mod tests {
     fn records_without_vertex_inputs_keep_their_start() {
         let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let test = "rectangles::tests::records_without_vertex_inputs_keep_their_start";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let (args, args_copy) = title_records(&[
             [6, 2, 9, 1],
             [4, 1, 30, 0],
@@ -1698,6 +1708,7 @@ mod tests {
             &[(0, 0, 0); 32],
             (&args_copy, args.address(), 16, 4),
             Some((&count_copy, count.address())),
+            None,
         )
         .expect("expanded");
         assert!(prepared.views.is_empty());
@@ -1762,9 +1773,9 @@ mod tests {
     fn unaligned_slots_with_padded_strides_expand_as_on_the_cpu() {
         let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let test = "rectangles::tests::unaligned_slots_with_padded_strides_expand_as_on_the_cpu";
-        if crate::testgpu::device(test).is_none() {
+        let Some(_gpu) = crate::testgpu::device(test) else {
             return;
-        }
+        };
         let (a, b) = (slot_vertices(0, 6), slot_vertices(2, 6));
         let mut bytes = vec![0u8; 256];
         bytes[2..2 + a.len()].copy_from_slice(&a);
@@ -1783,6 +1794,7 @@ mod tests {
             &inputs,
             &bound,
             (&args_copy, args.address(), 16, 2),
+            None,
             None,
         )
         .expect("expanded");

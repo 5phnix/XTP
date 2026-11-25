@@ -31,6 +31,7 @@ fn build(words: &[u32]) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
+        float_mode: 0xc0,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -73,6 +74,7 @@ fn build(words: &[u32]) -> HostShader {
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
+        group_base: lowered.group_base,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
@@ -216,6 +218,7 @@ fn mesh(words: &[u32]) -> Result<(), &'static str> {
     let native = NativeProgram {
         stage: HwStage::Ms,
         wave64: true,
+        float_mode: 0xc0,
         vgprs: 24,
         layout: vec![constant()],
         used: Vec::new(),
@@ -261,6 +264,7 @@ fn compute(words: &[u32]) -> Result<(), &'static str> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
+        float_mode: 0xc0,
         vgprs: 24,
         layout: vec![constant()],
         used: Vec::new(),

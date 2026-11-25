@@ -903,9 +903,10 @@ mod tests {
     /// the outer command's end (three dispatches, 192).
     #[test]
     fn each_marked_command_counts_what_it_ran() {
-        let Some(host) = device("pipestats::tests::each_marked_command_counts_what_it_ran") else {
+        let Some(gpu) = device("pipestats::tests::each_marked_command_counts_what_it_ran") else {
             return;
         };
+        let host = gpu.host();
         if std::env::var_os("XTP_GPU_TIMESTAMPS").is_some() {
             // The timestamps' hooks would query these commands as well.
             return;
@@ -961,9 +962,10 @@ mod tests {
         if std::env::var_os("XTP_GPU_PIPESTATS").is_some() {
             return;
         }
-        let Some(host) = device("pipestats::tests::nothing_is_asked_when_off") else {
+        let Some(gpu) = device("pipestats::tests::nothing_is_asked_when_off") else {
             return;
         };
+        let host = gpu.host();
         let list = host.new_list().unwrap();
         let has_entry = || {
             LISTS

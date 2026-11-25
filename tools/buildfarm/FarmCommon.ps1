@@ -74,6 +74,11 @@ function Get-FarmConfig {
         maxSendFileMB    = 20
         stateDir         = $null
         tempDir          = $null
+        # Shader surveys (Copy-FarmPack.ps1, Invoke-FarmSurvey.ps1).
+        packSource       = $null   # gs://.../shaders.rpf; default: the cloud configuration's bucket
+        packSigner       = $null   # service account that signs the pack's download URL; default <prefix>-pack
+        surveyDir        = $null   # where surveys come back; default farm-surveys next to stateDir
+        surveyMinutes    = 90      # longest survey job, its build included
     }
     foreach ($k in $defaults.Keys) {
         if (-not (Test-FarmProperty $c $k) -or $null -eq $c.$k) {
@@ -85,6 +90,8 @@ function Get-FarmConfig {
     $full = (Resolve-Path -LiteralPath $Path).Path
     if (-not $c.stateDir) { $c.stateDir = Split-Path -Parent $full }
     if (-not $c.tempDir) { $c.tempDir = Join-Path $c.stateDir 'tmp' }
+    if (-not $c.packSigner) { $c.packSigner = "$($c.prefix)-pack" }
+    if (-not $c.surveyDir) { $c.surveyDir = Join-Path (Split-Path -Parent $c.stateDir) 'farm-surveys' }
     foreach ($vm in @($c.vms)) {
         if (-not (Test-FarmProperty $vm 'machineType') -or -not $vm.machineType) {
             $vm | Add-Member -Force -NotePropertyName machineType -NotePropertyValue $c.machineType
@@ -237,7 +244,8 @@ function Stop-FarmProcessTree([int] $ProcessId) {
 }
 
 # Runs a program. Without -Capture or -StdoutFile its stdout and stderr are
-# this process's own (output streams straight through).
+# this process's own (output streams straight through); -StderrFile sends
+# its stderr to a file too.
 # -TimeoutSeconds: stop its whole tree when it runs longer. -StallSeconds:
 # stop it when it takes no stdin for that long (a stuck connection: ssh's own
 # keepalives cannot fire while it is blocked on its proxy). Either way the
@@ -250,11 +258,13 @@ function Invoke-FarmProcess {
         [string] $WorkingDirectory = '',
         [string] $StdinFile = '',
         [string] $StdoutFile = '',
+        [string] $StderrFile = '',
         [switch] $NoStdin,
         [switch] $Capture,
         [int] $TimeoutSeconds = 0,
         [int] $StallSeconds = 0
     )
+    if ($Capture) { $StderrFile = '' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
     $psi.Arguments = (@($ArgumentList | ForEach-Object { ConvertTo-FarmArg $_ }) -join ' ')
@@ -269,7 +279,7 @@ function Invoke-FarmProcess {
     }
     $psi.RedirectStandardInput = [bool] $StdinFile -or $NoStdin
     $psi.RedirectStandardOutput = $Capture -or [bool] $StdoutFile
-    $psi.RedirectStandardError = [bool] $Capture
+    $psi.RedirectStandardError = $Capture -or [bool] $StderrFile
     if ($Capture) {
         $psi.StandardOutputEncoding = New-Object Text.UTF8Encoding $false
         $psi.StandardErrorEncoding = New-Object Text.UTF8Encoding $false
@@ -277,17 +287,23 @@ function Invoke-FarmProcess {
     $deadline = $(if ($TimeoutSeconds -gt 0) { (Get-Date).AddSeconds($TimeoutSeconds) } else { [datetime]::MaxValue })
     $p = [System.Diagnostics.Process]::Start($psi)
     $fs = $null
+    $efs = $null
     $timedOut = $false
     try {
         $outTask = $null
         $errTask = $null
         $copyTask = $null
+        $errCopyTask = $null
         if ($Capture) {
             $outTask = $p.StandardOutput.ReadToEndAsync()
             $errTask = $p.StandardError.ReadToEndAsync()
         } elseif ($StdoutFile) {
             $fs = [IO.File]::Create($StdoutFile)
             $copyTask = $p.StandardOutput.BaseStream.CopyToAsync($fs)
+        }
+        if ($StderrFile) {
+            $efs = [IO.File]::Create($StderrFile)
+            $errCopyTask = $p.StandardError.BaseStream.CopyToAsync($efs)
         }
         if ($psi.RedirectStandardInput) {
             if ($StdinFile) {
@@ -327,6 +343,7 @@ function Invoke-FarmProcess {
         }
         $p.WaitForExit()
         if ($copyTask) { try { $copyTask.Wait() } catch { }; $fs.Dispose(); $fs = $null }
+        if ($errCopyTask) { try { $errCopyTask.Wait() } catch { }; $efs.Dispose(); $efs = $null }
         $code = $(if ($timedOut) { 255 } else { $p.ExitCode })
         $r = [pscustomobject]@{ ExitCode = $code; Out = ''; Err = ''; TimedOut = $timedOut }
         if ($Capture) {
@@ -336,6 +353,7 @@ function Invoke-FarmProcess {
         $r
     } finally {
         if ($fs) { $fs.Dispose() }
+        if ($efs) { $efs.Dispose() }
         $p.Dispose()
     }
 }
@@ -774,6 +792,7 @@ function Invoke-FarmSsh {
         [Parameter(Mandatory)] [string] $Command,
         [string] $StdinFile = '',
         [string] $StdoutFile = '',
+        [string] $StderrFile = '',
         [switch] $Capture,
         [int] $ConnectTimeout = 60,
         # Whole command; short commands get 3 minutes. 0: no limit.
@@ -787,7 +806,7 @@ function Invoke-FarmSsh {
     $a = @('-F', $p.Config, '-T', '-o', "ConnectTimeout=$ConnectTimeout", '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4')
     if (-not $StdinFile) { $a += '-n' }
     $a += @($Vm, $Command)
-    $r = Invoke-FarmProcess -FilePath (Get-FarmSshExe) -ArgumentList $a -StdinFile $StdinFile -StdoutFile $StdoutFile -Capture:$Capture `
+    $r = Invoke-FarmProcess -FilePath (Get-FarmSshExe) -ArgumentList $a -StdinFile $StdinFile -StdoutFile $StdoutFile -StderrFile $StderrFile -Capture:$Capture `
         -NoStdin:(-not $StdinFile) -Environment (Get-FarmGcloudEnv) -TimeoutSeconds $TimeoutSeconds -StallSeconds $StallSeconds
     if ($r.TimedOut) {
         $what = $(if ($Command.Length -gt 60) { $Command.Substring(0, 60) + '...' } else { $Command })
@@ -1090,8 +1109,10 @@ function Remove-FarmLease([string] $Path) {
 # VM) for one job, and takes a lease on them. Prefers a running VM, the one
 # holding this worktree's slot, the least loaded and the cheapest; starts a
 # stopped VM when every running one is busy and the budget allows it.
+# -Spread (shader surveys, which use every core for minutes): an idle running
+# VM first, else a stopped one if the budget allows it, else the least loaded.
 function Select-FarmTarget {
-    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Worktree, [string[]] $Exclude = @())
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Worktree, [string[]] $Exclude = @(), [switch] $Spread)
     Use-FarmLock -Config $Config -Script {
         $inst = @(Get-FarmInstances -Config $Config)
         $leases = @(Get-FarmLeases -Config $Config)
@@ -1122,8 +1143,13 @@ function Select-FarmTarget {
             }
         }
         $order = @(@{ Expression = 'mine'; Descending = $true }, @{ Expression = 'load'; Ascending = $true }, @{ Expression = 'rate'; Ascending = $true })
+        $maxLoad = [int] $Config.maxBuildsPerVm
+        if ($Spread) {
+            $order = @(@{ Expression = 'load'; Ascending = $true }, @{ Expression = 'mine'; Descending = $true }, @{ Expression = 'rate'; Ascending = $true })
+            $maxLoad = 1
+        }
         $running = @($cands | Where-Object { $_.running })
-        $pick = $running | Where-Object { $_.load -lt [int] $Config.maxBuildsPerVm } | Sort-Object -Property $order | Select-Object -First 1
+        $pick = $running | Where-Object { $_.load -lt $maxLoad } | Sort-Object -Property $order | Select-Object -First 1
         $start = $false
         $budget = $null
         if (-not $pick) {
@@ -1366,6 +1392,11 @@ function Receive-FarmFiles {
 # commands, streams their output and returns cargo's exit code. Retries on
 # another VM when one is reclaimed or unreachable. 75: the farm could not
 # take the job.
+# For shader surveys (Invoke-FarmSurvey.ps1): -Commit builds that commit
+# instead of the worktree's snapshot; -SlotKey takes the slots of that key
+# instead of the worktree's; -Spread prefers an idle VM; -StdoutFile and
+# -StderrFile take the job's output; -Info (a hashtable) gets the VM and
+# slot used.
 function Invoke-FarmJob {
     param(
         [Parameter(Mandatory)] $Config,
@@ -1374,10 +1405,17 @@ function Invoke-FarmJob {
         [string[]] $Labels = @(),
         [switch] $CollectBinaries,
         [string[]] $Fetch = @(),
-        [switch] $FetchOnly
+        [switch] $FetchOnly,
+        [string] $Commit = '',
+        [string] $SlotKey = '',
+        [switch] $Spread,
+        [string] $StdoutFile = '',
+        [string] $StderrFile = '',
+        [hashtable] $Info = @{}
     )
     $t0 = Get-Date
     $wt = Get-FarmWorktree $WorkDir
+    $key = $(if ($SlotKey) { $SlotKey } else { $wt.Top })
     if (-not (Test-Path -LiteralPath (Get-FarmSshPaths $Config).Config) -or -not (Test-Path -LiteralPath (Get-FarmSshPaths $Config).Key)) {
         Initialize-FarmSsh $Config | Out-Null
     }
@@ -1390,7 +1428,11 @@ function Invoke-FarmJob {
         if (-not $inst -or -not (Test-FarmRunning $inst)) { Write-FarmMessage "$($s.vm), which holds $($wt.Name)'s last build, is $($inst.status): build again to fetch"; return 1 }
         return (Receive-FarmFiles -Config $Config -Vm $s.vm -Slot $s.slot -Worktree $wt -Paths $Fetch)
     }
-    $snap = New-FarmSnapshot $Config $wt
+    if ($Commit) {
+        $snap = [pscustomobject]@{ Target = $Commit; Head = $Commit; Dirty = $false; Changed = @() }
+    } else {
+        $snap = New-FarmSnapshot $Config $wt
+    }
     $agent = Get-FarmAgentVersion
     $envs = Get-FarmForwardEnv
     $stepList = @()
@@ -1412,7 +1454,7 @@ function Invoke-FarmJob {
             Write-FarmLog $Config "gave up on a job of $($wt.Name) after $jobMinutes minutes"
             return $script:ExitUnavailable
         }
-        $sel = Select-FarmTarget -Config $Config -Worktree $wt.Top -Exclude $exclude
+        $sel = Select-FarmTarget -Config $Config -Worktree $key -Exclude $exclude -Spread:$Spread
         if (-not $sel.ok) {
             Write-FarmMessage "unavailable: $($sel.reason)"
             Write-FarmLog $Config "unavailable for $($wt.Name): $($sel.reason)"
@@ -1448,9 +1490,11 @@ function Invoke-FarmJob {
                     worktree    = $wt.Name
                 }
                 Write-FarmMessage ('{0} slot {1}: {2}, sent {3:0} KB' -f $sel.vm, $sel.slot, $what, ([double] $bundle.Size / 1KB))
+                $Info['vm'] = $sel.vm
+                $Info['slot'] = $sel.slot
                 $cmd = 'powershell -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -File C:\farm\bin\farm-run.ps1 ' + (ConvertTo-FarmBase64 $req)
                 $tRun = Get-Date
-                $run = Invoke-FarmSsh -Config $Config -Vm $sel.vm -Command $cmd -StdinFile $bundle.Path `
+                $run = Invoke-FarmSsh -Config $Config -Vm $sel.vm -Command $cmd -StdinFile $bundle.Path -StdoutFile $StdoutFile -StderrFile $StderrFile `
                     -TimeoutSeconds ([int] [Math]::Max(60, ($giveUp - (Get-Date)).TotalSeconds)) -StallSeconds 60
                 $code = $run.ExitCode
                 if ($bundle.Path) { Remove-Item -Force -LiteralPath $bundle.Path -ErrorAction SilentlyContinue }

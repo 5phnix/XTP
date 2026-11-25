@@ -3,9 +3,11 @@
 //! pipeline made into the pipeline library, before a session, so that the
 //! first session after a translator change does not wait for them in the
 //! world. Each container is made ready as the title's first use of it
-//! makes it, through the same calls (`xtp_gpu::pipeline::precook`); the
-//! graphics and mesh pipelines also need the title's graphics state, which
-//! no run records, so they are still made in the session.
+//! makes it, through the same calls (`xtp_gpu::pipeline::precook`). Then
+//! the graphics and mesh pipelines earlier sessions made, which also need
+//! the title's graphics state: sessions keep their descriptions beside the
+//! pipeline library (`recorded-pipelines.bin`), and the precook makes each
+//! one again into the library, as the session did.
 //!
 //! - The pack: as `xtp shader-survey` takes it (the path given, else
 //!   `XTP_SAMPLE_SHADERS`, else `shaders.rpf` in the game folder). A
@@ -21,10 +23,25 @@
 //! - Up to date: after a complete pass, a note beside the cache
 //!   (`shaders/precook.txt`) says for which translation key (the
 //!   translator, its settings and the host's wave sizes), pack and whether
-//!   with pipelines. A precook that finds its own note stops there, in
-//!   seconds (the pack is read and hashed, the host device made); `--force`
-//!   passes again. The host rejects the pipeline library after a driver
-//!   update, which the note does not see: `--force` then.
+//!   with pipelines, and with pipelines what they came from: the file of
+//!   kept descriptions (its BLAKE3) and the library file (its size). A
+//!   precook that finds its own note stops there, in seconds (the pack and
+//!   the kept descriptions are read and hashed, the host device made); one
+//!   whose note differs only by the kept descriptions makes those alone;
+//!   one whose library file is gone or smaller than noted passes again,
+//!   as does `--force`. The host rejects the pipeline library after a
+//!   driver update, which the note does not see: `--force` then.
+//! - Generations: after a translator change (the note's key is another),
+//!   or once the library file passes `LIBRARY_REBUILD_BYTES`, the pass
+//!   makes the library a new generation, which holds what it makes and
+//!   nothing of the translators before (`xtp_gpu::pipeline::precook`).
+//! - A pass whose library is not saved, or whose kept descriptions are not
+//!   read, writes no note.
+//! - The kept pipelines take at most `XTP_PRECOOK_SECONDS` (default
+//!   [`REPLAY_SECONDS`]): those not started by then are left to the
+//!   session, and the note is not written, so the next precook goes on
+//!   (what this one made, it finds in the library). A pipeline whose
+//!   shaders no longer translate is refused at once, as in a session.
 //! - `--no-wait` starts at once, without the lock (tests, or when you know
 //!   the machine is free).
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -62,8 +79,13 @@ pub struct Options {
 
 /// The note's name, in the shader cache's folder.
 const NOTE: &str = "precook.txt";
-/// The note's first line; another version of the note is no note.
-const NOTE_FORMAT: &str = "xtp precook 1";
+/// The note's first line; another version of the note is no note. Since
+/// version 2 a pass with pipelines makes the kept graphics and mesh ones
+/// too; since version 3 the note says what they came from.
+const NOTE_FORMAT: &str = "xtp precook 3";
+/// The time the kept graphics and mesh pipelines may take by default, in
+/// seconds (`XTP_PRECOOK_SECONDS`).
+const REPLAY_SECONDS: u64 = 900;
 /// How often a waiting precook looks again, and a running one looks for a
 /// title that started anyway.
 const LOOK_EVERY: Duration = Duration::from_secs(5);
@@ -130,19 +152,62 @@ fn precook(o: Options) -> Result<()> {
     // not need. Its check stays a matter of seconds whatever the cache
     // holds (2026-11-25: one that opened the cache first took 85 s on the
     // PC, the same check right after a pass 1 s).
+    // The pipeline cache beside the shader cache, where `use_shader_cache`
+    // keeps it (set here first: the note reads it before the shader cache
+    // is opened).
+    xtp_gpu::pipeline::use_pipeline_cache(shaders.with_file_name("pipelines"));
     let note_path = shaders.join(NOTE);
+    let cache = |pipelines: bool| -> Result<Option<Cache>> {
+        pipelines
+            .then(gpu::cache)
+            .transpose()
+            .map(|c| {
+                c.map(|c| Cache {
+                    recorded: c.recorded,
+                    library: c.library,
+                })
+            })
+            .map_err(anyhow::Error::msg)
+    };
     let note = Note {
         key: ready.key.clone(),
         pack: pack.to_hex().to_string(),
-        pipelines: o.pipelines,
+        pipelines: cache(o.pipelines)?,
     };
-    let found = std::fs::read_to_string(&note_path).ok();
-    if !o.force && found.as_deref().is_some_and(|text| note.covered_by(text)) {
+    let found = std::fs::read_to_string(&note_path)
+        .ok()
+        .and_then(|text| Note::parse(&text));
+    let plan = if o.force {
+        Plan::Whole
+    } else {
+        note.plan(found.as_ref())
+    };
+    if plan == Plan::Nothing {
         println!(
-            "up to date   for this translator, its settings and this pack ({:.1} s; --force passes again)",
+            "up to date   for this translator, its settings, this pack and the kept pipelines ({:.1} s; --force passes again)",
             started.elapsed().as_secs_f64()
         );
         return Ok(());
+    }
+    let library_bytes = note.pipelines.as_ref().map_or(0, |c| c.library);
+    let rebuild = o.pipelines
+        && (found.as_ref().is_some_and(|f| f.key != note.key)
+            || library_bytes > gpu::LIBRARY_REBUILD_BYTES);
+    // A new generation holds what this pass makes: all of it.
+    let plan = if rebuild { Plan::Whole } else { plan };
+    if rebuild {
+        anyhow::ensure!(
+            gpu::rebuild_library(),
+            "the pipeline library was opened before its new generation"
+        );
+        println!(
+            "library      a new generation ({}; {library_bytes} bytes before)",
+            if found.as_ref().is_some_and(|f| f.key != note.key) {
+                "another translator"
+            } else {
+                "past its bound"
+            }
+        );
     }
     let opening = Instant::now();
     xtp_hle::modules::d3d12x::use_shader_cache(shaders.clone());
@@ -156,31 +221,60 @@ fn precook(o: Options) -> Result<()> {
         .jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
         .max(1);
-    let pass = pass(
-        &data,
-        o.pipelines,
-        threads,
-        o.wait.then_some(&machine),
-        |c, s, p| gpu::container(c, s, p).into(),
-    );
-    gpu::finish();
+    let pass = match plan {
+        Plan::Whole => pass(
+            &data,
+            o.pipelines,
+            threads,
+            o.wait.then_some(&machine),
+            |c, s, p| gpu::container(c, s, p).into(),
+        ),
+        // The containers are as the note says: the kept pipelines alone.
+        Plan::Nothing | Plan::Kept => Pass { items: Vec::new() },
+    };
     let counts = gpu::counts();
+    let replay = o
+        .pipelines
+        .then(|| replay(threads, o.wait.then_some(&machine), replay_bound()));
+    let saved = gpu::finish();
     let seconds = started.elapsed().as_secs_f64();
-    // The note only after a whole pass: refusals are answers kept in the
-    // cache too, so a pass with some is whole.
-    write_atomically(&note_path, note.text().as_bytes())
-        .with_context(|| format!("writing {}", note_path.display()))?;
     print!(
         "{}",
         report(
             &pass,
+            plan,
             &counts,
+            replay.as_ref(),
             o.pipelines,
             threads,
             seconds,
             gpu::refusals()
         )
     );
+    // The note only after a whole pass: refusals are answers kept in the
+    // cache too, so a pass with some is whole; one whose kept pipelines
+    // ran out of time or were not read is not, nor one whose library was
+    // not saved. What it came from is read again: the precook rewrites the
+    // kept descriptions past their bound, and saves the library.
+    let whole = replay
+        .as_ref()
+        .is_none_or(|r| r.left == 0 && r.error.is_none());
+    match (&saved, whole) {
+        (Err(e), _) => {
+            println!("note         not written: the pipeline library was not saved ({e})")
+        }
+        (Ok(()), false) => {
+            println!("note         not written: the kept pipelines are not all made")
+        }
+        (Ok(()), true) => {
+            let done = Note {
+                pipelines: cache(o.pipelines)?,
+                ..note
+            };
+            write_atomically(&note_path, done.text().as_bytes())
+                .with_context(|| format!("writing {}", note_path.display()))?;
+        }
+    }
     if let Some(out) = &o.list {
         std::fs::write(out, list(&pass)).with_context(|| format!("writing {}", out.display()))?;
         println!("list         {}", out.display());
@@ -205,32 +299,98 @@ fn below_normal() {
 }
 
 /// What the note says: a complete pass was made for this key and pack,
-/// with or without pipelines.
+/// with pipelines from this cache (the kept descriptions and the library
+/// as they were after it), or without.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Note {
     key: String,
     pack: String,
-    pipelines: bool,
+    pipelines: Option<Cache>,
+}
+
+/// What the pipelines came from (`xtp_gpu::pipeline::precook::Cache`):
+/// the BLAKE3 of the file of kept descriptions (`none` without one) and
+/// the library file's size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cache {
+    recorded: String,
+    library: u64,
+}
+
+/// What a precook has to do, by its note ([`Note::plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    Nothing,
+    /// The kept descriptions changed: those alone.
+    Kept,
+    Whole,
 }
 
 impl Note {
     fn text(&self) -> String {
-        format!(
-            "{NOTE_FORMAT}\nkey {}\npack {}\npipelines {}\n",
-            self.key,
-            self.pack,
-            if self.pipelines { "yes" } else { "no" }
-        )
+        let mut o = format!("{NOTE_FORMAT}\nkey {}\npack {}\n", self.key, self.pack);
+        match &self.pipelines {
+            Some(c) => {
+                let _ = write!(
+                    o,
+                    "pipelines yes\nrecorded {}\nlibrary {}\n",
+                    c.recorded, c.library
+                );
+            }
+            None => o.push_str("pipelines no\n"),
+        }
+        o
     }
 
-    /// Whether a note reading `text` covers this pass: the same key and
-    /// pack, and pipelines if this pass makes them.
-    fn covered_by(&self, text: &str) -> bool {
-        let with = Note {
-            pipelines: true,
-            ..self.clone()
+    /// The note a file reading `text` holds; `None` if it is none (another
+    /// version, damage).
+    fn parse(text: &str) -> Option<Note> {
+        let mut lines = text.lines();
+        (lines.next()? == NOTE_FORMAT).then_some(())?;
+        let mut field = |name: &str| {
+            lines
+                .next()?
+                .strip_prefix(name)?
+                .strip_prefix(' ')
+                .map(str::to_owned)
         };
-        text == with.text() || (!self.pipelines && text == self.text())
+        let key = field("key")?;
+        let pack = field("pack")?;
+        let pipelines = match field("pipelines")?.as_str() {
+            "no" => None,
+            "yes" => Some(Cache {
+                recorded: field("recorded")?,
+                library: field("library")?.parse().ok()?,
+            }),
+            _ => return None,
+        };
+        let note = Note {
+            key,
+            pack,
+            pipelines,
+        };
+        (note.text() == text).then_some(note)
+    }
+
+    /// What this pass has to do after the one `found` notes: nothing if it
+    /// was for the same key and pack, with pipelines if this one makes
+    /// them, from the same kept descriptions and a library file at least
+    /// as large (a session adds to it); the kept descriptions alone if only
+    /// they differ; else everything.
+    fn plan(&self, found: Option<&Note>) -> Plan {
+        let Some(found) = found else {
+            return Plan::Whole;
+        };
+        if found.key != self.key || found.pack != self.pack {
+            return Plan::Whole;
+        }
+        match (&self.pipelines, &found.pipelines) {
+            (None, _) => Plan::Nothing,
+            (Some(_), None) => Plan::Whole,
+            (Some(now), Some(then)) if now.library < then.library => Plan::Whole,
+            (Some(now), Some(then)) if now.recorded != then.recorded => Plan::Kept,
+            (Some(_), Some(_)) => Plan::Nothing,
+        }
     }
 }
 
@@ -304,14 +464,40 @@ where
     C: Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Outcome + Sync,
 {
     let sources = sources(data);
-    let total = sources.len();
+    let seen = Mutex::new(std::collections::HashSet::new());
+    let mut items = parallel(sources.len(), threads, machine, "records", None, |i| {
+        item(&sources[i], &seen, pipelines, &cook)
+    });
+    // In the pack's order (`sources`'s), whichever thread took each.
+    items.sort_by_key(|&(i, _)| i);
+    let mut items: Vec<Item> = items.into_iter().map(|(_, item)| item).collect();
+    first_takes_the_outcome(&mut items);
+    Pass { items }
+}
+
+/// Runs `work` on each of `0..total` on `threads` threads, and gives what
+/// each gave, by index, in no order. Says how far it is ("precook: <n> of
+/// <total> <what>") every [`PROGRESS_EVERY`], pauses while `machine` says
+/// a title runs, and starts nothing after `until`: the indices not run are
+/// not in what it gives.
+fn parallel<T, W>(
+    total: usize,
+    threads: usize,
+    machine: Option<&Machine>,
+    what: &str,
+    until: Option<Instant>,
+    work: W,
+) -> Vec<(usize, T)>
+where
+    T: Send,
+    W: Fn(usize) -> T + Sync,
+{
     let next = AtomicUsize::new(0);
     let finished = AtomicUsize::new(0);
-    let seen = Mutex::new(std::collections::HashSet::new());
     let paused = AtomicBool::new(false);
     let done = AtomicBool::new(false);
     let started = Instant::now();
-    let mut items: Vec<(usize, Item)> = std::thread::scope(|s| {
+    std::thread::scope(|s| {
         // Says how far it is, and pauses the workers while a title runs.
         s.spawn(|| {
             let mut said = Instant::now();
@@ -335,7 +521,7 @@ where
                     said = Instant::now();
                     let n = finished.load(Ordering::Relaxed);
                     println!(
-                        "precook: {n} of {total} records ({:.0} %), {:.0} s",
+                        "precook: {n} of {total} {what} ({:.0} %), {:.0} s",
                         n as f64 * 100.0 / total.max(1) as f64,
                         started.elapsed().as_secs_f64()
                     );
@@ -350,11 +536,14 @@ where
                         while paused.load(Ordering::Relaxed) {
                             std::thread::sleep(Duration::from_millis(500));
                         }
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(source) = sources.get(i) else {
+                        if until.is_some_and(|t| Instant::now() >= t) {
                             break;
-                        };
-                        out.push((i, item(source, &seen, pipelines, &cook)));
+                        }
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= total {
+                            break;
+                        }
+                        out.push((i, work(i)));
                         finished.fetch_add(1, Ordering::Relaxed);
                     }
                     out
@@ -367,12 +556,143 @@ where
             .collect();
         done.store(true, Ordering::Relaxed);
         items
-    });
-    // In the pack's order (`sources`'s), whichever thread took each.
-    items.sort_by_key(|&(i, _)| i);
-    let mut items: Vec<Item> = items.into_iter().map(|(_, item)| item).collect();
-    first_takes_the_outcome(&mut items);
-    Pass { items }
+    })
+}
+
+/// The time the kept pipelines may take: `XTP_PRECOOK_SECONDS`, else
+/// [`REPLAY_SECONDS`].
+fn replay_bound() -> Duration {
+    let seconds = match std::env::var("XTP_PRECOOK_SECONDS") {
+        Err(_) => REPLAY_SECONDS,
+        Ok(text) => text.trim().parse().unwrap_or_else(|_| {
+            eprintln!("precook: XTP_PRECOOK_SECONDS expects seconds, not {text:?}");
+            REPLAY_SECONDS
+        }),
+    };
+    Duration::from_secs(seconds)
+}
+
+/// What became of the graphics and mesh pipelines sessions kept.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Replay {
+    /// The kept pipelines to make (each once).
+    kept: usize,
+    ready: usize,
+    untranslated: usize,
+    refused: usize,
+    /// Translator bugs (counted, not fatal).
+    panicked: usize,
+    /// Not started: the time bound ran out first.
+    left: usize,
+    /// Kept but not made again: entries that do not read back, pipelines
+    /// whose containers are not kept, repeats.
+    damaged: usize,
+    missing: usize,
+    repeated: usize,
+    /// Host pipelines made, and found in the library, meanwhile.
+    made: u64,
+    loaded: u64,
+    seconds: f64,
+    bound: Duration,
+    /// Where they are kept, and why they could not be read.
+    path: Option<PathBuf>,
+    error: Option<String>,
+    /// The file was rewritten past its bound: its size before, and the
+    /// descriptions that went.
+    compacted: Option<(u64, usize)>,
+}
+
+impl Replay {
+    /// Counts the `outcomes` of the kept pipelines made (each at most
+    /// once); the others were left.
+    fn count(&mut self, outcomes: &[Replayed]) {
+        for o in outcomes {
+            match o {
+                Replayed::Ready => self.ready += 1,
+                Replayed::Untranslated => self.untranslated += 1,
+                Replayed::Refused => self.refused += 1,
+                Replayed::Panicked => self.panicked += 1,
+            }
+        }
+        self.left = self.kept.saturating_sub(outcomes.len());
+    }
+}
+
+/// A kept pipeline's outcome, as `xtp_gpu::pipeline::precook` says it, or
+/// the translator's panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Replayed {
+    Ready,
+    Untranslated,
+    Refused,
+    Panicked,
+}
+
+#[cfg(windows)]
+impl From<xtp_gpu::pipeline::precook::Replayed> for Replayed {
+    fn from(o: xtp_gpu::pipeline::precook::Replayed) -> Replayed {
+        use xtp_gpu::pipeline::precook::Replayed as Gpu;
+        match o {
+            Gpu::Ready => Replayed::Ready,
+            Gpu::Untranslated => Replayed::Untranslated,
+            Gpu::Refused => Replayed::Refused,
+        }
+    }
+}
+
+/// Makes the graphics and mesh pipelines sessions kept into the library,
+/// on `threads` threads, for `bound` at most, pausing while `machine` says
+/// a title runs.
+#[cfg(windows)]
+fn replay(threads: usize, machine: Option<&Machine>, bound: Duration) -> Replay {
+    use xtp_gpu::pipeline::precook as gpu;
+
+    let started = Instant::now();
+    let before = gpu::counts();
+    let mut out = Replay {
+        bound,
+        ..Replay::default()
+    };
+    let recorded = match gpu::recorded() {
+        Ok(recorded) => recorded,
+        Err(e) => {
+            out.error = Some(e);
+            return out;
+        }
+    };
+    out.kept = recorded.len();
+    out.damaged = recorded.damaged;
+    out.missing = recorded.missing;
+    out.repeated = recorded.repeated;
+    out.path = recorded.path.clone();
+    out.compacted = recorded.compacted;
+    if !recorded.is_empty() {
+        println!(
+            "precook: {} graphics and mesh pipelines kept by sessions ({} s at most)",
+            recorded.len(),
+            bound.as_secs()
+        );
+    }
+    let outcomes: Vec<Replayed> = parallel(
+        recorded.len(),
+        threads,
+        machine,
+        "kept pipelines",
+        Some(started + bound),
+        |i| match catch_unwind(AssertUnwindSafe(|| gpu::replay(&recorded, i))) {
+            Ok(o) => o.into(),
+            Err(_) => Replayed::Panicked,
+        },
+    )
+    .into_iter()
+    .map(|(_, o)| o)
+    .collect();
+    out.count(&outcomes);
+    let after = gpu::counts();
+    out.made = after.made - before.made;
+    out.loaded = after.loaded - before.loaded;
+    out.seconds = started.elapsed().as_secs_f64();
+    out
 }
 
 /// Gives a repeated container's outcome to its first record in pack order:
@@ -515,9 +835,12 @@ impl Totals {
 /// The text report: what was translated and found, refused and made, and
 /// the time.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn report(
     pass: &Pass,
+    plan: Plan,
     counts: &xtp_gpu::pipeline::precook::Counts,
+    replay: Option<&Replay>,
     pipelines: bool,
     threads: usize,
     seconds: f64,
@@ -525,6 +848,20 @@ fn report(
 ) -> String {
     let t = Totals::of(pass);
     let mut o = String::new();
+    if plan != Plan::Whole {
+        let _ = writeln!(
+            o,
+            "containers   as the note says (this translator and pack): only the kept pipelines changed"
+        );
+        if let Some(r) = replay {
+            o.push_str(&replay_lines(r));
+        }
+        let _ = writeln!(
+            o,
+            "time         {seconds:.1} s on {threads} threads at below-normal priority"
+        );
+        return o;
+    }
     let _ = writeln!(
         o,
         "containers   {} in {} records ({} repeated{})",
@@ -561,6 +898,9 @@ fn report(
             "compute      {} programs: {} host pipelines made, {} from the library, {} without one",
             t.compute, counts.made, counts.loaded, t.no_pipeline
         );
+        if let Some(r) = replay {
+            o.push_str(&replay_lines(r));
+        }
         if let Some(r) = refusals {
             let _ = writeln!(o, "  {r}");
         }
@@ -571,6 +911,55 @@ fn report(
         o,
         "time         {seconds:.1} s on {threads} threads at below-normal priority"
     );
+    o
+}
+
+/// The report's lines on the kept graphics and mesh pipelines: how many,
+/// what became of them, what was not made and why.
+fn replay_lines(r: &Replay) -> String {
+    let mut o = String::new();
+    if let Some(e) = &r.error {
+        let _ = writeln!(o, "graphics     0 kept pipelines (not read: {e})");
+        return o;
+    }
+    let _ = writeln!(
+        o,
+        "graphics     {} kept pipelines: {} ready ({} host pipelines made, {} from the library), \
+         {} with shaders that do not translate, {} refused, in {:.1} s",
+        r.kept, r.ready, r.made, r.loaded, r.untranslated, r.refused, r.seconds
+    );
+    if r.panicked > 0 {
+        let _ = writeln!(o, "  {:>7}  panicked (translator bugs)", r.panicked);
+    }
+    if r.left > 0 {
+        let _ = writeln!(
+            o,
+            "  {:>7}  not made: {} s passed (XTP_PRECOOK_SECONDS); the next precook goes on",
+            r.left,
+            r.bound.as_secs()
+        );
+    }
+    if let Some((before, dropped)) = r.compacted {
+        let _ = writeln!(
+            o,
+            "  {dropped:>7}  dropped when the file was rewritten ({before} bytes before; the oldest go first)"
+        );
+    }
+    for (n, what) in [
+        (r.missing, "without their containers"),
+        (r.damaged, "that do not read back"),
+        (
+            r.repeated,
+            "repeated (descriptions this build reads as one pipeline)",
+        ),
+    ] {
+        if n > 0 {
+            let _ = writeln!(o, "  {n:>7}  {what}");
+        }
+    }
+    if let Some(path) = &r.path {
+        let _ = writeln!(o, "  kept in {}", path.display());
+    }
     o
 }
 
@@ -724,37 +1113,63 @@ fn alive(pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// The note covers its key, pack and pipelines: a pass with pipelines
+    /// covers one without; new kept descriptions are made alone; a library
+    /// file gone or smaller, another key or pack, or no note, pass again.
     #[test]
     fn the_note_covers_its_key_pack_and_pipelines() {
+        fn cache(recorded: &str, library: u64) -> Option<Cache> {
+            Some(Cache {
+                recorded: recorded.into(),
+                library,
+            })
+        }
         let note = Note {
             key: "ab".repeat(32),
             pack: "cd".repeat(32),
-            pipelines: true,
+            pipelines: cache("01", 1000),
         };
         let text = note.text();
-        assert!(text.starts_with("xtp precook 1\n"));
-        assert!(note.covered_by(&text));
-        let other_key = Note {
-            key: "ef".repeat(32),
-            ..note.clone()
+        assert!(text.starts_with("xtp precook 3\n"));
+        assert_eq!(Note::parse(&text), Some(note.clone()));
+        assert_eq!(note.plan(Some(&note)), Plan::Nothing);
+        assert_eq!(note.plan(None), Plan::Whole);
+        let with = |change: fn(&mut Note)| {
+            let mut n = note.clone();
+            change(&mut n);
+            n
         };
-        assert!(!other_key.covered_by(&text), "another translator or target");
-        let other_pack = Note {
-            pack: "00".repeat(32),
-            ..note.clone()
-        };
-        assert!(!other_pack.covered_by(&text), "another pack");
+        let other_key = with(|n| n.key = "ef".repeat(32));
+        assert_eq!(
+            other_key.plan(Some(&note)),
+            Plan::Whole,
+            "another translator or target"
+        );
+        let other_pack = with(|n| n.pack = "00".repeat(32));
+        assert_eq!(other_pack.plan(Some(&note)), Plan::Whole, "another pack");
+        // A session kept more descriptions, and made them into the library.
+        let more = with(|n| n.pipelines = cache("02", 1500));
+        assert_eq!(more.plan(Some(&note)), Plan::Kept);
+        // A session added to the library alone (compute pipelines).
+        let larger = with(|n| n.pipelines = cache("01", 1500));
+        assert_eq!(larger.plan(Some(&note)), Plan::Nothing);
+        // The library file removed, or another one in its place.
+        let gone = with(|n| n.pipelines = cache("01", 0));
+        assert_eq!(gone.plan(Some(&note)), Plan::Whole);
         // A pass without pipelines is covered by one with them, not the
         // other way round.
-        let without = Note {
-            pipelines: false,
-            ..note.clone()
-        };
-        assert!(without.covered_by(&text));
-        assert!(!note.covered_by(&without.text()));
-        assert!(without.covered_by(&without.text()));
-        assert!(!note.covered_by(""));
-        assert!(!note.covered_by(&text.replace("precook 1", "precook 0")));
+        let without = with(|n| n.pipelines = None);
+        assert_eq!(without.plan(Some(&note)), Plan::Nothing);
+        assert_eq!(note.plan(Some(&without)), Plan::Whole);
+        assert_eq!(Note::parse(&without.text()), Some(without.clone()));
+        // Not notes.
+        assert_eq!(Note::parse(""), None);
+        assert_eq!(Note::parse(&text.replace("precook 3", "precook 2")), None);
+        assert_eq!(
+            Note::parse(&text.replace("library 1000", "library many")),
+            None
+        );
+        assert_eq!(Note::parse(&format!("{text}more\n")), None);
     }
 
     #[test]
