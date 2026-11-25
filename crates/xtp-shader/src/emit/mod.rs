@@ -259,8 +259,6 @@ pub struct HostShader {
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
     pub user_data: Vec<UserData>,
-    /// Premier des trois dwords de la base de groupe, si le programme lit SV_GroupID.
-    pub group_base: Option<u32>,
     /// Immediate samplers: the four sampler words of `s<n>`.
     pub samplers: Vec<[u32; 4]>,
     /// The same samplers decoded, `s<n>` at position n: the static sampler
@@ -330,8 +328,7 @@ impl HostShader {
             .map(|u| u.index + 1)
             .max()
             .unwrap_or(0);
-        n.max(self.group_base.map_or(0, |base| base + 3))
-            .next_multiple_of(4)
+        n.next_multiple_of(4)
     }
 
     /// The wave size the shader requires (`WaveSize`), as its `PSV0`
@@ -649,7 +646,6 @@ pub fn emit_for(
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
-        group_base: l.group_base,
         user_data: l.user_data,
         static_samplers: l
             .samplers
@@ -949,7 +945,6 @@ mod tests {
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
-            group_base: None,
             user_data: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
@@ -962,7 +957,6 @@ mod tests {
             std::env::var(var).ok().map(|p| super::HostShader {
                 stage,
                 dxil: std::fs::read(p).unwrap(),
-                group_base: None,
                 user_data: Vec::new(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),

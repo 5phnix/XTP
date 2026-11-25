@@ -967,7 +967,6 @@ pub(crate) fn expand(
     vertices: &[(u64, u32, u32); 32],
     (args, arguments, stride, max): (&Arc<Shadow>, u64, u32, u32),
     count: Option<(&Arc<Shadow>, u64)>,
-    stats: Option<u64>,
 ) -> Result<Prepared, &'static str> {
     if stride < 16 || !stride.is_multiple_of(4) || !args.gpu(arguments).is_multiple_of(4) {
         return Err("rectangle records short or not 4-byte aligned");
@@ -1062,14 +1061,7 @@ pub(crate) fn expand(
         s.shadow.refresh(list, s.address, u64::from(s.size));
     }
     let src_args = args.gpu(arguments);
-    if !crate::indirect::rewrite(
-        list,
-        src_args,
-        (0, stride, max),
-        count.map(|(s, at)| s.gpu(at)),
-        None,
-        stats,
-    ) {
+    if !crate::indirect::clamp_uav(list, src_args, (0, stride, max)) {
         return Err("not bounded (no clamp)");
     }
 
@@ -1578,7 +1570,6 @@ mod tests {
                 &bound,
                 (&args_copy, args.address(), 16, 5),
                 Some((&count_copy, count.address())),
-                None,
             )
             .expect("expanded")
         };
@@ -1655,7 +1646,6 @@ mod tests {
             &bound,
             (&args_copy, args.address(), 16, 1),
             None,
-            None,
         )
         .expect("expanded");
         let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
@@ -1708,7 +1698,6 @@ mod tests {
             &[(0, 0, 0); 32],
             (&args_copy, args.address(), 16, 4),
             Some((&count_copy, count.address())),
-            None,
         )
         .expect("expanded");
         assert!(prepared.views.is_empty());
@@ -1794,7 +1783,6 @@ mod tests {
             &inputs,
             &bound,
             (&args_copy, args.address(), 16, 2),
-            None,
             None,
         )
         .expect("expanded");
