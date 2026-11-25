@@ -44,6 +44,11 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+Pixel shaders with wave operations take shader model 6.7
+(`WaveOpsIncludeHelperLanes`, so that helper lanes take part in them as they
+do on the console). A GPU without 6.7 refuses those pixel shaders, and their
+draws are skipped.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase

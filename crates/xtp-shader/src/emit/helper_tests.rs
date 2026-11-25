@@ -215,8 +215,9 @@ fn waterfall() -> Vec<u32> {
 /// keeps EXEC on entry, which holds only the covered pixels, and takes the
 /// helper lanes out of EXEC with it before the loop (as the console
 /// compiler does before exports and stores); whole-quad mode comes back
-/// after the loop, for the quad reads.
-fn ff1_waterfall(covered_only: bool) -> Vec<u32> {
+/// after the loop, for the quad reads. With `passes`, v3 is then the
+/// number of passes the lane's loop ran (s10), not its pass.
+fn ff1_waterfall(covered_only: bool, passes: bool) -> Vec<u32> {
     let mut w = Vec::new();
     if covered_only {
         w.push(sop1(0x04, 20, EXEC_LO)); // s_mov_b64 s[20:21], exec
@@ -246,6 +247,9 @@ fn ff1_waterfall(covered_only: bool) -> Vec<u32> {
     let done = w.len();
     w[to_done] = sopp(0x04, done as i32 - to_done as i32 - 1);
     w.push(sop1(0x04, EXEC_LO, 18)); // s_mov_b64 exec, s[18:19]
+    if passes {
+        w.push(vop1(0x06, 3, 10)); // v_cvt_f32_u32 v3, s10
+    }
     quads_of_v3(&mut w);
     w
 }
@@ -678,12 +682,12 @@ fn the_helper_lane_programs_decode_as_written() {
         ]
     };
     want(
-        &wave64(ff1_waterfall(false)),
+        &wave64(ff1_waterfall(false, false)),
         &[(0, "s_wqm_b64 exec, exec")],
     );
-    want(&wave64(ff1_waterfall(false)), &loop64(7));
+    want(&wave64(ff1_waterfall(false, false)), &loop64(7));
     want(
-        &wave64(ff1_waterfall(true)),
+        &wave64(ff1_waterfall(true, false)),
         &[
             (0, "s_mov_b64 s[20:21], exec"),
             (1, "s_wqm_b64 exec, exec"),
@@ -691,7 +695,7 @@ fn the_helper_lane_programs_decode_as_written() {
             (8, "s_and_b64 exec, exec, s[20:21]"),
         ],
     );
-    want(&wave64(ff1_waterfall(true)), &loop64(9));
+    want(&wave64(ff1_waterfall(true, false)), &loop64(9));
     want(
         &wave32(section_max()),
         &[
@@ -734,11 +738,11 @@ fn pixel_lane_reads_are_quad_reads_or_wave_operations_with_helper_lanes() {
         assert!(!ops.contains("isHelperLane"), "{name}: {ops}");
         assert!(!ops.contains("waveReadLaneAt"), "{name}: {ops}");
     }
-    let (_, ops) = translate(&wave64(ff1_waterfall(false)));
+    let (_, ops) = translate(&wave64(ff1_waterfall(false, false)));
     assert!(ops.contains("waveActiveBallot"), "{ops}");
     assert!(ops.contains("waveReadLaneAt"), "{ops}");
     assert!(!ops.contains("isHelperLane"), "{ops}");
-    let (_, ops) = translate(&wave64(ff1_waterfall(true)));
+    let (_, ops) = translate(&wave64(ff1_waterfall(true, false)));
     assert!(ops.contains("waveActiveBallot"), "{ops}");
     assert!(ops.contains("isHelperLane"), "{ops}");
     let (_, ops) = translate(&wave32(section_max()));
@@ -756,8 +760,12 @@ fn only_pixel_programs_with_wave_operations_take_sm_6_7() {
         ("swizzle", wave32(swizzles()), (6, 6)),
         ("first_lane", wave32(first_lane()), (6, 7)),
         ("waterfall", wave32(waterfall()), (6, 7)),
-        ("ff1_waterfall", wave64(ff1_waterfall(false)), (6, 7)),
-        ("covered_waterfall", wave64(ff1_waterfall(true)), (6, 7)),
+        ("ff1_waterfall", wave64(ff1_waterfall(false, false)), (6, 7)),
+        (
+            "covered_waterfall",
+            wave64(ff1_waterfall(true, false)),
+            (6, 7),
+        ),
         ("section_max", wave32(section_max()), (6, 7)),
     ];
     let wrong: Vec<String> = cases
@@ -887,7 +895,7 @@ fn a_waterfall_loop_serves_helper_lanes() {
 /// none, and the helper lanes ran to the loop's limit.)
 #[test]
 fn an_ff1_waterfall_serves_helper_lanes() {
-    draw_everywhere(&wave64(ff1_waterfall(false)), 0, |t| {
+    draw_everywhere(&wave64(ff1_waterfall(false, false)), 0, |t| {
         waterfall_order(t, true)
     });
 }
@@ -895,12 +903,29 @@ fn an_ff1_waterfall_serves_helper_lanes() {
 /// Once the program has taken its helper lanes out of EXEC, its ballots
 /// leave them out, as the console's: the `s_ff1` waterfall serves the
 /// covered pixels, one per pass in lane order, no helper lane between two
-/// of them. (A helper lane, which the console does not run there, sees a
-/// wave of its own and leaves in its first pass.)
+/// of them. A helper lane, which the console does not run there, sees a
+/// wave of its own and leaves in its first pass: none runs the loop to its
+/// bound (as each did when ballots left helper lanes out and nothing else
+/// changed, a TDR risk with the translator's loop limit).
 #[test]
 fn an_ff1_waterfall_without_helper_lanes_serves_covered_pixels_only() {
-    draw_everywhere(&wave64(ff1_waterfall(true)), 0, |t| {
+    draw_everywhere(&wave64(ff1_waterfall(true, false)), 0, |t| {
         waterfall_order(t, false)
+    });
+    draw_everywhere(&wave64(ff1_waterfall(true, true)), 0, |t| {
+        let mut wrong = Vec::new();
+        for (x, y) in t.pixels() {
+            let px = t.at(x, y);
+            for (n, (nx, ny), what) in neighbours(x, y) {
+                if !t.covered(nx, ny) && !(1.0..BOUND as f32).contains(&px[n]) {
+                    wrong.push(format!(
+                        "({x}, {y}) {what} (helper): {} passes, the bound is {BOUND}",
+                        px[n]
+                    ));
+                }
+            }
+        }
+        wrong
     });
 }
 
