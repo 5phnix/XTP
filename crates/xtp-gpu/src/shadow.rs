@@ -4285,9 +4285,10 @@ mod tests {
     fn a_full_refresh_takes_every_copy_whole_but_what_gpu_work_writes() {
         const CHILD: &str = "XTP_SHADOW_TEST_FULL_REFRESH";
         let test = "shadow::tests::a_full_refresh_takes_every_copy_whole_but_what_gpu_work_writes";
-        let Some(_gpu) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         if std::env::var_os(CHILD).is_none() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([test, "--exact", "--nocapture", "--test-threads=1"])
@@ -4318,8 +4319,8 @@ mod tests {
         // page is left out by the caller, not by the count.
         assert_eq!(shadow.missed(window, window + 4 * PAGE), 4 * PAGE);
         // GPU work in flight writes the second page.
-        let gpu = submission();
-        shadow.writing(gpu, window + PAGE, PAGE);
+        let writing = submission();
+        shadow.writing(writing, window + PAGE, PAGE);
         let next = submission();
         assert!(refresh_due(next));
         refresh_everything(next);
@@ -4341,12 +4342,11 @@ mod tests {
             "what the GPU writes, left alone"
         );
         assert!(all(window + 2 * PAGE, 2 * PAGE, 0x11), "taken again");
-        assert_eq!(shadow.copy_back(gpu, window + PAGE, PAGE), 0);
+        assert_eq!(shadow.copy_back(writing, window + PAGE, PAGE), 0);
 
         // A GPU word has no shader/copy Busy entry. The independent
         // submission's whole-memory sweep must consume the earlier label
         // and its readers before it touches their shadow.
-        let host = host().unwrap();
         let [first, independent] = std::array::from_fn(|_| host.new_list().unwrap());
         assert!(write(&first, window as u64, 0xdead_beef, 4));
         first.defer_write(window as _, crate::queue::Written::Value(0xdead_beef), 4);
@@ -4371,9 +4371,10 @@ mod tests {
         let test =
             "shadow::tests::learned_copy_back_keeps_the_completed_submission_until_first_touch";
         alone(test, || {
-            if crate::testgpu::device(test).is_none() {
+            let Some(gpu) = crate::testgpu::device(test) else {
                 return;
-            }
+            };
+            let host = gpu.host();
             let local = tempfile::tempdir().unwrap();
             let path = local.path().join("one-build.v1");
             crate::configure_copy_back(Some(path.clone()));
@@ -4433,6 +4434,7 @@ mod tests {
                 assert_eq!(publish(at + 3 * PAGE, 4), 0);
                 assert_eq!(title(private + 3 * PAGE + 7, 1), [0]);
                 assert_eq!(title(alias + 3 * PAGE + 7, 1), [4]);
+                host.drain();
                 unregister(1, at as u64);
             });
         });
