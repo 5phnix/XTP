@@ -950,27 +950,10 @@ impl HostPipeline {
             });
         }
 
-        // The console's rectangles whose vertex shader has no per-vertex
-        // input: a geometry stage makes each one's fourth corner.
-        let gs = if g.topology.0 == RECTANGLES {
-            let dxil = |i: usize| {
-                let t = stages.get(i).and_then(|(s, _)| s.translated());
-                t.map(|t| t.host.dxil.as_slice())
-            };
-            dxil(0).and_then(|vs| crate::rectangles::geometry_stage(&g.elements(), vs, dxil(1)))
-        } else {
-            None
-        };
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
-            GS: gs
-                .as_deref()
-                .map_or_else(D3D12_SHADER_BYTECODE::default, |b| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: b.as_ptr().cast(),
-                    BytecodeLength: b.len(),
-                }),
             PS: code(1),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
@@ -993,12 +976,12 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        let (vs_code, ps_code) = (code_bytes(&code(0)), code_bytes(&code(1)));
-        // The stage's bytes are in the name only when there is one: the other
-        // pipelines keep their names in the pipeline library.
-        let mut codes = vec![vs_code.as_slice(), ps_code.as_slice()];
-        codes.extend(gs.as_deref());
-        let name = super::library::name("graphics", &root_blob, &codes, &state);
+        let name = super::library::name(
+            "graphics",
+            &root_blob,
+            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &state,
+        );
         let made = super::library::pipeline(
             &name,
             // SAFETY: the description points at live data.
@@ -1006,32 +989,6 @@ impl HostPipeline {
             // SAFETY: as above.
             || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
         );
-        // Refused with the stage: made without it, as before it (each
-        // rectangle one triangle).
-        let made = match made {
-            Err(e) if gs.is_some() => {
-                tracing::warn!(
-                    error = %e,
-                    ?shaders,
-                    "host pipeline refused with the rectangles' geometry stage: made without it"
-                );
-                host.log_messages();
-                let plain = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-                    GS: D3D12_SHADER_BYTECODE::default(),
-                    ..desc
-                };
-                let codes = [vs_code.as_slice(), ps_code.as_slice()];
-                let name = super::library::name("graphics", &root_blob, &codes, &state);
-                super::library::pipeline(
-                    &name,
-                    // SAFETY: the description points at live data.
-                    |library, name| unsafe { library.LoadGraphicsPipeline(name, &plain) },
-                    // SAFETY: as above.
-                    || unsafe { host.device.CreateGraphicsPipelineState(&plain) },
-                )
-            }
-            made => made,
-        };
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
