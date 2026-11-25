@@ -1505,6 +1505,23 @@ pub(crate) mod tests {
         unmapped(b, 1);
     }
 
+    #[test]
+    fn unwinding_an_opening_restores_write_access() {
+        let _serial = serial();
+        let view = mapped(1);
+        assert_eq!(guard(view, view + PAGE), Some(vec![view / PAGE]));
+        REOPENING.set(Some(Box::new(|_| panic!("interrupt the opening"))));
+        assert!(std::panic::catch_unwind(|| writing(view, PAGE)).is_err());
+        assert!(!guards().opening.contains(&(view / PAGE)));
+        assert!(writable(view));
+        assert!(!WRITE_FAULTS.contains(view / PAGE));
+        let token = kernel_writing(view, PAGE);
+        poke(view, 42);
+        drop(token);
+        assert_eq!(guard(view, view + PAGE), Some(vec![view / PAGE]));
+        unmapped(view, 1);
+    }
+
     /// A pagefile section of `blocks` blocks.
     fn section(blocks: usize) -> windows_sys::Win32::Foundation::HANDLE {
         use windows_sys::Win32::System::Memory::CreateFileMappingW;
@@ -3330,9 +3347,9 @@ pub(crate) mod tests {
         assert_eq!(noted, [p / PAGE + 1, p / PAGE + 2]);
         // An announcement outside write-watched memory notes nothing.
         let view = mapped(1);
-        let before = JOURNAL.lock().unwrap().asked;
+        let before = last_write(view / PAGE);
         drop(kernel_writing(view, PAGE));
-        assert_eq!(JOURNAL.lock().unwrap().asked, before);
+        assert_eq!(last_write(view / PAGE), before);
         unmapped(view, 1);
         // SAFETY: our allocation.
         assert_ne!(unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) }, 0);
