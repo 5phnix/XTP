@@ -147,7 +147,7 @@ with an AI assistant.
 | 2 | Let idle staging buffers go | fork `578d459` `texture.rs` `let_go_idle` | `xtp-gpu/src/texture.rs`, `descriptor/host.rs` (`PASS_STAGING` counts what lives) | the 14–19 k waiting slots served within a few passes | S |
 | 3 | Views off their copy's elements get their own bytes | VIctory `86a5ed6` `shadow.rs`, fork `a26859f` | `xtp-gpu/src/descriptor/host.rs` (`off_element_view`), `shadow.rs` | culling constants and colour-table bakes read their bytes | M, after 5d4d8f6f and a recount |
 | 4 | A/B: the tiler and the ray pair skipped | fork #512 | none (one session, `XTP_SKIP_PIPELINES`) | tells whether XTP's zero comes from the tiled ray path | XS |
-| 5 | `11eeb27c2d15980d` translates | NuraadGit/VIctory `c1c3fbc` (or lines9686-rgb `261b653`) | `xtp-shader` IR operand reads | the light-loop data written; maybe the tile lists | S |
+| 5 | `11eeb27c2d15980d` translates | NuraadGit/VIctory `c1c3fbc` (or lines9686-rgb `261b653`) | `xtp-shader`: where a VGPR write counts as a read of its old value (`c1c3fbc` changes VIctory's `ir.rs` and `emit/lower.rs`; XTP's site not located here) | the light-loop data written; maybe the tile lists | S |
 | 6 | Textures picked by index uploaded before the decoration bake | fork `c96b4f2` `draw.rs` | `xtp-gpu/src/draw.rs` | characters' baked colour | M |
 
 Each port is a new task, reviewed critically and measured on the PC
