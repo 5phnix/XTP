@@ -274,7 +274,10 @@ a capture shows only through a replay.
   RGBA8 target RGB 0, another's green at most 1/255; the remaining
   targets normal (maximum 1.0). P417 and P419 (pixel programs
   `63051e97862e7dad`, `57a27c5e2e1d62a9` among others) raise the albedo
-  to a maximum of 0.44.
+  to a maximum of 0.44. The pipelines write the albedo through an
+  R8G8B8A8_UNORM_SRGB view of the typeless texture, as the title asks
+  (PSOs 19145 and 19387 alike), and the dump reads its bytes: 1/255 there
+  is a linear albedo of at most 0.0003.
 - The pixel programs of P351 with the most draws: `09eb0a73df63b87d` (32),
   `d42a2d8a9d2c954a` (24), `6590393ed93ff071` (21), `94d281151ca58b4f`
   (18). Their translated DXIL, taken from the capture (`xtp-pix pso`,
