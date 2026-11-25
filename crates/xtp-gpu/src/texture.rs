@@ -759,8 +759,23 @@ pub(crate) fn released_total() -> (u64, u64) {
 /// looks at `looks` textures in turns, and the buffers are destroyed out
 /// of the map's lock.
 pub(crate) fn release_staging(idle: u64, looks: usize) -> (u64, u64) {
-    release_staging_of(idle, looks, |_| true)
+    #[cfg(test)]
+    let alone = SWEPT_ALONE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    #[cfg(not(test))]
+    let alone: [usize; 0] = [];
+    release_staging_of(idle, looks, |r| !alone.contains(&r))
 }
+
+/// The textures tests here sweep themselves (`tests::SweptAlone`): the
+/// passes of other tests, whose sweeps go over every texture, leave them
+/// as they are, so that a test tells what its own sweeps release, and
+/// when. Before, such a pass could release a test's buffer first (every
+/// texture looks idle once the tests' own sweeps advanced [`SWEEPS`]).
+#[cfg(test)]
+static SWEPT_ALONE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// [`release_staging`] for the resources `of` takes (tests: other tests'
 /// textures are in the same map).
@@ -3085,6 +3100,7 @@ mod tests {
             return;
         };
         let (resource, texture) = texture_4x4(0x11);
+        let _alone = SweptAlone::new(resource);
         let Staged::NoRoom(bytes) = stage(resource, texture, 16) else {
             panic!("{:?}", stage(resource, texture, 16));
         };
@@ -3124,6 +3140,7 @@ mod tests {
         }
         const IDLE: u64 = 1000;
         let (resource, texture) = texture_4x4(0x11);
+        let _alone = SweptAlone::new(resource);
         let key = resource as usize;
         // Other tests' textures are in the same map: only this one goes.
         let sweep = || release_staging_of(IDLE, usize::MAX, |r| r == key);
@@ -3216,6 +3233,31 @@ mod tests {
         }
     }
 
+    /// While it lives, only the test that made it releases the staging
+    /// buffer of its resource: the passes of other tests leave it as it is
+    /// (`SWEPT_ALONE`).
+    struct SweptAlone(usize);
+
+    impl SweptAlone {
+        fn new(resource: This) -> SweptAlone {
+            let key = resource as usize;
+            SWEPT_ALONE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(key);
+            SweptAlone(key)
+        }
+    }
+
+    impl Drop for SweptAlone {
+        fn drop(&mut self) {
+            let mut alone = SWEPT_ALONE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = alone.iter().position(|&r| r == self.0) {
+                alone.swap_remove(at);
+            }
+        }
+    }
+
     /// `len` bytes of committed memory of our own: write-watched as the
     /// runtime reserves the title's if `watched`, plain otherwise (neither
     /// write-watched nor guarded: only a hash tells a change, and a check
@@ -3273,6 +3315,7 @@ mod tests {
         const LEN: usize = 64 << 10;
         let at = private_memory(LEN, false);
         let (resource, texture) = texture_in(at);
+        let _alone = SweptAlone::new(resource);
         let (id, size) = {
             let state = staging(resource, texture).unwrap();
             (state.id, state.layout.size as usize)
@@ -3354,6 +3397,7 @@ mod tests {
         const LEN: usize = 64 << 10;
         let at = private_memory(LEN, true);
         let (resource, texture) = texture_in(at);
+        let _alone = SweptAlone::new(resource);
         let (id, size) = {
             let state = staging(resource, texture).unwrap();
             (state.id, state.layout.size as usize)
@@ -3400,6 +3444,7 @@ mod tests {
         };
         let host = gpu.host();
         let [(a, ta), (b, tb), (never, _)] = [0x11, 0x22, 0x33].map(texture_4x4);
+        let _alone = [a, b, never].map(SweptAlone::new);
         let bytes = staging(a, ta).unwrap().size;
         assert_eq!(staging(b, tb).unwrap().size, bytes);
         released(a);
@@ -3450,6 +3495,7 @@ mod tests {
         };
         let host = gpu.host();
         let (resource, texture) = texture_4x4(0x11);
+        let _alone = SweptAlone::new(resource);
         let list = host.new_list().unwrap();
         assert!(upload(&list, resource, texture));
         list.close();
