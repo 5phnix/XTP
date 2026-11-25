@@ -118,6 +118,70 @@ void main(uint lane : SV_GroupIndex) {
 }
 "#;
 
+/// Copie des arguments avant le bridage, lue après la clôture GPU.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone)]
+pub(crate) struct Sample {
+    _buffer: ID3D12Resource,
+    data: usize,
+    stride: u32,
+    max: u32,
+    counted: bool,
+    hash: String,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Sample {
+    pub(crate) fn report(&self) {
+        // SAFETY: le tampon mappé est conservé par l’enregistrement soumis.
+        let read = |offset: usize| unsafe { ((self.data + offset) as *const u32).read_volatile() };
+        let bytes = self.stride as usize * self.max as usize;
+        let n = if self.counted { read(bytes).min(self.max) } else { self.max };
+        let mut high = 0;
+        let mut oversized = 0;
+        for i in 0..n {
+            let x = read(i as usize * self.stride as usize);
+            high = high.max(x);
+            oversized += u32::from(x > 65535);
+        }
+        tracing::info!(hash = %self.hash, records = n, oversized, max_x = high, "indirect group count");
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn measuring() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XTP_DISPATCH_COUNTS").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn sample(
+    list: &HostList, hash: String, stride: u32, max: u32,
+    args: (&ID3D12Resource, u64), count: Option<(&ID3D12Resource, u64)>,
+) {
+    let bytes = u64::from(stride) * u64::from(max);
+    if stride < 12 || !stride.is_multiple_of(4) { return; }
+    let Some((buffer, data)) = host().and_then(|h| h.shared_buffer(bytes + 4)) else {
+        tracing::warn!("indirect count sample allocation failed");
+        return;
+    };
+    // SAFETY: les plages sont validées par execute_indirect et gardées par la liste.
+    unsafe {
+        let copy = |(source, offset): (&ID3D12Resource, u64), to, len| {
+            let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            let src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            list.list.ResourceBarrier(&[transition(source, uav, src)]);
+            list.list.CopyBufferRegion(&buffer, to, source, offset, len);
+            list.list.ResourceBarrier(&[transition(source, src, uav)]);
+        };
+        copy(args, 0, bytes);
+        if let Some(count) = count { copy(count, bytes, 4); }
+    }
+    list.dispatch_sample(Sample {
+        _buffer: buffer, data: data as usize, stride, max, counted: count.is_some(), hash,
+    });
+}
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,

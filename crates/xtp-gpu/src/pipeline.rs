@@ -238,6 +238,11 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn dispatch_hash(this: This) -> Option<String> {
+    (!this.is_null()).then(|| pipeline(this).shaders.first().map(|s| s.hash.clone())).flatten()
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
