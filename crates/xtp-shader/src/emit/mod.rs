@@ -100,6 +100,8 @@ pub mod rect_gs;
 mod sampler;
 #[cfg(all(test, windows))]
 mod scalar_gap_tests;
+#[cfg(test)]
+mod sampler_tests;
 mod shader;
 #[cfg(all(test, windows))]
 mod smem_data_tests;
@@ -644,7 +646,8 @@ pub fn emit_for(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    // D3D12 encode comparaison, minimum et maximum dans le même champ.
+                    s.filter = (s.filter & !(3 << 7)) | 0x80;
                 }
                 s
             })
