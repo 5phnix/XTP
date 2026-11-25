@@ -430,6 +430,13 @@ pub fn last_module_summary() -> String {
     }
 }
 
+/// Joins where a descriptor's dword took an undefined value in the console
+/// flow without the proof that no lane reads it there (the `shortcut:` of
+/// `lower/flow.rs`'s descriptor-word rule), over every translation of the
+/// process: what a survey or a session reports of that shortcut.
+pub static UNPROVEN_DESCRIPTOR_JOINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 thread_local! {
     /// The form of the program [`emit_for`] translated last on this thread
     /// (see [`last_module_summary`]); empty after a failure.
