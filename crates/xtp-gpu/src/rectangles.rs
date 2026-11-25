@@ -128,9 +128,6 @@ const ARGS_MAX: u64 = COUNTER_BYTES + MAX_RECORDS as u64 * 16;
 /// that needed them only.
 const ARGS_POOLED: u64 = 1 << 20;
 
-/// Le pool garde au plus une réserve agrandie, dans le budget ordinaire d’un lot.
-const VERTICES_POOLED: u64 = 4 * SCRATCH_BYTES;
-
 /// Scratches kept for later lists when no list holds them.
 const POOLED: usize = 16;
 
@@ -875,13 +872,6 @@ pub(crate) fn give_back(mut scratch: Scratch) {
     }
     if scratch.args.as_ref().is_some_and(|a| a.len > ARGS_POOLED) {
         scratch.args = None;
-    }
-    if scratch
-        .vertices
-        .as_ref()
-        .is_some_and(|v| v.len > VERTICES_POOLED)
-    {
-        scratch.vertices = None;
     }
     if scratch.vertices.is_none() && scratch.args.is_none() && scratch.direct.is_none() {
         return;
