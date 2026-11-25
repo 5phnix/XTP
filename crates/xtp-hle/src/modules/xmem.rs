@@ -803,7 +803,12 @@ impl Aliases {
 /// (`shown`), or as no longer showing them.
 fn note_views(base: usize, len: usize, slice: &Slice, shown: bool) {
     static LOOKUP: std::sync::Once = std::sync::Once::new();
-    LOOKUP.call_once(|| xtp_gpu::set_alias_lookup(other_views));
+    LOOKUP.call_once(|| {
+        xtp_gpu::set_alias_lookup(other_views);
+        // SAFETY: map, unmap, write_physical and PageWindow pin the permanent
+        // range throughout a change. Each live title view retains its Section.
+        unsafe { xtp_gpu::set_copy_back_lookup(copy_back_page) };
+    });
     let section = Arc::as_ptr(&slice.section) as usize;
     let mut a = aliases();
     let a = &mut *a;
@@ -828,6 +833,16 @@ fn note_views(base: usize, len: usize, slice: &Slice, shown: bool) {
             a.shared.extend(list.iter().copied());
         }
     }
+}
+
+fn copy_back_page(at: usize, views: &mut Vec<usize>) -> Option<usize> {
+    let a = aliases();
+    let key = a.by_address.get(&at)?;
+    views.extend_from_slice(a.by_page.get(key)?);
+    // SAFETY: every indexed view holds its Section through a Slice until
+    // note_views removes the entry under this same lock.
+    let section = unsafe { &*(key.0 as *const Section) };
+    Some(section.at(key.1) as usize)
 }
 
 /// For each page of `range` (title addresses) that the title shows at other
@@ -1007,6 +1022,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         if !slice.section.commit(slice.index, *n) {
             return false;
         }
+        let _pin = xtp_gpu::pin_copy_back(slice.section.at(slice.index) as usize, *n * PAGE);
         let k = (n * PAGE - within).min(data.len() - done);
         // SAFETY: `within + k` bytes fit in the run's pages, which our view
         // shows committed read-write; other views of the pages only alias
@@ -1027,6 +1043,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// would then copy. Dropping it opens the guards of the title's views of
 /// its pages (`opened`).
 pub(crate) struct PageWindow {
+    _pin: xtp_gpu::CopyBackPin,
     /// Keeps our view mapped, should the title free the pages meanwhile.
     section: Arc<Section>,
     at: *mut u8,
@@ -1067,6 +1084,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     // SAFETY: the run's pages hold `offset % PAGE + len` bytes of our view.
     let at = unsafe { slice.section.at(slice.index).add(offset % PAGE) };
     Some(PageWindow {
+        _pin: xtp_gpu::pin_copy_back(at as usize, len),
         section: slice.section,
         at,
         len,
@@ -1168,6 +1186,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(views: &mut Views, base: usize, len: usize, slice: Slice) -> bool {
+    let _pin = xtp_gpu::pin_copy_back(slice.section.at(slice.index) as usize, len);
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -1297,6 +1316,7 @@ fn unmap(views: &mut Views, base: usize, len: usize) {
         // Before: guarded blocks get write access back, for the title's
         // writes until the view goes, and so do those of the pages' other
         // views, which do not see these writes.
+        let _pin = xtp_gpu::pin_copy_back(slice.section.at(slice.index) as usize, size);
         remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {

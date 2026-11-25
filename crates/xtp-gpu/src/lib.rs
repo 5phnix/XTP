@@ -42,6 +42,12 @@ mod pipestats;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
+#[cfg(windows)]
+mod readmap;
+#[cfg(windows)]
+pub use readmap::{configure_copy_back, save_copy_back_map};
+#[cfg(windows)]
+pub use watch::{CopyBackPin, pin_copy_back, set_copy_back_lookup};
 pub mod queue;
 #[cfg(windows)]
 mod rectangles;
