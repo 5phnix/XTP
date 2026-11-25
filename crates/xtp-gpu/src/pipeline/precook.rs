@@ -27,10 +27,9 @@
 //! - What a whole pass depends on besides the pack and the translator, for
 //!   the precook's note: the kept descriptions and the library file
 //!   ([`cache`]).
-//! - After a translator change, or once the library file has grown past
-//!   [`LIBRARY_REBUILD_BYTES`], the precook makes the library a new
-//!   generation ([`rebuild_library`]): what it makes or finds again, and
-//!   nothing of the translators before.
+//! - The precook reuses the pipeline library across translator changes.
+//!   It can compact a library past [`LIBRARY_REBUILD_BYTES`] into a new
+//!   generation ([`rebuild_library`]) containing the pipelines used again.
 
 use std::collections::HashSet;
 use std::sync::Arc;
