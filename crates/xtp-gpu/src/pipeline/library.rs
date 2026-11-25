@@ -624,9 +624,10 @@ mod tests {
     #[test]
     fn a_failed_save_is_made_again() {
         let test = "pipeline::library::tests::a_failed_save_is_made_again";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let device = host.device.cast::<ID3D12Device1>().unwrap();
         let library = RwLock::new(open(&device, Vec::new()).unwrap());
         library.read().unwrap().added.store(2, Ordering::Relaxed);
@@ -669,9 +670,10 @@ mod tests {
     #[test]
     fn a_new_generation_keeps_what_is_asked_for() {
         let test = "pipeline::library::tests::a_new_generation_keeps_what_is_asked_for";
-        let Some(host) = crate::testgpu::device(test) else {
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
         let device = host.device.cast::<ID3D12Device1>().unwrap();
         let (a, b) = (kernel(&host.device, 3), kernel(&host.device, 5));
         let dir = tempfile::tempdir().unwrap();
