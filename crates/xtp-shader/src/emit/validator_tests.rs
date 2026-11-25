@@ -91,7 +91,14 @@ fn pixel(mut inputs: Vec<SigElement>, reads: &[usize]) -> Vec<u8> {
         };
         let undef = s.m.undef(s.t.i32);
         let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(0), undef];
-        let v = s.op(b, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args);
+        let v = s.op(
+            b,
+            &format!("loadInput{suffix}"),
+            Attr::ReadNone,
+            ty,
+            4,
+            &args,
+        );
         let f32t = s.t.f32;
         vals.push(if int {
             s.m.cast(b, Cast::Bitcast, v, f32t)
@@ -225,7 +232,11 @@ fn a_row_gets_one_interpolation_mode() {
         [4, 1, 1]
     );
     assert_eq!(
-        modes(vec![position(), float(0, 2, 0), front_face(1, 1)], &[], true),
+        modes(
+            vec![position(), float(0, 2, 0), front_face(1, 1)],
+            &[],
+            true
+        ),
         [4, 1, 1]
     );
     assert_eq!(
@@ -253,11 +264,19 @@ fn a_row_gets_one_interpolation_mode() {
     );
     // Outputs: their mode is the next stage's to say.
     assert_eq!(
-        modes(vec![position(), uint(0, 1, 0), float(1, 2, 1)], &[1, 2], false),
+        modes(
+            vec![position(), uint(0, 1, 0), float(1, 2, 1)],
+            &[1, 2],
+            false
+        ),
         [4, 1, 1]
     );
     assert_eq!(
-        modes(vec![position(), float(0, 2, 0), float(1, 4, 1)], &[1, 2], false),
+        modes(
+            vec![position(), float(0, 2, 0), float(1, 4, 1)],
+            &[1, 2],
+            false
+        ),
         [4, 2, 2]
     );
     // Rows dxil.dll takes are left as they are: an undefined element
@@ -272,7 +291,11 @@ fn a_row_gets_one_interpolation_mode() {
     );
     // Two modes read in one row: left to dxil.dll, which refuses them.
     assert_eq!(
-        modes(vec![position(), float(0, 2, 0), float(1, 3, 1)], &[1, 2], true),
+        modes(
+            vec![position(), float(0, 2, 0), float(1, 3, 1)],
+            &[1, 2],
+            true
+        ),
         [4, 2, 3]
     );
 }
@@ -282,20 +305,53 @@ fn a_row_gets_one_interpolation_mode() {
 #[test]
 fn rows_of_one_mode_validate() {
     let ps = [
-        ("uint and float unread", vec![position(), uint(0, 1, 0), float(1, 2, 1)], vec![]),
-        ("float unread beside the front face", vec![position(), float(0, 2, 0), front_face(1, 1)], vec![]),
-        ("linear read, centroid unread", vec![position(), float(0, 2, 0), float(1, 3, 1)], vec![1]),
-        ("noperspective read, linear unread", vec![position(), float(0, 4, 0), float(1, 2, 1)], vec![1]),
-        ("linear unread, uint read", vec![position(), float(0, 2, 0), uint(1, 1, 1)], vec![2]),
-        ("uint unread, then linear read", vec![position(), uint(0, 1, 0), float(1, 2, 1)], vec![2]),
+        (
+            "uint and float unread",
+            vec![position(), uint(0, 1, 0), float(1, 2, 1)],
+            vec![],
+        ),
+        (
+            "float unread beside the front face",
+            vec![position(), float(0, 2, 0), front_face(1, 1)],
+            vec![],
+        ),
+        (
+            "linear read, centroid unread",
+            vec![position(), float(0, 2, 0), float(1, 3, 1)],
+            vec![1],
+        ),
+        (
+            "noperspective read, linear unread",
+            vec![position(), float(0, 4, 0), float(1, 2, 1)],
+            vec![1],
+        ),
+        (
+            "linear unread, uint read",
+            vec![position(), float(0, 2, 0), uint(1, 1, 1)],
+            vec![2],
+        ),
+        (
+            "uint unread, then linear read",
+            vec![position(), uint(0, 1, 0), float(1, 2, 1)],
+            vec![2],
+        ),
     ];
     for (what, inputs, reads) in ps {
         validates(&format!("pixel inputs: {what}"), &pixel(inputs, &reads));
     }
     let vs = [
-        ("uint and float", vec![position(), uint(0, 1, 0), float(1, 2, 1)]),
-        ("float and uint", vec![position(), float(0, 2, 0), uint(1, 1, 1)]),
-        ("linear and noperspective", vec![position(), float(0, 2, 0), float(1, 4, 1)]),
+        (
+            "uint and float",
+            vec![position(), uint(0, 1, 0), float(1, 2, 1)],
+        ),
+        (
+            "float and uint",
+            vec![position(), float(0, 2, 0), uint(1, 1, 1)],
+        ),
+        (
+            "linear and noperspective",
+            vec![position(), float(0, 2, 0), float(1, 4, 1)],
+        ),
     ];
     for (what, outputs) in vs {
         validates(&format!("vertex outputs: {what}"), &vertex(outputs));
