@@ -604,6 +604,9 @@ struct Settled {
     lineage: Lineage,
     /// The generations that went, most recently opened first.
     evicted: Vec<String>,
+    /// It had no file: started now (seeded, or empty). Its file is not the
+    /// one an earlier process of its key left, whatever its size.
+    new: bool,
 }
 
 /// Makes generation `id` in `dir` the most recently opened, its file
@@ -627,13 +630,16 @@ fn settle(dir: &Path, id: &str, kept: usize, budget: u64) -> std::io::Result<Set
     list.extend(found.iter().map(|id| Lineage::own(id)));
     let place = Place::of(dir, id);
     let listed = list.iter().position(|g| g.id == id).map(|i| list.remove(i));
-    let lineage = match listed {
-        Some(lineage) if place.library.exists() => lineage,
+    let (lineage, new) = match listed {
+        Some(lineage) if place.library.exists() => (lineage, false),
         // Listed, but its file is gone: seeded again.
-        _ => Lineage {
-            from: seed(dir, &place, &list),
-            ..Lineage::own(id)
-        },
+        _ => (
+            Lineage {
+                from: seed(dir, &place, &list),
+                ..Lineage::own(id)
+            },
+            true,
+        ),
     };
     list.insert(0, lineage.clone());
     let evicted = evict(dir, &mut list, kept, budget);
@@ -642,6 +648,7 @@ fn settle(dir: &Path, id: &str, kept: usize, budget: u64) -> std::io::Result<Set
         place,
         lineage,
         evicted,
+        new,
     })
 }
 
@@ -758,8 +765,8 @@ fn record_compaction(dir: &Path, id: &str, bytes: u64, bound: u64) -> std::io::R
 /// This process's generation of the library: where its files are, and what
 /// it held when settled ([`settle`], on first use: the host must be made).
 /// `None` without a cache folder.
-fn current() -> Option<&'static (Place, Lineage)> {
-    static CURRENT: OnceLock<Option<(Place, Lineage)>> = OnceLock::new();
+fn current() -> Option<&'static Settled> {
+    static CURRENT: OnceLock<Option<Settled>> = OnceLock::new();
     CURRENT
         .get_or_init(|| {
             let dir = DIR.get()?;
@@ -769,24 +776,32 @@ fn current() -> Option<&'static (Place, Lineage)> {
                     tracing::info!(
                         generation = s.lineage.id,
                         from = s.lineage.from.as_deref(),
+                        new = s.new,
                         evicted = ?s.evicted,
                         "host pipeline library generation"
                     );
-                    Some((s.place, s.lineage))
+                    Some(s)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "host pipeline library generations not listed");
-                    Some((Place::of(dir, &id), Lineage::own(&id)))
+                    // Its file, as it is: not known to be the one before.
+                    Some(Settled {
+                        place: Place::of(dir, &id),
+                        lineage: Lineage::own(&id),
+                        evicted: Vec::new(),
+                        new: true,
+                    })
                 }
             }
         })
         .as_ref()
 }
 
-/// This process's generation of the library, as settled ([`current`]);
-/// `None` without a cache folder.
-pub(crate) fn generation() -> Option<Lineage> {
-    current().map(|(_, lineage)| lineage.clone())
+/// This process's generation of the library, as settled ([`current`]), and
+/// whether it started in this process (`Settled::new`); `None` without a
+/// cache folder.
+pub(crate) fn generation() -> Option<(Lineage, bool)> {
+    current().map(|s| (s.lineage.clone(), s.new))
 }
 
 /// Title pipelines listed for an early start, at most.
@@ -808,7 +823,7 @@ fn library() -> Option<&'static RwLock<Library>> {
             OPENED.store(true, Ordering::SeqCst);
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             // This translator's generation alone.
-            let place = current().map(|(place, _)| place);
+            let place = current().map(|s| &s.place);
             let blob = place
                 .and_then(|p| std::fs::read(&p.library).ok())
                 .unwrap_or_default();
@@ -839,8 +854,9 @@ pub(crate) fn rebuild() -> bool {
 /// The size of this process's generation's library file, if there is one
 /// (settled first: [`current`]).
 pub(crate) fn file_bytes() -> Option<u64> {
-    let (place, _) = current()?;
-    std::fs::metadata(&place.library).ok().map(|m| m.len())
+    std::fs::metadata(&current()?.place.library)
+        .ok()
+        .map(|m| m.len())
 }
 
 /// The host's library of `bytes`, which must outlive it.
@@ -1107,7 +1123,7 @@ pub(crate) enum Saved {
 pub(crate) fn save(now: bool) -> Saved {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some((place, lineage))) = (DIR.get(), current()) else {
+    let (Some(dir), Some(Settled { place, lineage, .. })) = (DIR.get(), current()) else {
         return Saved::Nothing;
     };
     let Some(library) = library() else {
@@ -2071,12 +2087,14 @@ mod tests {
         let d = dir.path();
         let a = settle(d, A, GENERATIONS_KEPT, u64::MAX).unwrap();
         assert_eq!(a.lineage, Lineage::own(A), "nothing to start from");
+        assert!(a.new);
         assert_eq!(a.place, Place::of(d, A));
         assert!(!a.place.library.exists());
         save_as(&a.place, b"A's pipelines", "A's names");
 
         let b = settle(d, B, GENERATIONS_KEPT, u64::MAX).unwrap();
         assert_eq!(b.lineage.from.as_deref(), Some(A));
+        assert!(b.new);
         assert_eq!(std::fs::read(&b.place.library).unwrap(), b"A's pipelines");
         assert_eq!(
             std::fs::read_to_string(&b.place.names).unwrap(),
@@ -2102,6 +2120,13 @@ mod tests {
         // Opened again, a generation keeps what it was.
         let again = settle(d, C, GENERATIONS_KEPT, u64::MAX).unwrap();
         assert_eq!(again.lineage, c.lineage);
+        assert!(!again.new, "its file is the one it left");
+        // Its file gone (let go by another process's list): seeded again,
+        // and new, whatever its size (the precook's note does not hold it).
+        std::fs::remove_file(&again.place.library).unwrap();
+        let reseeded = settle(d, C, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(reseeded.lineage.from.as_deref(), Some(B));
+        assert!(reseeded.new);
     }
 
     /// A, then B (whose translator differs: compacted to its own pipelines),
@@ -2127,6 +2152,7 @@ mod tests {
 
         let back = settle(d, A, GENERATIONS_KEPT, u64::MAX).unwrap();
         assert_eq!(back.lineage, a_then, "its own, as it was");
+        assert!(!back.new);
         assert_eq!(
             std::fs::read(&back.place.library).unwrap(),
             b"A's pipelines"

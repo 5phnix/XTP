@@ -228,8 +228,10 @@ fn precook(o: Options) -> Result<()> {
         .as_ref()
         .zip(lineage.as_ref())
         .and_then(|(c, g)| new_generation(c.library, g, gpu::LIBRARY_REBUILD_BYTES));
-    let plan = if o.force || generation.is_some() {
-        // A new generation holds what this pass makes: all of it.
+    let plan = if o.force || generation.is_some() || lineage.as_ref().is_some_and(|g| g.new) {
+        // A new generation holds what this pass makes: all of it. So does
+        // a generation started now, whose file is not the one the note's
+        // pass left (its key's generation was let go, and seeded again).
         Plan::Whole
     } else {
         note.plan(found.as_ref())
@@ -420,6 +422,9 @@ struct Lineage {
     from: Option<String>,
     /// Its size after its last compaction, if past the bound then.
     compacted: Option<u64>,
+    /// It started in this process (empty, or seeded from another): not the
+    /// file the note's pass left.
+    new: bool,
 }
 
 #[cfg(windows)]
@@ -429,6 +434,7 @@ impl From<xtp_gpu::pipeline::precook::Generation> for Lineage {
             id: g.id,
             from: g.from,
             compacted: g.compacted,
+            new: g.new,
         }
     }
 }
@@ -1711,6 +1717,7 @@ mod tests {
             id: "0123456789abcdef".into(),
             from: from.map(str::to_owned),
             compacted,
+            new: false,
         };
         let own = lineage(None, None);
         let seeded = lineage(Some("fedcba9876543210"), None);

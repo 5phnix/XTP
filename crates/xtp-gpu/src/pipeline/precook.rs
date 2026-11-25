@@ -349,6 +349,10 @@ pub struct Generation {
     /// Its file's size just after its last compaction, if that was past
     /// [`LIBRARY_REBUILD_BYTES`].
     pub compacted: Option<u64>,
+    /// It had no file before this process (started empty or seeded now):
+    /// its file is not the one an earlier pass of this key left, whatever
+    /// its size, so a note of that pass does not hold for it.
+    pub new: bool,
 }
 
 /// This process's generation of the library ([`Generation`]), the oldest
@@ -356,10 +360,11 @@ pub struct Generation {
 /// cache folder. The host must be made, and this asked before any pipeline
 /// is (it settles which file the library opens).
 pub fn generation() -> Option<Generation> {
-    super::library::generation().map(|g| Generation {
+    super::library::generation().map(|(g, new)| Generation {
         id: g.id,
         from: g.from,
         compacted: g.compacted,
+        new,
     })
 }
 

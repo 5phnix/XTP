@@ -16,7 +16,10 @@ pipelines whose translations did not change cost 16 s in all (6 s of it
 reading their descriptions) and no `LoadPipeline`. The two broad changes
 before it cost 2,331 s and 2,543 s. On the PC, whose translation of the
 pack takes about 3 minutes, such a change should cost about 3 to 3.5
-minutes instead of 13 to 23.
+minutes instead of 13 to 23. Since §4, the library keeps one generation
+per translator, so a switch back to a branch whose translator was
+precooked before finds its pipelines held instead of making some 90,000
+again.
 
 ## 1. Where the time went (PC, 2026-11-25)
 
@@ -53,7 +56,8 @@ on 32 threads:
   asked for. Sessions alternating between two branches whose translators
   differ (an A/B pair) then remade the other branch's pipelines at every
   switch: `stall-r9e5-522e976e-after1` translated nothing (its translations
-  were in the cache) and still made 33,870 pipelines in 819 s.
+  were in the cache) and still made 33,870 pipelines in 819 s. The library
+  now keeps one generation per translator (§4).
 - **A change that alters a handful of programs** cost, before this task,
   the full translation (about 3 minutes on the PC) and one `LoadPipeline`
   per pipeline: about 2,500 compute ones (47 s in `stall-stride4b-1`) and
@@ -76,8 +80,8 @@ on 32 threads:
   library hashes its translated shaders, root signature and state
   (`pipeline::library::name`), so a pipeline whose translations did not
   change has the name it had. Every save writes the names the library holds
-  beside it (`host-pipelines.names`, tied to the library file by its size
-  and BLAKE3, `complete` or `partial`). The precook answers a pipeline whose
+  beside it (`host-pipelines-<id>.names` since §4, tied to the library file
+  by its size and BLAKE3, `complete` or `partial`). The precook answers a pipeline whose
   name the library holds without loading it (`library::without_loading`):
   its work is to have each pipeline in the file, and a session loads it
   when it needs it. A library read without its names (an older file)
@@ -164,24 +168,99 @@ without `LoadPipeline`.
   same few seconds: about 3 to 3.5 minutes, against 13 to 23. Not measured
   there yet: the PC was running image sessions.
 
-## 4. What is left
+## 4. One library generation per translator, and what is left
+
+### 4.1 Generations
+
+The PC queue runs sessions of worker branches one after another, and
+their translators differ. Before this change the host pipeline library was
+one file (`host-pipelines.bin`). Past its 2 GiB bound, a pass after a
+translator change compacted it to that translator's pipelines, and the
+next switch back made the other branch's pipelines again (§1). The
+library now keeps one generation per translation key
+(`pipeline::library`, task be47721e, resuming libgen's work for task
+bc28902e):
+
+- **Files.** A generation is `host-pipelines-<id>.bin` and its names file
+  `host-pipelines-<id>.names`, where `<id>` is the first 16 hexadecimal
+  digits of the translation key (`shader_cache::host_key`: the
+  translator's sources, its settings and the host's wave sizes, the key
+  the shader cache uses). `generations.txt` lists them, most recently
+  opened first, one line each: `<id> own`, `<id> from <id>` (seeded from
+  another generation, or `legacy`), `<id> compacted <bytes>`.
+- **A process opens its own generation only.** It settles it once, at its
+  first use of the library: a key with no generation starts from the most
+  recently opened one, its file hard-linked (copied where a link fails)
+  and its names file copied, so that a change that alters few programs
+  still finds every other pipeline by its name (§3's B1 case). The first
+  generation made takes over the one file of before (a rename). The file a
+  session reads into memory is no larger than before.
+- **Eviction.** Past 4 generations (`GENERATIONS_KEPT`) or 8 GiB of files
+  (`GENERATIONS_BYTES`), the least recently opened go, never the current
+  one. A generation linked from another counts the shared file's bytes
+  again: the budget errs on the safe side. Every write of a library file
+  replaces it by a rename, so a generation linked from another never
+  changes the other's file.
+- **Compaction is per generation.** `xtp precook` compacts its
+  generation (as before: a new library, what the pass asks for taken from
+  the generation before, the rest made) when its file is past
+  `LIBRARY_REBUILD_BYTES` and it holds another translator's pipelines
+  (seeded from another generation and not compacted since), or has no
+  compacted size past the bound (it crossed the bound since), or has
+  doubled since that size. The size after a compaction is kept in the
+  generations' list, not in the precook's note (version 5 drops it): the
+  note is one for the whole cache, and says the last pass's key.
+- **The precook's note and a generation started now.** A generation that
+  had no file before this process (started empty, or seeded again after
+  it was let go) is not the file the note's pass left, whatever its size:
+  that pass is whole.
+- **The report** says the generation opened: `library      generation
+  <id> (its own | from <id> | compacted to <bytes> bytes) (<bytes> bytes)`.
+- **Limits.**
+  - The list is changed by one thread at a time in a process. Two
+    processes of different translators on one cache at once could each
+    let the other's generation go. Sessions and precooks on a machine run
+    one at a time (the session lock).
+  - A build older than this change still reads and writes
+    `host-pipelines.bin`. Once generations exist, that file is left alone
+    and not counted in the budget. Merging main ends it.
+
+### 4.2 Measured: A, then B, then A again, on the L4
+
+Checked end to end by `apps/xtp/tests/precook.rs`
+(`precook_keeps_pipelines_across_translation_keys`, green on the L4 with
+`XTP_REQUIRE_GPU=1`): three translation keys one after the other, then
+the first again. The second key's generation starts from the first's
+(`from <id>`) and makes no pipeline; the first key, back, opens its own
+generation as it left it (`its own`) and makes none.
+
+On the whole pack, the run under way is three precooks on a cache of its
+own (`D:\xtp-data\precook-gen\cache` on the L4: the kept descriptions of
+§3's cache, no library, `XTP_PRECOOK_SECONDS=100000`). A is this change.
+B is the same plus a broad translator change, never merged: every
+program's fp32 denormal mode left undeclared, which c52c0fd's change
+showed reaches nearly every translation (§3, B0). The sequence is A, B,
+then A again. Expected: the second A makes no pipeline and costs its
+translation alone (11 minutes on the L4 at most, 3 on the PC, less with
+its translations still in the shader cache), against some 40 minutes on
+the L4 and 13 to 23 on the PC before. Its figures are not in this page
+yet.
+
+### 4.3 What is left
 
 - **The full translation stays.** About 3 minutes on the PC, 11 on the
   L4, for any translator change. Less needs the translator to say which
   programs a change can reach (task 13245ce1's option A), which nothing
   can prove from its sources today (§2).
-- **Broad changes stay as costly.** A change to code every program runs
-  (the denormal mode of c52c0fd, a common prologue) gives every program a
-  new translation and every pipeline a new name: 13 to 23 minutes on the
-  PC, made by the driver's compiler. Only the driver's own cache shortens
-  that (its size on the PC decides how many of the day's pipelines it
-  keeps).
-- **The library's 2 GiB bound against A/B pairs.** Two branches whose
-  translators differ broadly fill the library past its bound in two passes;
-  each switch after that compacts it to one branch, and the other's
-  pipelines are made again at the next switch (§1). A larger bound, or a
-  generation kept per translator, would keep both; every session reads the
-  whole library file into memory, which a larger bound makes larger.
+- **A broad change still costs its first pass.** A change to code every
+  program runs (the denormal mode of c52c0fd, a common prologue) gives
+  every program a new translation and every pipeline a new name: 13 to 23
+  minutes on the PC, made by the driver's compiler, the first time that
+  translator is precooked. Only the driver's own cache shortens that (its
+  size on the PC decides how many of the day's pipelines it keeps). A
+  switch back to a translator whose generation is kept no longer pays it.
+- **Disk.** Up to 8 GiB of library generations in the cache folder,
+  beside the shader cache.
 
 ## 5. The shader cache's index, cold
 
