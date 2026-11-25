@@ -257,7 +257,11 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
         listed.contains("refused: malformed shader: no DXIL part"),
         "{listed}"
     );
-    assert!(pipelines.join("host-pipelines.bin").is_file(), "{out}");
+    let (id, _) = generation(out).expect("the library's generation");
+    assert!(
+        pipelines.join(format!("host-pipelines-{id}.bin")).is_file(),
+        "{out}"
+    );
     let kept = std::fs::read_to_string(pipelines.join("early-pipelines.txt")).unwrap();
     let mut kept: Vec<&str> = kept.lines().collect();
     kept.sort();
@@ -320,6 +324,18 @@ fn pipelines(out: &str) -> (u64, u64, u64) {
 
 /// The compared line's counts: the same, changed, and not kept by the
 /// translator before.
+/// The report's `library` line: the generation the precook opened, and
+/// what it holds besides its translator's pipelines (`its own`, `from
+/// <id>`, ...).
+fn generation(out: &str) -> Option<(String, String)> {
+    let rest = out
+        .lines()
+        .find_map(|l| l.strip_prefix("library      generation "))?;
+    let (id, rest) = rest.split_once(" (")?;
+    let (what, _) = rest.split_once(") (")?;
+    Some((id.to_owned(), what.to_owned()))
+}
+
 fn compared(out: &str) -> Option<(u64, u64, u64)> {
     let line = out.lines().find(|l| l.starts_with("compared "))?;
     let n = |what: &str| -> u64 {
@@ -369,18 +385,25 @@ fn precook_keeps_pipelines_across_translation_keys() {
     assert_eq!(figure(out, "translated"), Some(3), "{out}");
     assert_eq!(pipelines(out), (3, 0, 0), "{out}");
     assert_eq!(compared(out), None, "nothing to compare with: {out}");
-    let library = dir.path().join("cache/pipelines/host-pipelines.bin");
+    // One library generation per translation key.
+    let (first_id, what) = generation(out).expect("the library's generation");
+    assert_eq!(what, "its own", "{out}");
+    let pipelines_dir = dir.path().join("cache/pipelines");
+    let library = pipelines_dir.join(format!("host-pipelines-{first_id}.bin"));
     assert!(library.is_file(), "{out}");
-    let names = dir.path().join("cache/pipelines/host-pipelines.names");
+    let names = pipelines_dir.join(format!("host-pipelines-{first_id}.names"));
     assert!(names.is_file(), "the library's names beside it: {out}");
 
-    // Another translator, the same translations: no pipeline made, and
-    // only the stand-in loaded.
+    // Another translator, the same translations: its generation starts from
+    // the first's, so no pipeline is made, and only the stand-in loaded.
     let same = run("256").unwrap().out;
     assert_eq!(figure(&same, "translated"), Some(3), "{same}");
     assert_eq!(compared(&same), Some((3, 0, 0)), "{same}");
     assert!(!same.contains("a new generation"), "{same}");
     assert_eq!(pipelines(&same), (0, 1, 2), "{same}");
+    let (same_id, what) = generation(&same).unwrap();
+    assert_ne!(same_id, first_id, "{same}");
+    assert_eq!(what, format!("from {first_id}"), "{same}");
 
     // And one container changed: its pipeline alone is made.
     write_pack(128);
@@ -388,16 +411,26 @@ fn precook_keeps_pipelines_across_translation_keys() {
     assert_eq!(figure(&changed, "translated"), Some(3), "{changed}");
     assert_eq!(compared(&changed), Some((2, 0, 1)), "{changed}");
     assert_eq!(pipelines(&changed), (1, 1, 1), "{changed}");
+    let (_, what) = generation(&changed).unwrap();
+    assert_eq!(what, format!("from {same_id}"), "{changed}");
 
     // The replaced pipeline is still available to a session using the old
-    // build, and its translations to its precook.
+    // build, and its translations to its precook: back to its own
+    // generation, as it left it.
     write_pack(64);
     let original = run("128").unwrap().out;
     assert_eq!(figure(&original, "from cache"), Some(3), "{original}");
     assert_eq!(pipelines(&original), (0, 1, 2), "{original}");
+    assert_eq!(
+        generation(&original),
+        Some((first_id.clone(), "its own".to_owned())),
+        "{original}"
+    );
 
     // A driver-rejected file is replaced with a usable library, and its
-    // names (another file's) are not trusted.
+    // names (another file's) are not trusted. (Another file in its place:
+    // a generation's file may be linked to another generation's.)
+    std::fs::remove_file(&library).unwrap();
     std::fs::write(&library, b"invalid pipeline library").unwrap();
     let repaired = run("128").unwrap().out;
     assert_eq!(pipelines(&repaired), (3, 0, 0), "{repaired}");

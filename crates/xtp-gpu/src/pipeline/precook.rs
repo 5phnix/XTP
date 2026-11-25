@@ -28,8 +28,11 @@
 //!   the precook's note: the kept descriptions and the library file
 //!   ([`cache`]).
 //! - The precook reuses the pipeline library across translator changes.
-//!   It can compact a library past [`LIBRARY_REBUILD_BYTES`] into a new
-//!   generation ([`rebuild_library`]) containing the pipelines used again.
+//!   Each translation key has its own generation of the library file,
+//!   seeded from the last one opened ([`generation`]); the precook can
+//!   compact one past [`LIBRARY_REBUILD_BYTES`] ([`rebuild_library`]) into
+//!   the pipelines used again, and a translator back to one whose
+//!   generation is still kept finds its pipelines there.
 //! - A pipeline the library holds is not loaded here ([`super::library`]'s
 //!   `without_loading`): it is made through the same function, which names
 //!   it from its translated shaders, root signature and state, and its name
@@ -329,6 +332,40 @@ fn digest_in(dir: &std::path::Path) -> Result<String, String> {
 /// before any pipeline is made; false if that is too late.
 pub fn rebuild_library() -> bool {
     super::library::rebuild()
+}
+
+/// This translation key's generation of the pipeline library: what its
+/// file holds besides this translator's pipelines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generation {
+    /// The translation key's first 16 hexadecimal digits: its files are
+    /// `host-pipelines-<id>.bin` and `.names`.
+    pub id: String,
+    /// The generation its file was seeded from (another translator's, or
+    /// `legacy`: the one file of before generations), and not compacted
+    /// since: it holds that translator's pipelines too. `None` for one that
+    /// started empty or was compacted.
+    pub from: Option<String>,
+    /// Its file's size just after its last compaction, if that was past
+    /// [`LIBRARY_REBUILD_BYTES`].
+    pub compacted: Option<u64>,
+    /// It had no file before this process (started empty or seeded now):
+    /// its file is not the one an earlier pass of this key left, whatever
+    /// its size, so a note of that pass does not hold for it.
+    pub new: bool,
+}
+
+/// This process's generation of the library ([`Generation`]), the oldest
+/// generations let go past their count or bytes; `None` without a pipeline
+/// cache folder. The host must be made, and this asked before any pipeline
+/// is (it settles which file the library opens).
+pub fn generation() -> Option<Generation> {
+    super::library::generation().map(|(g, new)| Generation {
+        id: g.id,
+        from: g.from,
+        compacted: g.compacted,
+        new,
+    })
 }
 
 /// The graphics and mesh pipelines sessions kept ([`super::record`]), each

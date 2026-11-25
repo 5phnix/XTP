@@ -35,11 +35,20 @@
 //!   one whose library file is gone or smaller than noted passes again,
 //!   as does `--force`. The host rejects the pipeline library after a
 //!   driver update, which the note does not see: `--force` then.
-//! - A translator change reuses the pipeline library in place. Entries are
-//!   keyed by the host DXIL, root signature and state. Once the library
-//!   exceeds `LIBRARY_REBUILD_BYTES`, the next pass compacts it, even if
-//!   it crossed the bound during the last save. A compacted library still
-//!   above the bound is compacted again when it doubles or changes translator.
+//! - The pipeline library keeps one generation per translation key, the
+//!   most recently opened few (`xtp_gpu::pipeline::precook::generation`):
+//!   a translator back to one whose generation is kept finds its pipelines
+//!   there and makes none, as when the PC queue alternates between branches
+//!   whose translators differ. A key with no generation starts from the
+//!   last one opened, its file linked: entries are keyed by the host DXIL,
+//!   root signature and state, so what a change did not alter is found by
+//!   its name. The report's `library` line says the generation opened.
+//! - A generation's file past `LIBRARY_REBUILD_BYTES` is compacted by the
+//!   next pass, even if it crossed the bound during the last save, when it
+//!   holds another translator's pipelines (seeded from another generation,
+//!   and not compacted since), has no compacted size past the bound, or has
+//!   doubled since that size ([`new_generation`]). The generations' list
+//!   keeps that size, not the note: the note is one for the whole cache.
 //! - After a translator change every container is translated again (the
 //!   answer is always this build's), and compared with what the translator
 //!   of the last whole pass kept: the report's `compared` line. A pipeline
@@ -107,8 +116,10 @@ const NOTE: &str = "precook.txt";
 /// The note's first line; another version of the note is no note. Since
 /// version 2 a pass with pipelines makes the kept graphics and mesh ones
 /// too; since version 3 the note says what they came from; since version 4
-/// the settings that change a pipeline and not a translation.
-const NOTE_FORMAT: &str = "xtp precook 4";
+/// the settings that change a pipeline and not a translation; since version
+/// 5 it no longer keeps a compacted library's size (each generation of the
+/// library does, [`Lineage`]).
+const NOTE_FORMAT: &str = "xtp precook 5";
 /// The time the kept graphics and mesh pipelines may take by default, in
 /// seconds (`XTP_PRECOOK_SECONDS`).
 const REPLAY_SECONDS: u64 = 900;
@@ -191,7 +202,6 @@ fn precook(o: Options) -> Result<()> {
                     recorded: c.recorded,
                     library: c.library,
                     settings: c.settings,
-                    compacted: None,
                 })
             })
             .map_err(anyhow::Error::msg)
@@ -204,11 +214,24 @@ fn precook(o: Options) -> Result<()> {
     let found = std::fs::read_to_string(&note_path)
         .ok()
         .and_then(|text| Note::parse(&text));
-    // Whether the library is made a new generation comes first: a library
-    // that grew past its bound while the note still holds is one too.
-    let generation = note.new_generation(found.as_ref(), gpu::LIBRARY_REBUILD_BYTES);
-    let plan = if o.force || generation.is_some() {
-        // A new generation holds what this pass makes: all of it.
+    // This translator's generation of the library (settled by `cache`
+    // above: seeded if it had none, the oldest let go).
+    let lineage = o
+        .pipelines
+        .then(gpu::generation)
+        .flatten()
+        .map(Lineage::from);
+    // Whether it is compacted comes first: a generation that grew past its
+    // bound while the note still holds is one too.
+    let generation = note
+        .pipelines
+        .as_ref()
+        .zip(lineage.as_ref())
+        .and_then(|(c, g)| new_generation(c.library, g, gpu::LIBRARY_REBUILD_BYTES));
+    let plan = if o.force || generation.is_some() || lineage.as_ref().is_some_and(|g| g.new) {
+        // A new generation holds what this pass makes: all of it. So does
+        // a generation started now, whose file is not the one the note's
+        // pass left (its key's generation was let go, and seeded again).
         Plan::Whole
     } else {
         note.plan(found.as_ref())
@@ -235,6 +258,9 @@ fn precook(o: Options) -> Result<()> {
         "cache        {} (opened in {opened:.1} s{listed})",
         shaders.display()
     );
+    if let (Some(g), Some(c)) = (&lineage, &note.pipelines) {
+        println!("library      {} ({} bytes)", g.text(), c.library);
+    }
     if plan == Plan::Nothing {
         println!(
             "up to date   for this translator, its settings, this pack and the kept pipelines ({:.1} s; --force passes again)",
@@ -336,12 +362,6 @@ fn precook(o: Options) -> Result<()> {
             let pipelines = match (cache(o.pipelines)?, &replay) {
                 (Some(mut now), Some(r)) => {
                     now.recorded = r.digest.clone();
-                    now.compacted = note.compaction_baseline(
-                        found.as_ref(),
-                        now.library,
-                        generation.is_some(),
-                        gpu::LIBRARY_REBUILD_BYTES,
-                    );
                     Some(now)
                 }
                 (now, _) => now,
@@ -382,7 +402,7 @@ struct Note {
 
 /// What the pipelines came from (`xtp_gpu::pipeline::precook::Cache`):
 /// the BLAKE3 of the file of kept descriptions (`none` without one) and
-/// the library file's size.
+/// the size of this translator's library file (its generation's).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cache {
     recorded: String,
@@ -391,9 +411,67 @@ struct Cache {
     /// (`xtp_gpu::pipeline::precook::PipelineSettings`): another is a
     /// whole pass.
     settings: String,
-    /// Size immediately after the last compaction, while still oversized.
-    /// Earlier notes have no such evidence and compact once above the bound.
+}
+
+/// What this translator's generation of the library holds besides its
+/// pipelines (`xtp_gpu::pipeline::precook::Generation`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Lineage {
+    id: String,
+    /// The generation its file was seeded from, not compacted since.
+    from: Option<String>,
+    /// Its size after its last compaction, if past the bound then.
     compacted: Option<u64>,
+    /// It started in this process (empty, or seeded from another): not the
+    /// file the note's pass left.
+    new: bool,
+}
+
+#[cfg(windows)]
+impl From<xtp_gpu::pipeline::precook::Generation> for Lineage {
+    fn from(g: xtp_gpu::pipeline::precook::Generation) -> Lineage {
+        Lineage {
+            id: g.id,
+            from: g.from,
+            compacted: g.compacted,
+            new: g.new,
+        }
+    }
+}
+
+impl Lineage {
+    /// The report's line.
+    fn text(&self) -> String {
+        match (&self.from, self.compacted) {
+            (Some(from), _) => format!("generation {} (from {from})", self.id),
+            (None, Some(bytes)) => {
+                format!("generation {} (compacted to {bytes} bytes)", self.id)
+            }
+            (None, None) => format!("generation {} (its own)", self.id),
+        }
+    }
+}
+
+/// Why this pass compacts the library's generation of `bytes`, `lineage`,
+/// into the pipelines it asks for: past `bound`, it holds another
+/// translator's pipelines (seeded from another generation, or from the one
+/// file of before generations), or was not compacted past the bound (it
+/// crossed it since: during the last save too), or has doubled since it
+/// was. `None`: it stays as it is, and a new translator's pipelines are
+/// added to it. Its own pipelines but for those only sessions asked for
+/// are kept (the precook asks for those it makes again).
+fn new_generation(bytes: u64, lineage: &Lineage, bound: u64) -> Option<&'static str> {
+    if bytes <= bound {
+        return None;
+    }
+    match (&lineage.from, lineage.compacted) {
+        (Some(_), _) => Some("past its bound, with another translator's pipelines"),
+        (None, None) => Some("past its bound"),
+        (None, Some(base)) if bytes >= base.saturating_mul(2) => {
+            Some("past its bound, twice its size after its last compaction")
+        }
+        (None, Some(_)) => None,
+    }
 }
 
 /// What a precook has to do, by its note ([`Note::plan`]).
@@ -406,25 +484,6 @@ enum Plan {
 }
 
 impl Note {
-    /// Keep the last compacted size across in-place saves. Crossing the
-    /// bound during a save leaves no baseline until a compaction succeeds.
-    fn compaction_baseline(
-        &self,
-        found: Option<&Note>,
-        saved: u64,
-        rebuilt: bool,
-        bound: u64,
-    ) -> Option<u64> {
-        if saved <= bound {
-            return None;
-        }
-        if rebuilt {
-            return Some(saved);
-        }
-        self.pipelines.as_ref().filter(|c| c.library > bound)?;
-        found?.pipelines.as_ref()?.compacted
-    }
-
     fn text(&self) -> String {
         let mut o = format!("{NOTE_FORMAT}\nkey {}\npack {}\n", self.key, self.pack);
         match &self.pipelines {
@@ -434,9 +493,6 @@ impl Note {
                     "pipelines yes\nrecorded {}\nlibrary {}\nsettings {}\n",
                     c.recorded, c.library, c.settings
                 );
-                if let Some(size) = c.compacted {
-                    let _ = writeln!(o, "compacted {size}");
-                }
             }
             None => o.push_str("pipelines no\n"),
         }
@@ -463,7 +519,6 @@ impl Note {
                 recorded: field("recorded")?,
                 library: field("library")?.parse().ok()?,
                 settings: field("settings")?,
-                compacted: field("compacted").and_then(|s| s.parse().ok()),
             }),
             _ => return None,
         };
@@ -473,22 +528,6 @@ impl Note {
             pipelines,
         };
         (note.text() == text).then_some(note)
-    }
-
-    /// An oversized library is compacted when it crosses the bound, doubles
-    /// or changes translator. Below the bound a new translator can load
-    /// matching entries directly and append any changed pipelines.
-    fn new_generation(&self, found: Option<&Note>, bound: u64) -> Option<&'static str> {
-        let now = self.pipelines.as_ref()?.library;
-        if now <= bound {
-            return None;
-        }
-        let then = found.and_then(|f| f.pipelines.as_ref());
-        (found.is_some_and(|f| f.key != self.key)
-            || then
-                .and_then(|c| c.compacted)
-                .is_none_or(|base| now >= base.saturating_mul(2)))
-        .then_some("past its bound")
     }
 
     /// What this pass has to do after the one `found` notes: nothing if it
@@ -1589,7 +1628,6 @@ mod tests {
                 recorded: recorded.into(),
                 library,
                 settings: "root-srv tables".into(),
-                compacted: None,
             })
         }
         let note = Note {
@@ -1598,7 +1636,7 @@ mod tests {
             pipelines: cache("01", 1000),
         };
         let text = note.text();
-        assert!(text.starts_with("xtp precook 4\n"));
+        assert!(text.starts_with("xtp precook 5\n"));
         assert_eq!(Note::parse(&text), Some(note.clone()));
         assert_eq!(note.plan(Some(&note)), Plan::Nothing);
         assert_eq!(note.plan(None), Plan::Whole);
@@ -1646,7 +1684,15 @@ mod tests {
         assert_eq!(Note::parse(&without.text()), Some(without.clone()));
         // Not notes.
         assert_eq!(Note::parse(""), None);
-        assert_eq!(Note::parse(&text.replace("precook 4", "precook 3")), None);
+        assert_eq!(Note::parse(&text.replace("precook 5", "precook 4")), None);
+        assert_eq!(
+            Note::parse(&format!(
+                "{}compacted 3000\n",
+                text.replace("precook 5", "precook 4")
+            )),
+            None,
+            "a note that kept a compacted size"
+        );
         assert_eq!(
             Note::parse(&text.replace("settings root-srv tables\n", "")),
             None,
@@ -1659,66 +1705,63 @@ mod tests {
         assert_eq!(Note::parse(&format!("{text}more\n")), None);
     }
 
-    /// Crossing the size bound triggers compaction even if the note holds.
-    /// An already oversized library is compacted again when its size doubles
-    /// or the translation key changes.
+    /// A generation past the bound is compacted when it holds another
+    /// translator's pipelines (seeded from another generation, or from the
+    /// one file of before), crossed the bound since its last compaction, or
+    /// doubled since; below the bound, or compacted past it and grown less
+    /// than twice, it stays. The note holding does not stop it.
     #[test]
-    fn a_library_past_its_bound_is_made_again_before_the_note_holds() {
-        let note = |key: &str, library| Note {
-            key: key.into(),
+    fn a_generation_past_its_bound_is_compacted_before_the_note_holds() {
+        let bound = 2000;
+        let lineage = |from: Option<&str>, compacted| Lineage {
+            id: "0123456789abcdef".into(),
+            from: from.map(str::to_owned),
+            compacted,
+            new: false,
+        };
+        let own = lineage(None, None);
+        let seeded = lineage(Some("fedcba9876543210"), None);
+        let legacy = lineage(Some("legacy"), None);
+        let compacted = lineage(None, Some(3000));
+        for g in [&own, &seeded, &legacy, &compacted] {
+            assert_eq!(new_generation(1500, g, bound), None, "{g:?}");
+            assert_eq!(new_generation(bound, g, bound), None, "{g:?}");
+        }
+        assert_eq!(new_generation(2500, &own, bound), Some("past its bound"));
+        for g in [&seeded, &legacy] {
+            assert_eq!(
+                new_generation(2500, g, bound),
+                Some("past its bound, with another translator's pipelines"),
+                "{g:?}"
+            );
+        }
+        assert_eq!(new_generation(3500, &compacted, bound), None);
+        assert_eq!(new_generation(5999, &compacted, bound), None);
+        assert_eq!(
+            new_generation(6000, &compacted, bound),
+            Some("past its bound, twice its size after its last compaction")
+        );
+        // The note holds (same key, pack, kept descriptions, a library at
+        // least as large): the generation is looked at first.
+        let note = |library| Note {
+            key: "k".into(),
             pack: "pack".into(),
             pipelines: Some(Cache {
                 recorded: "01".into(),
                 library,
                 settings: "root-srv tables".into(),
-                compacted: None,
             }),
         };
-        let bound = 2000;
-        let then = note("k", 1500);
-        assert_eq!(note("k", 1800).new_generation(Some(&then), bound), None);
-        let grown = note("k", 2500);
-        assert_eq!(grown.plan(Some(&then)), Plan::Nothing, "the note holds");
+        assert_eq!(note(2500).plan(Some(&note(1500))), Plan::Nothing);
+        assert_eq!(own.text(), "generation 0123456789abcdef (its own)");
         assert_eq!(
-            grown.new_generation(Some(&then), bound),
-            Some("past its bound"),
-            "looked at first"
-        );
-        let changed = note("j", bound);
-        assert_eq!(changed.plan(Some(&then)), Plan::Whole);
-        assert_eq!(changed.new_generation(Some(&then), bound), None);
-        assert_eq!(grown.new_generation(None, bound), Some("past its bound"));
-        // A new generation that is past the bound by itself.
-        let mut big = note("k", 3000);
-        assert_eq!(
-            then.compaction_baseline(Some(&then), 3000, false, bound),
-            None
-        );
-        assert!(
-            big.new_generation(Some(&big), bound).is_some(),
-            "crossed during a pass or legacy note"
-        );
-        big.pipelines.as_mut().unwrap().compacted =
-            big.compaction_baseline(Some(&then), 3000, true, bound);
-        let big = Note::parse(&big.text()).unwrap();
-        assert_eq!(note("k", 3500).new_generation(Some(&big), bound), None);
-        let mut larger = note("k", 4500);
-        larger.pipelines.as_mut().unwrap().compacted =
-            big.compaction_baseline(Some(&big), 4500, false, bound);
-        assert_eq!(
-            note("j", 3000).new_generation(Some(&big), bound),
-            Some("past its bound")
+            seeded.text(),
+            "generation 0123456789abcdef (from fedcba9876543210)"
         );
         assert_eq!(
-            note("k", 6000).new_generation(Some(&larger), bound),
-            Some("past its bound")
+            compacted.text(),
+            "generation 0123456789abcdef (compacted to 3000 bytes)"
         );
-        // Without pipelines, the library is not this pass's business.
-        let without = Note {
-            pipelines: None,
-            ..note("j", 0)
-        };
-        assert_eq!(without.new_generation(Some(&then), bound), None);
     }
 
     /// The outcomes of the kept pipelines and of the derived ones (after
