@@ -70,7 +70,12 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
     run_for(host, native, groups, host.target())
 }
 
-fn run_for(host: &Host, native: &crate::NativeProgram, groups: u32, target: super::Target) -> Result<Vec<u32>, String> {
+fn run_for(
+    host: &Host,
+    native: &crate::NativeProgram,
+    groups: u32,
+    target: super::Target,
+) -> Result<Vec<u32>, String> {
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
     // The validator, where one is installed: drivers take some modules it
     // refuses.
@@ -1675,25 +1680,30 @@ fn paired_lanes_share_lds_and_count_their_own_mask_bits() {
 #[ignore = "hardware: 32-lane waves (see hardware())"]
 fn paired_lanes_execute_a_half_precision_whole_wave_section() {
     let body = [
-        0x4A02_00FF, 0x3C00, // v_add_nc_u32 v1, 0x3c00, v0
+        0x4A02_00FF,
+        0x3C00,      // v_add_nc_u32 v1, 0x3c00, v0
         0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
-        0xD778_0002, 0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0xD778_0002,
+        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
         0x6404_0502, // v_add_f16 v2, v2, v2
-        0xD760_0009, 0x0001_4102, // v_readlane_b32 s9, v2, 32
+        0xD760_0009,
+        0x0001_4102, // v_readlane_b32 s9, v2, 32
         0xBEFE_040A, // s_mov_b64 exec, s[10:11]
         0x4A04_0409, // v_add_nc_u32 v2, s9, v2
     ];
     let p = program(&body, 128);
     let mut cs = emit_for(&p, HOSTS[0]).unwrap();
-    if let Ok(mut validator) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+    if let Ok(mut validator) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
         validator.validate(&mut cs.dxil).unwrap();
     }
     for (name, host) in hardware() {
         if host.target().runs(32) {
             let out = run_for(&host, &p, 1, HOSTS[0]).unwrap();
-            let expected: Vec<u32> = (0..128).map(|t| {
-                0x8000 + ((t & !15) ^ 16) + (t & !63) + 48
-            }).collect();
+            let expected: Vec<u32> = (0..128)
+                .map(|t| 0x8000 + ((t & !15) ^ 16) + (t & !63) + 48)
+                .collect();
             assert_eq!(out, expected, "{name}: paired FP16 rows");
         }
     }

@@ -176,8 +176,9 @@ The inexpensive per-lane paths run first, including constant lane reads
 through group-shared memory where the barriers meet. Otherwise a group
 of *k* complete console waves can declare `[numthreads(32*k,1,1)]` and
 `WaveSize(32)`. Host wave *w*, lane *i* carries console flat thread ids
-`64*w+i` and `64*w+i+32`. The original group dimensions decode both ids
-into x, y, z. Direct and indirect dispatch keep their original group counts.
+`64*w+i` and `64*w+i+32`. As in the existing lane assignment, the first
+lane's aligned flat id identifies its wave in the physical 1-D group. The
+original group dimensions decode both ids into x, y, z. Direct and indirect dispatch keep their original group counts.
 
 One host wave has all the registers of one console wave. At entry, the
 flat-id mapping covers every console thread once. Each SSA instruction
@@ -233,6 +234,14 @@ A number counts static occurrences. “Mask” counts `s_bcnt1_i32_b64` and
 | `d7db57731ada919b` | 4 | 14 | 12 | 0 | 0 | 0 |
 | `eae3498e6553afa8` | 3 | 2 | 2 | 2 | 0 | 0 |
 | `fa0bd10a35bfef3c` | 4 | 14 | 12 | 0 | 30 | 30 |
+
+All named lane reads in this set use immediate lanes. In
+`0c028454b58543f0` their rendezvous blocks and the group barrier do not
+form a dominance chain. Four programs also reach an LDS write from an LDS
+read without an intervening `s_barrier`: `02384a60fda6f2d0` at 0x608,
+`a1bf269d5b19f025` at 0x1d4, `b8f3f7979d6bbc50` at 0x101c and
+`eae3498e6553afa8` at 0xff8. The old mixed-access check rejects each
+path regardless of whether the addresses alias.
 
 ### The console flow on every host
 
