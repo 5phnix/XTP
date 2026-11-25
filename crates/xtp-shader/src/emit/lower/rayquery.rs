@@ -43,7 +43,7 @@ pub(crate) mod world;
 
 use sites::SITES;
 
-use super::super::bitcode::{Attr, Cast, Md, Module, Term, Ty, V, pred};
+use super::super::bitcode::{Attr, Bin, Cast, Md, Module, Term, Ty, V, pred};
 use super::super::container::Binding;
 use super::super::shader::{ROOT_CBV_SPACE, flags};
 use super::{Lower, Stop, Val, Why};
@@ -842,6 +842,24 @@ impl<'a> Lower<'a> {
         let at = self.begin_guarded(guard);
         let mask = self.s.m.i32(q.mask);
         let t_min = self.s.m.f32(q.t_min);
+        // DXR leaves a ray undefined (a device may hang on it) where its
+        // origin or direction is not finite, its direction is zero, or its
+        // t-max is below its t-min or NaN; the console's walk misses it
+        // (its box and triangle tests fail on NaN and on a zero direction),
+        // and so does the proof's host (`World::query`). Such a lane traces
+        // a ray of no length from the origin instead, which misses, and
+        // answers a miss at its own t-max.
+        let valid = self.valid_ray(origin, direction, t_min, t_max);
+        let zero = self.s.m.f32(0);
+        let unit = self.s.m.f32(1.0f32.to_bits());
+        let cur = self.cur;
+        let origin = origin.map(|x| self.s.m.select(cur, valid, x, zero));
+        let direction = [
+            self.s.m.select(cur, valid, direction[0], zero),
+            self.s.m.select(cur, valid, direction[1], zero),
+            self.s.m.select(cur, valid, direction[2], unit),
+        ];
+        let traced_t_max = self.s.m.select(cur, valid, t_max, t_min);
         let args = [
             query,
             tlas,
@@ -854,7 +872,7 @@ impl<'a> Lower<'a> {
             direction[0],
             direction[1],
             direction[2],
-            t_max,
+            traced_t_max,
         ];
         self.s.op(
             self.cur,
@@ -887,6 +905,7 @@ impl<'a> Lower<'a> {
         // COMMITTED_TRIANGLE_HIT.
         let one = self.s.m.i32(1);
         let hit = self.s.m.cmp(done, pred::EQ, status, one);
+        let hit = self.s.m.bin(done, Bin::And, hit, valid);
         let mut t = None;
         let mut values = Vec::with_capacity(q.results.len());
         for (&(_, kind), &old) in q.results.iter().zip(&olds) {
@@ -894,14 +913,15 @@ impl<'a> Lower<'a> {
                 Kind::Hit => self.s.m.cast(done, Cast::ZExt, hit, i32t),
                 Kind::T => {
                     let t = *t.get_or_insert_with(|| {
-                        self.s.op(
+                        let committed = self.s.op(
                             done,
                             "rayQuery_StateScalar.f32",
                             Attr::ReadOnly,
                             f32t,
                             200,
                             &[query],
-                        )
+                        );
+                        self.s.m.select(done, valid, committed, t_max)
                     });
                     self.s.m.cast(done, Cast::Bitcast, t, i32t)
                 }
@@ -916,6 +936,31 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Whether a ray is one DXR defines: its origin and direction finite,
+    /// its direction not zero, its t-max at or above its t-min. The compares
+    /// are ordered, so a NaN fails each.
+    fn valid_ray(&mut self, origin: [V; 3], direction: [V; 3], t_min: V, t_max: V) -> V {
+        let at = self.cur;
+        let inf = self.s.m.f32(f32::INFINITY.to_bits());
+        let minus_inf = self.s.m.f32(f32::NEG_INFINITY.to_bits());
+        let zero = self.s.m.f32(0);
+        let mut ok = self.s.m.cmp(at, pred::OGE, t_max, t_min);
+        for x in origin.into_iter().chain(direction) {
+            let below = self.s.m.cmp(at, pred::OLT, x, inf);
+            let above = self.s.m.cmp(at, pred::OGT, x, minus_inf);
+            ok = self.s.m.bin(at, Bin::And, ok, below);
+            ok = self.s.m.bin(at, Bin::And, ok, above);
+        }
+        let mut some = self.s.m.bool(false);
+        for d in direction {
+            let below = self.s.m.cmp(at, pred::OLT, d, zero);
+            let above = self.s.m.cmp(at, pred::OGT, d, zero);
+            some = self.s.m.bin(at, Bin::Or, some, below);
+            some = self.s.m.bin(at, Bin::Or, some, above);
+        }
+        self.s.m.bin(at, Bin::And, ok, some)
     }
 
     /// The acceleration structure's handle (`t`[`TLAS_REGISTER`] in

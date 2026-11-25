@@ -1728,6 +1728,92 @@ fn rayquery_proof_refuses_what_the_walk_does_not_do() {
     }
 }
 
+/// Rays DXR leaves undefined (a device may hang on them: a zero or NaN
+/// direction, a NaN origin, a t-max below t-min or NaN) miss, as the
+/// console's walk and the proof's host do; the other lanes of the wave
+/// trace as before. On WARP, family A's program over two triangles that
+/// cover its rays' square at z = 5.
+#[test]
+fn rayquery_family_a_misses_rays_dxr_leaves_undefined_on_warp() {
+    let (native, site) = family_a();
+    let cs = translate_with(&without_lds(&native), &site, false).unwrap();
+    let Ok(host) = super::host::Host::new(true) else {
+        eprintln!("no WARP device; skipped");
+        return;
+    };
+    let square = Blas {
+        leaves: vec![
+            vec![a_at(5.0)],
+            vec![[[4.0, 4.0, 5.0], [4.0, 0.0, 5.0], [0.0, 4.0, 5.0]]],
+        ],
+        cycle: None,
+    };
+    let w = one_instance(square);
+    let scene = warp::Scene {
+        blases: w
+            .blases
+            .iter()
+            .map(|b| b.triangles().copied().collect())
+            .collect(),
+        instances: w
+            .instances
+            .iter()
+            .map(|i| (i.to_world(), i.id, i.mask, i.contribution, i.flags, i.blas))
+            .collect(),
+    };
+    let undefined: [([f32; 3], [f32; 3], f32); 5] = [
+        ([1.0, 0.5, 0.0], [0.0, 0.0, 0.0], 20.0),
+        ([f32::NAN, 0.5, 0.0], [0.0, 0.0, 1.0], 20.0),
+        ([1.0, 0.5, 0.0], [0.0, f32::NAN, 1.0], 20.0),
+        ([1.0, 0.5, 0.0], [0.0, 0.0, 1.0], -1.0),
+        ([1.0, 0.5, 0.0], [0.0, 0.0, 1.0], f32::NAN),
+    ];
+    let mut records = Vec::new();
+    for l in 0..THREADS as usize {
+        // Lanes off the square's diagonal, straight up to z = 5.
+        let fine = (
+            [
+                0.25 + (l % 6) as f32 * 0.25,
+                0.25 + (l / 6) as f32 * 0.1,
+                0.0,
+            ],
+            [0.0, 0.0, 1.0],
+            20.0,
+        );
+        let (origin, direction, t_max) = undefined.get(l % 8).copied().unwrap_or(fine);
+        for x in origin
+            .into_iter()
+            .chain([t_max])
+            .chain(direction)
+            .chain([0.0])
+        {
+            records.extend(x.to_le_bytes());
+        }
+    }
+    let views = [
+        warp::View::Srv(records),
+        warp::View::Srv(vec![0; 256]),
+        warp::View::Out(THREADS),
+        warp::View::Srv(u32::MAX.to_le_bytes().to_vec()),
+    ];
+    let out = match warp::run(&host, &cs, &scene, &views, true) {
+        Ok(Some(out)) => out,
+        Ok(None) => {
+            eprintln!("WARP has no ray-tracing tier 1.1; skipped");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+    for (l, &got) in out.iter().enumerate() {
+        let got = f32::from_bits(got);
+        if l % 8 < undefined.len() {
+            assert_eq!(got, f32::MAX, "lane {l}: an undefined ray misses");
+        } else {
+            assert!((got - 5.04).abs() < 1e-4, "lane {l}: {got}");
+        }
+    }
+}
+
 /// The structure's descriptor is found where the dispatch looks: in the
 /// table whose address the site's user SGPR holds, at the site's offset; a
 /// site whose SGPR starts no table, or holds root constants, has none, and
