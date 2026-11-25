@@ -731,6 +731,7 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            crate::resource::note_target_view(texture, record.desc().map(|d| d.Format.0 as u32));
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
