@@ -514,18 +514,21 @@ impl HostList {
     /// cannot copy it, the plane stays behind its twin and waits for the
     /// next draw or dispatch after the query, as before.
     fn plane_between(&self, depth: &Arc<HostTexture>, twin: &Arc<Twin>, in_query: bool) {
-        if !in_query {
+        let recorded = if in_query {
+            self.copy_plane(depth, twin)
+        } else {
             self.pass_plane(depth, twin);
-        } else if !self.copy_plane(depth, twin) {
+            true
+        };
+        if !recorded {
             let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(u) = twins.by_twin.get_mut(&(Arc::as_ptr(twin) as usize)) {
                 u.plane_behind = true;
             }
             self.twins_due.store(true, Ordering::Relaxed);
-            return;
         }
         #[cfg(feature = "diagnostics")]
-        {
+        if recorded {
             stale::pass(true);
             probe::record(self, depth, twin, true);
         }
