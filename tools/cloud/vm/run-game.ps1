@@ -62,7 +62,7 @@ try {
         Set-XtpSource $Bundle $Ref $Commit
         $log = Join-Path 'C:\xtp\logs' ("{0}-build.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
         $code = Invoke-XtpSessionJob -Exe "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-            -Arguments '-NoProfile -ExecutionPolicy Bypass -File C:\xtp\tools\vm\cargo-steps.ps1 -Mode build' -Log $log -User $SessionUser -NoWait:$NoWait
+            -Arguments '-NoProfile -ExecutionPolicy Bypass -File C:\xtp\tools\vm\cargo-steps.ps1 -Mode build' -Log $log -User $SessionUser
         if ($code -ne 0) { Write-Output "build FAILED ($code) (log $log)"; exit $code }
         Write-Output "build PASSED (log $log)"
     }
@@ -122,7 +122,7 @@ try {
             '-Log', "`"$stopgapLog`"", '-After', (Get-Date).ToString('o'))
     }
     try {
-        $code = Invoke-XtpSessionJob -Exe $Exe -Arguments "run `"$title`" --execute $XtpArgs" -Log $raw -Seconds $Seconds -Environment $envs -User $SessionUser -Quiet -NoWait:$NoWait
+        $code = Invoke-XtpSessionJob -Exe $Exe -Arguments "run `"$title`" --execute $XtpArgs" -Log $raw -Seconds $Seconds -Environment $envs -User $SessionUser -Quiet
     } finally {
         foreach ($p in $sampler, $typeperf) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
         if ($stopgap) {

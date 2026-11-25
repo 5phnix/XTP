@@ -20,23 +20,3 @@ a private bucket. The guide is [docs/dev/cloud-setup.md](../../docs/dev/cloud-se
 
 Configuration: copy `cloud.example.json` to `%LOCALAPPDATA%\xtp\cloud.json`
 (outside the repository) and fill it in.
-
-### L4 queue
-
-Run `tools\cloud\run-remote.ps1 -Status` to see who holds the clone
-(`src`) and the desktop (`session`), followed by the waiters for each
-in admission order. Times are seconds held or seconds waiting. Status
-reads the VM without starting it or uploading scripts.
-
-Each lock request joins its own FIFO on arrival at the VM. Tickets under
-`C:\xtp\jobs\queue\<lock>\` carry the VM controller's PID, process start
-time and owner. Only the head can take the lock. `-NoWait` fails when the
-requested lock is held or another request is ahead. The next contender removes
-dead owners' tickets and locks, including locks from older clients. If
-the controller exits while its scheduled desktop job is active, the lock
-protects the job until it finishes.
-
-After one hour, a warning identifies a possible stall when the controller
-and live worker processes have used less than 1% of one CPU core on
-average. The status display and waiting callers report it. A long-running
-desktop job also checks its own lock. The warning leaves the job running.
