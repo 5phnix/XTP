@@ -226,7 +226,9 @@ struct Heap {
     object: Object,
     desc: Desc,
     #[cfg(windows)]
-    host: Option<HostHeap>,
+    // Un tas d’occlusion accepte les deux types. Chaque type initialise ses
+    // emplacements à sa propre valeur visible, lors de sa première utilisation.
+    host: [std::sync::OnceLock<Option<HostHeap>>; 2],
 }
 
 /// Device method.
@@ -245,13 +247,13 @@ pub(crate) extern "system" fn create(
         object: Object::new(&FUNCTIONS),
         desc,
         #[cfg(windows)]
-        host: make_host(desc),
+        host: Default::default(),
     });
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
 #[cfg(windows)]
-fn make_host(desc: Desc) -> Option<HostHeap> {
+fn make_host(desc: Desc, query_kind: u32) -> Option<HostHeap> {
     let kind = match desc.kind {
         0 => D3D12_QUERY_HEAP_TYPE_OCCLUSION,
         2 => D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
@@ -273,10 +275,15 @@ fn make_host(desc: Desc) -> Option<HostHeap> {
     let heap = heap?;
     let occlusion = if desc.kind == 0 {
         let host = crate::host::host()?;
-        let results = crate::host::buffers::card_buffer(&host.device, u64::from(desc.count) * 8)?;
+        let value: u64 = if query_kind == 0 { 1 << 20 } else { 1 };
+        let (results, slots) = host.shared_buffer(u64::from(desc.count) * 8)?;
         let (visible, data) = host.upload_buffer(8)?;
-        // SAFETY: les huit octets mappés restent constants pendant la vie du tas.
-        unsafe { data.cast::<u64>().write_unaligned(1) };
+        // SAFETY: les deux tampons sont mappés et encore privés. Le GPU peut
+        // lire un emplacement avant que le titre ait enregistré son premier EndQuery.
+        unsafe {
+            std::slice::from_raw_parts_mut(slots.cast::<u64>(), desc.count as usize).fill(value);
+            data.cast::<u64>().write_unaligned(value);
+        }
         Some((results, visible))
     } else {
         None
@@ -294,7 +301,9 @@ pub(crate) fn host_heap<'a>(this: This, kind: u32, first: u32, count: u32) -> Op
     {
         return None;
     }
-    heap.host.as_ref()
+    heap.host[usize::from(kind == 1)]
+        .get_or_init(|| make_host(heap.desc, kind))
+        .as_ref()
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -401,12 +410,114 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_draw_is_visible_until_the_slot_is_reused() {
-        let Some(_gpu) = crate::testgpu::device(
-            "query::tests::a_dropped_draw_is_visible_until_the_slot_is_reused",
-        ) else {
+    fn indirect_and_mesh_drops_mark_only_the_enclosing_query() {
+        let test = "query::tests::indirect_and_mesh_drops_mark_only_the_enclosing_query";
+        let Some(gpu) = crate::testgpu::device(test) else {
             return;
         };
+        let host = gpu.host();
+        let null = std::ptr::null();
+        let desc = Desc {
+            kind: 0,
+            count: 7,
+            nodes: 0,
+        };
+        let mut heap = null;
+        assert_eq!(
+            create(null, &desc, &HEAP_IIDS[0], &mut heap),
+            crate::object::S_OK
+        );
+        let args = TitleBuffer::new(256);
+        let out = TitleBuffer::new(256);
+        let list = TitleList::new();
+        let this = list.this();
+        let mark = |offset, index| {
+            slot::<extern "system" fn(This, This, u32, u32)>(this, offset)(this, heap, 0, index)
+        };
+        let newer = if crate::device::newer() { 16 } else { 0 };
+        for index in 0..7 {
+            mark(0xe0, index);
+            match index {
+                0..=4 => {
+                    // Sans pipeline, les commandes de dessin échouent. Un dispatch
+                    // de calcul et une liste de zéro commande laissent le compte à zéro.
+                    let kind = [0, 1, 10, 2, 0][index as usize];
+                    let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind),
+                        ..Default::default()
+                    };
+                    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                        ByteStride: 20,
+                        NumArgumentDescs: 1,
+                        pArgumentDescs: &arg,
+                        NodeMask: 0,
+                    };
+                    let mut sig = null;
+                    assert_eq!(
+                        crate::signature::create(
+                            null,
+                            (&raw const desc).cast(),
+                            null,
+                            &PAGEABLE_IIDS[0],
+                            &mut sig
+                        ),
+                        crate::object::S_OK
+                    );
+                    slot::<extern "system" fn(This, This, u32, This, u64, This, u64)>(
+                        this,
+                        0x1d8 + newer,
+                    )(
+                        this,
+                        sig,
+                        u32::from(index != 4),
+                        args.resource(),
+                        0,
+                        null,
+                        0,
+                    );
+                    slot::<extern "system" fn(This) -> u32>(sig, 0x10)(sig);
+                }
+                5 => slot::<extern "system" fn(This, u32, u32, u32)>(this, 0x3f8 + newer)(
+                    this, 1, 1, 1,
+                ),
+                _ => slot::<extern "system" fn(This, u32, u64, u64, u64)>(this, 0x310 + newer)(
+                    this,
+                    1,
+                    0,
+                    args.address(),
+                    0,
+                ),
+            }
+            mark(0xe8, index);
+        }
+        slot::<extern "system" fn(This, This, u32, u32, u32, This, u64)>(this, 0xf0)(
+            this,
+            heap,
+            0,
+            0,
+            desc.count,
+            out.resource(),
+            0,
+        );
+        release(heap);
+        list.run();
+        host.drain();
+        let words = out.words();
+        let values: Vec<_> = words[..14]
+            .chunks_exact(2)
+            .map(|w| u64::from(w[0]) | (u64::from(w[1]) << 32))
+            .collect();
+        let visible = 1 << 20;
+        assert_eq!(values, [visible, visible, visible, 0, 0, visible, visible]);
+    }
+
+    #[test]
+    fn a_dropped_draw_is_visible_until_the_slot_is_reused() {
+        let test = "query::tests::a_dropped_draw_is_visible_until_the_slot_is_reused";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
         for kind in [0, 1] {
             let desc = Desc {
                 kind: 0,
@@ -437,6 +548,10 @@ mod tests {
                         0xf0,
                     )(list.this(), heap, kind, 0, 2, out.resource(), offset)
                 };
+            // Une première lecture précède toute écriture, même sur le GPU.
+            let fresh = TitleList::new();
+            resolve(&fresh, 40);
+            fresh.run();
             // La liste de lecture est enregistrée avant celle qui produit les résultats.
             resolve(&reader, 24);
             mark(0xe0, 0);
@@ -466,9 +581,13 @@ mod tests {
             release(heap);
             writer.run();
             reader.run();
+            host.drain();
+            let visible = if kind == 0 { 1 << 20 } else { 1 };
             assert_eq!(
-                &out.words()[1..11],
-                &[0xface, 1, 0, 0, 0, 0, 0, 1, 0, 0xface]
+                &out.words()[1..15],
+                &[
+                    0xface, visible, 0, 0, 0, 0, 0, visible, 0, visible, 0, visible, 0, 0xface
+                ]
             );
         }
     }
