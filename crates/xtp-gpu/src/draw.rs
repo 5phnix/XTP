@@ -7701,8 +7701,7 @@ float4 ps(V v) : SV_Target { return v.color; }
             }
         }
         list.run();
-        let [through_table, through_root, through_decoy] =
-            [0, 1, 2].map(|k| outputs[k].words());
+        let [through_table, through_root, through_decoy] = [0, 1, 2].map(|k| outputs[k].words());
         let two = 2.0f32.to_bits();
         assert_eq!(through_table, [1, two, 0, 0], "the trace's rays");
         assert_eq!(through_table, through_root);
