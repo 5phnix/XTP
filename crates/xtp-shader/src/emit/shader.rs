@@ -161,6 +161,9 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// A vertex or geometry shader that declares a UAV (the loop-limit
+    /// counter): the validator wants it.
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const RASTER_ORDERED: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
@@ -497,6 +500,11 @@ impl Shader {
             &[bind, z, f],
         );
         self.flags |= flags::RAW_BUFFERS;
+        // A vertex shader (or the geometry half of a merged ES + GS stage)
+        // declaring a UAV: pixel, compute and mesh shaders need no flag.
+        if self.threads.is_none() && !self.pixel {
+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
+        }
         self.loop_counter = true;
         self.annotate(block, h, 0x100b, 0)
     }
@@ -948,6 +956,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
