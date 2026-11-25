@@ -144,6 +144,7 @@ impl IncompleteTargets {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    pub(crate) occlusion: crate::query::Active,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -2171,6 +2172,7 @@ impl State {
             meshes.ran();
         }
         if let Err(why) = ran {
+            self.occlusion.dropped_draw();
             dropped("mesh dispatch", self.pipeline, why);
         }
     }
@@ -2508,6 +2510,7 @@ impl State {
             meshes.ran();
         }
         if let Err(why) = ran {
+            self.occlusion.dropped_draw();
             dropped("draw", self.pipeline, why);
         }
     }
@@ -2607,7 +2610,10 @@ impl State {
                         #[cfg(feature = "diagnostics")]
                         meshes.ran();
                     }
-                    Err(why) => dropped("indexed draw", self.pipeline, why),
+                    Err(why) => {
+                        self.occlusion.dropped_draw();
+                        dropped("indexed draw", self.pipeline, why);
+                    }
                 }
                 return;
             }
@@ -2633,7 +2639,10 @@ impl State {
                 #[cfg(feature = "diagnostics")]
                 meshes.ran();
             }
-            Err(why) => dropped("indexed draw", self.pipeline, why),
+            Err(why) => {
+                self.occlusion.dropped_draw();
+                dropped("indexed draw", self.pipeline, why);
+            }
         }
     }
 }
@@ -2991,40 +3000,51 @@ impl State {
             Records::Direct(_) => Default::default(),
         };
         let pso = bind(self, list)?;
-        let prepared = self.expand_rectangles(list, inputs, (stride, max), arguments, writes)?;
-        self.host_roots[1] = 0;
-        // SAFETY: les passes de calcul ont remplacé le PSO, les racines graphiques restent valides.
-        unsafe { list.list.SetPipelineState(&pso) };
-        self.host_pipeline = pso.as_raw() as usize;
-        prepared.bind_vertices(list);
-        #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            let text = match arguments.0 {
-                Records::Title(_, at) => format!("indirect rectangles max {max} at {at:#x}"),
-                Records::Direct([indices, instances, ..]) => {
-                    format!("indexed rectangles {indices}x{instances}")
-                }
+        let mut batches = crate::rectangles::Batches::new(writes);
+        let mut first = 0;
+        while first < max {
+            let prepared = self.expand_rectangles(
+                list,
+                inputs,
+                (stride, first..max),
+                arguments,
+                &mut batches,
+            )?;
+            self.host_roots[1] = 0;
+            // SAFETY: les passes de calcul ont remplacé le PSO, les racines graphiques restent valides.
+            unsafe { list.list.SetPipelineState(&pso) };
+            self.host_pipeline = pso.as_raw() as usize;
+            prepared.bind_vertices(list);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                let text = match arguments.0 {
+                    Records::Title(_, at) => format!("indirect rectangles max {max} at {at:#x}"),
+                    Records::Direct([indices, instances, ..]) => {
+                        format!("indexed rectangles {indices}x{instances}")
+                    }
+                };
+                self.op_text(text, false)
+            });
+            let _timed = crate::timestamps::command(
+                list,
+                crate::timestamps::What::Rectangles,
+                crate::pipeline::host_pipeline(self.pipeline as This),
+            );
+            // SAFETY: an open list with everything set; the arguments and their
+            // count are the list's own, in the indirect argument state (records
+            // past the title's count do not run); the signature is cached.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    prepared.max,
+                    &prepared.args,
+                    prepared.offset,
+                    &prepared.args,
+                    prepared.count_offset,
+                )
             };
-            self.op_text(text, false)
-        });
-        let _timed = crate::timestamps::command(
-            list,
-            crate::timestamps::What::Rectangles,
-            crate::pipeline::host_pipeline(self.pipeline as This),
-        );
-        // SAFETY: an open list with everything set; the arguments and their
-        // count are the list's own, in the indirect argument state (records
-        // past the title's count do not run); the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                prepared.max,
-                &prepared.args,
-                prepared.offset,
-                &prepared.args,
-                prepared.count_offset,
-            )
-        };
+            first += prepared.max;
+        }
         Ok(())
     }
 
@@ -3035,9 +3055,9 @@ impl State {
         &mut self,
         list: &HostList,
         inputs: &[crate::pipeline::host::Input],
-        (stride, max): (u32, u32),
+        (stride, range): (u32, std::ops::Range<u32>),
         (records, counter, index): RectangleArguments,
-        writes: crate::indirect::Writes,
+        batches: &mut crate::rectangles::Batches,
     ) -> Result<crate::rectangles::Prepared, Unready> {
         let vertices = self.vertex.map(|v| (v.address, v.size, v.stride));
         self.recording.lease(list);
@@ -3046,15 +3066,15 @@ impl State {
             &mut self.own.rects,
             inputs,
             &vertices,
-            (records, stride, max),
+            (records, stride, range.clone()),
             index,
             counter,
-            if matches!(records, Records::Title(..)) {
+            if range.start == 0 && matches!(records, Records::Title(..)) {
                 self.own.indirect_samples.next(list, self.pipeline)
             } else {
                 None
             },
-            writes,
+            batches,
         )?)
     }
 }
@@ -3263,7 +3283,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::descriptor::host::SHARED_CHUNK;
     use crate::descriptor::{OWN_VIEW_HEAP, TestHeap};
@@ -4811,7 +4831,7 @@ float4 ps(V v) : SV_Target { return v.color; }
     /// in slot 0, colors (R8G8B8A8_UNORM) in slot 1. Without: corners from
     /// the vertex id, in white: vertex `i` is corner `i % 3` (top left,
     /// bottom left, bottom right) of cell `i / 3`.
-    struct Painter {
+    pub(crate) struct Painter {
         root: ID3D12RootSignature,
         pso: ID3D12PipelineState,
         target: ID3D12Resource,
@@ -4854,7 +4874,7 @@ float4 ps(V v) : SV_Target { return v.color; }
             code.expect("compiled code")
         }
 
-        fn new(host: &Host, inputs: bool) -> Painter {
+        pub(crate) fn new(host: &Host, inputs: bool) -> Painter {
             use windows::Win32::Graphics::Dxgi::Common::*;
             let entry = if inputs {
                 s!("vs_inputs")
@@ -4985,7 +5005,7 @@ float4 ps(V v) : SV_Target { return v.color; }
 
         /// Binds the pipeline and its target, as `prepare` binds a
         /// title's draw.
-        fn bind(&self, list: &HostList) {
+        pub(crate) fn bind(&self, list: &HostList) {
             let side = SIDE as f32;
             // SAFETY: an open list; our live objects, alive until it has run.
             unsafe {
@@ -5463,9 +5483,9 @@ float4 ps(V v) : SV_Target { return v.color; }
             .expand_rectangles(
                 list.host(),
                 &painter_inputs(),
-                (16, 1),
+                (16, 0..1),
                 (Records::Title(&args_copy, args.address()), None, None),
-                Default::default(),
+                &mut Default::default(),
             )
             .expect("expanded");
         let scratch = prepared.args.clone();

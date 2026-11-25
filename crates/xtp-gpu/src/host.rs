@@ -717,6 +717,7 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    pub(crate) query_resolves: crate::query::Resolves,
     /// Swapped for a fresh one when the list is reset while it runs.
     allocator: Mutex<ID3D12CommandAllocator>,
     pub(crate) list: ID3D12GraphicsCommandList,
@@ -1202,6 +1203,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                query_resolves: Default::default(),
                 states: Mutex::default(),
                 prelude: Mutex::new((prelude_allocator, prelude)),
                 twins: Mutex::default(),
