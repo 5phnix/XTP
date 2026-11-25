@@ -1134,11 +1134,10 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
-                    (Some(Val::Missing(super::mask::LANE_MASK)), false)
-                        if self.unused_pixel_sgpr(phi.reg, q, b) =>
-                    {
-                        self.s.m.i32(0)
-                    }
+                    (
+                        Some(Val::Missing(super::mask::LANE_MASK | super::smem::ONLY_DATA)),
+                        false,
+                    ) if self.unused_pixel_sgpr(phi.reg, q, b) => self.s.m.i32(0),
                     (Some(Val::Missing(_)), false)
                         if numbers && self.dead_at_join(arg, &mut Vec::new()) =>
                     {

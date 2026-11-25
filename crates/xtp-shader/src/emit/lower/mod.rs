@@ -202,19 +202,37 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             what: UNTRACKED_SELECT,
             ..
         }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
-        Err(ShaderError::Unsupported {
-            what: "the first half of an interpolation" | "a hardware SGPR input",
-            ..
-        }) if parts.native.stage == HwStage::Ps => {
-            let mut io = crate::io::raise_inputs(parts.p, parts.native, true)?;
-            io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
-            lower_program(
-                &Parts {
-                    io: &io,
-                    ..parts.clone()
-                },
-                false,
-            )
+        Err(original @ ShaderError::Unsupported { what, .. })
+            if parts.native.stage == HwStage::Ps
+                && matches!(
+                    what,
+                    "the first half of an interpolation" | "a hardware SGPR input"
+                ) =>
+        {
+            let retry = |io: &mut Io| {
+                io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
+                lower_program(
+                    &Parts {
+                        io,
+                        ..parts.clone()
+                    },
+                    false,
+                )
+            };
+            if what == "a hardware SGPR input" {
+                // Le nombre de SGPR définis à l'entrée ne change aucune paire.
+                match retry(&mut parts.io.clone()) {
+                    Ok(result) => return Ok(result),
+                    Err(ShaderError::Unsupported {
+                        what: "the first half of an interpolation",
+                        ..
+                    }) => {}
+                    Err(_) => return Err(original),
+                }
+            }
+            crate::io::raise_inputs(parts.p, parts.native, true)
+                .and_then(|mut io| retry(&mut io))
+                .map_err(|_| original)
         }
         result => result,
     }
