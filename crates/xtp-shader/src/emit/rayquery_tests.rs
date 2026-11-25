@@ -1899,6 +1899,15 @@ fn rayquery_proves_a_title_container_by_play() {
     // As the runtime translates it: spliced and valid.
     let cs = super::translate(&data).unwrap_or_else(|e| panic!("{e}"));
     check_dxil(&cs);
+    // What the host binds for it: whether it writes through views picked at
+    // run time (which make every host copy suspect), its root views.
+    eprintln!(
+        "run-time buffers {:#x}, root SRVs {:?}, root UAVs {:?}, user data {}",
+        cs.run_time_buffers,
+        cs.root_srvs,
+        cs.root_uavs,
+        cs.user_data.len()
+    );
     // Its DXIL, for a look at its loops (`dxc -dumpbin`), where
     // `XTP_RT_DXIL_OUT` says: outside the repository, as the container.
     if let Some(out) = std::env::var_os("XTP_RT_DXIL_OUT") {
