@@ -725,13 +725,15 @@ mod tests {
     /// [`install`] and [`Installed::set`] on real code of our own, in a page
     /// made `PAGE_EXECUTE_READ` like an image's `.text`: the functions
     /// answer 1 on bvh and 0 on the fallback, the page keeps its
-    /// protection, and two threads calling them while the path flips a few
-    /// thousand times only ever get 0 or 1.
+    /// protection, and two threads calling them while the path flips (4000
+    /// times at least, and until each thread has made 1000 rounds of calls)
+    /// only ever get 0 or 1.
     #[cfg(windows)]
     #[test]
     fn set_flips_live_code_and_keeps_its_protection() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+        use std::time::{Duration, Instant};
 
         use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
         use windows_sys::Win32::System::Memory::{
@@ -796,10 +798,14 @@ mod tests {
         assert_eq!((one(), two()), (1, 1));
         assert_eq!(protection(), PAGE_EXECUTE_READ);
 
+        // Flips go on until each caller has run a while beside them: on a
+        // loaded machine a caller may start late (the check's farm, where
+        // 4000 flips once ended before either had made a call).
         let stop = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
         let callers: Vec<_> = (0..2)
-            .map(|_| {
-                let stop = Arc::clone(&stop);
+            .map(|n| {
+                let (stop, calls) = (Arc::clone(&stop), Arc::clone(&calls));
                 std::thread::spawn(move || {
                     let mut seen = [0u64; 2];
                     while !stop.load(SeqCst) {
@@ -807,21 +813,32 @@ mod tests {
                             assert!(answer <= 1, "answered {answer}");
                             seen[answer as usize] += 1;
                         }
+                        calls[n].fetch_add(1, SeqCst);
                     }
                     seen
                 })
             })
             .collect();
-        for i in 0..4000 {
-            installed.set(Choice::of(i % 2 == 0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut flips = 0u64;
+        while flips < 4000 || calls.iter().any(|c| c.load(SeqCst) < 1000) {
+            if Instant::now() > deadline {
+                break;
+            }
+            installed.set(Choice::of(flips % 2 == 0)).unwrap();
+            flips += 1;
             std::thread::yield_now();
         }
         stop.store(true, SeqCst);
-        for caller in callers {
+        for (n, caller) in callers.into_iter().enumerate() {
             let seen = caller.join().expect("a caller failed");
-            assert!(seen[0] + seen[1] > 0);
+            assert!(
+                seen[0] + seen[1] > 0,
+                "caller {n} made no call in 60 s of {flips} flips"
+            );
         }
-        assert_eq!((one(), two()), (1, 1), "the last flip put bvh back");
+        installed.set(Choice::Bvh).unwrap();
+        assert_eq!((one(), two()), (1, 1), "bvh put back");
 
         drop(installed);
         // SAFETY: our page, no longer run.
