@@ -278,7 +278,6 @@ pub(crate) fn wave64_program(
     let native = xtp_shader::NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
-        float_mode: 0,
         vgprs: 8,
         // A UAV table in user SGPR 0; the group id in s1.
         layout: vec![RootParam {

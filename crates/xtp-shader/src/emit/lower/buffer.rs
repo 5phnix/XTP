@@ -958,7 +958,6 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
-            float_mode: 0,
             vgprs: 32,
             layout: vec![RootParam {
                 root: RootType::Table,

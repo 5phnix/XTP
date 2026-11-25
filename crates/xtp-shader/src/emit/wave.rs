@@ -78,11 +78,6 @@ pub(crate) enum Sym {
     Own(Value),
     /// A uniform value from before the section.
     Uni(Value),
-    /// Mot haut du nombre de lanes sélectionnées parmi `lanes`, en f64.
-    CountHi {
-        mask: Value,
-        lanes: u64,
-    },
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
     Red {
         op: Option<Op>,
@@ -98,7 +93,6 @@ pub(crate) enum Sym {
 pub(crate) enum Shape {
     K(u32),
     Value(Value),
-    CountHi(Value),
     /// The lane's own `mask ? src : ident`.
     Masked(Value, Value, u32),
     /// `op` over every lane.
@@ -149,44 +143,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let body = &insts[i + 1..end];
-        let mut constants = HashMap::new();
-        if body.iter().any(|step| step.name() == "v_add_f64") {
-            // Seules les lanes de l’ancien EXEC participent à la somme.
-            // Une constante écrite sous ce même EXEC est connue sur ces lanes.
-            for def in insts[..i].iter().rev() {
-                if def.read(Reg::S(EXEC)) != inst.read(Reg::S(EXEC))
-                    || def.read(Reg::S(EXEC + 1)) != inst.read(Reg::S(EXEC + 1))
-                {
-                    break;
-                }
-                if let Fields::Valu(v) = &def.fields
-                    && def.name() == "v_mov_b32"
-                    && v.sdwa.is_none()
-                    && v.dpp.is_none()
-                    && v.abs == 0
-                    && v.neg == 0
-                    && !v.clamp
-                    && v.omod == 0
-                    && let Some(Operand::Vector { reg, .. }) = v.dst
-                    && let Some(w) = def.write(Reg::V(reg))
-                {
-                    let k = match v.src.first() {
-                        Some(Operand::Literal(x)) => Some(*x),
-                        Some(Operand::Const(n)) => crate::resource::inline(*n),
-                        _ => None,
-                    };
-                    if let Some(k) = k {
-                        constants.insert(w, k);
-                    }
-                }
-            }
-        }
-        let saved_high = p
-            .wave64
-            .then(|| inst.write(Reg::S(saved_code(inst) + 1)))
-            .flatten();
-        let shapes = simulate(body, wave, (saved, saved_high), &constants);
+        let shapes = simulate(&insts[i + 1..end], wave, saved);
         out.insert(i, Section { end, shapes });
         i = end + 1;
     }
@@ -273,12 +230,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(
-    insts: &[Inst],
-    wave: u32,
-    saved: (Value, Option<Value>),
-    constants: &HashMap<Value, u32>,
-) -> HashMap<Value, Shape> {
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -320,30 +272,11 @@ fn simulate(
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
-            if name == "s_mov_b32"
-                && let Some(Operand::Scalar { code, .. }) = src.first()
-                && let Some(s) = inst.read(Reg::S(*code)).and_then(|v| uni.get(&v)).copied()
-                && let Some(&(_, w)) = inst.writes.first()
+            if name.starts_with("s_and_b")
+                && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
+                && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
-                uni.insert(w, s);
-            }
-            let mask_pair = |code| {
-                inst.read(Reg::S(code)).map(|lo| {
-                    (
-                        lo,
-                        if wave == 64 {
-                            inst.read(Reg::S(code + 1))
-                        } else {
-                            None
-                        },
-                    )
-                })
-            };
-            if (name == "s_and_b64" || wave == 32 && name == "s_and_b32")
-                && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if mask_pair(code).is_some_and(|p| masked.contains(&p))))
-                && let Some(&(Reg::S(code), w)) = inst.writes.first()
-            {
-                masked.push((w, if wave == 64 {inst.write(Reg::S(code + 1))} else {None}));
+                masked.push(w);
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
@@ -379,49 +312,6 @@ fn simulate(
             }
         };
         let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
-        if name == "v_add_f64"
-            && !modifiers
-            && v.dpp.is_none()
-            && exec == all
-            && let Some(Operand::Vector { reg, .. }) = v.dst
-            && let (Some(lo), Some(hi)) = (inst.write(Reg::V(reg)), inst.write(Reg::V(reg + 1)))
-        {
-            let words = |op: &Operand| {
-                let high = match *op {
-                    Operand::Vector { reg, .. } => Operand::Vector {
-                        reg: reg + 1,
-                        dwords: 1,
-                    },
-                    Operand::Scalar { code, .. } if code != NULL => Operand::Scalar {
-                        code: code + 1,
-                        dwords: 1,
-                    },
-                    _ => return None,
-                };
-                Some((lanes(op, &vec, &uni), lanes(&high, &vec, &uni)))
-            };
-            let mut low = vec![Sym::Unknown; wave as usize];
-            let mut high = low.clone();
-            if let (Some(a), Some(b)) = (words(&v.src[0]), words(&v.src[1])) {
-                for l in 0..wave as usize {
-                    if let (Some((m, x)), Some((n, y))) = (
-                        count_terms(a.0[l], a.1[l], constants),
-                        count_terms(b.0[l], b.1[l], constants),
-                    ) && m == n
-                        && x & y == 0
-                    {
-                        low[l] = Sym::K(0);
-                        high[l] = Sym::CountHi {
-                            mask: m,
-                            lanes: x | y,
-                        };
-                    }
-                }
-            }
-            vec.insert(lo, low);
-            vec.insert(hi, high);
-            continue;
-        }
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
@@ -499,26 +389,21 @@ fn simulate(
                 .collect(),
             ("v_cndmask_b32", Some(a)) => {
                 let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)).filter(|&lo| {
-                        let hi = if wave == 64 {
-                            inst.read(Reg::S(code + 1))
-                        } else {
-                            None
-                        };
-                        masked.contains(&(lo, hi))
-                    }),
+                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                     _ => None,
                 };
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) => Sym::Red {
-                            op: None,
-                            src: x,
-                            mask: m,
-                            ident,
-                            lanes: 1 << l,
-                        },
+                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
+                            Sym::Red {
+                                op: None,
+                                src: x,
+                                mask: m,
+                                ident,
+                                lanes: 1 << l,
+                            }
+                        }
                         _ => Sym::Unknown,
                     })
                     .collect()
@@ -623,37 +508,6 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// Les feuilles sont exactement +0.0 ou +1.0. Toute somme de ces 64 termes
-/// est exacte dans chaque mode d’arrondi et son mot bas reste nul.
-fn count_terms(lo: Sym, hi: Sym, constants: &HashMap<Value, u32>) -> Option<(Value, u64)> {
-    match (lo, hi) {
-        (Sym::K(0), Sym::CountHi { mask, lanes }) => Some((mask, lanes)),
-        (
-            Sym::Red {
-                op: None,
-                src: a,
-                mask: m,
-                ident: 0,
-                lanes: x,
-            },
-            Sym::Red {
-                op: None,
-                src: b,
-                mask: n,
-                ident: 0,
-                lanes: y,
-            },
-        ) if m == n
-            && x == y
-            && constants.get(&a) == Some(&0)
-            && constants.get(&b) == Some(&0x3ff0_0000) =>
-        {
-            Some((m, x))
-        }
-        _ => None,
-    }
-}
-
 /// The shape of each value, where every lane agrees on one.
 fn shapes(
     vec: HashMap<Value, Vec<Sym>>,
@@ -667,7 +521,6 @@ fn shapes(
     };
     let mut out = HashMap::new();
     let single = |s: Sym| match s {
-        Sym::CountHi { mask, lanes } if lanes == all => Some(Shape::CountHi(mask)),
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -711,7 +564,6 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     }
     if lanes.iter().all(|&s| s == first) {
         return match first {
-            Sym::CountHi { mask, lanes } if lanes == all => Some(Shape::CountHi(mask)),
             Sym::K(k) => Some(Shape::K(k)),
             Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
             Sym::Red {

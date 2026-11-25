@@ -52,7 +52,6 @@ fn mesh(words: &[u32], threads: u32, lds_bytes: u32) -> NativeProgram {
     NativeProgram {
         stage: crate::HwStage::Ms,
         wave64: true,
-        float_mode: 0,
         vgprs: 24,
         layout: Vec::new(),
         used: Vec::new(),
@@ -439,7 +438,6 @@ fn flat_pixel() -> NativeProgram {
     NativeProgram {
         stage: crate::HwStage::Ps,
         wave64: false,
-        float_mode: 0,
         vgprs: 4,
         layout: Vec::new(),
         used: Vec::new(),
@@ -695,7 +693,6 @@ fn triangle_mesh(prim: u32) -> NativeProgram {
     NativeProgram {
         stage: crate::HwStage::Ms,
         wave64: false,
-        float_mode: 0,
         vgprs: 16,
         layout: Vec::new(),
         used: Vec::new(),

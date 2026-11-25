@@ -33,7 +33,6 @@ pub enum Reg {
     S(u8),
     Scc,
     V(u8),
-    FloatMode,
 }
 
 pub const VCC: u8 = 106;
@@ -209,7 +208,6 @@ fn assemble(
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
-    let uses_mode = list.iter().any(|i| i.name() == Some("v_cvt_f32_f64"));
     for (n, ((machine, &flow), next)) in list.into_iter().zip(flows).zip(next_offsets).enumerate() {
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
         let name = machine.name().ok_or(ShaderError::Unsupported {
@@ -234,13 +232,7 @@ fn assemble(
                 Flow::Stop => Exit::End,
             };
         }
-        if let Some((mut reads, mut writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
-            if uses_mode && float_mode_field(name, &fields).is_some() {
-                reads.push(Reg::FloatMode);
-                writes.push(Reg::FloatMode);
-            } else if name == "v_cvt_f32_f64" {
-                reads.push(Reg::FloatMode);
-            }
+        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
                 machine,
@@ -328,7 +320,7 @@ fn assemble(
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
 /// Scalar codes 0-255 (from [`PARKED`] up: parked scalars), SCC, VGPRs 0-255.
-const REGS: usize = 256 + 1 + 256 + 1;
+const REGS: usize = 256 + 1 + 256;
 type RegSet = [u64; REGS.div_ceil(64)];
 
 fn index(reg: Reg) -> usize {
@@ -336,7 +328,6 @@ fn index(reg: Reg) -> usize {
         Reg::S(c) => usize::from(c),
         Reg::Scc => 256,
         Reg::V(r) => 257 + usize::from(r),
-        Reg::FloatMode => 513,
     }
 }
 
@@ -344,26 +335,7 @@ fn reg_at(i: usize) -> Reg {
     match i {
         0..256 => Reg::S(i as u8),
         256 => Reg::Scc,
-        513 => Reg::FloatMode,
         _ => Reg::V((i - 257) as u8),
-    }
-}
-
-/// Bits de MODE lus par la conversion f64 vers f32 (arrondi f32,
-/// conservation des dénormalisés en entrée f64 et en sortie f32).
-pub(crate) fn float_mode_field(name: &str, fields: &Fields) -> Option<(u32, u32)> {
-    match (name, fields) {
-        ("s_round_mode", _) => Some((0, 0x03)),
-        ("s_denorm_mode", _) => Some((4, 0x60)),
-        ("s_setreg_b32" | "s_setreg_imm32_b32", Fields::Sop { imm: Some(hw), .. })
-            if hw & 63 == 1 =>
-        {
-            let offset = u32::from(hw >> 6 & 31);
-            let width = u32::from(hw >> 11) + 1;
-            let mask = (u32::MAX >> (32 - width)) << offset & 0x63;
-            (mask != 0).then_some((offset, mask))
-        }
-        _ => None,
     }
 }
 
