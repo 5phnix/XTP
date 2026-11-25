@@ -94,28 +94,49 @@ pub fn stage(container: &[u8]) -> Option<HwStage> {
 /// translation into the shader cache and, with `pipelines`, a compute
 /// program's host pipeline into the library.
 pub fn container(container: &[u8], stage: Option<HwStage>, pipelines: bool) -> Outcome {
+    match prepare(container, stage, pipelines) {
+        Ok(Some(compute)) => compute.pipeline(),
+        Ok(None) => Outcome::Ready,
+        Err(outcome) => outcome,
+    }
+}
+
+/// A translated compute program, ready for the pipeline phase.
+pub struct Compute(Arc<Shader>);
+
+impl Compute {
+    /// Loads or creates the pipeline using the same description as a dispatch.
+    pub fn pipeline(&self) -> Outcome {
+        if HostPipeline::new(std::slice::from_ref(&self.0), None).is_some() {
+            Outcome::Ready
+        } else {
+            Outcome::NoPipeline
+        }
+    }
+}
+
+/// Translates one container and keeps its compute shader alive for the
+/// pipeline phase, so building the pipeline does not read the cache again.
+pub fn prepare(
+    container: &[u8],
+    stage: Option<HwStage>,
+    pipelines: bool,
+) -> Result<Option<Compute>, Outcome> {
     let target = crate::device::host_target();
     if !(pipelines && stage == Some(HwStage::Cs)) {
-        return match crate::shader_cache::host_shader(container, target) {
-            Ok(_) => Outcome::Ready,
-            Err(reason) => Outcome::Refused(reason),
-        };
+        return crate::shader_cache::host_shader(container, target)
+            .map(|_| None)
+            .map_err(Outcome::Refused);
     }
-    // As a compute pipeline the title creates: the shared container, then
-    // its host pipeline, which translates it through the cache first.
     let shader = super::shader("compute", container);
-    if super::host::HostPipeline::new(std::slice::from_ref(&shader), None).is_some() {
-        return Outcome::Ready;
+    if shader.translated().is_some() {
+        return Ok(Some(Compute(shader)));
     }
-    match shader.translated.get() {
-        // The translator refused it: its reason, from the refusal just
-        // kept (refusals count neither as made nor as found).
-        Some(None) => match crate::shader_cache::host_shader(container, target) {
-            Err(reason) => Outcome::Refused(reason),
-            Ok(_) => Outcome::NoPipeline,
-        },
-        _ => Outcome::NoPipeline,
-    }
+    // The shared shader keeps only the verdict. Recover the cached reason.
+    Err(match crate::shader_cache::host_shader(container, target) {
+        Err(reason) => Outcome::Refused(reason),
+        Ok(_) => Outcome::NoPipeline,
+    })
 }
 
 /// What the precook made and found since the start.

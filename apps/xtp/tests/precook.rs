@@ -214,6 +214,14 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
         return;
     };
     let out = &first.out;
+    for phase in ["translation  ", "compute PSOs ", "library save "] {
+        let seconds = out
+            .lines()
+            .find_map(|line| line.strip_prefix(phase))
+            .and_then(|time| time.split_once(" s"))
+            .and_then(|(seconds, _)| seconds.parse::<f64>().ok());
+        assert!(seconds.is_some_and(|s| s >= 0.0), "{phase}\n{out}");
+    }
     assert!(
         out.contains("containers   2 in 3 records (1 repeated)"),
         "{out}\n{}",
