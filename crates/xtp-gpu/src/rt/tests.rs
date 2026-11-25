@@ -1206,7 +1206,7 @@ fn plain_memory(len: usize) -> usize {
     }
 }
 
-/// Leonida #1816's fixture, reimplemented (watch item 497): a BLAS of known
+/// An upstream fork's fixture (#1816), reimplemented (watch item 497): a BLAS of known
 /// bounds, (−5, 0, 1) to (4, 8, 9), whose vertices and indices are title
 /// memory, read back by rays near each edge. Once in title buffers, once
 /// in plain title memory, the vertices across a 4 MiB window boundary
