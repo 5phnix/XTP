@@ -1,7 +1,8 @@
 //! A DXIL vertex, pixel, compute, mesh or geometry shader under
 //! construction: the module, the `dx.op` declarations it calls, its
 //! signatures and bound resources, and the metadata and container that wrap
-//! it up (SM 6.6, validator 1.6).
+//! it up (SM 6.6, validator 1.6; SM 6.7, validator 1.7, for a pixel shader
+//! whose wave operations include its helper lanes).
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
@@ -345,6 +346,20 @@ impl Shader {
     }
 
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
+    /// Whether this is a pixel program whose wave operations count its
+    /// helper lanes (`"waveops-include-helper-lanes"`, SM 6.7): one that
+    /// calls a wave operation whose lanes a helper lane can be one of
+    /// (ballots, lane reads, reductions). Lane indices and counts do not
+    /// depend on it, and quad operations read helper lanes anyway.
+    pub fn includes_helper_lanes(&self) -> bool {
+        self.pixel
+            && self.mesh.is_none()
+            && self.ops.iter().any(|op| {
+                op.starts_with("wave")
+                    && !matches!(op.as_str(), "waveGetLaneIndex" | "waveGetLaneCount")
+            })
+    }
+
     pub fn op(
         &mut self,
         block: usize,
@@ -920,14 +935,22 @@ impl Shader {
         let ident = self.m.md_str("xtp");
         let ident = self.m.md_node(vec![Some(ident)]);
         self.m.named_md("llvm.ident", vec![ident]);
+        // A pixel program with wave operations whose lanes are its helper
+        // lanes too, as the console's whole-quad mode makes them (see
+        // `lower/mask.rs`, `Helpers`): SM 6.7's
+        // `[WaveOpsIncludeHelperLanes]`. Every other program stays SM 6.6.
+        let helper_lanes = self.includes_helper_lanes();
+        let minor = if helper_lanes { 7 } else { 6 };
         let one = i32c(&mut self, 1);
         let six = i32c(&mut self, 6);
-        let version = self.m.md_node(vec![Some(one), Some(six)]);
+        let minor_md = i32c(&mut self, minor);
+        let version = self.m.md_node(vec![Some(one), Some(minor_md)]);
         self.m.named_md("dx.version", vec![version]);
-        // Validator 1.6: the parts (ISG1, OSG1, PSV0 runtime info version
-        // 2) are written as it writes them. Validators 1.8 and 1.9 check
-        // such a module by its rules; declared 1.8, they want PSV0 version 3
-        // and other signature parts (they refuse every module otherwise).
+        // Validator 1.6 (1.7 for SM 6.7, the first that knows it): the parts
+        // (ISG1, OSG1, PSV0 runtime info version 2) are written as both
+        // write them. Validators 1.8 and 1.9 check such a module by its
+        // rules; declared 1.8, they want PSV0 version 3 and other signature
+        // parts (they refuse every module otherwise).
         self.m.named_md("dx.valver", vec![version]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
@@ -938,19 +961,22 @@ impl Shader {
             (None, false) => ("vs", 1),
         };
         let name = self.m.md_str(name);
-        let sm = self.m.md_node(vec![Some(name), Some(six), Some(six)]);
+        let sm = self.m.md_node(vec![Some(name), Some(six), Some(minor_md)]);
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
         if let Some(mode) = self.denormals {
             self.m.declare_fp32_denormals(mode);
         }
+        if helper_lanes {
+            self.m.include_helper_lanes();
+        }
 
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
-        dxil.extend((kind << 16 | 0x66).to_le_bytes());
+        dxil.extend((kind << 16 | 0x60 | minor).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
         dxil.extend(b"DXIL");
-        dxil.extend(0x106u32.to_le_bytes());
+        dxil.extend((0x100 | minor).to_le_bytes());
         dxil.extend(16u32.to_le_bytes());
         dxil.extend((bitcode.len() as u32).to_le_bytes());
         dxil.extend(&bitcode);
@@ -993,8 +1019,18 @@ impl Shader {
             features |= 0x400_0000;
         }
         let sfi0 = features.to_le_bytes();
-        let isg1 = container::signature(&self.inputs, true);
-        let osg1 = container::signature(&self.outputs, false);
+        // Validator 1.7 wants each signature part's size a multiple of 4
+        // bytes: zeros after its names, as DXC writes them for 1.7 and later
+        // (1.6 wants none).
+        let signature = |elements: &[SigElement], input: bool| {
+            let mut part = container::signature(elements, input);
+            if helper_lanes {
+                part.resize(part.len().next_multiple_of(4), 0);
+            }
+            part
+        };
+        let isg1 = signature(&self.inputs, true);
+        let osg1 = signature(&self.outputs, false);
         let flag = if self.pixel {
             self.outputs.iter().any(|o| (17..=19).contains(&o.kind))
         } else {
@@ -1019,7 +1055,7 @@ impl Shader {
             shape.runtime_info(&mut psv0, flag);
         }
         let hash = [0u8; 20];
-        let psg1 = container::signature(&self.prims, false);
+        let psg1 = signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
         if self.mesh.is_some() {
