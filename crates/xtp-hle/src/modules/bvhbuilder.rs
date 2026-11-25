@@ -1,5 +1,5 @@
-//! Observation des imports du constructeur BVH, après résolution dans la DLL du titre.
-//! Activer la cible `xtp_hle::modules::bvhbuilder=debug` pour relever une session.
+//! Trace builder imports resolved to the title DLL.
+//! Enable the xtp_hle::modules::bvhbuilder debug target to capture a session.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -29,7 +29,7 @@ const _: () = {
     assert!(size_of::<BatchEntry>() == 80);
 };
 
-/// Enveloppe uniquement les exports effectivement trouvés dans la DLL du titre.
+/// Wraps exports found in the title DLL.
 pub struct WithBuilderTrace<'a>(pub &'a dyn ImportResolver);
 
 impl ImportResolver for WithBuilderTrace<'_> {
@@ -52,7 +52,7 @@ impl ImportResolver for WithBuilderTrace<'_> {
     }
 }
 
-// Le même type vérifie le point d'entrée et sert à rappeler la méthode d'origine.
+// One ABI type checks the hook and calls the original export.
 macro_rules! methods {
     ($($hook:ident: $abi:ty = $name:literal),+ $(,)?) => {
         $(mod $hook {
@@ -61,7 +61,7 @@ macro_rules! methods {
             const _: Abi = super::$hook;
             pub(super) static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
             pub(super) fn original() -> Abi {
-                // SAFETY: bind installe l'export de cette signature avant de publier le hook.
+                // SAFETY: bind stores the matching export before publishing the hook.
                 unsafe { std::mem::transmute::<usize, Abi>(ORIGINAL.load(Ordering::Acquire)) }
             }
         })+
@@ -127,8 +127,8 @@ extern "system" fn copy(this: Object, list: Object, dst: u64, src: u64, mode: i3
     unsafe { xtp_gpu::rt::Builder.copy(list.cast(), dst, src, mode) };
 }
 
-// Une frame est échantillonnée à l'entrée. L'identifiant relie les lignes même si
-// deux threads enregistrent des listes en parallèle.
+// Sample the frame at entry. The ID joins records from one call when
+// title threads record command lists concurrently.
 struct Call {
     frame: u64,
     id: u64,
@@ -163,8 +163,8 @@ impl Call {
         }
         for geometry in 0..count {
             let i = geometry as usize;
-            // SAFETY: le contrat BLAS fournit count descriptions CPU selon le layout.
-            // Les adresses GPU contenues dans ces descriptions ne sont jamais lues.
+            // SAFETY: BLAS inputs provide count CPU descriptors in the selected layout.
+            // GPU addresses in these descriptors are only logged.
             let desc = unsafe {
                 match layout {
                     D3D12_ELEMENTS_LAYOUT_ARRAY if !inputs.Anonymous.pGeometryDescs.is_null() => {
@@ -183,7 +183,7 @@ impl Call {
             let flags = desc.Flags.0;
             match desc.Type {
                 D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES => {
-                    // SAFETY: le discriminant sélectionne le membre Triangles.
+                    // SAFETY: the discriminant selects Triangles.
                     let t = unsafe { &desc.Anonymous.Triangles };
                     debug!(
                         frame,
@@ -203,7 +203,7 @@ impl Call {
                     );
                 }
                 D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS => {
-                    // SAFETY: le discriminant sélectionne le membre AABBs.
+                    // SAFETY: the discriminant selects AABBs.
                     let a = unsafe { &desc.Anonymous.AABBs };
                     debug!(
                         frame,
@@ -273,12 +273,12 @@ extern "system" fn build(this: Object, list: Object, count: u32, entries: *const
         );
         if !entries.is_null() {
             for i in 0..count {
-                // SAFETY: le titre passe count entrées CPU de 80 octets.
+                // SAFETY: the title supplies count live 80-byte entries.
                 let e = unsafe { &*entries.add(i as usize) };
                 call.description(i, &e.build);
                 if !e.postbuild.is_null() {
                     for j in 0..e.postbuild_count {
-                        // SAFETY: le tableau postbuild appartient à cette entrée.
+                        // SAFETY: this entry owns its postbuild array.
                         let p = unsafe { &*e.postbuild.add(j as usize) };
                         debug!(
                             frame = call.frame,
@@ -317,14 +317,14 @@ extern "system" fn prebuild(
     let call = enabled!(Level::DEBUG).then(Call::new);
     if let Some(call) = &call {
         debug!(frame = call.frame, id = call.id, ?this, ?stream, "prebuild");
-        // SAFETY: les entrées appartiennent à l'appel du titre et restent en vie.
+        // SAFETY: the title keeps the inputs alive through this call.
         if let Some(inputs) = unsafe { inputs.as_ref() } {
             call.inputs(0, inputs);
         }
     }
     prebuild::original()(this, inputs, stream, out);
     if let Some(call) = call
-        // SAFETY: la DLL vient d'écrire les trois tailles si une sortie est fournie.
+        // SAFETY: the DLL has filled all three sizes when given an output.
         && let Some(s) = unsafe { out.as_ref() }
     {
         debug!(
@@ -357,7 +357,7 @@ extern "system" fn rehydrate(
         );
         if !descs.is_null() {
             for i in 0..count {
-                // SAFETY: cette méthode passe count descriptions standard contiguës.
+                // SAFETY: the title supplies count contiguous build descriptions.
                 call.description(i, unsafe { &*descs.add(i as usize) });
             }
         }
@@ -409,7 +409,7 @@ mod tests {
                 && !desc.is_null()
                 && !cpu.is_null()
             {
-                // SAFETY: les données synthétiques sont conservées jusqu'au retour de l'appel.
+                // SAFETY: the test inputs are live until the hook returns.
                 if unsafe { (*desc).DestAccelerationStructureData == 32 && *cpu == 64 } {
                     return -42;
                 }
@@ -437,9 +437,9 @@ mod tests {
             provenance: Provenance::Hle,
         } = r.resolve("XBOXBVHBUILDER.DLL", &symbol)
         else {
-            panic!("interception absente");
+            panic!("builder import was not intercepted");
         };
-        // SAFETY: le résolveur a associé ce symbole à la signature exacte de rehydrate.
+        // SAFETY: the resolver bound this symbol to the rehydrate ABI.
         let hook = unsafe { std::mem::transmute::<usize, rehydrate::Abi>(address) };
         let desc = Desc {
             DestAccelerationStructureData: 32,

@@ -1074,8 +1074,6 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
-    /// Immutable BLAS generations referenced by TLAS builds and traces on this recording.
-    rt_maps: Vec<std::sync::Arc<crate::rt::BlasMap>>,
     rt_recording: Option<std::sync::Arc<()>>,
     rt_size_page: crate::rt::compaction::SizePage,
     rt_results: Vec<std::sync::Arc<crate::rt::ResultBuffer>>,
@@ -2754,10 +2752,6 @@ impl HostList {
 
     pub(crate) fn keep_rt_result(&self, result: &std::sync::Arc<crate::rt::ResultBuffer>) {
         self.deferred().rt_results.push(result.clone());
-    }
-
-    pub(crate) fn keep_rt_map(&self, map: &std::sync::Arc<crate::rt::BlasMap>) {
-        self.deferred().rt_maps.push(map.clone());
     }
 
     /// Whether this is the first time since the reset that the list asks

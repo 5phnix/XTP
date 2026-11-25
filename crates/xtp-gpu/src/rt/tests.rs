@@ -62,7 +62,13 @@ fn rt_triangle_translation_requires_the_whole_input_range() {
     }
 }
 
-fn trace(host: &Host, list: &HostList, tlas: u64, output: &TitleBuffer) {
+enum Scene {
+    Address(u64),
+    Descriptor(u64),
+}
+
+fn trace(host: &Host, title_list: &TitleList, tlas: Scene, output: &TitleBuffer) {
+    let list = title_list.host();
     let dxc = std::env::var_os("XTP_PC_DXC")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -106,10 +112,21 @@ fn trace(host: &Host, list: &HostList, tlas: u64, output: &TitleBuffer) {
         list.keep(&pso);
         list.list.SetPipelineState(&pso);
         list.list.SetComputeRootSignature(&root);
-        list.list.SetComputeRootShaderResourceView(0, tlas);
         list.list
             .SetComputeRootUnorderedAccessView(1, shadow.gpu(output.address()));
-        list.list.Dispatch(1, 1, 1);
+        match tlas {
+            Scene::Address(address) => {
+                list.list.SetComputeRootShaderResourceView(0, address);
+                list.list.Dispatch(1, 1, 1);
+            }
+            Scene::Descriptor(handle) => assert!(dispatch_descriptor_tlas(
+                title_list.this(),
+                handle,
+                &root,
+                0,
+                [1, 1, 1]
+            )),
+        }
         list.list.ResourceBarrier(&[uav_barrier()]);
     }
 }
@@ -178,8 +195,25 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         },
         ..Default::default()
     };
+    let future = TitleList::new();
+    let too_early = TitleList::new();
+    let delayed_hit = TitleBuffer::new(16);
+    let skipped = TitleBuffer::new(16);
+    skipped.set_words(|_| 77);
+    let mut slot = [0u64; 4];
+    let handle = slot.as_mut_ptr() as u64;
+    let mut srv = [0u32; 10];
+    srv[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+    srv[4] = first.address() as u32;
+    srv[5] = (first.address() >> 32) as u32;
+    crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &srv, handle);
+    trace(host, &future, Scene::Descriptor(handle), &delayed_hit);
+    trace(host, &too_early, Scene::Descriptor(handle), &skipped);
+    too_early.run();
+    assert_eq!(skipped.words(), [77; 4]);
+
     let displaced = TitleBuffer::new(24);
-    displaced.set_words(|i| (positions[i] + 16.).to_bits());
+    displaced.set_words(|i| (positions[i] + if i % 2 == 0 { 4. } else { 0. }).to_bits());
     let changed = self::geometry(&displaced, &indices);
     let after_refit = TitleBuffer::new(16);
     after_refit.set_words(|_| u32::MAX);
@@ -204,6 +238,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             .unwrap()
             .load(Ordering::Acquire);
         assert!(bytes > 0);
+        let registry_source_capacity = registry().structures[&blas.address()].result.bytes;
         assert!(Builder.copy(
             cloning.this(),
             compacted.address(),
@@ -212,7 +247,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         ));
         assert_eq!(
             registry().structures[&compacted.address()].result.bytes,
-            bytes
+            registry_source_capacity
         );
         assert!(Builder.copy(
             cloning.this(),
@@ -265,14 +300,16 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         let released = first.address();
         drop((blas, cloned, first, second));
         assert_eq!(host_tlas(list.this(), released), None);
-        trace(host, list.host(), a, &output);
-        trace(host, list.host(), b, &after_refit);
+        trace(host, &list, Scene::Address(a), &output);
+        trace(host, &list, Scene::Address(b), &after_refit);
     }
     // The TLAS was recorded before this producer was submitted.
     cloning.run();
     list.run();
+    future.run();
+    assert_eq!(delayed_hit.words(), [1, 2.0f32.to_bits(), 0, 0]);
     assert_eq!(output.words(), [1, 2.0f32.to_bits(), 0, 0]);
-    assert_eq!(after_refit.words(), [0, 0, 0, 0]);
+    assert_eq!(after_refit.words(), [0, 0, 1, 2.0f32.to_bits()]);
 }
 
 #[test]
@@ -290,7 +327,7 @@ fn rt_retirement_cancels_overlapping_publications_and_keeps_adjacent_ranges() {
         [base + 128, base + 512, base + 768]
     );
     table.retire(base + 180, base + 181, Some(None));
-    assert!(!table.finish(base + 128, new, None));
+    assert!(!table.finish(base + 128, new.generation, None));
     assert_eq!(table.ranges.len(), 2);
 }
 

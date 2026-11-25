@@ -650,15 +650,16 @@ Per title structure address, as VIctory #702 keys them (section 11):
   standard build flags and clears `PERFORM_UPDATE`. This supports changes
   to GPU-written index data without assuming the old topology. Host
   compaction uses a private postbuild slot, read after the producing
-  submission's fence. A compact copy recorded earlier uses the source
-  allocation's capacity. Both paths publish a distinct destination and
+  submission's fence. A compact copy reserves the source capacity so the
+  destination also fits a replay with different geometry. Both paths publish a distinct destination and
   preserve the title DLL's postbuild values.
 - **TLAS.** A compute pass reads the 64-byte instance records on the GPU
   after preceding writers, preserves their transforms, masks, IDs and
   flags, and rewrites the BLAS addresses using a sorted table. A missing
-  BLAS becomes a null, inactive instance. If a mapped BLAS producer on
-  another list is still pending, the consumer's upload resolves that row
-  at submission. The TLAS retains the candidate BLAS generations across
+  BLAS becomes a null, inactive instance. At submission the rewrite
+  takes the BLAS generations published by preceding queue commands,
+  including producers recorded after the TLAS. Its private indirect
+  argument selects the immutable upload and its row count. The TLAS retains the candidate BLAS generations across
   address reuse. Every consuming recording pins the TLAS and its table.
 - **Allocation and ordering.** Small AS results share 1 MiB pages in 256-byte slices.
   Scratch and rewritten instances use separate on-demand heaps. RT backing
@@ -674,7 +675,12 @@ Per title structure address, as VIctory #702 keys them (section 11):
   producer and retains the TLAS and its BLAS for that recording. Use it directly, or `descriptor_tlas` with the live title
   descriptor handle. Resolve each descriptor independently, including
   table 5 at byte offsets +0x60 and +0x80. A cross-list copy or direct
-  binding whose producer has yet to be submitted is unavailable.
+  binding whose producer has yet to be submitted is unavailable. Use
+  `dispatch_descriptor_tlas` for the trace splice. It records an indirect
+  root SRV and dispatch, resolving the descriptor's title address in
+  submission order. A missing TLAS gives a zero command count. Frame 677
+  of the present-1 session placed BVH work on L26 and lighting traces on
+  L68 and L77 (see refusals.md sections 6.2 and 6.3).
 - **Guest-format records**, only when a proven result reads them (AnyPS5's
   "HLE TLAS" idea): the title's instance records written in its TLAS
   memory from the same instance array.
@@ -683,9 +689,9 @@ Per title structure address, as VIctory #702 keys them (section 11):
 
 - **Builds per frame.** In a 30-second RTX 4080 SUPER gameplay session
   (`cache/play/20261125-100816/run.log`, before pooling), 5,565 committed
-  DXR allocations took a median of 316 µs and 3.68 ms at the 95th
+  DXR allocations took a median of 316 Âµs and 3.68 ms at the 95th
   percentile. The six GPU timestamp intervals containing RT work measured
-  5.65–11.60 ms per frame across 19–36 marked builds per frame. These
+  5.65â€“11.60 ms per frame across 19â€“36 marked builds per frame. These
   spans include the input rewrite and barriers. The allocation timer
   measures CPU wall time on recording threads.
 - **Memory (Series S mode).** The title's own structure memory is title

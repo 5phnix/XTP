@@ -1,13 +1,15 @@
 //! Host DXR builds recorded alongside the title's builder commands.
 
 mod allocation;
+mod dispatch;
 pub(crate) use allocation::ResultBuffer;
+pub use dispatch::dispatch_descriptor_tlas;
 pub(crate) mod compaction;
 mod instances;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod probe;
 
-pub(crate) use instances::BlasMap;
+use instances::BlasMap;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -173,23 +175,15 @@ impl<'a> Recorder<'a> {
         mode: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE,
     ) -> Option<Structure> {
         let capacity = source.result.bytes;
-        let bytes = match mode {
-            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE => capacity,
-            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT => {
-                let measured = source.compacted_size.as_ref()?.load(Ordering::Acquire);
-                // A compact copy recorded before the producing fence (including on the
-                // same list) still fits the original host allocation's upper bound.
-                if measured == 0 {
-                    capacity
-                } else {
-                    if measured > capacity {
-                        return None;
-                    }
-                    measured
-                }
-            }
+        match mode {
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE => {}
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT
+                if source.compacted_size.is_some() => {}
             _ => return None,
-        };
+        }
+        // A replay may rebuild different geometry into the same source.
+        // Its allocation bounds every execution, unlike a prior fence's measurement.
+        let bytes = capacity;
         let dest = ResultBuffer::new(self, bytes)?;
         self.list.keep_rt_result(&dest);
         // SAFETY: independent AS resources in the required state, retained through execution.
@@ -203,6 +197,7 @@ impl<'a> Recorder<'a> {
         }
         Some(Structure {
             producer: Producer::recorded(self.list),
+            instances: source.instances.as_ref().map(|map| map.capture(self.list)),
             result: dest,
             ..source.clone()
         })
@@ -246,12 +241,36 @@ impl Structure {
     fn retain(&self, list: &HostList) {
         list.keep_rt_result(&self.result);
         if let Some(map) = &self.instances {
-            list.keep_rt_map(map);
+            map.capture(list);
         }
     }
 }
 
+/// The last structure actually reached in queue order at this title address.
+type Slot = Arc<Mutex<Option<Structure>>>;
+type Candidates = Arc<BTreeMap<u64, Slot>>;
+
+struct BuildSlot {
+    generation: u64,
+    slot: Slot,
+    overwritten: Vec<Slot>,
+}
+
+impl BuildSlot {
+    fn submit(&self, list: &HostList, built: Option<Structure>) {
+        let slot = self.slot.clone();
+        let overwritten = self.overwritten.clone();
+        list.defer_host((0, 0), move || {
+            for old in &overwritten {
+                *old.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = built.clone();
+        });
+    }
+}
+
 struct Destination {
+    slot: Slot,
     end: u64,
     owner: Option<usize>,
     generation: u64,
@@ -262,8 +281,9 @@ struct Registry {
     structures: BTreeMap<u64, Structure>,
     // Includes builds still recording, so removal also cancels their publication.
     ranges: BTreeMap<u64, Destination>,
+    waiting: BTreeMap<u64, (Option<usize>, std::sync::Weak<Mutex<Option<Structure>>>)>,
     generation: u64,
-    snapshot: Option<Arc<BlasMap>>,
+    snapshot: Option<Candidates>,
 }
 
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
@@ -272,9 +292,42 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 }
 
 impl Registry {
-    fn retire(&mut self, start: u64, end: u64, owner: Option<Option<usize>>) -> Option<Structure> {
+    fn trace_slot(&mut self, address: u64) -> Slot {
+        if let Some(range) = self.ranges.get(&address) {
+            return range.slot.clone();
+        }
+        if let Some(slot) = self.waiting.get(&address).and_then(|(_, w)| w.upgrade()) {
+            return slot;
+        }
+        self.waiting.retain(|_, (_, w)| w.strong_count() != 0);
+        let slot = Slot::default();
+        self.waiting.insert(
+            address,
+            (
+                crate::shadow::buffer_owner(address).map(|o| o.0),
+                Arc::downgrade(&slot),
+            ),
+        );
+        slot
+    }
+
+    fn retire(
+        &mut self,
+        start: u64,
+        end: u64,
+        owner: Option<Option<usize>>,
+    ) -> (Option<Structure>, Vec<Slot>) {
         if end <= start {
-            return None;
+            return (None, Vec::new());
+        }
+        let waiting: Vec<_> = self
+            .waiting
+            .range(start..end)
+            .filter(|(_, (o, _))| owner.is_none_or(|owner| owner == *o))
+            .map(|(&key, _)| key)
+            .collect();
+        for key in waiting {
+            self.waiting.remove(&key);
         }
         let first = self
             .ranges
@@ -289,8 +342,11 @@ impl Registry {
             .map(|(&key, _)| key)
             .collect();
         let mut previous = None;
+        let mut slots = Vec::new();
         for key in keys {
-            self.ranges.remove(&key);
+            if let Some(range) = self.ranges.remove(&key) {
+                slots.push(range.slot);
+            }
             let old = self.structures.remove(&key);
             if old.as_ref().is_some_and(|s| s.instances.is_none()) {
                 self.snapshot = None;
@@ -299,10 +355,10 @@ impl Registry {
                 previous = old;
             }
         }
-        previous
+        (previous, slots)
     }
 
-    fn begin(&mut self, start: u64, bytes: Option<u64>) -> (u64, Option<Arc<ResultBuffer>>) {
+    fn begin(&mut self, start: u64, bytes: Option<u64>) -> (BuildSlot, Option<Arc<ResultBuffer>>) {
         let owner = crate::shadow::buffer_owner(start);
         let end = match (bytes.filter(|&n| n > 0), owner) {
             (Some(n), Some((_, end))) => start.saturating_add(n).min(end),
@@ -310,18 +366,30 @@ impl Registry {
             (None, Some((_, end))) => end,
             (None, None) => start.saturating_add(1),
         };
-        let old = self.retire(start, end, None);
+        let slot = self
+            .ranges
+            .get(&start)
+            .map(|r| r.slot.clone())
+            .or_else(|| self.waiting.remove(&start).and_then(|(_, w)| w.upgrade()))
+            .unwrap_or_default();
+        let (old, mut overwritten) = self.retire(start, end, None);
+        overwritten.retain(|s| !Arc::ptr_eq(s, &slot));
         self.generation += 1;
         self.ranges.insert(
             start,
             Destination {
+                slot: slot.clone(),
                 end,
                 owner: owner.map(|o| o.0),
                 generation: self.generation,
             },
         );
         (
-            self.generation,
+            BuildSlot {
+                generation: self.generation,
+                slot,
+                overwritten,
+            },
             old.map(|s| s.result).filter(|r| Arc::strong_count(r) == 1),
         )
     }
@@ -345,11 +413,18 @@ impl Registry {
         true
     }
 
-    fn blas_map(&mut self) -> Option<Arc<BlasMap>> {
-        if self.snapshot.is_none() {
-            self.snapshot = Some(Arc::new(BlasMap::new(&self.structures)?));
-        }
-        self.snapshot.clone()
+    fn blas_candidates(&mut self) -> Candidates {
+        self.snapshot
+            .get_or_insert_with(|| {
+                Arc::new(
+                    self.structures
+                        .iter()
+                        .filter(|(_, s)| s.instances.is_none())
+                        .map(|(&addr, _)| (addr, self.ranges[&addr].slot.clone()))
+                        .collect(),
+                )
+            })
+            .clone()
     }
 }
 
@@ -363,8 +438,7 @@ pub(crate) fn release_buffer(owner: Option<usize>, start: u64, end: u64) {
 /// `list` is a live title command list.
 pub unsafe fn host_tlas(list: *const Object, title_tlas: u64) -> Option<u64> {
     let list = crate::list::host_list(list)?;
-    let table = registry();
-    let entry = table.structures.get(&title_tlas)?;
+    let entry = registry().structures.get(&title_tlas)?.clone();
     entry.instances.as_ref()?;
     if !entry.producer.available(&list.rt_recording()) {
         return None;
@@ -383,6 +457,12 @@ pub use host_tlas as host_tlas_for_list;
 /// # Safety
 /// `list` is a live title command list and `handle` is a readable title descriptor slot.
 pub unsafe fn descriptor_tlas(list: *const Object, handle: u64) -> Option<u64> {
+    let address = descriptor_address(handle)?;
+    // SAFETY: the caller supplied the live list that records this descriptor's consumer.
+    unsafe { host_tlas_for_list(list, address) }
+}
+
+fn descriptor_address(handle: u64) -> Option<u64> {
     use crate::descriptor::{View, host::buffer_range, view};
     let view = view(handle)?;
     let words = match &view {
@@ -390,15 +470,13 @@ pub unsafe fn descriptor_tlas(list: *const Object, handle: u64) -> Option<u64> {
         View::Placed(false, _, words) => &words[..],
         _ => return None,
     };
-    let address = match D3D12_SRV_DIMENSION(words[1] as i32) {
+    Some(match D3D12_SRV_DIMENSION(words[1] as i32) {
         D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE => {
             u64::from(words[4]) | u64::from(words[5]) << 32
         }
         D3D12_SRV_DIMENSION_BUFFER => buffer_range(&view)?.0,
         _ => return None,
-    };
-    // SAFETY: the caller supplied the live list that records this descriptor's consumer.
-    unsafe { host_tlas_for_list(list, address) }
+    })
 }
 
 /// Mirrors a title build and invalidates an older destination on failure.
@@ -443,8 +521,7 @@ unsafe fn build_one(
                 recorder.build(&inputs, reuse, ordered)
             }
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
-                let map = registry().blas_map()?;
-                let inputs = instances::rewrite(&recorder, title_list, &inputs, &map)?;
+                let (inputs, map) = instances::rewrite(&recorder, title_list, &inputs)?;
                 Some(Structure {
                     instances: Some(map),
                     ..recorder.build(&inputs, reuse, ordered || inputs.NumDescs != 0)?
@@ -453,7 +530,10 @@ unsafe fn build_one(
             _ => None,
         }
     })();
-    registry().finish(dst, generation, built)
+    if let Some(list) = crate::list::host_list(title_list) {
+        generation.submit(list, built.clone());
+    }
+    registry().finish(dst, generation.generation, built)
 }
 
 /// Rebuilds a rehydrated title entry and optionally samples its inputs on the GPU.
@@ -556,7 +636,10 @@ impl Builder {
                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE(mode),
             )
         })();
-        registry().finish(dst, generation, copied)
+        if let Some(list) = crate::list::host_list(list) {
+            generation.submit(list, copied.clone());
+        }
+        registry().finish(dst, generation.generation, copied)
     }
 }
 
@@ -627,6 +710,10 @@ fn readable(mut address: u64, end: u64) -> bool {
     true
 }
 
+/// Translates indexed or non-indexed triangle descriptions to host addresses.
+///
+/// # Safety
+/// The active layout supplies NumDescs readable CPU descriptors or pointers to them.
 unsafe fn triangles(list: &HostList, inputs: &Inputs) -> Option<Vec<Geometry>> {
     let mut geometries = Vec::new();
     for i in 0..inputs.NumDescs as usize {

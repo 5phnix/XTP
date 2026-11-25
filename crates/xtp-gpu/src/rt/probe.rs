@@ -30,6 +30,9 @@ pub(super) fn enabled() -> bool {
 
 /// Samples bytes from the very resources used by an indexed build. The actual
 /// build has already checked the full ranges. Only booleans reach the log.
+///
+/// # Safety
+/// The successful build validated the active CPU descriptors. They remain live for the probe.
 pub(super) unsafe fn record(list: &HostList, desc: &Build) -> Option<()> {
     if desc.Inputs.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL
         || desc.Inputs.NumDescs == 0
