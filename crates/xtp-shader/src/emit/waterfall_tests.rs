@@ -81,6 +81,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
+        group_base: lowered.group_base,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),

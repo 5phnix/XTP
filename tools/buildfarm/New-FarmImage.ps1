@@ -49,6 +49,13 @@ $r.Out.Trim() -split "`r?`n" | ForEach-Object { Write-FarmMessage "$Builder> $_"
 Invoke-FarmGcloud -Config $c -AllowFailure -Arguments @('compute', 'instances', 'remove-metadata', $Builder, "--zone=$($spec.zone)",
     '--keys=windows-startup-script-ps1,sysprep-specialize-script-cmd,xtp-farm-rust-toolchain') | Out-Null
 
+# The shader pack (Copy-FarmPack.ps1) stays on the VMs' disks, never in an
+# image: run Copy-FarmPack.ps1 again afterwards.
+$r = Invoke-FarmSsh -Config $c -Vm $Builder -Command 'if exist C:\farm\pack rmdir /s /q C:\farm\pack' -Capture
+if ($r.ExitCode -ne 0 -or (Invoke-FarmSsh -Config $c -Vm $Builder -Command 'if exist C:\farm\pack exit 1' -Capture).ExitCode -ne 0) {
+    throw "cannot remove C:\farm\pack from ${Builder}: not making an image that holds the shader pack"
+}
+
 Write-FarmMessage "stopping $Builder"
 Stop-FarmVm $c $Builder
 Get-FarmInstances -Config $c -Refresh | Out-Null
