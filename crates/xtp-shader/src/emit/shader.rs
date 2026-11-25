@@ -231,6 +231,9 @@ pub(crate) struct Shader {
     pub stride_table: Option<V>,
     /// The loop-limit counter (`u0` in [`LOOP_COUNTER_SPACE`]) is written.
     pub loop_counter: bool,
+    /// `main`'s `"fp32-denorm-mode"`, where the program's f32 denormal mode
+    /// is one DXIL names (`lower::fp32_denorm_mode`).
+    pub denormals: Option<&'static str>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -312,6 +315,7 @@ impl Shader {
             tlas: None,
             stride_table: None,
             loop_counter: false,
+            denormals: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -929,6 +933,9 @@ impl Shader {
         let sm = self.m.md_node(vec![Some(name), Some(six), Some(six)]);
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
+        if let Some(mode) = self.denormals {
+            self.m.declare_fp32_denormals(mode);
+        }
 
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
@@ -1133,6 +1140,7 @@ pub(crate) fn one_mode_per_row(elements: &mut [SigElement], reads: bool) {
 
 #[cfg(all(test, windows))]
 pub(crate) mod tests {
+    use crate::emit::tests::{compute, emit_for};
     use crate::emit::validator::Validator;
 
     /// `dxc -dumpbin`'s listing of `shader`; none (and a note) where the
@@ -1166,5 +1174,78 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// S11: `main` declares the program's f32 denormal mode, the record's
+    /// float mode's unless the program writes MODE's f32 denormal field
+    /// otherwise; the validator takes it, and the listing shows it on
+    /// `main`.
+    #[test]
+    fn main_declares_the_programs_fp32_denormal_mode() {
+        let mode = |float_mode: u8, words: &[u32]| {
+            let native = crate::NativeProgram {
+                float_mode,
+                ..compute(words, false)
+            };
+            let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+            crate::emit::lower::fp32_denorm_mode(&native, &p)
+        };
+        let end = [S_ENDPGM];
+        // BTP 6's records: 0xC0, f32 denormals flushed.
+        assert_eq!(mode(0xC0, &end), Some("ftz"));
+        assert_eq!(mode(0xF0, &end), Some("preserve"));
+        // One way only: no DXIL mode.
+        assert_eq!(mode(0xD0, &end), None);
+        assert_eq!(mode(0xE0, &end), None);
+        // BTP 6's only MODE write, its f16/f64 rounding: not the field.
+        let rounding = [0xBA80_0881, 3, S_ENDPGM]; // s_setreg_imm32_b32 hwreg(MODE, 2, 2), 3
+        assert_eq!(mode(0xC0, &rounding), Some("ftz"));
+        // The field written with the entry's value, or with another.
+        let same = [0xBA80_0901, 0, S_ENDPGM]; // s_setreg_imm32_b32 hwreg(MODE, 4, 2), 0
+        assert_eq!(mode(0xC0, &same), Some("ftz"));
+        let other = [0xBA80_0901, 3, S_ENDPGM];
+        assert_eq!(mode(0xC0, &other), None);
+        let denorm = |imm: u32| [0xBFA5_0000 | imm, S_ENDPGM]; // s_denorm_mode imm
+        assert_eq!(mode(0xF0, &denorm(0xF)), Some("preserve"));
+        assert_eq!(mode(0xF0, &denorm(0xC)), None);
+
+        // v_mov_b32 v1, 1.0; v_add_f32 v1, v0, v1: an f32 operation.
+        let words = [0x7E02_02F2, 0x0602_0300, S_ENDPGM];
+        for (float_mode, want) in [(0xC0, Some("ftz")), (0xF0, Some("preserve")), (0xD0, None)] {
+            let native = crate::NativeProgram {
+                float_mode,
+                ..compute(&words, false)
+            };
+            let mut cs = emit_for(&native, crate::emit::Target::ANY).unwrap();
+            if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+                v.validate(&mut cs.dxil)
+                    .unwrap_or_else(|e| panic!("{float_mode:#x}: validation: {e}"));
+            }
+            let Some(listing) = listing(&cs) else {
+                continue;
+            };
+            let main = listing
+                .lines()
+                .find(|l| l.starts_with("define void @main()"))
+                .expect("main");
+            match want {
+                Some(mode) => {
+                    assert!(
+                        listing.contains(&format!("\"fp32-denorm-mode\"=\"{mode}\"")),
+                        "{float_mode:#x}: no fp32-denorm-mode {mode} in:\n{listing}"
+                    );
+                    assert!(
+                        main.contains('#'),
+                        "{float_mode:#x}: main has no attributes: {main}"
+                    );
+                }
+                None => assert!(
+                    !listing.contains("fp32-denorm-mode") && !main.contains('#'),
+                    "{float_mode:#x}: {main}"
+                ),
+            }
+        }
     }
 }
