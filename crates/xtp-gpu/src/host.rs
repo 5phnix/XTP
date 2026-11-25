@@ -800,6 +800,7 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    pub(crate) rt_scratch: Mutex<Option<ID3D12Resource>>,
     pub(crate) query_resolves: crate::query::Resolves,
     /// Swapped for a fresh one when the list is reset while it runs.
     allocator: Mutex<ID3D12CommandAllocator>,
@@ -1279,6 +1280,7 @@ impl Host {
                 format!("xtp host prelude {:#x}", prelude.as_raw() as usize)
             });
             Ok(HostList {
+                rt_scratch: Mutex::default(),
                 allocator: Mutex::new(allocator),
                 bounds_list: if self.depth_bounds {
                     Some(list.cast()?)
