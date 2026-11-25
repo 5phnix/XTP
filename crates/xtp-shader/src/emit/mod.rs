@@ -86,6 +86,8 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod image_tests;
 #[cfg(all(test, windows))]
+mod input_tests;
+#[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 #[cfg(all(test, windows))]
 mod loop_limit_tests;
@@ -807,6 +809,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: 0,
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -1012,6 +1015,7 @@ mod tests {
                         row2: 0,
                     }],
                     input_addr,
+                    rsrc2: 0,
                     db_shader_control: 0,
                     patches: vec![],
                 },
@@ -1083,6 +1087,7 @@ mod tests {
                     row2: 0,
                 }],
                 input_addr: 0,
+                rsrc2: 0,
                 db_shader_control: 0,
                 patches: vec![],
             },

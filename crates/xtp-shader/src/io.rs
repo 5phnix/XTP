@@ -195,6 +195,16 @@ pub struct Io {
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
+    raise_inputs(p, native, false)
+}
+
+/// On a live read of a folded first half, evaluate the two instructions
+/// independently. Ported from fxceless's VIctory fork (commit 578d459) by fxceless.
+pub(crate) fn raise_inputs(
+    p: &Program,
+    native: &NativeProgram,
+    separate: bool,
+) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
@@ -343,6 +353,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
+                        ("v_interp_p1_f32" | "v_interp_p2_f32", _) if separate => {
+                            io.interps.push((site, Interp::Weighted { attribute }));
+                        }
                         ("v_interp_p1_f32", _) => {}
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
@@ -363,6 +376,10 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
+                    "v_interp_p1ll_f16" | "v_interp_p2_f16" if separate => {
+                        let attribute = attribute(inst, &v.src[0])?;
+                        io.interps.push((site, Interp::Weighted { attribute }));
+                    }
                     "v_interp_p1ll_f16" => {}
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
@@ -584,6 +601,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs,
                 input_addr,
+                rsrc2: 0,
                 db_shader_control: 0,
                 patches: Vec::<ExportPatch>::new(),
             },

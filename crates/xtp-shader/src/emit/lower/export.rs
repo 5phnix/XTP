@@ -59,11 +59,9 @@ impl<'a> Lower<'a> {
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
         if let Some(g) = guard
-            && !mesh
+            && self.s.pixel
+            && e.done
         {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
             let t = self.s.m.bool(true);
             let kill = self.s.m.bin(c, Bin::Xor, g, t);
             self.s
@@ -195,7 +193,7 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit output the stage data does not mark");
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
-        let at = if mesh {
+        let at = if mesh || !self.s.pixel || !e.done {
             self.begin_guarded(guard)
         } else {
             None

@@ -35,6 +35,7 @@
 //!             mask, u8 attribute (v_interp `attr`), u8 default, u8 second
 //!             row (of a packed pair), u8 parameter slot, u8 flags (bit 0
 //!             flat, 1 linear, 3 fp16, 4 fp16 packed); E+0x124 u32 count
+//!     E+0x128 u32 SPI_SHADER_PGM_RSRC2_PS,
 //!     E+0x134 u32 SPI_PS_INPUT_ADDR, E+0x138 u32 DB_SHADER_CONTROL
 //!     E+0x148 u32 export patch size (dwords), E+0x14c 8 patches, one per
 //!             MRT: u32 code offset (dwords, -1 none), then the export code
@@ -178,7 +179,48 @@ impl NativeProgram {
                 }
             }
         }
+        if self.io.pops() {
+            skip_ordered_wait(&mut code, self.wave64);
+        }
         code
+    }
+}
+
+/// Host rasterizer-ordered UAVs serialize overlapping pixels. Bypass the
+/// console's collision test only when both paths lead to the same ordered
+/// section and the skipped block only polls SRC_POPS_EXITING_WAVE_ID.
+fn skip_ordered_wait(code: &mut [u8], wave64: bool) {
+    use crate::gfx10::{Fields, Operand};
+    let Ok(insts) = crate::gfx10::decode(code) else {
+        return;
+    };
+    for w in insts.windows(5) {
+        let [gate, sleep, add, cmp, back] = w else {
+            unreachable!()
+        };
+        if gate.words != [0xbf87_0004] // s_cbranch_vccnz past the poll
+            || back.words != [0xbf84_fffc] // s_cbranch_scc0 to sleep
+            || back.offset != gate.offset + 16
+            || sleep.name() != Some("s_sleep")
+            || add.name() != Some("s_add_i32")
+            || cmp.name() != Some("s_cmp_lt_u32")
+        {
+            continue;
+        }
+        let Fields::Sop {
+            dst: Some(dst),
+            src,
+            ..
+        } = add.fields(wave64)
+        else {
+            continue;
+        };
+        let Fields::Sop { src: compared, .. } = cmp.fields(wave64) else {
+            continue;
+        };
+        if src.first() == Some(&Operand::Const(239)) && compared.get(1) == Some(&dst) {
+            code[gate.offset..gate.offset + 4].copy_from_slice(&0xbf82_0004u32.to_le_bytes());
+        }
     }
 }
 
@@ -262,12 +304,31 @@ pub enum StageIo {
         inputs: Vec<PsInput>,
         /// `SPI_PS_INPUT_ADDR`: which system values arrive in VGPRs.
         input_addr: u32,
+        /// `SPI_SHADER_PGM_RSRC2_PS`: user SGPR count and optional system inputs.
+        rsrc2: u32,
         /// `DB_SHADER_CONTROL`: depth export, kill.
         db_shader_control: u32,
         patches: Vec<ExportPatch>,
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+}
+
+impl StageIo {
+    /// LOAD_COLLISION_WAVEID enables primitive-ordered pixel shading.
+    pub(crate) fn pops(&self) -> bool {
+        matches!(self, Self::Ps { rsrc2, .. } if rsrc2 & (1 << 25) != 0)
+    }
+
+    /// On entry the primitive mask follows user data. Only infer undefined
+    /// registers for the plain layout, without optional hardware SGPRs.
+    pub(crate) fn ps_initialized_sgprs(&self) -> Option<u8> {
+        let Self::Ps { rsrc2, .. } = *self else {
+            return None;
+        };
+        let user = (rsrc2 >> 1 & 31) | (rsrc2 >> 22 & 32);
+        (rsrc2 & ((3 << 25) | 0xc1) == 0).then_some(user as u8 + 1)
+    }
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -606,6 +667,7 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     Ok(StageIo::Ps {
         inputs,
         input_addr: u32_at(data, PS_INPUT_ADDR)?,
+        rsrc2: u32_at(data, 0x128)?,
         db_shader_control: u32_at(data, PS_DB_SHADER_CONTROL)?,
         patches,
     })
@@ -786,6 +848,7 @@ mod tests {
                     io: StageIo::Ps {
                         inputs: vec![],
                         input_addr: 0,
+                        rsrc2: 0,
                         db_shader_control: 0,
                         patches: vec![],
                     },

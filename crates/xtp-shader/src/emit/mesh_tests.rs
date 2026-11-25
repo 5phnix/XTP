@@ -453,6 +453,7 @@ fn flat_pixel() -> NativeProgram {
                 row2: 0,
             }],
             input_addr: 0,
+            rsrc2: 0,
             db_shader_control: 0,
             patches: Vec::new(),
         },
