@@ -1267,11 +1267,11 @@ mod tests {
         let prepared = crate::rectangles::expand(
             list.host(),
             &mut held,
-            &[],
-            &[(0, 0, 0); 32],
+            (&[], &[(0, 0, 0); 32]),
             (&args_copy, args.address(), 16, 1),
             None,
             None,
+            [0; 2],
         )
         .expect("expanded");
         target.bind(list.host(), &root, &pso);

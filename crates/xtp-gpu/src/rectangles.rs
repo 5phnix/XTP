@@ -963,11 +963,11 @@ struct Source {
 pub(crate) fn expand(
     list: &HostList,
     held: &mut Option<Scratch>,
-    inputs: &[Input],
-    vertices: &[(u64, u32, u32); 32],
+    (inputs, vertices): (&[Input], &[(u64, u32, u32); 32]),
     (args, arguments, stride, max): (&Arc<Shadow>, u64, u32, u32),
     count: Option<(&Arc<Shadow>, u64)>,
-    stats: Option<u64>,
+    stats: Option<(u64, u32)>,
+    writes: [u64; 2],
 ) -> Result<Prepared, &'static str> {
     if stride < 16 || !stride.is_multiple_of(4) || !args.gpu(arguments).is_multiple_of(4) {
         return Err("rectangle records short or not 4-byte aligned");
@@ -1061,25 +1061,29 @@ pub(crate) fn expand(
     for s in &sources {
         s.shadow.refresh(list, s.address, u64::from(s.size));
     }
-    let src_args = args.gpu(arguments);
-    if !crate::indirect::rewrite(
+    let bounded = crate::indirect::bound(
         list,
-        src_args,
+        (&args.buffer, args.offset(arguments)),
         (0, stride, max),
-        count.map(|(s, at)| s.gpu(at)),
-        None,
+        count.map(|(s, at)| (&s.buffer, s.offset(at))),
         stats,
-    ) {
-        return Err("not bounded (no clamp)");
-    }
+        writes,
+        false,
+    )
+    .ok_or("not bounded (no clamp)")?;
+    let _expanding =
+        crate::timestamps::command(list, crate::timestamps::What::RectangleExpansion, None);
+    // SAFETY: la passe précédente a écrit le compteur, puis les dessins au pas de 24 octets.
+    let count_gpu = unsafe { bounded.buffer.GetGPUVirtualAddress() } + bounded.offset;
+    let src_args = count_gpu + 4;
+    let stride = 24;
 
     let args_gpu = args_buffer.gpu();
     let (counter, records) = (args_gpu, args_gpu + COUNTER_BYTES);
-    let count_gpu = count.map_or(src_args, |(s, at)| s.gpu(at));
     let rewrite = [
         max,
         stride,
-        u32::from(count.is_some()),
+        1,
         max_src_verts,
         capacity,
         u32::from(need_vertices),
@@ -1574,11 +1578,11 @@ mod tests {
             expand(
                 list.host(),
                 &mut held,
-                &inputs,
-                &bound,
+                (&inputs, &bound),
                 (&args_copy, args.address(), 16, 5),
                 Some((&count_copy, count.address())),
                 None,
+                [0; 2],
             )
             .expect("expanded")
         };
@@ -1651,11 +1655,11 @@ mod tests {
         expand(
             list.host(),
             &mut held,
-            &inputs,
-            &bound,
+            (&inputs, &bound),
             (&args_copy, args.address(), 16, 1),
             None,
             None,
+            [0; 2],
         )
         .expect("expanded");
         let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
@@ -1704,11 +1708,11 @@ mod tests {
         let prepared = expand(
             list.host(),
             &mut held,
-            &inputs,
-            &[(0, 0, 0); 32],
+            (&inputs, &[(0, 0, 0); 32]),
             (&args_copy, args.address(), 16, 4),
             Some((&count_copy, count.address())),
             None,
+            [0; 2],
         )
         .expect("expanded");
         assert!(prepared.views.is_empty());
@@ -1791,11 +1795,11 @@ mod tests {
         let prepared = expand(
             list.host(),
             &mut held,
-            &inputs,
-            &bound,
+            (&inputs, &bound),
             (&args_copy, args.address(), 16, 2),
             None,
             None,
+            [0; 2],
         )
         .expect("expanded");
         let (_, layouts) = scratch_layout(&[(0, 10), (2, 6)], SCRATCH_BYTES).expect("a layout");

@@ -709,6 +709,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
+    pub(crate) clamps: Mutex<crate::indirect::Runs>,
     /// The host fence value of its last submission (0: none): it is not
     /// dropped before that one has finished.
     last: AtomicU64,
@@ -944,6 +945,9 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    // Dernière écriture connue de chaque tampon, et des UAV à indice dynamique.
+    buffer_writes: std::collections::HashMap<usize, u64>,
+    unknown_writes: u64,
 }
 
 /// A list a submission in flight names.
@@ -1162,6 +1166,7 @@ impl Host {
                 twins: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: Mutex::default(),
+                clamps: Mutex::default(),
                 last: AtomicU64::new(0),
                 fresh_after: AtomicU64::new(0),
                 ours: std::sync::atomic::AtomicBool::new(false),
@@ -2057,6 +2062,7 @@ impl HostList {
             }
             allocator.clone()
         };
+        *self.clamps.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // New ones: a submission in flight keeps its own (`Recorded`).
         *self.pipelines.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
@@ -2263,7 +2269,12 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        *deferred
+            .buffer_writes
+            .entry(shadow.buffer.as_raw() as usize)
+            .or_default() += 1;
+        deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
@@ -2277,15 +2288,45 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        *deferred
+            .buffer_writes
+            .entry(shadow.buffer.as_raw() as usize)
+            .or_default() += 1;
+        deferred
             .copies
             .push(Step::GpuCopy(shadow.clone(), address, len));
     }
 
     /// Counts a memory write of `bytes` the list records on the GPU, once
     /// per submission (see [`crate::shadow::write`]).
-    pub(crate) fn count_gpu_write(&self, bytes: usize) {
-        self.deferred().copies.push(Step::GpuWord(bytes));
+    pub(crate) fn count_gpu_write(&self, buffer: &ID3D12Resource, bytes: usize) {
+        let mut deferred = self.deferred();
+        *deferred
+            .buffer_writes
+            .entry(buffer.as_raw() as usize)
+            .or_default() += 1;
+        deferred.copies.push(Step::GpuWord(bytes));
+    }
+
+    pub(crate) fn unknown_buffer_write(&self) {
+        self.deferred().unknown_writes += 1;
+    }
+
+    pub(crate) fn indirect_writes(
+        &self,
+        args: &ID3D12Resource,
+        count: Option<&ID3D12Resource>,
+    ) -> [u64; 2] {
+        let d = self.deferred();
+        let revision = |b: &ID3D12Resource| {
+            d.unknown_writes
+                + d.buffer_writes
+                    .get(&(b.as_raw() as usize))
+                    .copied()
+                    .unwrap_or(0)
+        };
+        [revision(args), count.map_or(0, revision)]
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -2349,7 +2390,7 @@ impl HostList {
 
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
+    pub(crate) fn budget(&self) -> Option<ID3D12Resource> {
         let made = self
             .budget
             .lock()
@@ -2374,8 +2415,7 @@ impl HostList {
                 (0, 0),
             ));
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some(buffer)
     }
 
     /// Keeps `object` alive until the list is reset.

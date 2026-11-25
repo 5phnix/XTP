@@ -89,6 +89,8 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
+    // Racines validées avant le bridage, posées après sa passe de calcul.
+    pending_compute: Option<Vec<(u32, ComputeRoot)>>,
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
@@ -128,6 +130,30 @@ pub(crate) struct State {
     dropped_dispatch: bool,
     /// Memory of the list's own that root views are copied into.
     own: Own,
+}
+
+enum ComputeRoot {
+    Constants(Vec<u32>),
+    Cbv(u64),
+    Srv(u64),
+    Table(D3D12_GPU_DESCRIPTOR_HANDLE),
+}
+
+impl ComputeRoot {
+    fn set(self, list: &HostList, param: u32) {
+        let l = &list.list;
+        // SAFETY: bind a validé les ressources et la racine de ce pipeline.
+        unsafe {
+            match self {
+                Self::Constants(v) => {
+                    l.SetComputeRoot32BitConstants(param, v.len() as u32, v.as_ptr().cast(), 0)
+                }
+                Self::Cbv(gpu) => l.SetComputeRootConstantBufferView(param, gpu),
+                Self::Srv(gpu) => l.SetComputeRootShaderResourceView(param, gpu),
+                Self::Table(handle) => l.SetComputeRootDescriptorTable(param, handle),
+            }
+        }
+    }
 }
 
 impl Drop for State {
@@ -188,7 +214,6 @@ struct Own {
     copied: u64,
     /// What the list's indirect rectangle draws are expanded into.
     rects: Option<crate::rectangles::Scratch>,
-    dispatch_args: Option<crate::indirect::Expanded>,
     indirect_samples: crate::indirect::Samples,
     /// The holds on the raw views of the runtime stride tables the list's
     /// shaders read, by view heap ([`State::stride_table`]).
@@ -915,20 +940,16 @@ impl State {
         self.host_roots = [0; 2];
     }
 
-    /// Binds `p` and what its stages read; why not if the draw or dispatch
-    /// must not run.
-    fn bind(
-        &mut self,
-        list: &HostList,
-        p: &HostPipeline,
-        compute: bool,
-    ) -> Result<(), &'static str> {
+    fn compute_root(&mut self, list: &HostList, param: u32, value: ComputeRoot) {
+        if let Some(pending) = &mut self.pending_compute {
+            pending.push((param, value));
+        } else {
+            value.set(list, param);
+        }
+    }
+
+    fn bind_pipeline(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let l = &list.list;
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
-        let wanted = self.wanted_heaps(root_srvs);
-        self.set_host_heaps(list, wanted);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -952,10 +973,32 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+    }
+
+    /// Binds `p` and what its stages read; why not if the draw or dispatch
+    /// must not run.
+    fn bind(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+    ) -> Result<(), &'static str> {
+        let l = &list.list;
+        // Heaps first: a root signature with directly indexed heaps must be
+        // set after them.
+        let root_srvs = p.stages.iter().any(|s| !s.root_srvs.is_empty());
+        let wanted = self.wanted_heaps(root_srvs);
+        self.set_host_heaps(list, wanted);
+        if self.pending_compute.is_none() {
+            self.bind_pipeline(list, p, compute);
+        }
         let picked = p
             .stages
             .iter()
             .fold(0, |bits, s| bits | s.translated().host.run_time_buffers);
+        if picked & xtp_shader::emit::RUN_TIME_WRITES != 0 {
+            list.unknown_buffer_write();
+        }
         if picked != 0 && crate::device::run_time_views_on() {
             self.picked_buffers(list, &p.name);
         }
@@ -991,7 +1034,7 @@ impl State {
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        self.compute_root(list, param, ComputeRoot::Constants(values));
                     } else {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
@@ -1026,8 +1069,8 @@ impl State {
                         match (compute, srv) {
                             (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
                             (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                            (true, false) => self.compute_root(list, param, ComputeRoot::Cbv(gpu)),
+                            (true, true) => self.compute_root(list, param, ComputeRoot::Srv(gpu)),
                         }
                     }
                 }
@@ -1038,7 +1081,7 @@ impl State {
                 // the list keeps, and the list keeps the table too.
                 unsafe {
                     if compute {
-                        l.SetComputeRootShaderResourceView(param, gpu);
+                        self.compute_root(list, param, ComputeRoot::Srv(gpu));
                     } else {
                         l.SetGraphicsRootShaderResourceView(param, gpu);
                     }
@@ -1437,7 +1480,7 @@ impl State {
         // SAFETY: an open list; the slot is in the view heap set on it.
         unsafe {
             if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
+                self.compute_root(list, param, ComputeRoot::Table(handle));
             } else {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
@@ -2202,50 +2245,71 @@ impl State {
         if !matches!(kind, DRAW | INDEXED | DISPATCH | MESH) {
             return fail("no host signature".into());
         }
-        args.refresh(list, arguments, len);
-        if let Some((s, at)) = &counter {
-            s.refresh(list, *at, 4);
+        let Some(p) = crate::pipeline::host_pipeline(pipeline as This) else {
+            return fail(Unready::NoPipeline);
+        };
+        if p.compute != (kind == DISPATCH) || p.mesh != (kind == MESH) {
+            return fail("another kind of pipeline bound".into());
         }
-        let clamping = crate::timestamps::command(list, crate::timestamps::What::Clamp, None);
-        let expanded = if matches!(kind, DISPATCH | MESH) {
-            let Some(out) =
-                crate::indirect::Expanded::reserve(&mut self.own.dispatch_args, list, max)
-            else {
-                return fail("no memory for expanded dispatches".into());
-            };
-            Some(out)
+        let split = matches!(kind, DISPATCH | MESH);
+        let signature = if split {
+            p.dispatch_signature
+                .get_or_init(|| crate::indirect::signature(kind, &p.root, p.group_base()))
+                .clone()
         } else {
-            None
+            host_signature(kind, 24)
         };
-        let count_gpu = counter.as_ref().map(|(s, at)| s.gpu(*at));
-        let stats = self.own.indirect_samples.next(list, pipeline);
-        if !crate::indirect::rewrite(
-            list,
-            args.gpu(arguments),
-            (kind, stride, max),
-            count_gpu,
-            expanded,
-            stats,
-        ) {
-            return fail("not bounded (no clamp or invalid arguments)".into());
-        }
-        let expanded = expanded.map(|s| (s.buffer.clone(), s.capacity));
-        drop(clamping);
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
-        let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true).map_err(Unready::from),
-                Some(_) => Err("a graphics pipeline bound".into()),
-                None => Err(Unready::NoPipeline),
-            },
-            _ => Err("another kind".into()),
+        let Some(signature) = signature else {
+            return fail("no host signature".into());
         };
-        if let Err(why) = ran {
+
+        let counter = counter.as_ref().map(|(s, at)| {
+            s.refresh(list, *at, 4);
+            (&s.buffer, s.offset(*at))
+        });
+        args.refresh(list, arguments, len);
+        let writes = list.indirect_writes(&args.buffer, counter.map(|(s, _)| s));
+        let compute = kind == DISPATCH;
+        let ready = if compute {
+            self.pending_compute = Some(Vec::new());
+            self.bind(list, p, true).map_err(Unready::from)
+        } else {
+            self.prepare_for(list, kind == INDEXED, kind == MESH)
+        };
+        let roots = self.pending_compute.take();
+        if let Err(why) = ready {
             return fail(why);
         }
+        let stats = self.own.indirect_samples.next(list, pipeline);
+        let Some(out) = crate::indirect::bound(
+            list,
+            (&args.buffer, args.offset(arguments)),
+            (kind, stride, max),
+            counter,
+            stats,
+            writes,
+            true,
+        ) else {
+            return fail("not bounded (no clamp or invalid arguments)".into());
+        };
+        if out.dispatched {
+            self.host_roots[1] = 0;
+            if compute {
+                self.host_pipeline = 0;
+            } else {
+                // SAFETY: prepare_for a gardé le PSO et posé toutes les racines graphiques.
+                unsafe { list.list.SetPipelineState(&p.pso) };
+            }
+        }
+        if compute {
+            self.bind_pipeline(list, p, true);
+        }
+        if let Some(roots) = roots {
+            for (param, value) in roots {
+                value.set(list, param);
+            }
+        }
+        list.keep(&signature);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(
@@ -2258,58 +2322,25 @@ impl State {
             crate::timestamps::What::Indirect(kind),
             crate::pipeline::host_pipeline(self.pipeline as This),
         );
-        let (buffer, offset, maximum, counter, signature) = if let Some((out, capacity)) = expanded
-        {
-            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-                return fail(Unready::NoPipeline);
+        let command = out.offset
+            + if split && p.group_base().is_none() {
+                16
+            } else {
+                4
             };
-            let base = p.group_base();
-            let Some(sig) = p
-                .dispatch_signature
-                .get_or_init(|| crate::indirect::signature(kind, &p.root, base))
-                .as_ref()
-            else {
-                return fail("no split dispatch signature".into());
-            };
-            list.keep(sig);
-            let offset = if base.is_some() { 4 } else { 16 };
-            (out.clone(), offset, capacity, Some((out, 0)), sig.clone())
-        } else {
-            let Some(sig) = host_signature(kind, stride) else {
-                return fail("no host signature".into());
-            };
-            (
-                args.buffer.clone(),
-                args.offset(arguments),
-                max,
-                counter
-                    .as_ref()
-                    .map(|(s, at)| (s.buffer.clone(), s.offset(*at))),
-                sig,
-            )
-        };
-        let separate_count = counter.as_ref().map(|(s, _)| s).filter(|s| *s != &buffer);
-        crate::indirect::ready(list, &buffer);
-        if let Some(c) = separate_count {
-            crate::indirect::ready(list, c);
-        }
-        // SAFETY: les deux plages sont en état INDIRECT_ARGUMENT et gardées par la liste.
+        // SAFETY: la passe a borné les commandes et leur nombre dans la même tranche.
         unsafe {
-            if kind == DISPATCH && std::mem::take(&mut self.dropped_dispatch) {
+            if compute && std::mem::take(&mut self.dropped_dispatch) {
                 list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
             }
             list.list.ExecuteIndirect(
                 &signature,
-                maximum,
-                &buffer,
-                offset,
-                counter.as_ref().map(|(s, _)| s),
-                counter.as_ref().map_or(0, |(_, at)| *at),
-            )
-        };
-        crate::indirect::done(list, &buffer);
-        if let Some(c) = separate_count {
-            crate::indirect::done(list, c);
+                out.capacity,
+                &out.buffer,
+                command,
+                &out.buffer,
+                out.offset,
+            );
         }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2357,33 +2388,36 @@ impl State {
             &p.inputs,
             (stride, max),
             ((args, arguments), counter),
-            |s, l| s.prepare(l, false),
+            |s, l| s.prepare(l, false).map(|()| p.pso.clone()),
         )
     }
 
-    /// [`State::indirect_rectangles`] for a pipeline of `inputs`: the
-    /// expansion, then `bind` (the draw's own state, the pipeline's
-    /// included: the passes bound compute state of theirs), the expanded
-    /// vertices and `ExecuteIndirect` on the list's arguments, with their
-    /// record count as its count buffer.
+    /// Valide les ressources du dessin avant le bridage, puis rétablit son PSO
+    /// après les passes de calcul et exécute les rectangles développés.
     fn rectangles_indirect(
         &mut self,
         list: &HostList,
         inputs: &[crate::pipeline::host::Input],
         (stride, max): (u32, u32),
         ((args, arguments), counter): RectangleArguments,
-        bind: impl FnOnce(&mut State, &HostList) -> Result<(), Unready>,
+        bind: impl FnOnce(&mut State, &HostList) -> Result<ID3D12PipelineState, Unready>,
     ) -> Result<(), Unready> {
         // The rewritten records: draw arguments, 16 bytes apart.
         let signature = host_signature(0, 16).ok_or("no host signature")?;
-        let expanding =
-            crate::timestamps::command(list, crate::timestamps::What::RectangleExpansion, None);
-        let prepared =
-            self.expand_rectangles(list, inputs, (stride, max), (args, arguments), counter)?;
-        drop(expanding);
-        self.host_pipeline = 0;
+        let writes = list.indirect_writes(&args.buffer, counter.map(|(s, _)| &s.buffer));
+        let pso = bind(self, list)?;
+        let prepared = self.expand_rectangles(
+            list,
+            inputs,
+            (stride, max),
+            (args, arguments),
+            counter,
+            writes,
+        )?;
         self.host_roots[1] = 0;
-        bind(self, list)?;
+        // SAFETY: les passes de calcul ont remplacé le PSO, les racines graphiques restent valides.
+        unsafe { list.list.SetPipelineState(&pso) };
+        self.host_pipeline = pso.as_raw() as usize;
         prepared.bind_vertices(list);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -2423,17 +2457,18 @@ impl State {
         (stride, max): (u32, u32),
         (args, arguments): (&Arc<crate::shadow::Shadow>, u64),
         counter: Option<(&Arc<crate::shadow::Shadow>, u64)>,
+        writes: [u64; 2],
     ) -> Result<crate::rectangles::Prepared, Unready> {
         let vertices = self.vertex.map(|v| (v.address, v.size, v.stride));
         self.recording.lease(list);
         Ok(crate::rectangles::expand(
             list,
             &mut self.own.rects,
-            inputs,
-            &vertices,
+            (inputs, &vertices),
             (args, arguments, stride, max),
             counter,
             self.own.indirect_samples.next(list, self.pipeline),
+            writes,
         )?)
     }
 }
@@ -4488,14 +4523,9 @@ float4 ps(V v) : SV_Target { return v.color; }
                     (&args_copy, args.address()),
                     Some((&count_copy, count.address())),
                 ),
-                |s, l| {
-                    assert_eq!(
-                        (s.host_pipeline, s.host_roots[1]),
-                        (0, 0),
-                        "bound again after the passes"
-                    );
+                |_, l| {
                     painter.bind(l);
-                    Ok(())
+                    Ok(painter.pso.clone())
                 },
             )
             .expect("drawn");
@@ -4553,7 +4583,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                 ((&args_copy, args.address()), None),
                 |_, l| {
                     painter.bind(l);
-                    Ok(())
+                    Ok(painter.pso.clone())
                 },
             )
             .expect("drawn");
@@ -4600,6 +4630,7 @@ float4 ps(V v) : SV_Target { return v.color; }
                 (16, 1),
                 (&args_copy, args.address()),
                 None,
+                [0; 2],
             )
             .expect("expanded");
         let scratch = prepared.args.clone();
