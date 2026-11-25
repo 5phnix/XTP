@@ -36,17 +36,6 @@
 //!   exceeds `LIBRARY_REBUILD_BYTES`, the next pass compacts it, even if
 //!   it crossed the bound during the last save. A compacted library still
 //!   above the bound is compacted again when it doubles or changes translator.
-//! - After a translator change every container is translated again (the
-//!   answer is always this build's), and compared with what the translator
-//!   of the last whole pass kept: the report's `compared` line. A pipeline
-//!   whose translations did not change keeps its name in the library, and
-//!   the precook does not load it (the library's names file says it holds
-//!   it; a session loads it when it needs it): it costs its name alone.
-//!   Only the pipelines of the changed programs are made.
-//! - Before every pass, up to date or not, the shader cache's index is set
-//!   right from its folder (`xtp_gpu::shader_cache::reindex`).
-//! - The times the report gives leave out the pauses a running title
-//!   caused (said apart), and `XTP_PRECOOK_SECONDS` counts without them.
 //! - The note says the kept descriptions that were made again: the file as
 //!   the precook read it, not as it is at the end, which a session may
 //!   have added to meanwhile (the next precook makes those).
@@ -168,10 +157,11 @@ fn precook(o: Options) -> Result<()> {
         ready.lanes.1,
         &ready.key[..16]
     );
-    // The note first: what the pass has to do. Opening the shader cache
-    // reads its index file (before the index, every entry's header: 85 s on
-    // the PC on 2026-11-25), so an up-to-date check stays a matter of
-    // seconds whatever the cache holds, its listing included.
+    // The note first: opening the cache reads every entry's header (25,889
+    // after a pass over the pack), which a precook that is up to date does
+    // not need. Its check stays a matter of seconds whatever the cache
+    // holds (2026-11-25: one that opened the cache first took 85 s on the
+    // PC, the same check right after a pass 1 s).
     // The pipeline cache beside the shader cache, where `use_shader_cache`
     // keeps it (set here first: the note reads it before the shader cache
     // is opened).
@@ -207,28 +197,6 @@ fn precook(o: Options) -> Result<()> {
     } else {
         note.plan(found.as_ref())
     };
-    // The shader cache, whatever the plan: its index is set right from the
-    // folder, which the sessions since the last precook may have left
-    // stale (it only sizes the cache), while no title waits: a listing (no
-    // entry opened) and the index rewritten.
-    let opening = Instant::now();
-    xtp_hle::modules::d3d12x::use_shader_cache(shaders.clone());
-    let opened = opening.elapsed().as_secs_f64();
-    let listing = Instant::now();
-    let listed = match xtp_gpu::shader_cache::reindex() {
-        Some((true, entries, bytes)) => format!(
-            "; listed again in {:.1} s: {entries} entries, {bytes} bytes",
-            listing.elapsed().as_secs_f64()
-        ),
-        Some((false, entries, bytes)) => format!(
-            "; not listed again, a folder could not be read: {entries} entries, {bytes} bytes as indexed"
-        ),
-        None => String::new(),
-    };
-    println!(
-        "cache        {} (opened in {opened:.1} s{listed})",
-        shaders.display()
-    );
     if plan == Plan::Nothing {
         println!(
             "up to date   for this translator, its settings, this pack and the kept pipelines ({:.1} s; --force passes again)",
@@ -246,50 +214,46 @@ fn precook(o: Options) -> Result<()> {
             note.pipelines.as_ref().map_or(0, |c| c.library)
         );
     }
-    // After a translator change, each translation made is compared with
-    // the one the translator of the last whole pass kept: what the change
-    // altered, counted (the answers are this build's).
-    let earlier = found
-        .as_ref()
-        .filter(|f| f.key != note.key && gpu::compare_with(&f.key))
-        .map(|f| f.key.clone());
+    let opening = Instant::now();
+    xtp_hle::modules::d3d12x::use_shader_cache(shaders.clone());
+    println!(
+        "cache        {} (opened in {:.1} s)",
+        shaders.display(),
+        opening.elapsed().as_secs_f64()
+    );
 
     let threads = o
         .jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
         .max(1);
-    let look = || machine.busy();
-    let busy: Busy<'_> = o
-        .wait
-        .then_some(&look as &(dyn Fn() -> Option<String> + Sync));
     let pass = match plan {
         Plan::Whole => pass(
             &data,
             o.pipelines,
             threads,
-            busy,
+            o.wait.then_some(&machine),
             |c, s, p| gpu::prepare(c, s, p).map_err(Outcome::from),
             |compute| compute.pipeline().into(),
         ),
         // The containers are as the note says: the kept pipelines alone.
-        Plan::Nothing | Plan::Kept => Pass::default(),
+        Plan::Nothing | Plan::Kept => Pass { items: Vec::new() },
     };
     let counts = gpu::counts();
-    let replay = o
-        .pipelines
-        .then(|| replay(threads, busy, replay_bound(), &data, derive_wanted()));
+    let replay = o.pipelines.then(|| {
+        replay(
+            threads,
+            o.wait.then_some(&machine),
+            replay_bound(),
+            &data,
+            derive_wanted(),
+        )
+    });
     let save_started = Instant::now();
     let saved = gpu::finish();
     if o.pipelines {
         println!("library save {:.3} s", save_started.elapsed().as_secs_f64());
     }
-    let paused = pass.paused + replay.as_ref().map_or(Duration::ZERO, |r| r.paused);
-    let time = Time {
-        seconds: started.elapsed().saturating_sub(paused).as_secs_f64(),
-        paused,
-        threads,
-    };
-    let compared = earlier.map(|key| (key, gpu::compared()));
+    let seconds = started.elapsed().as_secs_f64();
     print!(
         "{}",
         report(
@@ -298,8 +262,8 @@ fn precook(o: Options) -> Result<()> {
             &counts,
             replay.as_ref(),
             o.pipelines,
-            &time,
-            compared.as_ref(),
+            threads,
+            seconds,
             gpu::refusals()
         )
     );
@@ -547,18 +511,8 @@ struct Item {
 }
 
 /// A pass over a pack.
-#[derive(Default)]
 struct Pass {
     items: Vec<Item>,
-    /// The time its phases were paused while a title ran.
-    paused: Duration,
-}
-
-/// A precook's time without its pauses, its pauses, and its threads.
-struct Time {
-    seconds: f64,
-    paused: Duration,
-    threads: usize,
 }
 
 /// The container bytes of `source`, as the title passes them: a container
@@ -575,30 +529,21 @@ fn container_bytes<'a>(source: &'a Source<'_>) -> Option<Cow<'a, [u8]>> {
 }
 
 /// Precooks every container of the pack in `data` on `threads` threads with
-/// separate translation and compute phases, pausing while `busy` says the
-/// machine is not free. Each phase's time is printed without its pauses.
+/// separate translation and compute phases, pausing while a title runs.
 fn pass<T: Send + Sync>(
     data: &[u8],
     pipelines: bool,
     threads: usize,
-    busy: Busy<'_>,
+    machine: Option<&Machine>,
     prepare: impl Fn(&[u8], Option<xtp_shader::HwStage>, bool) -> Result<Option<T>, Outcome> + Sync,
     compute: impl Fn(&T) -> Outcome + Sync,
 ) -> Pass {
     let started = Instant::now();
     let sources = sources(data);
-    let found = started.elapsed();
     let seen = Mutex::new(std::collections::HashSet::new());
-    let ran = parallel(sources.len(), threads, busy, "records", None, |i| {
+    let mut records = parallel(sources.len(), threads, machine, "records", None, |i| {
         item(&sources[i], &seen, pipelines, &prepare)
     });
-    let mut paused_in = ran.paused;
-    println!(
-        "translation  {:.3} s (including unpacking and cache access{})",
-        (found + ran.active).as_secs_f64(),
-        paused(ran.paused).map_or(String::new(), |p| format!("; {p}"))
-    );
-    let mut records = ran.items;
     records.sort_unstable_by_key(|&(i, _)| i);
     let mut items = Vec::with_capacity(records.len());
     let mut pending = Vec::new();
@@ -608,11 +553,16 @@ fn pass<T: Send + Sync>(
         }
         items.push(item);
     }
+    println!(
+        "translation  {:.3} s (including unpacking and cache access)",
+        started.elapsed().as_secs_f64()
+    );
     if pipelines {
-        let ran = parallel(
+        let started = Instant::now();
+        for (j, done) in parallel(
             pending.len(),
             threads,
-            busy,
+            machine,
             "compute pipelines",
             None,
             |j| {
@@ -620,138 +570,52 @@ fn pass<T: Send + Sync>(
                     .map(|o| Done::Cooked(Some(xtp_shader::HwStage::Cs), o))
                     .unwrap_or_else(|panic| panic)
             },
-        );
-        paused_in += ran.paused;
-        for (j, done) in ran.items {
+        ) {
             items[pending[j].0].done = done;
         }
-        println!(
-            "compute PSOs {:.3} s{}",
-            ran.active.as_secs_f64(),
-            paused(ran.paused).map_or(String::new(), |p| format!(" ({p})"))
-        );
+        println!("compute PSOs {:.3} s", started.elapsed().as_secs_f64());
     }
     first_takes_the_outcome(&mut items);
-    Pass {
-        items,
-        paused: paused_in,
-    }
-}
-
-/// A phase's pauses, for its line (none without).
-fn paused(time: Duration) -> Option<String> {
-    (!time.is_zero()).then(|| {
-        format!(
-            "{:.1} s paused while a title ran, not counted",
-            time.as_secs_f64()
-        )
-    })
-}
-
-/// Why the machine is not free for a precook now (`None`: it is), as
-/// [`Machine::busy`] says; no answer, no pauses.
-type Busy<'a> = Option<&'a (dyn Fn() -> Option<String> + Sync)>;
-
-/// What [`parallel`] gave: each index's result, in no order, and the time
-/// it took without the time it was paused.
-struct Ran<T> {
-    items: Vec<(usize, T)>,
-    /// From the start to the last worker's end, without the pauses.
-    active: Duration,
-    /// The time every worker waited for a title to end.
-    paused: Duration,
-}
-
-/// The time the workers of [`parallel`] were all held by a pause: from the
-/// last one's stop (the others waiting, or out of work) to the first one's
-/// going on. A worker stops between two items only, so a pause starts once
-/// the items under way are done.
-#[derive(Default)]
-struct Pauses {
-    /// Workers waiting for the pause to end, or out of work.
-    idle: usize,
-    /// When the last of them stopped, while all are.
-    since: Option<Instant>,
-    total: Duration,
-}
-
-impl Pauses {
-    /// A worker waits, or is out of work, among `workers`.
-    fn rest(&mut self, workers: usize) {
-        self.idle += 1;
-        if self.idle == workers {
-            self.since = Some(Instant::now());
-        }
-    }
-
-    /// A worker goes on after a pause.
-    fn wake(&mut self) {
-        if let Some(since) = self.since.take() {
-            self.total += since.elapsed();
-        }
-        self.idle -= 1;
-    }
-
-    /// The time paused so far, the pause under way included (`at_end`: not
-    /// one that only means every worker is out of work).
-    fn so_far(&self, at_end: bool) -> Duration {
-        match self.since {
-            Some(since) if !at_end => self.total + since.elapsed(),
-            _ => self.total,
-        }
-    }
+    Pass { items }
 }
 
 /// Runs `work` on each of `0..total` on `threads` threads, and gives what
 /// each gave, by index, in no order. Says how far it is ("precook: <n> of
-/// <total> <what>") every [`PROGRESS_EVERY`], pauses while `busy` says
-/// why the machine is not free (a title runs, looked at every
-/// [`LOOK_EVERY`]), and starts nothing once it ran for `budget` without
-/// its pauses: the indices not run are not in what it gives.
+/// <total> <what>") every [`PROGRESS_EVERY`], pauses while `machine` says
+/// a title runs, and starts nothing after `until`: the indices not run are
+/// not in what it gives.
 fn parallel<T, W>(
     total: usize,
     threads: usize,
-    busy: Busy<'_>,
+    machine: Option<&Machine>,
     what: &str,
-    budget: Option<Duration>,
+    until: Option<Instant>,
     work: W,
-) -> Ran<T>
+) -> Vec<(usize, T)>
 where
     T: Send,
     W: Fn(usize) -> T + Sync,
 {
     if total == 0 {
-        return Ran {
-            items: Vec::new(),
-            active: Duration::ZERO,
-            paused: Duration::ZERO,
-        };
+        return Vec::new();
     }
-    let workers = threads.clamp(1, total);
     let next = AtomicUsize::new(0);
     let finished = AtomicUsize::new(0);
     let paused = AtomicBool::new(false);
-    let held = Mutex::new(Pauses::default());
-    let pauses = || {
-        held.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    };
     let done = AtomicBool::new(false);
     let started = Instant::now();
-    let active = || started.elapsed().saturating_sub(pauses().so_far(false));
     std::thread::scope(|s| {
         // Says how far it is, and pauses the workers while a title runs.
-        // Parked between looks, and woken once the workers are done.
-        let watcher = s.spawn(|| {
+        s.spawn(|| {
             let mut said = Instant::now();
             let mut looked = Instant::now() - LOOK_EVERY;
             while !done.load(Ordering::Relaxed) {
-                std::thread::park_timeout(Duration::from_millis(200));
-                if let Some(busy) = busy
+                std::thread::sleep(Duration::from_millis(200));
+                if let Some(machine) = machine
                     && looked.elapsed() >= LOOK_EVERY
                 {
                     looked = Instant::now();
-                    let why = busy();
+                    let why = machine.busy();
                     if why.is_some() != paused.load(Ordering::Relaxed) {
                         match &why {
                             Some(why) => println!("precook: paused: {why}"),
@@ -760,30 +624,26 @@ where
                         paused.store(why.is_some(), Ordering::Relaxed);
                     }
                 }
-                if said.elapsed() >= PROGRESS_EVERY && !done.load(Ordering::Relaxed) {
+                if said.elapsed() >= PROGRESS_EVERY {
                     said = Instant::now();
                     let n = finished.load(Ordering::Relaxed);
                     println!(
                         "precook: {n} of {total} {what} ({:.0} %), {:.0} s",
-                        n as f64 * 100.0 / total as f64,
-                        active().as_secs_f64()
+                        n as f64 * 100.0 / total.max(1) as f64,
+                        started.elapsed().as_secs_f64()
                     );
                 }
             }
         });
-        let handles: Vec<_> = (0..workers)
+        let workers: Vec<_> = (0..threads.clamp(1, total.max(1)))
             .map(|_| {
                 s.spawn(|| {
                     let mut out = Vec::new();
                     loop {
-                        if paused.load(Ordering::Relaxed) {
-                            pauses().rest(workers);
-                            while paused.load(Ordering::Relaxed) {
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                            pauses().wake();
+                        while paused.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(500));
                         }
-                        if budget.is_some_and(|b| active() >= b) {
+                        if until.is_some_and(|t| Instant::now() >= t) {
                             break;
                         }
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -793,26 +653,16 @@ where
                         out.push((i, work(i)));
                         finished.fetch_add(1, Ordering::Relaxed);
                     }
-                    // Out of work: rests for good, so that a pause of the
-                    // others still counts.
-                    pauses().rest(workers);
                     out
                 })
             })
             .collect();
-        let items: Vec<(usize, T)> = handles
+        let items = workers
             .into_iter()
             .flat_map(|w| w.join().expect("precook thread"))
             .collect();
-        let ended = started.elapsed();
         done.store(true, Ordering::Relaxed);
-        watcher.thread().unpark();
-        let paused = pauses().so_far(true);
-        Ran {
-            items,
-            active: ended.saturating_sub(paused),
-            paused,
-        }
+        items
     })
 }
 
@@ -848,17 +698,10 @@ struct Replay {
     damaged: usize,
     missing: usize,
     repeated: usize,
-    /// Host pipelines made, loaded from the library, and held by it (not
-    /// loaded), meanwhile.
+    /// Host pipelines made, and found in the library, meanwhile.
     made: u64,
     loaded: u64,
-    known: u64,
-    /// The time the kept pipelines took without the pauses, the time they
-    /// were paused while a title ran, and the time reading them (and
-    /// deriving others) took before.
     seconds: f64,
-    paused: Duration,
-    read: Duration,
     bound: Duration,
     /// Where they are kept, and why they could not be read.
     path: Option<PathBuf>,
@@ -978,10 +821,15 @@ impl From<xtp_gpu::pipeline::precook::Replayed> for Replayed {
 /// Makes the graphics and mesh pipelines sessions kept into the library,
 /// then (with `derive`) those derived from the effects of the pack in
 /// `data` for the shader sets no kept one has, on `threads` threads, for
-/// `bound` at most (its pauses not counted), pausing while `busy` says the
-/// machine is not free.
+/// `bound` at most, pausing while `machine` says a title runs.
 #[cfg(windows)]
-fn replay(threads: usize, busy: Busy<'_>, bound: Duration, data: &[u8], derive: bool) -> Replay {
+fn replay(
+    threads: usize,
+    machine: Option<&Machine>,
+    bound: Duration,
+    data: &[u8],
+    derive: bool,
+) -> Replay {
     use xtp_gpu::pipeline::precook as gpu;
 
     let started = Instant::now();
@@ -1032,25 +880,22 @@ fn replay(threads: usize, busy: Busy<'_>, bound: Duration, data: &[u8], derive: 
             bound.as_secs()
         );
     }
-    out.read = started.elapsed();
-    let ran = parallel(
+    let outcomes: Vec<(usize, Replayed)> = parallel(
         recorded.len(),
         threads,
-        busy,
+        machine,
         "kept pipelines",
-        Some(bound),
+        Some(started + bound),
         |i| match catch_unwind(AssertUnwindSafe(|| gpu::replay(&recorded, i))) {
             Ok(o) => o.into(),
             Err(_) => Replayed::Panicked,
         },
     );
-    out.count(&ran.items);
+    out.count(&outcomes);
     let after = gpu::counts();
     out.made = after.made - before.made;
     out.loaded = after.loaded - before.loaded;
-    out.known = after.known - before.known;
-    out.seconds = ran.active.as_secs_f64();
-    out.paused = ran.paused;
+    out.seconds = started.elapsed().as_secs_f64();
     out
 }
 
@@ -1203,9 +1048,8 @@ impl Totals {
     }
 }
 
-/// The text report: what was translated and found, refused and made, how
-/// the translations compare with the translator before's (`compared`: its
-/// key, and the counts), and the time.
+/// The text report: what was translated and found, refused and made, and
+/// the time.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn report(
@@ -1214,21 +1058,12 @@ fn report(
     counts: &xtp_gpu::pipeline::precook::Counts,
     replay: Option<&Replay>,
     pipelines: bool,
-    time: &Time,
-    compared: Option<&(String, xtp_gpu::shader_cache::Compared)>,
+    threads: usize,
+    seconds: f64,
     refusals: Option<String>,
 ) -> String {
     let t = Totals::of(pass);
     let mut o = String::new();
-    let time_line = |o: &mut String| {
-        let _ = writeln!(
-            o,
-            "time         {:.1} s on {} threads at below-normal priority{}",
-            time.seconds,
-            time.threads,
-            paused(time.paused).map_or(String::new(), |p| format!(" ({p})"))
-        );
-    };
     if plan != Plan::Whole {
         let _ = writeln!(
             o,
@@ -1237,7 +1072,10 @@ fn report(
         if let Some(r) = replay {
             o.push_str(&replay_lines(r));
         }
-        time_line(&mut o);
+        let _ = writeln!(
+            o,
+            "time         {seconds:.1} s on {threads} threads at below-normal priority"
+        );
         return o;
     }
     let _ = writeln!(
@@ -1254,9 +1092,6 @@ fn report(
     );
     let _ = writeln!(o, "translated   {}", counts.translated);
     let _ = writeln!(o, "from cache   {}", counts.cached);
-    if let Some((key, c)) = compared {
-        o.push_str(&compared_line(key, c));
-    }
     let _ = writeln!(
         o,
         "refused      {} (kept in the cache: the title gets the same answer at once)",
@@ -1276,9 +1111,8 @@ fn report(
     if pipelines {
         let _ = writeln!(
             o,
-            "compute      {} programs: {} host pipelines made, {} from the library, {} held by it \
-             and not loaded, {} without one",
-            t.compute, counts.made, counts.loaded, counts.known, t.no_pipeline
+            "compute      {} programs: {} host pipelines made, {} from the library, {} without one",
+            t.compute, counts.made, counts.loaded, t.no_pipeline
         );
         if let Some(r) = replay {
             o.push_str(&replay_lines(r));
@@ -1289,30 +1123,10 @@ fn report(
     } else {
         let _ = writeln!(o, "compute      no host pipelines (--no-pipelines)");
     }
-    time_line(&mut o);
-    o
-}
-
-/// The report's line on how the translations made compare with the
-/// entries the translator of `key` (the last whole pass's) kept.
-#[cfg(windows)]
-fn compared_line(key: &str, c: &xtp_gpu::shader_cache::Compared) -> String {
-    let mut o = format!(
-        "compared     with the translator before ({}): {} the same, {} changed, {} not kept by it",
-        key.get(..16).unwrap_or(key),
-        c.same,
-        c.changed,
-        c.unknown
+    let _ = writeln!(
+        o,
+        "time         {seconds:.1} s on {threads} threads at below-normal priority"
     );
-    if !c.examples.is_empty() {
-        let shown = c.examples.iter().take(8).cloned().collect::<Vec<_>>();
-        let _ = write!(o, " (changed: {}", shown.join(" "));
-        if c.changed as usize > shown.len() {
-            o.push_str(" ...");
-        }
-        o.push(')');
-    }
-    o.push('\n');
     o
 }
 
@@ -1327,19 +1141,9 @@ fn replay_lines(r: &Replay) -> String {
     let _ = writeln!(
         o,
         "graphics     {} kept pipelines ({} drawn by sessions, made first): {} ready ({} host \
-         pipelines made, {} from the library, {} held by it and not loaded), {} with shaders \
-         that do not translate, {} refused, in {:.1} s (read in {:.1} s{})",
-        r.kept,
-        r.drawn,
-        r.ready,
-        r.made,
-        r.loaded,
-        r.known,
-        r.untranslated,
-        r.refused,
-        r.seconds,
-        r.read.as_secs_f64(),
-        paused(r.paused).map_or(String::new(), |p| format!("; {p}"))
+         pipelines made, {} from the library), {} with shaders that do not translate, {} \
+         refused, in {:.1} s",
+        r.kept, r.drawn, r.ready, r.made, r.loaded, r.untranslated, r.refused, r.seconds
     );
     if r.panicked > 0 {
         let _ = writeln!(o, "  {:>7}  panicked (translator bugs)", r.panicked);
@@ -1725,65 +1529,6 @@ mod tests {
         ));
         assert!(text.contains("derived      4 descriptions for 1 shader sets"));
         assert!(text.contains("): 1 ready"));
-    }
-
-    /// A pause counts from the last worker's stop to the first one's going
-    /// on; workers out of work count as stopped, and the end of the work
-    /// is no pause.
-    #[test]
-    fn a_pause_counts_while_every_worker_is_held() {
-        let mut p = Pauses::default();
-        p.rest(2);
-        assert_eq!(p.since, None, "one of two");
-        p.rest(2);
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(p.so_far(false) >= Duration::from_millis(20), "under way");
-        p.wake();
-        let held = p.total;
-        assert!(held >= Duration::from_millis(20));
-        p.rest(2);
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(p.so_far(true), held, "all out of work: the end");
-    }
-
-    /// The phases' time leaves out a pause while a title runs, and their
-    /// budget counts without it: everything is done, the pause apart.
-    #[test]
-    fn parallel_time_leaves_out_the_pauses() {
-        let looks = AtomicUsize::new(0);
-        // A title runs at the first look (after some 200 ms), not after.
-        let busy =
-            || (looks.fetch_add(1, Ordering::Relaxed) == 0).then(|| "a title runs".to_owned());
-        let busy: Busy<'_> = Some(&busy);
-        let started = Instant::now();
-        let budget = Some(Duration::from_secs(3));
-        let ran = parallel(20, 2, busy, "items", budget, |i| {
-            std::thread::sleep(Duration::from_millis(100));
-            i
-        });
-        let wall = started.elapsed();
-        assert_eq!(ran.items.len(), 20, "the budget leaves out the pause");
-        assert!(
-            ran.paused >= LOOK_EVERY - Duration::from_secs(1),
-            "{:?}",
-            ran.paused
-        );
-        assert!(ran.active < Duration::from_secs(3), "{:?}", ran.active);
-        assert!(ran.active + ran.paused <= wall);
-
-        let ran = parallel(
-            20,
-            1,
-            None,
-            "items",
-            Some(Duration::from_millis(250)),
-            |i| {
-                std::thread::sleep(Duration::from_millis(100));
-                i
-            },
-        );
-        assert!((1..20).contains(&ran.items.len()), "{}", ran.items.len());
-        assert_eq!(ran.paused, Duration::ZERO);
     }
 
     #[test]

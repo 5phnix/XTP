@@ -136,27 +136,15 @@ impl Drop for Staged {
 }
 
 /// The index file at a cache's root: [`INDEX_MAGIC`], then records of
-/// [`RECORD`] bytes: a snapshot (its own record, [`Change::Snapshot`], with
-/// how many entries follow, then one published record per entry), then the
-/// changes appended as they are made (one published, one removed).
-///
-/// The snapshot is written whole (a file renamed over the index), so its
-/// count makes a cut anywhere in it damage, even one between two records:
-/// the file then holds fewer entries than its snapshot says, or not even
-/// the snapshot's own record. The changes appended after it are written
-/// one record at a time, by any process: a cut inside a record is damage,
-/// a cut between two of them (the last appends of a process stopped with
-/// the machine) leaves a file that reads as sound without them. That is an
-/// entry the index misses, or one it still lists, which only the byte
-/// budget sees until [`super::Cache::reindex`] lists the folder again.
+/// [`RECORD`] bytes, each a change to the entries (one published, one
+/// removed): a snapshot first, then the changes appended as they are made.
 pub(super) const INDEX_FILE: &str = "index";
-/// Version 2: the snapshot's own record and count.
-const INDEX_MAGIC: &[u8; 16] = b"XTP cache index\x02";
-/// A record: its kind (1 published, 2 removed, 3 a snapshot), three zero
-/// bytes, the modification time's nanoseconds (u32), the key (32 bytes),
-/// the payload's size (a snapshot's entry count) and the modification
-/// time's seconds since 1970 (u64 each), then the first 8 bytes of the
-/// BLAKE3 of the 56 before, so that a torn or changed record is damage.
+const INDEX_MAGIC: &[u8; 16] = b"XTP cache index\x01";
+/// A record: its kind (1 published, 2 removed), three zero bytes, the
+/// modification time's nanoseconds (u32), the key (32 bytes), the payload's
+/// size and the modification time's seconds since 1970 (u64 each), then
+/// the first 8 bytes of the BLAKE3 of the 56 before, so that a torn or
+/// changed record is damage.
 const RECORD: usize = 64;
 
 /// One record of the index file.
@@ -170,11 +158,6 @@ pub(super) enum Change {
     Removed {
         key: [u8; 32],
     },
-    /// The file's first record: the snapshot's entry count. Not a change:
-    /// [`read_index`] checks it and leaves it out.
-    Snapshot {
-        entries: u64,
-    },
 }
 
 impl Change {
@@ -187,7 +170,6 @@ impl Change {
                 modified,
             } => (1, key, bytes, modified),
             Change::Removed { key } => (2, key, 0, SystemTime::UNIX_EPOCH),
-            Change::Snapshot { entries } => (3, [0; 32], entries, SystemTime::UNIX_EPOCH),
         };
         // Before 1970 (never for a file written now): the oldest there is.
         let since = modified
@@ -219,74 +201,30 @@ impl Change {
                     .checked_add(std::time::Duration::new(word(48), nanos))?,
             }),
             2 => Some(Change::Removed { key }),
-            3 if key == [0; 32] => Some(Change::Snapshot { entries: word(40) }),
             _ => None,
         }
     }
 }
 
-/// The changes the index file at `root` holds, in order (the snapshot's
-/// entries first); `None` without one, or for one that is damaged anywhere
-/// we can tell ([`INDEX_FILE`]: a torn or changed record, a snapshot cut
-/// short, another version): the cache then lists its folder instead.
+/// The changes the index file at `root` holds, in order; `None` without
+/// one, or for one that is damaged anywhere (a torn record, a changed
+/// byte, another version): the cache then looks at its entries instead.
 pub(super) fn read_index(root: &Path) -> Option<Vec<Change>> {
-    parse_index(&fs::read(root.join(INDEX_FILE)).ok()?)
-}
-
-/// The records of an index file of this version or the one before (the
-/// same records, without the snapshot's), none checked against the others:
-/// for the probe that times reading a real cache's index, which may have
-/// been written by a build of either.
-#[cfg(test)]
-pub(super) fn records_of_any_version(bytes: &[u8]) -> Option<Vec<Change>> {
-    let (magic, rest) = bytes.split_at_checked(INDEX_MAGIC.len())?;
-    (magic[..15] == INDEX_MAGIC[..15]).then_some(())?;
-    let (records, torn) = rest.as_chunks::<RECORD>();
-    torn.is_empty().then_some(())?;
-    records
-        .iter()
-        .map(Change::decode)
-        .filter(|c| !matches!(c, Some(Change::Snapshot { .. })))
-        .collect()
-}
-
-/// [`read_index`] of the file's bytes.
-pub(super) fn parse_index(bytes: &[u8]) -> Option<Vec<Change>> {
+    let bytes = fs::read(root.join(INDEX_FILE)).ok()?;
     let (records, torn) = bytes
         .strip_prefix(INDEX_MAGIC.as_slice())?
         .as_chunks::<RECORD>();
     if !torn.is_empty() {
         return None;
     }
-    let (first, records) = records.split_first()?;
-    let Change::Snapshot { entries } = Change::decode(first)? else {
-        return None;
-    };
-    let entries = usize::try_from(entries).ok()?;
-    let changes: Vec<Change> = records.iter().map(Change::decode).collect::<Option<_>>()?;
-    // The snapshot whole, and nothing but changes after it.
-    let (snapshot, appended) = changes.split_at_checked(entries)?;
-    let sound = snapshot
-        .iter()
-        .all(|c| matches!(c, Change::Published { .. }))
-        && !appended
-            .iter()
-            .any(|c| matches!(c, Change::Snapshot { .. }));
-    sound.then_some(changes)
+    records.iter().map(Change::decode).collect()
 }
 
 /// Replaces the index file at `root` with one holding `entries` (published
-/// changes) after the snapshot's record: written beside it, then renamed
-/// over it.
-pub(super) fn write_index(
-    root: &Path,
-    entries: impl ExactSizeIterator<Item = Change>,
-) -> io::Result<()> {
+/// changes): written beside it, then renamed over it.
+pub(super) fn write_index(root: &Path, entries: impl Iterator<Item = Change>) -> io::Result<()> {
     let mut bytes = INDEX_MAGIC.to_vec();
-    let count = Change::Snapshot {
-        entries: entries.len() as u64,
-    };
-    for change in std::iter::once(count).chain(entries) {
+    for change in entries {
         bytes.extend_from_slice(&change.encode());
     }
     let tmp = root.join(format!("{INDEX_FILE}.{}.tmp", std::process::id()));

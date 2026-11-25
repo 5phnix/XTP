@@ -214,12 +214,7 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
         return;
     };
     let out = &first.out;
-    for phase in [
-        "translation  ",
-        "compute PSOs ",
-        "library save ",
-        "time         ",
-    ] {
+    for phase in ["translation  ", "compute PSOs ", "library save "] {
         let seconds = out
             .lines()
             .find_map(|line| line.strip_prefix(phase))
@@ -237,8 +232,7 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     assert_eq!(figure(out, "refused"), Some(1), "{out}");
     assert!(
         out.contains(
-            "compute      1 programs: 1 host pipelines made, 0 from the library, 0 held by it \
-             and not loaded, 0 without one"
+            "compute      1 programs: 1 host pipelines made, 0 from the library, 0 without one"
         ),
         "{out}\n{}",
         first.err
@@ -297,49 +291,9 @@ fn precook_fills_the_cache_once_for_every_build_of_the_translator() {
     assert_eq!(figure(&shared.out, "from cache"), Some(1), "{}", shared.out);
 }
 
-/// The compute line's host pipelines: made, loaded from the library, and
-/// held by it and not loaded.
-fn pipelines(out: &str) -> (u64, u64, u64) {
-    let line = out
-        .lines()
-        .find(|l| l.starts_with("compute ") && l.contains(" programs: "))
-        .unwrap_or_else(|| panic!("no compute line\n{out}"));
-    let before = |what: &str| -> u64 {
-        let head = &line[..line.find(what).unwrap_or_else(|| panic!("{what}: {line}"))];
-        head.rsplit([' ', ',', ':'])
-            .find(|w| !w.is_empty())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("{what}: {line}"))
-    };
-    (
-        before(" host pipelines made"),
-        before(" from the library"),
-        before(" held by it and not loaded"),
-    )
-}
-
-/// The compared line's counts: the same, changed, and not kept by the
-/// translator before.
-fn compared(out: &str) -> Option<(u64, u64, u64)> {
-    let line = out.lines().find(|l| l.starts_with("compared "))?;
-    let n = |what: &str| -> u64 {
-        let head = &line[..line.find(what).unwrap()];
-        head.rsplit([' ', ',', ':'])
-            .find(|w| !w.is_empty())
-            .unwrap()
-            .parse()
-            .unwrap()
-    };
-    Some((n(" the same"), n(" changed"), n(" not kept by it")))
-}
-
-/// Translator changes, with the library reused in place. A loop-limit
-/// change gives the loop-free programs a new key, and the same
-/// translations: they are made again and compared with those the
-/// translator before kept (the same), and their pipelines, which the
-/// library holds, are not made, nor loaded but for the one the precook
-/// keeps as its stand-in. A program whose container changed (another group
-/// size) gets a pipeline of its own. One thread: the stand-in is the first.
+/// A new translation key with one changed DXIL. A loop-limit change gives
+/// the two loop-free programs a new key while preserving their DXIL. Changing
+/// the group size in one record then changes just that program's DXIL.
 #[test]
 fn precook_keeps_pipelines_across_translation_keys() {
     let dir = tempfile::tempdir().unwrap();
@@ -349,67 +303,59 @@ fn precook_keeps_pipelines_across_translation_keys() {
         let mut pack = b"SGD5".to_vec();
         pack.extend(record("CS_First_Wrapped", &compute_container(32)));
         pack.extend(record("CS_Second_Wrapped", &compute_container(threads)));
-        pack.extend(record("CS_Third_Wrapped", &compute_container(16)));
         std::fs::write(&path, pack).unwrap();
     };
-    let run_with = |limit, args: &[&str]| {
-        let args = [&["--jobs", "1"], args].concat();
+    let run = |limit| {
         precook_with_settings(
             xtp,
             dir.path(),
             &path,
-            &args,
+            &[],
             &[("XTP_SHADER_LOOP_LIMIT", limit)],
         )
     };
-    let run = |limit| run_with(limit, &[]);
     write_pack(64);
     let Some(first) = run("128") else { return };
-    let out = &first.out;
-    assert_eq!(figure(out, "translated"), Some(3), "{out}");
-    assert_eq!(pipelines(out), (3, 0, 0), "{out}");
-    assert_eq!(compared(out), None, "nothing to compare with: {out}");
+    assert_eq!(figure(&first.out, "translated"), Some(2), "{}", first.out);
     let library = dir.path().join("cache/pipelines/host-pipelines.bin");
-    assert!(library.is_file(), "{out}");
-    let names = dir.path().join("cache/pipelines/host-pipelines.names");
-    assert!(names.is_file(), "the library's names beside it: {out}");
+    assert!(library.is_file(), "{}", first.out);
 
-    // Another translator, the same translations: no pipeline made, and
-    // only the stand-in loaded.
-    let same = run("256").unwrap().out;
-    assert_eq!(figure(&same, "translated"), Some(3), "{same}");
-    assert_eq!(compared(&same), Some((3, 0, 0)), "{same}");
-    assert!(!same.contains("a new generation"), "{same}");
-    assert_eq!(pipelines(&same), (0, 1, 2), "{same}");
-
-    // And one container changed: its pipeline alone is made.
     write_pack(128);
-    let changed = run("512").unwrap().out;
-    assert_eq!(figure(&changed, "translated"), Some(3), "{changed}");
-    assert_eq!(compared(&changed), Some((2, 0, 1)), "{changed}");
-    assert_eq!(pipelines(&changed), (1, 1, 1), "{changed}");
+    let changed = run("256").unwrap().out;
+    assert_eq!(figure(&changed, "translated"), Some(2), "{changed}");
+    assert!(!changed.contains("a new generation"), "{changed}");
+    assert!(
+        changed.contains("1 host pipelines made, 1 from the library"),
+        "{changed}"
+    );
 
-    // The replaced pipeline is still available to a session using the old
-    // build, and its translations to its precook.
+    // The replaced pipeline is still available to a session using the old build.
     write_pack(64);
     let original = run("128").unwrap().out;
-    assert_eq!(figure(&original, "from cache"), Some(3), "{original}");
-    assert_eq!(pipelines(&original), (0, 1, 2), "{original}");
+    assert_eq!(figure(&original, "from cache"), Some(2), "{original}");
+    assert!(
+        original.contains("0 host pipelines made, 2 from the library"),
+        "{original}"
+    );
 
-    // A driver-rejected file is replaced with a usable library, and its
-    // names (another file's) are not trusted.
-    std::fs::write(&library, b"invalid pipeline library").unwrap();
+    // A driver-rejected file is replaced with a usable library.
+    std::fs::write(library, b"invalid pipeline library").unwrap();
     let repaired = run("128").unwrap().out;
-    assert_eq!(pipelines(&repaired), (3, 0, 0), "{repaired}");
-    let forced = run_with("128", &["--force"]).unwrap().out;
-    assert_eq!(pipelines(&forced), (0, 1, 2), "{forced}");
-
-    // A library whose names file is gone (an older one): its pipelines are
-    // loaded once, learned, and held by their names the next time.
-    std::fs::remove_file(&names).unwrap();
-    let learned = run_with("128", &["--force"]).unwrap().out;
-    assert_eq!(pipelines(&learned), (0, 3, 0), "{learned}");
-    assert!(names.is_file(), "the names learned are written: {learned}");
-    let known = run_with("128", &["--force"]).unwrap().out;
-    assert_eq!(pipelines(&known), (0, 1, 2), "{known}");
+    assert!(
+        repaired.contains("2 host pipelines made, 0 from the library"),
+        "{repaired}"
+    );
+    let forced = precook_with_settings(
+        xtp,
+        dir.path(),
+        &path,
+        &["--force"],
+        &[("XTP_SHADER_LOOP_LIMIT", "128")],
+    )
+    .unwrap()
+    .out;
+    assert!(
+        forced.contains("0 host pipelines made, 2 from the library"),
+        "{forced}"
+    );
 }
