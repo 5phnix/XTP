@@ -1,4 +1,8 @@
-// GFX10 opcode names, generated from Mesa's src/amd/compiler/aco_opcodes.py
+// LLVM MC encodings (llvm-project llvmorg-19.1.7, Apache-2.0 WITH
+// LLVM-exception) supply VOP3P 0x018 and MIMG 0x061 and 0x0e8..=0x0eb.
+// MIMG 0x0ec..=0x0ef (image_sample_*cd*_o_g16) are the GFX10 opcodes that
+// LLVM's llvm/lib/Target/AMDGPU/MIMGInstructions.td gives at the same tag.
+// The remaining rows come from Mesa's src/amd/compiler/aco_opcodes.py
 // (tag mesa-22.3.0, GFX10 column), which carries this notice:
 //
 // Copyright (c) 2018 Valve Corporation
@@ -332,6 +336,7 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x003, "v_add_f32"),
     (0x004, "v_sub_f32"),
     (0x005, "v_subrev_f32"),
+    // The console combines GFX10.1 MAD/MAC with BVH instructions, like gfx1013.
     (0x006, "v_mac_legacy_f32"),
     (0x007, "v_mul_legacy_f32"),
     (0x008, "v_mul_f32"),
@@ -657,6 +662,7 @@ pub(super) const VOPC: &[(u16, &str)] = &[
 ];
 
 pub(super) const VOP3: &[(u16, &str)] = &[
+    // The console combines GFX10.1 MAD/MAC with BVH instructions, like gfx1013.
     (0x140, "v_mad_legacy_f32"),
     (0x141, "v_mad_f32"),
     (0x142, "v_mad_i32_i24"),
@@ -800,6 +806,7 @@ pub(super) const VOP3P: &[(u16, &str)] = &[
     (0x015, "v_dot2_u32_u16"),
     (0x016, "v_dot4_i32_i8"),
     (0x017, "v_dot4_u32_u8"),
+    (0x018, "v_dot8_i32_i4"),
     (0x019, "v_dot8_u32_u4"),
     (0x020, "v_fma_mix_f32"),
     (0x021, "v_fma_mixlo_f16"),
@@ -1151,6 +1158,7 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x05e, "image_gather4_c_b_cl_o"),
     (0x05f, "image_gather4_c_lz_o"),
     (0x060, "image_get_lod"),
+    (0x061, "image_gather4h"),
     (0x068, "image_sample_cd"),
     (0x069, "image_sample_cd_cl"),
     (0x06a, "image_sample_c_cd"),
@@ -1170,6 +1178,14 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x0bb, "image_sample_c_d_cl_o_g16"),
     (0x0e6, "image_bvh_intersect_ray"),
     (0x0e7, "image_bvh64_intersect_ray"),
+    (0x0e8, "image_sample_cd_g16"),
+    (0x0e9, "image_sample_cd_cl_g16"),
+    (0x0ea, "image_sample_c_cd_g16"),
+    (0x0eb, "image_sample_c_cd_cl_g16"),
+    (0x0ec, "image_sample_cd_o_g16"),
+    (0x0ed, "image_sample_cd_cl_o_g16"),
+    (0x0ee, "image_sample_c_cd_o_g16"),
+    (0x0ef, "image_sample_c_cd_cl_o_g16"),
 ];
 
 pub(super) const FLAT: &[(u16, &str)] = &[

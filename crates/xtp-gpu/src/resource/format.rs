@@ -872,14 +872,28 @@ pub(crate) fn note_stand_in(title: u32, host: u32) {
 static LIVE: [std::sync::atomic::AtomicI64; 5] =
     [const { std::sync::atomic::AtomicI64::new(0) }; 5];
 
+#[cfg(windows)]
+static BY_ORIGIN: [[std::sync::atomic::AtomicI64; 2]; 5] =
+    [const { [const { std::sync::atomic::AtomicI64::new(0) }; 2] }; 5];
+
 /// Counts a host texture of `bytes` made (`alive`) or freed: `extra` of
 /// them for its stand-in format, `pooled` if placed in the texture pool.
-pub(crate) fn note_texture(alive: bool, bytes: u64, extra: u64, pooled: bool) {
+#[cfg(windows)]
+pub(super) fn note_texture(
+    alive: bool,
+    bytes: u64,
+    extra: u64,
+    pooled: bool,
+    origin: super::TextureOrigin,
+) {
     use std::sync::atomic::Ordering::Relaxed;
     let sign = if alive { 1 } else { -1 };
     LIVE[0].fetch_add(sign, Relaxed);
     LIVE[1].fetch_add(sign * bytes as i64, Relaxed);
     LIVE[2].fetch_add(sign * extra as i64, Relaxed);
+    let [count, size] = &BY_ORIGIN[origin as usize];
+    count.fetch_add(sign, Relaxed);
+    size.fetch_add(sign * bytes as i64, Relaxed);
     if pooled {
         LIVE[3].fetch_add(sign, Relaxed);
         LIVE[4].fetch_add(sign * bytes as i64, Relaxed);
@@ -918,6 +932,17 @@ pub(crate) fn report() -> Option<String> {
         (bytes - pooled_bytes) >> 20,
         extra >> 20
     );
+    #[cfg(windows)]
+    let pool = {
+        let [committed, offset, address, view, external] =
+            BY_ORIGIN.each_ref().map(|[count, size]| {
+                format!("{} / {} MiB", count.load(Relaxed), size.load(Relaxed) >> 20)
+            });
+        format!(
+            "{pool}; by title creation: committed {committed}, heap offset {offset}, \
+             address {address}, placed view {view}, external {external}"
+        )
+    };
     let stood_in: Vec<String> = counts
         .stood_in
         .iter()

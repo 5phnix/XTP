@@ -630,6 +630,13 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
     }
 }
 
+/// A stream subobject's size and whether it is a shader, for the frame
+/// recorder (`crate::record`), which copies what subobjects point at.
+#[cfg(all(windows, any(test, feature = "diagnostics")))]
+pub(crate) fn recorded_subobject(kind: u32) -> Option<(usize, bool)> {
+    subobject(kind).map(|(size, stage)| (size, stage.is_some()))
+}
+
 /// Device method: a pipeline from a stream; the shaders are kept, and the
 /// graphics state for the host pipeline.
 pub(crate) extern "system" fn create_stream(
@@ -709,6 +716,8 @@ mod builder;
 pub mod effects;
 #[cfg(windows)]
 pub use builder::register_builder;
+#[cfg(windows)]
+pub use builder::{BuilderCall, builder_call};
 #[cfg(windows)]
 pub(crate) fn builder_held(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::admitted()

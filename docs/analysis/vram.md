@@ -124,6 +124,12 @@ far ...`. Stand-ins (67 → RGBA16F, 85/86/115 → RGBA8, 116/117 → RGBA16F,
 189 → RGBA16_SNORM, 190 → RG8) take twice the title's bytes: the `+S MiB`
 is that half.
 
+The frame report gives live count and MiB by the title creation path that
+allocated each copy. The placed-view line gives current cached and retiring
+views, cumulative deferrals for unmapped memory and remap invalidations,
+and how many same-address lookups found a GPU-written source or shared it.
+Descriptor and command-list references can outlive a cache entry.
+
 ## 3. Measurements
 
 ### 3.1 Micro-benchmark (WARP)

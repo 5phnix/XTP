@@ -60,6 +60,8 @@
 //! measures before and after it (`apps/xtp/src/survey.rs`).
 
 mod buffer;
+#[cfg(test)]
+pub(crate) use buffer::{INTEGER_LOAD_PROGRAM_TEST, code_fingerprint};
 mod compare;
 mod descriptor;
 mod export;
@@ -132,6 +134,10 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Typed buffer loads that move 16-bit integers (`bufferLoad.i32`):
+    /// d16 ones, and plain ones of `buffer::INTEGER_LOAD_PROGRAMS`.
+    #[cfg(test)]
+    pub integer_loads: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -300,6 +306,9 @@ struct Lower<'a> {
     entries: HashMap<(usize, Site, u8), descriptor::Entry>,
     /// [`Lowered::run_time_buffers`] so far.
     run_time_buffers: u8,
+    /// [`Lowered::integer_loads`] so far.
+    #[cfg(test)]
+    integer_loads: u32,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -355,6 +364,8 @@ struct Lower<'a> {
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
     /// How lane masks become data.
     mask_data: MaskData,
+    /// A pixel program's masks' helper lanes (empty in other programs).
+    helper_bits: mask::HelperBits,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
@@ -432,6 +443,64 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 // a counted loop whose bound comes from data the host has not mirrored can
 // still run that long.
 pub(super) const COUNTED_LOOP_LIMIT: u32 = 1 << 20;
+
+/// MODE's f32 denormal field (bits 4-5): bit 4 keeps input denormals, bit
+/// 5 output ones.
+const F32_DENORMALS: u32 = 0x30;
+
+/// The `"fp32-denorm-mode"` of `main` (S11): how the program's f32
+/// operations treat denormals, which DXIL declares once per program. The
+/// program starts with the record's float mode (`native.float_mode`, 0xC0
+/// in every record read so far: f32 denormals flushed, so `"ftz"`), and
+/// `ir::float_modes` has refused a program whose f32 instructions run under
+/// two denormal modes. MODE's f32 field 0 (flush both ways) is `"ftz"`, 3
+/// (keep both) `"preserve"`.
+// shortcut: none (DXIL's "any", as before) where the field keeps only one
+// way (1 or 2: no DXIL mode), and where the program writes the field
+// (`s_denorm_mode`, an `s_setreg*` of MODE over bits 4-5) other than with a
+// constant equal to the entry's: the mode its f32 instructions then run
+// under needs `ir::float_modes`'s flow to say. No program of the pack writes
+// the field (shcuts' count of 606 records, task f3d80097).
+pub(crate) fn fp32_denorm_mode(native: &NativeProgram, p: &Program) -> Option<&'static str> {
+    let entry = u32::from(native.float_mode) & F32_DENORMALS;
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        // What the instruction writes of MODE (none: a value it reads from a
+        // register), and which bits.
+        let (value, mask) = match (inst.name(), &inst.fields) {
+            ("s_denorm_mode", Fields::Sopp { imm }) => (Some(u32::from(*imm) << 4), 0xF0),
+            (
+                "s_setreg_imm32_b32" | "s_setreg_b32",
+                Fields::Sop {
+                    imm: Some(hw), src, ..
+                },
+            ) if hw & 63 == 1 => {
+                let offset = u32::from(hw >> 6 & 31);
+                let width = u32::from(hw >> 11 & 31) + 1;
+                let mask = (u32::MAX >> (32 - width)) << offset;
+                let value = match src.first() {
+                    Some(&Operand::Literal(x)) if inst.name() == "s_setreg_imm32_b32" => {
+                        Some(x << offset & mask)
+                    }
+                    _ => None,
+                };
+                (value, mask)
+            }
+            _ => continue,
+        };
+        if mask & F32_DENORMALS == 0 {
+            continue;
+        }
+        if mask & F32_DENORMALS != F32_DENORMALS || value.is_none_or(|v| v & F32_DENORMALS != entry)
+        {
+            return None;
+        }
+    }
+    match entry >> 4 {
+        0 => Some("ftz"),
+        3 => Some("preserve"),
+        _ => None,
+    }
+}
 
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
@@ -832,6 +901,8 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             entries: HashMap::new(),
             run_time_buffers: 0,
+            #[cfg(test)]
+            integer_loads: 0,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -857,6 +928,11 @@ impl<'a> Lower<'a> {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
+            },
+            helper_bits: if x.native.stage == HwStage::Ps {
+                mask::HelperBits::of(p)
+            } else {
+                mask::HelperBits::default()
             },
             mask_ok: false,
             ballots: HashMap::new(),
@@ -1021,6 +1097,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        self.s.denormals = fp32_denorm_mode(self.x.native, self.x.p);
         if let Some(slot) = self.mesh_primitive {
             self.finish_mesh_indices(slot);
         }
@@ -1071,6 +1148,8 @@ impl<'a> Lower<'a> {
             run_time_buffers: self.run_time_buffers,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            integer_loads: self.integer_loads,
             #[cfg(test)]
             wave_ops: self.s.flags & super::shader::flags::WAVE_OPS != 0,
             #[cfg(test)]

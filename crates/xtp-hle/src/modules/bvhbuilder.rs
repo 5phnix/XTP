@@ -1,10 +1,8 @@
-//! Observation des imports du constructeur BVH, après résolution dans la DLL du titre.
-//! Activer la cible `xtp_hle::modules::bvhbuilder=debug` pour relever une session.
+//! Trace builder imports resolved to the title DLL.
+//! Enable the xtp_hle::modules::bvhbuilder debug target to capture a session.
 
-use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use tracing::{Level, debug, enabled};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -31,7 +29,7 @@ const _: () = {
     assert!(size_of::<BatchEntry>() == 80);
 };
 
-/// Enveloppe uniquement les exports effectivement trouvés dans la DLL du titre.
+/// Wraps exports found in the title DLL.
 pub struct WithBuilderTrace<'a>(pub &'a dyn ImportResolver);
 
 impl ImportResolver for WithBuilderTrace<'_> {
@@ -54,7 +52,7 @@ impl ImportResolver for WithBuilderTrace<'_> {
     }
 }
 
-// Le même type vérifie le point d'entrée et sert à rappeler la méthode d'origine.
+// One ABI type checks the hook and calls the original export.
 macro_rules! methods {
     ($($hook:ident: $abi:ty = $name:literal),+ $(,)?) => {
         $(mod $hook {
@@ -63,7 +61,7 @@ macro_rules! methods {
             const _: Abi = super::$hook;
             pub(super) static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
             pub(super) fn original() -> Abi {
-                // SAFETY: bind installe l'export de cette signature avant de publier le hook.
+                // SAFETY: bind stores the matching export before publishing the hook.
                 unsafe { std::mem::transmute::<usize, Abi>(ORIGINAL.load(Ordering::Acquire)) }
             }
         })+
@@ -98,34 +96,13 @@ fn frame() -> u64 {
     xtp_gpu::queue::presented()
 }
 
-static BUILDERS: Mutex<BTreeMap<usize, Arc<xtp_gpu::rt::Builder>>> = Mutex::new(BTreeMap::new());
-
-fn host_builder(this: Object) -> Option<Arc<xtp_gpu::rt::Builder>> {
-    BUILDERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&this.addr())
-        .cloned()
-}
-
 extern "system" fn ctor(this: Object, device: Object, flag: u8) -> Object {
     debug!(frame = frame(), ?this, ?device, flag, "ctor");
-    let object = ctor::original()(this, device, flag);
-    if !object.is_null() {
-        BUILDERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(object.addr(), Arc::default());
-    }
-    object
+    ctor::original()(this, device, flag)
 }
 
 extern "system" fn dtor(this: Object) {
     debug!(frame = frame(), ?this, "dtor");
-    BUILDERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&this.addr());
     dtor::original()(this)
 }
 
@@ -145,15 +122,71 @@ extern "system" fn copy(this: Object, list: Object, dst: u64, src: u64, mode: i3
         compact = mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT.0,
         "copy"
     );
-    copy::original()(this, list, dst, src, mode);
-    if let Some(builder) = host_builder(this) {
-        // SAFETY: the DLL receives this same live title list.
-        unsafe { builder.copy(list.cast(), dst, src, mode) };
+    {
+        let call = xtp_gpu::pipeline::builder_call();
+        copy::original()(this, list, dst, src, mode);
+        note_call(call.admitted(), "copy", [(dst, src)].into_iter());
+    }
+    // SAFETY: the DLL receives this same live title list.
+    unsafe { xtp_gpu::rt::Builder.copy(list.cast(), dst, src, mode) };
+}
+
+/// Title addresses of structures the title builder last wrote in a call it
+/// held (its dispatches dropped, `xtp_gpu::pipeline::builder_call`): they
+/// hold nothing built until a call it runs builds them whole again.
+static UNBUILT: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Notes the structures one builder call writes, `(destination, structure
+/// it reads or 0)` each, as built or not; warns when a call that runs reads
+/// one never built (a refit or a copy of it): that stage would run on what
+/// a held call left, the builder then running in part across calls.
+fn note_call(admitted: bool, what: &str, writes: impl Iterator<Item = (u64, u64)>) {
+    static READS: AtomicU64 = AtomicU64::new(0);
+    let mut unbuilt = UNBUILT.lock().unwrap_or_else(|e| e.into_inner());
+    if unbuilt.len() >= 1 << 16 {
+        unbuilt.clear();
+    }
+    for (dst, src) in writes.filter(|&(dst, _)| dst != 0) {
+        let reads_unbuilt = src != 0 && unbuilt.contains(&src);
+        if admitted && reads_unbuilt {
+            let reads = READS.fetch_add(1, Ordering::Relaxed) + 1;
+            if reads.is_power_of_two() {
+                tracing::warn!(
+                    what,
+                    dst = format_args!("{dst:#x}"),
+                    src = format_args!("{src:#x}"),
+                    reads,
+                    "the BVH builder runs a call that reads a structure a held call left unbuilt"
+                );
+            }
+        }
+        if admitted && !reads_unbuilt {
+            unbuilt.remove(&dst);
+        } else {
+            unbuilt.insert(dst);
+        }
     }
 }
 
-// Une frame est échantillonnée à l'entrée. L'identifiant relie les lignes même si
-// deux threads enregistrent des listes en parallèle.
+/// What a build writes and reads: a refit reads its source, the
+/// destination itself when it names none.
+fn build_writes(desc: &Desc) -> (u64, u64) {
+    let dst = desc.DestAccelerationStructureData;
+    let refit = desc
+        .Inputs
+        .Flags
+        .contains(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE);
+    let src = match desc.SourceAccelerationStructureData {
+        _ if !refit => 0,
+        0 => dst,
+        src => src,
+    };
+    (dst, src)
+}
+
+// Sample the frame at entry. The ID joins records from one call when
+// title threads record command lists concurrently.
 struct Call {
     frame: u64,
     id: u64,
@@ -188,8 +221,8 @@ impl Call {
         }
         for geometry in 0..count {
             let i = geometry as usize;
-            // SAFETY: le contrat BLAS fournit count descriptions CPU selon le layout.
-            // Les adresses GPU contenues dans ces descriptions ne sont jamais lues.
+            // SAFETY: BLAS inputs provide count CPU descriptors in the selected layout.
+            // GPU addresses in these descriptors are only logged.
             let desc = unsafe {
                 match layout {
                     D3D12_ELEMENTS_LAYOUT_ARRAY if !inputs.Anonymous.pGeometryDescs.is_null() => {
@@ -208,7 +241,7 @@ impl Call {
             let flags = desc.Flags.0;
             match desc.Type {
                 D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES => {
-                    // SAFETY: le discriminant sélectionne le membre Triangles.
+                    // SAFETY: the discriminant selects Triangles.
                     let t = unsafe { &desc.Anonymous.Triangles };
                     debug!(
                         frame,
@@ -218,6 +251,8 @@ impl Call {
                         flags,
                         vertex_format = t.VertexFormat.0,
                         index_format = t.IndexFormat.0,
+                        vertex_address = t.VertexBuffer.StartAddress,
+                        index_address = t.IndexBuffer,
                         vertices = t.VertexCount,
                         indices = t.IndexCount,
                         stride = t.VertexBuffer.StrideInBytes,
@@ -226,7 +261,7 @@ impl Call {
                     );
                 }
                 D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS => {
-                    // SAFETY: le discriminant sélectionne le membre AABBs.
+                    // SAFETY: the discriminant selects AABBs.
                     let a = unsafe { &desc.Anonymous.AABBs };
                     debug!(
                         frame,
@@ -270,6 +305,19 @@ impl Call {
     }
 }
 
+/// Title and host prebuild sizes describe different BVH formats. Ask the
+/// title builder with the active inputs while their CPU arrays are live.
+fn title_bytes(this: Object, desc: &Desc) -> Option<u64> {
+    if prebuild::ORIGINAL.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut inputs = desc.Inputs;
+    inputs.Flags &= !D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+    let mut sizes = Sizes::default();
+    prebuild::original()(this, &inputs, std::ptr::null(), &mut sizes);
+    Some(sizes.ResultDataMaxSizeInBytes).filter(|&bytes| bytes != 0)
+}
+
 extern "system" fn build(this: Object, list: Object, count: u32, entries: *const BatchEntry) {
     if enabled!(Level::DEBUG) {
         let call = Call::new();
@@ -283,12 +331,12 @@ extern "system" fn build(this: Object, list: Object, count: u32, entries: *const
         );
         if !entries.is_null() {
             for i in 0..count {
-                // SAFETY: le titre passe count entrées CPU de 80 octets.
+                // SAFETY: the title supplies count live 80-byte entries.
                 let e = unsafe { &*entries.add(i as usize) };
                 call.description(i, &e.build);
                 if !e.postbuild.is_null() {
                     for j in 0..e.postbuild_count {
-                        // SAFETY: le tableau postbuild appartient à cette entrée.
+                        // SAFETY: this entry owns its postbuild array.
                         let p = unsafe { &*e.postbuild.add(j as usize) };
                         debug!(
                             frame = call.frame,
@@ -303,13 +351,26 @@ extern "system" fn build(this: Object, list: Object, count: u32, entries: *const
             }
         }
     }
-    build::original()(this, list, count, entries);
-    if !entries.is_null()
-        && let Some(builder) = host_builder(this)
     {
-        for i in 0..count {
-            // SAFETY: these CPU descriptors and the list belong to the current call.
-            unsafe { builder.build(list.cast(), &(*entries.add(i as usize)).build) };
+        let call = xtp_gpu::pipeline::builder_call();
+        build::original()(this, list, count, entries);
+        if !entries.is_null() {
+            // SAFETY: the title supplies count live entries.
+            let entries = unsafe { std::slice::from_raw_parts(entries, count as usize) };
+            let writes = entries.iter().map(|entry| build_writes(&entry.build));
+            note_call(call.admitted(), "build", writes);
+        }
+    }
+    if !entries.is_null() {
+        // SAFETY: the title supplies count live entries and records no intervening list commands.
+        unsafe {
+            let entries = std::slice::from_raw_parts(entries, count as usize);
+            xtp_gpu::rt::Builder.build_batch_sized(
+                list.cast(),
+                entries
+                    .iter()
+                    .map(|entry| (&entry.build, title_bytes(this, &entry.build))),
+            );
         }
     }
 }
@@ -323,14 +384,14 @@ extern "system" fn prebuild(
     let call = enabled!(Level::DEBUG).then(Call::new);
     if let Some(call) = &call {
         debug!(frame = call.frame, id = call.id, ?this, ?stream, "prebuild");
-        // SAFETY: les entrées appartiennent à l'appel du titre et restent en vie.
+        // SAFETY: the title keeps the inputs alive through this call.
         if let Some(inputs) = unsafe { inputs.as_ref() } {
             call.inputs(0, inputs);
         }
     }
     prebuild::original()(this, inputs, stream, out);
     if let Some(call) = call
-        // SAFETY: la DLL vient d'écrire les trois tailles si une sortie est fournie.
+        // SAFETY: the DLL has filled all three sizes when given an output.
         && let Some(s) = unsafe { out.as_ref() }
     {
         debug!(
@@ -363,20 +424,34 @@ extern "system" fn rehydrate(
         );
         if !descs.is_null() {
             for i in 0..count {
-                // SAFETY: cette méthode passe count descriptions standard contiguës.
+                // SAFETY: the title supplies count contiguous build descriptions.
                 call.description(i, unsafe { &*descs.add(i as usize) });
             }
         }
     }
-    let hr = rehydrate::original()(this, list, count, descs, cpu);
-    if hr >= 0
-        && !descs.is_null()
-        && let Some(builder) = host_builder(this)
-    {
+    let hr = {
+        let call = xtp_gpu::pipeline::builder_call();
+        let hr = rehydrate::original()(this, list, count, descs, cpu);
+        if hr >= 0 && !descs.is_null() {
+            // SAFETY: the original call accepted this array of count descriptions.
+            let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+            // A rehydration builds whole from the title's data.
+            let writes = descs
+                .iter()
+                .map(|desc| (desc.DestAccelerationStructureData, 0));
+            note_call(call.admitted(), "rehydrate", writes);
+        }
+        hr
+    };
+    if hr >= 0 && !descs.is_null() {
         let mut recorded = 0;
         for i in 0..count {
             // SAFETY: the original call accepted this list and array of count descriptions.
-            recorded += u32::from(unsafe { builder.build(list.cast(), &*descs.add(i as usize)) });
+            let desc = unsafe { &*descs.add(i as usize) };
+            // SAFETY: the title list and the active CPU inputs are live for this call.
+            recorded += u32::from(unsafe {
+                xtp_gpu::rt::rehydrate_sized(list.cast(), desc, title_bytes(this, desc))
+            });
         }
         debug!(
             count,
@@ -414,7 +489,7 @@ mod tests {
                 && !desc.is_null()
                 && !cpu.is_null()
             {
-                // SAFETY: les données synthétiques sont conservées jusqu'au retour de l'appel.
+                // SAFETY: the test inputs are live until the hook returns.
                 if unsafe { (*desc).DestAccelerationStructureData == 32 && *cpu == 64 } {
                     return -42;
                 }
@@ -442,14 +517,45 @@ mod tests {
             provenance: Provenance::Hle,
         } = r.resolve("XBOXBVHBUILDER.DLL", &symbol)
         else {
-            panic!("interception absente");
+            panic!("builder import was not intercepted");
         };
-        // SAFETY: le résolveur a associé ce symbole à la signature exacte de rehydrate.
+        // SAFETY: the resolver bound this symbol to the rehydrate ABI.
         let hook = unsafe { std::mem::transmute::<usize, rehydrate::Abi>(address) };
         let desc = Desc {
             DestAccelerationStructureData: 32,
             ..Default::default()
         };
         assert_eq!(hook(8 as Object, 16 as Object, 1, &desc, &64), -42);
+    }
+
+    /// A structure a held call wrote stays unbuilt through refits and
+    /// copies, until a call that runs builds it whole.
+    #[test]
+    fn rt_builder_notes_what_held_calls_left_unbuilt() {
+        let (a, b) = (0x7e57_0000_1000, 0x7e57_0000_2000);
+        let unbuilt = |at| UNBUILT.lock().unwrap().contains(&at);
+        let refit = Desc {
+            DestAccelerationStructureData: a,
+            Inputs: Inputs {
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            build_writes(&refit),
+            (a, a),
+            "an update in place reads its destination"
+        );
+        note_call(false, "build", [(a, 0)].into_iter());
+        assert!(unbuilt(a));
+        note_call(true, "build", [build_writes(&refit)].into_iter());
+        assert!(unbuilt(a), "a refit that runs updates nothing built");
+        note_call(true, "copy", [(b, a)].into_iter());
+        assert!(unbuilt(b));
+        note_call(true, "build", [(a, 0)].into_iter());
+        assert!(!unbuilt(a));
+        note_call(true, "copy", [(b, a)].into_iter());
+        assert!(!unbuilt(b));
     }
 }

@@ -46,6 +46,9 @@ Areas in commit headers and `area/...` labels follow this table
   - *Graphics*: `xtp-shader` (untranslated shaders drop draws in the world)
     and `xtp-gpu` (frame time, queries, depth bounds, HDR). The README's
     status table lists what is missing.
+    Regenerate the GFX10 conformance corpus with `cargo xtask gfx10-corpus`
+    or point `--llvm-dir <DIR>` at the pinned LLVM MC AMDGPU files. Use
+    `--full --out-dir <DIR>` to write the unreduced corpus separately.
   - *System*: `xtp-hle`. An import we do not implement yet is named when the
     title calls it (`--unimplemented trap|zero`); implementing one is a
     well-bounded first change.

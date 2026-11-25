@@ -168,14 +168,60 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] = [
 
 /// How long a submission took: on the GPU, and in all (preparing, GPU,
 /// copying back, bottom-of-pipe writes).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Ran {
     pub(crate) gpu: std::time::Duration,
     pub(crate) total: std::time::Duration,
 }
 
+impl std::ops::Add for Ran {
+    type Output = Ran;
+
+    fn add(self, other: Ran) -> Ran {
+        Ran {
+            gpu: self.gpu + other.gpu,
+            total: self.total + other.total,
+        }
+    }
+}
+
+/// What the parts of a title submission run in parts ([`Host::run_as`])
+/// took so far: their lists, and their times, each added once it ran.
+type Parts = std::sync::Arc<Mutex<(usize, Ran)>>;
+
+/// A title submission, or a part of one, as the frame-rate line counts it.
+enum Title {
+    /// A whole submission, or the last part of one with what the parts
+    /// before it took: counted once it has run.
+    Last(Option<Parts>),
+    /// A part before the last: what it took goes to the last.
+    Part(Parts),
+}
+
+impl Title {
+    /// What the frame-rate line counts once this has run (`lists` lists,
+    /// `ran`), if anything yet. Parts finish in order, the last after the
+    /// others (`Host::run_as` waits for each before the next).
+    fn counted(self, lists: usize, ran: Ran) -> Option<(usize, Ran)> {
+        let add = |parts: &Parts| {
+            let mut so_far = parts.lock().unwrap_or_else(|e| e.into_inner());
+            *so_far = (so_far.0 + lists, so_far.1 + ran);
+            *so_far
+        };
+        match self {
+            Title::Last(None) => Some((lists, ran)),
+            Title::Last(Some(parts)) => Some(add(&parts)),
+            Title::Part(parts) => {
+                add(&parts);
+                None
+            }
+        }
+    }
+}
+
 /// The title's submissions since the last frame-rate line (one per
-/// `ExecuteCommandLists`; ours, the present copy, are not counted).
+/// `ExecuteCommandLists`, however many parts it ran in; ours, the present
+/// copy, are not counted).
 static TITLE: Mutex<Submissions> = Mutex::new(Submissions::new());
 
 /// Title submissions over a frame-rate window.
@@ -286,6 +332,19 @@ pub(crate) fn sync_submit() -> bool {
         on
     })
 }
+
+/// How many of `runs` come before the first one named a second time (all
+/// of them when none is): where a submission is split ([`Host::run_as`]).
+/// Submissions name few lists; a search beats building a set.
+fn first_repeat<T>(runs: &[&T]) -> usize {
+    (1..runs.len())
+        .find(|&i| runs[..i].iter().any(|r| std::ptr::eq(*r, runs[i])))
+        .unwrap_or(runs.len())
+}
+
+/// Calls, waits before a repeated list, and microseconds spent in those waits.
+#[cfg(feature = "diagnostics")]
+static SPLITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
@@ -415,6 +474,8 @@ fn create(software: bool) -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
+        // DRED 1.2: the markers' texts kept with their breadcrumbs.
+        crate::dred::enable();
         let mut device: Option<ID3D12Device> = None;
         if software {
             let adapter = warp_adapter()?;
@@ -632,6 +693,20 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// A submission is split before each list it names again, by identity
+    /// (equal values in two places are two lists).
+    #[test]
+    fn a_submission_is_split_before_a_list_named_again() {
+        let (a, b, c, a_twin) = (1, 2, 3, 1);
+        assert_eq!(first_repeat::<i32>(&[]), 0);
+        assert_eq!(first_repeat(&[&a]), 1);
+        assert_eq!(first_repeat(&[&a, &b, &c]), 3);
+        assert_eq!(first_repeat(&[&a, &a]), 1);
+        assert_eq!(first_repeat(&[&a, &b, &a]), 2);
+        assert_eq!(first_repeat(&[&a, &b, &c, &b, &a]), 3);
+        assert_eq!(first_repeat(&[&a, &a_twin]), 2);
+    }
+
     /// Where a list stopped, the device-removed report names the commands
     /// between the barriers around it by their markers, and the noted
     /// commands after them: DRED's count may lag the GPU (xcl#1592).
@@ -732,6 +807,35 @@ mod tests {
         assert_eq!(outside(100.0, 130.0), 0.0);
     }
 
+    /// A title submission run in parts (a list named again) counts once on
+    /// the frame-rate line, by its last part, with every part's lists and
+    /// times; a whole one counts as itself.
+    #[test]
+    fn the_frame_line_counts_a_split_submission_once() {
+        let ms = std::time::Duration::from_millis;
+        let ran = |gpu, total| Ran {
+            gpu: ms(gpu),
+            total: ms(total),
+        };
+        let mut s = Submissions::new();
+        let parts = Parts::default();
+        // [a, b, a, c, a] runs as [a, b], [a, c], [a].
+        assert_eq!(Title::Part(parts.clone()).counted(2, ran(10, 15)), None);
+        assert_eq!(Title::Part(parts.clone()).counted(2, ran(20, 30)), None);
+        let (lists, all) = Title::Last(Some(parts)).counted(1, ran(5, 8)).unwrap();
+        s.add(lists, all);
+        let whole = Title::Last(None).counted(3, ran(1, 2)).unwrap();
+        s.add(whole.0, whole.1);
+        let want = PerFrame {
+            submissions: 2.0,
+            lists: 4.0,
+            longest_ms: 53.0,
+            longest_gpu_ms: 35.0,
+            longest_lists: 5,
+        };
+        assert_eq!(s.per_frame(1.0), want);
+    }
+
     /// The GPU's time and the copying back the title's threads did not
     /// wait for: all of it waited for (synchronous submission) is no
     /// overlap; never below zero (the GPU's time is measured roughly).
@@ -823,6 +927,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin (`twins`).
     twins: Mutex<twins::TwinUses>,
+    /// Whether `twins` may have something for the next draw or dispatch
+    /// (`HostList::planes_now`, `HostList::twins_written`): read without
+    /// its lock, so that a list with nothing due takes none per bind.
+    twins_due: std::sync::atomic::AtomicBool,
     /// The pipelines the list binds, for reports of slow submissions:
     /// shared with its submissions ([`Recorded`]), a reset starts a new set.
     pipelines: Mutex<std::sync::Arc<std::collections::BTreeSet<String>>>,
@@ -869,6 +977,9 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// next recording afresh without taking them from it.
 #[derive(Clone, Default)]
 struct Recorded {
+    rt_sizes: std::sync::Arc<Vec<crate::rt::compaction::CompactedSize>>,
+    #[cfg(feature = "diagnostics")]
+    rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
     #[cfg(feature = "diagnostics")]
     dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     pipelines: std::sync::Arc<std::collections::BTreeSet<String>>,
@@ -895,6 +1006,10 @@ type States =
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
+        // `XTP_D3D12_DRED=0` (or empty) is off: not set alone.
+        if !crate::dred::asked(std::env::var_os("XTP_D3D12_DRED").as_deref()) {
+            return false;
+        }
         cfg!(feature = "diagnostics") && std::env::var_os("XTP_D3D12_DRED").is_some()
     })
 }
@@ -1048,11 +1163,75 @@ impl Drop for DynamicLease {
 /// Work a list runs as it closes ([`HostList::at_close`]).
 type Closing = Box<dyn FnOnce(&HostList) + Send>;
 
+/// Work a list runs at each of its submissions ([`HostList::at_submit`]).
+type Submitting = std::sync::Arc<dyn Fn(&HostList) + Send + Sync>;
+
+/// Latest write at each address, represented by the starts of runs with the
+/// same serial. A zero serial is a gap. An overwrite preserves both tails.
+#[derive(Default)]
+struct WriteRanges(std::collections::BTreeMap<usize, u64>);
+
+impl WriteRanges {
+    fn at(&self, address: usize) -> u64 {
+        self.0.range(..=address).next_back().map_or(0, |(_, &v)| v)
+    }
+
+    fn record(&mut self, from: usize, to: usize, serial: u64) {
+        let tail = self.at(to);
+        while let Some((&at, _)) = self.0.range(from..to).next() {
+            self.0.remove(&at);
+        }
+        self.0.insert(from, serial);
+        self.0.insert(to, tail);
+    }
+
+    fn latest(&self, from: usize, to: usize) -> u64 {
+        self.0
+            .range(from..to)
+            .map(|(_, &v)| v)
+            .max()
+            .unwrap_or(0)
+            .max(self.at(from))
+    }
+}
+
+/// Per recording. Key zero covers submission-time writes to title memory.
+/// GPU writes name the shadow they actually target.
+#[derive(Default)]
+struct BufferWrites {
+    serial: u64,
+    ranges: std::collections::HashMap<usize, WriteRanges>,
+    unknown: u64,
+    binding: bool,
+    indexed_output: bool,
+    shader_outputs: Vec<(usize, usize, usize)>,
+}
+
+impl BufferWrites {
+    fn record(&mut self, copy: usize, address: usize, len: usize) {
+        if len != 0 {
+            self.serial += 1;
+            self.ranges.entry(copy).or_default().record(
+                address,
+                address.saturating_add(len),
+                self.serial,
+            );
+        }
+    }
+
+    fn latest(&self, copy: usize, address: usize, end: usize) -> u64 {
+        self.ranges.get(&copy).map_or(0, |r| r.latest(address, end))
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    rt_sizes: std::sync::Arc<Vec<crate::rt::compaction::CompactedSize>>,
+    #[cfg(feature = "diagnostics")]
+    rt_samples: std::sync::Arc<Vec<crate::rt::probe::Sample>>,
     #[cfg(feature = "diagnostics")]
     dispatch_samples: std::sync::Arc<Vec<crate::indirect::Sample>>,
     /// What the list's draws read and its dispatches wrote, in recorded
@@ -1068,6 +1247,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    rt_recording: Option<std::sync::Arc<()>>,
+    rt_size_page: crate::rt::compaction::SizePage,
+    rt_results: Vec<std::sync::Arc<crate::rt::ResultBuffer>>,
     /// Dynamic descriptor slots leased by this recording.
     dynamic: Vec<DynamicLease>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -1077,6 +1259,8 @@ struct Deferred {
     refresh_epoch: u64,
     /// Work the list runs as it closes ([`HostList::at_close`]).
     closing: Vec<Closing>,
+    /// Work the list runs at each submission ([`HostList::at_submit`]).
+    submitting: Vec<Submitting>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1085,6 +1269,9 @@ struct Deferred {
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     indirect_writers: crate::indirect::Writers,
+    buffer_writes: BufferWrites,
+    /// Shadow and title range read by a recorded GPU copy into CBV memory.
+    cbv_reads: std::collections::HashSet<(usize, usize, usize)>,
 }
 
 /// A list a submission in flight names.
@@ -1120,9 +1307,11 @@ struct Pending {
     /// Its bottom-of-pipe writes, in list order: address, what, bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
     submitted: std::time::Instant,
-    /// For a title submission (the frame-rate line counts those): the
-    /// time it took to prepare.
-    title: Option<std::time::Duration>,
+    /// The time it took to prepare.
+    preparing: std::time::Duration,
+    /// For a title submission or a part of one: how the frame-rate line
+    /// counts it.
+    title: Option<Title>,
 }
 
 impl Pending {
@@ -1136,6 +1325,9 @@ impl Pending {
         // One list's lock at a time: a submission may name a list twice.
         for list in runs {
             let deferred = list.deferred();
+            for &(copy, from, to) in &deferred.cbv_reads {
+                touches.cbv_reads.entry(copy).or_default().push((from, to));
+            }
             for step in &deferred.copies {
                 match step {
                     Step::GpuWrite(shadow, address, len, _) => {
@@ -1190,6 +1382,7 @@ impl Pending {
             back,
             writes,
             submitted: std::time::Instant::now(),
+            preparing: std::time::Duration::ZERO,
             title: None,
         };
         (pending, touches)
@@ -1303,6 +1496,7 @@ impl Host {
                 states: Mutex::default(),
                 prelude: Mutex::new((prelude_allocator, prelude)),
                 twins: Mutex::default(),
+                twins_due: Default::default(),
                 pipelines: Mutex::default(),
                 writer: AtomicU64::new(0),
                 budget: Mutex::default(),
@@ -1360,6 +1554,7 @@ impl Host {
     /// Runs a title submission (the lists of one `ExecuteCommandLists`),
     /// counted for the frame-rate line once it has finished.
     pub(crate) fn submit(&self, runs: &[&HostList]) {
+        crate::resource::reap_placed_views();
         #[cfg(feature = "diagnostics")]
         crate::passdump::submitted(runs);
         #[cfg(feature = "diagnostics")]
@@ -1377,6 +1572,8 @@ impl Host {
     /// As [`Host::run`], waited for and finished before returning with
     /// `sync`.
     fn run_as(&self, runs: &[&HostList], title: bool, sync: bool) {
+        #[cfg(feature = "diagnostics")]
+        SPLITS[0].fetch_add(1, Ordering::Relaxed);
         if !sync {
             self.finisher.call_once(|| {
                 let spawned = std::thread::Builder::new()
@@ -1387,6 +1584,48 @@ impl Host {
                 }
             });
         }
+        // A title may name a list more than once in a submission; D3D12 runs
+        // a list again only once its previous execution has finished, in one
+        // `ExecuteCommandLists` or not (debug layer message 553), and each
+        // run of a list rewrites its prelude, upload memory and budget word.
+        // Such a submission goes in parts, each up to the next list named
+        // again, run once the part before has finished: the GPU runs the
+        // same lists in the same order, and each run finds what the run
+        // before wrote. The wait releases the host submission lock, but a
+        // title queue retains its line lock and a held submission retains
+        // release_held's global lock, delaying other queues. Counted once, by
+        // its last part, with all its parts' lists and their times
+        // preparing, on the GPU and copying back; the waits between them
+        // count as waiting, as a caller's would.
+        let mut rest = runs;
+        let mut parts: Option<Parts> = None;
+        loop {
+            let (part, next) = rest.split_at(first_repeat(rest));
+            let counted = title.then(|| match next {
+                [] => Title::Last(parts.take()),
+                _ => Title::Part(parts.get_or_insert_default().clone()),
+            });
+            self.run_part(part, counted, sync);
+            let Some(again) = next.first() else {
+                return;
+            };
+            #[cfg(feature = "diagnostics")]
+            let waiting = {
+                SPLITS[1].fetch_add(1, Ordering::Relaxed);
+                std::time::Instant::now()
+            };
+            self.settle(again.last.load(Ordering::Acquire));
+            #[cfg(feature = "diagnostics")]
+            SPLITS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+            rest = next;
+        }
+    }
+
+    /// Runs `runs`, no list among them twice: one submission, a title's
+    /// (or a part of one) with `title`, counted for the frame-rate line as
+    /// it says.
+    fn run_part(&self, runs: &[&HostList], title: Option<Title>, sync: bool) {
+        let is_title = title.is_some();
         // One submission at a time from preparation to submission (to
         // copy-back with `XTP_SYNC_SUBMIT`): what a step waits for is
         // decided against the submissions before it.
@@ -1431,9 +1670,21 @@ impl Host {
         if batch.submission.is_multiple_of(32) {
             crate::readmap::save_copy_back_map();
         }
+        // Records the title copied into its placed descriptor heaps as
+        // bytes, before the lists' own work at submission (their sweeps).
+        if is_title {
+            crate::descriptor::sync_heaps();
+        }
         for list in runs {
+            list.submitting();
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            // Copies of textures the title wrote after the list read them,
+            // found by its steps (`texture::late_copies`): before its
+            // prelude, from the states the lists before leave.
+            if let Some(late) = crate::texture::late_copies(list) {
+                lists.push(Some(late));
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -1464,7 +1715,8 @@ impl Host {
         let now = std::time::Instant::now();
         let preparing = (now - started).saturating_sub(waited);
         recording.finish(now, waited_now, preparing, &batch.work);
-        pending.title = title.then_some(preparing);
+        pending.preparing = preparing;
+        pending.title = title;
         // Diagnostics: each list on its own, timed and waited for
         // (`XTP_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -1524,10 +1776,15 @@ impl Host {
         let _ = &firsts;
         for list in runs {
             list.last.store(*submitted, Ordering::Release);
-            list.ours.store(!title, Ordering::Release);
+            list.ours.store(!is_title, Ordering::Release);
         }
+        // `XTP_PLANE_PROBE`: the probes of the lists' depth plane passes
+        // are read once this submission has run.
+        #[cfg(feature = "diagnostics")]
+        runs.iter()
+            .for_each(|list| list.twins_submitted(*submitted));
         self.timeline.push(*submitted, touches, pending);
-        crate::timestamps::submitted(&self.queue, runs, *submitted, title);
+        crate::timestamps::submitted(&self.queue, runs, *submitted, is_title);
         // `XTP_SYNC_SUBMIT`, and timed lists: finished before returning,
         // still one submission at a time.
         #[cfg(feature = "diagnostics")]
@@ -1544,6 +1801,13 @@ impl Host {
     /// the call, and later ones read it as it is after the call. 0: none.
     pub(crate) fn executing(&self) -> u64 {
         self.executing.load(Ordering::SeqCst)
+    }
+
+    /// The host queue: reserved textures' tile mappings
+    /// (`resource::pool::Tiles`) are queued on it, in order with the
+    /// submissions.
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
     }
 
     /// The host fence value the GPU has reached (all ones once the device
@@ -1633,18 +1897,10 @@ impl Host {
         }
     }
 
-    /// The live host copy covering a fill when an earlier submission is
-    /// writing part of it. A label or an alias alone cannot supply it.
-    pub(crate) fn fill_source(
-        &self,
-        address: u64,
-        len: u64,
-    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        let writer = self
-            .timeline
-            .fill_writer(address as usize, address.checked_add(len)? as usize)?;
-        let shadow = crate::shadow::existing(address, len)?;
-        (std::sync::Arc::as_ptr(&shadow) as usize == writer).then_some(shadow)
+    /// Identity of the host copy an earlier submission is writing in a CBV's range.
+    pub(crate) fn fill_writer(&self, address: u64, len: u64) -> Option<usize> {
+        self.timeline
+            .fill_writer(address as usize, address.checked_add(len)? as usize)
     }
 
     /// Runs `signal` once every submission made so far has finished: at
@@ -1798,6 +2054,9 @@ impl Host {
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             self.removed(Some(&p));
         }
+        for size in p.recorded.iter().flat_map(|r| r.rt_sizes.iter()) {
+            size.complete();
+        }
         // About how long it ran: from its submission or the end of the one
         // before, whichever is later, until it was seen done.
         let ran = {
@@ -1828,6 +2087,10 @@ impl Host {
         for sample in p.recorded.iter().flat_map(|r| r.dispatch_samples.iter()) {
             sample.report();
         }
+        #[cfg(feature = "diagnostics")]
+        for sample in p.recorded.iter().flat_map(|r| r.rt_samples.iter()) {
+            sample.report();
+        }
         // `XTP_MESH_STATS`: what the draws read, as the GPU left it.
         #[cfg(feature = "diagnostics")]
         crate::meshstat::finished(p.submission, p.recorded.iter().map(|r| &r.meshes));
@@ -1846,14 +2109,15 @@ impl Host {
             what.write(at as *mut u8, bytes);
         }
         self.log_messages();
-        if let Some(preparing) = p.title {
-            TITLE.lock().unwrap_or_else(|e| e.into_inner()).add(
-                p.lists.len(),
-                Ran {
-                    gpu: ran,
-                    total: preparing + ran + back,
-                },
-            );
+        let took = Ran {
+            gpu: ran,
+            total: p.preparing + ran + back,
+        };
+        if let Some((lists, ran)) = p.title.and_then(|t| t.counted(p.lists.len(), took)) {
+            TITLE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add(lists, ran);
         }
     }
 
@@ -1867,6 +2131,18 @@ impl Host {
             return String::new();
         };
         let mut text = String::new();
+        // DRED 1.2: the device state, each stopped list's last finished and
+        // first unfinished commands with their markers, the faulting
+        // allocations' ranges. Our markers' texts by list, for a runtime
+        // that keeps none with its breadcrumbs (NVIDIA's did not).
+        #[cfg(feature = "diagnostics")]
+        let notes: Vec<Vec<String>> = recorded
+            .iter()
+            .map(|r| r.notes.iter().map(|(note, _)| note.clone()).collect())
+            .collect();
+        #[cfg(not(feature = "diagnostics"))]
+        let notes: Vec<Vec<String>> = Vec::new();
+        text.push_str(&crate::dred::report(&self.device, runs, &notes));
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
@@ -2428,7 +2704,13 @@ impl HostList {
             let deferred = self.deferred();
             (deferred.dispatch_samples.clone(), deferred.meshes.clone())
         };
+        #[cfg(feature = "diagnostics")]
+        let rt_samples = self.deferred().rt_samples.clone();
+        let rt_sizes = self.deferred().rt_sizes.clone();
         Recorded {
+            rt_sizes,
+            #[cfg(feature = "diagnostics")]
+            rt_samples,
             #[cfg(feature = "diagnostics")]
             dispatch_samples,
             pipelines: self
@@ -2441,6 +2723,11 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             meshes,
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn rt_sample(&self, sample: crate::rt::probe::Sample) {
+        std::sync::Arc::make_mut(&mut self.deferred().rt_samples).push(sample);
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2468,6 +2755,7 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        deferred.buffer_writes.record(0, dst as usize, len);
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
@@ -2511,6 +2799,22 @@ impl HostList {
         self.deferred().closing.push(Box::new(work));
     }
 
+    /// Runs `work` at each submission of the list until it is reset, before
+    /// its steps; what `work` defers runs after them, and at the
+    /// submissions after this one too.
+    pub(crate) fn at_submit(&self, work: impl Fn(&HostList) + Send + Sync + 'static) {
+        self.deferred().submitting.push(std::sync::Arc::new(work));
+    }
+
+    /// Runs what the recording asked to run at each submission
+    /// ([`HostList::at_submit`]), the list's lock let go meanwhile.
+    fn submitting(&self) {
+        let work = self.deferred().submitting.clone();
+        for work in work {
+            work(self);
+        }
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -2548,6 +2852,13 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        let writes = &mut deferred.buffer_writes;
+        let copy = std::sync::Arc::as_ptr(shadow) as usize;
+        if writes.binding {
+            writes.shader_outputs.push((copy, address, len));
+        } else {
+            writes.record(copy, address, len);
+        }
         deferred.indirect_writers.record(&shadow.buffer, true);
         deferred.copies.push(Step::GpuWrite(
             shadow.clone(),
@@ -2567,6 +2878,9 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        deferred
+            .buffer_writes
+            .record(std::sync::Arc::as_ptr(shadow) as usize, address, len);
         deferred.indirect_writers.record(&shadow.buffer, false);
         deferred
             .copies
@@ -2582,6 +2896,9 @@ impl HostList {
         bytes: usize,
     ) {
         let mut deferred = self.deferred();
+        deferred
+            .buffer_writes
+            .record(std::sync::Arc::as_ptr(shadow) as usize, address, bytes);
         deferred.indirect_writers.record(&shadow.buffer, false);
         deferred
             .copies
@@ -2589,7 +2906,57 @@ impl HostList {
     }
 
     pub(crate) fn unknown_buffer_write(&self) {
-        self.deferred().indirect_writers.unknown();
+        let mut deferred = self.deferred();
+        deferred.indirect_writers.unknown();
+        deferred.buffer_writes.indexed_output = true;
+    }
+
+    /// Shader UAVs are declared while binding, but they write after all the
+    /// input copies of that command, even when both views alias.
+    pub(crate) fn begin_shader_outputs(&self) {
+        self.deferred().buffer_writes.binding = true;
+    }
+
+    pub(crate) fn end_shader_outputs(&self, bound: bool) {
+        let mut deferred = self.deferred();
+        let writes = &mut deferred.buffer_writes;
+        writes.binding = false;
+        while let Some((copy, address, len)) = writes.shader_outputs.pop() {
+            if bound {
+                writes.record(copy, address, len);
+            }
+        }
+        if std::mem::take(&mut writes.indexed_output) && bound {
+            // A shader indexing writable descriptors at run time can select
+            // a descriptor installed after recording.
+            writes.serial += 1;
+            writes.unknown = writes.serial;
+        }
+    }
+
+    pub(crate) fn cbv_read(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: u64,
+        len: u64,
+    ) {
+        self.deferred().cbv_reads.insert((
+            std::sync::Arc::as_ptr(shadow) as usize,
+            address as usize,
+            (address + len) as usize,
+        ));
+    }
+
+    /// Latest submission-time title write and GPU write to this input.
+    pub(crate) fn input_writes(&self, copy: Option<usize>, address: u64, len: u64) -> (u64, u64) {
+        let deferred = self.deferred();
+        let writes = &deferred.buffer_writes;
+        let end = address.saturating_add(len) as usize;
+        let from = address as usize;
+        (
+            writes.latest(0, from, end),
+            copy.map_or(0, |c| writes.latest(c, from, end).max(writes.unknown)),
+        )
     }
 
     pub(crate) fn indirect_writes(
@@ -2709,6 +3076,24 @@ impl HostList {
         }
     }
 
+    pub(crate) fn rt_recording(&self) -> std::sync::Arc<()> {
+        self.deferred()
+            .rt_recording
+            .get_or_insert_with(Default::default)
+            .clone()
+    }
+
+    pub(crate) fn rt_compacted_size(&self) -> Option<(u64, crate::rt::compaction::CompactedSize)> {
+        let mut deferred = self.deferred();
+        let (address, slot) = deferred.rt_size_page.reserve()?;
+        std::sync::Arc::make_mut(&mut deferred.rt_sizes).push(slot.clone());
+        Some((address, slot))
+    }
+
+    pub(crate) fn keep_rt_result(&self, result: &std::sync::Arc<crate::rt::ResultBuffer>) {
+        self.deferred().rt_results.push(result.clone());
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -2732,6 +3117,7 @@ impl HostList {
         work: impl Fn() + Send + 'static,
     ) {
         let mut deferred = self.deferred();
+        deferred.buffer_writes.record(0, writes.0, writes.1);
         deferred
             .copies
             .push(Step::Run(Box::new(work), writes, reads));
@@ -3350,7 +3736,9 @@ impl Meter {
         let [back_ms, back_mb] =
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        let [cbv_copies, cbv_hits] = crate::draw::take_cbv_copies().map(|n| n as f64 / frames);
         let indirect = crate::list::take_indirect() as f64 / frames;
+        let heap_sync = crate::descriptor::take_synced(frames);
         // The title's threads spend `cpu` and `waited` in submissions; the
         // GPU and the copying back run beside them for the rest.
         let outside_ms = outside(ms, cpu + waited);
@@ -3379,8 +3767,11 @@ impl Meter {
             .take(frames, 8);
         #[cfg(feature = "diagnostics")]
         let meshes = crate::meshstat::take();
+        #[cfg(feature = "diagnostics")]
+        twins::stale::frames(frames);
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
+            crate::loopstat::line();
             #[cfg(feature = "diagnostics")]
             crate::list::cuts::log();
             #[cfg(feature = "diagnostics")]
@@ -3400,7 +3791,8 @@ impl Meter {
                  longest {longest:.1} ms ({longest_gpu:.1} on the GPU, {longest_lists} lists), \
                  buffer copies {gpu_copies:.0} on the GPU {gpu_copy_mb:.1} MB and \
                  {cpu_copies:.0} on the CPU {cpu_copy_mb:.1} MB, {gpu_writes:.0} in-list writes \
-                 on the GPU, {draws:.0} draws/frame, dropped {dropped:.0} without a host \
+                 on the GPU, {cbv_copies:.1} GPU CBV copies/frame ({cbv_hits:.1} cache hits/frame), \
+                 {draws:.0} draws/frame, dropped {dropped:.0} without a host \
                  pipeline ({making} being made) and {indirect:.0} indirect",
                 submissions = title.submissions,
                 lists = title.lists,
@@ -3410,6 +3802,13 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             tracing::info!("snapshots per frame: {snapshot_ms:.3} ms");
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(
+                calls = SPLITS[0].load(Ordering::Relaxed),
+                waits = SPLITS[1].load(Ordering::Relaxed),
+                wait_us = SPLITS[2].load(Ordering::Relaxed),
+                "submission split totals"
+            );
             tracing::info!("guards and write watch per frame: {watch_ms:.3} ms");
             #[cfg(feature = "diagnostics")]
             tracing::info!(
@@ -3435,8 +3834,11 @@ impl Meter {
                  {words:.1} GPU word, {textures:.1} texture), {steps_ms:.3} ms in remaining step work, \
                  {other_ms:.3} ms in other preparation"
             );
+            heap_sync.log();
             #[cfg(feature = "diagnostics")]
             crate::indirect::log_counts();
+            #[cfg(feature = "diagnostics")]
+            twins::stale::log();
             crate::device::log_frame();
             if let Some(pools) = buffers::summary() {
                 tracing::info!("buffer heaps: {pools}");
@@ -3583,8 +3985,13 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 ),
             ]);
+            // XTP_SHADER_LOOP_COUNT: the frame's counters, copied after its lists.
+            crate::loopstat::record(self, list);
             p.copy.close();
             self.execute(&[&p.copy]);
+            // XTP_SHADER_LOOP_COUNT: the frame's stopped lanes, once its
+            // submissions have finished.
+            crate::loopstat::presented(self, frame);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             // A captured frame is finished, to be read back; its probe is
             // still read at the next present, as every probe with frames

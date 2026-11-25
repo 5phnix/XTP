@@ -435,6 +435,24 @@ fn a_missing_value_stays_missing_through_two_live_joins() {
 }
 
 #[test]
+fn signed_packed_dot_reports_unsupported() {
+    let words = [
+        0xCC18_4000,
+        0x1C0E_0501, // v_dot8_i32_i4 v0, v1, v2, v3
+        0xD834_0000,
+        0, // ds_write_b32 v0, v0
+        S_ENDPGM,
+    ];
+    assert!(matches!(
+        lower_with(&words, vec![], vec![]),
+        Err(crate::ShaderError::Unsupported {
+            what: "v_dot8_i32_i4",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn buffer_formats_by_number() {
     // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
     // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.

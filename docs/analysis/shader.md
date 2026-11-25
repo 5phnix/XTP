@@ -415,14 +415,14 @@ change, then those that do, then geometry, then 32-lane GPUs.
   `gpu_f64_math_random`, `gpu_packed_math_dots_movrel`.
 - Test: randomised GPU tests against Rust references.
 
-**S6 — Decoder conformance** (S, deps: none)
-- Goal: check `gfx10` names and lengths against a public encoding corpus
-  (LLVM MC gfx10 tests, Apache-2.0 with LLVM exception, compatible with
-  GPL-3.0; or AMD's MR-ISA XML, MIT) kept as test data we generate.
-- Files: `gfx10/mod.rs` tests, a generator under `xtask/`.
-- xcl: approach of `scripts/gen_rdna2.py` and the `tests/data/llvm-amdgpu`
-  agreement check; `gpu/rdna2_xbox.rs` for console-only opcodes.
-- Test: 100 % agreement or each difference explained.
+**S6 — Decoder conformance** (implemented in [PR #52](https://github.com/MiamiGame/XTP/pull/52))
+- `gfx10_conformance.rs` checks dword lengths and mnemonics across 19 encoding
+  families against the generated LLVM MC GFX10/GFX10.3 corpus. The checked-in
+  data keeps one representative per mnemonic, length and decoder selector
+  combination. Regenerate it with `cargo xtask gfx10-corpus`.
+- PR #68 filled the decoder gaps, and the test keeps the legacy MAD/MAC
+  names because the console combines GFX10.1 MAD/MAC with BVH instructions,
+  like `gfx1013`.
 
 **G1 — ES + GS pairing and GS stage data** (M, deps: S0)
 - Goal: `native.rs` returns ES and GS of one pipeline as a pair with the GS

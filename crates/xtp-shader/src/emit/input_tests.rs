@@ -102,6 +102,24 @@ fn emit_pixel(native: &NativeProgram) -> Result<HostShader, ShaderError> {
     emit(&c, native, &p, &st, &io, &res)
 }
 
+#[test]
+fn e64_f32_interpolation_reports_unsupported() {
+    for (w0, w1) in [
+        (0xD600_0005, 0x0002_0400),
+        (0xD601_0005, 0x0002_0400),
+        (0xD602_0005, 0),
+    ] {
+        let [e0, e1] = exp_mrt0(5);
+        assert!(matches!(
+            pixel(&[w0, w1, e0, e1, S_ENDPGM], PERSP_CENTER),
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "an e64 f32 interpolation"
+            })
+        ));
+    }
+}
+
 /// The translation's `SFI0` features and `ISG1` rows.
 fn parts(shader: &HostShader) -> (u64, Vec<SigElement>) {
     let c = Container::parse(&shader.dxil).unwrap();

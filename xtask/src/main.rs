@@ -2,9 +2,11 @@
 
 mod conventions;
 mod frames;
+mod gfx10_corpus;
 mod play;
 mod policy;
 mod pr_check;
+mod replay;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -96,6 +98,34 @@ enum Cmd {
         #[arg(long)]
         no_precook: bool,
     },
+    /// Generate the GFX10 decoder conformance corpus from LLVM MC AMDGPU tests.
+    Gfx10Corpus {
+        /// Optional local directory containing `llvm/test/MC/AMDGPU/*.s`.
+        /// When omitted, fetches the pinned LLVM release files over HTTPS.
+        #[arg(long, value_name = "DIR")]
+        llvm_dir: Option<PathBuf>,
+        /// Output directory for generated corpus shards (default:
+        /// `crates/xtp-shader/tests/data`).
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<PathBuf>,
+        /// Keep all unique encodings. Requires --out-dir <DIR>.
+        #[arg(long, requires = "out_dir")]
+        full: bool,
+    },
+    /// Build the diagnostics xtp, replay a recording of the title's GPU
+    /// work (`xtp run --record`) and print each frame's numbers beside the
+    /// previous replay's (docs/analysis/frame-replay.md).
+    Replay {
+        /// The recording's folder.
+        dir: PathBuf,
+        /// Run the diagnostics build as it is, without cargo build.
+        #[arg(long)]
+        no_build: bool,
+        /// Passed on to `xtp replay`: --frames, --loop, --poke, --pokes-file,
+        /// --stat, --session-gpu-pages.
+        #[arg(last = true)]
+        pass: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -154,6 +184,23 @@ fn main() -> Result<()> {
                 exe,
                 no_build,
                 no_precook,
+            },
+        ),
+        Cmd::Gfx10Corpus {
+            llvm_dir,
+            out_dir,
+            full,
+        } => gfx10_corpus::run(&root, llvm_dir.as_deref(), out_dir.as_deref(), full),
+        Cmd::Replay {
+            dir,
+            no_build,
+            pass,
+        } => replay::run(
+            &root,
+            &replay::Options {
+                dir,
+                no_build,
+                pass,
             },
         ),
     }
@@ -232,4 +279,38 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask lives in the workspace")
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_gfx10_corpus_requires_an_output_directory() {
+        let Err(err) = Cli::try_parse_from(["xtask", "gfx10-corpus", "--full"]) else {
+            panic!("--full should require --out-dir");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--out-dir <DIR>"));
+
+        let reduced = Cli::try_parse_from(["xtask", "gfx10-corpus"]).unwrap();
+        assert!(matches!(
+            reduced.command,
+            Cmd::Gfx10Corpus {
+                full: false,
+                out_dir: None,
+                ..
+            }
+        ));
+        let full =
+            Cli::try_parse_from(["xtask", "gfx10-corpus", "--full", "--out-dir", "out"]).unwrap();
+        assert!(matches!(
+            full.command,
+            Cmd::Gfx10Corpus {
+                full: true,
+                out_dir: Some(dir),
+                ..
+            } if dir == Path::new("out")
+        ));
+    }
 }

@@ -153,6 +153,10 @@ pub extern "system" fn create(
     if *iid == LEVEL_IIDS[8] {
         NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(hr) = crate::record::hand_out_device(iid, out) {
+        return hr;
+    }
     object::answer(object::DEVICE, iid, Some(device()), out)
 }
 
@@ -582,6 +586,7 @@ pub(crate) fn log_frame() {
         line.push_str(&part);
     }
     tracing::info!("{line}");
+    resource::log_placed_views();
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the

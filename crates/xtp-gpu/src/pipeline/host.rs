@@ -12,7 +12,9 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
-use xtp_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+use xtp_shader::emit::{
+    LOOP_COUNTER_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, TLAS_REGISTER, USER_DATA_SPACE,
+};
 
 use super::{Shader, Translated};
 use crate::host::host;
@@ -252,6 +254,20 @@ impl GraphicsState {
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
+        self.describe_with(self.depth_bounds)
+    }
+
+    /// [`Self::describe`] of the state a host makes, for the library's
+    /// name: the depth bounds test only where the host has one, as the
+    /// pipeline's description sets it (`g.depth_bounds &&
+    /// host.depth_bounds`). The title's ask alone named two descriptions
+    /// alike on hosts with and without it (Codex review of d286ffd, point
+    /// 5).
+    pub(crate) fn describe_on(&self, host_depth_bounds: bool) -> String {
+        self.describe_with(self.depth_bounds && host_depth_bounds)
+    }
+
+    fn describe_with(&self, depth_bounds: bool) -> String {
         let inputs: Vec<String> = self
             .inputs
             .iter()
@@ -268,11 +284,7 @@ impl GraphicsState {
                 )
             })
             .collect();
-        let bounds = if self.depth_bounds {
-            " depth-bounds"
-        } else {
-            ""
-        };
+        let bounds = if depth_bounds { " depth-bounds" } else { "" };
         format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{bounds}",
             self.blend,
@@ -510,6 +522,76 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("XTP_ROOT_SRV_DIRECT").is_none())
 }
 
+/// Whether the root SRV at `slot` of a translated shader is a one-view
+/// table (bound with a descriptor table) rather than a root descriptor:
+/// with [`bounded_root_srvs`], every slot but the RayQuery TLAS
+/// ([`TLAS_REGISTER`]), which always stays a root SRV. Its trace dispatch
+/// passes the host TLAS as an indirect root SRV argument
+/// ([`crate::rt::dispatch_descriptor_tlas`]), which a table cannot take,
+/// and an acceleration structure has no byte range for a view to bound.
+pub(crate) fn root_srv_in_table(slot: u8) -> bool {
+    slot != TLAS_REGISTER && bounded_root_srvs()
+}
+
+/// The root parameter of a translated shader's root view at `slot` of
+/// `kind` (a root CBV, SRV or UAV in [`ROOT_CBV_SPACE`]): a one-view table
+/// for root UAVs and the root SRVs [`root_srv_in_table`] names (its range
+/// pushed to `ranges`, which must outlive the parameter), else a root
+/// descriptor.
+#[expect(
+    clippy::vec_box,
+    reason = "a table parameter points at its range, which must stay in place as the vector grows"
+)]
+pub(crate) fn root_view(
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    slot: u8,
+    visibility: D3D12_SHADER_VISIBILITY,
+    ranges: &mut Vec<Box<D3D12_DESCRIPTOR_RANGE1>>,
+) -> D3D12_ROOT_PARAMETER1 {
+    if kind == D3D12_ROOT_PARAMETER_TYPE_UAV
+        || kind == D3D12_ROOT_PARAMETER_TYPE_SRV && root_srv_in_table(slot)
+    {
+        // A one-view table: the view's size bounds the reads, which a root
+        // descriptor leaves unbounded.
+        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
+                D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+            } else {
+                D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+            },
+            NumDescriptors: 1,
+            BaseShaderRegister: u32::from(slot),
+            RegisterSpace: ROOT_CBV_SPACE,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            OffsetInDescriptorsFromTableStart: 0,
+        }));
+        // The box keeps the range in place when the vector grows.
+        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last().expect("pushed");
+        return D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: range,
+                },
+            },
+            ShaderVisibility: visibility,
+        };
+    }
+    D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: u32::from(slot),
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: visibility,
+    }
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -632,6 +714,12 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// With `XTP_SHADER_LOOP_COUNT`, where a shader of it counts the lanes
+    /// stopped at a loop's limit or budget: the root parameter of the
+    /// counter (a root UAV, `u0` in [`LOOP_COUNTER_SPACE`], for every
+    /// stage) and the pipeline's slot, whose counter (16-byte aligned)
+    /// draws and dispatches bind there (`crate::loopstat`).
+    pub(crate) loop_counter: Option<(u32, u32)>,
 }
 
 /// Pipelines that got no host pipeline since the start, by reason.
@@ -1042,50 +1130,8 @@ impl HostPipeline {
                 ),
             ] {
                 for &slot in slots {
-                    if kind == D3D12_ROOT_PARAMETER_TYPE_UAV
-                        || kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs()
-                    {
-                        // A one-view table: the view's size bounds the reads,
-                        // which a root descriptor leaves unbounded.
-                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
-                                D3D12_DESCRIPTOR_RANGE_TYPE_UAV
-                            } else {
-                                D3D12_DESCRIPTOR_RANGE_TYPE_SRV
-                            },
-                            NumDescriptors: 1,
-                            BaseShaderRegister: u32::from(slot),
-                            RegisterSpace: ROOT_CBV_SPACE,
-                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                            OffsetInDescriptorsFromTableStart: 0,
-                        }));
-                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
-                        out.push((slot, params.len() as u32));
-                        params.push(D3D12_ROOT_PARAMETER1 {
-                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                                    NumDescriptorRanges: 1,
-                                    pDescriptorRanges: range,
-                                },
-                            },
-                            ShaderVisibility: visibility,
-                        });
-                        continue;
-                    }
                     out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
+                    params.push(root_view(kind, slot, visibility, &mut ranges));
                 }
             }
             if t.stride_table {
@@ -1123,6 +1169,27 @@ impl HostPipeline {
                 });
             }
             bound.push(stage);
+        }
+        // XTP_SHADER_LOOP_COUNT: a shader that counts the lanes it stops at a
+        // limit writes the pipeline's counter, a root UAV all stages see
+        // (`crate::loopstat`).
+        let mut loop_counter = None;
+        if translations.iter().any(|t| t.host.loop_counter()) {
+            let Some(slot) = crate::loopstat::slot(&format!("{shaders:?}")) else {
+                return refuse("its loop-limit counter has no buffer", shaders);
+            };
+            loop_counter = Some((params.len() as u32, slot));
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: LOOP_COUNTER_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
         }
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some()) {
@@ -1182,6 +1249,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                loop_counter,
             });
         }
         let Some(g) = g else {
@@ -1190,7 +1258,8 @@ impl HostPipeline {
         if let Some(why) = g.refusal(&crate::resource::format::HostCaps) {
             return refuse(why, shaders);
         }
-        let state = g.describe();
+        // The state the host makes names the pipeline in the library.
+        let state = g.describe_on(host.depth_bounds);
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh",
@@ -1198,13 +1267,8 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            #[repr(C)]
-            struct MeshStages(Sub<D3D12_SHADER_BYTECODE>, Sub<D3D12_SHADER_BYTECODE>);
-            let stages = MeshStages(
-                Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0)),
-                Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, code(1)),
-            );
-            // SAFETY: deux sous-objets alignés, les shaders restent vivants pendant l'appel.
+            let stages = MeshStages::new(code(0), code(1), &translations[0].host.dxil);
+            // SAFETY: trois sous-objets alignés, les shaders restent vivants pendant l'appel.
             let made = unsafe { stream_pipeline(host, &root, g, stages, &name) };
             let pso = match made {
                 Ok(pso) => pso,
@@ -1227,6 +1291,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                loop_counter,
             });
         }
 
@@ -1383,6 +1448,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            loop_counter,
         })
     }
 }
@@ -1391,33 +1457,31 @@ impl HostPipeline {
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
+/// A pipeline as a subobject stream: its root signature, its `stages`,
+/// and the graphics state the mesh and depth-bounds pipelines share.
+#[repr(C)]
+struct Stream<S> {
+    root: Sub<*mut std::ffi::c_void>,
+    stages: S,
+    blend: Sub<D3D12_BLEND_DESC>,
+    mask: Sub<u32>,
+    raster: Sub<D3D12_RASTERIZER_DESC>,
+    depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
+    targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+    dsv: Sub<DXGI_FORMAT>,
+    samples: Sub<DXGI_SAMPLE_DESC>,
+}
+
 /// Portage de victory-fork#82 de Kaivyyy (c96b4f2, GPL-3.0).
 /// Les pipelines de maillage et de sommets partagent l’état de rastérisation.
-///
-/// # Safety
-/// `stages` doit contenir une suite de sous-objets D3D12 alignés dont les
-/// pointeurs restent valides jusqu'à la création ou au chargement du pipeline.
-unsafe fn stream_pipeline<S>(
+fn stream_of<S>(
     host: &crate::host::Host,
     root: &ID3D12RootSignature,
     g: &GraphicsState,
     stages: S,
-    name: &str,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> Stream<S> {
     use windows::core::Interface;
-    #[repr(C)]
-    struct Stream<S> {
-        root: Sub<*mut std::ffi::c_void>,
-        stages: S,
-        blend: Sub<D3D12_BLEND_DESC>,
-        mask: Sub<u32>,
-        raster: Sub<D3D12_RASTERIZER_DESC>,
-        depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
-        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
-        dsv: Sub<DXGI_FORMAT>,
-        samples: Sub<DXGI_SAMPLE_DESC>,
-    }
-    let mut stream = Stream {
+    Stream {
         root: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
             root.as_raw(),
@@ -1452,11 +1516,85 @@ unsafe fn stream_pipeline<S>(
             g.depth_format,
         ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-    };
-    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
-        SizeInBytes: size_of_val(&stream),
-        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
-    };
+    }
+}
+
+impl<S> Stream<S> {
+    /// The description of this stream, which must stay in place while it
+    /// is used.
+    fn desc(&mut self) -> D3D12_PIPELINE_STATE_STREAM_DESC {
+        D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: size_of::<Self>(),
+            pPipelineStateSubobjectStream: std::ptr::from_mut(self).cast(),
+        }
+    }
+}
+
+/// A mesh pipeline's stages: its mesh and pixel programs, and the
+/// primitive topology its mesh program outputs. D3D12 keeps that topology
+/// in the pipeline it makes from a stream without one, so that a load from
+/// the library with the stream without it did not match the entry (D3D12
+/// message 972, then 970 at the store under the same name): every mesh
+/// pipeline was compiled again in every session (on the L4, 2026-11-25,
+/// about as many made as mesh pipelines drawn, before and after 5943ac5).
+#[repr(C)]
+struct MeshStages(
+    Sub<D3D12_SHADER_BYTECODE>,
+    Sub<D3D12_SHADER_BYTECODE>,
+    Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+);
+
+impl MeshStages {
+    /// The mesh program `ms`, whose translation is `ms_dxil`, and the pixel
+    /// program `ps`.
+    fn new(ms: D3D12_SHADER_BYTECODE, ps: D3D12_SHADER_BYTECODE, ms_dxil: &[u8]) -> MeshStages {
+        MeshStages(
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+            Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                mesh_topology(ms_dxil),
+            ),
+        )
+    }
+}
+
+/// The primitive topology the mesh program in the DXIL container `dxil`
+/// outputs: its `PSV0` runtime information's `MeshOutputTopology` (1 lines,
+/// 2 triangles, at byte 27 of the runtime information, after its size), as
+/// the translator writes it (`xtp-shader` `emit/container.rs`). Undefined
+/// if the container does not say.
+fn mesh_topology(dxil: &[u8]) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
+    use xtp_shader::{Container, FourCC};
+    let topology = Container::parse(dxil).ok().and_then(|c| {
+        let psv = c.part(FourCC::PSV0)?.data;
+        let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?);
+        (size >= 28).then_some(())?;
+        psv.get(4 + 27).copied()
+    });
+    match topology {
+        Some(1) => D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+        Some(2) => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        _ => D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
+    }
+}
+
+/// The pipeline of `stages` with the state of `g`, as a stream
+/// ([`stream_of`]), from the library under `name`.
+///
+/// # Safety
+/// `stages` doit contenir une suite de sous-objets D3D12 alignés dont les
+/// pointeurs restent valides jusqu'à la création ou au chargement du pipeline.
+unsafe fn stream_pipeline<S>(
+    host: &crate::host::Host,
+    root: &ID3D12RootSignature,
+    g: &GraphicsState,
+    stages: S,
+    name: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
+    use windows::core::Interface;
+    let mut stream = stream_of(host, root, g, stages);
+    let desc = stream.desc();
     let device = host.device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
         name,
@@ -1477,7 +1615,7 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         .to_vec()
 }
 
-fn root_signature(
+pub(crate) fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
@@ -2103,7 +2241,6 @@ mod tests {
             return;
         };
         let host = gpu.host();
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use windows::core::s;
         use xtp_shader::HwStage;
         const ITEM: &str = "struct V {
@@ -2179,6 +2316,11 @@ mod tests {
             depth.1.DepthBoundsTestEnable = true.into();
             g.read(21, (&raw const depth).cast());
             assert_ne!(g.describe(), disabled);
+            // The library's name: the state the host makes (Codex review
+            // of d286ffd, point 5): without the test on a host without it,
+            // as the pipeline's description has it there.
+            assert_eq!(g.describe_on(true), g.describe());
+            assert_eq!(g.describe_on(false), disabled);
             let legacy = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth);
             g.read(11, (&raw const legacy).cast());
             assert_eq!(g.describe(), disabled);
@@ -2331,7 +2473,6 @@ mod tests {
         width: u32,
         before_draw: impl FnOnce(&crate::testgpu::TitleList, D3D12_CPU_DESCRIPTOR_HANDLE),
     ) -> Vec<u8> {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use windows::core::s;
         let vs = title_shader(
             "vertex",
@@ -2387,6 +2528,7 @@ mod tests {
             )]);
             l.ClearRenderTargetView(rtv, &[11.0; 4], None);
             l.OMSetRenderTargets(1, Some(&rtv), false, None);
+            l.SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(None));
             l.SetGraphicsRootSignature(&p.root);
             l.SetPipelineState(&p.pso);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2519,7 +2661,6 @@ mod tests {
     ///   on every device, which also checks the dispatch read back here.
     #[test]
     fn wave64_compute_for_a_forced_32_lane_target() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use std::sync::atomic::{AtomicU64, Ordering};
         use xtp_shader::emit::{HostShader, Target};
         let test = "pipeline::host::tests::wave64_compute_for_a_forced_32_lane_target";
@@ -2674,7 +2815,8 @@ mod tests {
         l.keep(&p.pso);
         // SAFETY: an open list; live objects kept until it is reset.
         unsafe {
-            l.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            l.list
+                .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(&heap)));
             l.list.SetComputeRootSignature(&p.root);
             l.list.SetPipelineState(&p.pso);
             l.list
@@ -2718,6 +2860,593 @@ mod tests {
             || unsafe { host.device.CreateComputePipelineState(&desc) },
         );
         made.is_err()
+    }
+
+    /// `XTP_SHADER_LOOP_COUNT` end to end (S12): a compute program whose
+    /// lanes 0 to 4 loop past the loop limit, translated with the counter,
+    /// gets the counter's root UAV and a slot, and each group it runs adds
+    /// the 5 lanes the limit stops to that slot's counter. Translated
+    /// without the counter, its pipeline has neither.
+    ///
+    /// Four pipelines of it take four slots, each residue modulo 4 for
+    /// consecutive ones: each binds its counter at a 16-byte aligned
+    /// address, which the debug layer checks of a raw view's
+    /// (`XTP_D3D12_DEBUG=1`), and counts its own groups alone. A snapshot
+    /// recorded between two lists, as the present's list records one
+    /// (`loopstat::record`), holds what the lists before it counted, not
+    /// what the list after it adds to the live counters.
+    #[test]
+    fn a_loop_counter_counts_the_lanes_a_limit_stops() {
+        use crate::testgpu::TitleList;
+        use xtp_shader::native::{ComputeIo, StageIo};
+        let test = "pipeline::host::tests::a_loop_counter_counts_the_lanes_a_limit_stops";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let device = gpu.host();
+        // Lane t loops to 1, or past any limit where t < 5. The loop steps
+        // by a register, so it is no counted loop: the general limit.
+        let words = [
+            0x7E02_0280u32, // v_mov_b32 v1, 0
+            0x7E0A_0281,    // v_mov_b32 v5, 1
+            0x7E08_0281,    // v_mov_b32 v4, 1
+            0x7E0C_02FF,
+            0x7FFF_FFFF, // v_mov_b32 v6, 0x7fffffff
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0
+            0x0208_0D04, // v_cndmask_b32 v4, v4, v6, vcc_lo
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0x4A02_0305, // loop: v_add_nc_u32 v1, v5, v1
+            0x7D8C_0901, // v_cmp_ge_u32 vcc_lo, v1, v4
+            0x8808_086A, // s_or_b32 s8, vcc_lo, s8
+            0x8A7E_087E, // s_andn2_b32 exec_lo, exec_lo, s8
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+            0xBF81_0000, // s_endpgm
+        ];
+        let (container, template) = crate::shader_cache::wave64_program(false);
+        let native = xtp_shader::NativeProgram {
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            ..template
+        };
+        let translate = || {
+            xtp_shader::emit::translate_program(&container, &native)
+                .unwrap_or_else(|(step, e)| panic!("{}: {e}", step.name()))
+        };
+        let pipeline = |host: xtp_shader::emit::HostShader, hash: &str| {
+            let shader = Arc::new(Shader {
+                stage: "compute",
+                hash: hash.into(),
+                container: Vec::new(),
+                native: std::sync::OnceLock::new(),
+                translated: std::sync::OnceLock::from(Some(Translated {
+                    host,
+                    used: Vec::new(),
+                    wave64: false,
+                })),
+            });
+            HostPipeline::new(&[shader], None).expect("a pipeline")
+        };
+        if !xtp_shader::emit::loop_count() {
+            let plain = translate();
+            assert!(!plain.loop_counter());
+            assert_eq!(pipeline(plain, "loop-count-off").loop_counter, None);
+        }
+        let counting = xtp_shader::emit::with_loop_count(translate);
+        assert!(counting.loop_counter());
+        let pipelines: Vec<HostPipeline> = (0..4)
+            .map(|n| pipeline(counting.clone(), &format!("loop-count-on-{n}")))
+            .collect();
+        let slots: Vec<u32> = pipelines
+            .iter()
+            .map(|p| p.loop_counter.expect("the counter's root parameter").1)
+            .collect();
+        let distinct: std::collections::HashSet<u32> = slots.iter().copied().collect();
+        assert_eq!(distinct.len(), 4, "one slot per pipeline: {slots:?}");
+        let counted = || -> Vec<u32> {
+            slots
+                .iter()
+                .map(|&slot| crate::loopstat::counted(slot).expect("the counters"))
+                .collect()
+        };
+        // Runs `groups` groups of `p` in `l`, its counter bound as the draw
+        // state binds it.
+        let dispatch = |l: &crate::host::HostList, p: &HostPipeline, groups: u32| {
+            let (param, slot) = p.loop_counter.expect("the counter's root parameter");
+            let at = crate::loopstat::address(slot).expect("the slot's address");
+            assert_eq!(at % 16, 0, "slot {slot}: a raw view's address");
+            l.keep(&p.root);
+            l.keep(&p.pso);
+            let user = p.stages[0].user_data;
+            let zeros = vec![0u32; user.map_or(0, |(_, n)| n as usize)];
+            // SAFETY: an open list; live objects kept until it is reset;
+            // the counters live for good.
+            unsafe {
+                l.list.SetComputeRootSignature(&p.root);
+                l.list.SetPipelineState(&p.pso);
+                if let Some((param, n)) = user {
+                    l.list
+                        .SetComputeRoot32BitConstants(param, n, zeros.as_ptr().cast(), 0);
+                }
+                l.list.SetComputeRootUnorderedAccessView(param, at);
+                l.list.Dispatch(groups, 1, 1);
+            }
+        };
+        let before = counted();
+        let list = TitleList::new();
+        let l = list.host();
+        // The root signatures index both heaps directly: both are bound
+        // before one is set.
+        crate::testgpu::bind_indexed_heaps(l);
+        for (n, p) in pipelines.iter().enumerate() {
+            dispatch(l, p, n as u32 + 1);
+        }
+        list.run();
+        // SAFETY: a plain device query.
+        assert!(unsafe { device.device.GetDeviceRemovedReason() }.is_ok());
+        let after = counted();
+        for n in 0..4 {
+            assert_eq!(
+                after[n].wrapping_sub(before[n]),
+                5 * (n as u32 + 1),
+                "slot {}, of slots {slots:?}",
+                slots[n]
+            );
+        }
+        // The snapshot, then more lanes stopped after it.
+        let list = TitleList::new();
+        let snapshot = crate::loopstat::snapshot_in(device, &list.host().list)
+            .expect("a snapshot of the counters");
+        list.run();
+        let list = TitleList::new();
+        let l = list.host();
+        crate::testgpu::bind_indexed_heaps(l);
+        dispatch(l, &pipelines[0], 2);
+        list.run();
+        // SAFETY: a plain device query.
+        assert!(unsafe { device.device.GetDeviceRemovedReason() }.is_ok());
+        let copied: Vec<u32> = slots
+            .iter()
+            .map(|&slot| snapshot.counted(slot).expect("copied"))
+            .collect();
+        assert_eq!(copied, after, "the snapshot: slots {slots:?}");
+        let live = counted();
+        assert_eq!(live[0].wrapping_sub(after[0]), 10, "slot {}", slots[0]);
+        assert_eq!(live[1..], after[1..], "slots {slots:?}");
+    }
+
+    /// Where the parent's library file is, for [`library_child`].
+    const LIBRARY_CHILD: &str = "XTP_LIBRARY_CHILD";
+
+    /// A translated console mesh program: three corners from the lane
+    /// number (`xtp-shader` `emit/mesh_tests.rs`' triangle program), their
+    /// position exported, then triangle (0, 1, 2); none on a host without
+    /// mesh shaders.
+    fn triangle_mesh(host: &crate::host::Host) -> Option<xtp_shader::emit::HostShader> {
+        use xtp_shader::native::{MeshIo, NativeProgram, StageIo};
+        if !host.mesh_shaders() {
+            return None;
+        }
+        let words: [u32; 19] = [
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0xF800_08CF,
+            0x0706_0504, // exp pos0, v4, v5, v6, v7 done
+            0x7E12_02FF,
+            1 << 10 | 2 << 20, // v_mov_b32 v9, triangle (0, 1, 2)
+            0xF800_0941,
+            0x0000_0009, // exp prim, v9 done
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: xtp_shader::HwStage::Ms,
+            wave64: false,
+            float_mode: 0,
+            vgprs: 16,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ms(MeshIo {
+                outputs: Vec::new(),
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        // Its output signature: SV_Position, a float4 in row 0.
+        let mut osg1 = Vec::new();
+        for v in [1u32, 8, 0, 40, 0, 1, 3, 0] {
+            osg1.extend(v.to_le_bytes());
+        }
+        osg1.extend([0xf, 0, 0, 0, 0, 0, 0, 0]);
+        osg1.extend(b"SV_Position\0");
+        let container = xtp_shader::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![xtp_shader::Part {
+                fourcc: xtp_shader::FourCC::OSG1,
+                offset: 0,
+                data: &osg1,
+            }],
+        };
+        let target = crate::device::host_target();
+        let ms = xtp_shader::emit::translate_program_for(&container, &native, target)
+            .map_err(|(_, e)| e.to_string())
+            .expect("the mesh program translates");
+        Some(ms)
+    }
+
+    /// Three pipelines of the same state, each as a session describes it:
+    /// a vertex one as a classic description, the same as a subobject
+    /// stream ([`stream_of`], as the depth-bounds ones), and a mesh one
+    /// ([`MeshStages`], where the host has mesh shaders). `f` gets their
+    /// descriptions, each pointing at live data.
+    fn with_descs<R>(
+        host: &crate::host::Host,
+        f: impl FnOnce(
+            &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+            &D3D12_PIPELINE_STATE_STREAM_DESC,
+            Option<&D3D12_PIPELINE_STATE_STREAM_DESC>,
+        ) -> R,
+    ) -> R {
+        use windows::core::s;
+        let vs = compiled(
+            xtp_shader::HwStage::Vs,
+            "float4 main(uint id : SV_VertexID) : SV_Position { return float4(id, 0, 0, 1); }",
+            s!("vs_5_1"),
+        );
+        let ps = compiled(
+            xtp_shader::HwStage::Ps,
+            "float4 main() : SV_Target { return float4(0.25, 0.5, 0.75, 1); }",
+            s!("ps_5_1"),
+        );
+        let (root, _) = root_signature(&host.device, &[], &[], false).unwrap();
+        let g = state(&[28], 0);
+        let code = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: dxil.as_ptr().cast(),
+            BytecodeLength: dxil.len(),
+        };
+        let classic = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            VS: code(&vs.host.dxil),
+            PS: code(&ps.host.dxil),
+            BlendState: g.blend,
+            SampleMask: g.sample_mask,
+            RasterizerState: g.rasterizer,
+            DepthStencilState: g.depth,
+            IBStripCutValue: g.strip_cut,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: g.targets.NumRenderTargets,
+            RTVFormats: g.targets.RTFormats,
+            DSVFormat: g.depth_format,
+            SampleDesc: g.samples,
+            ..Default::default()
+        };
+        #[repr(C)]
+        struct VertexStages(
+            Sub<D3D12_SHADER_BYTECODE>,
+            Sub<D3D12_SHADER_BYTECODE>,
+            Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+        );
+        let vertex = VertexStages(
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, classic.VS),
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, classic.PS),
+            Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ),
+        );
+        let mut streamed = stream_of(host, &root, &g, vertex);
+        // The mesh pipeline, with the root signature a session makes for
+        // its translation.
+        let ms = triangle_mesh(host);
+        let mesh_root = ms.as_ref().map(|ms| {
+            let shader = title_shader(
+                "mesh",
+                "library test mesh",
+                Some(Translated {
+                    host: ms.clone(),
+                    used: Vec::new(),
+                    wave64: false,
+                }),
+            );
+            HostPipeline::new(&[shader], Some(&g))
+                .expect("a mesh pipeline")
+                .root
+        });
+        let mut meshed = ms.as_ref().zip(mesh_root.as_ref()).map(|(ms, root)| {
+            let stages =
+                MeshStages::new(code(&ms.dxil), D3D12_SHADER_BYTECODE::default(), &ms.dxil);
+            stream_of(host, root, &g, stages)
+        });
+        let meshed = meshed.as_mut().map(Stream::desc);
+        f(&classic, &streamed.desc(), meshed.as_ref())
+    }
+
+    /// The mesh stages as builds before 284010f streamed them: the mesh and
+    /// pixel programs, no primitive topology.
+    #[repr(C)]
+    struct Before(Sub<D3D12_SHADER_BYTECODE>, Sub<D3D12_SHADER_BYTECODE>);
+
+    /// The mesh pipeline of the stream description `meshed` (made by
+    /// [`with_descs`] from a `Stream<MeshStages>`) as a build before
+    /// 284010f streamed it: without its primitive topology.
+    ///
+    /// # Safety
+    /// `meshed` points at a live `Stream<MeshStages>`.
+    unsafe fn before(meshed: &D3D12_PIPELINE_STATE_STREAM_DESC) -> Stream<Before> {
+        // SAFETY: the caller's.
+        let now = unsafe {
+            &*meshed
+                .pPipelineStateSubobjectStream
+                .cast::<Stream<MeshStages>>()
+        };
+        Stream {
+            root: Sub(now.root.0, now.root.1),
+            stages: Before(
+                Sub(now.stages.0.0, now.stages.0.1),
+                Sub(now.stages.1.0, now.stages.1.1),
+            ),
+            blend: Sub(now.blend.0, now.blend.1),
+            mask: Sub(now.mask.0, now.mask.1),
+            raster: Sub(now.raster.0, now.raster.1),
+            depth: Sub(now.depth.0, now.depth.1),
+            targets: Sub(now.targets.0, now.targets.1),
+            dsv: Sub(now.dsv.0, now.dsv.1),
+            samples: Sub(now.samples.0, now.samples.1),
+        }
+    }
+
+    /// What loads, in a library of `blob`, of [`with_descs`]' three
+    /// pipelines stored under the names "classic", "stream" and "mesh",
+    /// and under "before" the mesh pipeline a build before 284010f made
+    /// and stored ([`before`]), loaded with this build's stream.
+    fn loads(host: &crate::host::Host, blob: &[u8]) -> String {
+        use windows::core::{HSTRING, Interface, PCWSTR};
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        // SAFETY: `blob` outlives the library, dropped first.
+        let library: ID3D12PipelineLibrary1 = unsafe {
+            device
+                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(blob)
+                .unwrap()
+                .cast()
+                .unwrap()
+        };
+        let said = |r: windows::core::Result<ID3D12PipelineState>| match r {
+            Ok(_) => "ok".to_owned(),
+            Err(e) => format!("{:?}", e.code()),
+        };
+        let name = |name: &str| HSTRING::from(name);
+        let (classic, streamed, meshed) = with_descs(host, |classic, streamed, meshed| {
+            // SAFETY: a live library; the descriptions point at live data.
+            unsafe {
+                (
+                    library.LoadGraphicsPipeline(PCWSTR(name("classic").as_ptr()), classic),
+                    library.LoadPipeline(PCWSTR(name("stream").as_ptr()), streamed),
+                    meshed.map(|m| {
+                        (
+                            library.LoadPipeline(PCWSTR(name("mesh").as_ptr()), m),
+                            library.LoadPipeline(PCWSTR(name("before").as_ptr()), m),
+                        )
+                    }),
+                )
+            }
+        });
+        let meshed = meshed.map_or_else(
+            || "mesh=none".to_owned(),
+            |(now, before)| format!("mesh={} before={}", said(now), said(before)),
+        );
+        format!(
+            "classic={} stream={} {meshed}",
+            said(classic),
+            said(streamed)
+        )
+    }
+
+    /// The child of [`pipelines_load_from_the_library_file`]: run by it
+    /// alone, it loads the parent's library file and writes what loads.
+    #[test]
+    #[ignore = "run by pipelines_load_from_the_library_file"]
+    fn library_child() {
+        let Some(dir) = std::env::var_os(LIBRARY_CHILD).map(std::path::PathBuf::from) else {
+            return;
+        };
+        let Some(gpu) = crate::testgpu::device("pipeline::host::tests::library_child") else {
+            return;
+        };
+        let blob = std::fs::read(dir.join("library.bin")).unwrap();
+        let said = loads(gpu.host(), &blob);
+        std::fs::write(dir.join("loads.txt"), said).unwrap();
+    }
+
+    /// The pipelines a session stores load from the library file, in it
+    /// and in the next process: a classic description, a subobject stream,
+    /// and a mesh one. The mesh stream had no primitive topology; D3D12
+    /// keeps the one its program outputs in the pipeline it makes, so the
+    /// stream without it did not load what it had stored (D3D12 message
+    /// 972, then 970 at the store under the same name: on the L4, every
+    /// mesh pipeline compiled again in every session). The stream without
+    /// it is checked to fail here too, so that this test tells the cause.
+    #[test]
+    fn pipelines_load_from_the_library_file() {
+        use windows::core::{HSTRING, Interface, PCWSTR};
+        let test = "pipeline::host::tests::pipelines_load_from_the_library_file";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let device2 = host.device.cast::<ID3D12Device2>().unwrap();
+        // SAFETY: an empty library, which keeps no pointer to the slice.
+        let library: ID3D12PipelineLibrary1 = unsafe {
+            device
+                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(&[])
+                .unwrap()
+                .cast()
+                .unwrap()
+        };
+        let name = |name: &str| HSTRING::from(name);
+        let mesh = with_descs(host, |classic, streamed, meshed| {
+            // SAFETY: live descriptions, a live library.
+            unsafe {
+                let made: ID3D12PipelineState =
+                    host.device.CreateGraphicsPipelineState(classic).unwrap();
+                library
+                    .StorePipeline(PCWSTR(name("classic").as_ptr()), &made)
+                    .unwrap();
+                let made: ID3D12PipelineState = device2.CreatePipelineState(streamed).unwrap();
+                library
+                    .StorePipeline(PCWSTR(name("stream").as_ptr()), &made)
+                    .unwrap();
+                if let Some(m) = meshed {
+                    let made: ID3D12PipelineState = device2.CreatePipelineState(m).unwrap();
+                    library
+                        .StorePipeline(PCWSTR(name("mesh").as_ptr()), &made)
+                        .unwrap();
+                    // The library a build before 284010f left: its stream
+                    // made and stored the pipeline (Codex review of
+                    // d286ffd, point 4). The name a session gives it is the
+                    // same in both builds (the topology is not in it, the
+                    // program's `PSV0` is, unchanged); D3D12 matches the
+                    // description, which this build's stream must load.
+                    let made: ID3D12PipelineState =
+                        device2.CreatePipelineState(&before(m).desc()).unwrap();
+                    library
+                        .StorePipeline(PCWSTR(name("before").as_ptr()), &made)
+                        .unwrap();
+                }
+            }
+            meshed.is_some()
+        });
+        if !mesh {
+            // Strict mode fails here: the mesh pipeline is what it checks.
+            crate::testgpu::skip(test, "no mesh shaders on this host");
+        }
+        let all = if mesh {
+            "classic=ok stream=ok mesh=ok before=ok"
+        } else {
+            "classic=ok stream=ok mesh=none"
+        };
+        // SAFETY: a live library; the buffer is its serialised size.
+        let blob = unsafe {
+            let mut blob = vec![0u8; library.GetSerializedSize()];
+            library.Serialize(&mut blob).unwrap();
+            blob
+        };
+        assert_eq!(loads(host, &blob), all, "this process");
+
+        // The mesh stream as it was, without its topology, does not load
+        // the entry: the cause, not only the cure.
+        if let Some(ms) = triangle_mesh(host) {
+            with_descs(host, |_, _, meshed| {
+                let meshed = meshed.expect("a mesh pipeline");
+                // SAFETY: the stream description was made by `with_descs`
+                // from a `Stream<MeshStages>`, alive meanwhile.
+                let mut before = unsafe { before(meshed) };
+                assert_eq!(
+                    mesh_topology(&ms.dxil),
+                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+                );
+                let desc = before.desc();
+                let refused = crate::testgpu::expect_layer_errors(|| {
+                    // SAFETY: a live library; the stream points at live data.
+                    unsafe {
+                        library.LoadPipeline::<_, ID3D12PipelineState>(
+                            PCWSTR(name("mesh").as_ptr()),
+                            &desc,
+                        )
+                    }
+                });
+                assert!(refused.is_err(), "the stream without its topology");
+            });
+        }
+
+        // The next process, from the file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("library.bin"), &blob).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "pipeline::host::tests::library_child",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(LIBRARY_CHILD, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        // The same machine: a child without the parent's device is a
+        // failure, not a pass without the next process's answer.
+        let said = std::fs::read_to_string(dir.path().join("loads.txt")).unwrap_or_else(|_| {
+            panic!(
+                "the child answered nothing: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(said, all, "the next process");
+    }
+
+    /// A mesh program's topology is its `PSV0`'s: lines, triangles, or
+    /// undefined without one.
+    #[test]
+    fn mesh_topologies_are_read_from_the_container() {
+        let with = |topology: u8| {
+            let mut psv = 48u32.to_le_bytes().to_vec();
+            let mut info = [0u8; 48];
+            info[27] = topology;
+            psv.extend(info);
+            // A DXBC container of that part alone.
+            let header = 0x20 + 4;
+            let mut out = b"DXBC".to_vec();
+            out.extend([0; 16]);
+            out.extend(1u16.to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+            out.extend(((header + 8 + psv.len()) as u32).to_le_bytes());
+            out.extend(1u32.to_le_bytes());
+            out.extend((header as u32).to_le_bytes());
+            out.extend(b"PSV0");
+            out.extend((psv.len() as u32).to_le_bytes());
+            out.extend(psv);
+            out
+        };
+        assert_eq!(mesh_topology(&with(1)), D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
+        assert_eq!(
+            mesh_topology(&with(2)),
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+        );
+        assert_eq!(
+            mesh_topology(&with(0)),
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED
+        );
+        assert_eq!(
+            mesh_topology(b"not a container"),
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED
+        );
     }
 }
 

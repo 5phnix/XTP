@@ -30,6 +30,15 @@
 //! - The precook reuses the pipeline library across translator changes.
 //!   It can compact a library past [`LIBRARY_REBUILD_BYTES`] into a new
 //!   generation ([`rebuild_library`]) containing the pipelines used again.
+//! - A pipeline the library holds is not loaded here ([`super::library`]'s
+//!   `without_loading`): it is made through the same function, which names
+//!   it from its translated shaders, root signature and state, and its name
+//!   found in the library's names is the answer ([`Counts::known`]). After
+//!   a translator change, the pipelines whose translations did not change
+//!   cost their name alone; a session loads each when it needs it.
+//! - After a translator change, each translation is compared with the one
+//!   the translator before kept ([`compare_with`], [`compared`]): what the
+//!   change altered, counted. The answer is always this build's.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -105,9 +114,13 @@ pub fn container(container: &[u8], stage: Option<HwStage>, pipelines: bool) -> O
 pub struct Compute(Arc<Shader>);
 
 impl Compute {
-    /// Loads or creates the pipeline using the same description as a dispatch.
+    /// Makes the pipeline from the same description as a dispatch, unless
+    /// the library holds it (then it is not loaded either).
     pub fn pipeline(&self) -> Outcome {
-        if HostPipeline::new(std::slice::from_ref(&self.0), None).is_some() {
+        let made = super::library::without_loading(|| {
+            HostPipeline::new(std::slice::from_ref(&self.0), None).is_some()
+        });
+        if made {
             Outcome::Ready
         } else {
             Outcome::NoPipeline
@@ -148,6 +161,8 @@ pub struct Counts {
     /// Host pipelines compiled, and loaded from the library.
     pub made: u64,
     pub loaded: u64,
+    /// Host pipelines the library holds by their names, not loaded.
+    pub known: u64,
 }
 
 /// The counts so far.
@@ -158,7 +173,32 @@ pub fn counts() -> Counts {
         cached,
         made: super::library::MADE.load(Ordering::Relaxed),
         loaded: super::library::LOADED.load(Ordering::Relaxed),
+        known: super::library::KNOWN.load(Ordering::Relaxed),
     }
+}
+
+/// From now on, compares each translation made with the entry the
+/// translator of `key` (another build's key, as [`Ready::key`] gives it in
+/// hexadecimal) kept for its container. False if `key` is not one, or a
+/// comparison is set already.
+pub fn compare_with(key: &str) -> bool {
+    if key.len() != 64 || !key.is_ascii() {
+        return false;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        match u8::from_str_radix(&key[2 * i..2 * i + 2], 16) {
+            Ok(v) => *b = v,
+            Err(_) => return false,
+        }
+    }
+    crate::shader_cache::compare_with(bytes)
+}
+
+/// How the translations made compare with the translator before's
+/// ([`compare_with`]).
+pub fn compared() -> crate::shader_cache::Compared {
+    crate::shader_cache::compared_counts()
 }
 
 /// The host pipelines refused so far, by reason, most first.
@@ -171,7 +211,8 @@ pub fn refusals() -> Option<String> {
 pub const LIBRARY_REBUILD_BYTES: u64 = 2 << 30;
 
 /// What a precook's pipelines depend on besides the pack and the
-/// translator: the descriptions sessions kept and the library file.
+/// translator: the descriptions sessions kept, the library file, and the
+/// settings that change a pipeline without changing a translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cache {
     /// The BLAKE3 of the file of kept descriptions, in hexadecimal; `none`
@@ -179,21 +220,92 @@ pub struct Cache {
     pub recorded: String,
     /// The library file's size (0: none).
     pub library: u64,
+    /// [`PipelineSettings::text`] of this run's.
+    pub settings: String,
 }
 
 /// The cache's state now ([`Cache`]); an empty one without a pipeline
 /// cache folder.
 pub fn cache() -> Result<Cache, String> {
+    let settings = PipelineSettings::now().text();
     let Some(dir) = super::library::dir() else {
         return Ok(Cache {
             recorded: "none".into(),
             library: 0,
+            settings,
         });
     };
     Ok(Cache {
         recorded: digest_in(dir)?,
         library: super::library::file_bytes().unwrap_or(0),
+        settings,
     })
+}
+
+/// What changes the host pipelines besides the translations (the key
+/// their cache entries are kept under) and the title's descriptions: each
+/// setting and host capability that changes a pipeline's description (its
+/// root signature, the state the host makes) or whether it is made at all,
+/// by its effective value. A precook's note says it, and a pass for other
+/// settings is a whole pass (Codex review of d286ffd, point 1: with
+/// `XTP_ROOT_SRV_DIRECT=1` set after a pass, the note still said up to
+/// date, its translation key the same, and no pipeline of the new root
+/// signatures was made: a session made each at its first use).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineSettings {
+    /// Root SRVs bound as one-view tables, not root descriptors
+    /// (`XTP_ROOT_SRV_DIRECT` unset): the root signatures.
+    pub root_srv_tables: bool,
+    /// Wave64 mesh programs refused on hosts without 64-lane waves
+    /// (`XTP_WAVE64_MESH=refuse`): which mesh pipelines are made.
+    pub wave64_mesh_refused: bool,
+    /// The host's wave sizes and shader model: which programs it runs.
+    pub lanes: Option<(u32, u32)>,
+    pub model: Option<(u32, u32)>,
+    /// The host has a depth bounds test (in a pipeline's state) and mesh
+    /// shaders (whether mesh pipelines are made).
+    pub depth_bounds: bool,
+    pub mesh_shaders: bool,
+}
+
+impl PipelineSettings {
+    /// This run's (the host must be made for its capabilities).
+    pub fn now() -> PipelineSettings {
+        let host = crate::host::host();
+        PipelineSettings {
+            root_srv_tables: super::host::bounded_root_srvs(),
+            wave64_mesh_refused: super::host::wave64_mesh_refused(),
+            lanes: crate::device::host_wave_lanes(),
+            model: crate::device::host_shader_model(),
+            depth_bounds: host.is_some_and(|h| h.depth_bounds),
+            mesh_shaders: host.is_some_and(|h| h.mesh_shaders()),
+        }
+    }
+
+    /// One line that says them all, as the note keeps it.
+    pub fn text(&self) -> String {
+        let pair = |p: Option<(u32, u32)>, sep: char| {
+            p.map_or_else(|| "unknown".to_owned(), |(a, b)| format!("{a}{sep}{b}"))
+        };
+        let yes = |b: bool| if b { "yes" } else { "no" };
+        format!(
+            "root-srv {} wave64-mesh {} lanes {} model {} depth-bounds {} mesh {}",
+            if self.root_srv_tables {
+                "tables"
+            } else {
+                "direct"
+            },
+            if self.wave64_mesh_refused {
+                "refused"
+            } else {
+                "translated"
+            },
+            pair(self.lanes, '-'),
+            pair(self.model, '.'),
+            yes(self.depth_bounds),
+            yes(self.mesh_shaders),
+        )
+    }
 }
 
 /// The BLAKE3 of the file of kept descriptions in `dir` now, in
@@ -642,10 +754,10 @@ pub enum Replayed {
 
 /// Makes the host pipeline of `recorded`'s pipeline `i` into the library,
 /// as the session's first draw with it would: the same function, shaders
-/// and state.
+/// and state. One the library holds is not loaded.
 pub fn replay(recorded: &Recorded, i: usize) -> Replayed {
     let d = &recorded.pipelines[i];
-    if HostPipeline::new(&d.shaders, Some(&d.state)).is_some() {
+    if super::library::without_loading(|| HostPipeline::new(&d.shaders, Some(&d.state)).is_some()) {
         return Replayed::Ready;
     }
     if d.shaders
@@ -673,6 +785,36 @@ pub fn finish() -> Result<(), String> {
 
 #[cfg(test)]
 pub(in crate::pipeline) mod tests {
+    /// Each pipeline setting changes the note's line ([`PipelineSettings`]).
+    #[test]
+    fn each_pipeline_setting_changes_its_line() {
+        let base = super::PipelineSettings {
+            root_srv_tables: true,
+            wave64_mesh_refused: false,
+            lanes: Some((32, 32)),
+            model: Some((6, 7)),
+            depth_bounds: true,
+            mesh_shaders: true,
+        };
+        assert_eq!(
+            base.text(),
+            "root-srv tables wave64-mesh translated lanes 32-32 model 6.7 depth-bounds yes mesh yes"
+        );
+        let changed: [fn(&mut super::PipelineSettings); 6] = [
+            |s| s.root_srv_tables = false,
+            |s| s.wave64_mesh_refused = true,
+            |s| s.lanes = Some((32, 64)),
+            |s| s.model = None,
+            |s| s.depth_bounds = false,
+            |s| s.mesh_shaders = false,
+        ];
+        for (i, change) in changed.iter().enumerate() {
+            let mut other = base;
+            change(&mut other);
+            assert_ne!(other.text(), base.text(), "setting {i}");
+        }
+    }
+
     use super::*;
 
     /// A container's stage is its translated program's; none without one.
@@ -720,6 +862,18 @@ pub(in crate::pipeline) mod tests {
         profile: windows::core::PCSTR,
         container: &[u8],
     ) -> Arc<Shader> {
+        translated_with(stage, kind, source, profile, container, |_| {})
+    }
+
+    /// [`translated`], its translation's bindings changed by `edit`.
+    fn translated_with(
+        stage: &'static str,
+        kind: HwStage,
+        source: Option<&str>,
+        profile: windows::core::PCSTR,
+        container: &[u8],
+        edit: impl FnOnce(&mut xtp_shader::emit::HostShader),
+    ) -> Arc<Shader> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         let translated = source.map(|source| {
             let mut blob = None;
@@ -747,20 +901,22 @@ pub(in crate::pipeline) mod tests {
                 )
                 .to_vec()
             };
+            let mut host = xtp_shader::emit::HostShader {
+                stage: kind,
+                dxil,
+                group_base: None,
+                user_data: vec![],
+                samplers: vec![],
+                static_samplers: vec![],
+                root_cbvs: vec![],
+                root_srvs: vec![],
+                root_uavs: vec![],
+                stride_table: false,
+                run_time_buffers: 0,
+            };
+            edit(&mut host);
             super::super::Translated {
-                host: xtp_shader::emit::HostShader {
-                    stage: kind,
-                    dxil,
-                    group_base: None,
-                    user_data: vec![],
-                    samplers: vec![],
-                    static_samplers: vec![],
-                    root_cbvs: vec![],
-                    root_srvs: vec![],
-                    root_uavs: vec![],
-                    stride_table: false,
-                    run_time_buffers: 0,
-                },
+                host,
                 used: vec![],
                 wave64: false,
             }
@@ -990,7 +1146,8 @@ pub(in crate::pipeline) mod tests {
 
     /// A graphics pipeline a session kept is made again into the library
     /// by the same function, with the state read again from its stream:
-    /// compiled the first time, found in the library the next. Two
+    /// compiled the first time, the next time held by the library's names
+    /// and not loaded (a session loads it). Two
     /// descriptions this build reads as one pipeline are made once; one
     /// whose shader no longer translates is refused at once.
     #[test]
@@ -1064,9 +1221,12 @@ pub(in crate::pipeline) mod tests {
         let made = counts().made;
         assert_eq!(replay(&recorded, 0), Replayed::Ready);
         assert!(counts().made > made, "compiled");
-        let loaded = counts().loaded;
+        // Made again by the precook: its name is held, so it is not loaded.
+        // (Other tests of this process load and make pipelines meanwhile:
+        // the counts only say that this one was answered by its name.)
+        let known = counts().known;
         assert_eq!(replay(&recorded, 0), Replayed::Ready);
-        assert!(counts().loaded > loaded, "found in the library");
+        assert!(counts().known > known, "held by the library");
         assert_eq!(replay(&recorded, 1), Replayed::Untranslated);
 
         // Keep the same translated shaders and change only the topology.
@@ -1079,5 +1239,54 @@ pub(in crate::pipeline) mod tests {
         let loaded = counts().loaded;
         assert!(HostPipeline::new(&shaders, Some(&state)).is_some());
         assert!(counts().loaded > loaded, "loaded for the same topology");
+    }
+
+    /// A pipeline is named by its root signature as well as by its
+    /// translated code: two compute programs whose DXIL is byte for byte
+    /// the same but whose bindings differ (a root CBV more) are two
+    /// pipelines, and the precook does not answer the second by the
+    /// first's name. (Whether a pipeline is answered by its name is told
+    /// by the stand-in it gets: counts are the process's.)
+    #[test]
+    fn the_same_code_with_another_root_signature_is_another_pipeline() {
+        let test = "pipeline::precook::tests::the_same_code_with_another_root_signature_is_another_pipeline";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !super::super::library::has_library() {
+            return;
+        }
+        let source = "[numthreads(11, 3, 1)] void main() {}";
+        let plain = translated(
+            "compute",
+            HwStage::Cs,
+            Some(source),
+            windows::core::s!("cs_5_1"),
+            b"precook root test: plain",
+        );
+        let rooted = translated_with(
+            "compute",
+            HwStage::Cs,
+            Some(source),
+            windows::core::s!("cs_5_1"),
+            b"precook root test: a root CBV more",
+            |host| host.root_cbvs = vec![0],
+        );
+        let dxil = |s: &Shader| s.translated().map(|t| t.host.dxil.clone());
+        assert_eq!(dxil(&plain), dxil(&rooted), "the same code");
+        let precooked = |shader: &Arc<Shader>| {
+            super::super::library::without_loading(|| {
+                HostPipeline::new(std::slice::from_ref(shader), None).expect("a pipeline")
+            })
+        };
+        let is_stand_in = |p: &HostPipeline| super::super::library::is_stand_in(&p.pso);
+        // Made or answered by its name, then by its name.
+        let _ = precooked(&plain);
+        assert!(is_stand_in(&precooked(&plain)), "held by its name");
+        assert!(
+            !is_stand_in(&precooked(&rooted)),
+            "another root signature: not answered by the plain one's name"
+        );
+        assert!(is_stand_in(&precooked(&rooted)), "then by its own");
     }
 }

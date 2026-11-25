@@ -39,6 +39,16 @@ Copyright (c) Microsoft Corporation.
 [Code source](https://github.com/microsoft/STL/blob/vs-2022-17.14/stl/inc/algorithm)
 · [Licence Apache-2.0 WITH LLVM-exception](LICENSES/Microsoft-STL.txt).
 
+## LLVM MC GFX10 conformance data
+
+`crates/xtp-shader/tests/data/gfx10-llvm-mc-*.txt` contains mnemonics and
+encoding words extracted, reformatted, deduplicated and reduced from the
+[LLVM Project's AMDGPU MC tests](https://github.com/llvm/llvm-project/tree/llvmorg-19.1.7/llvm/test/MC/AMDGPU)
+at `llvmorg-19.1.7`. Copyright (c) LLVM Project contributors.
+See the [Apache-2.0 WITH LLVM-exception licence](crates/xtp-shader/tests/data/LICENSE-LLVM.txt).
+The comparison uses XTP's existing Mesa 22.3.0 GFX10 opcode table, which
+carries its MIT notice in `crates/xtp-shader/src/gfx10/opcodes.rs`.
+
 ## References that are not copied
 
 The following projects are studied as references only. **No code is copied

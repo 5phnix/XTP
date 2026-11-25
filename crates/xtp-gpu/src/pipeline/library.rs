@@ -38,7 +38,28 @@
 //!   before when that has it (loaded there, stored here) and made
 //!   otherwise, and the save replaces the file with the new generation
 //!   alone. What only sessions asked for is made again when one asks.
+//! - The names the library holds: D3D12 cannot list them, so every save
+//!   writes them beside the file ([`NAMES_FILE`]), with the file's size and
+//!   BLAKE3, which the next process checks before it trusts them. A library
+//!   read without them (an older file, or one saved by a process that died
+//!   before writing them) learns them as they load.
+//! - The precook does not load a pipeline the library is known to hold
+//!   ([`without_loading`]): its work is to have each pipeline in the file,
+//!   and a session loads it when it needs it. That round trip was the whole
+//!   cost of an unchanged pipeline after a translator change.
+//! - A name the library holds but whose entry does not load for its
+//!   description (StorePipeline refuses a name it holds, so before this the
+//!   pipeline was compiled again in every session) gets the pipeline under
+//!   an alternate name ([`SLOTS`]), which the next session loads.
+//! - Such a name is remembered as broken in the names file: the precook
+//!   answers a pipeline by its names only when one of them is held and not
+//!   known to fail, and otherwise makes it (under the next name), so that
+//!   a pipeline a load refused is not counted ready again. What no process
+//!   has loaded yet cannot be known to fail without a load: the session
+//!   that first finds such an entry makes the pipeline beside it and says
+//!   so in the names file, and the precooks after it count it no more.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -64,6 +85,9 @@ pub(crate) fn dir() -> Option<&'static std::path::Path> {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Host pipelines the precook found in the library's names and did not
+/// load ([`without_loading`]), since the start.
+pub(crate) static KNOWN: AtomicU64 = AtomicU64::new(0);
 /// Microseconds pipelines waited for the library (their name, or a save),
 /// and spent loading from it, since the start (the library's line).
 static LOCK_US: AtomicU64 = AtomicU64::new(0);
@@ -78,12 +102,309 @@ struct Library {
     /// While a new generation is made ([`rebuild`]): the one before, read
     /// only.
     previous: Option<Generation>,
+    /// The names this library holds, as far as this process knows.
+    names: RwLock<Names>,
+    /// Names learned since the names file was last written.
+    names_changed: AtomicBool,
+    /// The library file this library holds the same pipelines as: the one
+    /// it was read from (`_blob`, accepted: hashed when first needed) or
+    /// the one last saved. `None` with `_blob` not the file's (empty, or
+    /// rejected by the host).
+    file: Mutex<Option<FileId>>,
+    blob_is_file: bool,
 }
 
-/// A generation of the library read only, and the blob it was made from.
+/// A generation of the library read only, the blob it was made from, and
+/// the names it holds if its names file was its own.
 struct Generation {
     library: ID3D12PipelineLibrary1,
     _blob: Vec<u8>,
+    names: Option<Names>,
+}
+
+impl Library {
+    /// A library of `blob` (read from the file when `blob_is_file`), with
+    /// the names known to be in it.
+    fn new(
+        library: ID3D12PipelineLibrary1,
+        blob: Vec<u8>,
+        names: Names,
+        file: Option<FileId>,
+        blob_is_file: bool,
+        previous: Option<Generation>,
+    ) -> Library {
+        Library {
+            library,
+            _blob: blob,
+            added: AtomicU64::new(0),
+            previous,
+            names: RwLock::new(names),
+            names_changed: AtomicBool::new(false),
+            file: Mutex::new(file),
+            blob_is_file,
+        }
+    }
+
+    fn names(&self) -> std::sync::RwLockReadGuard<'_, Names> {
+        self.names.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `name` is held: stored by this process, refused by StorePipeline as
+    /// one the library holds, or loaded.
+    fn hold(&self, name: &str) {
+        let mut names = self.names.write().unwrap_or_else(|e| e.into_inner());
+        if names.held.insert(name.to_owned()) {
+            self.names_changed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A load of `name` for the description of that name loaded (`ok`), or
+    /// failed: the name is held and mended, or marked broken if it is known
+    /// to be held (a load also fails for a name the library does not hold,
+    /// which a library read without its names may not know of).
+    fn loaded(&self, name: &str, ok: bool) {
+        let mut names = self.names.write().unwrap_or_else(|e| e.into_inner());
+        let changed = if ok {
+            let held = names.held.insert(name.to_owned());
+            names.broken.remove(name) | held
+        } else {
+            names.held.contains(name) && names.broken.insert(name.to_owned())
+        };
+        if changed {
+            self.names_changed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Stores `pso` under the first of `slots` (its names, [`slot`]) that
+    /// does not hold an entry this pipeline's description fails to load
+    /// from: `failed` says the slots whose load failed here. A slot the
+    /// library holds that was not tried holds this pipeline already (stored
+    /// meanwhile by another thread: a name is its description's hash), and
+    /// nothing more is stored; one that was tried and failed holds another
+    /// entry, and the next slot is tried. A name StorePipeline refuses is
+    /// held, by the same rules.
+    fn store(
+        &self,
+        slots: &[(String, HSTRING)],
+        failed: &[bool; SLOTS],
+        pso: &ID3D12PipelineState,
+    ) {
+        for ((name, wide), &failed) in slots.iter().zip(failed) {
+            if self.names().held.contains(name) {
+                if failed {
+                    continue;
+                }
+                return;
+            }
+            // SAFETY: a live pipeline; a name already stored is refused,
+            // which leaves the library as it was.
+            match unsafe { self.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) } {
+                Ok(()) => {
+                    self.added.fetch_add(1, Ordering::Relaxed);
+                    self.hold(name);
+                    return;
+                }
+                Err(e) if e.code() == windows::Win32::Foundation::E_INVALIDARG => {
+                    self.hold(name);
+                    if !failed {
+                        return;
+                    }
+                    // Held, and its load failed here: another entry.
+                    self.loaded(name, false);
+                }
+                Err(e) => {
+                    tracing::debug!(name, error = %e, "host pipeline not stored");
+                    return;
+                }
+            }
+        }
+        tracing::debug!(
+            name = slots[0].0,
+            "host pipeline not stored: each of its names is held"
+        );
+    }
+}
+
+/// A library file: its size and BLAKE3, which say whether a names file is
+/// that file's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    bytes: u64,
+    blake3: [u8; 32],
+}
+
+impl FileId {
+    fn of(bytes: &[u8]) -> FileId {
+        FileId {
+            bytes: bytes.len() as u64,
+            blake3: *blake3::hash(bytes).as_bytes(),
+        }
+    }
+}
+
+/// The names a library holds, as far as a process knows them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Names {
+    held: HashSet<String>,
+    /// Of `held`, the names whose entry did not load for the description
+    /// of that name when a process last loaded it (another description's
+    /// entry, or one the driver refuses).
+    broken: HashSet<String>,
+    /// `held` is every name the library holds: it started empty, or its
+    /// names file said so. Otherwise a name not in it may still be there.
+    complete: bool,
+}
+
+/// The names file beside the library, and its first line. Version 2 marks
+/// broken names ([`Names::broken`]); version 1, which did not, is read too.
+const NAMES_FILE: &str = "host-pipelines.names";
+const NAMES_FORMAT: &str = "xtp pipeline names 2";
+const NAMES_FORMAT_1: &str = "xtp pipeline names 1";
+/// After a broken name in the names file.
+const BROKEN: &str = " broken";
+
+impl Names {
+    /// The names of a library that holds none.
+    fn empty() -> Names {
+        Names {
+            complete: true,
+            ..Names::default()
+        }
+    }
+
+    /// The names of a library read without its names file: none known.
+    fn unknown() -> Names {
+        Names::default()
+    }
+
+    /// Whether the library holds some name of the pipeline named `name`
+    /// that is not known to fail to load ([`Names::broken`]): what the
+    /// precook answers without loading ([`without_loading`]).
+    fn ready_any(&self, name: &str) -> bool {
+        (0..SLOTS)
+            .map(|k| slot(name, k))
+            .any(|n| self.held.contains(&n) && !self.broken.contains(&n))
+    }
+
+    /// The names file of a library file `file` holding these names.
+    fn text(&self, file: &FileId) -> String {
+        let mut held: Vec<&str> = self.held.iter().map(String::as_str).collect();
+        held.sort_unstable();
+        let mut text = format!(
+            "{NAMES_FORMAT}\nlibrary {} {} {}\n",
+            file.bytes,
+            blake3::Hash::from(file.blake3).to_hex(),
+            if self.complete { "complete" } else { "partial" }
+        );
+        for name in held {
+            text.push_str(name);
+            if self.broken.contains(name) {
+                text.push_str(BROKEN);
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    /// The names a names file reading `text` gives the library file of
+    /// `blob`; `None` if it is another file's (or not a names file).
+    fn read(text: &str, blob: &[u8]) -> Option<(Names, FileId)> {
+        let mut lines = text.lines();
+        let marks = match lines.next()? {
+            NAMES_FORMAT => true,
+            NAMES_FORMAT_1 => false,
+            _ => return None,
+        };
+        let mut head = lines.next()?.strip_prefix("library ")?.split(' ');
+        let bytes: u64 = head.next()?.parse().ok()?;
+        let hash = head.next()?;
+        let complete = match head.next()? {
+            "complete" => true,
+            "partial" => false,
+            _ => return None,
+        };
+        if head.next().is_some() || bytes != blob.len() as u64 {
+            return None;
+        }
+        // Hashed only once the size agrees: some 0.5 s per GiB.
+        let file = FileId::of(blob);
+        (blake3::Hash::from(file.blake3).to_hex().as_str() == hash).then_some(())?;
+        let mut names = Names {
+            complete,
+            ..Names::default()
+        };
+        for line in lines {
+            let (name, broken) = match line.strip_suffix(BROKEN) {
+                Some(name) if marks => (name, true),
+                _ => (line, false),
+            };
+            is_name(name).then_some(())?;
+            if broken {
+                names.broken.insert(name.to_owned());
+            }
+            names.held.insert(name.to_owned());
+        }
+        Some((names, file))
+    }
+}
+
+/// Whether `text` is a pipeline's name in the library ([`name`]) or one of
+/// its alternates ([`slot`]).
+fn is_name(text: &str) -> bool {
+    let (name, k) = match text.split_once('~') {
+        Some((name, k)) => (
+            name,
+            k.parse::<usize>().ok().filter(|k| (1..SLOTS).contains(k)),
+        ),
+        None => (text, Some(0)),
+    };
+    k.is_some() && name.len() == 32 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The names a pipeline may be stored under: its own, then alternates for
+/// when the entry of its own name does not load for its description.
+const SLOTS: usize = 4;
+
+/// The `k`th name of the pipeline named `name` (`0`: its own).
+fn slot(name: &str, k: usize) -> String {
+    if k == 0 {
+        name.to_owned()
+    } else {
+        format!("{name}~{k}")
+    }
+}
+
+thread_local! {
+    /// Set by [`without_loading`] on the precook's threads.
+    static SKIP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A pipeline of this process, answered for a pipeline the library holds
+/// that [`without_loading`] does not load ([`found_in`] keeps the first it
+/// makes or loads).
+struct StandIn(ID3D12PipelineState);
+// SAFETY: D3D12 objects are free-threaded, and this one is only held.
+unsafe impl Send for StandIn {}
+// SAFETY: as above.
+unsafe impl Sync for StandIn {}
+static STAND_IN: OnceLock<StandIn> = OnceLock::new();
+
+/// Runs `make` (a host pipeline's creation, `HostPipeline::new`) with every
+/// pipeline the library's names hold answered without loading it: the
+/// pipeline `make` gets is then another one of this process (the first it
+/// made or loaded), so only the precook calls this, as it keeps nothing it
+/// makes. A pipeline the names do not hold is loaded or made as always.
+/// The precook's work is to have each pipeline in the library file; a
+/// session loads it, by its name, when it needs it.
+pub(crate) fn without_loading<R>(make: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SKIP.set(self.0);
+        }
+    }
+    let _restore = Restore(SKIP.replace(true));
+    make()
 }
 
 // SAFETY: D3D12 objects are free-threaded. The library synchronises its
@@ -122,14 +443,13 @@ fn library() -> Option<&'static RwLock<Library>> {
         .get_or_init(|| {
             OPENED.store(true, Ordering::SeqCst);
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR
-                .get()
-                .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
-                .unwrap_or_default();
+            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
+            let blob = read(LIBRARY_FILE).unwrap_or_default();
+            let names = read(NAMES_FILE).and_then(|t| String::from_utf8(t).ok());
             let library = if REBUILD.load(Ordering::SeqCst) {
-                new_generation(&device, blob)
+                new_generation(&device, blob, names.as_deref())
             } else {
-                open(&device, blob)
+                open(&device, blob, names.as_deref())
             };
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -166,18 +486,23 @@ fn make(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12Pip
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
-/// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
+/// adapter or driver change, damage), with the names `names` (the names
+/// file's text) says it holds if they are that blob's.
+fn open(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) -> Option<Library> {
     if !blob.is_empty() {
         match make(device, &blob) {
             Ok(library) => {
-                tracing::info!(bytes = blob.len(), "host pipeline library loaded");
-                return Some(Library {
-                    library,
-                    _blob: blob,
-                    added: AtomicU64::new(0),
-                    previous: None,
-                });
+                let read = names.and_then(|text| Names::read(text, &blob));
+                tracing::info!(
+                    bytes = blob.len(),
+                    names = read.as_ref().map(|(n, _)| n.held.len()),
+                    "host pipeline library loaded"
+                );
+                let (names, file) = match read {
+                    Some((names, file)) => (names, Some(file)),
+                    None => (Names::unknown(), None),
+                };
+                return Some(Library::new(library, blob, names, file, true, None));
             }
             Err(e) => {
                 tracing::info!(error = %e, "host pipeline library rejected; starting an empty one")
@@ -187,22 +512,27 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
     let library = make(device, &[]).ok()?;
-    Some(Library {
+    Some(Library::new(
         library,
-        _blob: Vec::new(),
-        added: AtomicU64::new(0),
-        previous: None,
-    })
+        Vec::new(),
+        Names::empty(),
+        None,
+        false,
+        None,
+    ))
 }
 
 /// An empty library, the one in `blob` its generation before (none if the
-/// host rejects it).
-fn new_generation(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
+/// host rejects it), with the names `names` says it holds.
+fn new_generation(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) -> Option<Library> {
     let previous = if blob.is_empty() {
         None
     } else {
         match make(device, &blob) {
             Ok(library) => Some(Generation {
+                names: names
+                    .and_then(|text| Names::read(text, &blob))
+                    .map(|(n, _)| n),
                 library,
                 _blob: blob,
             }),
@@ -217,13 +547,10 @@ fn new_generation(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
         "host pipeline library: a new generation, from the one before"
     );
     let library = make(device, &[]).ok()?;
-    Some(Library {
-        library,
-        _blob: Vec::new(),
-        // Even a generation with no surviving pipelines replaces its file.
-        added: AtomicU64::new(1),
-        previous,
-    })
+    let library = Library::new(library, Vec::new(), Names::empty(), None, false, previous);
+    // Even a generation with no surviving pipelines replaces its file.
+    library.added.store(1, Ordering::Relaxed);
+    Some(library)
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -262,16 +589,43 @@ enum Source {
     /// The generation before (stored into the library).
     Previous,
     Made,
+    /// Held by the library and not loaded ([`without_loading`]): the
+    /// pipeline answered is a stand-in.
+    Known,
 }
 
 /// [`pipeline`] in `library`, and where it came from.
+///
+/// A pipeline is looked for under each of its names ([`slot`]) the library
+/// is known to hold, and under its own name when the library's names are
+/// not all known. Made, it is stored under the first name the library does
+/// not hold: an entry of its name that does not load for this description
+/// keeps its name, and the pipeline goes beside it, where the next session
+/// finds it.
 fn found_in(
     library: &RwLock<Library>,
     name: &str,
     load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<(ID3D12PipelineState, Source)> {
-    let wide = HSTRING::from(name);
+    if SKIP.get()
+        && let Some(stand_in) = STAND_IN.get()
+        && library
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .names()
+            .ready_any(name)
+    {
+        KNOWN.fetch_add(1, Ordering::Relaxed);
+        return Ok((stand_in.0.clone(), Source::Known));
+    }
+    let slots: Vec<(String, HSTRING)> = (0..SLOTS)
+        .map(|k| {
+            let name = slot(name, k);
+            let wide = HSTRING::from(&name);
+            (name, wide)
+        })
+        .collect();
     let since = |t: std::time::Instant| t.elapsed().as_micros() as u64;
     // The name's lock, then the library's (a save takes it alone).
     let take = || {
@@ -281,38 +635,84 @@ fn found_in(
         LOCK_US.fetch_add(since(asked), Ordering::Relaxed);
         (held, l)
     };
-    let store = |l: &Library, pso: &ID3D12PipelineState| {
-        // SAFETY: a live pipeline; a name already stored (a description
-        // that differs, or another thread's) is refused, which leaves the
-        // library as it was.
-        if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok() {
-            l.added.fetch_add(1, Ordering::Relaxed);
-        }
+    // The slots worth a load in a library of `names`: those it holds, or
+    // all of them when `names` may miss some (a library read without its
+    // names file: a load that finds no entry costs little).
+    let tried = |names: Option<&Names>| -> Vec<usize> {
+        (0..SLOTS)
+            .filter(|&k| names.is_none_or(|n| !n.complete || n.held.contains(&slots[k].0)))
+            .collect()
     };
+    // The slots of this library whose load failed: their entries are other
+    // descriptions', and a store goes past them ([`Library::store`]).
+    let mut failed = [false; SLOTS];
     let loaded = {
         let (_name, l) = take();
         let started = std::time::Instant::now();
-        let mut loaded = load(&l.library, PCWSTR(wide.as_ptr())).map(|pso| (pso, Source::Library));
-        if loaded.is_err()
+        let mut loaded = None;
+        let ours = tried(Some(&l.names()));
+        for k in ours {
+            match load(&l.library, PCWSTR(slots[k].1.as_ptr())) {
+                Ok(pso) => {
+                    // Learned, when the names were not all known, and
+                    // mended if a load failed before.
+                    l.loaded(&slots[k].0, true);
+                    loaded = Some((pso, Source::Library));
+                    break;
+                }
+                Err(_) => {
+                    failed[k] = true;
+                    l.loaded(&slots[k].0, false);
+                }
+            }
+        }
+        if loaded.is_none()
             && let Some(previous) = &l.previous
-            && let Ok(pso) = load(&previous.library, PCWSTR(wide.as_ptr()))
         {
-            store(&l, &pso);
-            loaded = Ok((pso, Source::Previous));
+            for k in tried(previous.names.as_ref()) {
+                if let Ok(pso) = load(&previous.library, PCWSTR(slots[k].1.as_ptr())) {
+                    l.store(&slots, &failed, &pso);
+                    loaded = Some((pso, Source::Previous));
+                    break;
+                }
+            }
         }
         LOAD_US.fetch_add(since(started), Ordering::Relaxed);
         loaded
     };
-    if let Ok(found) = loaded {
+    if let Some(found) = loaded {
         LOADED.fetch_add(1, Ordering::Relaxed);
+        keep_stand_in(&found.0);
         return Ok(found);
     }
     // Compiled outside the locks: compiles take up to seconds.
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let (_name, l) = take();
-    store(&l, &pso);
+    l.store(&slots, &failed, &pso);
+    keep_stand_in(&pso);
     Ok((pso, Source::Made))
+}
+
+/// For tests: whether `pso` is the stand-in [`without_loading`] answers
+/// for a pipeline the library's names hold.
+#[cfg(test)]
+pub(crate) fn is_stand_in(pso: &ID3D12PipelineState) -> bool {
+    STAND_IN.get().is_some_and(|s| s.0 == *pso)
+}
+
+/// For tests: whether this process has a pipeline library (none: every
+/// pipeline is made, and [`without_loading`] answers none by its name).
+#[cfg(test)]
+pub(crate) fn has_library() -> bool {
+    library().is_some()
+}
+
+/// Keeps `pso` as the stand-in [`without_loading`] answers, if none is.
+fn keep_stand_in(pso: &ID3D12PipelineState) {
+    if STAND_IN.get().is_none() {
+        let _ = STAND_IN.set(StandIn(pso.clone()));
+    }
 }
 
 /// What a save did.
@@ -383,6 +783,7 @@ pub(crate) fn save(now: bool) -> Saved {
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            known = KNOWN.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             created,
             created_unkept = unkept,
@@ -429,19 +830,37 @@ fn write_library(
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let serialised = (|| -> std::io::Result<_> {
         std::fs::create_dir_all(dir)?;
-        let (mapped, added) = {
-            // Alone: no store between the size and the bytes.
+        let (mapped, added, names) = {
+            // Alone: no store between the size and the bytes, nor between
+            // the bytes and the names they hold.
             let l = library.write().unwrap_or_else(|e| e.into_inner());
             let added = l.added.load(Ordering::Relaxed);
             if added == 0 {
+                // The file holds what the library holds: the names learned
+                // since (loads of a library read without them) are its.
+                let names = l
+                    .names_changed
+                    .swap(false, Ordering::Relaxed)
+                    .then(|| l.names().clone());
+                drop(l);
+                if let Some(names) = names {
+                    write_names(library, dir, &names, None);
+                }
                 return Ok(None);
             }
-            (LibraryFile::serialize(&tmp, &l.library)?, added)
+            l.names_changed.store(false, Ordering::Relaxed);
+            let names = l.names().clone();
+            (LibraryFile::serialize(&tmp, &l.library)?, added, names)
         };
         let size = mapped.size;
         mapped.flush()?;
+        // SAFETY: the view holds `size` bytes the library wrote, and lives
+        // until `mapped` is dropped below.
+        let file =
+            FileId::of(unsafe { std::slice::from_raw_parts(mapped.view.Value.cast(), size) });
         drop(mapped);
         std::fs::rename(&tmp, &path)?;
+        write_names(library, dir, &names, Some(file));
         Ok(Some((size, added)))
     })();
     let serialised = match serialised {
@@ -462,6 +881,40 @@ fn write_library(
         }
         (Ok(true), None) => Saved::Written,
         (Ok(false), None) => Saved::Nothing,
+    }
+}
+
+/// Writes the names file of the library file in `dir`: `names`, held by the
+/// file just written (`file`, its identity), or by the file the library was
+/// read from or last saved to (`None`). The names stay to write again if it
+/// fails, or if that file is not known (a library that did not read back),
+/// and a file whose names are not written is read without them: what the
+/// names file says is always its library file's.
+fn write_names(
+    library: &RwLock<Library>,
+    dir: &std::path::Path,
+    names: &Names,
+    file: Option<FileId>,
+) {
+    let l = library.read().unwrap_or_else(|e| e.into_inner());
+    let file = {
+        let mut known = l.file.lock().unwrap_or_else(|e| e.into_inner());
+        if file.is_some() {
+            *known = file;
+        } else if known.is_none() && l.blob_is_file {
+            *known = Some(FileId::of(&l._blob));
+        }
+        *known
+    };
+    let written =
+        file.map(|file| write_atomically(&dir.join(NAMES_FILE), names.text(&file).as_bytes()));
+    match written {
+        Some(Ok(())) => {}
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "host pipeline names not written");
+            l.names_changed.store(true, Ordering::Relaxed);
+        }
+        None => l.names_changed.store(true, Ordering::Relaxed),
     }
 }
 
@@ -619,7 +1072,7 @@ mod tests {
         let device = gpu.device.cast::<ID3D12Device1>().expect("ID3D12Device1");
         // The layer reports the blob it cannot read; the library falls back.
         let library = crate::testgpu::expect_layer_errors(|| {
-            open(&device, b"not a pipeline library".repeat(16)).expect("an empty library")
+            open(&device, b"not a pipeline library".repeat(16), None).expect("an empty library")
         });
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
@@ -746,7 +1199,7 @@ mod tests {
         };
         let host = gpu.host();
         let device = host.device.cast::<ID3D12Device1>().unwrap();
-        let library = RwLock::new(open(&device, Vec::new()).unwrap());
+        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
         library.read().unwrap().added.store(2, Ordering::Relaxed);
         let dir = tempfile::tempdir().unwrap();
         // A file where the folder should be.
@@ -796,7 +1249,7 @@ mod tests {
         };
         let host = gpu.host();
         let device = host.device.cast::<ID3D12Device1>().unwrap();
-        let library = RwLock::new(open(&device, Vec::new()).unwrap());
+        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
         library.read().unwrap().added.store(2, Ordering::Relaxed);
         let dir = tempfile::tempdir().unwrap();
         let (inside, go) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
@@ -846,7 +1299,7 @@ mod tests {
             );
             std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap()
         };
-        let old = RwLock::new(open(&device, Vec::new()).unwrap());
+        let old = RwLock::new(open(&device, Vec::new(), None).unwrap());
         assert_eq!(ask(&old, &host.device, &a, "a"), Source::Made);
         assert_eq!(ask(&old, &host.device, &b, "b"), Source::Made);
         // Even a matching name must not return a pipeline whose
@@ -854,22 +1307,288 @@ mod tests {
         let mismatch = crate::testgpu::expect_layer_errors(|| ask(&old, &host.device, &b, "a"));
         assert_eq!(mismatch, Source::Made);
         assert_eq!(ask(&old, &host.device, &a, "a"), Source::Library);
-        let new = RwLock::new(new_generation(&device, saved(&old)).unwrap());
+        let new = RwLock::new(new_generation(&device, saved(&old), None).unwrap());
         assert_eq!(ask(&new, &host.device, &a, "a"), Source::Previous);
         assert_eq!(ask(&new, &host.device, &a, "a"), Source::Library);
-        let next = RwLock::new(open(&device, saved(&new)).unwrap());
+        let next = RwLock::new(open(&device, saved(&new), None).unwrap());
         assert_eq!(ask(&next, &host.device, &a, "a"), Source::Library);
         assert_eq!(
             ask(&next, &host.device, &b, "b"),
             Source::Made,
             "not asked for"
         );
-        let empty = RwLock::new(new_generation(&device, saved(&next)).unwrap());
-        let reopened = RwLock::new(open(&device, saved(&empty)).unwrap());
+        let empty = RwLock::new(new_generation(&device, saved(&next), None).unwrap());
+        let reopened = RwLock::new(open(&device, saved(&empty), None).unwrap());
         assert_eq!(
             ask(&reopened, &host.device, &a, "a"),
             Source::Made,
             "nothing survived"
         );
+    }
+
+    /// A names file is its library file's: read back with the names it was
+    /// written with, and refused for another file (another size, or other
+    /// bytes of the same size), another format or a line that is no name.
+    #[test]
+    fn names_are_read_back_for_their_own_file_only() {
+        let blob = b"a serialised pipeline library".repeat(8);
+        let a = "0123456789abcdef0123456789abcdef";
+        let names = Names {
+            held: [a.to_owned(), format!("{a}~1")].into(),
+            broken: [a.to_owned()].into(),
+            complete: true,
+        };
+        let file = FileId::of(&blob);
+        let text = names.text(&file);
+        assert_eq!(Names::read(&text, &blob), Some((names.clone(), file)));
+        // A file of the first version marks none broken, and its marks are
+        // no names.
+        let first = text.replace(NAMES_FORMAT, NAMES_FORMAT_1);
+        assert_eq!(Names::read(&first, &blob), None, "a mark in version 1");
+        let first = first.replace(BROKEN, "");
+        let unmarked = Names {
+            broken: HashSet::new(),
+            ..names.clone()
+        };
+        assert_eq!(Names::read(&first, &blob), Some((unmarked, file)));
+        let partial = Names {
+            complete: false,
+            ..names.clone()
+        };
+        assert_eq!(
+            Names::read(&partial.text(&file), &blob).map(|(n, _)| n),
+            Some(partial)
+        );
+        let mut other = blob.clone();
+        other[3] ^= 1;
+        assert_eq!(Names::read(&text, &other), None, "other bytes");
+        assert_eq!(Names::read(&text, &blob[1..]), None, "another size");
+        assert_eq!(Names::read(&format!("{text}{a}~4\n"), &blob), None);
+        assert_eq!(Names::read(&format!("{text}not a name\n"), &blob), None);
+        assert_eq!(
+            Names::read(&text.replace(NAMES_FORMAT, "xtp pipeline names 0"), &blob),
+            None
+        );
+        assert_eq!(Names::read("", &blob), None);
+        assert!(is_name(a) && is_name(&format!("{a}~3")));
+        assert!(!is_name(&format!("{a}~0")) && !is_name(&a.to_uppercase()) && !is_name("a"));
+        assert!(names.ready_any(a) && !names.ready_any(&a.replace('0', "f")));
+        // Ready by a name held and not broken only.
+        let only_broken = Names {
+            held: [a.to_owned()].into(),
+            ..names.clone()
+        };
+        assert!(!only_broken.ready_any(a), "its one name is broken");
+        assert_eq!(
+            Names::read(&format!("{text}{a}~2{BROKEN}{BROKEN}\n"), &blob),
+            None
+        );
+    }
+
+    /// An entry of a pipeline's name that does not load for its
+    /// description (here: another kernel stored under that name) used to
+    /// make the pipeline again each time, since StorePipeline refuses a
+    /// name the library holds. The pipeline is stored under the next name
+    /// instead, and found there from then on, after a save too; the names
+    /// file says which names the saved library holds.
+    #[test]
+    fn a_name_that_does_not_load_gets_the_next_one() {
+        let test = "pipeline::library::tests::a_name_that_does_not_load_gets_the_next_one";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let (a, b) = (kernel(&host.device, 3), kernel(&host.device, 5));
+        let name = "00112233445566778899aabbccddeeff";
+        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        assert_eq!(ask(&library, &host.device, &a, name), Source::Made);
+        let other =
+            || crate::testgpu::expect_layer_errors(|| ask(&library, &host.device, &b, name));
+        assert_eq!(other(), Source::Made, "the entry of its name is another's");
+        assert_eq!(other(), Source::Library, "found under the next name");
+        assert_eq!(ask(&library, &host.device, &a, name), Source::Library);
+        let held = library.read().unwrap().names().clone();
+        assert_eq!(held.held, [name.to_owned(), slot(name, 1)].into());
+        assert!(held.complete, "started empty");
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            write_library(&library, dir.path(), true, |_| Ok(true)),
+            Saved::Written
+        );
+        let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
+        assert_eq!(Names::read(&text, &blob), Some((held, FileId::of(&blob))));
+        let reopened = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let other =
+            || crate::testgpu::expect_layer_errors(|| ask(&reopened, &host.device, &b, name));
+        assert_eq!(other(), Source::Library, "repaired for the next process");
+        assert_eq!(
+            reopened.read().unwrap().added.load(Ordering::Relaxed),
+            0,
+            "nothing made"
+        );
+    }
+
+    /// The precook does not load a pipeline the library's names hold
+    /// ([`without_loading`]); one they do not hold is made and stored as
+    /// always. A library read without its names learns those that load,
+    /// and a save writes the names learned.
+    #[test]
+    fn the_precook_does_not_load_what_the_names_hold() {
+        let test = "pipeline::library::tests::the_precook_does_not_load_what_the_names_hold";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let (a, b) = (kernel(&host.device, 3), kernel(&host.device, 5));
+        let (name_a, name_b) = (
+            "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+            "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        assert_eq!(ask(&library, &host.device, &a, name_a), Source::Made);
+        assert_eq!(
+            write_library(&library, dir.path(), true, |_| Ok(true)),
+            Saved::Written
+        );
+        let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
+
+        // Read with its names: held, so not loaded; another is made. (The
+        // count is the process's: other tests' precooks, the replay's,
+        // may add to it meanwhile. `Source::Known` says this ask's.)
+        let known = KNOWN.load(Ordering::Relaxed);
+        let named = RwLock::new(open(&device, blob.clone(), Some(&text)).unwrap());
+        assert_eq!(
+            without_loading(|| ask(&named, &host.device, &a, name_a)),
+            Source::Known
+        );
+        assert!(KNOWN.load(Ordering::Relaxed) > known, "counted");
+        assert_eq!(
+            without_loading(|| ask(&named, &host.device, &b, name_b)),
+            Source::Made
+        );
+        assert_eq!(
+            ask(&named, &host.device, &a, name_a),
+            Source::Library,
+            "a session loads it"
+        );
+
+        // Read without its names (an older file): loaded once, then known.
+        let unnamed = RwLock::new(open(&device, blob, None).unwrap());
+        assert_eq!(
+            without_loading(|| ask(&unnamed, &host.device, &a, name_a)),
+            Source::Library
+        );
+        assert_eq!(
+            without_loading(|| ask(&unnamed, &host.device, &a, name_a)),
+            Source::Known
+        );
+        // Nothing added: the save writes the names learned alone, for the
+        // file as it is.
+        std::fs::remove_file(dir.path().join(NAMES_FILE)).unwrap();
+        assert_eq!(
+            write_library(&unnamed, dir.path(), true, |_| Ok(false)),
+            Saved::Nothing
+        );
+        let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
+        let (learned, _) = Names::read(&text, &blob).expect("the file's names");
+        assert_eq!(
+            (learned.held, learned.complete),
+            ([name_a.to_owned()].into(), false)
+        );
+    }
+
+    /// The Codex review of 12556d6: the precook answered a pipeline by any
+    /// name the library held, before the driver, even one whose entry does
+    /// not load for its description. A load that fails now marks the name
+    /// broken, in the names file too, and the precook does not answer by a
+    /// broken name: it makes the pipeline under the next one, by which it
+    /// answers from then on.
+    #[test]
+    fn the_precook_does_not_answer_by_a_broken_name() {
+        let test = "pipeline::library::tests::the_precook_does_not_answer_by_a_broken_name";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let (a, b) = (kernel(&host.device, 3), kernel(&host.device, 7));
+        let name = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+        let dir = tempfile::tempdir().unwrap();
+        let saved = |library: &RwLock<Library>| {
+            let wrote = write_library(library, dir.path(), true, |_| Ok(true));
+            assert!(!matches!(wrote, Saved::Failed(_)), "{wrote:?}");
+            let blob = std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap();
+            let text = std::fs::read_to_string(dir.path().join(NAMES_FILE)).unwrap();
+            (blob, text)
+        };
+        // The library's entry of the name is another description's.
+        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        assert_eq!(ask(&library, &host.device, &a, name), Source::Made);
+        let (blob, text) = saved(&library);
+
+        // A session's load of `b` by that name fails, and its compile too
+        // (nothing goes under the next name): the names file says broken.
+        let session = RwLock::new(open(&device, blob.clone(), Some(&text)).unwrap());
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a copy of a live root signature, not released by the
+            // description.
+            pRootSignature: unsafe { std::mem::transmute_copy(&b.root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.code.as_ptr().cast(),
+                BytecodeLength: b.code.len(),
+            },
+            ..Default::default()
+        };
+        let refused = crate::testgpu::expect_layer_errors(|| {
+            found_in(
+                &session,
+                name,
+                // SAFETY: the description points at live data.
+                |l, name| unsafe { l.LoadComputePipeline(name, &desc) },
+                || Err(windows::Win32::Foundation::E_FAIL.into()),
+            )
+        });
+        assert!(refused.is_err());
+        let (blob, text) = saved(&session);
+        let (names, _) = Names::read(&text, &blob).expect("its names");
+        assert_eq!(names.broken, [name.to_owned()].into(), "{text}");
+        assert!(!names.ready_any(name));
+
+        // The precook does not answer by it: it loads, then makes `b`,
+        // under the next name.
+        let precook = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let made = crate::testgpu::expect_layer_errors(|| {
+            without_loading(|| ask(&precook, &host.device, &b, name))
+        });
+        assert_eq!(made, Source::Made, "not answered by a broken name");
+        assert_eq!(
+            without_loading(|| ask(&precook, &host.device, &b, name)),
+            Source::Known,
+            "by the next name"
+        );
+        let (blob, text) = saved(&precook);
+        let (names, _) = Names::read(&text, &blob).expect("its names");
+        assert_eq!(
+            (names.held, names.broken),
+            (
+                [name.to_owned(), slot(name, 1)].into(),
+                [name.to_owned()].into()
+            )
+        );
+
+        // A session after it loads `b` by the next name; `a` still loads
+        // by its own, which mends it.
+        let next = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let found = crate::testgpu::expect_layer_errors(|| ask(&next, &host.device, &b, name));
+        assert_eq!(found, Source::Library);
+        assert_eq!(ask(&next, &host.device, &a, name), Source::Library);
+        assert!(next.read().unwrap().names().broken.is_empty(), "mended");
     }
 }

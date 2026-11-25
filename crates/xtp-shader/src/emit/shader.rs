@@ -1,7 +1,8 @@
 //! A DXIL vertex, pixel, compute, mesh or geometry shader under
 //! construction: the module, the `dx.op` declarations it calls, its
 //! signatures and bound resources, and the metadata and container that wrap
-//! it up (SM 6.6, validator 1.6).
+//! it up (SM 6.6, validator 1.6; SM 6.7, validator 1.7, for a pixel shader
+//! whose wave operations include its helper lanes).
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
@@ -17,6 +18,11 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the host's runtime stride table is bound: `t0` in this space, a
 /// raw buffer of one [`StrideEntry`] per view-heap slot.
 pub const STRIDE_SPACE: u32 = 2;
+/// Where the host binds the loop-limit counter: `u0` in this space, a root
+/// UAV whose first dword counts the lanes of the pipeline that left a loop
+/// at XTP's limit or budget (`crate::emit::loop_count`). The host points it
+/// at the pipeline's own dword of its counters.
+pub const LOOP_COUNTER_SPACE: u32 = 2;
 
 /// What the host writes per view-heap slot in the runtime stride table, for
 /// buffers a program reads by element without a stride known when it was
@@ -156,6 +162,9 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// A vertex, geometry or mesh shader that declares a UAV (the
+    /// loop-limit counter): the validator wants it.
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const RASTER_ORDERED: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
@@ -224,6 +233,11 @@ pub(crate) struct Shader {
     /// Handle of the runtime stride table (`t0` in [`STRIDE_SPACE`]), if
     /// read.
     pub stride_table: Option<V>,
+    /// The loop-limit counter (`u0` in [`LOOP_COUNTER_SPACE`]) is written.
+    pub loop_counter: bool,
+    /// `main`'s `"fp32-denorm-mode"`, where the program's f32 denormal mode
+    /// is one DXIL names (`lower::fp32_denorm_mode`).
+    pub denormals: Option<&'static str>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -304,6 +318,8 @@ impl Shader {
             root_uavs: Vec::new(),
             tlas: None,
             stride_table: None,
+            loop_counter: false,
+            denormals: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -330,6 +346,20 @@ impl Shader {
     }
 
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
+    /// Whether this is a pixel program whose wave operations count its
+    /// helper lanes (`"waveops-include-helper-lanes"`, SM 6.7): one that
+    /// calls a wave operation whose lanes a helper lane can be one of
+    /// (ballots, lane reads, reductions). Lane indices and counts do not
+    /// depend on it, and quad operations read helper lanes anyway.
+    pub fn includes_helper_lanes(&self) -> bool {
+        self.pixel
+            && self.mesh.is_none()
+            && self.ops.iter().any(|op| {
+                op.starts_with("wave")
+                    && !matches!(op.as_str(), "waveGetLaneIndex" | "waveGetLaneCount")
+            })
+    }
+
     pub fn op(
         &mut self,
         block: usize,
@@ -468,6 +498,32 @@ impl Shader {
         h
     }
 
+    /// The handle of the loop-limit counter (`u0` in [`LOOP_COUNTER_SPACE`],
+    /// a raw buffer), made in DXIL block `block`: only where a lane leaves
+    /// at a limit, so that a program without one declares no counter.
+    pub fn loop_counter_handle(&mut self, block: usize) -> V {
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(LOOP_COUNTER_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        self.flags |= flags::RAW_BUFFERS;
+        // A UAV declared by a stage other than pixel and compute (vertex,
+        // geometry, mesh), as DXC's shader flags have it.
+        if !self.pixel && (self.threads.is_none() || self.mesh.is_some()) {
+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
+        }
+        self.loop_counter = true;
+        self.annotate(block, h, 0x100b, 0)
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -584,6 +640,7 @@ impl Shader {
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
             || self.stride_table.is_some()
+            || self.loop_counter
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -685,7 +742,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            if !self.root_uavs.is_empty() || self.loop_counter {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -694,13 +751,23 @@ impl Shader {
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                // (space, register) of each raw buffer bound by binding: the
+                // root UAVs, then the loop-limit counter.
+                let mut specs: Vec<(u32, u32)> = self
+                    .root_uavs
+                    .iter()
+                    .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                    .collect();
+                if self.loop_counter {
+                    specs.push((LOOP_COUNTER_SPACE, 0));
+                }
+                for (n, (space, register)) in specs.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(no),
@@ -712,8 +779,8 @@ impl Shader {
 
                     bindings.push(Binding {
                         kind: 7,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }
@@ -868,14 +935,28 @@ impl Shader {
         let ident = self.m.md_str("xtp");
         let ident = self.m.md_node(vec![Some(ident)]);
         self.m.named_md("llvm.ident", vec![ident]);
+        // A pixel program with wave operations whose lanes are its helper
+        // lanes too, as the console's whole-quad mode makes them (see
+        // `lower/mask.rs`, `Helpers`): SM 6.7's
+        // `[WaveOpsIncludeHelperLanes]`. Every other program stays SM 6.6.
+        let helper_lanes = self.includes_helper_lanes();
+        let minor = if helper_lanes { 7 } else { 6 };
         let one = i32c(&mut self, 1);
         let six = i32c(&mut self, 6);
-        let version = self.m.md_node(vec![Some(one), Some(six)]);
+        // (One metadata value more only where it differs: an SM 6.6 module
+        // stays as it was, byte for byte.)
+        let minor_md = if helper_lanes {
+            i32c(&mut self, minor)
+        } else {
+            six
+        };
+        let version = self.m.md_node(vec![Some(one), Some(minor_md)]);
         self.m.named_md("dx.version", vec![version]);
-        // Validator 1.6: the parts (ISG1, OSG1, PSV0 runtime info version
-        // 2) are written as it writes them. Validators 1.8 and 1.9 check
-        // such a module by its rules; declared 1.8, they want PSV0 version 3
-        // and other signature parts (they refuse every module otherwise).
+        // Validator 1.6 (1.7 for SM 6.7, the first that knows it): the parts
+        // (ISG1, OSG1, PSV0 runtime info version 2) are written as both
+        // write them. Validators 1.8 and 1.9 check such a module by its
+        // rules; declared 1.8, they want PSV0 version 3 and other signature
+        // parts (they refuse every module otherwise).
         self.m.named_md("dx.valver", vec![version]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
@@ -886,21 +967,30 @@ impl Shader {
             (None, false) => ("vs", 1),
         };
         let name = self.m.md_str(name);
-        let sm = self.m.md_node(vec![Some(name), Some(six), Some(six)]);
+        let sm = self.m.md_node(vec![Some(name), Some(six), Some(minor_md)]);
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
+        if let Some(mode) = self.denormals {
+            self.m.declare_fp32_denormals(mode);
+        }
+        if helper_lanes {
+            self.m.include_helper_lanes();
+        }
 
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
-        dxil.extend((kind << 16 | 0x66).to_le_bytes());
+        dxil.extend((kind << 16 | 0x60 | minor).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
         dxil.extend(b"DXIL");
-        dxil.extend(0x106u32.to_le_bytes());
+        dxil.extend((0x100 | minor).to_le_bytes());
         dxil.extend(16u32.to_le_bytes());
         dxil.extend((bitcode.len() as u32).to_le_bytes());
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -935,8 +1025,18 @@ impl Shader {
             features |= 0x400_0000;
         }
         let sfi0 = features.to_le_bytes();
-        let isg1 = container::signature(&self.inputs, true);
-        let osg1 = container::signature(&self.outputs, false);
+        // Signature parts as the declared validator writes them (1.7 differs
+        // from 1.6: [`signature_1_7`]).
+        let signature = |elements: &[SigElement], input: bool| {
+            let part = container::signature(elements, input);
+            if helper_lanes {
+                signature_1_7(&part)
+            } else {
+                part
+            }
+        };
+        let isg1 = signature(&self.inputs, true);
+        let osg1 = signature(&self.outputs, false);
         let flag = if self.pixel {
             self.outputs.iter().any(|o| (17..=19).contains(&o.kind))
         } else {
@@ -961,7 +1061,7 @@ impl Shader {
             shape.runtime_info(&mut psv0, flag);
         }
         let hash = [0u8; 20];
-        let psg1 = container::signature(&self.prims, false);
+        let psg1 = signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
         if self.mesh.is_some() {
@@ -1026,6 +1126,71 @@ impl Shader {
 /// order), and refuses a later element of another mode, undefined (0)
 /// included, once the row has a defined one ("interpolation mode that
 /// differs from another element packed into the same row").
+/// A signature part (`ISG1`, `OSG1`, `PSG1`) of validator 1.6's form
+/// ([`container::signature`]) in validator 1.7's, which dxil.dll compares
+/// byte for byte with the part it writes for a module that declares 1.7
+/// (DXC's `DxilProgramSignatureWriter` without its `< 1.7` compatibility):
+///
+/// * one name per distinct semantic name (1.6 keys names by string object,
+///   one per element but for system values), at offsets in the order the
+///   names first appear in element order, which is 1.6's table order;
+/// * the elements sorted by stream, register, then that offset: elements of
+///   one register now sharing a name keep their order (DXC's insertion sort
+///   up to 32 elements is stable, and 1.6's order there is element order);
+/// * zeros after the names up to a multiple of 4 bytes.
+// shortcut: past 32 elements, DXC's std::sort partitions and may swap
+// elements of one key (`sort_signature_rows` in `container.rs` follows it
+// for 1.6); a stable sort is used here, so such a signature with two
+// elements of one register and name may be refused by the validator.
+fn signature_1_7(part: &[u8]) -> Vec<u8> {
+    let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"));
+    let count = word(part, 0) as usize;
+    let table = 8 + 32 * count;
+    let mut offsets = std::collections::HashMap::new();
+    let mut names: Vec<&[u8]> = Vec::new();
+    let mut first: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+    let mut next = table as u32;
+    let mut at = table;
+    while at < part.len() {
+        let len = part[at..]
+            .iter()
+            .position(|&c| c == 0)
+            .expect("names end with a 0");
+        let name = &part[at..at + len];
+        let offset = *first.entry(name).or_insert_with(|| {
+            names.push(name);
+            let o = next;
+            next += len as u32 + 1;
+            o
+        });
+        offsets.insert(at as u32, offset);
+        at += len + 1;
+    }
+    let mut elements: Vec<[u8; 32]> = (0..count)
+        .map(|i| {
+            part[8 + 32 * i..8 + 32 * (i + 1)]
+                .try_into()
+                .expect("32 bytes")
+        })
+        .collect();
+    for e in &mut elements {
+        let offset = offsets[&word(e, 4)];
+        e[4..8].copy_from_slice(&offset.to_le_bytes());
+    }
+    // Stream, register, name.
+    elements.sort_by_key(|e| (word(e, 0), word(e, 20), word(e, 4)));
+    let mut out = part[..8].to_vec();
+    for e in &elements {
+        out.extend(e);
+    }
+    for name in names {
+        out.extend(name);
+        out.push(0);
+    }
+    out.resize(out.len().next_multiple_of(4), 0);
+    out
+}
+
 fn row_conflict(elements: &[SigElement], row: u32) -> bool {
     let mut mode = 0;
     for e in elements.iter().filter(|e| e.row == Some(row)) {
@@ -1086,6 +1251,157 @@ pub(crate) fn one_mode_per_row(elements: &mut [SigElement], reads: bool) {
             let e = &mut elements[i];
             if !kept(e) {
                 e.interp = if int(e) && mode != 1 { 0 } else { mode };
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) mod tests {
+    use crate::emit::tests::{compute, emit_for};
+    use crate::emit::validator::Validator;
+
+    /// `signature_1_7` turns a signature part of validator 1.6's form into
+    /// 1.7's as DXC writes them: dxc 1.8.2502's `ISG1` of one pixel shader,
+    /// `-validator-version 1.6` and `1.7` (SV_Position; TEXCOORD0 and 1
+    /// packed into one register; COLOR0; TEXCOORD3, 2 and 4).
+    #[test]
+    fn signature_parts_take_validator_1_7s_form() {
+        let bytes = |hex: &[&str]| -> Vec<u8> {
+            let hex: String = hex.concat();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let v1_6 = bytes(&[
+            "070000000800000000000000e800000000000000010000000300000000000000",
+            "0f0100000000000000000000f400000000000000000000000300000001000000",
+            "030300000000000000000000fd00000001000000000000000300000001000000",
+            "0c0c000000000000000000000601000000000000000000000300000002000000",
+            "0f0f000000000000000000000c01000003000000000000000300000003000000",
+            "0101000000000000000000001501000002000000000000000300000004000000",
+            "0f0f000000000000000000001e01000004000000000000000100000005000000",
+            "010100000000000053565f506f736974696f6e00544558434f4f524400544558",
+            "434f4f524400434f4c4f5200544558434f4f524400544558434f4f5244005445",
+            "58434f4f524400",
+        ]);
+        let v1_7 = bytes(&[
+            "070000000800000000000000e800000000000000010000000300000000000000",
+            "0f0100000000000000000000f400000000000000000000000300000001000000",
+            "030300000000000000000000f400000001000000000000000300000001000000",
+            "0c0c00000000000000000000fd00000000000000000000000300000002000000",
+            "0f0f00000000000000000000f400000003000000000000000300000003000000",
+            "010100000000000000000000f400000002000000000000000300000004000000",
+            "0f0f00000000000000000000f400000004000000000000000100000005000000",
+            "010100000000000053565f506f736974696f6e00544558434f4f524400434f4c",
+            "4f520000",
+        ]);
+        assert_eq!(super::signature_1_7(&v1_6), v1_7);
+    }
+
+    /// `dxc -dumpbin`'s listing of `shader`; none (and a note) where the
+    /// Windows SDK's `dxc.exe` is not there (`XTP_PC_DXC` names another).
+    pub(crate) fn listing(shader: &crate::emit::HostShader) -> Option<String> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dxc = match std::env::var_os("XTP_PC_DXC") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => Validator::default_path()?.with_file_name("dxc.exe"),
+        };
+        if !dxc.exists() {
+            eprintln!("no dxc.exe; the listing is not checked");
+            return None;
+        }
+        let file = std::env::temp_dir().join(format!(
+            "xtp-shader-{}-{}.dxil",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&file, &shader.dxil).unwrap();
+        let out = std::process::Command::new(&dxc)
+            .arg("-dumpbin")
+            .arg(&file)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// S11: `main` declares the program's f32 denormal mode, the record's
+    /// float mode's unless the program writes MODE's f32 denormal field
+    /// otherwise; the validator takes it, and the listing shows it on
+    /// `main`.
+    #[test]
+    fn main_declares_the_programs_fp32_denormal_mode() {
+        let mode = |float_mode: u8, words: &[u32]| {
+            let native = crate::NativeProgram {
+                float_mode,
+                ..compute(words, false)
+            };
+            let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+            crate::emit::lower::fp32_denorm_mode(&native, &p)
+        };
+        let end = [S_ENDPGM];
+        // BTP 6's records: 0xC0, f32 denormals flushed.
+        assert_eq!(mode(0xC0, &end), Some("ftz"));
+        assert_eq!(mode(0xF0, &end), Some("preserve"));
+        // One way only: no DXIL mode.
+        assert_eq!(mode(0xD0, &end), None);
+        assert_eq!(mode(0xE0, &end), None);
+        // BTP 6's only MODE write, its f16/f64 rounding: not the field.
+        let rounding = [0xBA80_0881, 3, S_ENDPGM]; // s_setreg_imm32_b32 hwreg(MODE, 2, 2), 3
+        assert_eq!(mode(0xC0, &rounding), Some("ftz"));
+        // The field written with the entry's value, or with another.
+        let same = [0xBA80_0901, 0, S_ENDPGM]; // s_setreg_imm32_b32 hwreg(MODE, 4, 2), 0
+        assert_eq!(mode(0xC0, &same), Some("ftz"));
+        let other = [0xBA80_0901, 3, S_ENDPGM];
+        assert_eq!(mode(0xC0, &other), None);
+        let denorm = |imm: u32| [0xBFA5_0000 | imm, S_ENDPGM]; // s_denorm_mode imm
+        assert_eq!(mode(0xF0, &denorm(0xF)), Some("preserve"));
+        assert_eq!(mode(0xF0, &denorm(0xC)), None);
+
+        // v_mov_b32 v1, 1.0; v_add_f32 v1, v0, v1: an f32 operation.
+        let words = [0x7E02_02F2, 0x0602_0300, S_ENDPGM];
+        for (float_mode, want) in [(0xC0, Some("ftz")), (0xF0, Some("preserve")), (0xD0, None)] {
+            let native = crate::NativeProgram {
+                float_mode,
+                ..compute(&words, false)
+            };
+            let mut cs = emit_for(&native, crate::emit::Target::ANY).unwrap();
+            if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+                v.validate(&mut cs.dxil)
+                    .unwrap_or_else(|e| panic!("{float_mode:#x}: validation: {e}"));
+            }
+            let Some(listing) = listing(&cs) else {
+                continue;
+            };
+            let main = listing
+                .lines()
+                .find(|l| l.starts_with("define void @main()"))
+                .expect("main");
+            match want {
+                Some(mode) => {
+                    assert!(
+                        listing.contains(&format!("\"fp32-denorm-mode\"=\"{mode}\"")),
+                        "{float_mode:#x}: no fp32-denorm-mode {mode} in:\n{listing}"
+                    );
+                    assert!(
+                        main.contains('#'),
+                        "{float_mode:#x}: main has no attributes: {main}"
+                    );
+                }
+                None => assert!(
+                    !listing.contains("fp32-denorm-mode") && !main.contains('#'),
+                    "{float_mode:#x}: {main}"
+                ),
             }
         }
     }

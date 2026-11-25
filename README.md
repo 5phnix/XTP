@@ -44,6 +44,11 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+Pixel shaders with wave operations take shader model 6.7
+(`WaveOpsIncludeHelperLanes`, so that helper lanes take part in them as they
+do on the console). A GPU without 6.7 refuses those pixel shaders, and their
+draws are skipped.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -123,6 +128,13 @@ xtp run <exe|folder> [--execute] [--unimplemented trap|zero] [--strict]
 xtp config
 ```
 
+`xtp shader-info --disasm` decodes the GFX10 e64 f32 interpolation forms,
+`image_gather4h`, the eight coarse gradient sample forms with `_g16`, and
+`v_dot8_i32_i4`. The four non-comparison samples translate through
+`SampleGrad`, which selects a level per lane. The comparison samples with
+explicit gradients require SM 6.8. The interpolation, gather and signed dot
+forms still need DXIL lowering.
+
 `xtp inspect --json` emits a stable JSON object (`"format": "xtp-inspect 1"`)
 with string fields `file`, `blake3`, `kind` (`"exe"` or `"dll"`), hex-string
 fields `machine`, `image_base` and `entry_rva`, numeric fields `subsystem` and
@@ -166,6 +178,8 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_D3D12_DEBUG=1` | host debug layer |
 | `XTP_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `XTP_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `XTP_D3D12_DRED=contexts` | as the above, with DRED's breadcrumb contexts (marker texts kept by the runtime; slower, and empty on NVIDIA so far: docs/analysis/device-removed.md) |
+| `XTP_RT_BUILDS=0` | (every build) the title's acceleration structure builds, copies and rehydrations are refused; traces bind an empty TLAS, where every ray misses |
 | `XTP_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `XTP_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `XTP_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
@@ -173,6 +187,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_PIPELINE_WAIT_MS=<graphics>,<compute>` | (every build) milliseconds per frame title threads may wait for pipelines being made before their draws and dispatches are dropped for that frame (default `2,8`) |
 | `XTP_SHADER_LOOP_LIMIT=<n>` | (every build) translated shader loops stop after `n` iterations per lane instead of 16384 (2^14, under the host GPU watchdog); loops that only reread memory until it changes (spin waits) after 4096, or `n` if lower (own shader cache entries); a lower `n` shows whether loops hitting the limit make world frames slow, a higher one whether a wrong result comes from a legitimate loop the default cut short |
 | `XTP_SHADER_LOOP_BUDGET=<n>` | (every build) a lane of a translated shader leaves, as at the loop limit, once it has gone back `n` times in all of its loops together instead of 1048576 (2^20; loops inside loops multiply their own limits); `0` turns the budget off (own shader cache entries) |
+| `XTP_SHADER_LOOP_COUNT=1` | (every build) a lane a loop limit or the budget stops adds itself to its pipeline's counter (a root UAV, `u0` in space 2; own shader cache entries); with the frame line, a line gives the lanes stopped per frame and the pipelines that stopped the most, by their shaders' hashes, and `xtp_gpu::loopstat=debug` a line per frame with stopped lanes. Off, translations are byte for byte those without it |
 | `XTP_DXIL_OPT=1` | (every build) clean-up passes over each translated shader before the driver gets it: dead code, constants and identities, one instruction for one value, what a branch taken says about its condition, one read for one place within a block; or only those named (`dead,fold,reuse,facts,loads`); a shader whose declared features they would change is kept as translated; off by default (own shader cache entries) |
 | `XTP_DXIL_CENSUS=<file>` | (every build) appends one line per translated shader module to the file: its instructions by kind as translated and as written, and whether the clean-up passes were kept |
 | `XTP_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
@@ -181,6 +196,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_WATCHDOG_HOOK=1` | every build: keeps the title's own watchdog from ending it after about 30 s without progress (slow world frames), and logs a warning (at most every 30 s) when it would have; a real deadlock then hangs for ever, with no `crashes.log` entry; known builds only, otherwise a warning and nothing patched |
 | `XTP_TITLE_ASSERTS=continue` | every build: where the title's own assertion would end it because an entry of its archive store could not be made (`int3` at title+0x23d8f03; the entry's header was not read, docs/analysis/archive-null.md), it takes the title's own path for a null object instead, and logs how many times (at once, then at most every 10 s) and a census of that store; hides the failure, it does not fix it; known builds only, otherwise a warning and nothing patched |
 | `XTP_XMEM_LEDGER=1` | every build: counts what the title asks of XMem by category (`XMemAlloc` by allocator id and memory type, committed resources included, the share our `XMemAllocDefault` serves, physical pages, virtual reserves, commits and frees, the budget reported) and logs each category that changed every 10 s: calls, failures, frees, live and peak bytes, bytes asked in all |
+| `XTP_LOW_VA_RESERVE_MIB=<n>` | every Windows build: with the variable unset, a known build with a measured startup request gets a placeholder of that size below 4 GiB (185 MiB for the supported build). An explicit `n` from 1 to 4095 instead supplies up to `n` MiB in pieces when 32-bit placeholder allocations fail. The reserve commits no pages. Set `0` to disable it. |
 | `XTP_SKIP_INTRO=1` | every build: cuts the intro movie of the start-up front end (sent to its last frame when it starts), so the world starts loading about 13 s sooner (docs/analysis/intro-skip.md); known builds only, otherwise a warning and nothing changed |
 | `XTP_SKIP_CPU_CHECK=1` | every build: skips the host CPU feature check that `xtp run --execute` performs before starting the title |
 | `XTP_QUEUE_WAIT=0` | every build: a queue told to wait for a fence no signal has reached yet runs what it is given next at once, as before queues held it (to compare frame times); such waits are still counted on the `queue waits for fences so far` line |
@@ -206,6 +222,8 @@ maps the code and lists good first issues. Before opening a pull request, run
 ```powershell
 cargo xtask pr-check     # what CI checks, with a summary
 ```
+
+No PC that runs the title? [docs/contributing-without-a-gaming-pc.md](docs/contributing-without-a-gaming-pc.md) lists work that needs no GPU.
 
 Report vulnerabilities privately as [SECURITY.md](SECURITY.md) describes.
 Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).

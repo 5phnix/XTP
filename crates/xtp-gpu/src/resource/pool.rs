@@ -31,13 +31,37 @@
 //!   the reserve needs it, and all empty ones go when usage passes the
 //!   budget.
 //!
+//! Textures of the 64 KiB class of two tiles or more are reserved
+//! resources (`CreateReservedResource`) whose 64 KiB tiles are mapped onto
+//! the heaps a unit at a time, a unit being a standard mip of an array
+//! slice or a slice's packed mips ([`Tiles`]), as `texture` asks: the
+//! units whose title memory is committed get memory when the texture's
+//! contents are detiled, and a texture the title's streaming left behind
+//! gives its tiles back while the texture itself stays (its views stay
+//! valid: from tiled resources tier 2 on, unmapped tiles read zero and
+//! writes into them are dropped), mapped again by its next upload. Before,
+//! every host texture held memory for its whole mip chain for its whole
+//! life: in the Series S world 24,800 textures held 11 GiB, 85 % of the
+//! video memory budget, and the textures shaders pick by index waited for
+//! room (task cba81604). Mappings are queued on the host queue, so they
+//! fall between submissions in their order; ranges a texture gives back
+//! return to the heaps once the host fence passes the submission after the
+//! unmapping (a heap is never released under an in-flight read). Only
+//! resident heaps get tiles. Off until a world session measures it:
+//! `XTP_TEXTURE_TILES=1` turns it on (unset or `0`, these textures are
+//! placed as before). The idea of reserved textures mapped by level from their
+//! title memory comes from xcl #258 (branch
+//! `d3d12x/streamed-texture-level-tiles`, GPL-2.0-only: its behaviour
+//! only, this is written without its code).
+//!
 //! The pool is off by default: `XTP_TEXTURE_POOL=1` turns it on (unset or
 //! `0`: every host texture a committed resource, as before; measured in
 //! game in docs/analysis/vram.md §3.2). `XTP_TEXTURE_HEAP_MIB` sets the heap size (the small class gets
 //! an eighth), `XTP_TEXTURE_RESERVE_MIB` the reserve (one heap).
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
@@ -54,6 +78,17 @@ use super::residency::Residency;
 const KIB_4: u64 = 4 << 10;
 const KIB_64: u64 = 64 << 10;
 const MIB: u64 = 1 << 20;
+
+/// A tile of a reserved resource.
+pub(crate) const TILE: u64 = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES as u64;
+
+/// The fewest tiles a texture is reserved with: one of a single tile gains
+/// nothing from it.
+const TILED_FROM: u64 = 2;
+
+/// The most pieces a unit's tiles are taken in, within one heap (a heap
+/// whose free bytes are that scattered is passed over).
+const PIECES: usize = 16;
 
 /// How long after its heap was made a placement may wait for the heap's
 /// residency, and at most how long one placement waits: below VidMm's
@@ -89,8 +124,13 @@ pub(crate) fn global_if_made() -> Option<&'static Pool> {
 }
 
 /// The run's pool, made with the host device on first use; `None` when
-/// switched off or without a host GPU.
+/// switched off or without a host GPU. In tests, the textures a thread
+/// makes inside [`tests::Pooled`] go to a pool of the tests' own.
 pub(crate) fn global() -> Option<&'static Pool> {
+    #[cfg(test)]
+    if tests::POOLED.get() {
+        return tests::pool_for_tests();
+    }
     POOL.get_or_init(|| {
         if !enabled() {
             return None;
@@ -102,6 +142,7 @@ pub(crate) fn global() -> Option<&'static Pool> {
             small_heap_mib = config.heap[Class::Small.index()] / MIB,
             reserve_mib = config.reserve[Class::Normal.index()] / MIB,
             largest_mib = config.largest / MIB,
+            tiles = config.tiles,
             "host textures placed in pooled heaps"
         );
         Some(Pool::new(
@@ -156,11 +197,16 @@ pub(crate) struct Config {
     pub(crate) reserve: [u64; 2],
     /// The largest texture placed; larger ones are committed.
     pub(crate) largest: u64,
+    /// Whether textures of the 64 KiB class are reserved and their tiles
+    /// mapped as they are filled ([`Tiles`]), where the device can.
+    pub(crate) tiles: bool,
 }
 
 impl Config {
-    /// From `XTP_TEXTURE_HEAP_MIB` (256) and `XTP_TEXTURE_RESERVE_MIB`
-    /// (one heap: making a heap not resident takes about a millisecond).
+    /// From `XTP_TEXTURE_HEAP_MIB` (256), `XTP_TEXTURE_RESERVE_MIB` (one
+    /// heap: making a heap not resident takes about a millisecond) and
+    /// `XTP_TEXTURE_TILES` (off unless set to something else than `0`,
+    /// `off` or `false`).
     pub(crate) fn from_env() -> Config {
         let mib = |name: &str| {
             std::env::var(name)
@@ -170,19 +216,35 @@ impl Config {
         };
         let heap = mib("XTP_TEXTURE_HEAP_MIB").unwrap_or(256).clamp(8, 4096) * MIB;
         let reserve = mib("XTP_TEXTURE_RESERVE_MIB").map_or(heap, |v| v * MIB);
-        Config::sized(heap, reserve)
+        Config {
+            tiles: asks_tiles(std::env::var("XTP_TEXTURE_TILES").ok().as_deref()),
+            ..Config::sized(heap, reserve)
+        }
     }
 
     /// Heaps of `heap` bytes and a reserve of `reserve` for the 64 KiB
-    /// class; an eighth of each for the small class.
+    /// class; an eighth of each for the small class. Textures placed, not
+    /// reserved.
     pub(crate) fn sized(heap: u64, reserve: u64) -> Config {
         let small = (heap / 8).next_multiple_of(KIB_64).max(KIB_64);
         Config {
             heap: [small, heap],
             reserve: [(reserve / 8).max(small.min(reserve)), reserve],
             largest: heap / 4,
+            tiles: false,
         }
     }
+}
+
+/// Whether `XTP_TEXTURE_TILES`'s value asks for reserved textures: set,
+/// and not empty, `0`, `off` or `false`.
+fn asks_tiles(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|v| {
+        !(v.is_empty()
+            || v == "0"
+            || v.eq_ignore_ascii_case("off")
+            || v.eq_ignore_ascii_case("false"))
+    })
 }
 
 /// Whether D3D12's small resource rule may give the host texture `d` a
@@ -237,6 +299,14 @@ struct Inner {
     changes: Option<BudgetEvent>,
     /// Heaps refuse `CREATE_NOT_ZEROED` (an older runtime): made without.
     zeroed: AtomicBool,
+    /// The device's tiled resources tier (`D3D12_OPTIONS`).
+    tier: i32,
+    /// Whether each host format may be reserved (`FORMAT_SUPPORT2_TILED`),
+    /// asked once.
+    tileable: Mutex<HashMap<i32, bool>>,
+    /// Reserved textures alive, and the bytes of their tiles mapped.
+    reserved: AtomicU64,
+    mapped: AtomicU64,
 }
 
 // SAFETY: D3D12 devices and heaps are free-threaded; the state is behind
@@ -249,6 +319,11 @@ struct State {
     classes: [Vec<Heap>; 2],
     /// Heaps to release (on the thread).
     releasing: Vec<ID3D12Heap>,
+    /// Ranges of the 64 KiB class a reserved texture gave back (heap id,
+    /// offset, length), and the host fence value after which they return
+    /// to their heap: the unmapping was queued before the submission that
+    /// signals it.
+    retired: std::collections::VecDeque<(u64, u64, u64, u64)>,
     stop: bool,
     woken: bool,
     next_id: u64,
@@ -264,6 +339,8 @@ struct Heap {
     heap: ID3D12Heap,
     size: u64,
     ranges: Ranges,
+    /// Ranges taken: a placed texture's, a piece of a reserved texture's
+    /// tiles (mapped or retired).
     textures: u32,
     residency: Arc<Residency>,
     /// When it was made.
@@ -289,6 +366,14 @@ pub(crate) struct Stats {
     pub(crate) early: u64,
     /// Heaps not made because of the budget.
     pub(crate) over_budget: u64,
+    /// Textures reserved ([`Tiles`]); units of them mapped, unmapped, and
+    /// left unmapped for want of room in a resident heap; tile mapping
+    /// calls queued.
+    pub(crate) reserved: u64,
+    pub(crate) units_mapped: u64,
+    pub(crate) units_unmapped: u64,
+    pub(crate) units_short: u64,
+    pub(crate) tile_calls: u64,
 }
 
 /// What the pool holds now.
@@ -299,40 +384,420 @@ pub(crate) struct Holding {
     pub(crate) pending: u64,
     pub(crate) bytes: u64,
     pub(crate) used: u64,
+    /// Ranges taken: placed textures, pieces of reserved textures' tiles.
     pub(crate) textures: u64,
+    /// Reserved textures alive, and the bytes of their tiles mapped (part
+    /// of `used`); bytes given back waiting for the fence (also part of it).
+    pub(crate) reserved: u64,
+    pub(crate) mapped: u64,
+    pub(crate) retired: u64,
 }
 
-/// A texture's range in the pool, given back when dropped.
+/// A texture's memory in the pool: its range (a placed texture), given
+/// back when dropped, or its tiles (a reserved texture).
 pub(crate) struct Slot {
     inner: Arc<Inner>,
-    class: Class,
-    heap: u64,
-    offset: u64,
-    len: u64,
+    kind: Kind,
+}
+
+enum Kind {
+    Range {
+        class: Class,
+        heap: u64,
+        offset: u64,
+        len: u64,
+    },
+    /// Its tiles go back when the last holder of them goes (the texture's
+    /// host copy, and a mapping under way).
+    Tiles(Arc<Tiles>),
 }
 
 impl Slot {
-    /// Its class, heap offset and length.
+    /// Its class, heap offset and length (a placed texture's).
     #[cfg(test)]
     pub(crate) fn place(&self) -> (Class, u64, u64) {
-        (self.class, self.offset, self.len)
+        match self.kind {
+            Kind::Range {
+                class, offset, len, ..
+            } => (class, offset, len),
+            Kind::Tiles(_) => panic!("a reserved texture has no range"),
+        }
+    }
+
+    /// Its tiles, if it is reserved.
+    #[cfg(test)]
+    pub(crate) fn tiles(&self) -> Option<&Arc<Tiles>> {
+        match &self.kind {
+            Kind::Tiles(tiles) => Some(tiles),
+            Kind::Range { .. } => None,
+        }
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.inner.give_back(self);
+        if let Kind::Range {
+            class,
+            heap,
+            offset,
+            len,
+        } = self.kind
+        {
+            self.inner.give_range(class, heap, offset, len);
+        }
     }
 }
 
 impl std::fmt::Debug for Slot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Slot")
-            .field("class", &self.class)
-            .field("heap", &self.heap)
-            .field("offset", &self.offset)
-            .field("len", &self.len)
-            .finish()
+        match &self.kind {
+            Kind::Range {
+                class,
+                heap,
+                offset,
+                len,
+            } => f
+                .debug_struct("Slot")
+                .field("class", class)
+                .field("heap", heap)
+                .field("offset", offset)
+                .field("len", len)
+                .finish(),
+            Kind::Tiles(tiles) => f
+                .debug_struct("Slot")
+                .field("units", &tiles.units.len())
+                .field("mapped", &tiles.mapped())
+                .finish(),
+        }
+    }
+}
+
+/// A unit of a reserved texture's tiles, mapped or not as a whole: a
+/// standard mip of an array slice, or a slice's packed mips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unit {
+    /// Its first subresource (the slice's first packed mip for its packed
+    /// mips; any of them names the same tiles).
+    subresource: u32,
+    /// The array slice (0 for a 3D texture), and its mips: the first and
+    /// how many.
+    pub(crate) slice: u32,
+    pub(crate) first_mip: u32,
+    pub(crate) mips: u32,
+    /// Its tiles.
+    pub(crate) tiles: u32,
+}
+
+/// The heap ranges a mapped unit's tiles are in: its heap and the pieces
+/// (offset, length, in bytes), in the order of the unit's tiles.
+#[derive(Debug)]
+struct Pieces {
+    heap: u64,
+    ranges: Vec<(u64, u64)>,
+}
+
+/// Ranges taken for a unit's tiles ([`Inner::take_tiles`]): the heap, its
+/// id and the pieces.
+type Taken = (ID3D12Heap, u64, Vec<(u64, u64)>);
+
+/// One mapping call of a [`Tiles::map`]: the heap, the units mapped into
+/// it and their ranges, in order.
+struct Call {
+    heap: ID3D12Heap,
+    units: Vec<usize>,
+    ranges: Vec<(u64, u64)>,
+}
+
+/// A reserved texture's tiles: its units and the heap ranges of those
+/// mapped. Registered by texture ([`tiles_of`]) while it lives.
+pub(crate) struct Tiles {
+    inner: Arc<Inner>,
+    texture: ID3D12Resource,
+    units: Vec<Unit>,
+    /// The mapped units' ranges, by unit, under the lock every mapping of
+    /// the texture is queued under (their order on the queue is the
+    /// lock's).
+    pieces: Mutex<Vec<Option<Pieces>>>,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the mappings are behind their
+// lock.
+unsafe impl Send for Tiles {}
+// SAFETY: as above.
+unsafe impl Sync for Tiles {}
+
+/// What a [`Tiles::map`] did: units mapped and unmapped, and those wanted
+/// left unmapped (no room in a resident heap now).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Mapped {
+    pub(crate) added: u32,
+    pub(crate) removed: u32,
+    pub(crate) short: u32,
+}
+
+/// Reserved textures' tiles by texture (its interface pointer: the tiles
+/// hold a reference, so it is not reused while registered).
+static TILES: Mutex<Option<HashMap<usize, Weak<Tiles>>>> = Mutex::new(None);
+
+/// The tiles of host texture `texture`, if it is a reserved one of the
+/// pool.
+pub(crate) fn tiles_of(texture: &ID3D12Resource) -> Option<Arc<Tiles>> {
+    TILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()?
+        .get(&(texture.as_raw() as usize))?
+        .upgrade()
+}
+
+impl Tiles {
+    /// Its units, in the order [`Tiles::map`] takes what it wants.
+    pub(crate) fn units(&self) -> &[Unit] {
+        &self.units
+    }
+
+    /// The bytes of its tiles mapped now.
+    pub(crate) fn mapped(&self) -> u64 {
+        let pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
+        self.mapped_of(&pieces)
+    }
+
+    fn mapped_of(&self, pieces: &[Option<Pieces>]) -> u64 {
+        self.units
+            .iter()
+            .zip(pieces)
+            .filter(|(_, p)| p.is_some())
+            .map(|(u, _)| u64::from(u.tiles) * TILE)
+            .sum()
+    }
+
+    /// Whether every unit `wanted` says is mapped (tests).
+    #[cfg(test)]
+    pub(crate) fn holds(&self, wanted: &[bool]) -> bool {
+        let pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
+        pieces
+            .iter()
+            .zip(wanted)
+            .all(|(p, &want)| !want || p.is_some())
+    }
+
+    /// Whether any unit is mapped.
+    pub(crate) fn any(&self) -> bool {
+        let pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
+        pieces.iter().any(Option::is_some)
+    }
+
+    /// Whether the resident heaps have free bytes for the units `wanted`
+    /// says that are not mapped (in one heap each, or in pieces).
+    pub(crate) fn room_for(&self, wanted: &[bool]) -> bool {
+        let missing: Vec<u64> = {
+            let pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
+            self.units
+                .iter()
+                .zip(pieces.iter())
+                .zip(wanted)
+                .filter(|((_, p), want)| **want && p.is_none())
+                .map(|((u, _), _)| u64::from(u.tiles) * TILE)
+                .collect()
+        };
+        if missing.is_empty() {
+            return true;
+        }
+        let s = self.inner.lock();
+        let free: Vec<u64> = s.classes[Class::Normal.index()]
+            .iter()
+            .filter(|h| h.residency.is_ready())
+            .map(|h| h.ranges.free())
+            .collect();
+        missing.iter().all(|&len| free.iter().any(|&f| f >= len))
+            && missing.iter().sum::<u64>() <= free.iter().sum::<u64>()
+    }
+
+    /// Maps the units `wanted` says (one flag a unit) and unmaps the
+    /// others, queued on `host`'s queue: work submitted after this reads
+    /// the new mapping, work submitted before the old one. A unit mapped
+    /// anew holds nothing yet: its texels come with the next copy into it.
+    /// A wanted unit no resident heap has room for stays unmapped (`short`;
+    /// the pool's thread is woken to make room).
+    pub(crate) fn map(&self, host: &crate::host::Host, wanted: &[bool]) -> Mapped {
+        let inner = &self.inner;
+        inner.reclaim(host.completed());
+        let mut pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
+        let mut done = Mapped::default();
+        let before = self.mapped_of(&pieces);
+        // Unmapped first: their ranges may serve the units mapped below,
+        // once the fence passes.
+        let gone: Vec<usize> = (0..self.units.len())
+            .filter(|&i| pieces[i].is_some() && !wanted.get(i).copied().unwrap_or(false))
+            .collect();
+        if !gone.is_empty() {
+            self.unmap(host, &gone, &mut pieces);
+            done.removed = gone.len() as u32;
+        }
+        // Mapped by heap: one call for the units that land in the same one.
+        let mut calls: Vec<Call> = Vec::new();
+        for i in 0..self.units.len() {
+            if pieces[i].is_some() || !wanted.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let len = u64::from(self.units[i].tiles) * TILE;
+            let Some((heap, id, ranges)) = inner.take_tiles(len) else {
+                done.short += 1;
+                continue;
+            };
+            match calls.iter_mut().find(|c| c.heap.as_raw() == heap.as_raw()) {
+                Some(call) => {
+                    call.units.push(i);
+                    call.ranges.extend_from_slice(&ranges);
+                }
+                None => calls.push(Call {
+                    heap,
+                    units: vec![i],
+                    ranges: ranges.clone(),
+                }),
+            }
+            pieces[i] = Some(Pieces { heap: id, ranges });
+            done.added += 1;
+        }
+        for Call {
+            heap,
+            units,
+            ranges,
+        } in &calls
+        {
+            let (coordinates, sizes) = self.regions(units);
+            let starts: Vec<u32> = ranges.iter().map(|&(at, _)| (at / TILE) as u32).collect();
+            let counts: Vec<u32> = ranges.iter().map(|&(_, len)| (len / TILE) as u32).collect();
+            let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; ranges.len()];
+            // SAFETY: a reserved texture of ours and a heap of the pool
+            // the ranges were taken from (alive while a range is taken);
+            // as many tiles in the regions as in the ranges.
+            unsafe {
+                host.queue().UpdateTileMappings(
+                    &self.texture,
+                    units.len() as u32,
+                    Some(coordinates.as_ptr()),
+                    Some(sizes.as_ptr()),
+                    heap,
+                    ranges.len() as u32,
+                    Some(flags.as_ptr()),
+                    Some(starts.as_ptr()),
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                )
+            };
+        }
+        let after = self.mapped_of(&pieces);
+        drop(pieces);
+        inner.mapped.fetch_add(after, Ordering::Relaxed);
+        inner.mapped.fetch_sub(before, Ordering::Relaxed);
+        let mut s = inner.lock();
+        s.stats.units_mapped += u64::from(done.added);
+        s.stats.units_unmapped += u64::from(done.removed);
+        s.stats.units_short += u64::from(done.short);
+        s.stats.tile_calls += calls.len() as u64 + u64::from(done.removed > 0);
+        done
+    }
+
+    /// Unmaps every unit: what is read of the texture after work submitted
+    /// before this is zero, until it is mapped again. The units unmapped.
+    pub(crate) fn evict(&self, host: &crate::host::Host) -> u32 {
+        self.map(host, &vec![false; self.units.len()]).removed
+    }
+
+    /// Unmaps units `gone` (mapped), queued on `host`'s queue; their ranges
+    /// go back once the host fence passes the next submission.
+    fn unmap(&self, host: &crate::host::Host, gone: &[usize], pieces: &mut [Option<Pieces>]) {
+        let (coordinates, sizes) = self.regions(gone);
+        let tiles: u32 = gone.iter().map(|&i| self.units[i].tiles).sum();
+        let flags = [D3D12_TILE_RANGE_FLAG_NULL];
+        // SAFETY: a reserved texture of ours; one null range for all the
+        // regions' tiles.
+        unsafe {
+            host.queue().UpdateTileMappings(
+                &self.texture,
+                gone.len() as u32,
+                Some(coordinates.as_ptr()),
+                Some(sizes.as_ptr()),
+                None::<&ID3D12Heap>,
+                1,
+                Some(flags.as_ptr()),
+                None,
+                Some(&raw const tiles),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            )
+        };
+        // Read after the call: the next value the queue signals is queued
+        // after the unmapping, and every read of the old tiles before it.
+        let after = host.executing() + 1;
+        let mut retired = Vec::new();
+        for &i in gone {
+            if let Some(p) = pieces[i].take() {
+                retired.extend(
+                    p.ranges
+                        .into_iter()
+                        .map(|(at, len)| (after, p.heap, at, len)),
+                );
+            }
+        }
+        self.inner.lock().retired.extend(retired);
+    }
+
+    /// The regions of units `of`: each a whole unit, its tiles in linear
+    /// order from its first subresource.
+    fn regions(
+        &self,
+        of: &[usize],
+    ) -> (
+        Vec<D3D12_TILED_RESOURCE_COORDINATE>,
+        Vec<D3D12_TILE_REGION_SIZE>,
+    ) {
+        of.iter()
+            .map(|&i| {
+                let u = &self.units[i];
+                (
+                    D3D12_TILED_RESOURCE_COORDINATE {
+                        X: 0,
+                        Y: 0,
+                        Z: 0,
+                        Subresource: u.subresource,
+                    },
+                    D3D12_TILE_REGION_SIZE {
+                        NumTiles: u.tiles,
+                        UseBox: false.into(),
+                        Width: 0,
+                        Height: 0,
+                        Depth: 0,
+                    },
+                )
+            })
+            .unzip()
+    }
+}
+
+impl Drop for Tiles {
+    fn drop(&mut self) {
+        // The texture goes: the lists that named it were reset (they held
+        // its host copy), so nothing reads its tiles; its ranges go back now,
+        // as a placed texture's do.
+        let pieces = std::mem::take(self.pieces.get_mut().unwrap_or_else(|e| e.into_inner()));
+        let mapped = self.mapped_of(&pieces);
+        for p in pieces.into_iter().flatten() {
+            for (at, len) in p.ranges {
+                self.inner.give_range(Class::Normal, p.heap, at, len);
+            }
+        }
+        self.inner.mapped.fetch_sub(mapped, Ordering::Relaxed);
+        self.inner.reserved.fetch_sub(1, Ordering::Relaxed);
+        let key = self.texture.as_raw() as usize;
+        let mut map = TILES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut()
+            && map
+                .get(&key)
+                .is_some_and(|w| std::ptr::eq(w.as_ptr(), std::ptr::from_ref(self)))
+        {
+            map.remove(&key);
+        }
     }
 }
 
@@ -400,6 +865,13 @@ impl Pool {
     /// A pool on `device`; its thread starts filling the reserve.
     pub(crate) fn new(device: ID3D12Device, config: Config, budget: Budget) -> Pool {
         let changes = BudgetEvent::register(&device);
+        let tier = tiled_tier(&device);
+        if config.tiles && tier < D3D12_TILED_RESOURCES_TIER_2.0 {
+            tracing::info!(
+                tier,
+                "texture pool: no reserved textures (tiled resources tier 2 needed): placed"
+            );
+        }
         let inner = Arc::new(Inner {
             device,
             config,
@@ -407,6 +879,7 @@ impl Pool {
             state: Mutex::new(State {
                 classes: [Vec::new(), Vec::new()],
                 releasing: Vec::new(),
+                retired: std::collections::VecDeque::new(),
                 stop: false,
                 woken: true,
                 next_id: 1,
@@ -416,6 +889,10 @@ impl Pool {
             wake: Condvar::new(),
             changes,
             zeroed: AtomicBool::new(false),
+            tier,
+            tileable: Mutex::new(HashMap::new()),
+            reserved: AtomicU64::new(0),
+            mapped: AtomicU64::new(0),
         });
         let thread = {
             let inner = inner.clone();
@@ -451,6 +928,17 @@ impl Pool {
         if len > inner.config.largest {
             return refused("too large for the pool");
         }
+        if class == Class::Normal && len >= TILED_FROM * TILE && inner.reservable(d) {
+            match inner.reserve(d, state) {
+                Ok(reserved) => return Ok(reserved),
+                Err(why) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(why, ?d, "a reserved host texture refused: placed instead")
+                    });
+                }
+            }
+        }
         let taken = match inner.take(class, len) {
             Some(taken) => taken,
             None => {
@@ -468,10 +956,12 @@ impl Pool {
         let (heap, id, offset, residency, made) = taken;
         let slot = Slot {
             inner: inner.clone(),
-            class,
-            heap: id,
-            offset,
-            len,
+            kind: Kind::Range {
+                class,
+                heap: id,
+                offset,
+                len,
+            },
         };
         let mut texture: Option<ID3D12Resource> = None;
         // SAFETY: a live heap, a range of it no other live resource uses,
@@ -529,20 +1019,31 @@ impl Pool {
     pub(crate) fn report(&self) -> String {
         let (h, s) = (self.holding(), self.stats());
         format!(
-            "texture pool: {} heaps ({} not resident yet), {} MiB, {} MiB placed in {} textures; \
-             so far {} heaps made ({} by the title's thread), {} released, {} textures not placed, \
-             {} handed out before their heap was resident, {} heaps held back by the budget",
+            "texture pool: {} heaps ({} not resident yet), {} MiB, {} MiB placed in {} ranges \
+             ({} reserved textures, {} MiB of their tiles mapped, {} MiB given back waiting for \
+             the fence); so far {} heaps made ({} by the title's thread), {} released, {} textures \
+             not placed, {} handed out before their heap was resident, {} heaps held back by the \
+             budget, {} textures reserved, tile units {} mapped, {} unmapped, {} left for want of \
+             room, {} tile mapping calls",
             h.heaps,
             h.pending,
             h.bytes / MIB,
             h.used / MIB,
             h.textures,
+            h.reserved,
+            h.mapped / MIB,
+            h.retired / MIB,
             s.heaps,
             s.emergency,
             s.released,
             s.not_placed,
             s.early,
-            s.over_budget
+            s.over_budget,
+            s.reserved,
+            s.units_mapped,
+            s.units_unmapped,
+            s.units_short,
+            s.tile_calls
         )
     }
 
@@ -560,6 +1061,19 @@ impl Pool {
                 return true;
             }
             self.inner.notify();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Waits until every heap is resident (at most `timeout`): tests.
+    #[cfg(test)]
+    pub(crate) fn resident(&self, timeout: Duration) -> bool {
+        let until = Instant::now() + timeout;
+        while Instant::now() < until {
+            if self.holding().pending == 0 {
+                return true;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         false
@@ -665,16 +1179,21 @@ impl Inner {
         Some(taken)
     }
 
-    /// Gives a texture's range back; its heap goes if it is empty and the
-    /// reserve does not need it.
-    fn give_back(&self, slot: &Slot) {
+    /// Gives a range back; its heap goes if it is empty and the reserve
+    /// does not need it.
+    fn give_range(&self, class: Class, heap: u64, offset: u64, len: u64) {
         let mut s = self.lock();
-        let reserve = self.config.reserve[slot.class.index()];
-        let heaps = &mut s.classes[slot.class.index()];
-        let Some(at) = heaps.iter().position(|h| h.id == slot.heap) else {
+        self.give_locked(&mut s, class, heap, offset, len);
+    }
+
+    /// [`Inner::give_range`] under the state's lock.
+    fn give_locked(&self, s: &mut State, class: Class, heap: u64, offset: u64, len: u64) {
+        let reserve = self.config.reserve[class.index()];
+        let heaps = &mut s.classes[class.index()];
+        let Some(at) = heaps.iter().position(|h| h.id == heap) else {
             return;
         };
-        heaps[at].ranges.give(slot.offset, slot.len);
+        heaps[at].ranges.give(offset, len);
         heaps[at].textures -= 1;
         if heaps[at].textures > 0 {
             return;
@@ -692,6 +1211,138 @@ impl Inner {
             s.woken = true;
             self.wake.notify_all();
         }
+    }
+
+    /// Gives back the ranges reserved textures retired before the host
+    /// fence reached `completed`, oldest first (one retired a little out of
+    /// order waits for those before it).
+    fn reclaim(&self, completed: u64) {
+        let mut s = self.lock();
+        while let Some(&(after, heap, at, len)) = s.retired.front()
+            && after <= completed
+        {
+            s.retired.pop_front();
+            self.give_locked(&mut s, Class::Normal, heap, at, len);
+        }
+    }
+
+    /// Whether host texture `d` may be reserved: the pool reserves, the
+    /// device has tier 2 (3 for 3D textures) and tiles its format.
+    fn reservable(&self, d: &D3D12_RESOURCE_DESC) -> bool {
+        let tier = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            D3D12_TILED_RESOURCES_TIER_3.0
+        } else {
+            D3D12_TILED_RESOURCES_TIER_2.0
+        };
+        if !self.config.tiles || self.tier < tier || d.SampleDesc.Count > 1 {
+            return false;
+        }
+        let mut known = self.tileable.lock().unwrap_or_else(|e| e.into_inner());
+        *known.entry(d.Format.0).or_insert_with(|| {
+            let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: d.Format,
+                ..Default::default()
+            };
+            // SAFETY: the query writes the structure of the given size.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut data).cast(),
+                    size_of_val(&data) as u32,
+                )
+            };
+            asked.is_ok() && data.Support2.contains(D3D12_FORMAT_SUPPORT2_TILED)
+        })
+    }
+
+    /// `d` made a reserved texture in `state`, nothing of it mapped.
+    fn reserve(
+        self: &Arc<Self>,
+        d: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Result<Placed, &'static str> {
+        let desc = D3D12_RESOURCE_DESC {
+            Alignment: 0,
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            ..*d
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: a texture description in the reserved layout; the out
+        // pointer is ours.
+        unsafe {
+            self.device
+                .CreateReservedResource(&desc, state, None, &mut texture)
+        }
+        .map_err(|_| "the driver refused it")?;
+        let texture = texture.ok_or("no texture")?;
+        let units = units_of(&self.device, &texture, &desc).ok_or("no tiling")?;
+        let tiles: u64 = units.iter().map(|u| u64::from(u.tiles)).sum();
+        let reserved = Arc::new(Tiles {
+            inner: self.clone(),
+            texture: texture.clone(),
+            pieces: Mutex::new(units.iter().map(|_| None).collect()),
+            units,
+        });
+        TILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(texture.as_raw() as usize, Arc::downgrade(&reserved));
+        self.reserved.fetch_add(1, Ordering::Relaxed);
+        self.lock().stats.reserved += 1;
+        Ok(Placed {
+            texture,
+            slot: Slot {
+                inner: self.clone(),
+                kind: Kind::Tiles(reserved),
+            },
+            // Nothing of its own to make resident: its tiles are mapped
+            // into resident heaps only.
+            residency: Arc::new(Residency::resident()),
+            bytes: tiles * TILE,
+        })
+    }
+
+    /// `len` bytes (whole tiles) of a resident heap of the 64 KiB class for
+    /// a unit of a reserved texture: a range of the tightest fit, else
+    /// pieces of the heap with the most free bytes (in the order taken);
+    /// with the heap and its id. The thread is woken if the reserve runs
+    /// short, or if none has room.
+    fn take_tiles(&self, len: u64) -> Option<Taken> {
+        let mut s = self.lock();
+        let class = Class::Normal;
+        let heaps = &mut s.classes[class.index()];
+        let resident = |h: &Heap| h.residency.is_ready();
+        let whole = heaps
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| resident(h))
+            .filter_map(|(i, h)| h.ranges.fit(len).map(|fit| (fit, i)))
+            .min();
+        let taken = match whole {
+            Some((_, i)) => {
+                let h = &mut heaps[i];
+                h.ranges.take(len).map(|at| (i, vec![(at, len)]))
+            }
+            None => heaps
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| resident(h) && h.ranges.free() >= len)
+                .max_by_key(|(_, h)| h.ranges.free())
+                .map(|(i, _)| i)
+                .and_then(|i| scattered(&mut heaps[i].ranges, len).map(|r| (i, r))),
+        };
+        let wake = taken.is_none() || self.short(&s, class);
+        let found = taken.map(|(i, ranges)| {
+            let h = &mut s.classes[class.index()][i];
+            h.textures += ranges.len() as u32;
+            (h.heap.clone(), h.id, ranges)
+        });
+        if wake {
+            s.woken = true;
+            self.wake.notify_all();
+        }
+        found
     }
 
     /// Makes a heap of `size` bytes for `class`, not resident, and asks for
@@ -821,11 +1472,15 @@ impl Inner {
             h.used += heap.size - heap.ranges.free();
             h.textures += u64::from(heap.textures);
         }
+        h.retired = s.retired.iter().map(|&(.., len)| len).sum();
+        h.reserved = self.reserved.load(Ordering::Relaxed);
+        h.mapped = self.mapped.load(Ordering::Relaxed);
         h
     }
 
-    /// The thread: heaps released, the budget followed, refused heaps asked
-    /// again, the reserve kept; then sleep until woken (or a second).
+    /// The thread: heaps released, retired ranges given back, the budget
+    /// followed, refused heaps asked again, the reserve kept; then sleep
+    /// until woken (or a second).
     fn run(&self) {
         loop {
             let releasing = {
@@ -837,6 +1492,9 @@ impl Inner {
                 std::mem::take(&mut s.releasing)
             };
             drop(releasing);
+            if let Some(host) = crate::host::host() {
+                self.reclaim(host.completed());
+            }
             if self.changes.as_ref().is_some_and(BudgetEvent::fired) {
                 self.budget_changed();
             }
@@ -892,10 +1550,168 @@ impl Inner {
     }
 }
 
+/// The device's tiled resources tier (0 if it cannot tell).
+fn tiled_tier(device: &ID3D12Device) -> i32 {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: the query writes the structure of the given size.
+    let asked = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    };
+    if asked.is_ok() {
+        options.TiledResourcesTier.0
+    } else {
+        0
+    }
+}
+
+/// The units of reserved texture `texture` (made from `desc`): each
+/// standard mip of each array slice (3D: of the texture), then each
+/// slice's packed mips, in subresource order.
+fn units_of(
+    device: &ID3D12Device,
+    texture: &ID3D12Resource,
+    desc: &D3D12_RESOURCE_DESC,
+) -> Option<Vec<Unit>> {
+    let mips = u32::from(desc.MipLevels.max(1));
+    let slices = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(desc.DepthOrArraySize.max(1))
+    };
+    let mut count = mips * slices;
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); count as usize];
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    let mut total = 0u32;
+    // SAFETY: room for `count` subresource tilings; plain outputs.
+    unsafe {
+        device.GetResourceTiling(
+            texture,
+            Some(&raw mut total),
+            Some(&raw mut packed),
+            None,
+            Some(&raw mut count),
+            0,
+            tilings.as_mut_ptr(),
+        )
+    };
+    let standard = u32::from(packed.NumStandardMips).min(mips);
+    let packed_mips = u32::from(packed.NumPackedMips);
+    let mut units = Vec::with_capacity((slices * (standard + 1)) as usize);
+    for slice in 0..slices {
+        for mip in 0..standard {
+            let subresource = slice * mips + mip;
+            let t = tilings.get(subresource as usize)?;
+            if t.StartTileIndexInOverallResource == D3D12_PACKED_TILE {
+                return None;
+            }
+            let tiles = t.WidthInTiles * u32::from(t.HeightInTiles) * u32::from(t.DepthInTiles);
+            units.push(Unit {
+                subresource,
+                slice,
+                first_mip: mip,
+                mips: 1,
+                tiles,
+            });
+        }
+        if packed_mips > 0 && packed.NumTilesForPackedMips > 0 {
+            units.push(Unit {
+                subresource: slice * mips + standard,
+                slice,
+                first_mip: standard,
+                mips: packed_mips,
+                tiles: packed.NumTilesForPackedMips,
+            });
+        }
+    }
+    let sum: u32 = units.iter().map(|u| u.tiles).sum();
+    (sum == total && sum > 0).then_some(units)
+}
+
+/// `len` bytes (whole tiles) of `ranges` in pieces: the largest free range
+/// up to what is left each time, [`PIECES`] at most; `None` (nothing taken)
+/// if they do not hold them so.
+fn scattered(ranges: &mut Ranges, len: u64) -> Option<Vec<(u64, u64)>> {
+    let mut taken = Vec::new();
+    let mut left = len;
+    while left > 0 && taken.len() < PIECES {
+        // The longest piece up to `left` a free range holds: by halves
+        // over whole tiles.
+        let (mut low, mut high) = (0, left / TILE);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if ranges.fit(mid * TILE).is_some() {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let Some(at) = (low > 0).then(|| ranges.take(low * TILE)).flatten() else {
+            break;
+        };
+        taken.push((at, low * TILE));
+        left -= low * TILE;
+    }
+    if left > 0 {
+        for (at, len) in taken {
+            ranges.give(at, len);
+        }
+        return None;
+    }
+    Some(taken)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
+
+    thread_local! {
+        /// Host textures this thread makes go to the tests' pool
+        /// ([`Pooled`]).
+        pub(crate) static POOLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// While it lives, the host textures this thread makes that the pool
+    /// takes go to the tests' own pool ([`pool_for_tests`]), reserved where
+    /// the device can: other tests' textures stay committed.
+    pub(crate) struct Pooled;
+
+    impl Pooled {
+        pub(crate) fn new() -> Pooled {
+            POOLED.set(true);
+            Pooled
+        }
+    }
+
+    impl Drop for Pooled {
+        fn drop(&mut self) {
+            POOLED.set(false);
+        }
+    }
+
+    /// The tests' pool: 4 MiB heaps, reserved textures, no budget.
+    pub(crate) fn pool_for_tests() -> Option<&'static Pool> {
+        static TEST_POOL: OnceLock<Option<Pool>> = OnceLock::new();
+        TEST_POOL
+            .get_or_init(|| {
+                let host = crate::host::host()?;
+                let config = Config {
+                    tiles: true,
+                    ..Config::sized(4 * MIB, 4 * MIB)
+                };
+                Some(Pool::new(host.device.clone(), config, unlimited()))
+            })
+            .as_ref()
+    }
+
+    /// Whether the test device reserves textures (tiled resources tier 2).
+    pub(crate) fn reserves(pool: &Pool) -> bool {
+        pool.inner.tier >= D3D12_TILED_RESOURCES_TIER_2.0
+    }
 
     fn texture(width: u64, height: u32, format: DXGI_FORMAT, mips: u16) -> D3D12_RESOURCE_DESC {
         D3D12_RESOURCE_DESC {
@@ -1286,6 +2102,286 @@ mod tests {
         ));
         drop(pool);
         eprintln!("{}", rows.join("\n"));
+    }
+
+    /// The bytes of subresource `sub` of 2D colour texture `texture` (in
+    /// the copy destination state), rows as their copyable footprint lays
+    /// them out: row pitch and rows.
+    pub(crate) fn read_sub(
+        host: &crate::host::Host,
+        texture: &ID3D12Resource,
+        sub: u32,
+    ) -> (Vec<u8>, usize, usize) {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut total) = (0u32, 0u64);
+        // SAFETY: room for the one footprint requested.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                sub,
+                1,
+                0,
+                Some(&mut footprint),
+                Some(&mut rows),
+                None,
+                Some(&mut total),
+            );
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: total,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let list = host.new_list().unwrap();
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: sub,
+            },
+        };
+        let t = crate::host::transition;
+        let (dest, source) = (
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        // SAFETY: an open list; both locations name live resources.
+        unsafe {
+            list.list.ResourceBarrier(&[t(texture, dest, source)]);
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.list.ResourceBarrier(&[t(texture, source, dest)]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a readback buffer the GPU is done with.
+        unsafe { readback.Map(0, None, Some(&mut data)).unwrap() };
+        // SAFETY: `total` bytes mapped.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), total as usize) }.to_vec();
+        let f = footprint.Footprint;
+        (bytes, f.RowPitch as usize, rows as usize)
+    }
+
+    /// Fills subresource `sub` of `texture` (RGBA8, in the copy destination
+    /// state) with `byte`, through an upload buffer, and runs the copy.
+    fn fill_sub(host: &crate::host::Host, texture: &ID3D12Resource, sub: u32, byte: u8) {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0u64;
+        // SAFETY: room for the one footprint requested.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                sub,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut total),
+            );
+        }
+        footprint.Offset = 0;
+        let (upload, data) = host.upload_buffer(total).unwrap();
+        // SAFETY: `total` bytes of the mapped buffer.
+        unsafe { data.write_bytes(byte, total as usize) };
+        let list = host.new_list().unwrap();
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: sub,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&upload) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+    }
+
+    /// Whether every texel row of `read` (pitch, rows) is `byte` over
+    /// `width` bytes.
+    pub(crate) fn rows_are(read: &(Vec<u8>, usize, usize), width: usize, byte: u8) -> bool {
+        let (bytes, pitch, rows) = read;
+        (0..*rows).all(|r| {
+            bytes[r * pitch..r * pitch + width]
+                .iter()
+                .all(|&b| b == byte)
+        })
+    }
+
+    /// A texture of two tiles or more is reserved, nothing of it mapped:
+    /// its units (each standard mip, the packed mips) are mapped as asked,
+    /// a copy reaches the mapped ones and is dropped in the others, which
+    /// read zero; unmapped, the texture reads zero again, and the ranges
+    /// it gave back return to their heap only once the host fence passes
+    /// the submission after the unmapping; mapped again, it takes copies
+    /// again; dropped, its ranges go back at once and it leaves the
+    /// registry.
+    #[test]
+    fn reserved_textures_map_and_give_back_their_tiles() {
+        let test = "resource::pool::tests::reserved_textures_map_and_give_back_their_tiles";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let config = Config {
+            tiles: true,
+            ..Config::sized(4 * MIB, 4 * MIB)
+        };
+        let pool = Pool::new(gpu.device.clone(), config, unlimited());
+        if !reserves(&pool) {
+            eprintln!("{test}: skipped, the device has no tiled resources tier 2");
+            return;
+        }
+        assert!(pool.settle(Duration::from_secs(5)));
+        assert!(pool.resident(Duration::from_secs(5)), "the heaps resident");
+        let state = D3D12_RESOURCE_STATE_COPY_DEST;
+        let d = texture(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, 9);
+        let placed = pool.place(&d, state).expect("reserved");
+        let tiles = placed.slot.tiles().expect("a reserved texture").clone();
+        let texture = placed.texture.clone();
+        assert!(Arc::ptr_eq(&tiles_of(&texture).unwrap(), &tiles));
+        // Units: standard mips from the largest, then the packed ones,
+        // covering the chain once.
+        let units = tiles.units().to_vec();
+        assert!(units.len() >= 2, "{units:?}");
+        let covered: Vec<u32> = units
+            .iter()
+            .flat_map(|u| u.first_mip..u.first_mip + u.mips)
+            .collect();
+        assert_eq!(covered, (0..9).collect::<Vec<_>>(), "{units:?}");
+        let all: u64 = units.iter().map(|u| u64::from(u.tiles) * TILE).sum();
+        assert_eq!(placed.bytes, all);
+        assert_eq!(tiles.mapped(), 0, "nothing mapped yet");
+        assert_eq!(pool.stats().reserved, 1);
+
+        // The first unit (mip 0) and the last; not the second (mip 1).
+        let mut wanted = vec![false; units.len()];
+        wanted[0] = true;
+        *wanted.last_mut().unwrap() = true;
+        let done = tiles.map(host, &wanted);
+        assert_eq!((done.added, done.removed, done.short), (2, 0, 0));
+        assert!(tiles.holds(&wanted));
+        let both = u64::from(units[0].tiles + units.last().unwrap().tiles) * TILE;
+        assert_eq!(tiles.mapped(), both);
+        assert_eq!(pool.holding().mapped, both);
+        fill_sub(host, &texture, 0, 0x5a);
+        fill_sub(host, &texture, 1, 0x6b);
+        assert!(rows_are(&read_sub(host, &texture, 0), 256 * 4, 0x5a));
+        assert!(
+            rows_are(&read_sub(host, &texture, 1), 128 * 4, 0),
+            "an unmapped unit reads zero"
+        );
+
+        // Unmapped: zero again, the ranges retired until the fence passes
+        // a submission queued after the unmapping (the gate holds the queue
+        // meanwhile, other tests' submissions too).
+        let used = pool.holding().used;
+        let mut gate = crate::host::Gate::close(host);
+        assert_eq!(tiles.evict(host), 2);
+        assert_eq!(tiles.mapped(), 0);
+        assert!(!tiles.any());
+        pool.inner.reclaim(host.completed());
+        let held = pool.holding();
+        assert_eq!(held.retired, both, "not back before the fence");
+        assert_eq!(held.used, used);
+        gate.open();
+        assert!(rows_are(&read_sub(host, &texture, 0), 256 * 4, 0));
+        pool.inner.reclaim(host.completed());
+        assert_eq!(pool.holding().retired, 0, "back once one ran");
+        assert_eq!(pool.holding().used, used - both);
+
+        // Mapped again: copies reach it again.
+        let done = tiles.map(host, &vec![true; units.len()]);
+        assert_eq!((done.added, done.short), (units.len() as u32, 0));
+        fill_sub(host, &texture, 1, 0x7c);
+        assert!(rows_are(&read_sub(host, &texture, 1), 128 * 4, 0x7c));
+
+        // Dropped: its ranges go back at once, and it leaves the registry.
+        drop(placed);
+        drop(tiles);
+        assert!(tiles_of(&texture).is_none());
+        let after = pool.holding();
+        assert_eq!((after.mapped, after.reserved), (0, 0));
+        assert_eq!(after.used, used - both, "{after:?}");
+    }
+
+    /// A unit's tiles are taken in pieces of a fragmented heap, the longest
+    /// first, or not at all.
+    #[test]
+    fn units_are_taken_in_pieces_or_not_at_all() {
+        let mut r = Ranges::new(8 * TILE);
+        let [_a, b, _c, d, _e] = [2, 1, 2, 1, 2].map(|n| r.take(n * TILE).unwrap());
+        r.give(b, TILE);
+        r.give(d, TILE);
+        assert_eq!(scattered(&mut r, 3 * TILE), None);
+        assert_eq!(r.free(), 2 * TILE, "nothing taken");
+        assert_eq!(
+            scattered(&mut r, 2 * TILE),
+            Some(vec![(b, TILE), (d, TILE)])
+        );
+        assert_eq!(r.free(), 0);
+    }
+
+    #[test]
+    fn tiles_are_off_unless_asked() {
+        assert!(!asks_tiles(None), "off by default");
+        assert!(asks_tiles(Some("1")));
+        for off in ["0", "off", "FALSE", " 0 ", ""] {
+            assert!(!asks_tiles(Some(off)), "{off}");
+        }
     }
 
     /// Larger textures than a quarter heap and alignments the pool has no
