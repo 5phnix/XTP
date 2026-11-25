@@ -1769,7 +1769,9 @@ impl State {
             list,
             self.pipeline,
             crate::meshstat::Op::Mesh {
-                groups: groups[0].saturating_mul(groups[1]).saturating_mul(groups[2]),
+                groups: groups[0]
+                    .saturating_mul(groups[1])
+                    .saturating_mul(groups[2]),
             },
         );
         let ran = self.prepare_for(list, false, true).and_then(|()| {
