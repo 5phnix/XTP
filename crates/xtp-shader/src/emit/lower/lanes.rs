@@ -692,7 +692,11 @@ impl<'a> Lower<'a> {
             111,
             &[],
         );
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let f = if self.s.m.paired_lanes() {
+            self.s.m.paired_flat(e, base, lane)
+        } else {
+            self.s.m.bin(e, Bin::Add, base, lane)
+        };
         self.s.flags |= flags::WAVE_OPS;
         self.console_flat = Some(f);
         f
@@ -710,11 +714,9 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the console flow can run this compute program on the host:
-    /// what `Lower::new` requires before it asks for it. In two 32-lane
-    /// halves, one console wave per group (the halves meet at group
-    /// barriers), no `ds_permute` across the halves, and whole-wave
-    /// sections only in a group of exactly 64 threads; on a host that runs
-    /// the console's waves, no `ds_permute`.
+    /// used when a per-lane mask read needs all 64 console lanes.
+    /// Complete waves can run paired. A partial single wave can use the
+    /// original group exchange when it has no whole-wave section.
     pub(super) fn console_flow_runs(&self) -> bool {
         if self.mask_data != MaskData::Console {
             return false;
@@ -732,7 +734,9 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 && !self.x.target.runs(64) {
             let sections =
                 (0..p.blocks.len()).any(|b| !crate::emit::wave::sections(p, b).is_empty());
-            self.x.target.runs(32) && threads <= 64 && !permute && (threads == 64 || !sections)
+            self.x.target.runs(32)
+                && !permute
+                && (threads.is_multiple_of(64) || threads < 64 && !sections)
         } else {
             self.x.target.runs(self.wave()) && !permute
         }
@@ -744,7 +748,12 @@ impl<'a> Lower<'a> {
     /// of 32 threads or fewer exchanges nothing.)
     pub(super) fn exchange_fits(&self) -> Result<(), Why> {
         let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
-        if self.console_cf && self.split && threads > 32 && self.s.lds_dwords + 2 > 8192 {
+        if self.console_cf
+            && self.split
+            && !self.s.m.paired_lanes()
+            && threads > 32
+            && self.s.lds_dwords + 2 > 8192
+        {
             return Err("a wave64 program whose LDS leaves no room for its halves' exchange");
         }
         if self.group_reads && self.s.lds_dwords + threads > 8192 {
@@ -814,6 +823,9 @@ impl<'a> Lower<'a> {
     /// fewer has no upper half: its lanes count as inactive there (0).
     pub(super) fn exchange(&mut self, at: usize, x: V) -> (V, V) {
         let threads: u32 = self.s.threads.expect("compute").iter().product();
+        if self.s.m.paired_lanes() {
+            return self.s.m.paired_words(at, x);
+        }
         let z = self.s.m.i32(0);
         if threads <= 32 {
             return (x, z);

@@ -550,16 +550,6 @@ fn selects_from_independently_written_mask_words() {
         };
         for target in [wave32_only, crate::emit::Target::ANY] {
             let result = crate::emit::emit_for(&c, &native, &p, &st, &io, &res, target);
-            if uses_select && threads > 64 && !target.runs(64) {
-                assert!(matches!(
-                    result,
-                    Err(crate::ShaderError::Unsupported {
-                        what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
-                        ..
-                    })
-                ));
-                continue;
-            }
             let shader = result.unwrap();
             let emitted = crate::Container::parse(&shader.dxil).unwrap();
             let features = emitted.part(crate::FourCC::SFI0).unwrap();
