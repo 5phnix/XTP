@@ -825,7 +825,7 @@ mod tests {
             if Instant::now() > deadline {
                 break;
             }
-            installed.set(Choice::of(flips % 2 == 0)).unwrap();
+            installed.set(Choice::of(flips.is_multiple_of(2))).unwrap();
             flips += 1;
             std::thread::yield_now();
         }
