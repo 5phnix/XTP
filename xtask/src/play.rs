@@ -32,6 +32,8 @@ const HANDED_BACK: &str = "control handed back to the player";
 const STOPS: &str = "the script stops here";
 /// The frame-rate line, every 5 s (crates/xtp-gpu/src/host.rs).
 const FRAME_RATE: &str = "xtp_gpu::host";
+/// Cuts the intro movie (crates/xtp-game/src/intro.rs).
+const SKIP_INTRO: &str = "XTP_SKIP_INTRO";
 
 pub struct Options {
     /// Seconds of gameplay before the title is ended.
@@ -107,7 +109,8 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
             None => ", then the controls are yours".into(),
         }
     );
-    let mut child = Command::new(&xtp)
+    let mut command = Command::new(&xtp);
+    command
         .arg("run")
         .arg(&game)
         .arg("--execute")
@@ -115,7 +118,19 @@ pub fn run(root: &Path, options: &Options) -> Result<()> {
         .arg(&autopilot)
         .args(["--console", console])
         // Over the config file's: the title writes only the copy.
-        .env("XTP_DATA_DIR", &data)
+        .env("XTP_DATA_DIR", &data);
+    if skips_intro(
+        options.measure.is_some(),
+        std::env::var_os(SKIP_INTRO).is_some(),
+        std::env::var_os("XTP_PLAY_INTRO").is_some(),
+    ) {
+        // A measured run only needs the world: cutting the intro movie saves
+        // about 13 s a session (docs/analysis/intro-skip.md). XTP_PLAY_INTRO
+        // keeps it; an XTP_SKIP_INTRO already set is left as it is.
+        println!("play: intro movie cut (XTP_PLAY_INTRO=1 keeps it)");
+        command.env(SKIP_INTRO, "1");
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -234,6 +249,13 @@ fn with_exit(script: &str, measure: Option<u64>) -> String {
         text += &format!("\n# cargo xtask play --measure {seconds}\nexit after {seconds}\n");
     }
     text
+}
+
+/// Whether a run cuts the intro movie: measured runs do, unless the caller
+/// set `XTP_SKIP_INTRO` itself (left as it is) or asked for the movie with
+/// `XTP_PLAY_INTRO`.
+fn skips_intro(measured: bool, already_set: bool, keep_intro: bool) -> bool {
+    measured && !already_set && !keep_intro
 }
 
 /// `YYYYMMDD-HHMMSS`, UTC.
@@ -515,6 +537,23 @@ fn summary(lines: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measured_runs_cut_the_intro_unless_told_otherwise() {
+        assert!(skips_intro(true, false, false));
+        assert!(
+            !skips_intro(false, false, false),
+            "a run for the player keeps it"
+        );
+        assert!(
+            !skips_intro(true, true, false),
+            "a caller's own setting stays"
+        );
+        assert!(
+            !skips_intro(true, false, true),
+            "XTP_PLAY_INTRO keeps the movie"
+        );
+    }
 
     const WORLD: &str = "2026-11-24T13:52:27.256955Z  INFO xtp_gpu::host: 1.4 fps, 714.3 ms/frame \
         (365.2 preparing: copies 280.0 ms 212.3 MB, textures 0.0 ms 0.0 MB; 250.5 on the GPU; \
