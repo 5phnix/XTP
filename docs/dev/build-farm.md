@@ -52,7 +52,7 @@ with its own persistent `target` directory. A worktree gets the same slot
 each time it builds on that VM; a new worktree (a delivery check in a fresh checkout, for
 example) takes the least recently used free slot. Since every branch is
 close to `main`, a checkout over another branch's slot only rewrites the
-files that differ, and cargo rebuilds incrementally.
+files that differ, and cargo rebuilds only the crates that changed.
 
 **Run.** `farm-run.ps1` reads the bundle from the SSH connection's stdin,
 checks the slot out at the snapshot's commit and runs cargo with your
@@ -61,8 +61,22 @@ the arguments are rewritten to the slot's. Your `RUSTFLAGS`, `RUST_*`,
 `CARGO_PROFILE_*` and `XTP_*` variables go along, except those that hold
 paths of your PC (the game folder, caches). `CARGO_TARGET_DIR` and
 `CARGO_BUILD_JOBS` do not: the VM uses its slot's target and all its cores.
-cargo's stdout and stderr are the SSH connection's, so output streams as it
-comes.
+Builds run without incremental compilation (`CARGO_INCREMENTAL=0`, whatever
+the client sets): farm builds gain little from it, and its caches filled
+the disks. cargo's stdout and stderr are the SSH connection's, so output
+streams as it comes.
+
+**Disk room.** Before its build, a job removes the incremental folders left
+from before, in its own slot and in each slot no job holds: it takes that
+slot's lock (`C:\farm\locks\<slot>.lock`, which `farm-run.ps1` holds for a
+whole job) for the time it takes, so no job starts there meanwhile, and it
+never touches a slot a job holds. (Until 25 November it judged a slot idle
+by its incremental folder's date, which does not change while files deep
+inside it do, and deleted caches under running builds: "unable to copy
+...\incremental\... to ...\deps\..." failed two deliveries.) Under 20 GB
+free after that, the whole `target` folders of free slots that had no job
+for 30 minutes go too, least recently used first (each slot's last job is
+in `C:\farm\state\<slot>.used`); their next build there is a full one.
 
 **Time limits.** Nothing waits for ever. A job has `maxRunMinutes` (30) in
 all, its attempts included, or `XTP_FARM_JOB_MINUTES` (`xtp-check.ps1` sets
@@ -183,7 +197,7 @@ Things to know:
   on the RTX of the PC (game runs, benchmarks, `cargo run`) stays local.
 - A run is a snapshot: edits you make while it runs are not in it.
 - The first build of a new slot is a cold build (a few minutes); later ones
-  are incremental.
+  rebuild only the crates that changed.
 
 ## Shader surveys
 
@@ -218,7 +232,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <XTP>\tools\buildfarm\Invoke
 - Several at once, from any worktrees: each survey takes an idle running VM,
   else starts a stopped one if the daily budget allows it, else shares the
   least loaded one (in another slot). Surveys share their slots (key
-  `farm-survey`), so the release build is incremental after the first one
+  `farm-survey`), so the release build rebuilds only what changed after the first one
   on each slot.
 - Time limit: `surveyMinutes` (90) for the build and the run, `-Minutes`
   for one survey.
