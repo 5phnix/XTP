@@ -1,6 +1,7 @@
 # The precook after a translator change: where the time goes, and what a narrow change costs
 
-`xtp precook` runs before every PC session (`cargo xtask play`). After a
+`xtp precook` runs before every PC session (`cargo xtask play`; measured
+sessions skip it since §7). After a
 translator change it made every session wait 13 to 23 minutes before the
 title started: about 26,500 records of the shader pack translated again,
 then about 80,800 kept graphics and mesh pipelines and 10,100 derived ones
@@ -323,3 +324,39 @@ header: 122.9 s for 25,925 entries cold (task 13245ce1).
 - **Point 6.** The loop limit's test changed the limit by halving it,
   which gives 1 again for `XTP_SHADER_LOOP_LIMIT=1`; it now flips its
   lowest bit, another value whatever the run's.
+
+## 7. Measured sessions start without a precook (task 97adad7c, first part)
+
+`cargo xtask play --measure` no longer runs `xtp precook` before the
+title: after a translator change the whole pass cost each PC session 13
+to 23 minutes (§1), most of it for pipelines the session never binds (a
+measured session of 2026-11-25 binds 1,600 to 1,800 pipelines and about
+2,000 programs, of some 92,000 pipelines and 25,900 containers).
+`XTP_PLAY_PRECOOK=1` runs it first, as before; `--no-precook` still skips
+it for a run for the player, which keeps it by default.
+
+- **What the session does instead.** Each program is translated and each
+  host pipeline made at its first use, by the functions the precook calls:
+  a draw or dispatch asks for its host pipeline
+  (`pipeline::host_pipeline`, `graphics_pipeline`), which queues it for
+  the pipeline workers (`pipeline::make`); a worker makes it with
+  `HostPipeline::new`, which translates each of its shaders
+  (`Shader::translated`: the shader cache's `host_shader`, this
+  translator's entry or a translation kept into it) and takes the
+  pipeline from the library by its name or compiles and stores it.
+  Compute pipelines go the same way with their one shader, graphics and
+  mesh ones with the title's state. Nothing is stood in: a translation
+  made at first use is the precook's, under the same key.
+- **What it costs.** A title thread waits for a pipeline being made at
+  most the frame's budget (`XTP_PIPELINE_WAIT_MS`, 2 ms for graphics and
+  8 ms for compute by default), and not at all for a heavy one (a
+  container of 48 KiB or more); past it, the draw or dispatch is dropped
+  until a worker has made the pipeline, and the frame line counts it
+  ("being made"). After a translator change the first world frames drop
+  draws for that reason, as a session without a precook always did; the
+  title's watchdog is hooked in measured runs, so slow frames do not end
+  the title. Pipelines a run drew with are started at their creation
+  (the early list), while the world loads.
+- **Next.** Precooking only what the last sessions bound (a list kept
+  beside the cache), so that those pipelines are made before the title
+  and only the rest at first use.
