@@ -765,6 +765,20 @@ fn root_srv_direct(list: &HostList, address: u64) -> Option<u64> {
     Some(shadow.gpu(address))
 }
 
+/// Why a dispatch of a program spliced with an inline ray query (RT phase
+/// 2b) does not run: it reads the host TLAS at the reserved root SRV, and
+/// nothing binds one there before RT phase 2c (`docs/analysis/rt-dxr.md`
+/// section 8, `xtp_gpu::rt::host_tlas`).
+const NO_HOST_TLAS: &str = "rt: no host TLAS";
+
+/// Whether `p` reads the host TLAS ([`xtp_shader::emit::TLAS_REGISTER`]).
+fn reads_tlas(p: &HostPipeline) -> bool {
+    use xtp_shader::emit::TLAS_REGISTER;
+    p.stages
+        .iter()
+        .any(|s| s.root_srvs.iter().any(|r| r.0 == TLAS_REGISTER))
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1323,6 +1337,9 @@ impl State {
         compute: bool,
         limits: [u32; 3],
     ) -> Result<(), &'static str> {
+        if reads_tlas(p) {
+            return Err(NO_HOST_TLAS);
+        }
         #[cfg(feature = "diagnostics")]
         list.twin_reader(&p.name);
         // Depth planes whose twins shaders of the list wrote are drawn
@@ -2343,6 +2360,14 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             self.dispatch_dropped(Unready::NoPipeline);
+            return;
+        }
+        // A program spliced with an inline ray query: dropped as one
+        // without a host pipeline is, the RT stand-in included, until the
+        // host TLAS is bound ([`NO_HOST_TLAS`]).
+        if crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| reads_tlas(&p)) {
+            self.rt_dropped(list, crate::rt_standin::Work::Groups([x, y, z]));
+            self.dispatch_dropped(NO_HOST_TLAS.into());
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {

@@ -54,10 +54,6 @@ use crate::native::NativeProgram;
 pub const TLAS_REGISTER: u8 = 240;
 
 /// DXR ray flags (`RAY_FLAG_*`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no site is named yet: only the tests make sites")
-)]
 pub(crate) mod ray_flags {
     pub const FORCE_OPAQUE: u32 = 0x01;
     pub const CULL_BACK_FACING_TRIANGLES: u32 = 0x10;
@@ -166,8 +162,35 @@ pub(crate) struct Source {
 
 /// The walks to splice, by the [`fingerprint`] of their program's code.
 /// Each is described by hand from its disassembly (never committed) and
-/// proven by play at translation: none yet.
-const SITES: &[(u64, Site)] = &[];
+/// proven by play at translation.
+const SITES: &[(u64, Site)] = &[(
+    // `32ed072b9f845048`, the local lights' tiled traced shadows (family A,
+    // rt-dxr.md section 4.3). The rays in v1-v3 (origin), v4 (t-max) and
+    // v6, v9, v11 (the direction, normalised); the empty-structure check
+    // branches to 0xcc4; the code after the walk reads whether it hit (v7,
+    // a node pointer), its t (v4), its iteration count (v14, against
+    // 0xfffe) and EXEC. The structure's descriptor is the third of the
+    // table in user SGPR 5.
+    0x0487_AF5C_D93B_33BD,
+    Site {
+        header: 0x170,
+        exit: 0xcc8,
+        skip: Some(0xcc4),
+        origin: [1, 2, 3],
+        direction: [6, 9, 11],
+        t_max: 4,
+        t_min: 0,
+        mask: 0xd5,
+        flags: ray_flags::FORCE_OPAQUE | ray_flags::CULL_BACK_FACING_TRIANGLES,
+        results: &[(7, Kind::Hit), (4, Kind::T), (14, Kind::Count)],
+        kept: &[Reg::S(EXEC)],
+        cap: Some(0xfffe),
+        tlas: Source {
+            user_sgpr: 5,
+            offset: 0x20,
+        },
+    },
+)];
 
 /// The site [`SITES`] names for a program's code, if any.
 pub(crate) fn site_of(code: &[u8]) -> Option<&'static Site> {
