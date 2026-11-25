@@ -938,6 +938,7 @@ fn clear(
         list.twins_written();
         crate::list::ensure_state(list, texture, UNORDERED_ACCESS);
         // A view clears one subresource, not every texel of the texture.
+        crate::resource::decode::wrote(list, texture);
         crate::texture::gpu_write(list, texture, false);
     }
     #[cfg(feature = "diagnostics")]

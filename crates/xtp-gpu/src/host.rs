@@ -829,6 +829,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
+    pub(crate) decode_uses: Mutex<crate::resource::decode::Uses>,
+    pub(crate) decode_pipeline: std::sync::atomic::AtomicBool,
     pub(crate) clamps: Mutex<crate::indirect::Runs>,
     /// The host fence value of its last submission (0: none): it is not
     /// dropped before that one has finished.
@@ -1295,6 +1297,8 @@ impl Host {
                 pipelines: Mutex::default(),
                 writer: AtomicU64::new(0),
                 budget: Mutex::default(),
+                decode_uses: Mutex::default(),
+                decode_pipeline: Default::default(),
                 clamps: Mutex::default(),
                 last: AtomicU64::new(0),
                 fresh_after: AtomicU64::new(0),
@@ -2247,6 +2251,11 @@ impl HostList {
             }
             allocator.clone()
         };
+        self.decode_uses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.decode_pipeline.store(false, Ordering::Relaxed);
         *self.clamps.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // New ones: a submission in flight keeps its own (`Recorded`).

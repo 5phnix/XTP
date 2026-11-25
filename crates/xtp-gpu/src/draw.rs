@@ -1069,6 +1069,7 @@ impl State {
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
+            crate::resource::decode::wrote(list, t as This);
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
@@ -1241,6 +1242,10 @@ impl State {
             constant_reads || root_uavs || root_srvs && crate::pipeline::host::bounded_root_srvs(),
         );
         self.set_host_heaps(list, wanted);
+        list.decode_uses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin_bind();
         self.bind_pipeline(list, p, compute);
         let picked = p
             .stages
@@ -1262,6 +1267,13 @@ impl State {
             crate::frameprobe::begin(&stage.shader.hash);
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
+            // Decoding binds a compute PSO and root signature. Restore the descriptor
+            // tables before setting the compute stage's root arguments.
+            if list.decode_pipeline.swap(false, Ordering::Relaxed) {
+                self.host_roots[1] = 0;
+                self.host_pipeline = 0;
+                self.bind_pipeline(list, p, compute);
+            }
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1422,6 +1434,7 @@ impl State {
         {
             self.writes += 1;
         }
+        crate::resource::decode::bound_writes(list);
         list.twins_written();
         Ok(())
     }
@@ -3377,6 +3390,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             crate::capture::note_target(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::passdump::written(list, *resource as This);
+            crate::resource::decode::bound_uav(list, *resource as This);
             list.twin_use(*resource as This, true, true);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
