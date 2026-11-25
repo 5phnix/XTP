@@ -209,16 +209,6 @@ fn assemble(
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
-    // A program that writes MODE: its 16- and 64-bit float instructions
-    // read it too (see `float_modes`).
-    let writes_mode = list.iter().any(|i| {
-        i.name().is_some_and(|n| {
-            matches!(
-                n,
-                "s_round_mode" | "s_denorm_mode" | "s_setreg_b32" | "s_setreg_imm32_b32"
-            ) && float_mode_field(n, &i.fields(wave64)).is_some()
-        })
-    });
     for (n, ((machine, &flow), next)) in list.into_iter().zip(flows).zip(next_offsets).enumerate() {
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
         let name = machine.name().ok_or(ShaderError::Unsupported {
@@ -247,7 +237,7 @@ fn assemble(
             if float_mode_field(name, &fields).is_some() {
                 reads.push(Reg::FloatMode);
                 writes.push(Reg::FloatMode);
-            } else if name == "v_cvt_f32_f64" || writes_mode && float_kinds(name).half() {
+            } else if name == "v_cvt_f32_f64" {
                 reads.push(Reg::FloatMode);
             }
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
@@ -390,16 +380,30 @@ fn setreg_field(name: &str, fields: &Fields) -> Option<(u32, u32)> {
 
 /// The float bits of MODE ([`FLOAT_MODE_BITS`]) that `name` writes: the
 /// field's offset in MODE (its source's bit 0 goes there) and the bits.
-/// The lowering follows them as [`Reg::FloatMode`] (`v_cvt_f32_f64` reads
-/// its rounding and denormal bits); [`float_modes`] checks what the
-/// translation cannot follow.
-pub(crate) fn float_mode_field(name: &str, fields: &Fields) -> Option<(u32, u32)> {
+/// [`float_modes`] checks every such write.
+fn mode_write(name: &str, fields: &Fields) -> Option<(u32, u32)> {
     let (offset, mask) = match name {
         "s_round_mode" => (0, 0x0F),
         "s_denorm_mode" => (4, 0xF0),
         _ => setreg_field(name, fields)?,
     };
     let mask = mask & FLOAT_MODE_BITS;
+    (mask != 0).then_some((offset, mask))
+}
+
+/// The MODE bits a lowering reads: `v_cvt_f32_f64`'s f32 rounding (0-1),
+/// f32 output denormals (5) and f64 input denormals (6).
+const LOWERED_MODE_BITS: u32 = 0x63;
+
+/// What [`mode_write`] writes of [`LOWERED_MODE_BITS`]: the writes the
+/// IR follows as [`Reg::FloatMode`], for the lowering (`set_float_mode`).
+/// The other float bits stay out of the SSA form, which nothing would read
+/// (the values a whole-wave section writes must all be ones its simulation
+/// follows, and each would put a constant in the module); [`float_modes`]
+/// checks them.
+pub(crate) fn float_mode_field(name: &str, fields: &Fields) -> Option<(u32, u32)> {
+    let (offset, mask) = mode_write(name, fields)?;
+    let mask = mask & LOWERED_MODE_BITS;
     (mask != 0).then_some((offset, mask))
 }
 
@@ -415,13 +419,6 @@ const F16_64: u8 = 2;
 pub(crate) struct FloatKinds {
     pub rounds: u8,
     pub denormals: u8,
-}
-
-impl FloatKinds {
-    /// Whether 16- or 64-bit floats are in it.
-    pub fn half(self) -> bool {
-        (self.rounds | self.denormals) & F16_64 != 0
-    }
 }
 
 /// [`FloatKinds`] of VALU opcode `name`, by its name's types: the first one
@@ -541,8 +538,8 @@ type Mode = [Field; 4];
 // programs set round toward zero before their 16-bit interpolation (about
 // 70 % of those dumped, the light loop included); the lowering of 16-bit
 // results (`input.rs`, `valu16.rs`, `valu.rs`) has to round toward zero
-// under such a mode for the results to be the console's, and the 16-bit
-// instructions read [`Reg::FloatMode`] for it.
+// under such a mode for the results to be the console's (MODE's bits 2-3
+// then in [`Reg::FloatMode`], read by the 16-bit instructions).
 pub fn float_modes(blocks: &[Block]) -> Result<FloatModes, ShaderError> {
     let refuse = |offset, what| ShaderError::Unsupported { offset, what };
     // The constant a scalar register holds, where a move of one wrote it.
@@ -554,7 +551,7 @@ pub fn float_modes(blocks: &[Block]) -> Result<FloatModes, ShaderError> {
         {
             return Err(refuse(inst.machine.offset, OTHER_MODE_BITS));
         }
-        any |= float_mode_field(inst.name(), &inst.fields).is_some();
+        any |= mode_write(inst.name(), &inst.fields).is_some();
         if let (
             "s_mov_b32" | "s_movk_i32",
             Fields::Sop {
@@ -593,7 +590,7 @@ pub fn float_modes(blocks: &[Block]) -> Result<FloatModes, ShaderError> {
         Some(source << offset & mask)
     };
     let write = |mode: &mut Mode, inst: &Inst| {
-        let Some((offset, mask)) = float_mode_field(inst.name(), &inst.fields) else {
+        let Some((offset, mask)) = mode_write(inst.name(), &inst.fields) else {
             return;
         };
         let bits = written(inst, offset, mask);

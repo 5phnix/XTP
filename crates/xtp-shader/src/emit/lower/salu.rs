@@ -11,9 +11,9 @@ use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Inst, Reg};
 
 impl<'a> Lower<'a> {
-    /// A write of MODE's float bits (`s_round_mode`, `s_denorm_mode`,
-    /// `s_setreg*` of `HW_REG_MODE`): the register's new value, which
-    /// `v_cvt_f32_f64` reads. What the translation cannot follow (an f32
+    /// A write of MODE's float bits that a lowering reads (`s_round_mode`,
+    /// `s_denorm_mode`, `s_setreg*` of `HW_REG_MODE`; `ir::float_mode_field`):
+    /// the register's new value, which `v_cvt_f32_f64` reads. What the translation cannot follow (an f32
     /// rounding other than to nearest even, a mode computed at run time
     /// reaching float instructions, denormal modes that change, MODE bits
     /// that differ by path at a conversion) is refused before lowering,
@@ -25,10 +25,10 @@ impl<'a> Lower<'a> {
     // shortcut: a 16- or 64-bit rounding other than to nearest even (BTP
     // 6's pixel programs set round toward zero before 16-bit interpolation)
     // is followed here but not applied: 16-bit results are rounded to
-    // nearest even, at most one f16 ulp from the console's. The 16- and
-    // 64-bit instructions of a program that writes MODE read it
-    // (`Reg::FloatMode`) for the lowering that will round them toward zero;
-    // `ir::float_modes_of` counts the programs it concerns.
+    // nearest even, at most one f16 ulp from the console's. Those bits are
+    // not followed here (`ir::float_mode_field`: what no lowering reads);
+    // `ir::float_modes_of` counts the programs it concerns (the survey's
+    // `f16 rounding` line).
     pub(super) fn set_float_mode(&mut self, inst: &Inst) -> Result<(), Why> {
         let (offset, mask) =
             crate::ir::float_mode_field(inst.name(), &inst.fields).ok_or("a float mode field")?;
@@ -80,8 +80,9 @@ impl<'a> Lower<'a> {
             "s_setreg_imm32_b32" | "s_setreg_b32" | "s_swappc_b64" | "s_version"
         ) || name.starts_with("s_waitcnt")
         {
-            // A MODE write of float bits is `set_float_mode`'s; one of the
-            // other float bits is refused (`ir::float_modes`).
+            // A MODE write of bits a lowering reads is `set_float_mode`'s;
+            // `ir::float_modes` has checked every MODE write (refused, or
+            // the f16 and f64 rounding counted) before lowering.
             // shortcut: the other hardware registers an `s_setreg*` writes
             // (the scratch base, MODE's trap and debug enables) have nothing
             // to set on the host; s_swappc_b64 is the vertex fetch call,

@@ -121,11 +121,12 @@ fn an_f32_rounding_mode_is_refused_where_it_reaches_f32_arithmetic() {
 }
 
 /// BTP 6's pixel programs set the 16- and 64-bit rounding toward zero
-/// before their 16-bit interpolation: not refused, counted; a 16-bit
-/// instruction of a program that writes MODE reads it, one of a program
-/// that does not, not.
+/// before their 16-bit interpolation: not refused, counted. No lowering
+/// reads those bits, so the write stays out of the SSA form (`Reg::FloatMode`
+/// is neither written nor read): the IR, and so the translation, is the one
+/// it was.
 #[test]
-fn a_16_bit_rounding_toward_zero_is_counted_and_read_by_16_bit_instructions() {
+fn a_16_bit_rounding_toward_zero_is_counted_and_stays_out_of_the_ssa_form() {
     let add16 = vop2(V_ADD_F16, 0, 1, 2);
     let rtz = setreg_imm(2, 2, 3);
     let found = modes(&[rtz[0], rtz[1], add16]);
@@ -136,15 +137,21 @@ fn a_16_bit_rounding_toward_zero_is_counted_and_read_by_16_bit_instructions() {
     // f32 arithmetic is not under the 16-bit rounding.
     let add = vop2(V_ADD_F32, 0, 1, 2);
     assert!(!modes(&[rtz[0], rtz[1], add]).half_rounding);
-    let reads_mode = |words: &[u32]| {
-        let p = build(words).unwrap();
-        let insts = p.blocks.iter().flat_map(|b| &b.insts);
-        insts
-            .filter(|i| i.name() == "v_add_f16")
-            .all(|i| i.read(Reg::FloatMode).is_some())
-    };
-    assert!(reads_mode(&[rtz[0], rtz[1], add16]));
-    assert!(!reads_mode(&[add16]));
+    let p = build(&[rtz[0], rtz[1], add16]).unwrap();
+    let insts = p.blocks.iter().flat_map(|b| &b.insts);
+    for i in insts {
+        assert!(i.read(Reg::FloatMode).is_none(), "{}", i.name());
+        assert!(i.write(Reg::FloatMode).is_none(), "{}", i.name());
+    }
+    // The f32 rounding, which `v_cvt_f32_f64` reads, is followed.
+    let f32_rne = setreg_imm(0, 2, 0);
+    let p = build(&[f32_rne[0], f32_rne[1], CVT_F32_F64]).unwrap();
+    let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
+    assert!(insts[0].write(Reg::FloatMode).is_some());
+    assert_eq!(
+        insts[1].read(Reg::FloatMode),
+        insts[0].write(Reg::FloatMode)
+    );
 }
 
 /// A mode the program computes, from a register no constant moves into,
