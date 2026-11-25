@@ -827,6 +827,8 @@ pub(crate) struct HostList {
     /// shared with its submissions ([`Recorded`]), a reset starts a new set.
     pipelines: Mutex<std::sync::Arc<std::collections::BTreeSet<String>>>,
     writer: AtomicU64,
+    /// Recorded buffer writes, including transfers and clears outside draw binding.
+    buffer_writes: AtomicU64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: Mutex<Option<(ID3D12Resource, usize)>>,
@@ -1319,6 +1321,7 @@ impl Host {
                 twins: Mutex::default(),
                 pipelines: Mutex::default(),
                 writer: AtomicU64::new(0),
+                buffer_writes: AtomicU64::new(0),
                 budget: Mutex::default(),
                 decode_uses: Mutex::default(),
                 decode_pipeline: Default::default(),
@@ -1655,18 +1658,10 @@ impl Host {
         }
     }
 
-    /// The live host copy covering a fill when an earlier submission is
-    /// writing part of it. A label or an alias alone cannot supply it.
-    pub(crate) fn fill_source(
-        &self,
-        address: u64,
-        len: u64,
-    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        let writer = self
-            .timeline
-            .fill_writer(address as usize, address.checked_add(len)? as usize)?;
-        let shadow = crate::shadow::existing(address, len)?;
-        (std::sync::Arc::as_ptr(&shadow) as usize == writer).then_some(shadow)
+    /// Identity of the host copy an earlier submission is writing in a CBV's range.
+    pub(crate) fn fill_writer(&self, address: u64, len: u64) -> Option<usize> {
+        self.timeline
+            .fill_writer(address as usize, address.checked_add(len)? as usize)
     }
 
     /// Runs `signal` once every submission made so far has finished: at
@@ -2507,6 +2502,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred
             .copies
@@ -2603,6 +2599,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.indirect_writers.record(&shadow.buffer, true);
         deferred.copies.push(Step::GpuWrite(
@@ -2622,6 +2619,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.indirect_writers.record(&shadow.buffer, false);
         deferred
@@ -2637,6 +2635,7 @@ impl HostList {
         address: usize,
         bytes: usize,
     ) {
+        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.indirect_writers.record(&shadow.buffer, false);
         deferred
@@ -2645,7 +2644,12 @@ impl HostList {
     }
 
     pub(crate) fn unknown_buffer_write(&self) {
+        self.buffer_writes.fetch_add(1, Ordering::Relaxed);
         self.deferred().indirect_writers.unknown();
+    }
+
+    pub(crate) fn buffer_writes(&self) -> u64 {
+        self.buffer_writes.load(Ordering::Relaxed)
     }
 
     pub(crate) fn indirect_writes(
@@ -3424,6 +3428,7 @@ impl Meter {
         let [back_ms, back_mb] =
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        let [cbv_copies, cbv_hits] = crate::draw::take_cbv_copies().map(|n| n as f64 / frames);
         let indirect = crate::list::take_indirect() as f64 / frames;
         // The title's threads spend `cpu` and `waited` in submissions; the
         // GPU and the copying back run beside them for the rest.
@@ -3477,7 +3482,8 @@ impl Meter {
                  longest {longest:.1} ms ({longest_gpu:.1} on the GPU, {longest_lists} lists), \
                  buffer copies {gpu_copies:.0} on the GPU {gpu_copy_mb:.1} MB and \
                  {cpu_copies:.0} on the CPU {cpu_copy_mb:.1} MB, {gpu_writes:.0} in-list writes \
-                 on the GPU, {draws:.0} draws/frame, dropped {dropped:.0} without a host \
+                 on the GPU, {cbv_copies:.1} GPU CBV copies/frame ({cbv_hits:.1} cache hits/frame), \
+                 {draws:.0} draws/frame, dropped {dropped:.0} without a host \
                  pipeline ({making} being made) and {indirect:.0} indirect",
                 submissions = title.submissions,
                 lists = title.lists,
