@@ -1978,8 +1978,16 @@ impl Host {
         let mut text = String::new();
         // DRED 1.2: the device state, each stopped list's last finished and
         // first unfinished commands with their markers, the faulting
-        // allocations' ranges.
-        text.push_str(&crate::dred::report(&self.device, runs));
+        // allocations' ranges. Our markers' texts by list, for a runtime
+        // that keeps none with its breadcrumbs (NVIDIA's did not).
+        #[cfg(feature = "diagnostics")]
+        let notes: Vec<Vec<String>> = recorded
+            .iter()
+            .map(|r| r.notes.iter().map(|(note, _)| note.clone()).collect())
+            .collect();
+        #[cfg(not(feature = "diagnostics"))]
+        let notes: Vec<Vec<String>> = Vec::new();
+        text.push_str(&crate::dred::report(&self.device, runs, &notes));
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.

@@ -7,16 +7,19 @@
 //! stopped, with the texts of our markers (`HostList::note_op`) paired with
 //! the breadcrumbs by order. This module adds:
 //!
-//! - breadcrumb contexts (`ID3D12DeviceRemovedExtendedDataSettings1`): the
-//!   runtime keeps each marker's text with its breadcrumb index, so a
-//!   command's marker is read from DRED itself, not paired by order;
 //! - the state DRED found the device in (hung, fault, page fault);
 //! - for each list that stopped, its last finished command and its first
 //!   unfinished one, each with the marker just before it: what the title's
 //!   list ran there (draw, dispatch or copy, the pipeline and its program
 //!   hashes, user data, root views and tables: `draw.rs` `op_text`);
 //! - for the allocations DRED lists at a page fault, their host address
-//!   range and where the fault lies in it.
+//!   range and where the fault lies in it;
+//! - with `XTP_D3D12_DRED=contexts`, breadcrumb contexts
+//!   (`ID3D12DeviceRemovedExtendedDataSettings1`): the runtime keeps each
+//!   marker's text with its breadcrumb. Off otherwise: on the L4 they cost
+//!   about 3 s a world frame and came back empty
+//!   (docs/analysis/device-removed.md), and markers are then paired with
+//!   our notes by order, as `host.rs` does.
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -29,13 +32,20 @@ const QUOTE: usize = 1500;
 /// Allocations listed per kind (existing, freed) at a page fault.
 const ALLOCATIONS: usize = 8;
 
-/// Turns on breadcrumb contexts, with the auto-breadcrumbs and page-fault
-/// data, before the host device is made (`host::create`), when
-/// device-removed data is on.
+/// Whether `XTP_D3D12_DRED`'s value asks for breadcrumb contexts.
+fn contexts_asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v.eq_ignore_ascii_case("contexts"))
+}
+
+/// Turns on the auto-breadcrumbs and page-fault data through the DRED 1.2
+/// settings, and breadcrumb contexts when asked (`XTP_D3D12_DRED=contexts`),
+/// before the host device is made (`host::create`), when device-removed
+/// data is on.
 pub(crate) fn enable() {
     if !crate::host::dred_on() {
         return;
     }
+    let contexts = contexts_asked(std::env::var_os("XTP_D3D12_DRED").as_deref());
     let mut settings: Option<ID3D12DeviceRemovedExtendedDataSettings1> = None;
     // SAFETY: a plain interface query and settings calls, before the
     // device is made (DRED reads them at device creation).
@@ -45,24 +55,27 @@ pub(crate) fn enable() {
                 if let Some(s) = settings {
                     s.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                     s.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    s.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    if contexts {
+                        s.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
                     tracing::info!(
-                        "device-removed data on: breadcrumbs with marker texts, page faults"
+                        contexts,
+                        "device-removed data on: breadcrumbs, page faults, marker texts kept \
+                         by DRED only with XTP_D3D12_DRED=contexts"
                     );
                 }
             }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "no DRED 1.2 settings: the report pairs markers with breadcrumbs by order"
-            ),
+            Err(e) => tracing::warn!(error = %e, "no DRED 1.2 settings"),
         }
     }
 }
 
 /// What DRED 1.2 adds to the device-removed report (`Host::removal_data`),
-/// for the lists of the submissions in flight (`runs`, by index): empty
-/// when the device has no device-removed data.
-pub(crate) fn report(device: &ID3D12Device, runs: &[&HostList]) -> String {
+/// for the lists of the submissions in flight (`runs`, by index) with the
+/// texts of the markers each one set, in order (`notes`, by the same
+/// index; empty without diagnostics): empty when the device has no
+/// device-removed data.
+pub(crate) fn report(device: &ID3D12Device, runs: &[&HostList], notes: &[Vec<String>]) -> String {
     let Ok(dred) = device.cast::<ID3D12DeviceRemovedExtendedData2>() else {
         return String::new();
     };
@@ -103,7 +116,7 @@ pub(crate) fn report(device: &ID3D12Device, runs: &[&HostList]) -> String {
         let mut lists = Vec::new();
         let mut node = crumbs.pHeadAutoBreadcrumbNode;
         while let Some(p) = node.as_ref() {
-            lists.push(Crumbs::read(p, runs));
+            lists.push(Crumbs::read(p, runs, notes));
             node = p.pNext;
         }
         text.push_str(&lists_text(&lists));
@@ -122,12 +135,30 @@ struct Crumbs {
     done: u32,
     /// The marker texts, by the breadcrumb index they belong to.
     contexts: Vec<(u32, String)>,
+    /// Where those texts come from.
+    texts: Texts,
+}
+
+/// Where a list's marker texts come from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Texts {
+    /// DRED's breadcrumb contexts.
+    Dred,
+    /// Our notes, the k-th one for the k-th marker command (as `host.rs`
+    /// pairs them).
+    Order,
+    /// Neither: no contexts and no notes for the list.
+    None,
 }
 
 impl Crumbs {
     /// # Safety
     /// `p` is a node of the runtime's breadcrumb output, still valid.
-    unsafe fn read(p: &D3D12_AUTO_BREADCRUMB_NODE1, runs: &[&HostList]) -> Self {
+    unsafe fn read(
+        p: &D3D12_AUTO_BREADCRUMB_NODE1,
+        runs: &[&HostList],
+        notes: &[Vec<String>],
+    ) -> Self {
         // SAFETY: the node's pointers are the runtime's, with their counts.
         unsafe {
             let history = if p.pCommandHistory.is_null() {
@@ -165,13 +196,29 @@ impl Crumbs {
                     || name.as_deref()
                         == Some(format!("xtp host list {:#x}", r.list.as_raw() as usize).as_str())
             });
+            let ours = run.and_then(|i| notes.get(i)).filter(|n| !n.is_empty());
+            let (contexts, texts) = match (contexts.is_empty(), ours) {
+                (false, _) => (contexts, Texts::Dred),
+                (true, Some(notes)) => (by_order(&history, notes), Texts::Order),
+                (true, None) => (contexts, Texts::None),
+            };
             Self {
                 run,
                 name,
                 history,
                 done,
                 contexts,
+                texts,
             }
+        }
+    }
+
+    /// Where its marker texts come from, for the report.
+    fn texts_text(&self) -> &'static str {
+        match self.texts {
+            Texts::Dred => "markers kept by DRED",
+            Texts::Order => "markers paired with our notes by order: DRED kept no texts",
+            Texts::None => "no marker texts: DRED kept none and the list has no notes",
         }
     }
 
@@ -202,10 +249,11 @@ fn lists_text(lists: &[Crumbs]) -> String {
         .collect();
     for l in &stopped {
         text.push_str(&format!(
-            "; {} stopped after {} of {} commands: last done {}; first not done {}",
+            "; {} stopped after {} of {} commands ({}): last done {}; first not done {}",
             l.who(),
             l.done,
             count(l),
+            l.texts_text(),
             command_text(&l.history, &l.contexts, l.done as usize - 1),
             command_text(&l.history, &l.contexts, l.done as usize),
         ));
@@ -258,6 +306,18 @@ fn command_text(
         }
         None => format!("command {at} ({}), no marker before it", op_name(op)),
     }
+}
+
+/// Our notes as marker texts: the k-th marker command of `history` gets
+/// the k-th note (`HostList::note_op` sets one marker per note).
+fn by_order(history: &[D3D12_AUTO_BREADCRUMB_OP], notes: &[String]) -> Vec<(u32, String)> {
+    history
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| **op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
+        .zip(notes)
+        .map(|((at, _), note)| (at as u32, note.clone()))
+        .collect()
 }
 
 /// The first command of a list that does work (not a marker, event or
@@ -432,7 +492,54 @@ mod tests {
             history: history.to_vec(),
             done,
             contexts,
+            texts: Texts::Dred,
         }
+    }
+
+    #[test]
+    fn contexts_are_asked_by_the_switch_value() {
+        use std::ffi::OsStr;
+        assert!(contexts_asked(Some(OsStr::new("contexts"))));
+        assert!(contexts_asked(Some(OsStr::new("Contexts"))));
+        assert!(!contexts_asked(Some(OsStr::new("1"))));
+        assert!(!contexts_asked(None));
+    }
+
+    #[test]
+    fn without_dred_texts_the_notes_are_paired_with_the_markers_by_order() {
+        // As the L4's report: notes before a run of unmarked host builds.
+        const BUILD: D3D12_AUTO_BREADCRUMB_OP =
+            D3D12_AUTO_BREADCRUMB_OP_BUILDRAYTRACINGACCELERATIONSTRUCTURE;
+        let history = [
+            MARKER, DISPATCH, MARKER, DISPATCH, BARRIER, BUILD, BARRIER, BUILD, MARKER, DISPATCH,
+        ];
+        let notes: Vec<String> = ["copy", "dispatch 4x1x1", "dispatch 5x1x1", "unused"]
+            .map(String::from)
+            .to_vec();
+        let contexts = by_order(&history, &notes);
+        assert_eq!(
+            contexts,
+            vec![
+                (0, "copy".to_owned()),
+                (2, "dispatch 4x1x1".to_owned()),
+                (8, "dispatch 5x1x1".to_owned()),
+            ]
+        );
+        let list = Crumbs {
+            run: Some(0),
+            name: None,
+            history: history.to_vec(),
+            done: 7,
+            contexts,
+            texts: Texts::Order,
+        };
+        assert_eq!(
+            lists_text(&[list]),
+            "; DRED lists: 1 (0 finished, 0 not started); list 0 stopped after 7 of 10 \
+             commands (markers paired with our notes by order: DRED kept no texts): last done \
+             command 6 (resource barrier) after marker 2: «dispatch 4x1x1»; first not done \
+             command 7 (build acceleration structure) after marker 2: «dispatch 4x1x1»"
+        );
     }
 
     #[test]
@@ -469,8 +576,9 @@ mod tests {
         assert_eq!(
             text,
             "; DRED lists: 1 (0 finished, 0 not started); list 3 stopped after 4 of 7 \
-             commands: last done command 3 (dispatch) after marker 2: «dispatch at 3»; first \
-             not done command 4 (resource barrier) after marker 2: «dispatch at 3»"
+             commands (markers kept by DRED): last done command 3 (dispatch) after marker 2: \
+             «dispatch at 3»; first not done command 4 (resource barrier) after marker 2: \
+             «dispatch at 3»"
         );
     }
 
