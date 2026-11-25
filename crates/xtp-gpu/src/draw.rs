@@ -1234,6 +1234,7 @@ impl State {
             if !staged {
                 spent += crate::texture::staged_bytes(resource).unwrap_or(0);
             }
+            crate::descriptor::host::note_heap_texture(index, at, texture, "uploaded first");
             counts.uploaded += 1;
             host.texture_slot_done(index, write);
         }
@@ -1268,6 +1269,14 @@ impl State {
                 crate::texture::Change::Yes => {
                     counts.changed += 1;
                     readable(list, &sampled, &view);
+                    if let Some(t) = crate::resource::host_resource(resource) {
+                        crate::descriptor::host::note_heap_texture(
+                            index,
+                            handle(index),
+                            t,
+                            "changed: uploaded again",
+                        );
+                    }
                 }
                 // Only the check at submission's hash tells: within a budget.
                 crate::texture::Change::Unknown(bytes) => {

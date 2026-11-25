@@ -2268,6 +2268,34 @@ impl HostHeap {
     }
 }
 
+/// A texture a pass over the textures shaders pick by index uploads
+/// (`what`: for the first time, or again after a change), at debug level
+/// under its own target, `xtp_gpu::heap_textures`
+/// (`XTP_LOG=info,xtp_gpu::heap_textures=debug`): its title slot, the
+/// address the title placed it at (none: a texture object), its host size
+/// and format. To tell whether a given texture the title fills (by its
+/// address) is taken.
+pub(crate) fn note_heap_texture(index: u32, handle: u64, texture: &ID3D12Resource, what: &str) {
+    if !tracing::enabled!(target: "xtp_gpu::heap_textures", tracing::Level::DEBUG) {
+        return;
+    }
+    let placed = match super::view(handle) {
+        Some(View::Placed(_, _, desc)) => Some(u64::from(desc[10]) | u64::from(desc[11]) << 32),
+        _ => None,
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    tracing::debug!(
+        target: "xtp_gpu::heap_textures",
+        slot = index,
+        placed = ?placed.map(|a| format!("{a:#x}")),
+        width = d.Width,
+        height = d.Height,
+        format = d.Format.0,
+        "a texture shaders pick by index: {what}"
+    );
+}
+
 /// Whether the passes have logged their first line.
 static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
