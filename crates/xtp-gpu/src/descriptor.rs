@@ -876,6 +876,33 @@ pub(crate) fn own_view_heap() -> Option<&'static host::HostHeap> {
         .as_ref()
 }
 
+/// The key of XTP's own sampler heap (no title heap is at this address).
+#[cfg(windows)]
+pub(crate) const OWN_SAMPLER_HEAP: usize = usize::MAX - 1;
+
+/// XTP's own sampler heap (made on first use), of null samplers: bound for
+/// lists that bind no sampler heap of the title's, since a root signature
+/// that indexes the sampler heap directly may only be set once one is
+/// bound (D3D12 debug layer message 1419).
+#[cfg(windows)]
+pub(crate) fn own_sampler_heap() -> Option<&'static host::HostHeap> {
+    static OWN: std::sync::OnceLock<Option<host::HostHeap>> = std::sync::OnceLock::new();
+    OWN.get_or_init(host::HostHeap::own_samplers).as_ref()
+}
+
+/// In tests: the heaps to set before a root signature that indexes both
+/// heaps directly (message 1419): `views` (XTP's own view heap if none),
+/// with XTP's own sampler heap.
+#[cfg(all(windows, test))]
+pub(crate) fn heaps_with_own_samplers(
+    views: Option<&windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>,
+) -> [Option<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>; 2] {
+    let views = views
+        .cloned()
+        .or_else(|| own_view_heap().map(|h| h.heap.clone()));
+    [views, own_sampler_heap().map(|h| h.heap.clone())]
+}
+
 /// Gives back what a list held, in one batch per heap: each host heap is
 /// locked once, not once per range. Heaps the title released since are
 /// passed over (their slots went with them), and so is a heap made since at

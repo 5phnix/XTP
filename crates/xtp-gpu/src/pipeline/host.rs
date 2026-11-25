@@ -2163,7 +2163,6 @@ mod tests {
             return;
         };
         let host = gpu.host();
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use windows::core::s;
         use xtp_shader::HwStage;
         const ITEM: &str = "struct V {
@@ -2391,7 +2390,6 @@ mod tests {
         width: u32,
         before_draw: impl FnOnce(&crate::testgpu::TitleList, D3D12_CPU_DESCRIPTOR_HANDLE),
     ) -> Vec<u8> {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use windows::core::s;
         let vs = title_shader(
             "vertex",
@@ -2447,6 +2445,7 @@ mod tests {
             )]);
             l.ClearRenderTargetView(rtv, &[11.0; 4], None);
             l.OMSetRenderTargets(1, Some(&rtv), false, None);
+            l.SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(None));
             l.SetGraphicsRootSignature(&p.root);
             l.SetPipelineState(&p.pso);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2579,7 +2578,6 @@ mod tests {
     ///   on every device, which also checks the dispatch read back here.
     #[test]
     fn wave64_compute_for_a_forced_32_lane_target() {
-        crate::testgpu::known_layer_errors(&[1419], "#45");
         use std::sync::atomic::{AtomicU64, Ordering};
         use xtp_shader::emit::{HostShader, Target};
         let test = "pipeline::host::tests::wave64_compute_for_a_forced_32_lane_target";
@@ -2734,7 +2732,8 @@ mod tests {
         l.keep(&p.pso);
         // SAFETY: an open list; live objects kept until it is reset.
         unsafe {
-            l.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            l.list
+                .SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(Some(&heap)));
             l.list.SetComputeRootSignature(&p.root);
             l.list.SetPipelineState(&p.pso);
             l.list

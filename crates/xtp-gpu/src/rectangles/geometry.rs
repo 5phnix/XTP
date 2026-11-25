@@ -414,6 +414,9 @@ mod tests {
                 let rtv = self.views.GetCPUDescriptorHandleForHeapStart();
                 let l = &list.list;
                 l.ClearRenderTargetView(rtv, &[0.0f32; 4], None);
+                // A root signature that indexes the heaps directly is set
+                // only once both are bound (debug layer message 1419).
+                l.SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(None));
                 l.SetGraphicsRootSignature(root);
                 l.SetPipelineState(pso);
                 l.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1236,6 +1239,7 @@ mod tests {
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_STREAM_OUT,
             )]);
+            l.SetDescriptorHeaps(&crate::descriptor::heaps_with_own_samplers(None));
             l.SetGraphicsRootSignature(&root);
             l.SetPipelineState(&pso);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
