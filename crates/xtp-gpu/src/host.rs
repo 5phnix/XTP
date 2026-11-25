@@ -3381,6 +3381,7 @@ impl Meter {
         let meshes = crate::meshstat::take();
         if self.logged.elapsed() >= line_every() {
             self.logged = std::time::Instant::now();
+            crate::loopstat::line();
             #[cfg(feature = "diagnostics")]
             crate::list::cuts::log();
             #[cfg(feature = "diagnostics")]
@@ -3585,6 +3586,9 @@ impl Host {
             ]);
             p.copy.close();
             self.execute(&[&p.copy]);
+            // XTP_SHADER_LOOP_COUNT: the frame's stopped lanes, once its
+            // submissions have finished.
+            crate::loopstat::presented(self, frame);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             // A captured frame is finished, to be read back; its probe is
             // still read at the next present, as every probe with frames

@@ -99,6 +99,13 @@ fn build() -> &'static [u8; 32] {
         }
         // And structured reads through raw handles (XTP_RAW_STRUCTURED).
         let raw = u32::from(xtp_shader::emit::raw_structured());
+        // And the loop-limit counter (XTP_SHADER_LOOP_COUNT), in the same
+        // word as the raw reads: bit 1 (0 without it, so the key is the
+        // one it had before the switch).
+        let raw = raw | u32::from(xtp_shader::emit::loop_count()) << 1;
+        if xtp_shader::emit::loop_count() {
+            tracing::info!("XTP_SHADER_LOOP_COUNT: translated loops count the lanes they stop");
+        }
         build_of(xtp_shader::SOURCES, ENCODING, [limit, budget, passes, raw])
     })
 }
@@ -924,6 +931,9 @@ mod tests {
             xtp_shader::emit::dxil_opt(),
             u32::from(xtp_shader::emit::raw_structured()),
         ];
+        // The loop-limit counter shares the raw reads' word (`build`).
+        let mut settings = settings;
+        settings[3] |= u32::from(xtp_shader::emit::loop_count()) << 1;
         let ours = build_of(xtp_shader::SOURCES, ENCODING, settings);
         assert_eq!(*build(), ours, "nothing but these parts");
 

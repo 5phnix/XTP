@@ -17,6 +17,11 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the host's runtime stride table is bound: `t0` in this space, a
 /// raw buffer of one [`StrideEntry`] per view-heap slot.
 pub const STRIDE_SPACE: u32 = 2;
+/// Where the host binds the loop-limit counter: `u0` in this space, a root
+/// UAV whose first dword counts the lanes of the pipeline that left a loop
+/// at XTP's limit or budget (`crate::emit::loop_count`). The host points it
+/// at the pipeline's own dword of its counters.
+pub const LOOP_COUNTER_SPACE: u32 = 2;
 
 /// What the host writes per view-heap slot in the runtime stride table, for
 /// buffers a program reads by element without a stride known when it was
@@ -224,6 +229,8 @@ pub(crate) struct Shader {
     /// Handle of the runtime stride table (`t0` in [`STRIDE_SPACE`]), if
     /// read.
     pub stride_table: Option<V>,
+    /// The loop-limit counter (`u0` in [`LOOP_COUNTER_SPACE`]) is written.
+    pub loop_counter: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -304,6 +311,7 @@ impl Shader {
             root_uavs: Vec::new(),
             tlas: None,
             stride_table: None,
+            loop_counter: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -468,6 +476,27 @@ impl Shader {
         h
     }
 
+    /// The handle of the loop-limit counter (`u0` in [`LOOP_COUNTER_SPACE`],
+    /// a raw buffer), made in DXIL block `block`: only where a lane leaves
+    /// at a limit, so that a program without one declares no counter.
+    pub fn loop_counter_handle(&mut self, block: usize) -> V {
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(LOOP_COUNTER_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        self.flags |= flags::RAW_BUFFERS;
+        self.loop_counter = true;
+        self.annotate(block, h, 0x100b, 0)
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -584,6 +613,7 @@ impl Shader {
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
             || self.stride_table.is_some()
+            || self.loop_counter
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -685,7 +715,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            if !self.root_uavs.is_empty() || self.loop_counter {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -694,13 +724,23 @@ impl Shader {
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                // (space, register) of each raw buffer bound by binding: the
+                // root UAVs, then the loop-limit counter.
+                let mut specs: Vec<(u32, u32)> = self
+                    .root_uavs
+                    .iter()
+                    .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                    .collect();
+                if self.loop_counter {
+                    specs.push((LOOP_COUNTER_SPACE, 0));
+                }
+                for (n, (space, register)) in specs.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(no),
@@ -712,8 +752,8 @@ impl Shader {
 
                     bindings.push(Binding {
                         kind: 7,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }
@@ -1088,5 +1128,43 @@ pub(crate) fn one_mode_per_row(elements: &mut [SigElement], reads: bool) {
                 e.interp = if int(e) && mode != 1 { 0 } else { mode };
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) mod tests {
+    use crate::emit::validator::Validator;
+
+    /// `dxc -dumpbin`'s listing of `shader`; none (and a note) where the
+    /// Windows SDK's `dxc.exe` is not there (`XTP_PC_DXC` names another).
+    pub(crate) fn listing(shader: &crate::emit::HostShader) -> Option<String> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dxc = match std::env::var_os("XTP_PC_DXC") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => Validator::default_path()?.with_file_name("dxc.exe"),
+        };
+        if !dxc.exists() {
+            eprintln!("no dxc.exe; the listing is not checked");
+            return None;
+        }
+        let file = std::env::temp_dir().join(format!(
+            "xtp-shader-{}-{}.dxil",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&file, &shader.dxil).unwrap();
+        let out = std::process::Command::new(&dxc)
+            .arg("-dumpbin")
+            .arg(&file)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }

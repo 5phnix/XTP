@@ -223,6 +223,8 @@ enum ComputeRoot {
     Cbv(u64),
     Srv(u64),
     Table(D3D12_GPU_DESCRIPTOR_HANDLE),
+    /// A root UAV: the loop-limit counter's dword (`loopstat`).
+    Uav(u64),
 }
 
 impl ComputeRoot {
@@ -237,6 +239,7 @@ impl ComputeRoot {
                 Self::Cbv(gpu) => l.SetComputeRootConstantBufferView(param, gpu),
                 Self::Srv(gpu) => l.SetComputeRootShaderResourceView(param, gpu),
                 Self::Table(handle) => l.SetComputeRootDescriptorTable(param, handle),
+                Self::Uav(gpu) => l.SetComputeRootUnorderedAccessView(param, gpu),
             }
         }
     }
@@ -1459,6 +1462,19 @@ impl State {
                     } else {
                         l.SetGraphicsRootShaderResourceView(param, gpu);
                     }
+                }
+            }
+        }
+        // XTP_SHADER_LOOP_COUNT: the pipeline's dword of the loop-limit
+        // counters, which its shaders add their stopped lanes to.
+        if let Some((param, slot)) = p.loop_counter {
+            let gpu = crate::loopstat::address(slot).ok_or("no loop-limit counter buffer")?;
+            // SAFETY: an open list; the counters' buffer lives for good.
+            unsafe {
+                if compute {
+                    self.compute_root(list, param, ComputeRoot::Uav(gpu));
+                } else {
+                    l.SetGraphicsRootUnorderedAccessView(param, gpu);
                 }
             }
         }
