@@ -3,11 +3,13 @@
 //! the boolean tracker loses, kept as numbers) and M2 (masks holding
 //! lanes elsewhere) start here.
 
+use std::collections::HashMap;
+
 use super::{Lower, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{EXEC, Inst, Reg, Value};
+use crate::ir::{EXEC, Inst, Program, Reg, Value};
 use crate::structure::{Atom, Bool, Structured};
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
@@ -33,6 +35,262 @@ pub(super) enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+
+/// What a pixel program stops with where a wave operation reads a mask
+/// whose helper lanes' bits [`HelperBits`] does not follow.
+pub(super) const HELPER_BITS: Why = "a lane mask whose helper lanes' bits are not followed";
+
+/// What a pixel program's helper lanes hold of a lane mask on the console.
+///
+/// A helper lane runs a pixel program for a quad's pixel the primitive does
+/// not cover. On the console, EXEC on entry holds only covered pixels;
+/// `s_wqm` adds the helper lanes of their quads, and the program takes them
+/// out again itself (`s_and_b64 exec, exec, s[live]` before its exports and
+/// stores). A mask a compare writes holds the lanes of EXEC there; a mask
+/// operation's helper bits are those of its operands'.
+///
+/// The per-lane form ([`crate::structure`]) runs every host lane, helper
+/// lanes too, as if EXEC held them from the start: each mask's per-lane bit
+/// there is a covered lane's on the console, and a helper lane's where the
+/// mask holds the helper lanes ([`Helpers::In`]), not where they are out of
+/// it ([`Helpers::Out`]). A pixel program with wave operations declares
+/// `WaveOpsIncludeHelperLanes` (SM 6.7, `shader.rs`): its helper lanes are
+/// lanes of its ballots, lane reads and reductions as on the console, and a
+/// wave operation on a mask whose helper lanes are out of it leaves them out
+/// ([`Lower::console_bit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Helpers {
+    /// A helper lane holds its per-lane bit, as a covered lane does.
+    In,
+    /// No helper lane is set.
+    Out,
+    /// Something else: helper bits that are neither (a mask with helper
+    /// lanes in or with them out, say), or not followed.
+    Other,
+}
+
+impl Helpers {
+    fn join(a: Option<Helpers>, b: Helpers) -> Helpers {
+        match a {
+            None => b,
+            Some(a) if a == b => a,
+            Some(_) => Helpers::Other,
+        }
+    }
+
+    /// The helper bits of the mask operation `f` (as `structure.rs`'s
+    /// `combine` names them) of masks with helper bits `a` and `c`: the
+    /// operation's per-lane result where each operand's helper bits are its
+    /// per-lane bits or clear, if it is one of those.
+    fn combine(f: &str, a: Helpers, c: Helpers) -> Option<Helpers> {
+        use Helpers::{In, Other, Out};
+        let both = |x| a == x && c == x;
+        Some(match f {
+            "and" if a == Out || c == Out => Out,
+            "andn2" if a == Out => Out,
+            "andn1" if c == Out => Out,
+            "or" | "xor" if both(Out) => Out,
+            "and" | "andn2" | "andn1" | "or" | "xor" | "orn2" | "orn1" | "nand" | "nor"
+            | "xnor"
+                if both(In) =>
+            {
+                In
+            }
+            "and" | "andn2" | "andn1" | "or" | "xor" | "orn2" | "orn1" | "nand" | "nor"
+            | "xnor" => Other,
+            _ => return None,
+        })
+    }
+}
+
+/// The [`Helpers`] of each lane mask of a pixel program, by the value of any
+/// of its dwords, and of EXEC where each is written.
+#[derive(Debug, Default)]
+pub(super) struct HelperBits {
+    masks: HashMap<Value, Helpers>,
+    /// EXEC's helper bits where each mask is written (entering the block,
+    /// for a join).
+    exec_at: HashMap<Value, Helpers>,
+}
+
+impl HelperBits {
+    /// Follows the masks of `p`, a pixel program, from EXEC on entry
+    /// ([`Helpers::Out`]) through compares, mask operations and joins.
+    pub(super) fn of(p: &Program) -> HelperBits {
+        use Helpers::{Other, Out};
+        let mut h = HelperBits::default();
+        let entry = p.inputs.iter().find(|i| i.0 == Reg::S(EXEC)).map(|i| i.1);
+        for &(reg, v) in &p.inputs {
+            if reg == Reg::S(EXEC) || reg == Reg::S(EXEC + 1) {
+                h.masks.insert(v, Out);
+                h.exec_at.insert(v, Out);
+            }
+        }
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        // EXEC's low dword leaving each block.
+        let mut exec_out: Vec<Option<Value>> = vec![None; p.blocks.len()];
+        // Kinds only rise (unknown, then In or Out, then Other): joins over
+        // loops settle within a few rounds.
+        for _ in 0..64 {
+            let mut changed = false;
+            for (n, &b) in order.iter().enumerate() {
+                let block = &p.blocks[b];
+                let mut exec = match block.phis.iter().find(|q| q.reg == Reg::S(EXEC)) {
+                    Some(phi) => Some(phi.value),
+                    None if n == 0 => entry,
+                    None => block.preds.iter().find_map(|&q| exec_out[q]),
+                };
+                for phi in &block.phis {
+                    let mut k = None;
+                    for a in &phi.args {
+                        if let Some(&x) = h.masks.get(a) {
+                            k = Some(Helpers::join(k, x));
+                        }
+                    }
+                    if let Some(k) = k {
+                        changed |= h.rise(phi.value, k);
+                    }
+                }
+                let entering = h.kind(exec);
+                for phi in &block.phis {
+                    changed |= h.rise_exec(phi.value, entering);
+                }
+                for inst in &block.insts {
+                    let e = h.kind(inst.read(Reg::S(EXEC)).or(exec));
+                    let (dst, new_exec) = h.step(inst, e, p.wave64);
+                    let mut set = |code: u8, k: Helpers| {
+                        for r in [code, code + 1] {
+                            if let Some(v) = inst.write(Reg::S(r)) {
+                                changed |= h.rise(v, k);
+                                changed |= h.rise_exec(v, e);
+                            }
+                        }
+                    };
+                    if let Some((code, k)) = dst {
+                        set(code, k);
+                    }
+                    if inst.write(Reg::S(EXEC)).is_some() {
+                        set(EXEC, new_exec.unwrap_or(Other));
+                    }
+                    if let Some(w) = inst.write(Reg::S(EXEC)) {
+                        exec = Some(w);
+                    }
+                }
+                exec_out[b] = exec;
+            }
+            if !changed {
+                return h;
+            }
+        }
+        // Not settled: nothing is followed.
+        for k in h.masks.values_mut().chain(h.exec_at.values_mut()) {
+            *k = Other;
+        }
+        h
+    }
+
+    /// The helper bits a mask instruction `inst` writes, run with EXEC's
+    /// helper bits `e`: its destination's (its SGPR, the bits), and the new
+    /// EXEC's.
+    fn step(
+        &self,
+        inst: &Inst,
+        e: Helpers,
+        wave64: bool,
+    ) -> (Option<(u8, Helpers)>, Option<Helpers>) {
+        use Helpers::{In, Other};
+        match &inst.fields {
+            Fields::Sop { dst, src, .. } => {
+                let width = if wave64 { "_b64" } else { "_b32" };
+                let Some(op) = inst
+                    .name()
+                    .strip_prefix("s_")
+                    .and_then(|n| n.strip_suffix(width))
+                else {
+                    return (None, None);
+                };
+                let operand = |n: usize| match src.get(n) {
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                        self.kind(inst.read(Reg::S(code)))
+                    }
+                    // All lanes or none: the same in helper lanes.
+                    Some(Operand::Const(128 | 193)) | Some(Operand::Literal(0 | u32::MAX)) => In,
+                    _ => Other,
+                };
+                let dst = match dst {
+                    Some(Operand::Scalar { code, .. }) if *code != NULL => Some(*code),
+                    _ => None,
+                };
+                let saved = op
+                    .strip_suffix("_saveexec")
+                    .map(|f| (true, f))
+                    .or_else(|| op.strip_suffix("_wrexec").map(|f| (false, f)));
+                if let Some((saveexec, f)) = saved {
+                    let new = Helpers::combine(f, operand(0), e).unwrap_or(Other);
+                    let saved = if saveexec { e } else { new };
+                    return (dst.map(|d| (d, saved)), Some(new));
+                }
+                let r = match op {
+                    "mov" => operand(0),
+                    "not" if operand(0) == In => In,
+                    "not" => Other,
+                    // Some lane of the quad: helper lanes join their quad.
+                    "wqm" => In,
+                    "cselect" => Helpers::join(Some(operand(0)), operand(1)),
+                    _ => match Helpers::combine(op, operand(0), operand(1)) {
+                        Some(r) => r,
+                        None => return (None, None),
+                    },
+                };
+                (dst.map(|d| (d, r)), Some(r))
+            }
+            Fields::Valu(v) => {
+                // A compare's (or carry's) bits: the lanes of EXEC here.
+                let name = inst.name();
+                if name.starts_with("v_cmpx") {
+                    return (None, Some(e));
+                }
+                let compare = v.dst.filter(|_| name.starts_with("v_cmp"));
+                let dst = compare.iter().chain(&v.carry).find_map(|op| match *op {
+                    Operand::Scalar { code, .. } if code != NULL => Some((code, e)),
+                    _ => None,
+                });
+                (dst, None)
+            }
+            _ => (None, None),
+        }
+    }
+
+    fn kind(&self, v: Option<Value>) -> Helpers {
+        v.and_then(|v| self.masks.get(&v).copied())
+            .unwrap_or(Helpers::Other)
+    }
+
+    /// Raises `v`'s helper bits to `k` (joined); whether they changed.
+    fn rise(&mut self, v: Value, k: Helpers) -> bool {
+        let old = self.masks.get(&v).copied();
+        let new = Helpers::join(old, k);
+        self.masks.insert(v, new);
+        old != Some(new)
+    }
+
+    fn rise_exec(&mut self, v: Value, k: Helpers) -> bool {
+        let old = self.exec_at.get(&v).copied();
+        let new = Helpers::join(old, k);
+        self.exec_at.insert(v, new);
+        old != Some(new)
+    }
+
+    /// The helper bits of mask `v` (any of its dwords).
+    pub(super) fn mask(&self, v: Value) -> Helpers {
+        self.kind(Some(v))
+    }
+
+    /// EXEC's helper bits where mask `v` is written.
+    pub(super) fn exec_at(&self, v: Value) -> Helpers {
+        self.exec_at.get(&v).copied().unwrap_or(Helpers::Other)
+    }
+}
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -133,18 +391,104 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = self.with_partial(at, bit?);
+                let console = self.console_bit(lo, at, bit)?;
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                let r = self.s.op(
+                    at,
+                    "waveActiveBallot",
+                    Attr::NoUnwind,
+                    four,
+                    116,
+                    &[console],
+                );
                 self.s.flags |= flags::WAVE_OPS;
                 let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = self.alone(self.helper_bits.exec_at(lo), at, bit, xy)?;
                 self.ballots.insert(lo, xy);
                 xy
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Whether this lane is a helper lane (a pixel program's, at `at`).
+    pub(super) fn is_helper(&mut self, at: usize) -> V {
+        self.s
+            .op(at, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[])
+    }
+
+    /// `bit`, this lane's per-lane bit of mask `v` at `at`, as the console's
+    /// wave holds it: in a pixel program, clear in a helper lane where the
+    /// mask's helper lanes are out of it ([`Helpers`]).
+    pub(super) fn console_bit(&mut self, v: Value, at: usize, bit: V) -> Result<V, Why> {
+        if !self.s.pixel {
+            return Ok(bit);
+        }
+        match self.helper_bits.mask(v) {
+            Helpers::In => Ok(bit),
+            Helpers::Out => {
+                let helper = self.is_helper(at);
+                let t = self.s.m.bool(true);
+                let covered = self.s.m.bin(at, Bin::Xor, helper, t);
+                Ok(self.s.m.bin(at, Bin::And, bit, covered))
+            }
+            Helpers::Other => Err(HELPER_BITS),
+        }
+    }
+
+    /// The words (low, high) of a ballot a lane reads where EXEC's helper
+    /// bits are `exec` (the console's ballot `xy`, in which this lane's
+    /// per-lane bit is `bit`): in a pixel program where EXEC holds no helper
+    /// lane, a helper lane, which the console does not run there, sees only
+    /// its own bit. It then runs as a wave of its own: a loop that serves
+    /// the lanes of a key it read from the mask (`s_ff1`, `v_readlane`)
+    /// serves it in its first pass, where the covered lanes' keys would
+    /// never match it.
+    pub(super) fn alone(
+        &mut self,
+        exec: Helpers,
+        at: usize,
+        bit: V,
+        xy: (V, V),
+    ) -> Result<(V, V), Why> {
+        if !self.s.pixel {
+            return Ok(xy);
+        }
+        match exec {
+            Helpers::In => Ok(xy),
+            Helpers::Out => {
+                let lane = self.s.op(
+                    at,
+                    "waveGetLaneIndex",
+                    Attr::ReadOnly,
+                    self.s.t.i32,
+                    111,
+                    &[],
+                );
+                let (k31, k5, one, z) = (
+                    self.s.m.i32(31),
+                    self.s.m.i32(5),
+                    self.s.m.i32(1),
+                    self.s.m.i32(0),
+                );
+                let sh = self.s.m.bin(at, Bin::And, lane, k31);
+                let own = self.s.m.bin(at, Bin::Shl, one, sh);
+                let word = self.s.m.bin(at, Bin::LShr, lane, k5);
+                let helper = self.is_helper(at);
+                let mine = self.s.m.bin(at, Bin::And, helper, bit);
+                let mut out = [xy.0, xy.1];
+                for (n, w) in out.iter_mut().enumerate() {
+                    let k = self.s.m.i32(n as u32);
+                    let here = self.s.m.cmp(at, pred::EQ, word, k);
+                    let set = self.s.m.bin(at, Bin::And, mine, here);
+                    let own = self.s.m.select(at, set, own, z);
+                    *w = self.s.m.select(at, helper, own, *w);
+                }
+                Ok((out[0], out[1]))
+            }
+            Helpers::Other => Err(HELPER_BITS),
+        }
     }
 
     pub(super) fn boolean(&mut self, b: Bool, at: usize) -> Result<V, Why> {

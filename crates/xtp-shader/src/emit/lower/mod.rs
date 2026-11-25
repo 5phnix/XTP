@@ -364,6 +364,8 @@ struct Lower<'a> {
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
     /// How lane masks become data.
     mask_data: MaskData,
+    /// A pixel program's masks' helper lanes (empty in other programs).
+    helper_bits: mask::HelperBits,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
@@ -926,6 +928,11 @@ impl<'a> Lower<'a> {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
+            },
+            helper_bits: if x.native.stage == HwStage::Ps {
+                mask::HelperBits::of(p)
+            } else {
+                mask::HelperBits::default()
             },
             mask_ok: false,
             ballots: HashMap::new(),
