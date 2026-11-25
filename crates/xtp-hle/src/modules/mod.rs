@@ -12,6 +12,8 @@
 pub mod apu;
 pub mod audio;
 pub mod autopilot;
+#[cfg(windows)]
+pub mod bvhbuilder;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;

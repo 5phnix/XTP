@@ -226,6 +226,7 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    let with_dlls = xtp_hle::modules::bvhbuilder::WithBuilderTrace(&with_dlls);
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -404,6 +405,7 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
+                let resolver = xtp_hle::modules::bvhbuilder::WithBuilderTrace(&resolver);
                 for (name, dll) in &new {
                     register_builder(name, &self.title_dir)?;
                     println!(
