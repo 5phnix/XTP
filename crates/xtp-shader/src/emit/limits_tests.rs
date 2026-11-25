@@ -248,7 +248,7 @@ fn cube_program(face: &[u32], inst: [u32; 2]) -> Vec<u32> {
     let s_mov = |d: u32, src: u32| 0xBE80_0300 | d << 16 | src;
     let s_load = |op: u32, d: u32, base: u32, offset: u32| {
         [
-            0xF400_0000 | op << 18 | d << 6 | base / 2,
+            0xF400_0000 | op << 18 | d << 6 | (base / 2),
             0xFA00_0000 | offset,
         ]
     };

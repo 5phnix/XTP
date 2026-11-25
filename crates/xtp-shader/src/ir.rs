@@ -582,10 +582,10 @@ pub fn float_modes(blocks: &[Block]) -> Result<FloatModes, ShaderError> {
     let written = |inst: &Inst, offset: u32, mask: u32| -> Option<u32> {
         let source = match &inst.fields {
             Fields::Sopp { imm } => Some(u32::from(*imm) & 0xF),
-            Fields::Sop { src, .. } => match src.first()? {
-                &Operand::Literal(x) => Some(x),
-                &Operand::Const(c) => crate::resource::inline(c),
-                &Operand::Scalar { code, .. } => constants.get(&inst.read(Reg::S(code))?).copied(),
+            Fields::Sop { src, .. } => match *src.first()? {
+                Operand::Literal(x) => Some(x),
+                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Scalar { code, .. } => constants.get(&inst.read(Reg::S(code))?).copied(),
                 _ => None,
             },
             _ => None,

@@ -87,7 +87,7 @@ impl Layer {
     /// A float constant: a face id, or a face id plus 8 × a slice.
     fn of_constant(bits: u32) -> Layer {
         let x = f32::from_bits(bits);
-        if !(x >= 0.0 && x.fract() == 0.0 && x < 16_777_216.0) {
+        if !((0.0..16_777_216.0).contains(&x) && x.fract() == 0.0) {
             return Layer::Unknown;
         }
         match (x as u32 % 8, x < 8.0) {
@@ -1373,7 +1373,9 @@ impl<'a> Lower<'a> {
     fn eight_times(&self, inst: &Inst, f: &crate::gfx10::Valu, k: usize) -> bool {
         if let Some(bits) = self.constant(inst, f, k) {
             let x = f32::from_bits(bits);
-            return x >= 0.0 && x < 16_777_216.0 && x.fract() == 0.0 && x as u32 % 8 == 0;
+            return (0.0..16_777_216.0).contains(&x)
+                && x.fract() == 0.0
+                && (x as u32).is_multiple_of(8);
         }
         let Some(&Operand::Vector { reg, .. }) = f.src.get(k) else {
             return false;
