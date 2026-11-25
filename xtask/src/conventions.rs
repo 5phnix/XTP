@@ -97,6 +97,313 @@ pub fn check_header(header: &str) -> Vec<String> {
     if len > MAX_HEADER {
         problems.push(format!("{len} characters, more than {MAX_HEADER}"));
     }
+    if let Some(evidence) = french(header) {
+        problems.push(not_english(&evidence));
+    }
+    problems
+}
+
+/// Accented letters of French that English text does not use.
+const FRENCH_LETTERS: &[char] = &[
+    'é', 'è', 'à', 'ç', 'ù', 'â', 'ê', 'î', 'ô', 'û', 'É', 'È', 'À', 'Ç', 'Ù', 'Â', 'Ê', 'Î', 'Ô',
+    'Û',
+];
+
+/// French function words that are not English words: one is enough.
+const FRENCH_WORDS: &[&str] = &[
+    "les", "dans", "avec", "sont", "cette", "ces", "leur", "leurs", "mais", "donc", "quand",
+    "aussi", "nous", "vous", "ainsi", "chaque", "puis", "selon",
+];
+
+/// French function words that an English text may hold on its own (a
+/// cipher, an abbreviation, an LLVM predicate, a loanword): they count only
+/// with a second sign of French on the same line.
+const WEAK_FRENCH_WORDS: &[&str] = &[
+    "une", "des", "est", "pour", "sans", "sur", "pas", "que", "qui", "du", "ne", "il", "le", "la",
+    "un", "de", "et", "ou", "si", "au", "aux",
+];
+
+/// Why a line is rejected, with what gave it away.
+fn not_english(evidence: &str) -> String {
+    format!("{evidence} reads as French: commit messages, code comments and docs are in English")
+}
+
+/// Whether `line` reads as French; if so, the words that gave it away.
+///
+/// Left out: `Ported from <project> (commit) by <login>` lines and git
+/// trailers (`Signed-off-by: ...`), which carry names; text between
+/// backticks or double quotes (identifiers, quoted output); URLs and
+/// `@login`s; capitalized words with accents (proper names); all-caps words
+/// (acronyms).
+pub fn french(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.starts_with("Ported from ") || is_trailer(line) {
+        return None;
+    }
+    let mut strong = Vec::new();
+    let mut weak = Vec::new();
+    for chunk in unquoted(line).split_whitespace() {
+        let chunk = chunk.trim_start_matches(|c: char| "([{<*".contains(c));
+        if chunk.starts_with('@') || chunk.contains("://") {
+            continue;
+        }
+        for word in chunk.split(|c: char| !(c.is_alphanumeric() || "_-'’".contains(c))) {
+            let word = word.trim_matches(|c| c == '\'' || c == '’' || c == '-');
+            if word.is_empty() {
+                continue;
+            }
+            let lower = word.to_lowercase();
+            let capitalized = word.chars().next().is_some_and(char::is_uppercase);
+            let all_caps = word.chars().filter(|c| c.is_alphabetic()).count() > 1
+                && !word.chars().any(char::is_lowercase);
+            if all_caps {
+                continue;
+            }
+            let lowercase_rest = word.chars().skip(1).all(|c| !c.is_uppercase());
+            if !lowercase_rest {
+                continue;
+            }
+            if is_elision(word) {
+                strong.push(word.to_owned());
+            } else if word.contains(FRENCH_LETTERS) {
+                if !capitalized {
+                    strong.push(word.to_owned());
+                }
+            } else if FRENCH_WORDS.contains(&lower.as_str()) {
+                strong.push(word.to_owned());
+            } else if WEAK_FRENCH_WORDS.contains(&lower.as_str()) {
+                weak.push(word.to_owned());
+            }
+        }
+    }
+    let signs = strong.len() + weak.len();
+    if strong.is_empty() && signs < 2 {
+        return None;
+    }
+    let shown: Vec<String> = strong
+        .into_iter()
+        .chain(weak)
+        .take(3)
+        .map(|w| format!("`{w}`"))
+        .collect();
+    Some(shown.join(", "))
+}
+
+/// `c'est`, `d'un`, `l'adresse`, `qu'il`: a French elided article or pronoun.
+fn is_elision(word: &str) -> bool {
+    let Some((stem, rest)) = word.split_once(['\'', '’']) else {
+        return false;
+    };
+    let stem = stem.to_lowercase();
+    ["c", "d", "j", "l", "m", "n", "s", "t", "qu", "jusqu", "lorsqu", "puisqu"]
+        .contains(&stem.as_str())
+        && rest.chars().next().is_some_and(char::is_alphabetic)
+        // `C's`, `T's`: an English possessive.
+        && !rest.eq_ignore_ascii_case("s")
+}
+
+/// A git trailer such as `Signed-off-by: Name <mail>`.
+fn is_trailer(line: &str) -> bool {
+    line.split_once(": ").is_some_and(|(key, _)| {
+        key.ends_with("-by") && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// `line` without what stands between backticks or double quotes.
+fn unquoted(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut open: Option<char> = None;
+    for c in line.chars() {
+        match open {
+            Some(q) if c == q => {
+                open = None;
+                out.push(' ');
+            }
+            Some(_) => {}
+            None if matches!(c, '`' | '"' | '“' | '«') => {
+                open = Some(match c {
+                    '“' => '”',
+                    '«' => '»',
+                    other => other,
+                });
+            }
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// Where a line of Rust source leaves the lexer, for the next line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Lexer {
+    #[default]
+    Code,
+    /// Inside a `"..."` string.
+    Str,
+    /// Inside a raw string with this many `#`.
+    RawStr(usize),
+    /// Inside a block comment, this deep.
+    Block(usize),
+}
+
+/// The comment text of one line of Rust source (`//` to the end of the
+/// line, or what lies inside block comments), given where the previous
+/// line left `state`, which it updates. Strings and char literals are not
+/// comments.
+pub fn rust_comment(line: &str, state: &mut Lexer) -> Option<String> {
+    let b = line.as_bytes();
+    fn push(comment: &mut Option<String>, text: &str) {
+        match comment {
+            Some(c) => {
+                c.push(' ');
+                c.push_str(text);
+            }
+            None => *comment = Some(text.to_owned()),
+        }
+    }
+    let mut comment: Option<String> = None;
+    let mut block_start = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let rest = &b[i..];
+        match *state {
+            Lexer::Code => {
+                if rest.starts_with(b"//") {
+                    push(&mut comment, &line[i + 2..]);
+                    return comment;
+                } else if rest.starts_with(b"/*") {
+                    *state = Lexer::Block(1);
+                    i += 2;
+                    block_start = i;
+                    continue;
+                } else if b[i] == b'"' {
+                    *state = Lexer::Str;
+                } else if b[i] == b'r' && raw_prefix(&b[..i]) {
+                    let hashes = rest[1..].iter().take_while(|&&c| c == b'#').count();
+                    if rest.get(1 + hashes) == Some(&b'"') {
+                        *state = Lexer::RawStr(hashes);
+                        i += 2 + hashes;
+                        continue;
+                    }
+                } else if b[i] == b'\'' {
+                    // A char literal (`'"'`, `'\''`, `'é'`) or a lifetime.
+                    let after = &line[i + 1..];
+                    // `'\x41'`: the quote that closes it comes after the
+                    // escaped character.
+                    let len = if let Some(escape) = after.strip_prefix('\\') {
+                        escape.get(1..).and_then(|s| s.find('\'')).map(|n| n + 2)
+                    } else {
+                        after
+                            .chars()
+                            .next()
+                            .map(char::len_utf8)
+                            .filter(|&n| after[n..].starts_with('\''))
+                    };
+                    if let Some(len) = len {
+                        i += len + 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            Lexer::Str => {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'"' {
+                    *state = Lexer::Code;
+                }
+                i += 1;
+            }
+            Lexer::RawStr(hashes) => {
+                if b[i] == b'"' && rest[1..].iter().take_while(|&&c| c == b'#').count() >= hashes {
+                    *state = Lexer::Code;
+                    i += 1 + hashes;
+                    continue;
+                }
+                i += 1;
+            }
+            Lexer::Block(depth) => {
+                if rest.starts_with(b"*/") {
+                    if depth == 1 {
+                        push(&mut comment, &line[block_start..i]);
+                        *state = Lexer::Code;
+                    } else {
+                        *state = Lexer::Block(depth - 1);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if rest.starts_with(b"/*") {
+                    *state = Lexer::Block(depth + 1);
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+    if matches!(state, Lexer::Block(_)) {
+        push(&mut comment, &line[block_start.min(line.len())..]);
+    }
+    comment
+}
+
+/// Whether an `r` after `before` may start a raw string: it does not end
+/// an identifier, or follows a lone `b` or `c` (`br"..."`, `cr"..."`).
+fn raw_prefix(before: &[u8]) -> bool {
+    let ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+    match before {
+        [] => true,
+        [.., p, b'b' | b'c'] if !ident(p) => true,
+        [b'b' | b'c'] => true,
+        [.., p] => !ident(p),
+    }
+}
+
+/// Problems with the Rust comments that a unified diff (`git diff -U0`)
+/// adds: each added `.rs` line whose comment reads as French.
+pub fn check_diff(diff: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut file: Option<&str> = None;
+    let mut line_no = 0usize;
+    // `-U0` shows no context: a string or block comment the hunk does not
+    // open itself is not seen.
+    let mut state = Lexer::Code;
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            file = path.strip_prefix("b/").filter(|p| p.ends_with(".rs"));
+            continue;
+        }
+        if line.starts_with("--- ") {
+            continue;
+        }
+        if let Some(hunk) = line.strip_prefix("@@ ") {
+            // `@@ -a,b +c,d @@`: added lines are numbered from c.
+            line_no = hunk
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix('+'))
+                .and_then(|range| range.split(',').next()?.parse().ok())
+                .unwrap_or(0);
+            state = Lexer::Code;
+            continue;
+        }
+        let Some(added) = line.strip_prefix('+') else {
+            continue;
+        };
+        if let Some(path) = file
+            && let Some(comment) = rust_comment(added, &mut state)
+            && let Some(evidence) = french(&comment)
+        {
+            problems.push(format!(
+                "{path}:{line_no}: comment `{}`: {}",
+                comment.trim(),
+                not_english(&evidence)
+            ));
+        }
+        line_no += 1;
+    }
     problems
 }
 
@@ -113,6 +420,15 @@ pub fn check_message(message: &str) -> Vec<String> {
         && !second.trim().is_empty()
     {
         problems.push("a blank line must separate the header from the body".to_owned());
+    }
+    for (i, line) in message.lines().enumerate().skip(1) {
+        if let Some(evidence) = french(line) {
+            problems.push(format!(
+                "line {} of the message: {}",
+                i + 1,
+                not_english(&evidence)
+            ));
+        }
     }
     problems
 }
@@ -210,7 +526,8 @@ pub fn commits(root: &Path, base: &str, head: &str) -> Result<Vec<Commit>> {
 }
 
 /// Problems with every commit of `base..head`, each prefixed with the short
-/// commit id and its header. Also returns how many commits were checked.
+/// commit id and its header, then with the Rust comments the range adds
+/// (see [`check_diff`]). Also returns how many commits were checked.
 pub fn check_range(root: &Path, base: &str, head: &str) -> Result<(usize, Vec<String>)> {
     let commits = commits(root, base, head)?;
     let mut problems = Vec::new();
@@ -221,7 +538,36 @@ pub fn check_range(root: &Path, base: &str, head: &str) -> Result<(usize, Vec<St
             problems.push(format!("commit {short} `{header}`: {p}"));
         }
     }
+    problems.extend(check_diff(&added_rust_lines(root, base, head)?));
     Ok((commits.len(), problems))
+}
+
+/// `git diff -U0` of the Rust files between where `head` left `base` and
+/// `head`: what the range adds, not what `base` gained since.
+fn added_rust_lines(root: &Path, base: &str, head: &str) -> Result<String> {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            "-U0",
+            &format!("{base}...{head}"),
+            "--",
+            "*.rs",
+        ])
+        .current_dir(root)
+        .output()
+        .context("running git diff")?;
+    if !out.status.success() {
+        bail!(
+            "git diff {base}...{head} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// The commit to compare a local branch against: where it left the first of
@@ -326,6 +672,144 @@ mod tests {
         assert!(!check_message("core: add x\nWhy it is needed.\n").is_empty());
         assert!(!check_message("\ncore: add x\n").is_empty());
         assert!(!check_message("").is_empty());
+    }
+
+    #[test]
+    fn accepts_english_text() {
+        for line in [
+            "gpu: clamp indirect draw arguments",
+            "The fcmp predicate une is unordered or not equal; oeq is ordered.",
+            "Decrypt with DES, then compare (EST timestamps).",
+            "Ported from Xenia (0123abcd) by @josé-dev",
+            "Signed-off-by: José Núñez <jose@example.org>",
+            "Thanks to Clément and Hervé for the trace.",
+            "The title logs `les registres` and \"une erreur est survenue\".",
+            "See https://example.org/les-pages-de-garde for the layout.",
+            "A naïve copy is on par with du -sh.",
+            "It's the lane's address; don't read the user's copy.",
+            "Pour the samples into the ring buffer.",
+            "Sans-serif glyphs come from the font atlas.",
+            "The dumps of session C's run and of the L's corner.",
+        ] {
+            assert_eq!(french(line), None, "{line}");
+        }
+        ok("shader: lower une and ueq fcmp predicates");
+        assert!(check_message("core: add x\n\nPorted from Xenia (0123abcd) by @josé\n").is_empty());
+    }
+
+    #[test]
+    fn rejects_french_text() {
+        for (line, word) in [
+            ("corrige les draws indirects", "`les`"),
+            ("SAFETY: la passe lit la sortie via une UAV.", "`une`"),
+            ("Une page de garde du titre que la copie lit", "`Une`"),
+            ("lire uniquement si le premier dword est accessible", "`si`"),
+            (
+                "Pour un TBUFFER sur SRV, le format vient de l'instruction.",
+                "`l'instruction`",
+            ),
+            ("Un SRV racine n'a pas de borne D3D.", "`n'a`"),
+            ("garde déjà posée", "`déjà`"),
+            ("Dans ce cas, rien à faire", "`Dans`"),
+        ] {
+            let found = french(line).unwrap_or_default();
+            assert!(found.contains(word), "{line}: {found:?}");
+        }
+        bad("gpu: corrige les draws indirects", "reads as French");
+        bad("hle: unité de copie", "`unité`");
+        let message = "core: add x\n\nThe copy runs first.\nPuis la garde est posée.\n";
+        let problems = check_message(message);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("line 4 of the message"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn finds_the_comment_of_a_rust_line() {
+        let comment = |line: &str| rust_comment(line, &mut Lexer::Code);
+        assert_eq!(comment("let x = 1; // one").as_deref(), Some(" one"));
+        assert_eq!(comment("    /// doc").as_deref(), Some("/ doc"));
+        assert_eq!(
+            comment("let a = 1; /* b */ let c = 2;").as_deref(),
+            Some(" b ")
+        );
+        assert_eq!(comment("let url = \"https://les.example\";"), None);
+        assert_eq!(
+            comment("let s = \"a \\\" // b\"; // c").as_deref(),
+            Some(" c")
+        );
+        assert_eq!(
+            comment("let r = r#\"a\" // b\"#; // c").as_deref(),
+            Some(" c")
+        );
+        assert_eq!(
+            comment("let q = ['\"', '\\'', '\\\\', 'é']; // d").as_deref(),
+            Some(" d")
+        );
+        assert_eq!(
+            comment("fn f<'a>(x: &'a str) {} // e").as_deref(),
+            Some(" e")
+        );
+
+        // A string or a block comment that goes on to the next lines.
+        let mut state = Lexer::Code;
+        assert_eq!(rust_comment("let s = \"one", &mut state), None);
+        assert_eq!(rust_comment("// still the string", &mut state), None);
+        assert_eq!(
+            rust_comment("end\"; /* open", &mut state).as_deref(),
+            Some(" open")
+        );
+        assert_eq!(
+            rust_comment("  inside", &mut state).as_deref(),
+            Some("  inside")
+        );
+        assert_eq!(
+            rust_comment("close */ x();", &mut state).as_deref(),
+            Some("close ")
+        );
+        assert_eq!(state, Lexer::Code);
+    }
+
+    #[test]
+    fn checks_the_comments_a_diff_adds() {
+        let diff = "\
+diff --git a/crates/a/src/lib.rs b/crates/a/src/lib.rs
+--- a/crates/a/src/lib.rs
++++ b/crates/a/src/lib.rs
+@@ -3,2 +3,0 @@
+-// Lit les registres du titre.
+-// Une page de garde.
+@@ -10,0 +8,4 @@
++// Reads the title's registers.
++let msg = \"les registres sont lus\"; // logged as is
++    /// Copie les pages dans la vue.
++fn une() {}
+diff --git a/docs/notes.md b/docs/notes.md
+--- a/docs/notes.md
++++ b/docs/notes.md
+@@ -1,0 +1 @@
++// Les notes en français.
+diff --git a/crates/a/src/new.rs b/crates/a/src/new.rs
+--- /dev/null
++++ b/crates/a/src/new.rs
+@@ -0,0 +1,2 @@
++//! Module d'entrée.
++pub fn f() {}
+";
+        let problems = check_diff(diff);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].starts_with("crates/a/src/lib.rs:10:"),
+            "{problems:?}"
+        );
+        assert!(problems[0].contains("`les`"), "{problems:?}");
+        assert!(
+            problems[1].starts_with("crates/a/src/new.rs:1:"),
+            "{problems:?}"
+        );
+        assert!(check_diff("").is_empty());
     }
 
     #[test]
@@ -457,5 +941,36 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("`Fix stuff.`"), "{problems:?}");
         assert!(check_range(dir.path(), "main", "no-such-branch").is_err());
+
+        // French on main before the branch left it is not the range's.
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("old.rs"), "// Les gardes.\n").unwrap();
+        git(&["add", "old.rs"]);
+        git(&["commit", "-q", "-m", "core: add the old file"]);
+        git(&["checkout", "-q", "-b", "french", "main"]);
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "// Reads the guard.\nfn f() {} // pour chaque page\n",
+        )
+        .unwrap();
+        git(&["add", "lib.rs"]);
+        git(&["commit", "-q", "-m", "core: corrige les gardes"]);
+        git(&["checkout", "-q", "main"]);
+        git(&[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "core: après la branche",
+        ]);
+
+        let (count, problems) = check_range(dir.path(), "main", "french").unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].contains("`core: corrige les gardes`"),
+            "{problems:?}"
+        );
+        assert!(problems[1].starts_with("lib.rs:2: "), "{problems:?}");
     }
 }
