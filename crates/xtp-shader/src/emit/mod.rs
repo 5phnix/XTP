@@ -111,6 +111,8 @@ pub(crate) mod lower;
 #[cfg(all(test, windows))]
 mod r1_tests;
 #[cfg(all(test, windows))]
+mod r4_tests;
+#[cfg(all(test, windows))]
 mod raw_tests;
 pub mod rect_gs;
 mod sampler;
@@ -341,6 +343,8 @@ pub const DISPATCH_THREADS: RootType = RootType::Other(0x104);
 pub const PACKED_ADDRESS_SRV: RootType = RootType::Other(0x105);
 pub const SCALAR_ADDRESS_SRV: RootType = RootType::Other(0x106);
 pub const VECTOR_ADDRESS_SRV: RootType = RootType::Other(0x107);
+/// Slot d'une SRV brute alignée, suivi en bits 0..3 du décalage de la base du titre.
+pub const INDEXED_ADDRESS_SRV: RootType = RootType::Other(0x108);
 
 /// Entries before slot 0's in the host's runtime stride table
 /// ([`StrideEntry`]): slot `i`'s entry is at `(i + STRIDE_HEADER) * 8`. The
