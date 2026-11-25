@@ -416,7 +416,20 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// between edges is a phi ([`Atom::Phi`]). Guard vector instructions with
 /// [`Structured::execs`] and ignore [`Structured::exits`]' conditions.
 pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
-    run(Lanes::new(program, true)?)
+    match run(Lanes::new(program, true)?) {
+        // The console flow takes every branch with the whole wave and guards
+        // each vector instruction with EXEC (`execs`): what a lane knows on
+        // entering a block only narrows guards and branch conditions that
+        // flow does not use. Where that knowledge grows too large (a long
+        // program, every mask join a phi there), the console form goes
+        // without it: each block entered knowing nothing.
+        Err(e) if e == TOO_LARGE => {
+            let mut l = Lanes::new(program, true)?;
+            l.unknowing = true;
+            run(l)
+        }
+        r => r,
+    }
 }
 
 fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
@@ -425,7 +438,11 @@ fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
         while let Some(key) = l.console_pending.pop() {
             l.mask(key);
         }
-        let cond = l.paths()?;
+        let cond = if l.unknowing {
+            vec![Bool::TRUE; l.p.blocks.len()]
+        } else {
+            l.paths()?
+        };
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
             return l.finish(&execs, &cond);
@@ -443,6 +460,9 @@ struct Lanes<'a> {
     p: &'a Program,
     /// See [`structure_console`].
     console: bool,
+    /// The console form without what lanes know on entering each block
+    /// (see [`structure_console`]).
+    unknowing: bool,
     console_pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
@@ -527,6 +547,7 @@ impl<'a> Lanes<'a> {
         Ok(Lanes {
             p,
             console,
+            unknowing: false,
             console_pending: Vec::new(),
             order,
             index,
@@ -584,10 +605,14 @@ impl<'a> Lanes<'a> {
         let mut exec_out: Vec<Halves> = vec![(None, None); p.blocks.len()];
         for n in 0..self.order.len() {
             let b = self.order[n];
-            let mut c = if n == 0 { Bool::TRUE } else { Bool::FALSE };
+            let mut c = if n == 0 || self.unknowing {
+                Bool::TRUE
+            } else {
+                Bool::FALSE
+            };
             for k in 0..self.incoming[b].len() {
                 let (q, taken) = self.incoming[b][k];
-                if self.index[q] < n {
+                if self.index[q] < n && !self.unknowing {
                     let e = self.edge(self.first[q], q, taken);
                     c = self.b.or(c, e);
                 }
@@ -1074,6 +1099,38 @@ impl<'a> Lanes<'a> {
         })
     }
 
+    /// Whether scalar operation `inst` tests bits of a number held in a
+    /// register that holds a mask on another path: one source is a constant
+    /// that is no lane set (neither none nor all lanes), another a join of
+    /// values one of which a scalar memory read loads. The console compiler
+    /// reuses registers across paths: such a join is a mask where the path
+    /// it came by left one and a number where a load did, and a bit test of
+    /// it with a constant is the number's (a flag word read after the load).
+    /// Its result is a number, not a mask.
+    fn tests_a_reused_number(&self, inst: &Inst, src: &[Operand]) -> bool {
+        let p = self.p;
+        let all = if p.wave64 { u64::MAX } else { u64::from(u32::MAX) };
+        let constant = |v: u64| v != 0 && v != all;
+        let lane_set = src.iter().any(|op| match *op {
+            Operand::Literal(x) => constant(u64::from(x)),
+            Operand::Const(c @ 129..=192) => constant(u64::from(c) - 128),
+            _ => false,
+        });
+        let loaded = |v: Value| {
+            self.defs
+                .get(&v)
+                .is_some_and(|&(b, i)| matches!(p.blocks[b].insts[i].fields, Fields::Smem { .. }))
+        };
+        let reused = src.iter().any(|op| match *op {
+            Operand::Scalar { code, .. } if code != NULL => inst
+                .read(Reg::S(code))
+                .and_then(|v| self.phis.get(&v))
+                .is_some_and(|&(b, i)| p.blocks[b].phis[i].args.iter().any(|&a| loaded(a))),
+            _ => false,
+        });
+        lane_set && reused
+    }
+
     /// Records the masks `inst` defines; `exec` is EXEC there, if known.
     fn step(&mut self, inst: &Inst, exec: Option<Bool>) {
         let name = inst.name();
@@ -1089,6 +1146,7 @@ impl<'a> Lanes<'a> {
                         takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
                     }
                 }
+                takes_mask &= !self.tests_a_reused_number(inst, src);
                 let touches_exec =
                     inst.write(Reg::S(EXEC)).is_some() || inst.read(Reg::S(EXEC)).is_some();
                 if (takes_mask || touches_exec)
