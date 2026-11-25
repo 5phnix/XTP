@@ -59,7 +59,6 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -241,11 +240,13 @@ fn precook(o: Options) -> Result<()> {
     };
     let counts = gpu::counts();
     let replay = o.pipelines.then(|| {
-        let mut r = replay(threads, o.wait.then_some(&machine), replay_bound());
-        if r.error.is_none() {
-            r.coverage = Some(pack_effects(&data).map(|pack| Coverage::of(&pack, &r.sets)));
-        }
-        r
+        replay(
+            threads,
+            o.wait.then_some(&machine),
+            replay_bound(),
+            &data,
+            derive_wanted(),
+        )
     });
     let saved = gpu::finish();
     let seconds = started.elapsed().as_secs_f64();
@@ -644,26 +645,17 @@ struct Replay {
     /// The BLAKE3 of the file as read (the descriptions made), for the
     /// note.
     digest: String,
-    /// The shader sets of the kept descriptions (their containers' BLAKE3,
-    /// sorted), each once.
-    sets: HashSet<Vec<[u8; 32]>>,
-    /// What the pack's effects say of them ([`pack_effects`]); why not,
-    /// if they were not read.
+    /// After the kept pipelines, those derived from the pack's effects
+    /// (`xtp_gpu::pipeline::precook::derive`), and of them those ready.
+    derived: usize,
+    derived_ready: usize,
+    /// What the pack's effects say of the kept pipelines ([`Coverage`]);
+    /// why not, if they were not read.
     coverage: Option<Result<Coverage, String>>,
 }
 
-/// The shader sets of the pack's passes that draw, by its effects
-/// (`xtp_gpu::pipeline::effects`).
-struct PackSets {
-    effects: usize,
-    passes: usize,
-    /// Passes that name programs not in the pack.
-    outside: usize,
-    draws: usize,
-    sets: HashSet<Vec<[u8; 32]>>,
-}
-
-/// What the pack's effects say against the kept descriptions.
+/// What the pack's effects say against the kept descriptions, and what was
+/// derived from them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Coverage {
     effects: usize,
@@ -675,30 +667,25 @@ struct Coverage {
     sets: usize,
     /// Of those sets, how many the kept descriptions have; and how many
     /// sets they have that no pass names.
-    kept: usize,
+    covered: usize,
     other: usize,
+    /// The sets without a kept description that got derived ones, and how
+    /// many.
+    derived_sets: usize,
+    derived: usize,
 }
 
-impl Coverage {
-    fn of(pack: &PackSets, kept: &HashSet<Vec<[u8; 32]>>) -> Coverage {
-        let covered = pack.sets.intersection(kept).count();
-        Coverage {
-            effects: pack.effects,
-            passes: pack.passes,
-            outside: pack.outside,
-            draws: pack.draws,
-            sets: pack.sets.len(),
-            kept: covered,
-            other: kept.len() - covered,
-        }
-    }
-}
-
-/// The shader sets of the pack's passes that draw, from its effects
-/// (`xtp_gpu::pipeline::effects`): each program by its container as the
-/// title passes it (its record unpacked), whatever its stage; a pass with
-/// a record that does not unpack is left out.
-fn pack_effects(data: &[u8]) -> Result<PackSets, String> {
+/// The pack's effects (`xtp_gpu::pipeline::effects`), and its records,
+/// whose containers they name.
+fn pack_effects(
+    data: &[u8],
+) -> Result<
+    (
+        xtp_gpu::pipeline::effects::Effects,
+        Vec<xtp_game::sgd5::Record<'_>>,
+    ),
+    String,
+> {
     use xtp_gpu::pipeline::effects;
     let records: Vec<xtp_game::sgd5::Record<'_>> = xtp_game::sgd5::records(data).collect();
     let found: Vec<effects::Record> = records
@@ -708,43 +695,25 @@ fn pack_effects(data: &[u8]) -> Result<PackSets, String> {
             name: r.name.map(str::len),
         })
         .collect();
-    let read = effects::read(data, &found)?;
-    let mut hashes: std::collections::HashMap<usize, Option<[u8; 32]>> = Default::default();
-    let mut sets = HashSet::new();
-    let mut draws = 0;
-    for pass in read.passes.iter().filter(|p| p.draws()) {
-        draws += 1;
-        let set = pass
-            .programs
-            .iter()
-            .enumerate()
-            .filter(|&(list, _)| list != effects::COMPUTE)
-            .filter_map(|(_, program)| *program)
-            .map(|i| {
-                *hashes
-                    .entry(i)
-                    .or_insert_with(|| records[i].unpack().map(|c| *blake3::hash(&c).as_bytes()))
-            })
-            .collect::<Option<Vec<_>>>();
-        if let Some(mut set) = set {
-            set.sort_unstable();
-            sets.insert(set);
-        }
-    }
-    Ok(PackSets {
-        effects: read.effects.len(),
-        passes: read.passes.len(),
-        outside: read.passes.iter().filter(|p| p.outside).count(),
-        draws,
-        sets,
-    })
+    Ok((effects::read(data, &found)?, records))
+}
+
+/// Whether descriptions are derived from the pack's effects for the shader
+/// sets no kept description has (`XTP_PRECOOK_DERIVE`, unless `0`).
+fn derive_wanted() -> bool {
+    std::env::var("XTP_PRECOOK_DERIVE").map_or(true, |v| v.trim() != "0")
 }
 
 impl Replay {
-    /// Counts the `outcomes` of the kept pipelines made (each at most
-    /// once); the others were left.
-    fn count(&mut self, outcomes: &[Replayed]) {
-        for o in outcomes {
+    /// Counts the `outcomes` of the pipelines made (each at most once, by
+    /// its index: the kept ones, then the derived ones); the others were
+    /// left.
+    fn count(&mut self, outcomes: &[(usize, Replayed)]) {
+        for &(i, o) in outcomes {
+            if i >= self.kept {
+                self.derived_ready += usize::from(o == Replayed::Ready);
+                continue;
+            }
             match o {
                 Replayed::Ready => self.ready += 1,
                 Replayed::Untranslated => self.untranslated += 1,
@@ -752,7 +721,7 @@ impl Replay {
                 Replayed::Panicked => self.panicked += 1,
             }
         }
-        self.left = self.kept.saturating_sub(outcomes.len());
+        self.left = (self.kept + self.derived).saturating_sub(outcomes.len());
     }
 }
 
@@ -779,10 +748,17 @@ impl From<xtp_gpu::pipeline::precook::Replayed> for Replayed {
 }
 
 /// Makes the graphics and mesh pipelines sessions kept into the library,
-/// on `threads` threads, for `bound` at most, pausing while `machine` says
-/// a title runs.
+/// then (with `derive`) those derived from the effects of the pack in
+/// `data` for the shader sets no kept one has, on `threads` threads, for
+/// `bound` at most, pausing while `machine` says a title runs.
 #[cfg(windows)]
-fn replay(threads: usize, machine: Option<&Machine>, bound: Duration) -> Replay {
+fn replay(
+    threads: usize,
+    machine: Option<&Machine>,
+    bound: Duration,
+    data: &[u8],
+    derive: bool,
+) -> Replay {
     use xtp_gpu::pipeline::precook as gpu;
 
     let started = Instant::now();
@@ -798,8 +774,24 @@ fn replay(threads: usize, machine: Option<&Machine>, bound: Duration) -> Replay 
             return out;
         }
     };
-    out.sets = std::mem::take(&mut recorded.shader_sets);
-    out.kept = recorded.len();
+    out.coverage = Some(pack_effects(data).map(|(effects, records)| {
+        let d = gpu::derive(&mut recorded, &effects, derive, |i| {
+            records.get(i)?.unpack()
+        });
+        Coverage {
+            effects: effects.effects.len(),
+            passes: effects.passes.len(),
+            outside: effects.passes.iter().filter(|p| p.outside).count(),
+            draws: effects.passes.iter().filter(|p| p.draws()).count(),
+            sets: d.sets,
+            covered: d.covered,
+            other: d.other,
+            derived_sets: d.derived_sets,
+            derived: d.descriptions,
+        }
+    }));
+    out.derived = recorded.derived;
+    out.kept = recorded.len() - recorded.derived;
     out.damaged = recorded.damaged;
     out.missing = recorded.missing;
     out.repeated = recorded.repeated;
@@ -811,12 +803,13 @@ fn replay(threads: usize, machine: Option<&Machine>, bound: Duration) -> Replay 
     out.digest = recorded.digest.clone();
     if !recorded.is_empty() {
         println!(
-            "precook: {} graphics and mesh pipelines kept by sessions ({} s at most)",
-            recorded.len(),
+            "precook: {} graphics and mesh pipelines kept by sessions and {} derived ({} s at most)",
+            out.kept,
+            out.derived,
             bound.as_secs()
         );
     }
-    let outcomes: Vec<Replayed> = parallel(
+    let outcomes: Vec<(usize, Replayed)> = parallel(
         recorded.len(),
         threads,
         machine,
@@ -826,10 +819,7 @@ fn replay(threads: usize, machine: Option<&Machine>, bound: Duration) -> Replay 
             Ok(o) => o.into(),
             Err(_) => Replayed::Panicked,
         },
-    )
-    .into_iter()
-    .map(|(_, o)| o)
-    .collect();
+    );
     out.count(&outcomes);
     let after = gpu::counts();
     out.made = after.made - before.made;
@@ -1128,9 +1118,15 @@ fn replay_lines(r: &Replay) -> String {
                 c.outside,
                 c.draws,
                 c.sets,
-                c.kept,
-                c.kept as f64 * 100.0 / c.sets.max(1) as f64,
+                c.covered,
+                c.covered as f64 * 100.0 / c.sets.max(1) as f64,
                 c.other
+            );
+            let _ = writeln!(
+                o,
+                "derived      {} descriptions for {} shader sets without a kept one (their \
+                 passes' shaders with the states kept for passes like them): {} ready",
+                c.derived, c.derived_sets, r.derived_ready
             );
         }
         Some(Err(e)) => {
@@ -1394,29 +1390,44 @@ mod tests {
         assert_eq!(without.new_generation(Some(&then), bound), None);
     }
 
-    /// The kept descriptions cover the pack's shader sets they have; those
-    /// no pass names are counted apart.
+    /// The outcomes of the kept pipelines and of the derived ones (after
+    /// them) are counted apart, the pipelines not started as left; the
+    /// report says the pack's coverage and what was derived.
     #[test]
-    fn coverage_counts_the_packs_sets_the_kept_descriptions_have() {
-        let set = |a: u8, b: u8| vec![[a; 32], [b; 32]];
-        let pack = PackSets {
-            effects: 2,
-            passes: 5,
-            outside: 1,
-            draws: 4,
-            sets: [set(1, 2), set(1, 3), set(4, 5)].into_iter().collect(),
-        };
-        let kept = [set(1, 3), set(4, 5), set(6, 7)].into_iter().collect();
-        let c = Coverage::of(&pack, &kept);
-        assert_eq!((c.sets, c.kept, c.other), (3, 2, 1));
-        let r = Replay {
+    fn kept_and_derived_pipelines_are_counted_apart() {
+        let mut r = Replay {
             kept: 3,
-            coverage: Some(Ok(c)),
+            derived: 4,
+            coverage: Some(Ok(Coverage {
+                effects: 2,
+                passes: 9,
+                outside: 1,
+                draws: 6,
+                sets: 3,
+                covered: 2,
+                other: 1,
+                derived_sets: 1,
+                derived: 4,
+            })),
             ..Replay::default()
         };
-        assert!(replay_lines(&r).contains(
-            "4 draw, with 3 shader sets; the kept descriptions have 2 of them (66.7 %), and 1 sets no pass names"
+        r.count(&[
+            (0, Replayed::Ready),
+            (2, Replayed::Untranslated),
+            (3, Replayed::Ready),
+            (5, Replayed::Refused),
+            (1, Replayed::Ready),
+        ]);
+        assert_eq!(
+            (r.ready, r.untranslated, r.derived_ready, r.left),
+            (2, 1, 1, 2)
+        );
+        let text = replay_lines(&r);
+        assert!(text.contains(
+            "6 draw, with 3 shader sets; the kept descriptions have 2 of them (66.7 %), and 1 sets no pass names"
         ));
+        assert!(text.contains("derived      4 descriptions for 1 shader sets"));
+        assert!(text.contains("): 1 ready"));
     }
 
     #[test]

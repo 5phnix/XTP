@@ -100,6 +100,9 @@ pub struct Pass {
     pub effect: usize,
     /// Each list's program: its record, in the records given to [`read`].
     pub programs: [Option<usize>; LISTS],
+    /// The rest of its entry: its render state, as the effect gives it
+    /// (the title overrides it at creation).
+    pub state: [u8; 24 - LISTS],
     /// It names programs its effect does not list: they are not in the
     /// pack (in the title's, 18 effects list no programs at all, among them
     /// the `_bvh8` variants of the ray-tracing ones, while their 670
@@ -236,6 +239,7 @@ fn file(
                 out.passes.push(Pass {
                     effect: index,
                     programs: if outside { [None; LISTS] } else { programs },
+                    state: bytes[LISTS..].try_into().expect("18 bytes"),
                     outside,
                 });
             }
@@ -588,6 +592,7 @@ mod tests {
         let outside: Vec<bool> = e.passes.iter().map(|p| p.outside).collect();
         assert_eq!(outside, [false, false, false, false, false, true, false]);
         assert!(!e.passes[5].draws());
+        assert_eq!(e.passes[0].state[..6], [0, 0, 0, 0xff, 0, 0]);
         assert_eq!(e.passes[6].effect, 3);
     }
 
