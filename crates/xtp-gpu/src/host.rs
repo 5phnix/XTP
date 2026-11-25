@@ -1078,7 +1078,7 @@ struct Deferred {
     rt_maps: Vec<std::sync::Arc<crate::rt::BlasMap>>,
     rt_recording: Option<std::sync::Arc<()>>,
     rt_size_page: crate::rt::compaction::SizePage,
-    rt_results: Vec<std::sync::Arc<ID3D12Resource>>,
+    rt_results: Vec<std::sync::Arc<crate::rt::ResultBuffer>>,
     /// Dynamic descriptor slots leased by this recording.
     dynamic: Vec<DynamicLease>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -2752,7 +2752,7 @@ impl HostList {
         Some((address, slot))
     }
 
-    pub(crate) fn keep_rt_result(&self, result: &std::sync::Arc<ID3D12Resource>) {
+    pub(crate) fn keep_rt_result(&self, result: &std::sync::Arc<crate::rt::ResultBuffer>) {
         self.deferred().rt_results.push(result.clone());
     }
 

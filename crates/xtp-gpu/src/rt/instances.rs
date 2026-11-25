@@ -7,7 +7,7 @@ use windows::core::s;
 /// resources share one immutable lifetime across TLAS builds, copies and dispatches.
 pub(crate) struct BlasMap {
     upload: ID3D12Resource,
-    generations: Vec<(u64, Arc<ID3D12Resource>, Arc<Producer>)>,
+    generations: Vec<(u64, Arc<ResultBuffer>, Arc<Producer>)>,
 }
 
 impl BlasMap {
@@ -21,7 +21,7 @@ impl BlasMap {
             unsafe {
                 data.cast::<[u64; 2]>()
                     .add(i)
-                    .write([title, s.result.GetGPUVirtualAddress()])
+                    .write([title, s.result.gpu()])
             };
             generations.push((title, s.result.clone(), s.producer.clone()));
         }
@@ -52,7 +52,7 @@ impl BlasMap {
                 // List replay waits for its prior execution before rewriting these rows.
                 unsafe {
                     let address = if producer.submitted.load(Ordering::Acquire) {
-                        resource.GetGPUVirtualAddress()
+                        resource.gpu()
                     } else {
                         0
                     };

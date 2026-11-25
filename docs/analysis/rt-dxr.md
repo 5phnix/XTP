@@ -660,8 +660,12 @@ Per title structure address, as VIctory #702 keys them (section 11):
   another list is still pending, the consumer's upload resolves that row
   at submission. The TLAS retains the candidate BLAS generations across
   address reuse. Every consuming recording pins the TLAS and its table.
-- **Allocation and ordering.** AS results, scratch and rewritten instances
-  use the card heap reserve. An unreferenced result at a reused title
+- **Allocation and ordering.** Small AS results share 1 MiB pages in 256-byte slices.
+  Scratch and rewritten instances use separate on-demand heaps. RT backing
+  allocations together may use up to one eighth of the DXGI local budget,
+  capped at 512 MiB. Growth also preserves one sixteenth of the local
+  budget (up to 256 MiB) for other work. If DXGI cannot report a budget
+  or either limit is reached, allocation is refused and logged. An unreferenced result at a reused title
   address can be rebuilt in place if it is large enough. Scratch is reused
   per list. Consecutive builds in a batch share their intervening UAV
   barrier. Releasing a title buffer or remapping loose title memory retires

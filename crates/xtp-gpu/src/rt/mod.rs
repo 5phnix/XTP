@@ -1,5 +1,7 @@
 //! Host DXR builds recorded alongside the title's builder commands.
 
+mod allocation;
+pub(crate) use allocation::ResultBuffer;
 pub(crate) mod compaction;
 mod instances;
 #[cfg(feature = "diagnostics")]
@@ -72,46 +74,7 @@ fn buffer(rec: &Recorder<'_>, bytes: u64, state: D3D12_RESOURCE_STATES) -> Optio
         }
         return Some(buffer);
     }
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: bytes,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        ..Default::default()
-    };
-    let mut resource = None;
-    // SAFETY: one committed, shader-writable buffer with a state matching its use.
-    unsafe {
-        device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            &desc,
-            state,
-            None,
-            &mut resource,
-        )
-    }
-    .ok()?;
-    if let Some(started) = started {
-        tracing::debug!(
-            bytes,
-            state = state.0,
-            us = started.elapsed().as_micros() as u64,
-            "host DXR buffer allocation"
-        );
-    }
-    resource
+    None
 }
 
 fn width(buffer: &ID3D12Resource) -> u64 {
@@ -137,7 +100,7 @@ impl<'a> Recorder<'a> {
     fn build(
         &self,
         inputs: &Inputs,
-        reuse: Option<Arc<ID3D12Resource>>,
+        reuse: Option<Arc<ResultBuffer>>,
         ordered: bool,
     ) -> Option<Structure> {
         let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
@@ -151,12 +114,8 @@ impl<'a> Recorder<'a> {
         }
         // A retired allocation can serve a later generation at the same title address.
         let result = match reuse {
-            Some(resource) if width(&resource) >= sizes.ResultDataMaxSizeInBytes => resource,
-            _ => Arc::new(buffer(
-                self,
-                sizes.ResultDataMaxSizeInBytes,
-                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-            )?),
+            Some(resource) if resource.bytes >= sizes.ResultDataMaxSizeInBytes => resource,
+            _ => ResultBuffer::new(self, sizes.ResultDataMaxSizeInBytes)?,
         };
         let mut scratch = self
             .list
@@ -190,7 +149,7 @@ impl<'a> Recorder<'a> {
             self.commands.BuildRaytracingAccelerationStructure(
                 &Build {
                     Inputs: *inputs,
-                    DestAccelerationStructureData: result.GetGPUVirtualAddress(),
+                    DestAccelerationStructureData: result.gpu(),
                     ScratchAccelerationStructureData: scratch_address,
                     SourceAccelerationStructureData: 0,
                 },
@@ -213,7 +172,7 @@ impl<'a> Recorder<'a> {
         source: &Structure,
         mode: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE,
     ) -> Option<Structure> {
-        let capacity = width(&source.result);
+        let capacity = source.result.bytes;
         let bytes = match mode {
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE => capacity,
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT => {
@@ -231,18 +190,13 @@ impl<'a> Recorder<'a> {
             }
             _ => return None,
         };
-        let dest = buffer(
-            self,
-            bytes,
-            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-        )?;
-        let dest = Arc::new(dest);
+        let dest = ResultBuffer::new(self, bytes)?;
         self.list.keep_rt_result(&dest);
         // SAFETY: independent AS resources in the required state, retained through execution.
         unsafe {
             self.commands.CopyRaytracingAccelerationStructure(
-                dest.GetGPUVirtualAddress(),
-                source.result.GetGPUVirtualAddress(),
+                dest.gpu(),
+                source.result.gpu(),
                 mode,
             );
             self.commands.ResourceBarrier(&[uav_barrier()]);
@@ -282,7 +236,7 @@ impl Producer {
 #[derive(Clone)]
 struct Structure {
     producer: Arc<Producer>,
-    result: Arc<ID3D12Resource>,
+    result: Arc<ResultBuffer>,
     // Only TLAS generations refer to a snapshot of the BLAS address space.
     instances: Option<Arc<BlasMap>>,
     compacted_size: Option<Arc<AtomicU64>>,
@@ -348,7 +302,7 @@ impl Registry {
         previous
     }
 
-    fn begin(&mut self, start: u64, bytes: Option<u64>) -> (u64, Option<Arc<ID3D12Resource>>) {
+    fn begin(&mut self, start: u64, bytes: Option<u64>) -> (u64, Option<Arc<ResultBuffer>>) {
         let owner = crate::shadow::buffer_owner(start);
         let end = match (bytes.filter(|&n| n > 0), owner) {
             (Some(n), Some((_, end))) => start.saturating_add(n).min(end),
@@ -417,7 +371,7 @@ pub unsafe fn host_tlas(list: *const Object, title_tlas: u64) -> Option<u64> {
     }
     entry.retain(list);
     // SAFETY: the list owns this resource until the GPU has finished the recording.
-    Some(unsafe { entry.result.GetGPUVirtualAddress() })
+    Some(entry.result.gpu())
 }
 
 /// Compatibility name for the recording-scoped lookup.

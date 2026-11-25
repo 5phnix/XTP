@@ -65,7 +65,7 @@ const RESERVE: u64 = HEAP / 2;
 
 /// Free ranges of a heap: best fit, merged when given back.
 #[derive(Default)]
-struct Ranges {
+pub(crate) struct Ranges {
     /// Offset → length.
     by_offset: BTreeMap<u64, u64>,
     /// (length, offset).
@@ -74,7 +74,7 @@ struct Ranges {
 }
 
 impl Ranges {
-    fn new(size: u64) -> Ranges {
+    pub(crate) fn new(size: u64) -> Ranges {
         let mut r = Ranges::default();
         r.insert(0, size);
         r
@@ -94,7 +94,7 @@ impl Ranges {
 
     /// The offset of `len` bytes taken from the smallest free range that
     /// holds them.
-    fn take(&mut self, len: u64) -> Option<u64> {
+    pub(crate) fn take(&mut self, len: u64) -> Option<u64> {
         let &(size, offset) = self.by_size.range((len, 0)..).next()?;
         self.remove(offset, size);
         if size > len {
@@ -104,7 +104,7 @@ impl Ranges {
     }
 
     /// Gives `[offset, offset + len)` back, merged with its free neighbours.
-    fn give(&mut self, mut offset: u64, mut len: u64) {
+    pub(crate) fn give(&mut self, mut offset: u64, mut len: u64) {
         if let Some((&before, &n)) = self.by_offset.range(..offset).next_back()
             && before + n == offset
         {
@@ -124,6 +124,7 @@ impl Ranges {
 }
 
 struct Heap {
+    _rt: Option<RtReservation>,
     id: u64,
     heap: ID3D12Heap,
     size: u64,
@@ -185,6 +186,7 @@ impl State {
         let id = self.next_id;
         self.next_id += 1;
         self.heaps.push(Heap {
+            _rt: None,
             id,
             heap,
             size,
@@ -269,14 +271,85 @@ fn card_pool(device: &ID3D12Device) -> Option<&'static Pool> {
     STARTED.get_or_init(|| pool.start_reserve()).then_some(pool)
 }
 
-/// Place an RT result, scratch or instance buffer in its required initial state.
+/// Actual local memory backing RT pages and heaps, including allocations
+/// still held by recordings. Concurrent heap creation reserves before D3D12.
+static RT_RESERVED: AtomicU64 = AtomicU64::new(0);
+pub(crate) struct RtReservation(u64);
+
+fn fits_rt_budget(reserved: u64, size: u64, budget: u64, used: u64) -> bool {
+    let cap = (budget / 8).min(512 << 20);
+    let headroom = (budget / 16).min(256 << 20);
+    size <= cap.saturating_sub(reserved)
+        && size <= budget.saturating_sub(used).saturating_sub(headroom)
+}
+
+impl RtReservation {
+    pub(crate) fn allocate<T>(
+        device: &ID3D12Device,
+        size: u64,
+        make: impl FnOnce() -> Option<T>,
+    ) -> Option<(T, Self)> {
+        static GROW: Mutex<()> = Mutex::new(());
+        let _grow = GROW.lock().unwrap_or_else(|e| e.into_inner());
+        let (budget, used) = crate::dxgi::video_memory(device).unwrap_or_default();
+        let granted = RT_RESERVED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+            fits_rt_budget(reserved, size, budget, used).then(|| reserved + size)
+        });
+        if let Err(reserved) = granted {
+            static REFUSED: AtomicU64 = AtomicU64::new(0);
+            let refused = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if refused.is_power_of_two() {
+                tracing::warn!(
+                    size,
+                    reserved,
+                    budget,
+                    used,
+                    refused,
+                    "host DXR memory budget exhausted"
+                );
+            }
+            return None;
+        }
+        let reservation = Self(size);
+        Some((make()?, reservation))
+    }
+}
+
+impl Drop for RtReservation {
+    fn drop(&mut self) {
+        RT_RESERVED.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
+
+/// Scratch and instance buffers use on-demand heaps separate from title
+/// shadows. Releasing the last placed resource returns the heap's budget.
 pub(crate) fn rt_buffer(
     device: &ID3D12Device,
     size: u64,
     state: D3D12_RESOURCE_STATES,
 ) -> Option<ID3D12Resource> {
-    card_pool(device)?
-        .place_in_state(size, state)
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    let pool = POOL.get_or_init(|| Pool::new(Kind::Card, device));
+    let len = size.max(1).checked_next_multiple_of(ALIGN)?;
+    let room = if let Some(room) = {
+        let mut s = pool.lock();
+        s.take(len)
+    } {
+        room
+    } else {
+        let bytes = if enabled() { len.max(4 << 20) } else { len };
+        let (heap, charge) = RtReservation::allocate(device, bytes, || pool.make_heap(bytes))?;
+        let mut s = pool.lock();
+        // A simultaneous release can supply a better fit while CreateHeap runs.
+        if let Some(room) = s.take(len) {
+            room
+        } else {
+            s.add(heap, bytes);
+            s.heaps.last_mut()?._rt = Some(charge);
+            s.take(len)?
+        }
+    };
+    pool.place_room(room, len, size, state)
         .map(|(resource, _)| resource)
 }
 
@@ -529,6 +602,13 @@ impl Pool {
         if let Some(h) = s.heaps.iter_mut().find(|h| h.id == heap) {
             h.free.give(offset, len);
         }
+        if let Some(i) = s
+            .heaps
+            .iter()
+            .position(|h| h.id == heap && h._rt.is_some() && h.free.free == h.size)
+        {
+            s.heaps.swap_remove(i);
+        }
         // Room for a waiting thread, or an empty heap to release.
         self.changed.notify_all();
     }
@@ -550,12 +630,23 @@ impl Pool {
         #[cfg(test)]
         before_placing(size);
         let len = size.max(1).next_multiple_of(ALIGN);
+        let room = self.room(len)?;
+        self.place_room(room, len, size, state)
+    }
+
+    fn place_room(
+        &'static self,
+        room: Room,
+        len: u64,
+        size: u64,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let Room {
             heap,
             id,
             offset,
             dirty,
-        } = self.room(len)?;
+        } = room;
         let flags = if self.kind == Kind::Upload {
             D3D12_RESOURCE_FLAG_NONE
         } else {
@@ -580,6 +671,8 @@ impl Pool {
         // SAFETY: a buffer placed in our heap, in a range of its own;
         // mapped as committed ones are (but in the card's memory, which
         // cannot be).
+        let mut lease_created = false;
+        // SAFETY: the room is exclusively reserved through the resource lease.
         let made = unsafe {
             self.device
                 .CreatePlacedResource(&heap, offset, &desc, state, None, &mut buffer)
@@ -589,6 +682,7 @@ impl Pool {
                         b.Map(0, None, Some(&mut data))?;
                     }
                     let lease = Lease::interface(self, id, offset, len);
+                    lease_created = true;
                     b.SetPrivateDataInterface(&LEASE, &lease)
                 })
         };
@@ -597,8 +691,8 @@ impl Pool {
             (made, buffer) => {
                 // Not leased (or the lease went with the resource, giving
                 // the range back): give it back if it did not.
-                let leased = buffer.is_some_and(|b| has_lease(&b));
-                if !leased {
+                drop(buffer);
+                if !lease_created {
                     self.give(id, offset, len);
                 }
                 if let Err(e) = made {
@@ -624,6 +718,7 @@ impl Pool {
 const LEASE: GUID = GUID::from_u128(0x6a1f_02c4_3b7d_4e1a_9c55_8d0e_b2f3_7a61);
 
 /// Whether a resource holds a lease (and so gives its range back itself).
+#[cfg(test)]
 fn has_lease(resource: &ID3D12Resource) -> bool {
     let mut size = 0u32;
     // SAFETY: asks the size of our private data only.
@@ -1216,5 +1311,18 @@ mod tests {
                 "room again once the first copy is gone"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod rt_budget_tests {
+    use super::fits_rt_budget;
+    #[test]
+    fn rt_budget_limits_physical_growth_and_leaves_local_headroom() {
+        let mib = 1 << 20;
+        assert!(fits_rt_budget(496 * mib, 16 * mib, 8192 * mib, 0));
+        assert!(!fits_rt_budget(497 * mib, 16 * mib, 8192 * mib, 0));
+        assert!(!fits_rt_budget(0, 16 * mib, 1024 * mib, 945 * mib));
+        assert!(!fits_rt_budget(0, 1, 0, 0));
     }
 }

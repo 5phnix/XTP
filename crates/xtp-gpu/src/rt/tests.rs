@@ -211,7 +211,7 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT.0
         ));
         assert_eq!(
-            width(&registry().structures[&compacted.address()].result),
+            registry().structures[&compacted.address()].result.bytes,
             bytes
         );
         assert!(Builder.copy(
@@ -239,6 +239,12 @@ fn rt_ray_hits_the_cloned_blas_at_two_units() {
         let a = host_tlas_for_list(list.this(), first.address()).unwrap();
         let b = host_tlas_for_list(list.this(), second.address()).unwrap();
         assert_ne!(a, b);
+        assert_eq!(a % 256, 0);
+        assert_eq!(b % 256, 0);
+        assert!(
+            a.abs_diff(b) < 65536,
+            "small TLAS results share one physical page"
+        );
         assert_eq!(host_tlas(list.this(), first.address()), Some(a));
         assert_eq!(host_tlas(list.this(), second.address()), Some(b));
         let mut table = [0u64; 20];
