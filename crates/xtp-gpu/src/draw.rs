@@ -1938,6 +1938,9 @@ impl State {
         let pass = host.texture_pass()?;
         let started = std::time::Instant::now();
         let mut counts = PassCounts::default();
+        // The slots this pass uploads, first and again (`XTP_PASS_DUMP`).
+        #[cfg(feature = "diagnostics")]
+        let mut uploads: (Vec<u32>, Vec<u32>) = Default::default();
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -2044,6 +2047,8 @@ impl State {
             }
             readable(list, &sampled, &view);
             crate::descriptor::host::note_heap_texture(index, at, texture, "uploaded first");
+            #[cfg(feature = "diagnostics")]
+            uploads.0.push(index);
             counts.uploaded += 1;
             host.texture_slot_done(index, write);
         }
@@ -2196,6 +2201,8 @@ impl State {
                     texture,
                     "changed: uploaded again",
                 );
+                #[cfg(feature = "diagnostics")]
+                uploads.1.push(index);
             }
         }
         if let Some(last) = last {
@@ -2203,6 +2210,21 @@ impl State {
         }
         counts.bytes = spent + refreshes.made();
         counts.us = started.elapsed().as_micros() as u64;
+        // In the pass dump (`XTP_PASS_DUMP`), as an op of this list: the
+        // slots whose uploads run before this list's commands and after the
+        // lists submitted before it, against the draws that pick them
+        // (faces black in the G-buffer: Samuel's watch 38, item 490).
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!(
+                "texture pass of heap {:#x}, frame {}: uploaded first {:?}, uploaded again {:?}; {} due left",
+                title.start,
+                pass.frame,
+                uploads.0,
+                uploads.1,
+                pass.left(&counts)
+            )
+        });
         host.texture_pass_done(&pass, counts);
         Some(counts)
     }
@@ -5247,6 +5269,134 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::resource::memory_remapped(address as usize, KIB_64 as usize);
         // SAFETY: the reservation made above; nothing is placed in it now.
         unsafe { VirtualFree(address as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A view of a texture the title fills, which the title copies into its
+    /// placed heap as bytes (no call sees it) and a shader picks by index:
+    /// its host slot is never made and no pass serves it, so the program
+    /// reads zeros. Once the look before a submission has mirrored it
+    /// (`descriptor::sync_heaps`, ported from Marvisak/VIctory (86a5ed6) by
+    /// Marvisak), the slot is made and the pass over textures picked by
+    /// index uploads it: the program reads the title's texels.
+    #[test]
+    fn textures_copied_into_the_heap_as_bytes_are_read_by_shaders_picking_them() {
+        use crate::resource::tests_support::{committed, sampled};
+        use crate::testgpu::{TitleBuffer, TitleList};
+        let test =
+            "draw::tests::textures_copied_into_the_heap_as_bytes_are_read_by_shaders_picking_them";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        if crate::descriptor::host::heap_textures_budget().is_none() {
+            return;
+        }
+        let (cs, used) = texture_picking_program();
+        let (root, pso) = compute_pipeline(host, &cs);
+        let heap = crate::descriptor::PlacedTestHeap::views(8);
+        let title = crate::descriptor::heap(heap.this);
+        let at = |i: u64| title.start + i * 32;
+        let null = std::ptr::null();
+        let (slots, out) = (TitleBuffer::new(1 << 12), TitleBuffer::new(1 << 12));
+        // The index and the output, as in the test above, through calls.
+        let mut srv = [0u32; 10];
+        (srv[0], srv[1], srv[2], srv[6], srv[8]) = (39, 1, 0x1688, 1024, 1);
+        crate::descriptor::create_srv(null, slots.resource(), &srv, at(0));
+        let mut uav = [0u32; 10];
+        (uav[1], uav[4], uav[5]) = (1, 16, 16);
+        crate::descriptor::create_uav(null, out.resource(), null, &uav, at(1));
+        let views = title.host().expect("a host heap");
+        // A texture object the title fills: its view made where no heap
+        // sees it, then its 32 bytes copied into slot 5.
+        let object = committed(&sampled(16, 16, 28));
+        let started = std::time::Instant::now();
+        while crate::resource::host_resource(object).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never resident");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (memory, desc) = crate::resource::texture_memory(object).unwrap();
+        let size = crate::resource::texture_layout(&desc).unwrap().size as usize;
+        // SAFETY: the texture's own title memory, `size` bytes.
+        unsafe { memory.cast_mut().write_bytes(0x11, size) };
+        let record = [0u64; 4];
+        let texture_2d = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_srv(null, object, &texture_2d, record.as_ptr() as u64);
+        // SAFETY: slot 5 of the heap, in memory it holds.
+        unsafe {
+            std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), at(5) as *mut u8, 32);
+        }
+        let texel = |words: &[u32]| -> Option<u8> {
+            let first = f32::from_bits(words[0]);
+            words
+                .iter()
+                .all(|&w| w == words[0])
+                .then(|| (first * 255.0).round() as u8)
+        };
+        // One dispatch picking `slot`, after a pass if `pass`.
+        let run = |slot: u32, pass: bool| -> Vec<u32> {
+            slots.set_words(|i| if i == 0 { slot } else { 0 });
+            out.set_words(|_| 0);
+            let list = TitleList::new();
+            let l = list.host();
+            let mut state = state(heap.this);
+            heaps(&mut state, l);
+            state.set_table(true, 1, title.start);
+            state.tables(l, &used, true).unwrap();
+            if pass {
+                state.heap_textures(l);
+            }
+            l.keep(&root);
+            l.keep(&pso);
+            let zeros = vec![0u32; cs.user_data_dwords() as usize];
+            // SAFETY: an open list with the heap and every root argument
+            // set; what it names outlives the run.
+            unsafe {
+                l.list.SetComputeRootSignature(&root);
+                l.list.SetPipelineState(&pso);
+                l.list.SetComputeRoot32BitConstants(
+                    0,
+                    zeros.len() as u32,
+                    zeros.as_ptr().cast(),
+                    0,
+                );
+                l.list.Dispatch(1, 1, 1);
+            }
+            drop(state);
+            list.run();
+            out.words()[..64].to_vec()
+        };
+        let next_frame = || {
+            crate::descriptor::host::PASS_LATER.fetch_add(1, Ordering::Relaxed);
+        };
+        // Not mirrored: null, and no pass serves it.
+        for _ in 0..2 {
+            next_frame();
+            assert_eq!(texel(&run(5, true)), Some(0), "a slot no call wrote");
+        }
+        assert_eq!(views.texture_queue().waiting_slots(), [] as [u32; 0]);
+        // Mirrored by the look: made, and waiting for its first upload.
+        let found = heap.look();
+        assert_eq!(
+            (found.copied, found.textures, found.tabled),
+            (1, 1, 0),
+            "{found:?}"
+        );
+        assert_eq!(views.texture_queue().waiting_slots(), [5]);
+        // The host copy may take passes to be resident.
+        let mut passes = 0;
+        while !views.texture_queue().waiting_slots().is_empty() {
+            passes += 1;
+            assert!(passes < 64, "still waiting after {passes} passes");
+            next_frame();
+            run(5, true);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(texel(&run(5, false)), Some(0x11), "the title's texels");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        type Release = extern "system" fn(This) -> u32;
+        crate::object::slot::<Release>(object, 0x10)(object);
+        drop(heap);
     }
 
     /// What passes over the textures shaders pick by index cost the
