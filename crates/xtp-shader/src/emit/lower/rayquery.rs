@@ -16,7 +16,8 @@
 //! [`TLAS_REGISTER`] in [`ROOT_CBV_SPACE`], listed among the shader's root
 //! SRVs as the title's root views are (`HostShader::root_srvs`), declared
 //! as resource kind 16 (`RTAccelerationStructure`). The host binds its own
-//! TLAS there at the dispatch (section 7); that binding is RT phase 2c.
+//! TLAS there at the dispatch (section 7), the one it built for the
+//! structure the title's descriptor names ([`tlas_descriptor`]).
 //!
 //! Gate (section 5.2): a program is spliced only when [`SITES`] names it,
 //! by the fingerprint of its code ([`fingerprint`]), and only when its walk
@@ -37,7 +38,10 @@ use std::collections::{HashMap, HashSet};
 pub(crate) mod asm;
 pub(crate) mod play;
 pub(crate) mod proof;
+mod sites;
 pub(crate) mod world;
+
+use sites::SITES;
 
 use super::super::bitcode::{Attr, Cast, Md, Module, Term, Ty, V, pred};
 use super::super::container::Binding;
@@ -46,7 +50,7 @@ use super::{Lower, Stop, Val, Why};
 use crate::ShaderError;
 use crate::gfx10::{Encoding, Fields, Instruction, Valu};
 use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
-use crate::native::NativeProgram;
+use crate::native::{NativeProgram, RootType};
 
 /// The register of the acceleration structure's root SRV: `t240` in
 /// [`ROOT_CBV_SPACE`], past every title root parameter (a root signature
@@ -160,42 +164,61 @@ pub(crate) struct Source {
     pub offset: u16,
 }
 
-/// The walks to splice, by the [`fingerprint`] of their program's code.
-/// Each is described by hand from its disassembly (never committed) and
-/// proven by play at translation.
-const SITES: &[(u64, Site)] = &[(
-    // `32ed072b9f845048`, the local lights' tiled traced shadows (family A,
-    // rt-dxr.md section 4.3). The rays in v1-v3 (origin), v4 (t-max) and
-    // v6, v9, v11 (the direction, normalised); the empty-structure check
-    // branches to 0xcc4; the code after the walk reads whether it hit (v7,
-    // a node pointer), its t (v4), its iteration count (v14, against
-    // 0xfffe) and EXEC. The structure's descriptor is the third of the
-    // table in user SGPR 5.
-    0x0487_AF5C_D93B_33BD,
-    Site {
-        header: 0x170,
-        exit: 0xcc8,
-        skip: Some(0xcc4),
-        origin: [1, 2, 3],
-        direction: [6, 9, 11],
-        t_max: 4,
-        t_min: 0,
-        mask: 0xd5,
-        flags: ray_flags::FORCE_OPAQUE | ray_flags::CULL_BACK_FACING_TRIANGLES,
-        results: &[(7, Kind::Hit), (4, Kind::T), (14, Kind::Count)],
-        kept: &[Reg::S(EXEC)],
-        cap: Some(0xfffe),
-        tlas: Source {
-            user_sgpr: 5,
-            offset: 0x20,
-        },
-    },
-)];
-
-/// The site [`SITES`] names for a program's code, if any.
+/// The site [`SITES`] (`rayquery/sites/`) names for a program's code, if
+/// any.
 pub(crate) fn site_of(code: &[u8]) -> Option<&'static Site> {
     let key = fingerprint(code);
     SITES.iter().find(|(k, _)| *k == key).map(|(_, s)| s)
+}
+
+/// Where the dispatch of a spliced program finds the title's view of the
+/// structure its walk read (section 8): the descriptor at byte `offset` of
+/// the descriptor table the title binds at root parameter `slot`. The host
+/// looks its own TLAS up from that descriptor (`xtp_gpu::rt`) and binds it
+/// at [`TLAS_REGISTER`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlasDescriptor {
+    /// The root parameter, in the title's root signature, of the table.
+    pub slot: u8,
+    /// The descriptor's byte offset in the table.
+    pub offset: u32,
+}
+
+/// The [`TlasDescriptor`] of a program [`SITES`] names: the descriptor
+/// table whose address its site's user SGPR holds ([`Site::tlas`]). `None`
+/// for any other program, and for a site whose SGPR does not start a table
+/// of the program's root signature layout (no translation splices it then:
+/// [`prepared`] refuses it).
+pub fn tlas_descriptor(native: &NativeProgram) -> Option<TlasDescriptor> {
+    let site = site_of(&native.code)?;
+    table_of(native, &site.tlas)
+}
+
+/// [`tlas_descriptor`] of the program of a container (the bytes the title
+/// gives, as `translate` takes them).
+pub fn container_tlas_descriptor(container: &[u8]) -> Option<TlasDescriptor> {
+    let c = crate::dxbc::Container::parse(container).ok()?;
+    let part = c.part(crate::dxbc::FourCC::DXIL)?;
+    crate::native_programs(part.data)
+        .ok()?
+        .iter()
+        .find_map(tlas_descriptor)
+}
+
+/// The table [`Source`] reads in `native`'s root signature layout.
+pub(crate) fn table_of(native: &NativeProgram, source: &Source) -> Option<TlasDescriptor> {
+    let mut tables = native.layout.iter().filter(|rp| {
+        rp.root == RootType::Table && native.stage.user_sgpr(rp.user_data) == source.user_sgpr
+    });
+    let first = tables.next()?;
+    // Every range of one table shares its SGPR: one parameter.
+    if tables.any(|rp| rp.slot != first.slot) {
+        return None;
+    }
+    Some(TlasDescriptor {
+        slot: first.slot,
+        offset: u32::from(source.offset),
+    })
 }
 
 /// FNV-1a (64 bits) of a program's code: how [`SITES`] names it.
@@ -211,9 +234,26 @@ pub(crate) fn fingerprint(code: &[u8]) -> u64 {
 /// walk's node reads. A walk the play does not prove is refused where the
 /// play stopped.
 pub(crate) fn prepared(p: Program, native: &NativeProgram) -> Result<Program, ShaderError> {
-    let Some(site) = site_of(&native.code) else {
-        return Ok(p);
-    };
+    match site_of(&native.code) {
+        Some(site) => spliced(p, native, site),
+        None => Ok(p),
+    }
+}
+
+/// [`prepared`] for the walk at `site`: its structure's descriptor must be
+/// in a table the dispatch finds ([`tlas_descriptor`]), its walk proven by
+/// play, then spliced.
+pub(crate) fn spliced(
+    p: Program,
+    native: &NativeProgram,
+    site: &Site,
+) -> Result<Program, ShaderError> {
+    if table_of(native, &site.tlas).is_none() {
+        return Err(ShaderError::Unsupported {
+            offset: site.header,
+            what: "a ray-tracing walk whose structure is not in one descriptor table",
+        });
+    }
     proof::prove(&p, native, site).map_err(|f| ShaderError::Unsupported {
         offset: f.offset,
         what: f.why,
@@ -933,7 +973,35 @@ pub(in crate::emit) fn tlas_binding() -> Binding {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, fingerprint};
+    use super::{Kind, SITES, fingerprint};
+
+    /// Each site of `sites/` says what a walk can be: one program each, a
+    /// skip path inside the walk, a cap exactly when a count is read, and
+    /// registers that do not overlap where they must not.
+    #[test]
+    fn rayquery_sites_are_consistent() {
+        for (n, (key, site)) in SITES.iter().enumerate() {
+            assert!(SITES[..n].iter().all(|(k, _)| k != key), "{key:#x}");
+            assert!(site.header < site.exit, "{key:#x}");
+            assert!(
+                site.skip
+                    .is_none_or(|s| (site.header..site.exit).contains(&s) && s != site.header),
+                "{key:#x}"
+            );
+            let counted = site.results.iter().any(|r| r.1 == Kind::Count);
+            assert_eq!(site.cap.is_some(), counted, "{key:#x}");
+            let mut ray: Vec<u8> = site.origin.into_iter().chain(site.direction).collect();
+            ray.push(site.t_max);
+            let mut distinct = ray.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(distinct.len(), ray.len(), "{key:#x}");
+            let mut results: Vec<u8> = site.results.iter().map(|r| r.0).collect();
+            results.sort_unstable();
+            results.dedup();
+            assert_eq!(results.len(), site.results.len(), "{key:#x}");
+        }
+    }
 
     #[test]
     fn rayquery_kinds_round_trip_through_their_codes() {

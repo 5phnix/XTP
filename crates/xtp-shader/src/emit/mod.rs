@@ -161,6 +161,9 @@ pub use bitcode::opt::dxil_opt;
 pub(crate) use lower::geometry::GsShape;
 /// The root SRV register of an inline ray query's acceleration structure.
 pub use lower::rayquery::TLAS_REGISTER;
+/// Where a spliced program's dispatch finds the title's descriptor of its
+/// structure.
+pub use lower::rayquery::{TlasDescriptor, container_tlas_descriptor, tlas_descriptor};
 pub use sampler::StaticSampler;
 pub use shader::LOOP_COUNTER_SPACE;
 pub use shader::{

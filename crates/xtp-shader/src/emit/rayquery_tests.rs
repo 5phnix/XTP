@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use super::HostShader;
 use super::lower::rayquery::proof::{self, Play, Prover};
 use super::lower::rayquery::world::{self, Blas, Instance, Rng, Root, Tri, World};
-use super::lower::rayquery::{Kind, Site, Source, TLAS_REGISTER, asm, ray_flags, splice};
+use super::lower::rayquery::{
+    self, Kind, Site, Source, TLAS_REGISTER, TlasDescriptor, asm, ray_flags, splice,
+};
 use crate::dxbc::{Container, FourCC};
 use crate::ir::{EXEC, Program, Reg};
 use crate::native::{
@@ -243,16 +245,14 @@ fn translate_with(
         parts: vec![],
     };
     let p = ir(native);
-    if prove {
-        proof::prove(&p, native, site).map_err(|f| crate::ShaderError::Unsupported {
-            offset: f.offset,
-            what: f.why,
-        })?;
-    }
-    let p = splice(p, site).map_err(|what| crate::ShaderError::Unsupported {
-        offset: site.header,
-        what,
-    })?;
+    let p = if prove {
+        rayquery::spliced(p, native, site)?
+    } else {
+        splice(p, site).map_err(|what| crate::ShaderError::Unsupported {
+            offset: site.header,
+            what,
+        })?
+    };
     let st = crate::structure::structure(&p);
     let res = crate::resource::track_native(&p, native, st.as_ref().ok())?;
     let io = crate::io::raise(&p, native)?;
@@ -1643,6 +1643,61 @@ fn rayquery_proof_refuses_what_the_walk_does_not_do() {
     }
 }
 
+/// The structure's descriptor is found where the dispatch looks: in the
+/// table whose address the site's user SGPR holds, at the site's offset; a
+/// site whose SGPR starts no table, or holds root constants, has none, and
+/// its walk is not spliced.
+#[test]
+fn rayquery_finds_the_structure_s_table_or_refuses_the_site() {
+    let (native, site) = family_a();
+    assert_eq!(
+        rayquery::table_of(&native, &site.tlas),
+        Some(TlasDescriptor {
+            slot: 0,
+            offset: 0x20
+        })
+    );
+    // A second table at user SGPR 1, root parameter 3, with two ranges.
+    let mut two = native.clone();
+    let range = |table_offset_dwords| RootParam {
+        root: RootType::Table,
+        table_offset_dwords,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 1,
+        slot: 3,
+    };
+    two.layout.extend([range(0), range(8)]);
+    let at_1 = Source {
+        user_sgpr: 1,
+        offset: 0x40,
+    };
+    assert_eq!(
+        rayquery::table_of(&two, &at_1),
+        Some(TlasDescriptor {
+            slot: 3,
+            offset: 0x40
+        })
+    );
+    // No parameter at SGPR 2; root constants at SGPR 0.
+    let at_2 = Source {
+        user_sgpr: 2,
+        offset: 0x20,
+    };
+    assert_eq!(rayquery::table_of(&two, &at_2), None);
+    let mut constants = native.clone();
+    constants.layout[0].root = RootType::Constants;
+    assert_eq!(rayquery::table_of(&constants, &site.tlas), None);
+    let refused =
+        |native: &NativeProgram, site: &Site| match rayquery::spliced(ir(native), native, site) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => what,
+            other => panic!("{:?}", other.map(|_| ())),
+        };
+    let why = "a ray-tracing walk whose structure is not in one descriptor table";
+    assert_eq!(refused(&constants, &site), why);
+    assert_eq!(refused(&native, &Site { tlas: at_2, ..site }), why);
+}
+
 /// The proof of the walks `rayquery::SITES` names, for a
 /// container of the title's given by path (`XTP_RT_CONTAINER`; its bytes
 /// never enter the repository): each report, or the failure with its world,
@@ -1664,6 +1719,9 @@ fn rayquery_proves_a_title_container_by_play() {
         let started = std::time::Instant::now();
         let report = proof::prove(&ir(&native), &native, site).unwrap_or_else(|f| panic!("{f:?}"));
         eprintln!("{report:?} in {:?}", started.elapsed());
+        // Where the dispatch finds the title's descriptor of the structure.
+        let tlas = rayquery::tlas_descriptor(&native).expect("the structure's table");
+        eprintln!("{tlas:?}");
         proven += 1;
     }
     assert!(proven > 0, "no site in this container");
