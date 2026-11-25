@@ -114,6 +114,8 @@ mod userdata_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
+mod validator_tests;
+#[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
