@@ -1675,8 +1675,11 @@ impl<'a> Lower<'a> {
     }
 }
 
-/// Blocks [`Lower::unread_on_edge`] searches at most.
-const UNREAD_STEPS: usize = 4096;
+/// Blocks [`Lower::unread_on_edge`] searches at most (each a visit of a
+/// block by an edge, again when what reaches it changes). 4096 ended the
+/// search in the large character pixel programs (33 KiB of code), where
+/// the taint goes far before every register holding it is written again.
+const UNREAD_STEPS: usize = 1 << 16;
 /// Atoms a path keeps at most (the latest).
 const MAX_KNOWN: usize = 32;
 /// Atoms of a condition beyond which a path learns nothing from it.
