@@ -126,12 +126,10 @@ fn shader(words: &[u32], uav: u32, io: ComputeIo) -> HostShader {
 /// `dxil.dll` is, as a host shader.
 fn host_shader(mut l: super::lower::Lowered) -> HostShader {
     assert!(l.stride_table, "the program reads the table");
-    if let Ok(mut v) =
-        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    match super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
     {
-        v.validate(&mut l.dxil).expect("DXIL validation");
-    } else {
-        eprintln!("no dxil.dll; validation skipped");
+        Ok(mut v) => v.validate(&mut l.dxil).expect("DXIL validation"),
+        Err(e) => eprintln!("not validated: {e}"),
     }
     HostShader {
         stage: HwStage::Cs,
@@ -158,20 +156,7 @@ fn hosts() -> (
     let one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut hosts = Vec::new();
-    for (name, warp) in [("WARP", true), ("the default adapter", false)] {
-        match Host::new(warp) {
-            Ok(h) => hosts.push((name, h)),
-            Err(e) => eprintln!("{name}: no SM 6.6 device ({e}); skipped"),
-        }
-    }
-    // In tests WARP may be the only device: once is enough.
-    hosts.truncate(if super::host::test_adapter().is_some() {
-        1
-    } else {
-        2
-    });
-    (one, hosts)
+    (one, Host::test_hosts())
 }
 
 /// What the GPU side makes for a buffer view of `count` elements of

@@ -788,8 +788,7 @@ mod tests {
     /// it.
     #[test]
     fn a_join_of_two_code_tables_reads_each_paths_table() {
-        let Ok(host) = Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
+        let Some(host) = Host::test_device() else {
             return;
         };
         let out = run(&host, &joined());

@@ -152,9 +152,9 @@ Every other test gives the same result on both adapters. In particular:
 | Test | Why | Owner |
 |------|-----|-------|
 | `emit::diff_tests::translated_mesh_shaders_draw_as_pc_ones`, `translated_shaders_draw_as_pc_ones`, `translated_compute_matches_pc`, `float_semantics_are_the_consoles` | need the console SDK's `dxc.exe` (`XTP_CONSOLE_DXC`), on no machine of ours: they skip on WARP and on the L4. Among them was the only test that drew a translated mesh program against the PC's. | the person (a console compiler on the VM is their call: it is the SDK's) |
-| `emit::lower::flow::tests::descriptor_dwords_join_data_as_undefined_on_their_edge` | creates its device with `Host::new(true)`, WARP on every machine: it never runs on the L4. `Host::new(false)` would follow `XTP_TEST_ADAPTER` like the others. | loop-limits (holds `flow.rs`) |
+| `emit::lower::flow::tests::descriptor_dwords_join_data_as_undefined_on_their_edge` | created its device with `Host::new(true)`, WARP on every machine, so it did not run on the L4 in section 2's run. | done: uses `Host::test_device()` (`XTP_TEST_ADAPTER`) |
 | `resource::tests::buffer_data_reaches_a_stand_in_texture_converted` | the reverse: skips on WARP ("the host has every use of B5G5R5A1"), runs and passes on the L4, whose driver lacks some. | – (as intended) |
-| xtp-shader's GPU tests | return early, and pass, when they get no device, whatever `XTP_REQUIRE_GPU` says (`eprintln!("...; skipped")`); xtp-gpu's fail then (`testgpu::skip`). `-GpuTests` counts them as skips. | whoever next touches `emit/host.rs`: route them through one helper that honours `XTP_REQUIRE_GPU` |
+| xtp-shader's GPU tests | returned early and passed when they got no device, whatever `XTP_REQUIRE_GPU` said (`eprintln!("...; skipped")`); xtp-gpu's failed (`testgpu::skip`). | done: routed through `emit::host::skip_gpu` (`XTP_REQUIRE_GPU`) |
 
 five-star's two hangs were mesh programs. XTP's mesh lowering already
 leaves out the `s_barrier`s of blocks that the allocation request dominates

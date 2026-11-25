@@ -159,13 +159,8 @@ fn immediate_sampler_reads_depth_and_compares() {
     let _lock = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let host = match Host::new(false) {
-        Ok(host) => host,
-        Err(e) => {
-            assert!(std::env::var_os("XTP_REQUIRE_GPU").is_none(), "{e}");
-            eprintln!("skipped: {e}");
-            return;
-        }
+    let Some(host) = Host::test_device() else {
+        return;
     };
     for comparison_first in [false, true] {
         let shader = mixed_sampler(true, comparison_first, LESS_EQUAL);

@@ -5,7 +5,7 @@
 //! descriptors at s0: entry 0 (dword 0) a constant buffer, entry 1
 //! (dword 8) a raw UAV, entry 2 (dword 16) another constant buffer. Every
 //! translation is checked by the validator where `dxil.dll` is found, and
-//! the one that translates is run on WARP.
+//! the one that translates is run on the test device.
 //!
 //! The names start with `smem_`, so the task's check (`cargo test -p
 //! xtp-shader smem`) runs them.
@@ -220,7 +220,7 @@ fn refusal(native: &NativeProgram) -> Option<&'static str> {
 /// The registers of a constant buffer read only by its `s_buffer_load`s and
 /// by a join with a number the program reads behind the flag that chose
 /// the number (r1smem's group B, `01d73927f08aed16` at 0x1cec): the
-/// buffer's dwords are no data, the program translates, and on WARP the
+/// buffer's dwords are no data, the program translates, and on the host the
 /// number's edge gives the number (77, the buffer's dword 1), the other
 /// edge 7.
 #[test]
@@ -229,16 +229,15 @@ fn smem_a_constant_buffers_registers_reused_for_a_number_translate() {
     number_on_its_edge_only(&cs);
 }
 
-/// Runs `cs`, a program of [`Reuse::Number`]'s form, on WARP: the
-/// number's edge gives the number (77, the buffer's dword 1), the other
-/// edge 7. Nothing where there is no WARP device.
+/// Runs `cs`, a program of [`Reuse::Number`]'s form, on the test device:
+/// the number's edge gives the number (77, the buffer's dword 1), the other
+/// edge 7. Nothing where there is no device.
 fn number_on_its_edge_only(cs: &HostShader) {
     // One GPU test at a time (see `valu_tests::ONE_AT_A_TIME`).
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(true) else {
-        eprintln!("no WARP device; skipped");
+    let Some(host) = Host::test_device() else {
         return;
     };
     let (root, pso) = host.compute_pipeline(cs).expect("a pipeline");

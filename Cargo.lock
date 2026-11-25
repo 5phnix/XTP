@@ -930,6 +930,7 @@ dependencies = [
  "thiserror",
  "windows",
  "windows-sys",
+ "xtp-testkit",
 ]
 
 [[package]]

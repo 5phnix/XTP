@@ -1812,3 +1812,210 @@ impl Host {
         }
     }
 }
+
+/// Whether GPU tests must fail instead of skipping when no host device is
+/// available (`XTP_REQUIRE_GPU` set to anything other than `""` or `"0"`).
+#[cfg(test)]
+pub(crate) fn require_gpu() -> bool {
+    require_gpu_value(std::env::var_os("XTP_REQUIRE_GPU").as_deref())
+}
+
+#[cfg(test)]
+fn require_gpu_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Reports a non-GPU test skip (`xtp_testkit::skip`) at most once per test and
+/// reason, so helpers called in a loop do not repeat the marker.
+#[cfg(test)]
+pub(crate) fn skip_once(reason: &str) {
+    thread_local! {
+        static SEEN: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = (xtp_testkit::current_test_name(), reason.to_owned());
+    let first = SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
+    if first {
+        xtp_testkit::skip(reason);
+    }
+}
+
+/// Reports that the current test did not run because no host GPU device was
+/// available (`reason`): fails when `XTP_REQUIRE_GPU` (or
+/// `XTP_REQUIRE=no-gpu`) is set, else writes the standard `SKIPPED <test>:
+/// <reason>` marker once.
+#[cfg(test)]
+pub(crate) fn skip_gpu(reason: &str) {
+    if require_gpu() {
+        let test = xtp_testkit::current_test_name();
+        panic!("{test} needs a host GPU: {reason} (XTP_REQUIRE_GPU is set)");
+    }
+    let require = std::env::var(xtp_testkit::REQUIRE_ENV).ok();
+    if xtp_testkit::is_required(xtp_testkit::reason::NO_GPU, require.as_deref()) {
+        xtp_testkit::skip(xtp_testkit::reason::NO_GPU);
+        return;
+    }
+    skip_once(reason);
+}
+
+#[cfg(test)]
+impl Host {
+    /// The test adapter's SM 6.6 device (`Host::new(false)`), or `None` after
+    /// reporting the skip through [`skip_gpu`].
+    pub(crate) fn test_device() -> Option<Self> {
+        Self::test_with(false)
+    }
+
+    /// Like [`Host::test_device`], pinned to WARP unless `XTP_TEST_ADAPTER`
+    /// disables devices (`none`).
+    pub(crate) fn test_warp() -> Option<Self> {
+        Self::test_with(true)
+    }
+
+    fn test_with(warp: bool) -> Option<Self> {
+        match Self::new(warp) {
+            Ok(host) => Some(host),
+            Err(reason) => {
+                skip_gpu(&reason);
+                None
+            }
+        }
+    }
+
+    /// The SM 6.6 devices multi-backend tests run on, by label: `"warp"` when
+    /// `XTP_TEST_ADAPTER=warp`, `"hardware"` and `"warp"` when hardware is
+    /// allowed, or none (reported through [`skip_gpu`]) when `XTP_TEST_ADAPTER`
+    /// disables devices or none is available. With `XTP_REQUIRE_GPU` set and
+    /// hardware allowed, a missing hardware adapter fails the test rather than
+    /// letting WARP stand in for it.
+    pub(crate) fn test_hosts() -> Vec<(&'static str, Self)> {
+        match test_adapter().as_deref() {
+            Some("warp") => match Self::create(true, None) {
+                Ok(host) => vec![("warp", host)],
+                Err(e) => {
+                    skip_gpu(&format!("warp: {e}"));
+                    Vec::new()
+                }
+            },
+            Some(other) => {
+                skip_gpu(&format!("no device in tests (XTP_TEST_ADAPTER={other})"));
+                Vec::new()
+            }
+            None => {
+                let mut out = Vec::new();
+                let hardware = match std::env::var("XTP_ADAPTER") {
+                    Ok(name) if !name.is_empty() => Self::on(&name),
+                    _ => adapters().and_then(|a| match a.first() {
+                        Some(name) => Self::on(name),
+                        None => Err("no hardware adapter".to_string()),
+                    }),
+                };
+                let hw_err = match hardware {
+                    Ok(host) => {
+                        out.push(("hardware", host));
+                        None
+                    }
+                    Err(e) => {
+                        if require_gpu() {
+                            skip_gpu(&format!("hardware: {e}"));
+                        }
+                        Some(e)
+                    }
+                };
+                match Self::create(true, None) {
+                    Ok(host) => out.push(("warp", host)),
+                    Err(e) if out.is_empty() => {
+                        let hw = hw_err.unwrap_or_default();
+                        skip_gpu(&format!("hardware: {hw}; warp: {e}"));
+                    }
+                    Err(e) => eprintln!("warp: {e}"),
+                }
+                out
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::process::Command;
+
+    use super::*;
+
+    const CHILD_ENV: &str = "XTP_SHADER_SKIP_TEST_CHILD";
+
+    #[test]
+    fn require_gpu_reads_non_zero_values() {
+        assert!(!require_gpu_value(None));
+        assert!(!require_gpu_value(Some(OsStr::new(""))));
+        assert!(!require_gpu_value(Some(OsStr::new("0"))));
+        assert!(require_gpu_value(Some(OsStr::new("1"))));
+        assert!(require_gpu_value(Some(OsStr::new("true"))));
+    }
+
+    #[test]
+    fn child_gpu_skip_probe() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        skip_gpu("synthetic missing adapter");
+        skip_gpu("synthetic missing adapter");
+    }
+
+    #[test]
+    fn skip_gpu_prints_standard_marker_once_or_fails_when_required() {
+        let exe = std::env::current_exe().expect("test binary");
+        let run = |require_gpu: Option<&str>, require: Option<&str>| {
+            let mut cmd = Command::new(&exe);
+            cmd.args(["--exact", "emit::host::tests::child_gpu_skip_probe"])
+                .env(CHILD_ENV, "1")
+                .env_remove("XTP_REQUIRE_GPU")
+                .env_remove(xtp_testkit::REQUIRE_ENV);
+            if let Some(v) = require_gpu {
+                cmd.env("XTP_REQUIRE_GPU", v);
+            }
+            if let Some(v) = require {
+                cmd.env(xtp_testkit::REQUIRE_ENV, v);
+            }
+            cmd.output().expect("spawn child test")
+        };
+
+        let skipped = run(None, None);
+        assert!(skipped.status.success(), "{skipped:?}");
+        let stderr = String::from_utf8_lossy(&skipped.stderr);
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|l| l.starts_with(
+                    "SKIPPED emit::host::tests::child_gpu_skip_probe: synthetic missing adapter"
+                ))
+                .count(),
+            1,
+            "expected exactly one canonical SKIPPED marker on stderr: {stderr}"
+        );
+
+        let strict_gpu = run(Some("1"), None);
+        assert!(!strict_gpu.status.success(), "XTP_REQUIRE_GPU=1 must fail");
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&strict_gpu.stdout),
+            String::from_utf8_lossy(&strict_gpu.stderr)
+        );
+        assert!(combined.contains("XTP_REQUIRE_GPU is set"), "{combined}");
+
+        let strict_testkit = run(None, Some(xtp_testkit::reason::NO_GPU));
+        assert!(
+            !strict_testkit.status.success(),
+            "XTP_REQUIRE=no-gpu must fail"
+        );
+    }
+}

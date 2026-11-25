@@ -171,12 +171,8 @@ fn a_sampler_chosen_by_control_flow_samples_through_the_chosen_one() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let host = match Host::new(false) {
-        Ok(host) => host,
-        Err(e) => {
-            assert!(std::env::var_os("XTP_REQUIRE_GPU").is_none(), "{e}");
-            return;
-        }
+    let Some(host) = Host::test_device() else {
+        return;
     };
     let (root, pso) = host
         .pipeline(&vs, &ps)

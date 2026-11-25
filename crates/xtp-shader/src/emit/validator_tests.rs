@@ -4,7 +4,7 @@
 //! allows per signature row. Small modules built with [`Shader`] (their
 //! signatures as given), and one console pixel program translated whole.
 //! Each container is checked by the system's dxil.dll where there is one
-//! (a skip is said on standard error).
+//! (noted on standard error without one).
 
 use super::bitcode::{Attr, Cast, Term};
 use super::container::{self, SigElement};
@@ -17,7 +17,7 @@ fn verdict(what: &str, container: &[u8]) -> Option<Result<(), String>> {
     match Validator::load(Validator::default_path().as_deref()) {
         Ok(mut v) => Some(v.validate(&mut container.to_vec())),
         Err(e) => {
-            eprintln!("SKIPPED validation of {what}: {e}");
+            eprintln!("{what}: not validated ({e})");
             None
         }
     }
@@ -39,8 +39,8 @@ fn the_validator_knows_the_declared_version() {
     let path = Validator::default_path();
     let v = match Validator::load(path.as_deref()) {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("SKIPPED: {e}");
+        Err(_) => {
+            super::host::skip_once(xtp_testkit::reason::NO_DXIL);
             return;
         }
     };

@@ -226,16 +226,11 @@ fn translated_at(
     (shader, integer_loads)
 }
 
-/// Runs `shader` with `views` on WARP and, when there is one, the hardware
-/// adapter; `check` gets each run's first UAV as dwords. At least one runs.
+/// Runs `shader` with `views` on each of [`Host::test_hosts`]; `check` gets
+/// each run's first UAV as dwords.
 fn run(shader: &HostShader, views: &[View], check: impl Fn(&str, &[u32])) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for (label, warp) in [("warp", true), ("hardware", false)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
+    for (label, host) in Host::test_hosts() {
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -260,9 +255,7 @@ fn run(shader: &HostShader, views: &[View], check: impl Fn(&str, &[u32])) {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         check(label, &out[0]);
-        ran += 1;
     }
-    assert!(ran > 0, "no SM 6.6 device available");
 }
 
 /// `v[1:2] = from[thread]` (four halves), `to[thread] = v[1:2]`, `from` the

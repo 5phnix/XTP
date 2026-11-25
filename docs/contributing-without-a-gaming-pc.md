@@ -144,8 +144,9 @@ $env:XTP_TEST_ADAPTER = 'warp'
 cargo test -p xtp-shader -p xtp-gpu --locked
 ```
 
-- Without a device, an `xtp-gpu` test prints `SKIPPED <test>: <reason>` and
-  passes, unless `XTP_REQUIRE_GPU` is set: then it fails.
+- Without a device, an `xtp-gpu` or `xtp-shader` test prints
+  `SKIPPED <test>: <reason>` and passes, unless `XTP_REQUIRE_GPU` is set:
+  then it fails.
 - CI runs the `xtp-gpu` tests on WARP under the D3D12 debug layer. Locally,
   with Windows' optional "Graphics Tools" feature installed:
 

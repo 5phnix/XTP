@@ -8,7 +8,7 @@
 //!
 //! Two kinds of check:
 //! - the kind of every resource-heap handle of a translation, from dxc's
-//!   disassembly (the Windows SDK's `dxc.exe`, else skipped): one slot,
+//!   disassembly (the Windows SDK's `dxc.exe`, else not checked): one slot,
 //!   one kind of view, whatever path the program reaches it by;
 //! - on WARP, what the loads read: a raw and a structured view in a heap
 //!   slot, at constant, computed and unaligned offsets, past the view's
@@ -169,10 +169,12 @@ pub(super) fn disassembly(shader: &HostShader) -> Option<String> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dxc = match std::env::var_os("XTP_PC_DXC") {
         Some(p) => PathBuf::from(p),
-        None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
+        None => super::validator::Validator::default_path()
+            .map(|p| p.with_file_name("dxc.exe"))
+            .unwrap_or_default(),
     };
     if !dxc.exists() {
-        eprintln!("dxc.exe missing, disassembly skipped");
+        eprintln!("no dxc.exe at {}; not disassembled", dxc.display());
         return None;
     }
     let file = std::env::temp_dir().join(format!(
@@ -450,10 +452,10 @@ fn run_scalar_reads(slot: View) -> Option<Vec<u32>> {
         // The table's raw buffer and the slot raw, the table's UAV.
         assert_eq!(distinct(kinds), [11, 11 | 0x1000]);
     }
-    let Ok(host) = Host::new(true) else {
-        eprintln!("no WARP device; skipped");
-        return None;
-    };
+    // Kept on WARP: the structured-slot test below reads a structured
+    // descriptor through a raw handle without the stride table (`stride_tests`
+    // covers hardware).
+    let host = Host::test_warp()?;
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
     let table = [2u32, 8, 0x40, 0x0e];
     let views = [

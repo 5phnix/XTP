@@ -113,7 +113,7 @@ fn devices() -> Vec<(String, Host)> {
         .filter_map(|name| match Host::on(&name) {
             Ok(host) => Some((name, host)),
             Err(e) => {
-                eprintln!("{name}: no SM 6.6 device ({e}); skipped");
+                eprintln!("{name}: no SM 6.6 device ({e})");
                 None
             }
         })

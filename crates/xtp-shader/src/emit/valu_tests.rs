@@ -187,12 +187,7 @@ pub(super) fn run_cases(
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
+    for (label, host) in Host::test_hosts() {
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -219,9 +214,7 @@ pub(super) fn run_cases(
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             check(label, i, inputs, out[0][0]);
         }
-        ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
 fn is_f16_nan(bits: u16) -> bool {

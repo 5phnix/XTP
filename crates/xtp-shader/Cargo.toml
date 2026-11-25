@@ -27,6 +27,9 @@ windows = { workspace = true, optional = true, features = [
     "Win32_Graphics_Dxgi_Common",
 ] }
 
+[dev-dependencies]
+xtp-testkit.workspace = true
+
 [target.'cfg(windows)'.dev-dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",

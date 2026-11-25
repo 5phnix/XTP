@@ -266,31 +266,7 @@ fn hosts() -> (
     let one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut hosts = Vec::new();
-    for (name, warp) in [("WARP", true), ("the default adapter", false)] {
-        match Host::new(warp) {
-            Ok(h) => hosts.push((name, h)),
-            Err(e) => eprintln!("{name}: no SM 6.6 device ({e}); skipped"),
-        }
-    }
-    // In tests WARP may be the only device: once is enough.
-    hosts.truncate(if super::host::test_adapter().is_some() {
-        1
-    } else {
-        2
-    });
-    if std::env::var("XTP_REQUIRE_GPU").as_deref() == Ok("1") {
-        let required = if super::host::test_adapter().is_some() {
-            "WARP"
-        } else {
-            "the default adapter"
-        };
-        assert!(
-            hosts.iter().any(|(name, _)| *name == required),
-            "missing required {required}"
-        );
-    }
-    (one, hosts)
+    (one, Host::test_hosts())
 }
 
 /// Runs `cs` over the buffer of `kind` holding [`data`] (an unordered view

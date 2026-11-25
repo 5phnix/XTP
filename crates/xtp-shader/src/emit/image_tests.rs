@@ -296,13 +296,10 @@ fn host() -> Option<OneAtATime> {
     let one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    match Host::new(false) {
-        Ok(host) => Some(OneAtATime { host, _one: one }),
-        Err(e) => {
-            eprintln!("no SM 6.6 device ({e}); skipped");
-            None
-        }
-    }
+    Some(OneAtATime {
+        host: Host::test_device()?,
+        _one: one,
+    })
 }
 
 /// Point sampling, clamped; LESS_EQUAL for comparisons (passes when the
@@ -1711,7 +1708,9 @@ mod atomic64 {
     fn host() -> Option<OneAtATime> {
         let host = super::host()?;
         if !host.int64_image_atomics() {
-            eprintln!("the device has no 64-bit atomics on heap typed resources; skipped");
+            super::super::host::skip_once(
+                "the device has no 64-bit atomics on heap typed resources",
+            );
             return None;
         }
         Some(host)

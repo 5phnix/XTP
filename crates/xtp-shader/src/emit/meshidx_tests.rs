@@ -16,9 +16,8 @@ fn repeated_exports_emit_indices_once_in_dxil() {
 }
 
 #[test]
-fn warp_draws_the_last_primitive_export() {
-    let Ok(host) = Host::new(true) else {
-        eprintln!("WARP SM 6.6 indisponible, rendu ignoré");
+fn draws_the_last_primitive_export() {
+    let Some(host) = Host::test_device() else {
         return;
     };
     let cases: [(&[u32], usize); 6] = [

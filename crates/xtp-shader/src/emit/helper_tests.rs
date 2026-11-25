@@ -393,20 +393,66 @@ fn vertex_shader(ps: &HostShader) -> HostShader {
 }
 
 /// The devices to draw on: WARP, then each hardware adapter (none where
-/// `XTP_TEST_ADAPTER` keeps the tests off hardware).
+/// `XTP_TEST_ADAPTER` keeps the tests off hardware), reporting missing or
+/// disabled devices through [`super::host::skip_gpu`].
 fn hosts() -> Vec<(String, Host)> {
-    let mut out = Vec::new();
-    match Host::new(true) {
-        Ok(h) => out.push(("WARP".to_string(), h)),
-        Err(e) => eprintln!("WARP: no SM 6.6 device ({e}); not run there"),
-    }
-    for name in adapters().unwrap_or_default() {
-        match Host::on(&name) {
-            Ok(h) => out.push((name, h)),
-            Err(e) => eprintln!("{name}: {e}; not run there"),
+    match super::host::test_adapter().as_deref() {
+        Some("warp") => match Host::new(true) {
+            Ok(h) => vec![("WARP".to_string(), h)],
+            Err(e) => {
+                super::host::skip_gpu(&format!("WARP: {e}"));
+                Vec::new()
+            }
+        },
+        Some(other) => {
+            super::host::skip_gpu(&format!("no device in tests (XTP_TEST_ADAPTER={other})"));
+            Vec::new()
+        }
+        None => {
+            let mut out = Vec::new();
+            let warp_err = match Host::new(true) {
+                Ok(h) => {
+                    out.push(("WARP".to_string(), h));
+                    None
+                }
+                Err(e) => {
+                    eprintln!("WARP: no SM 6.6 device ({e}); not run there");
+                    Some(e)
+                }
+            };
+            let mut hw = 0;
+            let mut last_hw_err = None;
+            match adapters() {
+                Ok(names) => {
+                    for name in names {
+                        match Host::on(&name) {
+                            Ok(h) => {
+                                hw += 1;
+                                out.push((name, h));
+                            }
+                            Err(e) => {
+                                eprintln!("{name}: {e}; not run there");
+                                last_hw_err = Some(format!("{name}: {e}"));
+                            }
+                        }
+                    }
+                }
+                Err(e) => last_hw_err = Some(e),
+            }
+            if hw == 0 && super::host::require_gpu() {
+                super::host::skip_gpu(
+                    last_hw_err
+                        .as_deref()
+                        .unwrap_or("no hardware adapter with an SM 6.6 device"),
+                );
+            } else if out.is_empty() {
+                let hw = last_hw_err.unwrap_or_else(|| "no hardware adapter".to_string());
+                let warp = warp_err.unwrap_or_default();
+                super::host::skip_gpu(&format!("hardware: {hw}; warp: {warp}"));
+            }
+            out
         }
     }
-    out
 }
 
 /// A pixel's key: x + 100 y of its centre.
@@ -475,9 +521,9 @@ impl Drawn {
     }
 }
 
-/// Draws `p` on every host and runs `check` on each target, which returns
-/// its failures (empty: right). Panics with every host's failures, and
-/// when no host drew at all: a test that drew nothing proves nothing.
+/// Draws `p` on every host from [`hosts`] (skipping or failing through
+/// [`super::host::skip_gpu`] when none is available) and runs `check` on
+/// each target, which returns its failures (empty: right).
 fn draw_everywhere(
     p: &Program,
     marker: usize,
@@ -488,9 +534,13 @@ fn draw_everywhere(
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let hosts = hosts();
+    if hosts.is_empty() {
+        return Vec::new();
+    }
     let mut failures = Vec::new();
     let mut drawn = Vec::new();
-    for (name, host) in hosts() {
+    for (name, host) in hosts {
         let (root, pso) = host
             .pipeline(&vs, &ps)
             .unwrap_or_else(|e| panic!("{name}: pipeline: {e}"));
@@ -525,10 +575,6 @@ fn draw_everywhere(
         failures.extend(wrong.into_iter().map(|w| format!("{name}: {w}")));
         drawn.push((name, t));
     }
-    assert!(
-        !drawn.is_empty(),
-        "no device drew: neither WARP nor a hardware adapter (XTP_TEST_ADAPTER=none?)"
-    );
     assert!(failures.is_empty(), "{failures:#?}");
     drawn
 }
