@@ -527,20 +527,18 @@ pub(crate) fn memory_change(resource: This) -> Change {
     }
     let asked = staging.last.lock().unwrap_or_else(|e| e.into_inner()).asked;
     let (start, end) = staging.range();
-    let since = |written: &[(usize, u64)]| {
-        if written.iter().any(|&(_, w)| w > asked) {
+    let since = || {
+        if crate::watch::changed_since(start, end, asked) {
             Change::Yes
         } else {
             Change::No
         }
     };
-    if let Some((_, written)) = crate::watch::writes(start, end, false) {
-        return since(&written);
+    if crate::watch::writes(start, end, false).is_some() {
+        return since();
     }
-    if guards()
-        && let Some((_, written)) = crate::watch::writes(start, end, true)
-    {
-        let change = since(&written);
+    if guards() && crate::watch::writes(start, end, true).is_some() {
+        let change = since();
         if change == Change::Yes {
             return change;
         }
@@ -1362,8 +1360,8 @@ impl Staging {
                 self.seen.again.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+        if let Some(now) = crate::watch::writes(start, start + size, false) {
+            if last.asked != 0 && !crate::watch::changed_since(start, start + size, last.asked) {
                 return 0;
             }
             last.asked = now;
@@ -1388,9 +1386,10 @@ impl Staging {
         // it or `verify` asks (a change is then one they missed).
         let (mut reported, mut unseen) = (false, false);
         if guards()
-            && let Some((now, written)) = crate::watch::writes(start, start + size, true)
+            && let Some(now) = crate::watch::writes(start, start + size, true)
         {
-            let clean = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let clean =
+                last.asked != 0 && !crate::watch::changed_since(start, start + size, last.asked);
             last.asked = now;
             // A write they report is hashed below anyway.
             let suspect = self.suspect.swap(false, Ordering::Relaxed);

@@ -577,6 +577,33 @@ mod tests {
         ] if *a == base + 4 && *b == base + 24 && *c == *b));
     }
 
+    #[test]
+    fn batch_keeps_gaps_and_flushes_each_range_hit_by_a_copy() {
+        let Some(_gpu) =
+            crate::testgpu::device("batch_keeps_gaps_and_flushes_each_range_hit_by_a_copy")
+        else {
+            return;
+        };
+        let buffer = crate::testgpu::TitleBuffer::new(256);
+        let base = buffer.address() as usize;
+        let shadow = buffer.shadow();
+        let mut batch = Batch::default();
+        for offset in [24, 8, 12, 48, 0, 4] {
+            batch.add(&shadow, base + offset, 4);
+        }
+        let ranges = |b: &Batch<'_>| {
+            b.refreshes
+                .iter()
+                .map(|(_, a, z)| (a - base, z - base))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranges(&batch), [(0, 16), (24, 28), (48, 52)]);
+        batch.flush_before_copy(&shadow, base + 16, 8);
+        assert_eq!(ranges(&batch).len(), 3);
+        batch.flush_before_copy(&shadow, base + 15, 10);
+        assert_eq!(ranges(&batch), [(48, 52)]);
+    }
+
     #[cfg(feature = "diagnostics")]
     #[test]
     fn recorded_preserves_both_diagnostic_samples_without_deadlock() {
@@ -2796,8 +2823,8 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
+/// A submission's pending refreshes, sorted by copy and address. Overlapping
+/// and adjacent ranges merge. Done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
@@ -2883,14 +2910,25 @@ impl Batch<'_> {
     }
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
         let end = address + len;
-        match self
+        let key = std::sync::Arc::as_ptr(shadow);
+        let first = self
             .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            .partition_point(|(s, _, to)| (std::sync::Arc::as_ptr(s), *to) < (key, address));
+        let pending = &self.refreshes[first..];
+        let count = pending
+            .partition_point(|(s, from, _)| (std::sync::Arc::as_ptr(s), *from) <= (key, end));
+        if count == 0 {
+            self.refreshes.insert(first, (shadow.clone(), address, end));
+        } else {
+            let to = end.max(pending[count - 1].2);
+            let (_, from, last) = &mut self.refreshes[first];
+            *from = address.min(*from);
+            *last = to;
+            self.refreshes.drain(first + 1..first + count);
         }
     }
 
@@ -2915,10 +2953,13 @@ impl Batch<'_> {
         len: usize,
     ) {
         let end = at.saturating_add(len);
-        if let Some(i) = self.refreshes.iter().position(|(shadow, from, to)| {
-            std::sync::Arc::ptr_eq(shadow, dst) && *from < end && at < *to
-        }) {
-            let (shadow, from, to) = self.refreshes.swap_remove(i);
+        let key = std::sync::Arc::as_ptr(dst);
+        let first = self
+            .refreshes
+            .partition_point(|(s, _, to)| (std::sync::Arc::as_ptr(s), *to) <= (key, at));
+        let count = self.refreshes[first..]
+            .partition_point(|(s, from, _)| (std::sync::Arc::as_ptr(s), *from) < (key, end));
+        for (shadow, from, to) in self.refreshes.drain(first..first + count) {
             self.work.copy_bytes += Self::refresh(&shadow, from, to) as u64;
         }
     }
@@ -3232,6 +3273,8 @@ impl Meter {
             .map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let preparation = preparation::take();
         let per_frame_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / frames;
+        #[cfg(feature = "diagnostics")]
+        let guard_wait_ms = per_frame_ms(crate::watch::take_guard_wait());
         let cpu = per_frame_ms(preparation.total);
         let [
             copy_ms,
@@ -3309,6 +3352,10 @@ impl Meter {
             );
             tracing::info!("snapshots per frame: {snapshot_ms:.3} ms");
             tracing::info!("guards and write watch per frame: {watch_ms:.3} ms");
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(
+                "GUARDS contention outside preparation per frame: {guard_wait_ms:.3} ms"
+            );
             let merged = work.merged_fills as f64 / frames;
             tracing::info!("fills per frame: {fill_ms:.3} ms, {fill_mb:.2} MB, {merged:.2} merged");
             let steps = work.steps.iter().sum::<u64>() as f64 / frames;

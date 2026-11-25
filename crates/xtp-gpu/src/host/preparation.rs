@@ -39,6 +39,12 @@ thread_local! {
     static CLOCK: RefCell<Option<Clock>> = const { RefCell::new(None) };
 }
 
+/// A fault can interrupt a clock update on this thread.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn active() -> bool {
+    CLOCK.with(|clock| !clock.try_borrow().is_ok_and(|c| c.is_none()))
+}
+
 impl Phase {
     fn switch(self) -> Option<Self> {
         CLOCK.with_borrow_mut(|clock| {
