@@ -35,6 +35,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(windows)]
+mod loopstat;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod meshstat;
 pub mod object;
