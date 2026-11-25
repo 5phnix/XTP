@@ -534,6 +534,34 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_permlanex16_b32"
+                if self.s.m.paired_lanes() && (guard.is_none() || v.opsel & 1 != 0) =>
+            {
+                // The 16 selector nibbles index the opposite row of this
+                // 32-lane half. Every source is live under full EXEC or FI.
+                let (x, sel0, sel1) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let (seven, eight, fifteen, sixteen, two, zero) = (
+                    self.s.m.i32(7),
+                    self.s.m.i32(8),
+                    self.s.m.i32(15),
+                    self.s.m.i32(16),
+                    self.s.m.i32(2),
+                    self.s.m.i32(0),
+                );
+                let word = self.s.m.bin(c, Bin::And, lane, eight);
+                let low = self.s.m.cmp(c, pred::EQ, word, zero);
+                let sel = self.s.m.select(c, low, sel0, sel1);
+                let nibble = self.s.m.bin(c, Bin::And, lane, seven);
+                let shift = self.s.m.bin(c, Bin::Shl, nibble, two);
+                let pick = self.s.m.bin(c, Bin::LShr, sel, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, fifteen);
+                let row = self.s.m.bin(c, Bin::And, lane, sixteen);
+                let other = self.s.m.bin(c, Bin::Xor, row, sixteen);
+                let at = self.s.m.bin(c, Bin::Or, other, pick);
+                let r = self.read_lane(x, at);
+                int(self, r)
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane

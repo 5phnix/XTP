@@ -271,7 +271,10 @@ impl<'a> Lower<'a> {
             // next one. The halves are two host waves, both here (console
             // flow): a group barrier before each LDS access puts it after
             // every earlier one, whichever half made it.
-            let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+            // Paired lanes run in one host wave. Fence their shared
+            // accesses without synchronising independent console waves.
+            let sync = u32::from(!self.s.m.paired_lanes());
+            let (mode, void) = (self.s.m.i32(sync | 8), self.s.t.void);
             self.s
                 .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }

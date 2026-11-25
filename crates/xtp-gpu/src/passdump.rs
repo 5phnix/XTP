@@ -1844,6 +1844,7 @@ fn report(frame: u64) {
         host.drain();
         if let Some(text) = dump().as_mut().and_then(|d| d.report(frame)) {
             let path = folder.join(format!("passes-{frame}.txt"));
+            let _ = std::fs::create_dir_all(folder);
             match std::fs::write(&path, text) {
                 Ok(()) => tracing::info!(path = %path.display(), "pass dump written"),
                 Err(e) => {

@@ -1516,11 +1516,14 @@ impl HostHeap {
         // Within a budget a pass: each view may need a host copy made (a
         // resource, which can wait in the kernel), and the world's loading
         // leaves tens of thousands waiting. Those past it wait for the next
-        // frames' passes, in the order the title wrote them.
+        // frames' passes, in the order the title wrote them. One view a pass
+        // at least, however long the thread waited before it (the lock, or
+        // a loaded machine): a pass always makes progress, and n views that
+        // wait are made within n passes.
         let mut made_now = 0u32;
         let mut left = Vec::new();
         for (n, &index) in waiting.iter().enumerate() {
-            if started.elapsed() > PICKED_BUDGET {
+            if n > 0 && started.elapsed() > PICKED_BUDGET {
                 left.extend_from_slice(&waiting[n..]);
                 break;
             }
@@ -1595,6 +1598,14 @@ impl HostHeap {
             .unwrap_or_else(|e| e.into_inner())
             .waiting
             .len()
+    }
+
+    /// Forgets this frame's [`HostHeap::picked_spans`] pass, so that the
+    /// next call makes one, as the first list of a new frame does (tests:
+    /// the frame count is the process's, and other tests count it).
+    #[cfg(test)]
+    pub(crate) fn forget_picked_pass(&self) {
+        *self.picked.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Slot `index`'s table entry (tests).

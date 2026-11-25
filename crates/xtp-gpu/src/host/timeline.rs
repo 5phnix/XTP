@@ -7,12 +7,15 @@
 //! Each submission also names the title memory its GPU work writes (written
 //! back when it finishes) and reads (host copies and textures brought up to
 //! date for it), so that a later submission's CPU-side steps can find the
-//! earlier ones they must wait for ([`Timeline::conflict`]).
+//! earlier ones they must wait for ([`Timeline::conflict`]), and so does a
+//! page mapping, for the pages it replaces ([`Host::settle_remap`]).
 //!
 //! Ported from Marvisak/VIctory#595 (wbkepler), as `timeline.rs` there.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard};
+
+use super::Host;
 
 /// Title memory ranges `[from, to)`, sorted and merged.
 #[derive(Default)]
@@ -36,6 +39,12 @@ impl Ranges {
     pub(crate) fn overlaps(&self, from: usize, to: usize) -> bool {
         let i = self.0.partition_point(|&(_, b)| b <= from);
         self.0.get(i).is_some_and(|&(a, _)| a < to)
+    }
+
+    /// Whether one of `other`'s ranges overlaps one of these (a search in
+    /// these for each of `other`'s: `other` is the short one).
+    fn meets(&self, other: &Ranges) -> bool {
+        other.0.iter().any(|&(a, b)| self.overlaps(a, b))
     }
 }
 
@@ -159,6 +168,23 @@ impl<W> Timeline<W> {
             .map(|e| e.value)
     }
 
+    /// For title memory `pages` about to show other pages (a page
+    /// mapping): the newest submission not finished yet whose GPU work
+    /// touches them, writing or reading them, as for a step that writes
+    /// them ([`Timeline::conflict`]); and the newest that writes them.
+    pub(crate) fn remap_conflict(&self, pages: &Ranges) -> (Option<u64>, Option<u64>) {
+        let mut touched = None;
+        for e in self.entries().iter().rev() {
+            if e.writes.meets(pages) {
+                return (touched.or(Some(e.value)), Some(e.value));
+            }
+            if touched.is_none() && e.reads.meets(pages) {
+                touched = Some(e.value);
+            }
+        }
+        (touched, None)
+    }
+
     /// The newest submission not finished yet whose shaders write
     /// `[from, to)` through the host copy `copy`: what it writes back is
     /// told from a snapshot of the copy, which a later GPU write to the
@@ -279,6 +305,37 @@ impl<W> Timeline<W> {
             .iter()
             .filter_map(|e| e.work.as_ref())
             .for_each(&mut f);
+    }
+}
+
+impl Host {
+    /// Before title memory `pages` (ranges `[from, to)`) shows other
+    /// physical pages (a queue's page-mapping copy,
+    /// `queue::copy_page_mappings`): finishes the submissions in flight
+    /// whose GPU work touches them, as before a step that writes title
+    /// memory ([`Timeline::remap_conflict`]). What they write then goes back
+    /// into the pages they were submitted with, and no later refresh
+    /// brings the new pages into host copies they still read; the others
+    /// run on. Returns whether it waited, and whether that went past the
+    /// newest submission writing the pages (for one that only reads them).
+    #[track_caller]
+    pub(crate) fn settle_remap(&self, pages: Vec<(usize, usize)>) -> (bool, bool) {
+        let pages = Ranges::new(pages);
+        match self.timeline.remap_conflict(&pages) {
+            (Some(touched), written) => {
+                self.settle(touched);
+                (true, written != Some(touched))
+            }
+            (None, _) => (false, false),
+        }
+    }
+
+    /// Before the first submission in an isolated test, leave write-backs
+    /// pending until a caller settles them, even if the GPU is already done.
+    #[cfg(test)]
+    pub(crate) fn finish_on_caller(&self) {
+        assert!(!self.finisher.is_completed());
+        self.finisher.call_once(|| {});
     }
 }
 
@@ -405,6 +462,50 @@ mod tests {
         assert_eq!(t.staging_conflict(0xdead_2000), None);
         t.finish(5, |()| {});
         assert_eq!(t.staging_conflict(staging_a), None);
+    }
+
+    /// A page mapping finds the newest submission whose GPU work touches
+    /// any of its pages, one that only reads them included, and the newest
+    /// that writes them.
+    #[test]
+    fn a_page_mapping_conflicts_with_the_newest_submission_touching_its_pages() {
+        let t: Timeline<()> = Timeline::new();
+        let page = 0x1_0000;
+        // 1 writes page 1 by shaders and a label on page 4; 2 reads page 2;
+        // 3 writes page 3 by a buffer copy.
+        let shaders = Touches {
+            shaders: vec![(7, page, page + 0x100)],
+            labels: vec![(4 * page + 8, 4 * page + 16)],
+            ..Touches::default()
+        };
+        t.push(1, shaders, ());
+        let reads = Touches {
+            reads: vec![(2 * page, 2 * page + 0x100)],
+            ..Touches::default()
+        };
+        t.push(2, reads, ());
+        let copies = Touches {
+            copies: vec![(7, 3 * page + 0x40, 3 * page + 0x80)],
+            ..Touches::default()
+        };
+        t.push(3, copies, ());
+        let pages =
+            |p: &[usize]| Ranges::new(p.iter().map(|&p| (p * page, (p + 1) * page)).collect());
+        // Elsewhere, and next to what they touch: nothing.
+        assert_eq!(t.remap_conflict(&pages(&[0, 5])), (None, None));
+        let next_to = Ranges::new(vec![(page + 0x100, 2 * page)]);
+        assert_eq!(t.remap_conflict(&next_to), (None, None));
+        assert_eq!(t.remap_conflict(&Ranges::default()), (None, None));
+        // The one writing the old pages, labels and buffer copies included.
+        assert_eq!(t.remap_conflict(&pages(&[1])), (Some(1), Some(1)));
+        assert_eq!(t.remap_conflict(&pages(&[4])), (Some(1), Some(1)));
+        assert_eq!(t.remap_conflict(&pages(&[3])), (Some(3), Some(3)));
+        // One reading them, past the newest writing them.
+        assert_eq!(t.remap_conflict(&pages(&[2])), (Some(2), None));
+        assert_eq!(t.remap_conflict(&pages(&[1, 2])), (Some(2), Some(1)));
+        assert_eq!(t.remap_conflict(&pages(&[0, 1, 2, 3])), (Some(3), Some(3)));
+        t.finish(3, |()| {});
+        assert_eq!(t.remap_conflict(&pages(&[1, 2, 3, 4])), (None, None));
     }
 
     /// A thread that needs a submission finished waits for the one
