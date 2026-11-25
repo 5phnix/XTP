@@ -1225,9 +1225,11 @@ mod tests {
         );
     }
 
+    /// Another value whatever this run's is (Codex review of d286ffd, point
+    /// 6: halving gave 1 again for `XTP_SHADER_LOOP_LIMIT=1`).
     #[test]
     fn the_loop_limit_is_in_the_key() {
-        a_changed_setting_is_rejected(|s| s.loop_limit = s.loop_limit.max(2) / 2);
+        a_changed_setting_is_rejected(|s| s.loop_limit ^= 1);
     }
 
     #[test]

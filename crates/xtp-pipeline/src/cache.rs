@@ -63,6 +63,14 @@ struct Index {
     /// Where each change to `files` is appended once the cache is open
     /// ([`disk::INDEX_FILE`]).
     journal: Option<disk::Journal>,
+    /// The last listing missed part of the folder (a folder, or an entry's
+    /// type, size or time it could not read), so the entries are not all
+    /// known: nothing is evicted ([`Index::trim`]) until a whole listing
+    /// ([`Cache::reindex`]). The oldest entries may be the ones it missed,
+    /// and the counts may be an index's that lists entries gone since:
+    /// past the budget is better than a live entry evicted for nothing
+    /// (Codex review of d286ffd, point 3).
+    unlisted: bool,
 }
 
 impl std::fmt::Debug for Index {
@@ -151,8 +159,10 @@ impl Cache {
         let mut opened = Opened::Off;
         if limit != 0 {
             let started = std::time::Instant::now();
-            let mut trim = true;
-            opened = match disk::read_index(&root) {
+            // The file as read: a snapshot written from it, or from a
+            // listing, carries what other processes append to it meanwhile.
+            let (read, mark) = disk::read_index_marked(&root);
+            opened = match read {
                 Some(changes) => {
                     let records = changes.len();
                     for change in changes {
@@ -165,28 +175,29 @@ impl Cache {
                         // folder is listed before anything goes, so that no
                         // live entry is evicted for one that is not there
                         // (Codex review of 12556d6, point 2). A listing that
-                        // missed a folder evicts nothing.
-                        trim = index.relist(&root) != Relisted::Unlisted;
+                        // missed a folder evicts nothing, now or later.
+                        index.relist(&root);
                     } else if records > 2 * index.files.len() + 4096 {
                         // Mostly changes since its snapshot: a new snapshot.
-                        index.snapshot(&root);
+                        index.snapshot(&root, mark.as_ref());
                     }
                     Opened::Index
                 }
                 None => {
                     // A listing that missed a folder it could not read is
                     // not written: the next open lists again, rather than
-                    // trust an index without that folder's entries.
+                    // trust an index without that folder's entries. Nor
+                    // does it evict: the oldest may be in that folder.
                     if index.scan(&root) {
-                        index.snapshot(&root);
+                        index.snapshot(&root, mark.as_ref());
+                    } else {
+                        index.unlisted = true;
                     }
                     Opened::Scan
                 }
             };
             index.journal = Some(disk::Journal::new(&root));
-            if trim {
-                index.trim(&root, limit);
-            }
+            index.trim(&root, limit);
             tracing::info!(
                 root = %root.display(),
                 entries = index.files.len(),
@@ -248,9 +259,7 @@ impl Cache {
         }
         let mut index = lock(&self.store.index);
         let relisted = index.relist(&self.store.root);
-        if relisted != Relisted::Unlisted {
-            index.trim(&self.store.root, self.store.limit);
-        }
+        index.trim(&self.store.root, self.store.limit);
         relisted == Relisted::Written
     }
 
@@ -417,16 +426,21 @@ enum Relisted {
 impl Index {
     /// Lists the folder at `root` ([`Index::scan`]) and, if the listing is
     /// whole, takes its entries in place of these and writes them as the
-    /// index file.
+    /// index file, with what other processes appended to it while the
+    /// listing ran. If it is not, nothing is evicted until one is
+    /// ([`Index::unlisted`]).
     fn relist(&mut self, root: &Path) -> Relisted {
+        let mark = disk::mark(root);
         let mut listed = Index::default();
         if !listed.scan(root) {
+            self.unlisted = true;
             return Relisted::Unlisted;
         }
+        self.unlisted = false;
         self.files = listed.files;
         self.oldest = listed.oldest;
         self.bytes = listed.bytes;
-        if self.snapshot(root) {
+        if self.snapshot(root, mark.as_ref()) {
             Relisted::Written
         } else {
             Relisted::NotWritten
@@ -570,18 +584,26 @@ impl Index {
         }
     }
 
-    /// Replaces the index file with these entries; appends go to the new
-    /// one. One that cannot be written leaves the old one, and the cache
-    /// works as well: the next open may look at every entry. Whether it was
-    /// written.
-    fn snapshot(&mut self, root: &Path) -> bool {
+    /// Replaces the index file with these entries, then the changes other
+    /// processes appended to it since `since` (the file as these entries'
+    /// listing or read found it: [`disk::write_index`]), which these
+    /// entries take too; appends go to the new one. One that cannot be
+    /// written leaves the old one, and the cache works as well: the next
+    /// open may look at every entry. Whether it was written.
+    fn snapshot(&mut self, root: &Path, since: Option<&disk::Mark>) -> bool {
         let entries = self.files.iter().map(|(key, r)| disk::Change::Published {
             key: *key.0.as_bytes(),
             bytes: r.bytes,
             modified: r.modified,
         });
-        match disk::write_index(root, entries) {
-            Ok(()) => {
+        match disk::write_index(root, entries, since) {
+            Ok(appended) => {
+                // In the file already: not appended again.
+                let journal = self.journal.take();
+                for change in appended {
+                    self.apply(change);
+                }
+                self.journal = journal;
                 if let Some(journal) = &mut self.journal {
                     journal.reopen();
                 }
@@ -595,7 +617,7 @@ impl Index {
     }
 
     fn trim(&mut self, root: &Path, available: u64) -> bool {
-        if self.bytes <= available {
+        if self.bytes <= available || self.unlisted {
             return true;
         }
         let pinned: u64 = self
@@ -1282,7 +1304,7 @@ mod tests {
             modified,
         };
         let snapshot = [published(7), published(8)];
-        disk::write_index(tmp.path(), snapshot.into_iter()).unwrap();
+        disk::write_index(tmp.path(), snapshot.into_iter(), None).unwrap();
         assert_eq!(disk::read_index(tmp.path()), Some(snapshot.to_vec()));
         let path = tmp.path().join(disk::INDEX_FILE);
         let good = fs::read(&path).unwrap();
@@ -1313,7 +1335,7 @@ mod tests {
             modified,
         };
         let snapshot = [published(1), published(2), published(3)];
-        disk::write_index(tmp.path(), snapshot.into_iter()).unwrap();
+        disk::write_index(tmp.path(), snapshot.into_iter(), None).unwrap();
         let whole = fs::read(&path).unwrap();
         let (magic, record) = (16, 64);
         assert_eq!(whole.len(), magic + 4 * record);
@@ -1521,21 +1543,214 @@ mod tests {
             bytes: u64::from(k),
             modified,
         };
-        disk::write_index(tmp.path(), [published(1)].into_iter()).unwrap();
+        disk::write_index(tmp.path(), [published(1)].into_iter(), None).unwrap();
         let mut journal = disk::Journal::new(tmp.path());
         journal.append(&published(2));
         assert_eq!(
             disk::read_index(tmp.path()),
             Some(vec![published(1), published(2)])
         );
-        // Another process's snapshot, then this one's next change.
-        disk::write_index(tmp.path(), [published(3)].into_iter()).unwrap();
+        // Another process's snapshot (from a listing begun after the last
+        // append), then this one's next change.
+        let mark = disk::mark(tmp.path());
+        disk::write_index(tmp.path(), [published(3)].into_iter(), mark.as_ref()).unwrap();
         journal.append(&published(4));
         assert_eq!(
             disk::read_index(tmp.path()),
             Some(vec![published(3), published(4)]),
             "appended to the index there is"
         );
+    }
+
+    /// Codex review of d286ffd, point 2: another process publishes an entry
+    /// and appends its record after this one's listing began and before
+    /// its snapshot replaced the file: that record was lost with the file
+    /// it went to, and the next open trusted a snapshot without the entry.
+    /// The snapshot now carries what was appended since its listing began,
+    /// and so does this process's index; and if yet another snapshot
+    /// replaced the file meanwhile, what was appended after that one.
+    #[test]
+    fn a_snapshot_keeps_what_was_appended_during_its_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let conv = upper(1);
+        let cache = Cache::open(&root).unwrap();
+        cache.get_or_convert(&conv, b"listed").unwrap();
+        drop(cache);
+        // This process starts a listing.
+        let mark = disk::mark(&root);
+        let mut listed = Index::default();
+        assert!(listed.scan(&root));
+        // The other publishes "late" (its file, then its record).
+        let late = upper(2);
+        let late_path = path_for(&root, &CacheKey::new(&late, b"late"));
+        let modified = disk::Staged::write(&late_path, b"LATE")
+            .unwrap()
+            .publish(&late_path)
+            .unwrap();
+        let record = disk::Change::Published {
+            key: *CacheKey::new(&late, b"late").0.as_bytes(),
+            bytes: 4,
+            modified,
+        };
+        disk::Journal::new(&root).append(&record);
+        // This one's snapshot, from its listing.
+        assert!(listed.snapshot(&root, mark.as_ref()));
+        assert_eq!(
+            (listed.files.len(), listed.bytes),
+            (2, 6 + 4),
+            "taken here too"
+        );
+        let cache = Cache::open(&root).unwrap();
+        assert_eq!(cache.opened(), Opened::Index);
+        assert_eq!(
+            (cache.stats().entries, cache.stats().bytes),
+            (2, 6 + 4),
+            "the next open counts it"
+        );
+        drop(cache);
+
+        // A snapshot that replaced the file meanwhile, and an append to it.
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_600_000);
+        let published = |k: u8| disk::Change::Published {
+            key: [k; 32],
+            bytes: u64::from(k),
+            modified,
+        };
+        // Both listings begin on the same file; the other's snapshot comes
+        // first, and gets an append.
+        let before = disk::mark(&root);
+        disk::write_index(&root, [published(5)].into_iter(), before.as_ref()).unwrap();
+        disk::Journal::new(&root).append(&published(6));
+        let carried = disk::write_index(&root, [published(1)].into_iter(), before.as_ref());
+        assert_eq!(carried.unwrap(), vec![published(6)]);
+        assert_eq!(
+            disk::read_index(&root),
+            Some(vec![published(1), published(6)])
+        );
+    }
+
+    /// An append under way holds the index file shared with no deleting: a
+    /// snapshot waits for it rather than replace the file under it, then
+    /// carries its record.
+    #[cfg(windows)]
+    #[test]
+    fn a_snapshot_waits_for_an_append_under_way() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_600_000);
+        let published = |k: u8| disk::Change::Published {
+            key: [k; 32],
+            bytes: u64::from(k),
+            modified,
+        };
+        disk::write_index(tmp.path(), [published(1)].into_iter(), None).unwrap();
+        let mark = disk::mark(tmp.path());
+        // An appender's handle, shared as `disk::Journal` shares it: open
+        // before the snapshot starts.
+        let appending = fs::File::options()
+            .append(true)
+            .share_mode(1 | 2)
+            .open(tmp.path().join(disk::INDEX_FILE))
+            .unwrap();
+        let root = tmp.path().to_owned();
+        let three = published(3);
+        let snapshot = std::thread::spawn(move || {
+            disk::write_index(&root, [three].into_iter(), mark.as_ref())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        // A record appended while the snapshot waits.
+        disk::Journal::new(tmp.path()).append(&published(2));
+        drop(appending);
+        let carried = snapshot
+            .join()
+            .unwrap()
+            .expect("written once the append is done");
+        assert_eq!(carried, vec![published(2)]);
+        assert_eq!(
+            disk::read_index(tmp.path()),
+            Some(vec![published(3), published(2)])
+        );
+    }
+
+    /// Codex review of d286ffd, point 3: a listing that misses a folder (an
+    /// open without an index, or with one past the budget) must not evict,
+    /// then or at the first access after: the oldest entries may be in that
+    /// folder, and the counts may be an index's that lists entries gone
+    /// since. Past the budget meanwhile; a whole listing evicts to it.
+    #[cfg(windows)]
+    #[test]
+    fn a_listing_that_misses_a_folder_evicts_nothing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let conv = upper(1);
+        let shard = |input: &[u8]| {
+            path_for(&root, &CacheKey::new(&conv, input))
+                .parent()
+                .unwrap()
+                .to_owned()
+        };
+        // Three entries of 4 bytes, the first in a folder of its own.
+        let inputs: Vec<Vec<u8>> = std::iter::once(b"old1".to_vec())
+            .chain(
+                (0u32..)
+                    .map(|n| format!("{n:04}").into_bytes())
+                    .filter(|input| shard(input) != shard(b"old1"))
+                    .take(2),
+            )
+            .collect();
+        let paths: Vec<PathBuf> = {
+            let cache = Cache::open_with_limit(&root, 100).unwrap();
+            inputs
+                .iter()
+                .map(|input| {
+                    cache.get_or_convert(&conv, input).unwrap();
+                    std::thread::sleep(Duration::from_millis(20));
+                    cache.path_for(&CacheKey::new(&conv, input))
+                })
+                .collect()
+        };
+        let hold = || {
+            fs::File::options()
+                .read(true)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(shard(b"old1"))
+                .unwrap()
+        };
+        let all_there = || paths.iter().all(|p| p.exists());
+
+        // No index: the listing misses the oldest's folder, and the two it
+        // sees are past a budget of 4.
+        fs::remove_file(root.join(disk::INDEX_FILE)).unwrap();
+        let held = hold();
+        let cache = Cache::open_with_limit(&root, 4).unwrap();
+        assert_eq!(cache.opened(), Opened::Scan);
+        assert_eq!(cache.stats().entries, 2);
+        assert!(all_there(), "nothing evicted at the open");
+        cache.get_or_convert(&conv, &inputs[1]).unwrap();
+        assert!(all_there(), "nor at the first access");
+        assert_eq!(&*cache.get_or_convert(&conv, b"new1").unwrap(), b"NEW1");
+        assert!(all_there(), "nor to store a new entry, which is stored");
+        drop(cache);
+        drop(held);
+
+        // An index past the budget, whose listing misses the folder.
+        let cache = Cache::open_with_limit(&root, 100).unwrap();
+        assert!(cache.reindex());
+        drop(cache);
+        let held = hold();
+        let cache = Cache::open_with_limit(&root, 4).unwrap();
+        assert_eq!(cache.opened(), Opened::Index);
+        cache.get_or_convert(&conv, &inputs[2]).unwrap();
+        assert!(all_there(), "nothing evicted on the index's counts");
+        drop(held);
+        // A whole listing: evicted to the budget, the oldest first.
+        assert!(cache.reindex());
+        assert!(cache.stats().bytes <= 4);
+        assert!(!paths[0].exists(), "the oldest went");
     }
 
     /// Codex review of 12556d6, point 5: an entry whose type cannot be read
@@ -1678,7 +1893,7 @@ mod tests {
         }
         index.scan(&root);
         let copy = tempfile::tempdir().unwrap();
-        index.snapshot(copy.path());
+        index.snapshot(copy.path(), None);
         timed("index read", &|| {
             let mut read = Index::default();
             for change in disk::read_index(copy.path()).unwrap() {

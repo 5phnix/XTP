@@ -24,7 +24,11 @@
 //!   (`shaders/precook.txt`) says for which translation key (the
 //!   translator, its settings and the host's wave sizes), pack and whether
 //!   with pipelines, and with pipelines what they came from: the file of
-//!   kept descriptions (its BLAKE3) and the library file (its size). A
+//!   kept descriptions (its BLAKE3), the library file (its size), and the
+//!   settings that change a pipeline without changing a translation (the
+//!   root SRVs' binding, the wave64 mesh programs refused, the host's
+//!   waves, shader model, depth bounds and mesh shaders: another is a
+//!   whole pass). A
 //!   precook that finds its own note stops there, in seconds (the pack and
 //!   the kept descriptions are read and hashed, the host device made); one
 //!   whose note differs only by the kept descriptions makes those alone;
@@ -102,8 +106,9 @@ pub struct Options {
 const NOTE: &str = "precook.txt";
 /// The note's first line; another version of the note is no note. Since
 /// version 2 a pass with pipelines makes the kept graphics and mesh ones
-/// too; since version 3 the note says what they came from.
-const NOTE_FORMAT: &str = "xtp precook 3";
+/// too; since version 3 the note says what they came from; since version 4
+/// the settings that change a pipeline and not a translation.
+const NOTE_FORMAT: &str = "xtp precook 4";
 /// The time the kept graphics and mesh pipelines may take by default, in
 /// seconds (`XTP_PRECOOK_SECONDS`).
 const REPLAY_SECONDS: u64 = 900;
@@ -185,6 +190,7 @@ fn precook(o: Options) -> Result<()> {
                 c.map(|c| Cache {
                     recorded: c.recorded,
                     library: c.library,
+                    settings: c.settings,
                     compacted: None,
                 })
             })
@@ -381,6 +387,10 @@ struct Note {
 struct Cache {
     recorded: String,
     library: u64,
+    /// What changes the pipelines and not the translations, the key's
+    /// (`xtp_gpu::pipeline::precook::PipelineSettings`): another is a
+    /// whole pass.
+    settings: String,
     /// Size immediately after the last compaction, while still oversized.
     /// Earlier notes have no such evidence and compact once above the bound.
     compacted: Option<u64>,
@@ -421,8 +431,8 @@ impl Note {
             Some(c) => {
                 let _ = write!(
                     o,
-                    "pipelines yes\nrecorded {}\nlibrary {}\n",
-                    c.recorded, c.library
+                    "pipelines yes\nrecorded {}\nlibrary {}\nsettings {}\n",
+                    c.recorded, c.library, c.settings
                 );
                 if let Some(size) = c.compacted {
                     let _ = writeln!(o, "compacted {size}");
@@ -452,6 +462,7 @@ impl Note {
             "yes" => Some(Cache {
                 recorded: field("recorded")?,
                 library: field("library")?.parse().ok()?,
+                settings: field("settings")?,
                 compacted: field("compacted").and_then(|s| s.parse().ok()),
             }),
             _ => return None,
@@ -496,6 +507,8 @@ impl Note {
             (None, _) => Plan::Nothing,
             (Some(_), None) => Plan::Whole,
             (Some(now), Some(then)) if now.library < then.library => Plan::Whole,
+            // Other pipelines from the same translations.
+            (Some(now), Some(then)) if now.settings != then.settings => Plan::Whole,
             (Some(now), Some(then)) if now.recorded != then.recorded => Plan::Kept,
             (Some(_), Some(_)) => Plan::Nothing,
         }
@@ -1575,6 +1588,7 @@ mod tests {
             Some(Cache {
                 recorded: recorded.into(),
                 library,
+                settings: "root-srv tables".into(),
                 compacted: None,
             })
         }
@@ -1584,7 +1598,7 @@ mod tests {
             pipelines: cache("01", 1000),
         };
         let text = note.text();
-        assert!(text.starts_with("xtp precook 3\n"));
+        assert!(text.starts_with("xtp precook 4\n"));
         assert_eq!(Note::parse(&text), Some(note.clone()));
         assert_eq!(note.plan(Some(&note)), Plan::Nothing);
         assert_eq!(note.plan(None), Plan::Whole);
@@ -1610,6 +1624,20 @@ mod tests {
         // The library file removed, or another one in its place.
         let gone = with(|n| n.pipelines = cache("01", 0));
         assert_eq!(gone.plan(Some(&note)), Plan::Whole);
+        // Two passes in a row, the second with a setting that changes the
+        // pipelines and not the translations (`XTP_ROOT_SRV_DIRECT=1`: the
+        // root signatures): the first's note does not cover it (Codex
+        // review of d286ffd, point 1), and the second's note covers a third
+        // with its settings.
+        let direct = with(|n| {
+            if let Some(c) = &mut n.pipelines {
+                c.settings = "root-srv direct".into();
+            }
+        });
+        assert_eq!(direct.plan(Some(&note)), Plan::Whole, "other settings");
+        let after = Note::parse(&direct.text()).unwrap();
+        assert_eq!(direct.plan(Some(&after)), Plan::Nothing);
+        assert_eq!(note.plan(Some(&after)), Plan::Whole, "and back");
         // A pass without pipelines is covered by one with them, not the
         // other way round.
         let without = with(|n| n.pipelines = None);
@@ -1618,7 +1646,12 @@ mod tests {
         assert_eq!(Note::parse(&without.text()), Some(without.clone()));
         // Not notes.
         assert_eq!(Note::parse(""), None);
-        assert_eq!(Note::parse(&text.replace("precook 3", "precook 2")), None);
+        assert_eq!(Note::parse(&text.replace("precook 4", "precook 3")), None);
+        assert_eq!(
+            Note::parse(&text.replace("settings root-srv tables\n", "")),
+            None,
+            "a note of before the settings"
+        );
         assert_eq!(
             Note::parse(&text.replace("library 1000", "library many")),
             None
@@ -1637,6 +1670,7 @@ mod tests {
             pipelines: Some(Cache {
                 recorded: "01".into(),
                 library,
+                settings: "root-srv tables".into(),
                 compacted: None,
             }),
         };
