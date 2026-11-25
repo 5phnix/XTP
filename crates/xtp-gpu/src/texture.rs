@@ -2282,6 +2282,82 @@ mod tests {
         texels
     }
 
+    /// A 2D RGBA8 texture of `slices` array slices and `mips` mips, `width`
+    /// square, that shaders sample (the layout library's pick).
+    fn sampled_chain(width: u64, slices: u16, mips: u16) -> crate::resource::ResourceDesc {
+        let desc = sampled(width, width as u32, 28);
+        // SAFETY: a description is 56 bytes, 14 words; word 7 holds the
+        // array size (low half) and the mip count (high half).
+        let mut words: [u32; 14] = unsafe { std::mem::transmute_copy(&desc) };
+        words[7] = u32::from(slices) | u32::from(mips) << 16;
+        // SAFETY: as above, the same layout back.
+        unsafe { std::mem::transmute_copy(&words) }
+    }
+
+    /// Data that arrives after a texture's upload in a late mip only (the
+    /// smallest, in the mip tail) or in another array slice only is found
+    /// by the look before an upload and detiled into that subresource of
+    /// the staging buffer. The cases of victory-fork #559 (NickJBc), whose
+    /// fingerprint of three windows missed them; here the guards cover
+    /// every page of the texture, so no window is needed.
+    #[test]
+    fn late_mips_and_other_slices_are_found_changed() {
+        let test = "texture::tests::late_mips_and_other_slices_are_found_changed";
+        let Some(host) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !guards() || verify_guards() || !predication() {
+            return;
+        }
+        let _serial = crate::watch::tests::serial();
+        const LEN: usize = 1 << 20;
+        // A 256-wide chain of 9 mips (1x1 last), then an array of 6 slices.
+        for (case, desc, (mip, slice)) in [
+            ("the last mip", sampled_chain(256, 1, 9), (8, 0)),
+            ("slice 3 of 6", sampled_chain(64, 6, 1), (0, 3)),
+        ] {
+            let (view, other) = section_views(LEN);
+            let resource = crate::resource::tests_support::at_address(view as u64, &desc);
+            let started = Instant::now();
+            while crate::resource::host_resource(resource).is_none() {
+                assert!(started.elapsed().as_secs() < 5, "never resident");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let texture = crate::resource::host_resource(resource).unwrap();
+            let staging = staging(resource, texture).unwrap();
+            let size = staging.layout.size as usize;
+            assert!(size <= LEN, "{case}: {size}");
+            // SAFETY: bytes of the title's view, as its CPU writes them.
+            unsafe { (view as *mut u8).write_bytes(0x11, size) };
+            sample_in(host, resource, 1);
+            assert_eq!(memory_change(resource), Change::No, "{case}: clean");
+            // The element (0, 0) of that mip and slice only.
+            let at = staging.layout.offset(mip, 0, 0, slice).unwrap() as usize;
+            assert!(at + 4 <= size, "{case}: {at}");
+            // SAFETY: inside the texture's memory, in the view.
+            unsafe { ((view + at) as *mut u32).write_unaligned(0x7777_7777) };
+            assert_eq!(memory_change(resource), Change::Yes, "{case}: written");
+            let before = staging.written.load(Ordering::Acquire);
+            sample_in(host, resource, 1);
+            assert!(
+                staging.written.load(Ordering::Acquire) > before,
+                "{case}: detiled"
+            );
+            // D3D12's subresource order: mips of slice 0, then of slice 1...
+            let sub = (slice * staging.mips + mip) as usize;
+            let offset = staging.footprints[sub].Offset as usize;
+            // SAFETY: the mapped staging buffer; nothing writes it now.
+            let texel = unsafe { staging.data.add(offset).cast::<u32>().read_unaligned() };
+            assert_eq!(texel, 0x7777_7777, "{case}: subresource {sub}");
+            assert_eq!(memory_change(resource), Change::No, "{case}: clean again");
+            type Release = extern "system" fn(This) -> u32;
+            assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+            crate::watch::title_memory_remapped(view, LEN);
+            let _ = other;
+        }
+        assert_eq!(host.log_messages(), None);
+    }
+
     /// Texture writes follow submission order, not recording order
     /// (watch.md item 263; reimplemented after andrewpozdnakov7-jpg's test
     /// on VIctory #1891). A 4×4 RGBA8 texture the title fills with a
