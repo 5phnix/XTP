@@ -3633,6 +3633,8 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 ),
             ]);
+            // XTP_SHADER_LOOP_COUNT: the frame's counters, copied after its lists.
+            crate::loopstat::record(self, list);
             p.copy.close();
             self.execute(&[&p.copy]);
             // XTP_SHADER_LOOP_COUNT: the frame's stopped lanes, once its
