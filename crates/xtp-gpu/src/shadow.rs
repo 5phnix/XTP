@@ -954,7 +954,7 @@ impl Shadow {
         if at < to {
             gaps.push((at, to));
         }
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED && !whole_ranges() {
             #[cfg(test)]
             tests::ASKED.set(tests::ASKED.get() + 1);
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
@@ -1030,7 +1030,7 @@ impl Shadow {
     /// [`Shadow::update_gaps`] of `[from, to)` (inside the buffer) where no
     /// GPU work writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED && !whole_ranges() {
             #[cfg(test)]
             tests::ASKED.set(tests::ASKED.get() + 1);
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
@@ -2252,6 +2252,108 @@ pub(crate) mod census {
     }
 }
 
+/// `XTP_FULL_REFRESH`, a diagnostic (slow): host copies brought up to date
+/// whatever the write tracking (journal, guards, kernel) says, to tell
+/// whether a copy the tracking left stale is what a picture lacks. The
+/// idea is the fork's (watch item 226: with `VICTORY_FULL_REFRESH=1`, walls
+/// that drew nothing came back in 3 runs of 3).
+///
+/// - `ranges`: each refresh copies its whole range from title memory, as
+///   for memory that is not watched (the fork's switch).
+/// - `<n>`: before every n-th submission's lists, every host copy is copied
+///   whole from title memory, but where GPU work in flight writes, through
+///   any copy ([`refresh_everything`]); also the memory no refresh covers
+///   (buffers read through directly indexed heaps). `1` is every
+///   submission: about 2 GB of copies each time in the Series S world
+///   (its System pool), so `30`, about once a frame, keeps it usable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FullRefresh {
+    Off,
+    Ranges,
+    Every(u64),
+}
+
+fn full_refresh() -> FullRefresh {
+    static SETTING: std::sync::OnceLock<FullRefresh> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let value = std::env::var("XTP_FULL_REFRESH").unwrap_or_default();
+        let setting = match value.trim() {
+            "" | "0" => FullRefresh::Off,
+            "ranges" => FullRefresh::Ranges,
+            n => match n.parse::<u64>() {
+                Ok(n) if n > 0 => FullRefresh::Every(n),
+                _ => {
+                    tracing::warn!(
+                        value,
+                        "XTP_FULL_REFRESH: 0, ranges or a number of submissions"
+                    );
+                    FullRefresh::Off
+                }
+            },
+        };
+        if setting != FullRefresh::Off {
+            tracing::info!(
+                ?setting,
+                "host copies refreshed whole, whatever the write tracking says (XTP_FULL_REFRESH)"
+            );
+        }
+        setting
+    })
+}
+
+/// Whether refreshes copy their whole range (`XTP_FULL_REFRESH=ranges`).
+fn whole_ranges() -> bool {
+    full_refresh() == FullRefresh::Ranges
+}
+
+/// With `XTP_FULL_REFRESH=<n>`, before `submission`'s lists if its number
+/// is a multiple of `n`: every host copy (title buffers' and loose memory's)
+/// copied whole from title memory, but where a submission not copied back
+/// yet writes through any copy: there title memory is older than the GPU's
+/// bytes. Returns the bytes copied.
+fn refresh_everything(submission: u64) -> usize {
+    let FullRefresh::Every(n) = full_refresh() else {
+        return 0;
+    };
+    if !submission.is_multiple_of(n) {
+        return 0;
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let mut copies: Vec<Arc<Shadow>> = buffers()
+        .values()
+        .filter_map(|e| e.shadow.clone())
+        .collect();
+    copies.extend(lock(&LOOSE).values().cloned());
+    let mut busy = Vec::new();
+    for shadow in &copies {
+        busy.extend(shadow.busy().iter().map(|b| (b.from, b.to)));
+    }
+    let busy = joined(busy);
+    let mut bytes = 0;
+    for shadow in &copies {
+        let (from, to) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        let mut at = from;
+        for &(a, e) in busy.iter().filter(|&&(a, e)| a < to && e > from) {
+            if a > at {
+                bytes += shadow.copy(at, a);
+            }
+            at = at.max(e);
+        }
+        if at < to {
+            bytes += shadow.copy(at, to);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::FullRefreshes, 1);
+        add(C::FullRefreshBytes, bytes as u64);
+        add(C::FullRefreshUs, started.elapsed().as_micros() as u64);
+    }
+    bytes
+}
+
 /// `mutex`'s guard, poisoned or not.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -2646,6 +2748,9 @@ struct Job {
 pub(crate) fn cards_around(
     submission: u64,
 ) -> (Option<ID3D12CommandList>, Option<ID3D12CommandList>) {
+    // First, with `XTP_FULL_REFRESH=<n>`, every copy taken whole (what goes
+    // into a copy on the card goes up below).
+    refresh_everything(submission);
     if !cards() {
         return (None, None);
     }
@@ -3836,6 +3941,62 @@ mod tests {
             // SAFETY: inside the mapping; tests stand in for the GPU.
             unsafe { self.data.add(from).write_bytes(byte, len) };
         }
+    }
+
+    /// `XTP_FULL_REFRESH=1` (a diagnostic): before a submission, a copy the
+    /// write tracking left stale is taken whole from title memory again,
+    /// but where GPU work in flight writes it. In a process of its own,
+    /// where the switch is read afresh.
+    #[test]
+    fn a_full_refresh_takes_every_copy_whole_but_what_gpu_work_writes() {
+        const CHILD: &str = "XTP_SHADOW_TEST_FULL_REFRESH";
+        let test = "shadow::tests::a_full_refresh_takes_every_copy_whole_but_what_gpu_work_writes";
+        if crate::testgpu::device(test).is_none() {
+            return;
+        }
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("XTP_FULL_REFRESH", "1")
+                .output()
+                .unwrap();
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{test} in a process of its own: {stdout}\n{stderr}"
+            );
+            return;
+        }
+        assert_eq!(full_refresh(), FullRefresh::Every(1));
+        let window = watched(4 * PAGE);
+        let shadow = find(window as u64, (4 * PAGE) as u64).expect("a host copy");
+        set_title(window, 4 * PAGE, 0x11);
+        shadow.update(window, 4 * PAGE);
+        // Stale, and the tracking does not know: the copy holds other bytes
+        // than title memory.
+        shadow.set_host(window, 4 * PAGE, 0x22);
+        assert!(!shadow.stale(window, window + 4 * PAGE));
+        // GPU work in flight writes the second page.
+        let gpu = submission();
+        shadow.writing(gpu, window + PAGE, PAGE);
+        let lists = cards_around(submission());
+        assert!(
+            lists.0.is_none() && lists.1.is_none(),
+            "no copy on the card"
+        );
+        let all =
+            |at: usize, len: usize, byte: u8| shadow.host_bytes(at, len).iter().all(|&b| b == byte);
+        assert!(all(window, PAGE, 0x11), "taken again");
+        assert!(
+            all(window + PAGE, PAGE, 0x22),
+            "what the GPU writes, left alone"
+        );
+        assert!(all(window + 2 * PAGE, 2 * PAGE, 0x11), "taken again");
+        assert_eq!(shadow.copy_back(gpu, window + PAGE, PAGE), 0);
     }
 
     /// The card's passes compile, and their pipeline is made.

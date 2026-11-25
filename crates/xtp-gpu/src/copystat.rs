@@ -103,8 +103,13 @@ pub(crate) enum C {
     CardCompared,
     CardChanged,
     CardBackUs,
+    /// `XTP_FULL_REFRESH=<n>`: host copies taken whole before a
+    /// submission, their bytes and time in microseconds.
+    FullRefreshes,
+    FullRefreshBytes,
+    FullRefreshUs,
 }
-const COUNTERS: usize = 52;
+const COUNTERS: usize = 55;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -223,6 +228,14 @@ pub(crate) fn log(frames: f64) {
         crate::shadow::MIRRORS.load(Relaxed) as f64 / 1e6,
         crate::shadow::mirror_phase(),
     );
+    if c[C::FullRefreshes as usize] > 0.0 {
+        tracing::info!(
+            "full refreshes per frame (XTP_FULL_REFRESH): {:.1}, {:.1} MB in {:.1} ms",
+            c[C::FullRefreshes as usize],
+            mb(c[C::FullRefreshBytes as usize]),
+            ms(c[C::FullRefreshUs as usize]),
+        );
+    }
     if let Some(cards) = crate::shadow::card_summary() {
         tracing::info!(
             "copies on the card per frame ({cards}): {:.0} ranges declared, no snapshot; {:.1} \

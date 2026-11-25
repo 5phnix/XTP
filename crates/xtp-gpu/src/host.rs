@@ -1250,7 +1250,8 @@ impl Host {
         // Copies of big title buffers in the card's memory
         // (`shadow::cards_around`): what their CPU side took goes up first,
         // and what the shaders wrote is found on the card after the lists,
-        // in the same submission.
+        // in the same submission. (With `XTP_FULL_REFRESH=<n>`, a
+        // diagnostic, every host copy is taken whole there first.)
         let (cards_first, cards_last) = crate::shadow::cards_around(batch.submission);
         if let Some(first) = cards_first {
             lists.insert(0, Some(first));
