@@ -701,12 +701,6 @@ struct Viewed {
 struct Made {
     /// The record (view index and generation; 0 when not made).
     keys: Vec<u64>,
-    /// The record ([`super::record_key`]) the title last wrote at each slot
-    /// through its view calls and descriptor copies (a mirror that is not
-    /// for a draw), or that the look for records copied in as bytes last
-    /// found there ([`HostHeap::copied_records`]): a record found there
-    /// that is neither was copied in as bytes, with no call.
-    written: Vec<u64>,
     /// For a texture view, the host texture the slot views (0: none, the
     /// slot is null) and, for a texture the title placed itself, the
     /// resource made for its memory (see [`HostHeap::mirror`]).
@@ -1545,7 +1539,6 @@ impl HostHeap {
             sampler,
             made: Mutex::new(Made {
                 keys: vec![0; count as usize],
-                written: vec![0; count as usize],
                 textures: HashMap::new(),
                 waiting: Vec::new(),
                 queued: vec![false; if sampler { 0 } else { count as usize }],
@@ -2159,11 +2152,6 @@ impl HostHeap {
         if header_at(handle) != header {
             // Published meanwhile.
             return Err(Unmade::Rewritten);
-        }
-        if !for_draw {
-            // The title's own write, through a call: not a record it copied
-            // in as bytes ([`HostHeap::copied_records`]).
-            made.written[index as usize] = super::record_key(header);
         }
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -3418,32 +3406,19 @@ impl HostHeap {
         stamp != 0 && u64::from(stamp_of(clock).wrapping_sub(stamp)) <= frames
     }
 
-    /// Of the records `keys` ([`super::record_key`]) that the look for
-    /// records copied in as bytes (`super::sync_heaps`) found at title
-    /// slots `first`, `first + 1`, ...: those the title wrote with no call,
-    /// each with whether its host slot was made from it. Neither did the
-    /// title's calls (view creation, descriptor copies) write them last,
-    /// nor did an earlier look find them; each is noted found, so that it
-    /// counts once. Slots past the host heap are left out.
-    pub(crate) fn copied_records(&self, first: u32, keys: &[u64]) -> Vec<(u32, bool)> {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let made = &mut *made;
-        let mut copied = Vec::new();
-        for (index, &key) in (first..).zip(keys) {
-            let Some(written) = made.written.get_mut(index as usize) else {
-                break;
-            };
-            if *written != key {
-                *written = key;
-                copied.push((index, key != 0 && made.keys[index as usize] == key));
-            }
-        }
-        copied
+    /// The record ([`super::record_key`]) each of title slots `indices`
+    /// was last made from: 0 for one not made, made null, or past the host
+    /// heap (`super::sync_heaps`, before it mirrors records copied in as
+    /// bytes; tests).
+    pub(crate) fn made_keys(&self, indices: &[u32]) -> Vec<u64> {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let key = |i: u32| made.keys.get(i as usize).copied().unwrap_or(0);
+        indices.iter().map(|&i| key(i)).collect()
     }
 
     /// What title slot `index`, which the title copied a record into as
-    /// bytes ([`HostHeap::copied_records`]), holds for the shaders that may
-    /// read it: `view` (`None`: no view of ours).
+    /// bytes (`super::sync_heaps`), holds for the shaders that may read it:
+    /// `view` (`None`: no view of ours).
     pub(crate) fn copied_kind(&self, index: u32, view: Option<&View>) -> CopiedKind {
         if self.sampler {
             return CopiedKind::Sampler;

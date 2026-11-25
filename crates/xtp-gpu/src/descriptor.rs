@@ -13,6 +13,9 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+#[cfg(windows)]
+use std::ops::Range;
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -63,10 +66,11 @@ pub(crate) struct Heap {
     /// it ([`HeapHold`]).
     #[cfg(windows)]
     life: std::sync::Arc<Life>,
-    /// Shader-visible heaps placed in the title's memory: what the look for
-    /// records the title copies into them as bytes keeps ([`sync_heaps`]).
+    /// Shader-visible heaps placed in the title's memory, in a run that
+    /// looks for the records the title copies into them as bytes: what that
+    /// look keeps ([`sync_heaps`]).
     #[cfg(windows)]
-    watched: Option<std::sync::Mutex<Watched>>,
+    watched: Option<Watch>,
 }
 
 /// Whether a title heap is still there, for work that outlives the
@@ -200,11 +204,11 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     Some((heap, heap.index(handle)?))
 }
 
-/// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap.
+/// Makes the host descriptor for what the title wrote at `handle` through
+/// a call, if it is in a shader-visible heap (`slot`: [`shader_slot`]).
 #[cfg(windows)]
-fn mirror(handle: u64) {
-    let Some((heap, index)) = shader_slot(handle) else {
+fn mirror(slot: Option<(&Heap, u32)>, handle: u64) {
+    let Some((heap, index)) = slot else {
         return;
     };
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -231,14 +235,71 @@ pub(crate) fn record_key([tag, i, generation]: [u32; 3]) -> u64 {
     }
 }
 
-/// Whether [`sync_heaps`] looks for records copied in as bytes:
-/// `XTP_HEAP_SYNC=1` does, `ab` in turns within the run ([`xtp_core::ab`]:
-/// phase A not, B does). Off by default: in the world it took 6.7 to 9.9 ms
-/// a frame (session faces-1, Series S, 24 to 34 submissions a frame).
+/// Notes `key` as the record the title's call wrote at `slot` (a slot of a
+/// shader-visible heap, [`shader_slot`]): called within the write of
+/// [`RECORDS`] that wrote the record ([`Watch::noted`]).
+#[cfg(windows)]
+fn note_call(slot: Option<(&Heap, u32)>, key: u64) {
+    if let Some((heap, index)) = slot
+        && let Some(note) = heap
+            .watched
+            .as_ref()
+            .and_then(|w| w.noted.get(index as usize))
+    {
+        note.store(key, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether [`sync_heaps`] looks for records copied in as bytes and mirrors
+/// them: `XTP_HEAP_SYNC=1` does, `ab` in turns within the run
+/// ([`xtp_core::ab`]: phase A not, B does). Off by default: counting alone
+/// took 6.7 to 9.9 ms a frame in the world (session faces-1, Series S, 24
+/// to 34 submissions a frame).
 #[cfg(windows)]
 fn heap_sync() -> &'static xtp_core::ab::Switch<bool> {
     static SWITCH: std::sync::OnceLock<xtp_core::ab::Switch<bool>> = std::sync::OnceLock::new();
     SWITCH.get_or_init(|| xtp_core::ab::switch("XTP_HEAP_SYNC", false))
+}
+
+/// Whether the run looks for records copied in as bytes at all (in either
+/// arm of an A/B; tests look themselves): placed heaps then keep what the
+/// look needs ([`Watch`]), from their creation, so that the calls of a
+/// phase that does not look are noted too. Nothing is kept otherwise.
+#[cfg(windows)]
+fn heap_sync_used() -> bool {
+    use xtp_core::ab::Arm;
+    cfg!(test) || heap_sync().at(Arm::A) || heap_sync().at(Arm::B)
+}
+
+/// A placed shader-visible heap's part in the look for the records the
+/// title copies into it as bytes ([`sync_heaps`]).
+#[cfg(windows)]
+struct Watch {
+    /// The record ([`record_key`]) each slot was last noted with: by the
+    /// title's call that wrote it (view creation, descriptor copies), in
+    /// the same write of [`RECORDS`] as the record itself, or by the look
+    /// that found it, which reads slots and notes under that lock. A slot
+    /// whose record is not its note was copied in as bytes since.
+    /// Codex review of 7c64b95: the call noted its record under the host
+    /// heap's lock after writing it, and the look noted what it had read
+    /// once its read was over, so either could come between the other's
+    /// two steps (a call's record counted as copied, or a look's older
+    /// record noted over it and both counted); and a call before the host
+    /// heap was made queued the slot's index alone, so the queue's replay
+    /// noted whatever the slot held by then, copied or not.
+    noted: Box<[std::sync::atomic::AtomicU64]>,
+    /// What the look keeps from one look to the next, one look at a time.
+    look: std::sync::Mutex<Watched>,
+}
+
+#[cfg(windows)]
+impl Watch {
+    fn new(count: u32) -> Watch {
+        Watch {
+            noted: (0..count).map(|_| Default::default()).collect(),
+            look: Default::default(),
+        }
+    }
 }
 
 /// What the look for records copied in as bytes ([`sync_heaps`]) keeps of a
@@ -261,6 +322,13 @@ struct Watched {
     /// guards take. Counted, not looked at; asked again every
     /// [`UNWATCHED_AGAIN`] looks (the title may map memory there since).
     unwatched: std::collections::BTreeSet<usize>,
+    /// Blocks holding the first byte of slots a look could not read (none
+    /// of their memory mapped then): looked at again at each look until
+    /// read, whatever the watch says. Before, a changed block whose slots
+    /// one read failed was passed over until written again (Codex review
+    /// of 7c64b95), with every slot of that read, and the read reached into
+    /// the next block for the slot across their boundary.
+    unread: std::collections::BTreeSet<usize>,
     /// Looks so far.
     looks: u64,
     /// Room for the records of a changed page.
@@ -280,15 +348,18 @@ pub(crate) struct Copies {
     pub(crate) pages: u64,
     pub(crate) slots: u64,
     /// Slots holding a record the title copied in as bytes, with no view
-    /// call nor descriptor copy, each counted once.
+    /// call nor descriptor copy, since the last look (each mirrored).
+    /// Changes between looks: two copies that bring a slot back to the
+    /// record it had are none (the host slot shows that record already).
     pub(crate) copied: u64,
     /// Of them, views of textures the title fills, and of those the ones a
     /// draw read through a table lately (draws make them: the others are
-    /// read only by shaders that pick textures by index).
+    /// read only by shaders that pick textures by index, if any does: not
+    /// read through a table lately does not say that a shader reads them).
     pub(crate) textures: u64,
     pub(crate) tabled: u64,
     /// Buffer views, and of those the ones in heaps whose shaders pick
-    /// buffers at run time.
+    /// buffers at run time (as the heap's last sweep says).
     pub(crate) buffers: u64,
     pub(crate) picked_buffers: u64,
     /// Samplers, other views of ours, and no view of ours.
@@ -296,8 +367,12 @@ pub(crate) struct Copies {
     pub(crate) other: u64,
     pub(crate) none: u64,
     /// Of the copied, those whose host slot was not made from their record
-    /// when the look found them (null, or another view).
+    /// when the look found them (null, or another view), which the mirror
+    /// made (a buffer view null until a draw or a sweep makes it).
     pub(crate) unmade: u64,
+    /// Slots on changed pages a look could not read (none of their memory
+    /// mapped): looked at again at the next ([`Watched::unread`]).
+    pub(crate) unread: u64,
     /// Blocks of placed heaps no write watch answers for (the most at one
     /// look, not summed).
     pub(crate) unwatched: u64,
@@ -326,9 +401,9 @@ impl Copies {
         }
     }
 
-    /// The slots shaders pick by index: views of textures the title fills
-    /// that no table read lately, and buffer views in heaps whose shaders
-    /// pick buffers at run time.
+    /// The slots shaders may pick by index, an estimate: views of textures
+    /// the title fills that no table read lately, and buffer views in heaps
+    /// whose shaders pick buffers at run time.
     pub(crate) fn picked(&self) -> u64 {
         self.textures - self.tabled + self.picked_buffers
     }
@@ -346,6 +421,7 @@ impl Copies {
         self.other += other.other;
         self.none += other.none;
         self.unmade += other.unmade;
+        self.unread += other.unread;
         self.unwatched = self.unwatched.max(other.unwatched);
     }
 }
@@ -366,6 +442,7 @@ static SYNCED: std::sync::Mutex<(Copies, u64)> = std::sync::Mutex::new((
         other: 0,
         none: 0,
         unmade: 0,
+        unread: 0,
         unwatched: 0,
     },
     0,
@@ -376,39 +453,49 @@ static SYNCED: std::sync::Mutex<(Copies, u64)> = std::sync::Mutex::new((
 #[cfg(all(test, windows))]
 static LOOKED_AT_BY_TESTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
-/// Looks for descriptor records the title copied into its placed
+/// Mirrors the descriptor records the title copied into its placed
 /// shader-visible heaps as bytes (stores or memcpy, which no `Create*View`
 /// nor `CopyDescriptors` shows), before each title submission: the pages the
 /// write watch (the guards, for view memory) reports changed since the last
 /// look are read through the kernel (a page the title unmapped meanwhile
-/// fails the read instead of faulting), and each slot whose record is
-/// neither what the title's calls wrote there nor what the last look found
-/// is counted once, with what it holds ([`Copies`], on the frame line:
-/// [`take_synced`]).
+/// fails the read instead of faulting), and each slot whose record is not
+/// the one last noted there ([`Watch::noted`]: by the title's call that
+/// wrote it, or by the look that found it) is made on the host as a call's
+/// would be ([`host::HostHeap::mirror`]: a texture view at once and queued
+/// for the pass over textures shaders pick by index, a buffer view null
+/// until a draw or a sweep makes it), and counted once, with what it holds
+/// ([`Copies`], on the frame line: [`take_synced`]). Without it, shaders
+/// that pick such a slot by index read null, or the view it showed before.
 ///
-/// Counted only, for now: such a slot stays on the host as it was (null for
-/// a placed texture, the view it showed before otherwise) unless a draw
-/// reads it through a table, which makes it. The mirror of these slots
-/// (VIctory 86a5ed6 by Marvis; the fork's a26859f and 9376fd6) is to be
-/// ported once this count shows shaders picking them.
+/// Ported from Marvisak/VIctory (86a5ed6) by Marvisak: the mirror at each
+/// submission of the slots on pages written since the last. Ported from
+/// fxceless/victory-fork (a26859f) by Flyander (its PR #305) and fxceless:
+/// the pages read through the kernel first, only the records that changed
+/// mirrored, and the count on the frame line. What differs:
+/// - a slot's record is compared by its key (the header XTP writes,
+///   [`record_key`]) with the one last noted there, which the title's calls
+///   note in the same write as the record: not by a fingerprint of its
+///   bytes against the last look's, so a slot the title rewrites through a
+///   call is not mirrored a second time, and a slot that is not mirrored
+///   again holds the record its host slot was made from (VIctory mirrored
+///   every slot of a written page, each a buffer view made null again);
+/// - a slot draws read through tables lately is mirrored all the same
+///   (9376fd6 left those to their draws whatever they held, and a shader
+///   picking one by index read the view it showed before): one a draw made
+///   from the same record is left as it is;
+/// - a record across two pages is looked at from either page (a26859f left
+///   it to the range holding its first byte, which fork #802 reports);
+/// - the watch is asked per run of blocks it answers for (the fork asked
+///   once for the heap, which over memory the watch answers for only in
+///   part gave nothing at all: it decides by the first block);
+/// - slots a read could not reach are read in smaller pieces, and those
+///   still unread are looked at again ([`Watched::unread`]).
 ///
-/// Ported from fxceless/victory-fork (a26859f) by Flyander (its PR #305)
-/// and fxceless: the look before each submission at the pages the write
-/// watch reports changed, read through the kernel, and its count on the
-/// frame line. What differs: a slot's record is compared by its key (the
-/// header XTP writes, [`record_key`]) with the one the title's calls last
-/// wrote there, not by a fingerprint of its bytes against the last look's,
-/// so a slot the title rewrites through a call is never taken for a copy,
-/// and a slot draws read through tables lately is counted all the same
-/// (9376fd6 left those out of its pass whatever they held); a record across
-/// two pages is looked at from either page (a26859f left it to the range
-/// holding its first byte, which fork #802 reports); and the watch is asked
-/// per run of blocks it answers
-/// for (the fork asked once for the heap, which over memory the watch
-/// answers for only in part gave nothing at all).
-///
-/// shortcut: a record a call publishes while a look reads its page may be
-/// counted as copied once (the call notes it just after its write).
+/// shortcut: the mirror reads each record again in place, as a call's
+/// does, after the look read it through the kernel: a page the title
+/// unmapped between the two would fault. A record the title is copying
+/// while a look reads it may be found torn once: it is mirrored as the
+/// slot holds it then, and the whole one at the next look.
 /// With `XTP_HEAP_SYNC=1`, or `ab` in turns ([`heap_sync`]); off, nothing is
 /// looked at.
 #[cfg(windows)]
@@ -511,21 +598,116 @@ fn changed_pages(w: &mut Watched, start: usize, end: usize) -> Vec<usize> {
         .collect()
 }
 
+/// `slots` (of `step` bytes each from `start`) in pieces that a kernel
+/// page (4 KiB) not mapped leaves whole: runs of slots within one kernel
+/// page, and each slot across two on its own.
+#[cfg(windows)]
+fn kernel_pieces(start: usize, step: usize, slots: Range<usize>) -> Vec<Range<usize>> {
+    const KERNEL_PAGE: usize = 4096;
+    let page = |byte: usize| byte / KERNEL_PAGE;
+    // The kernel page of a run's bytes, if they are in one.
+    let within = |r: &Range<usize>| {
+        let first = page(start + r.start * step);
+        (first == page(start + r.end * step - 1)).then_some(first)
+    };
+    let mut pieces: Vec<Range<usize>> = Vec::new();
+    for slot in slots {
+        let one = slot..slot + 1;
+        match (pieces.last_mut(), within(&one)) {
+            (Some(last), Some(page)) if within(last) == Some(page) => last.end = slot + 1,
+            _ => pieces.push(one),
+        }
+    }
+    pieces
+}
+
+/// Of slots `slots` of a placed heap from `start` (`step` bytes each),
+/// those whose record is not the one noted there ([`Watch::noted`]), each
+/// with its record's key, noted now. Slots and notes are read in one read
+/// of [`RECORDS`], so no call writes a record and its note meanwhile. A
+/// read that fails (some of the memory not mapped) is made again in
+/// [`kernel_pieces`], and the slots no piece reaches are left to the next
+/// look ([`Watched::unread`]).
+#[cfg(windows)]
+fn changed_slots(
+    watch: &Watch,
+    w: &mut Watched,
+    (start, step): (usize, usize),
+    slots: Range<usize>,
+    found: &mut Copies,
+) -> Vec<(u32, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Watched { bytes, unread, .. } = w;
+    bytes.resize(slots.len() * step, 0);
+    let at = |slot: usize| start + slot * step;
+    let into = |bytes: &mut Vec<u8>, piece: &Range<usize>| {
+        let room = &mut bytes[(piece.start - slots.start) * step..(piece.end - slots.start) * step];
+        crate::host::read_into(at(piece.start) as *const u8, room)
+    };
+    let _records = records_read();
+    let read = if into(bytes, &slots) {
+        vec![slots.clone()]
+    } else {
+        let (read, missed): (Vec<_>, Vec<_>) = kernel_pieces(start, step, slots.clone())
+            .into_iter()
+            .partition(|piece| into(bytes, piece));
+        for piece in missed {
+            found.unread += piece.len() as u64;
+            unread.extend(piece.map(|slot| at(slot) / crate::watch::PAGE));
+        }
+        read
+    };
+    #[cfg(test)]
+    if let Some(between) = LOOK_BETWEEN.with(|b| b.borrow_mut().take()) {
+        between();
+    }
+    found.pages += u64::from(!read.is_empty());
+    let mut changed = Vec::new();
+    for slot in read.into_iter().flatten() {
+        found.slots += 1;
+        let record = &bytes[(slot - slots.start) * step..];
+        let header =
+            std::array::from_fn(|k| u32::from_le_bytes([0, 1, 2, 3].map(|b| record[4 * k + b])));
+        let key = record_key(header);
+        if let Some(note) = watch.noted.get(slot)
+            && note.load(Relaxed) != key
+        {
+            note.store(key, Relaxed);
+            changed.push((slot as u32, key));
+        }
+    }
+    changed
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    /// Run once by the next look on this thread, between its read of a
+    /// range of slots and its comparison with their notes, while it holds
+    /// [`RECORDS`] (tests: a call publishing a record then).
+    static LOOK_BETWEEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(windows)]
 impl Heap {
     /// [`sync_heaps`]' look at this heap, if it is placed in the title's
-    /// memory and has its host heap: what it found added to `found`.
+    /// memory and has its host heap: the records copied in as bytes since
+    /// the last look mirrored, and what it found added to `found`.
     fn look_for_copies(&self, found: &mut Copies) {
-        let (Some(watched), Some(Some(host)), Some(step)) =
+        let (Some(watch), Some(Some(host)), Some(step)) =
             (&self.watched, self.host.get(), increment(self.desc.kind))
         else {
             return;
         };
         let step = step as usize;
         let start = self.start as usize;
-        let mut w = watched.lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = watch.look.lock().unwrap_or_else(|e| e.into_inner());
         let w = &mut *w;
-        let pages = changed_pages(w, start, start + self.desc.count as usize * step);
+        let mut pages = changed_pages(w, start, start + self.desc.count as usize * step);
+        // Blocks with slots the last looks could not read: again.
+        pages.extend(std::mem::take(&mut w.unread));
+        pages.sort_unstable();
+        pages.dedup();
         found.unwatched += w.unwatched.len() as u64;
         // Slots past the host heap (a capped one) have no host slot.
         let count = self.desc.count.min(host.count()) as usize;
@@ -534,68 +716,79 @@ impl Heap {
         let mut next = 0;
         for page in pages {
             let slots = page_slots(page, start, step, count);
-            let (from, to) = (slots.start.max(next), slots.end);
-            if from >= to {
+            let slots = slots.start.max(next)..slots.end;
+            if slots.is_empty() {
                 continue;
             }
-            next = to;
-            w.bytes.resize((to - from) * step, 0);
-            let read = {
-                let _records = records_read();
-                crate::host::read_into((start + from * step) as *const u8, &mut w.bytes)
-            };
-            if !read {
+            next = slots.end;
+            let changed = changed_slots(watch, w, (start, step), slots, found);
+            if changed.is_empty() {
                 continue;
             }
-            found.pages += 1;
-            found.slots += (to - from) as u64;
-            let headers: Vec<[u32; 3]> = w
-                .bytes
-                .chunks_exact(step)
-                .map(|r| {
-                    std::array::from_fn(|k| u32::from_le_bytes([0, 1, 2, 3].map(|b| r[4 * k + b])))
-                })
-                .collect();
-            let keys: Vec<u64> = headers.iter().map(|&h| record_key(h)).collect();
-            for (index, made) in host.copied_records(from as u32, &keys) {
-                let at = index as usize - from;
-                let [_, i, generation] = headers[at];
-                let view = (keys[at] != 0).then(|| view_at(i, generation)).flatten();
-                found.add_slot(host.copied_kind(index, view.as_ref()), made);
+            // What their host slots were made from, before the mirror.
+            let indices: Vec<u32> = changed.iter().map(|&(index, _)| index).collect();
+            let made = host.made_keys(&indices);
+            for (&(index, key), made) in changed.iter().zip(made) {
+                let handle = self.start + u64::from(index) * step as u64;
+                let view = host.mirror(index, handle, false);
+                let kind = host.copied_kind(index, view.as_ref());
+                // In the frames listed for capture: each record mirrored,
+                // what its host slot was made from before, and its view.
+                #[cfg(feature = "diagnostics")]
+                if crate::capture::listed(crate::frame::current()) {
+                    tracing::debug!(
+                        target: "xtp_gpu::heap_sync",
+                        heap = format_args!("{:#x}", self.start),
+                        slot = index,
+                        record = format_args!("{key:#x}"),
+                        before = format_args!("{made:#x}"),
+                        ?kind,
+                        ?view,
+                        "mirrored a record the title copied in as bytes"
+                    );
+                }
+                found.add_slot(kind, key != 0 && made == key);
             }
         }
     }
 }
 
 /// What [`sync_heaps`] found since the last call, for the frame line over
-/// `frames` frames ([`HeapSyncLine::log`]).
+/// `frames` frames ([`HeapSyncLine::log`]). Nothing is looked at in a run
+/// that does not look for records copied in as bytes.
 #[cfg(windows)]
 pub(crate) fn take_synced(frames: f64) -> HeapSyncLine {
     let (copies, micros) = std::mem::take(&mut *SYNCED.lock().unwrap_or_else(|e| e.into_inner()));
-    // Slots of shader-visible heaps in XTP's own memory, whose host heap is
-    // made: the title may copy records into them as well, and no write
-    // watch shows it.
-    let unplaced = SHADER_HEAPS
+    let mut line = HeapSyncLine {
+        copies,
+        micros,
+        unplaced: 0,
+        past: 0,
+        frames: frames.max(1.0),
+    };
+    if !heap_sync_used() {
+        return line;
+    }
+    for &(_, _, at) in SHADER_HEAPS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .map(|&(_, _, at)| {
-            // SAFETY: registered heaps are live (removed when dropped).
-            let heap = unsafe { &*(at as *const Heap) };
-            let made = heap.host.get().is_some_and(Option::is_some);
-            if heap.watched.is_none() && made {
-                u64::from(heap.desc.count)
-            } else {
-                0
-            }
-        })
-        .sum();
-    HeapSyncLine {
-        copies,
-        micros,
-        unplaced,
-        frames: frames.max(1.0),
+    {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(Some(host)) = heap.host.get() else {
+            continue;
+        };
+        if heap.watched.is_none() {
+            // In XTP's own memory: the title may copy records into it as
+            // well, and no write watch shows it.
+            line.unplaced += u64::from(heap.desc.count);
+        } else {
+            // Past the host heap (a capped one): no host slot to make.
+            line.past += u64::from(heap.desc.count.saturating_sub(host.count()));
+        }
     }
+    line
 }
 
 /// [`sync_heaps`]' part of the frame line ([`take_synced`]).
@@ -603,7 +796,10 @@ pub(crate) fn take_synced(frames: f64) -> HeapSyncLine {
 pub(crate) struct HeapSyncLine {
     copies: Copies,
     micros: u64,
+    /// Slots of shader-visible heaps in XTP's memory, whose host heap is
+    /// made, and slots of placed heaps past their host heap: not looked at.
     unplaced: u64,
+    past: u64,
     frames: f64,
 }
 
@@ -619,13 +815,14 @@ impl HeapSyncLine {
         let per = |n: u64| n as f64 / self.frames;
         tracing::info!(
             "descriptor records the title copied into its placed heaps as bytes, with no view call \
-             nor descriptor copy (counted only, with XTP_HEAP_SYNC=1 or ab), per frame: \
-             {:.1} changed heap pages, {:.0} slots looked at, {:.1} copied slots; picked by index \
-             {:.1} ({:.1} views of textures the title fills that no table read lately, {:.1} \
-             buffer views in heaps whose shaders pick buffers at run time); besides {:.1} textures \
-             read through tables, {:.1} buffer views, {:.1} samplers, {:.1} other views, {:.1} no \
-             view of ours; {:.1} not what their host slot was made from; {:.3} ms; {} blocks no \
-             write watch answers for, {} slots of heaps in XTP's memory (not looked at)",
+             nor descriptor copy (mirrored, with XTP_HEAP_SYNC=1 or ab), per frame: \
+             {:.1} changed heap pages, {:.0} slots looked at, {:.1} copied slots; of them, slots \
+             shaders may pick by index {:.1} ({:.1} views of textures the title fills that no table \
+             read lately, {:.1} buffer views in heaps whose shaders pick buffers at run time); \
+             besides {:.1} textures read through tables, {:.1} buffer views, {:.1} samplers, {:.1} \
+             other views, {:.1} no view of ours; {:.1} not what their host slot was made from; \
+             {:.1} slots not mapped (again at the next look); {:.3} ms; {} blocks no write watch \
+             answers for, {} slots of heaps in XTP's memory and {} past host heaps (not looked at)",
             per(c.pages),
             per(c.slots),
             per(c.copied),
@@ -638,9 +835,11 @@ impl HeapSyncLine {
             per(c.other),
             per(c.none),
             per(c.unmade),
+            per(c.unread),
             self.micros as f64 / 1000.0 / self.frames,
             c.unwatched,
             self.unplaced,
+            self.past,
         );
     }
 }
@@ -1174,6 +1373,9 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    // Found first: the slot's note is written with its record.
+    #[cfg(windows)]
+    let slot = shader_slot(handle);
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,
@@ -1198,12 +1400,15 @@ fn record(handle: u64, view: View) {
     let generation = views.list[i as usize].1;
     {
         let _records = records_written();
+        let header = [VIEW_TAG, i, generation];
         // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-        unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+        unsafe { (handle as *mut [u32; 3]).write_unaligned(header) };
+        #[cfg(windows)]
+        note_call(slot, record_key(header));
     }
     drop(views);
     #[cfg(windows)]
-    mirror(handle);
+    mirror(slot, handle);
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -1328,14 +1533,28 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
+        // Found first: the slots' notes are written with their records.
+        #[cfg(windows)]
+        let slots: Vec<_> = (0..u64::from(count))
+            .map(|i| shader_slot(dst + i * step))
+            .collect();
         {
             let _records = records_written();
             // SAFETY: both ranges are descriptor slots the title owns.
             unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+            #[cfg(windows)]
+            for (i, &slot) in (0..).zip(&slots) {
+                if slot.is_some() {
+                    // SAFETY: a descriptor slot just written, at least 16
+                    // bytes.
+                    let header = unsafe { ((dst + i * step) as *const [u32; 3]).read_unaligned() };
+                    note_call(slot, record_key(header));
+                }
+            }
         }
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
+        for (i, slot) in (0..).zip(slots) {
+            mirror(slot, dst + i * step);
         }
     }
 }
@@ -1458,7 +1677,7 @@ pub(crate) extern "system" fn create_heap(
             heap: std::sync::RwLock::new(0),
         }),
         #[cfg(windows)]
-        watched: (placed && visible).then(Default::default),
+        watched: (placed && visible && heap_sync_used()).then(|| Watch::new(desc.count)),
     });
     // The box does not move: its address is the heap's for its life.
     #[cfg(windows)]
@@ -1582,6 +1801,84 @@ impl TestHeap {
 impl Drop for TestHeap {
     fn drop(&mut self) {
         release(self.0);
+    }
+}
+
+/// A shader-visible title view heap for tests placed in title memory the
+/// runtime write-watches, as BTP 6 places its own, which only its test
+/// looks at for records copied in as bytes ([`PlacedTestHeap::look`]);
+/// released, and its memory freed, when dropped.
+#[cfg(all(test, windows))]
+pub(crate) struct PlacedTestHeap {
+    pub(crate) this: This,
+    memory: usize,
+}
+
+#[cfg(all(test, windows))]
+impl PlacedTestHeap {
+    /// A heap of `count` view slots (at most 64 KiB of them).
+    pub(crate) fn views(count: u32) -> PlacedTestHeap {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let size = count as usize * 32;
+        assert!(size <= crate::watch::PAGE);
+        // SAFETY: a fresh allocation of our own, freed when dropped.
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(memory, 0, "write-watched memory");
+        #[repr(C)]
+        struct Extended(HeapDesc, Placement);
+        let extended = Extended(
+            HeapDesc {
+                kind: VIEWS_KIND,
+                count,
+                flags: SHADER_VISIBLE,
+                nodes: 1,
+            },
+            Placement {
+                address: memory as u64,
+                size: size as u64,
+            },
+        );
+        let mut this = std::ptr::null();
+        let made = create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut this);
+        assert_eq!(made, crate::object::S_OK, "a placed title view heap");
+        LOOKED_AT_BY_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(this as usize);
+        PlacedTestHeap { this, memory }
+    }
+
+    /// One look for the records copied into it as bytes, as before a
+    /// submission ([`sync_heaps`]): they are mirrored.
+    pub(crate) fn look(&self) -> Copies {
+        let mut found = Copies::default();
+        heap(self.this).look_for_copies(&mut found);
+        found
+    }
+}
+
+#[cfg(all(test, windows))]
+impl Drop for PlacedTestHeap {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        LOOKED_AT_BY_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&at| at != self.this as usize);
+        release(self.this);
+        // SAFETY: our own allocation, which the released heap no longer
+        // uses.
+        unsafe { VirtualFree(self.memory as *mut _, 0, MEM_RELEASE) };
     }
 }
 
@@ -1849,7 +2146,11 @@ mod tests {
             (thread.join().expect("the asking thread"), left)
         };
         object::add_ref(this);
-        assert_eq!(release_asked(hold.clone()), (Some(start), 1), "not the last");
+        assert_eq!(
+            release_asked(hold.clone()),
+            (Some(start), 1),
+            "not the last"
+        );
         assert_eq!(release_asked(hold.clone()), (None, 0), "the last");
         assert!(hold.with(|_| ()).is_none());
     }
@@ -2045,8 +2346,16 @@ mod tests {
         let kinds = (second.copied, second.textures, second.tabled, second.other);
         assert_eq!(kinds, (3, 2, 1, 1), "{second:?}");
         assert_eq!(second.picked(), 1, "the texture no table read: {second:?}");
-        assert_eq!(second.unmade, 3, "their host slots are as they were");
+        assert_eq!(second.unmade, 3, "their host slots were as they were");
         assert_eq!(second.pages, 3, "a page in each block: {second:?}");
+        // Mirrored: the views of the texture made from their records, in
+        // the slot a table read lately too (9376fd6 left it as it was), and
+        // the constant buffer view null until a draw makes it.
+        let texture_key = record_key(header(at(2)));
+        assert_eq!(
+            host.made_keys(&[4000, 5000, 10]),
+            [texture_key, texture_key, 0]
+        );
         // Nothing since, then the same record copied again: nothing new.
         assert_eq!(look(title).copied, 0);
         copy_bytes(title, 2, 4000);
@@ -2112,6 +2421,221 @@ mod tests {
         let second = look(title);
         assert_eq!(second.copied, 1, "found in the watched block: {second:?}");
         release_placed(h);
+        drop(memory);
+    }
+
+    /// A constant buffer view's record written at `at` with no call that
+    /// sees a heap (the title's records it copies from), `size` bytes.
+    #[cfg(windows)]
+    fn constant_record(size: u32) -> [u64; 4] {
+        let source = [0u64; 4];
+        create_cbv(
+            std::ptr::null(),
+            &[0x4000, 1, size, 0],
+            source.as_ptr() as u64,
+        );
+        source
+    }
+
+    /// Copies `record` into title slot `to` with plain stores.
+    #[cfg(windows)]
+    fn store_record(title: &Heap, record: &[u64; 4], to: u32) {
+        let at = (title.start + u64::from(to) * 32) as *mut u8;
+        // SAFETY: a slot of the heap, in memory the test holds.
+        unsafe { std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), at, 32) };
+    }
+
+    /// Codex review of 7c64b95: a call wrote A into a slot while the host
+    /// heap was not made yet, which queued the slot's index alone; the
+    /// title copied B over it as bytes; the queue's replay found B and
+    /// noted it as the call's, so no look counted it. The call notes its
+    /// own record, in the write that wrote it.
+    #[cfg(windows)]
+    #[test]
+    fn a_record_copied_over_a_call_before_the_host_heap_is_made_is_found() {
+        let test =
+            "descriptor::tests::a_record_copied_over_a_call_before_the_host_heap_is_made_is_found";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let memory = TitlePages::new(1, 0);
+        let h = placed_views(memory.at as u64, 64);
+        let title = heap(h);
+        let at4 = title.start + 4 * 32;
+        create_cbv(std::ptr::null(), &[0x5000, 1, 256, 0], at4);
+        assert!(title.host.get().is_none(), "the call is queued");
+        let copied = constant_record(512);
+        store_record(title, &copied, 4);
+        let host = title.host().expect("a host heap");
+        let found = look(title);
+        assert_eq!((found.copied, found.other), (1, 1), "{found:?}");
+        assert_eq!(look(title).copied, 0, "counted once");
+        assert_eq!(
+            host.made_keys(&[4]),
+            [0],
+            "a constant view: null until a draw"
+        );
+        release_placed(h);
+        drop(memory);
+    }
+
+    /// Codex review of 7c64b95: the look read all the slots of a changed
+    /// page at once, the slot across the next block's start included, and
+    /// passed them all over when any of that memory was not mapped; the
+    /// page's other slots were then looked at again only once the title
+    /// wrote there again. Now the slots of a failed read are read in pieces
+    /// a kernel page not mapped leaves whole, and those no piece reaches
+    /// are read at the next looks, until they are.
+    #[cfg(windows)]
+    #[test]
+    fn slots_next_to_memory_not_mapped_are_found_and_the_rest_later() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect};
+        let test =
+            "descriptor::tests::slots_next_to_memory_not_mapped_are_found_and_the_rest_later";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let memory = TitlePages::new(2, 0);
+        // 16 bytes into the first block: slot 2047 lies across the blocks.
+        let count = ((2 * PAGE - 16) / 32) as u32;
+        let h = placed_views(memory.at as u64 + 16, count);
+        let title = heap(h);
+        title.host().expect("a host heap");
+        let record = constant_record(256);
+        for slot in [5, 2047, 3000] {
+            store_record(title, &record, slot);
+        }
+        // The second block's first kernel page goes away: the end of slot
+        // 2047, and the slots after it there.
+        let gone = memory.at + PAGE;
+        let protect = |access| {
+            let mut old = 0;
+            // SAFETY: memory the test holds.
+            unsafe { VirtualProtect(gone as *const _, 4096, access, &mut old) }
+        };
+        assert_ne!(protect(PAGE_NOACCESS), 0);
+        let reached = |slot: u32| {
+            let first = title.start as usize + slot as usize * 32;
+            first + 32 <= gone || first >= gone + 4096
+        };
+        let unreachable = (0..count).filter(|&s| !reached(s)).count() as u64;
+        let first = look(title);
+        assert_eq!(
+            (first.copied, first.unread),
+            (2, unreachable),
+            "slots 5 and 3000, not 2047: {first:?}"
+        );
+        // Left for the next looks: the blocks of slot 2047's first byte and
+        // of the slots past it, whatever the watch says of them.
+        let unread = |title: &Heap| {
+            let watch = title.watched.as_ref().expect("looked at");
+            let w = watch.look.lock().unwrap();
+            w.unread.iter().copied().collect::<Vec<_>>()
+        };
+        let block = memory.at / PAGE;
+        assert_eq!(unread(title), [block, block + 1]);
+        assert_ne!(protect(PAGE_READWRITE), 0);
+        // Nothing written since: the slots not read are read again.
+        let second = look(title);
+        assert_eq!(
+            (second.copied, second.unread),
+            (1, 0),
+            "slot 2047: {second:?}"
+        );
+        assert_eq!(unread(title), [] as [usize; 0]);
+        // The kernel may report the block whose protection changed as
+        // written again; nothing new is found there.
+        let third = look(title);
+        assert_eq!((third.copied, third.unread), (0, 0), "{third:?}");
+        release_placed(h);
+        drop(memory);
+    }
+
+    /// Codex review of 7c64b95: a look read a slot, a call published
+    /// another record there and noted it, then the look compared what it
+    /// had read with that note and noted its own over it: the call's
+    /// record was counted as copied at the next look, and so was the
+    /// first, which no copy had written. Now a look reads slots and notes
+    /// in one read of the records' lock, which a call's write waits for.
+    #[cfg(windows)]
+    #[test]
+    fn a_call_while_a_look_reads_is_neither_counted_nor_lost() {
+        use crate::resource::tests_support::{committed, sampled};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let test = "descriptor::tests::a_call_while_a_look_reads_is_neither_counted_nor_lost";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let memory = TitlePages::new(1, 0);
+        let h = placed_views(memory.at as u64, 64);
+        let title = heap(h);
+        let host = title.host().expect("a host heap");
+        let handle = title.start + 7 * 32;
+        let texture = committed(&sampled(16, 16, 28)) as usize;
+        // Views of the texture, each a record of its own: format, 2D, a
+        // mapping, then (from word 4) the first mip and the count.
+        let view = |mapping: u32| [28, 4, mapping, 0, 0, 1, 0, 0, 0, 0];
+        let call = move |mapping: u32| {
+            create_srv(std::ptr::null(), texture as This, &view(mapping), handle);
+        };
+        // Runs a look during which another thread's call publishes the
+        // record of `mapping` at the slot: what the look found.
+        let look_while_called = |mapping: u32| {
+            let caller = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let (spawned, done) = (caller.clone(), std::sync::Arc::new(AtomicBool::new(false)));
+            LOOK_BETWEEN.with(|b| {
+                *b.borrow_mut() = Some(Box::new(move || {
+                    let finished = done.clone();
+                    let thread = std::thread::spawn(move || {
+                        call(mapping);
+                        finished.store(true, Ordering::SeqCst);
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    assert!(!done.load(Ordering::SeqCst), "the call waits for the look");
+                    *spawned.lock().unwrap() = Some(thread);
+                }));
+            });
+            let found = look(title);
+            let thread = caller.lock().unwrap().take().expect("called meanwhile");
+            thread.join().expect("the calling thread");
+            found
+        };
+        call(0x1688);
+        assert_eq!(look(title).copied, 0);
+        // No copy at all: a call, then another while the look reads.
+        call(0x1689);
+        let during = look_while_called(0x168a);
+        let after = look(title);
+        assert_eq!(
+            (during.copied, after.copied),
+            (0, 0),
+            "{during:?} {after:?}"
+        );
+        // A copy, then a call while the look reads: the copy counted once.
+        let source = [0u64; 4];
+        create_srv(
+            std::ptr::null(),
+            texture as This,
+            &view(0x168b),
+            source.as_ptr() as u64,
+        );
+        store_record(title, &source, 7);
+        let during = look_while_called(0x1688);
+        let after = look(title);
+        assert_eq!(
+            (during.copied, after.copied),
+            (1, 0),
+            "{during:?} {after:?}"
+        );
+        assert_eq!(
+            host.made_keys(&[7]),
+            [record_key(header(handle))],
+            "the call's"
+        );
+        release_placed(h);
+        type Release = extern "system" fn(This) -> u32;
+        slot::<Release>(texture as This, 0x10)(texture as This);
         drop(memory);
     }
 
