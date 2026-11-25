@@ -1454,6 +1454,12 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 ///   groups; bit 15 runs the program in 32-lane waves; bit 1, which BTP 6
 ///   never sets, lets the last group of each dimension run only the
 ///   threads left.
+/// - The programs agree: the one dispatched with `0x8020` is a 32-lane
+///   program of 32 threads a group, which checks its thread id against a
+///   count of its own; the one with `0x20` is a 64-lane program of 64
+///   threads, each group reading 8 KiB at 8 KiB × its group id. Its first
+///   dispatch asked for 45: one group as threads, 45 groups (45 times the
+///   memory it reads) as groups.
 /// - So the flags are taken as that register, and bit 5
 ///   ([`USE_THREAD_DIMENSIONS`]) makes the counts threads. Without bit 1
 ///   the command processor runs whole groups, the last one rounded up (radv
