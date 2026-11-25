@@ -205,6 +205,8 @@ Every commit message and every pull request title starts with a header:
   and says why.
 - `fixup!` / `squash!` commits and `Revert "..."` are accepted as git writes
   them; merge commits are not checked.
+- Commit messages, code comments and docs are in English. The check rejects
+  French in a message and in the Rust comments a change adds.
 
 `cargo xtask conventions --title "..."` checks a header; the `commit-msg` hook
 checks each commit; the "PR conventions" check checks the title and every
