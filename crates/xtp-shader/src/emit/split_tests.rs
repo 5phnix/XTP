@@ -76,6 +76,9 @@ fn run_for(
     groups: u32,
     target: super::Target,
 ) -> Result<Vec<u32>, String> {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
     // The validator, where one is installed: drivers take some modules it
     // refuses.
@@ -518,8 +521,7 @@ fn a_select_on_a_mask_held_as_a_number_runs_as_the_console() {
     });
 }
 
-/// Constant lane reads retain the existing small exchange. A computed
-/// read in multiple complete waves uses paired lanes.
+/// Les groupes complets utilisent les lanes appariées pour les deux sortes de sélecteur.
 #[test]
 fn several_console_waves_choose_the_exchange_their_lane_reads_need() {
     let body = [
@@ -533,10 +535,12 @@ fn several_console_waves_choose_the_exchange_their_lane_reads_need() {
         stride_table: false,
     };
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    // Two console waves: not in the console flow, but each lane on its own
-    // path with the lane read through group-shared memory
-    // (`lane_reads_cross_halves_in_groups_of_several_console_waves`).
-    assert!(emit_for(&program(&body, 128), nvidia).is_ok());
+    emit_for(&program(&body, 128), nvidia).unwrap();
+    assert!(super::last_module_summary().ends_with("; console flow with paired lanes"));
+    assert!(emit_for(&program(&body, 96), nvidia).is_err());
+    let lane31 = [body[0], 0x0001_3f00, body[2]];
+    emit_for(&program(&lane31, 96), nvidia).unwrap();
+    assert!(super::last_module_summary().ends_with("lane reads through group-shared memory"));
     // A computed lane (s1, the group id).
     let computed = [
         0xD760_0009,
@@ -548,11 +552,8 @@ fn several_console_waves_choose_the_exchange_their_lane_reads_need() {
     assert!(emit_for(&program(&computed, 96), nvidia).is_err());
 }
 
-/// Lane reads of the other half in groups of several console waves, as
-/// the title's 16 × 16 downsampling programs make them: each lane on its
-/// own path in two 32-lane halves, the lane read through group-shared
-/// memory between group barriers. Lane t stores what lane 40 of its console
-/// wave holds:
+/// Lecture de la lane 40 de chaque wave console dans un groupe complet.
+/// Valeur attendue pour chaque thread :
 /// - its own id (two and four console waves per group);
 /// - what it read from LDS, after an `s_barrier`, at the other wave of its
 ///   pair (t ^ 64), which that wave wrote before the barrier;
@@ -570,6 +571,13 @@ fn lane_reads_cross_halves_in_groups_of_several_console_waves() {
     for threads in [128, 256] {
         program_case("v_readlane 40", &program(&own, threads), lane_40, true);
     }
+    let lane31 = [own[0], 0x0001_3f00, own[2]];
+    program_case(
+        "lane 31 dans 96 threads",
+        &program(&lane31, 96),
+        |t| (t & !63) + 31,
+        true,
+    );
     let lds = [
         0x3408_0082, // v_lshlrev_b32 v4, 2, v0
         0xD834_0000,
@@ -1534,6 +1542,8 @@ fn every_hardware_case_translates_and_validates_without_a_device() {
     a_lane_read_past_the_wave_reads_its_low_bits();
     paired_lanes_share_lds_and_count_their_own_mask_bits();
     paired_lanes_execute_a_half_precision_whole_wave_section();
+    paired_reads_ignore_exec_and_lds_writes_keep_their_order();
+    paired_exec_dwords_first_lane_and_partial_mbcnt();
     lds_in_a_group_of_48_threads_reads_both_halves();
     a_loop_exit_mask_read_inside_the_loop_counts_the_lanes_that_left();
     DRY.with(|d| d.set(false));
@@ -1711,9 +1721,8 @@ fn paired_lanes_share_lds_and_count_their_own_mask_bits() {
     );
 }
 
-/// A whole-wave section with a half-precision addition, which the symbolic
-/// reduction pass cannot express. Each lane doubles the FP16 value from
-/// lane 0 of its opposite 16-lane row. Both rows then read console lane 32.
+/// Chaque nibble choisit une lane dans la rangée opposée. On conserve
+/// le motif lu et le résultat arrondi de deux opérations FP16 successives.
 #[test]
 #[ignore = "hardware: 32-lane waves (see hardware())"]
 fn paired_lanes_execute_a_half_precision_whole_wave_section() {
@@ -1721,16 +1730,36 @@ fn paired_lanes_execute_a_half_precision_whole_wave_section() {
         0x4A02_00FF,
         0x3C00,      // v_add_nc_u32 v1, 0x3c00, v0
         0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
-        0xD778_0002,
-        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
-        0x6404_0502, // v_add_f16 v2, v2, v2
+        0xbe8c_03ff,
+        0x0123_4567,
+        0xbe8d_03ff,
+        0xfedc_ba98,
+        0xd778_0002,
+        (13 << 18) | (12 << 9) | 257,
+        0x7e06_0302, // v3 = motif FP16 choisi
+        0x7e0c_02ff,
+        0x6800,      // v6 = 2048 en FP16
+        0x6404_0d02, // v2 = v2 + v6
+        0x6604_0d02, // v2 = v2 - v6
         0xD760_0009,
         0x0001_4102, // v_readlane_b32 s9, v2, 32
         0xBEFE_040A, // s_mov_b64 exec, s[10:11]
         0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+        0x4a04_0702, // v2 += v3
     ];
-    let p = program(&body, 128);
-    let mut cs = emit_for(&p, HOSTS[0]).unwrap();
+    paired_case("arrondi FP16 après permutation", &body, |t| {
+        let pick = if t & 8 == 0 { 7 - (t & 7) } else { t & 15 };
+        let source = ((t & !15) ^ 16) + pick;
+        // (2048 + 1) - 2048 = 0, mais le successeur FP16 de 1 donne 2.
+        let bits = if source == 0 { 0 } else { 0x4000 };
+        bits + 0x4000 + 0x3c00 + source
+    });
+}
+
+fn paired_case(label: &str, body: &[u32], want: impl Fn(u32) -> u32) {
+    let p = program(body, 128);
+    let mut cs = emit_for(&p, HOSTS[0]).unwrap_or_else(|e| panic!("{label}: {e}"));
+    assert!(super::last_module_summary().ends_with("console flow with paired lanes"));
     if let Ok(mut validator) =
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
     {
@@ -1739,10 +1768,170 @@ fn paired_lanes_execute_a_half_precision_whole_wave_section() {
     for (name, host) in hardware() {
         if host.target().runs(32) {
             let out = run_for(&host, &p, 1, HOSTS[0]).unwrap();
-            let expected: Vec<u32> = (0..128)
-                .map(|t| 0x8000 + ((t & !15) ^ 16) + (t & !63) + 48)
-                .collect();
-            assert_eq!(out, expected, "{name}: paired FP16 rows");
+            assert_eq!(
+                out,
+                (0..128).map(&want).collect::<Vec<_>>(),
+                "{name}: {label}"
+            );
         }
     }
+}
+
+/// Le registre de la lane 40 vaut 140 dans la première wave. Il reste
+/// lisible par les lanes 0 à 39 dans la branche, même quand EXEC[40] vaut 0.
+const MASKED_READ: &[u32] = &[
+    0x4a0a_00ff,
+    100,         // v5 = 100 + id
+    0x3602_00bf, // v1 = id & 63
+    0x7e04_0280,
+    0x7d88_02a8, // vcc = lane < 40
+    0xbe8a_246a,
+    0xbf88_0003,
+    0xd760_0009,
+    0x0001_5105, // s9 = v5[40]
+    0x7e04_0209,
+    0x88fe_0a7e,
+];
+
+/// Deux écritures successives par adresse, séparées seulement par waitcnt.
+/// L'échange des adresses entre demi-waves laisse 2 dans chaque case.
+fn lds_two_writes(atomic: bool) -> Vec<u32> {
+    let mut body = vec![
+        0x3408_0082, // v4 = 4 * id
+        0x3a0a_00a0, // v5 = id ^ 32
+        0x340a_0a82,
+        0x7e02_0281,
+        0xd834_0000,
+        0x0000_0104, // LDS[v4] = 1
+        0xbf8c_c07f,
+        0x7e02_0282,
+    ];
+    if atomic {
+        body.extend([0xd880_0000, 0x0600_0105]); // v6 = atomic_add(LDS[v5], 2)
+    } else {
+        body.extend([0xd834_0000, 0x0000_0105]);
+    }
+    body.extend([0xbf8a_0000, 0xd8d8_0000, 0x0200_0004]);
+    if atomic {
+        body.push(0x4a04_0d02); // 3 relu + 1 retourné
+    }
+    body.extend([0xd760_0009, 0x0001_3f02, 0x7e04_0209]); // lane 31
+    body
+}
+
+#[test]
+fn partial_groups_refuse_divergent_exchanges_and_unordered_lds() {
+    let even_lanes = [
+        0xbe89_0380, // s9 = 0 avant la branche
+        0x3602_0081, // v1 = id & 1
+        0x7d84_0280, // vcc = v1 == 0
+        0xbe8a_246a,
+        0xbf88_0002, // reconvergence sans autre barrière
+        0xd760_0009,
+        0x0001_3f00,
+        0x88fe_0a7e,
+        0x7e04_0209,
+    ];
+    for body in [
+        even_lanes.as_slice(),
+        MASKED_READ,
+        &lds_two_writes(false),
+        &lds_two_writes(true),
+    ] {
+        assert!(emit_for(&program_lds(body, 96), HOSTS[0]).is_err());
+    }
+    // Sans lecture de lane, les 32 Kio restent entièrement disponibles.
+    let mut p = program(IN_HALF, 128);
+    let StageIo::Cs(io) = &mut p.io else {
+        unreachable!()
+    };
+    io.rsrc2 |= 64 << 15;
+    emit_for(&p, HOSTS[0]).unwrap();
+    assert!(super::last_module_summary().ends_with("console flow with paired lanes"));
+}
+
+#[test]
+fn whole_wave_read_of_an_incoming_vgpr_is_not_a_local_value() {
+    let p = program_wave32(
+        &[
+            0xbe8e_3dc1, // s_or_saveexec_b32 s14, -1
+            0xd760_000a,
+            0x0001_0b00, // s10 = v0[5]
+            0xbe8b_030a, // s11 = s10
+            0xbefe_030e, // exec_lo = s14
+            0x7e02_020b, // v1 = s11
+            0x7e04_0301,
+        ],
+        32,
+    );
+    let err = emit_for(&p, HOSTS[0]).unwrap_err();
+    assert!(err.to_string().contains("whole-wave section"), "{err}");
+}
+
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn paired_reads_ignore_exec_and_lds_writes_keep_their_order() {
+    program_case(
+        "lecture de la lane 40 masquée",
+        &program(MASKED_READ, 128),
+        |t| if t & 63 < 40 { (t & !63) + 140 } else { 0 },
+        true,
+    );
+    for atomic in [false, true] {
+        program_case(
+            "deux écritures LDS",
+            &program_lds(&lds_two_writes(atomic), 128),
+            |_| if atomic { 4 } else { 2 },
+            true,
+        );
+    }
+    // Les lanes paires publient sous une garde, puis chaque lane lit
+    // l'adresse de la lane paire voisine de l'autre demi-wave, sans s_barrier.
+    let body = [
+        0x3408_0082,
+        0x3602_0081,
+        0x7d84_0280,
+        0xbe8a_246a,
+        0xd834_0000,
+        0x0000_0004,
+        0x88fe_0a7e,
+        0x360a_00c2, // v5 = id & -2
+        0x3a0a_0aa0,
+        0x340a_0a82,
+        0xd8d8_0000,
+        0x0200_0005,
+        0xd760_0009,
+        0x0001_0100, // base de la wave (lane 0)
+        0x4a04_0409,
+    ];
+    program_case(
+        "LDS entre lanes, sans barrière",
+        &program_lds(&body, 128),
+        |t| ((t & !1) ^ 32) + (t & !63),
+        true,
+    );
+}
+
+#[test]
+#[ignore = "hardware: 32- or 64-lane waves (see hardware())"]
+fn paired_exec_dwords_first_lane_and_partial_mbcnt() {
+    let body = [
+        0xbefe_0380, // exec_lo = 0
+        0xbeff_0388, // exec_hi = 8 : première lane active = 35
+        0x7e12_0500, // s9 = readfirstlane(v0)
+        0xbefe_04c1, // exec = -1
+        0xbe8a_03ff,
+        0x8000_0005,
+        0xbe8b_03ff,
+        0x4000_000a,
+        0xd765_0002,
+        0x0001_000a, // mbcnt_lo(s10, 0)
+        0xd766_0002,
+        0x0002_040b, // mbcnt_hi(s11, v2)
+        0x4a04_0409,
+    ];
+    paired_case("masques EXEC et mbcnt", &body, |t| {
+        let below = (1u64 << (t & 63)) - 1;
+        (t & !63) + 35 + (0x4000_000a_8000_0005 & below).count_ones()
+    });
 }
