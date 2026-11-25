@@ -641,7 +641,8 @@ impl Call {
             return;
         }
         // A call with result data: waiters arriving before the routine
-        // returns still find it. One without, or a failed one, is detached
+        // returns, or its result is taken (`release`), still find it. One
+        // without, or a failed one, is detached
         // from its block here, as libHttpClient detaches its state at
         // completion: a later wait returns at once (a provider that completes
         // inside Begin leaves no wait on a port nobody has dispatched yet).
@@ -699,9 +700,10 @@ struct Registry {
     /// Wait-only entries: providers are inaccessible and begin is refused
     /// until cleanup and publication finish. Both maps share one lock.
     completing: HashMap<usize, Arc<Call>>,
-    /// Calls whose completion routine is queued or running, so that status
-    /// waiters can still wait for it to return. Begin is not refused: the
-    /// routine may begin the next call on its block.
+    /// Calls with result data whose completion routine is queued or
+    /// running, until their result is taken, so that status waiters can
+    /// still wait for it to return. Begin is not refused: the routine may
+    /// begin the next call on its block.
     routines: HashMap<usize, Arc<Call>>,
 }
 impl Registry {
@@ -777,7 +779,19 @@ fn status(block: *mut AsyncBlock) -> HRESULT {
 
 fn release(block: *mut AsyncBlock, expected: &Call) {
     // Unlocked before the provider runs: it may call back into us.
-    let removed = lock(&REGISTRY).remove_active(block, expected);
+    let mut registry = lock(&REGISTRY);
+    let removed = registry.remove_active(block, expected);
+    // Taking the result detaches the call from its block, as libHttpClient's
+    // does: a wait that starts after it returns at once; waiters that hold
+    // the call still wait for its routine.
+    if registry
+        .routines
+        .get(&(block as usize))
+        .is_some_and(|c| std::ptr::eq(c.as_ref(), expected))
+    {
+        registry.routines.remove(&(block as usize));
+    }
+    drop(registry);
     if let Some(call) = removed {
         call.cleanup(block);
     }
@@ -824,8 +838,10 @@ fn begin(
         finished: Condvar::new(),
     });
     registry.active.insert(block as usize, call.clone());
-    // An older call whose routine is still queued or running (or left in a
-    // manual port nobody dispatches) no longer shadows the block's waiters.
+    // An older call's routine entry never shadows the new call. None can be
+    // here today (a call with result data is active until its result is
+    // taken, which drops its entry, and an active block is refused above);
+    // this keeps it so if that changes.
     registry.routines.remove(&(block as usize));
     drop(registry);
     // A failed begin fails the call, so the completion routine still runs.
@@ -872,9 +888,9 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 /// the title set a completion routine, until that routine has returned, as
 /// the public API documents and libHttpClient's implementation does. A call
 /// with no result data, or a failed one, is detached from its block when it
-/// completes, as libHttpClient does: a query that comes after that returns
-/// its status at once, and only queries already waiting wait for the
-/// routine.
+/// completes, and one with result data when its result is taken, as
+/// libHttpClient does: a query that comes after that returns its status at
+/// once, and only queries already waiting wait for the routine.
 ///
 /// Cleanup must not wait, directly or indirectly through a join, lock or
 /// event, on a thread blocking with `wait = true` on the same block: the
@@ -2035,9 +2051,10 @@ mod tests {
         XTaskQueueCloseHandle(q);
     }
 
-    /// A waiter arriving while the completion routine of a call with result
-    /// data runs returns only after it has returned, even though the routine
-    /// took the result (which ends the call) first.
+    /// A waiter that holds a call with result data when its routine starts
+    /// returns only after the routine has returned, though the routine takes
+    /// the result first. Taking it detaches the call, as libHttpClient's
+    /// does: a wait that starts after that returns at once.
     #[test]
     fn a_status_wait_returns_after_the_completion_routine() {
         if !bounded_child("a_status_wait_returns_after_the_completion_routine") {
@@ -2046,28 +2063,33 @@ mod tests {
         use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
         struct Gate {
             entered: Mutex<Sender<()>>,
-            release: Mutex<Receiver<()>>,
+            take: Mutex<Receiver<()>>,
+            took: Mutex<Sender<bool>>,
+            finish: Mutex<Receiver<()>>,
         }
         static ROUTINE_DONE: AtomicBool = AtomicBool::new(false);
-        static TOOK: AtomicBool = AtomicBool::new(false);
         const IDENTITY: *const c_void = 0x45 as *const c_void;
         extern "system" fn routine(block: *mut AsyncBlock) {
+            let long = Duration::from_secs(10);
             // SAFETY: the test leaks the gate behind the block's context.
             let gate = unsafe { &*(*block).context.cast::<Gate>() };
-            let mut value = 0u64;
-            TOOK.store(
-                result(block, IDENTITY, &mut value) == S_OK && value == 7,
-                Ordering::SeqCst,
-            );
             lock(&gate.entered).send(()).unwrap();
-            let _ = lock(&gate.release).recv_timeout(Duration::from_secs(10));
+            let _ = lock(&gate.take).recv_timeout(long);
+            let mut value = 0u64;
+            let took = result(block, IDENTITY, &mut value) == S_OK && value == 7;
+            lock(&gate.took).send(took).unwrap();
+            let _ = lock(&gate.finish).recv_timeout(long);
             ROUTINE_DONE.store(true, Ordering::SeqCst);
         }
         let (entered, routine_entered) = channel();
-        let (release, released) = channel();
+        let (take, may_take) = channel();
+        let (took, routine_took) = channel();
+        let (finish, may_finish) = channel();
         let gate: &Gate = Box::leak(Box::new(Gate {
             entered: Mutex::new(entered),
-            release: Mutex::new(released),
+            take: Mutex::new(may_take),
+            took: Mutex::new(took),
+            finish: Mutex::new(may_finish),
         }));
         let mut q = std::ptr::null();
         // Work and completion on the thread pool.
@@ -2078,14 +2100,11 @@ mod tests {
             callback: Some(routine),
             internal: [0; 4],
         }));
+        let long = Duration::from_secs(5);
         assert_eq!(finished_with(block, IDENTITY, Ok(bytes(7u64))), S_OK);
-        routine_entered
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the routine ran");
-        assert!(TOOK.load(Ordering::SeqCst), "the routine took the result");
-        assert!(call(block).is_none(), "taking the result ended the call");
+        routine_entered.recv_timeout(long).expect("the routine ran");
         assert_eq!(XAsyncGetStatus(block, false), S_OK, "published");
-        let retained = waiting_call(block).expect("waiters still find the call");
+        let retained = waiting_call(block).expect("waiters find the call");
         let baseline = Arc::strong_count(&retained);
         let address = block as usize;
         let (sent, received) = sync_channel(1);
@@ -2095,18 +2114,24 @@ mod tests {
                 .unwrap();
         });
         // The waiter holds the call (or, wrongly, has returned already)
-        // before the routine may return.
+        // before the routine takes the result.
         while Arc::strong_count(&retained) == baseline && !waiter.is_finished() {
             std::thread::yield_now();
         }
-        release.send(()).unwrap();
+        take.send(()).unwrap();
+        assert!(routine_took.recv_timeout(long).unwrap(), "took the result");
+        assert!(call(block).is_none(), "taking the result ended the call");
+        // A wait that starts now returns at once: this thread is the only
+        // one that can let the routine finish.
+        assert!(waiting_call(block).is_none(), "the call is detached");
+        assert_eq!(XAsyncGetStatus(block, true), S_OK);
+        finish.send(()).unwrap();
         assert_eq!(
-            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            received.recv_timeout(long).unwrap(),
             (S_OK, true),
             "the waiter returned before the routine had"
         );
         waiter.join().unwrap();
-        assert!(waiting_call(block).is_none());
         XTaskQueueCloseHandle(q);
     }
 
@@ -2299,11 +2324,12 @@ mod tests {
         XTaskQueueCloseHandle(q);
     }
 
-    /// A new call on the block drops an older call's routine entry: once the
-    /// new call is over and detached, a wait finds no call, not the old one
-    /// whose routine is still queued.
+    /// Taking the result detaches a call whose routine is still queued (on a
+    /// manual port nobody dispatches): a wait finds no call and returns at
+    /// once, as in libHttpClient, and a new call on the block is not
+    /// shadowed by it.
     #[test]
-    fn begin_drops_an_older_routines_entry() {
+    fn taking_the_result_detaches_the_call() {
         extern "system" fn routine(_: *mut AsyncBlock) {}
         let mut q = std::ptr::null();
         assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
@@ -2318,7 +2344,8 @@ mod tests {
         let mut value = 0u64;
         assert_eq!(result(block, identity, &mut value), S_OK);
         assert!(call(block).is_none(), "taking the result ended it");
-        assert!(waiting_call(block).is_some(), "its routine is still queued");
+        assert!(waiting_call(block).is_none(), "a wait would block");
+        assert_eq!(XAsyncGetStatus(block, true), S_OK);
         // No result data: it completes inside Begin and is detached.
         assert_eq!(finished(block, identity, S_OK), S_OK);
         assert!(
