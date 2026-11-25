@@ -57,6 +57,9 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
+        if guard.is_some() && !mesh && !self.s.pixel {
+            return Err("a conditional export");
+        }
         let c = self.cur;
         if let Some(g) = guard
             && self.s.pixel

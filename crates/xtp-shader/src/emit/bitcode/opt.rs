@@ -134,6 +134,8 @@ pub(crate) struct Usage {
     pub int64: bool,
     /// A typed load of several components from a UAV (`TYPED_UAV_LOADS`).
     pub typed_uav_loads: bool,
+    /// An annotated rasterizer-ordered UAV.
+    pub ordered_uavs: bool,
     /// Typed loads whose handle is not an annotation the kind can be read
     /// from.
     pub untraced_loads: u32,
@@ -163,6 +165,7 @@ impl Usage {
                 "untraced_loads",
                 self.untraced_loads != other.untraced_loads,
             ),
+            ("ordered_uavs", self.ordered_uavs != other.ordered_uavs),
             ("heap_views", self.heap_views != other.heap_views),
             ("heap_samplers", self.heap_samplers != other.heap_samplers),
             ("atomics64", self.atomics64 != other.atomics64),
@@ -1176,6 +1179,9 @@ impl Module {
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
                 if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
+                } else if name == "annotateHandle" {
+                    u.ordered_uavs |=
+                        annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {
                         Some((_, 0)) => u.heap_views = true,
