@@ -2987,7 +2987,6 @@ mod tests {
         /// source were read whole first.
         #[test]
         fn resource_and_memory_copies_run_on_the_gpu() {
-            crate::testgpu::known_layer_errors(&[538], "#45");
             let test = "list::tests::gpu::resource_and_memory_copies_run_on_the_gpu";
             let Some(gpu) = device(test) else { return };
             let host = gpu.host();
