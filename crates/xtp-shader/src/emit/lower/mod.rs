@@ -503,6 +503,15 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.ordered_uavs = x.native.io.pops();
+        // Portage de VIctory #2085 (0xkn0wh3r3, 1f6fa41, GPL-3.0).
+        // DEPTH_BEFORE_SHADER fait rejeter les pixels masqués avant leurs écritures UAV.
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = x.native.io
+            && db_shader_control & (1 << 12) != 0
+        {
+            s.flags |= super::shader::flags::FORCE_EARLY_DEPTH_STENCIL;
+        }
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
