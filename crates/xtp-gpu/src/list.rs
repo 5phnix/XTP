@@ -153,6 +153,14 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = query_list(this)?;
+    // Une commande suivante (fermeture comprise) doit voir les résultats.
+    list.query_resolves.flush(list);
+    Some(list)
+}
+
+#[cfg(windows)]
+fn query_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -1703,27 +1711,16 @@ extern "system" fn resolve_queries(
     }
     #[cfg(windows)]
     if let (Some(list), Some(heap)) = (
-        host_list(this),
+        query_list(this),
         crate::query::host_heap(_heap, kind, _first, count),
     ) && offset.is_multiple_of(8)
         && let Some(at) = (data as u64).checked_add(offset)
         && let Some(dst) = crate::shadow::find(at, u64::from(count) * bytes)
         && dst.offset(at).is_multiple_of(8)
     {
-        use windows::Win32::Graphics::Direct3D12::*;
         dst.gpu_copies(list, at, u64::from(count) * bytes);
-        let common = D3D12_RESOURCE_STATE_COMMON;
-        let copy = D3D12_RESOURCE_STATE_COPY_DEST;
-        // SAFETY: the list keeps both resources and the whole range was checked.
-        unsafe {
-            list.list.ResourceBarrier(&[
-                crate::host::uav_barrier(),
-                crate::host::transition(&dst.buffer, common, copy),
-            ]);
-            heap.resolve(list, kind, _first, count, &dst.buffer, dst.offset(at));
-            list.list
-                .ResourceBarrier(&[crate::host::transition(&dst.buffer, copy, common)]);
-        }
+        list.query_resolves
+            .push(list, heap, _first, count, &dst.buffer, dst.offset(at));
         return;
     }
     for i in 0..u64::from(count) {

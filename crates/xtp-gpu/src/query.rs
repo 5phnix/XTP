@@ -83,45 +83,120 @@ impl HostHeap {
             }
         }
     }
+}
 
-    pub(crate) fn resolve(
+#[cfg(windows)]
+#[derive(PartialEq, Eq)]
+enum Source {
+    Occlusion(ID3D12Resource),
+    Statistics(ID3D12QueryHeap),
+}
+
+#[cfg(windows)]
+struct ResolveBatch {
+    source: Source,
+    dst: ID3D12Resource,
+    ranges: Vec<(u32, u32, u64)>,
+}
+
+#[cfg(windows)]
+impl ResolveBatch {
+    fn record(&self, list: &crate::host::HostList) {
+        use crate::host::{transition, uav_barrier};
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        let write = D3D12_RESOURCE_STATE_COPY_DEST;
+        let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let mut before = vec![uav_barrier(), transition(&self.dst, common, write)];
+        let mut after = vec![transition(&self.dst, write, common)];
+        match &self.source {
+            Source::Occlusion(results) => {
+                list.keep(results);
+                before.push(transition(results, write, read));
+                after.push(transition(results, read, write));
+            }
+            Source::Statistics(heap) => list.keep(heap),
+        }
+        // SAFETY: chaque plage a été validée et la liste retient les ressources.
+        unsafe {
+            list.list.ResourceBarrier(&before);
+            for &(first, count, at) in &self.ranges {
+                match &self.source {
+                    Source::Occlusion(results) => list.list.CopyBufferRegion(
+                        &self.dst,
+                        at,
+                        results,
+                        u64::from(first) * 8,
+                        u64::from(count) * 8,
+                    ),
+                    Source::Statistics(heap) => list.list.ResolveQueryData(
+                        heap,
+                        D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+                        first,
+                        count,
+                        &self.dst,
+                        at,
+                    ),
+                }
+            }
+            list.list.ResourceBarrier(&after);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+pub(crate) struct Resolves {
+    pending: std::sync::atomic::AtomicBool,
+    batch: std::sync::Mutex<Option<ResolveBatch>>,
+}
+
+#[cfg(windows)]
+impl Resolves {
+    pub(crate) fn push(
         &self,
         list: &crate::host::HostList,
-        kind: u32,
+        heap: &HostHeap,
         first: u32,
         count: u32,
         dst: &ID3D12Resource,
         at: u64,
     ) {
-        use crate::host::transition;
-        let write = D3D12_RESOURCE_STATE_COPY_DEST;
-        let read = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        // SAFETY: les deux plages ont été validées et les ressources restent vivantes.
-        unsafe {
-            if let Some((results, _)) = &self.occlusion {
-                list.keep(results);
-                list.list
-                    .ResourceBarrier(&[transition(results, write, read)]);
-                list.list.CopyBufferRegion(
-                    dst,
-                    at,
-                    results,
-                    u64::from(first) * 8,
-                    u64::from(count) * 8,
-                );
-                list.list
-                    .ResourceBarrier(&[transition(results, read, write)]);
-            } else {
-                list.keep(&self.heap);
-                list.list.ResolveQueryData(
-                    &self.heap,
-                    D3D12_QUERY_TYPE(kind as i32),
-                    first,
-                    count,
-                    dst,
-                    at,
-                );
-            }
+        use std::sync::atomic::Ordering;
+        let (source, stride) = match &heap.occlusion {
+            Some((results, _)) => (Source::Occlusion(results.clone()), 8),
+            None => (Source::Statistics(heap.heap.clone()), 88),
+        };
+        let mut slot = self.batch.lock().unwrap_or_else(|e| e.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|b| b.source != source || b.dst != *dst)
+            && let Some(batch) = slot.take()
+        {
+            batch.record(list);
+        }
+        let batch = slot.get_or_insert_with(|| ResolveBatch {
+            source,
+            dst: dst.clone(),
+            ranges: Vec::new(),
+        });
+        if let Some((start, n, offset)) = batch.ranges.last_mut()
+            && *start + *n == first
+            && *offset + u64::from(*n) * stride == at
+        {
+            *n += count;
+        } else {
+            batch.ranges.push((first, count, at));
+        }
+        self.pending.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn flush(&self, list: &crate::host::HostList) {
+        if self.pending.load(std::sync::atomic::Ordering::Acquire)
+            && let Some(batch) = self.batch.lock().unwrap_or_else(|e| e.into_inner()).take()
+        {
+            self.pending
+                .store(false, std::sync::atomic::Ordering::Release);
+            batch.record(list);
         }
     }
 }
@@ -288,14 +363,28 @@ mod tests {
                 unsafe { list.host().list.DrawInstanced(3, 1, 0, 0) };
             }
             mark(0xe8, 1);
-            slot::<extern "system" fn(This, This, u32, u32, u32, This, u64)>(list.this(), 0xf0)(
-                list.this(),
-                heap,
-                kind,
-                0,
-                2,
-                out.resource(),
-                8,
+            let host_list = list.host();
+            for index in 0..2 {
+                slot::<extern "system" fn(This, This, u32, u32, u32, This, u64)>(list.this(), 0xf0)(
+                    list.this(),
+                    heap,
+                    kind,
+                    index,
+                    1,
+                    out.resource(),
+                    8 + u64::from(index) * words as u64 * 4,
+                );
+            }
+            assert_eq!(
+                host_list
+                    .query_resolves
+                    .batch
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .ranges,
+                [(0, 2, 8)]
             );
             release(heap);
             list.run();
