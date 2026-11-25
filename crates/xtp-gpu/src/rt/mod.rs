@@ -704,6 +704,10 @@ pub(crate) fn host_tlas_in(list: &HostList, title_tlas: u64) -> Option<u64> {
 /// that BLAS, with mask 0, for an instance of a BLAS the host does not have
 /// ([`instances::rewrite`]), and is that TLAS when it has no instance.
 fn empty_tlas(rec: &Recorder<'_>) -> Option<(Arc<ResultBuffer>, Arc<ResultBuffer>)> {
+    #[cfg(test)]
+    if tests::EMPTY_FAILS.get() {
+        return None;
+    }
     /// The TLAS and the BLAS its instance names, which must outlive it.
     static EMPTY: Mutex<Option<(Structure, Arc<ResultBuffer>)>> = Mutex::new(None);
     let mut shared = EMPTY.lock().unwrap_or_else(|e| e.into_inner());
@@ -831,6 +835,17 @@ fn descriptor_address(handle: u64) -> Option<u64> {
     })
 }
 
+/// What mirroring one title build did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Mirrored {
+    /// The structure is published at its title address.
+    registered: bool,
+    /// A build was recorded, and so its trailing UAV barrier, which orders
+    /// the next build of a batch: a TLAS of no instance is the shared empty
+    /// TLAS and records none.
+    barrier: bool,
+}
+
 /// Mirrors a title build and invalidates an older destination on failure.
 ///
 /// # Safety
@@ -840,12 +855,16 @@ unsafe fn build_one(
     desc: &Build,
     ordered: bool,
     title_bytes: Option<u64>,
-) -> bool {
+) -> Mirrored {
     let dst = desc.DestAccelerationStructureData;
     if dst == 0 || !builds_on() {
-        return false;
+        return Mirrored {
+            registered: false,
+            barrier: false,
+        };
     }
     let generation = registry().begin(dst, title_bytes);
+    let barrier = std::cell::Cell::new(false);
     let built = (|| {
         if !generation.known_extent {
             return None;
@@ -873,32 +892,44 @@ unsafe fn build_one(
                     },
                     ..inputs
                 };
-                recorder.build(&inputs, Some(dst), ordered)
+                let built = recorder.build(&inputs, Some(dst), ordered)?;
+                barrier.set(true);
+                Some(built)
             }
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
                 // The empty TLAS traces fall back to, made before they bind
                 // their state, and its BLAS, which stands in for the BLAS of
-                // an instance the host does not have.
-                let empty = empty_tlas(&recorder);
-                let stand_in = empty.as_ref().map_or(0, |(_, blas)| blas.gpu());
-                let (inputs, map) = instances::rewrite(&recorder, title_list, &inputs, stand_in)?;
-                if inputs.NumDescs == 0
-                    && let Some((tlas, blas)) = empty.clone()
-                {
+                // an instance the host does not have. Without them, such an
+                // instance would name a null BLAS and a TLAS of no instance
+                // would be built as one, the two cases they stand in for
+                // (WARP faults on both): the TLAS is refused.
+                let Some((empty, stand_in)) = empty_tlas(&recorder) else {
+                    tracing::warn!(
+                        address = format_args!("{dst:#x}"),
+                        "host DXR TLAS refused: no empty TLAS to stand in for its missing BLAS"
+                    );
+                    return None;
+                };
+                let (inputs, map) =
+                    instances::rewrite(&recorder, title_list, &inputs, stand_in.gpu())?;
+                if inputs.NumDescs == 0 {
                     // WARP divides by zero building a TLAS of no instance:
                     // the empty TLAS, which no ray hits either.
                     return Some(Structure {
                         producer: Producer::recorded(list),
-                        result: tlas,
+                        result: empty,
                         instances: Some(map),
                         compacted_size: None,
-                        holds: Some(blas),
+                        holds: Some(stand_in),
                     });
                 }
+                // The rewrite's barriers order what came before this build.
+                let built = recorder.build(&inputs, Some(dst), true)?;
+                barrier.set(true);
                 Some(Structure {
                     instances: Some(map),
-                    holds: empty.map(|(_, blas)| blas),
-                    ..recorder.build(&inputs, Some(dst), ordered || inputs.NumDescs != 0)?
+                    holds: Some(stand_in),
+                    ..built
                 })
             }
             _ => None,
@@ -911,7 +942,10 @@ unsafe fn build_one(
     if let Some(list) = crate::list::host_list(title_list) {
         generation.submit(list, built.clone());
     }
-    registry().finish(dst, generation.generation, built)
+    Mirrored {
+        registered: registry().finish(dst, generation.generation, built),
+        barrier: barrier.get(),
+    }
 }
 
 /// What the host could not record at a title address.
@@ -959,7 +993,7 @@ pub unsafe fn rehydrate(list: *const Object, desc: &Build) -> bool {
 /// The list and CPU arrays obey the same contract as `rehydrate`.
 pub unsafe fn rehydrate_sized(list: *const Object, desc: &Build, title_bytes: Option<u64>) -> bool {
     // SAFETY: the caller supplies the same live inputs required by build.
-    let recorded = unsafe { build_one(list, desc, false, title_bytes) };
+    let recorded = unsafe { build_one(list, desc, false, title_bytes) }.registered;
     #[cfg(feature = "diagnostics")]
     if probe::enabled() {
         let sampled = recorded
@@ -983,11 +1017,13 @@ impl Builder {
     /// `list` is a live title command list and the CPU geometry arrays are valid for the call.
     pub unsafe fn build(&self, list: *const Object, desc: &Build) -> bool {
         // SAFETY: the caller supplies the list and geometry arrays.
-        unsafe { build_one(list, desc, false, None) }
+        unsafe { build_one(list, desc, false, None) }.registered
     }
 
     /// Records a contiguous batch. The preceding build's final UAV barrier also
-    /// orders scratch reuse and AS dependencies for the following entry.
+    /// orders scratch reuse and AS dependencies for the following entry; an
+    /// entry that recorded no build (a TLAS of no instance, a refused one)
+    /// leaves the next its own entry barrier.
     ///
     /// # Safety
     /// The list and descriptors obey the single-build contract. No external GPU commands
@@ -1012,8 +1048,8 @@ impl Builder {
     ) {
         let mut ordered = false;
         for (desc, title_bytes) in descs {
-            // SAFETY: the batch supplies live inputs. Only a completed build leaves a trailing barrier.
-            ordered = unsafe { build_one(list, desc, ordered, title_bytes) };
+            // SAFETY: the batch supplies live inputs. Only a recorded build leaves a trailing barrier.
+            ordered = unsafe { build_one(list, desc, ordered, title_bytes) }.barrier;
         }
     }
 

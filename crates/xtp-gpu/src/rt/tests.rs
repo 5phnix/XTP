@@ -1303,3 +1303,123 @@ fn rt_blas_of_known_bounds_from_title_memory() {
         }
     }
 }
+
+thread_local! {
+    /// Set by a test to make the empty TLAS fail on its own thread
+    /// ([`empty_tlas`]), as an exhausted RT budget would.
+    pub(super) static EMPTY_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The empty TLAS failing on this thread until dropped.
+struct EmptyFails;
+
+impl EmptyFails {
+    fn new() -> EmptyFails {
+        EMPTY_FAILS.set(true);
+        EmptyFails
+    }
+}
+
+impl Drop for EmptyFails {
+    fn drop(&mut self) {
+        EMPTY_FAILS.set(false);
+    }
+}
+
+/// A TLAS of no instance is the shared empty TLAS: it records no build and
+/// so leaves no trailing barrier, and the next entry of a batch records its
+/// own entry barrier (Codex review 11f27db1, P1-1: the next BLAS took it
+/// for ordered and skipped its barrier). A recorded build leaves one.
+#[test]
+fn rt_a_tlas_of_no_instance_leaves_the_next_build_its_barrier() {
+    let test = "rt_a_tlas_of_no_instance_leaves_the_next_build_its_barrier";
+    let Some(_gpu) = dxr(test) else {
+        return;
+    };
+    let (vertices, indices) = (TitleBuffer::new(24), TitleBuffer::new(8));
+    vertices.set_words(|i| POSITIONS[i].to_bits());
+    indices.set_words(|i| [1 << 16, 2][i]);
+    let geometry = geometry(&vertices, &indices);
+    let (blas, tlas, first) = (
+        TitleBuffer::new(1024),
+        TitleBuffer::new(1024),
+        TitleBuffer::new(1024),
+    );
+    let instances = instances_of(&[blas.address()]);
+    let no_instance = |at: &TitleBuffer| {
+        let mut desc = tlas_desc(at.address(), &instances);
+        desc.Inputs.NumDescs = 0;
+        desc
+    };
+    // An empty TLAS made and submitted first, which the next takes.
+    let producer = TitleList::new();
+    // SAFETY: the title list and every buffer the descriptions name are live.
+    unsafe { build_one(producer.this(), &no_instance(&first), false, None) };
+    producer.run();
+    let list = TitleList::new();
+    // SAFETY: as above.
+    unsafe {
+        let empty = build_one(list.this(), &no_instance(&tlas), false, None);
+        assert_eq!(
+            empty,
+            Mirrored {
+                registered: true,
+                barrier: false
+            },
+            "a TLAS of no instance"
+        );
+        let built = build_one(
+            list.this(),
+            &Build {
+                DestAccelerationStructureData: blas.address(),
+                Inputs: blas_input(&geometry),
+                ..Default::default()
+            },
+            empty.barrier,
+            None,
+        );
+        assert_eq!(
+            built,
+            Mirrored {
+                registered: true,
+                barrier: true
+            },
+            "a BLAS build"
+        );
+    }
+    list.run();
+}
+
+/// A title TLAS is refused when the empty TLAS it would fall back to cannot
+/// be made: of no instance it would be built as one, and an instance of a
+/// BLAS the host does not have would name a null BLAS (Codex review
+/// 11f27db1, P1-3).
+#[test]
+fn rt_a_tlas_without_its_stand_in_is_refused() {
+    let test = "rt_a_tlas_without_its_stand_in_is_refused";
+    let Some(_gpu) = dxr(test) else {
+        return;
+    };
+    let _fails = EmptyFails::new();
+    let nothing = TitleBuffer::new(1024);
+    let unknown = instances_of(&[nothing.address()]);
+    let tlas: [TitleBuffer; 2] = std::array::from_fn(|_| TitleBuffer::new(1024));
+    let producer = TitleList::new();
+    // SAFETY: the title list and the instance buffer are live.
+    unsafe {
+        let mut none = tlas_desc(tlas[0].address(), &unknown);
+        none.Inputs.NumDescs = 0;
+        assert!(
+            !Builder.build(producer.this(), &none),
+            "a TLAS of no instance"
+        );
+        assert!(
+            !Builder.build(producer.this(), &tlas_desc(tlas[1].address(), &unknown)),
+            "a TLAS of an unknown BLAS"
+        );
+    }
+    producer.run();
+    for t in &tlas {
+        assert!(!registry().structures.contains_key(&t.address()));
+    }
+}

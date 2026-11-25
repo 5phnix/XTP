@@ -32,6 +32,16 @@ const QUOTE: usize = 1500;
 /// Allocations listed per kind (existing, freed) at a page fault.
 const ALLOCATIONS: usize = 8;
 
+/// Whether `XTP_D3D12_DRED`'s value turns device-removed data on: set, and
+/// neither `0` nor empty ([`crate::host::dred_on`]).
+pub(crate) fn asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.to_string_lossy();
+        let v = v.trim();
+        !v.is_empty() && v != "0"
+    })
+}
+
 /// Whether `XTP_D3D12_DRED`'s value asks for breadcrumb contexts.
 fn contexts_asked(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|v| v.eq_ignore_ascii_case("contexts"))
@@ -494,6 +504,17 @@ mod tests {
             contexts,
             texts: Texts::Dred,
         }
+    }
+
+    #[test]
+    fn the_switch_is_off_at_zero_or_empty() {
+        use std::ffi::OsStr;
+        assert!(asked(Some(OsStr::new("1"))));
+        assert!(asked(Some(OsStr::new("contexts"))));
+        assert!(!asked(Some(OsStr::new("0"))));
+        assert!(!asked(Some(OsStr::new(" 0 "))));
+        assert!(!asked(Some(OsStr::new(""))));
+        assert!(!asked(None));
     }
 
     #[test]

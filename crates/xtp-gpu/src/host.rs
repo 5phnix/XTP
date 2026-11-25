@@ -904,6 +904,10 @@ type States =
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
+        // `XTP_D3D12_DRED=0` (or empty) is off: not set alone.
+        if !crate::dred::asked(std::env::var_os("XTP_D3D12_DRED").as_deref()) {
+            return false;
+        }
         cfg!(feature = "diagnostics") && std::env::var_os("XTP_D3D12_DRED").is_some()
     })
 }
