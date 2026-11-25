@@ -509,8 +509,14 @@ pub(crate) fn buffer_format(title: u32, unordered: bool) -> u32 {
 
 /// [`buffer_format`] on a device that can do `caps`.
 fn buffer_format_with(caps: &impl Caps, title: u32, unordered: bool) -> u32 {
+    // DXGI ne propose aucun élément typé de trois octets. UNKNOWN sans
+    // stride donne une vue nulle, y compris quand le format 45 est disponible.
+    if (118..=120).contains(&title) {
+        note_buffer_without_format(title, unordered);
+        return 0;
+    }
     let Some(e) = entry(title) else {
-        return super::pc_vertex_format(title);
+        return title;
     };
     let needs = if unordered {
         uses::BUFFER | uses::TYPED_UNORDERED_ACCESS
@@ -1407,7 +1413,10 @@ mod tests {
         assert_eq!(buffer_format_with(&Host, 190, false), 60);
         // Formats outside the table, as before.
         assert_eq!(buffer_format_with(&Host, 28, false), 28);
-        assert_eq!(buffer_format_with(&Host, 118, false), 45);
+        for title in 118..=120 {
+            assert_eq!(buffer_format_with(&Host, title, false), 0);
+            assert_eq!(buffer_format_with(&Host, title, true), 0);
+        }
         for format in [53, 39, 60] {
             assert_eq!(super::super::family(format), format, "{format} is typeless");
         }
