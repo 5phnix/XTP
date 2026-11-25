@@ -169,6 +169,25 @@ fn as_is(kind: u32) -> bool {
     matches!(kind, 8..=11 | 13..=18 | 20 | 21)
 }
 
+/// Whether byte `i` of the data (after its type) of a subobject of `kind`
+/// kept byte for byte is padding: the title leaves whatever was there,
+/// which would make one state two descriptions (a session to the world
+/// created 14,784 descriptions
+/// that the one before had kept with other padding in their blend and
+/// depth-stencil, 2026-11-25), so it is kept as zeros. Blend (8): three
+/// bytes after each target's write mask, four at the end; depth-stencil
+/// (11, 21): two after the stencil masks, and four at the end of the
+/// second; sample description (17): four at the end.
+fn padding(kind: u32, i: usize) -> bool {
+    match kind {
+        8 => i >= 328 || (i >= 8 && (i - 8) % 40 >= 37),
+        11 => (18..20).contains(&i),
+        21 => (18..20).contains(&i) || (56..60).contains(&i),
+        17 => (8..12).contains(&i),
+        _ => false,
+    }
+}
+
 /// The graphics subobjects of a title's pipeline stream, as kept: each its
 /// type (u8), its length (u16) and its data, in the stream's order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,8 +289,13 @@ impl Capture {
             _ if as_is(kind) && size > 4 => {
                 // SAFETY: the subobject's data follows its type, `size` in
                 // all.
-                let data = unsafe { std::slice::from_raw_parts(at.add(4), size - 4) };
-                self.push(kind, data);
+                let mut data = unsafe { std::slice::from_raw_parts(at.add(4), size - 4) }.to_vec();
+                for (i, byte) in data.iter_mut().enumerate() {
+                    if padding(kind, i) {
+                        *byte = 0;
+                    }
+                }
+                self.push(kind, &data);
             }
             // The shaders: kept apart, by their containers.
             _ => {
@@ -1808,6 +1832,24 @@ mod tests {
                 .shaders
                 .iter()
                 .all(|(_, h)| read.container(h).is_some())
+        );
+    }
+
+    /// Two streams that differ only in the padding of their blend and
+    /// depth-stencil are kept as one.
+    #[test]
+    fn padding_is_kept_as_zeros() {
+        let a = title_stream(18);
+        let mut b = title_stream(18);
+        // The padding after target 6's write mask, and the depth-stencil's.
+        b.bytes[0x88 + 4 + 8 + 40 * 6 + 37] = 0x5a;
+        b.bytes[0x214 + 18] = 0x77;
+        assert_ne!(a.bytes, b.bytes);
+        let (sa, sb) = (kept_stream(&a), kept_stream(&b));
+        assert_eq!(sa, sb);
+        assert_eq!(
+            sa.state().unwrap().describe(),
+            create(&a).host.graphics.as_deref().unwrap().describe()
         );
     }
 
