@@ -3,13 +3,17 @@
 //! `v_mad_f32`), S5 (f64), M1 (`v_cndmask_b32` on
 //! an untracked mask).
 
+use std::collections::{HashMap, HashSet};
+
 use super::mask::{LANE_MASK, MaskData};
 use super::uniform::Level;
 use super::{Lower, UNTRACKED_SELECT, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{EXEC, Inst, Reg};
+use crate::ir::{EXEC, Inst, Reg, Value};
+use crate::resource::Site;
+use crate::structure::Bool;
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 
@@ -384,7 +388,18 @@ impl<'a> Lower<'a> {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
+                let a = match s(self, 0) {
+                    // shortcut: 0 for a descriptor's address or format
+                    // copied into an element of an M0-indexed array that
+                    // nothing but the array's moves reads
+                    // (`unused_element`), assuming M0 never names it.
+                    Err(why)
+                        if why == super::smem::DESCRIPTOR_WORD && self.unused_element(inst) =>
+                    {
+                        self.s.m.i32(0)
+                    }
+                    a => a?,
+                };
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -1062,4 +1077,175 @@ impl<'a> Lower<'a> {
         let z = self.s.m.bin(c, Bin::Or, az, bz);
         self.s.m.select(c, z, zero, m)
     }
+
+    /// Whether `inst`, a plain `v_mov_b32` of a descriptor's dword into a
+    /// VGPR, fills an element of an M0-indexed array (`v_movrels_b32`,
+    /// `v_movreld_b32`) past its first, which nothing else reads. The
+    /// console compiler fills such an array from a run of SGPRs; past the
+    /// elements the program uses the run holds whatever is there, which can
+    /// be a descriptor's address or format, and the moves name every VGPR
+    /// from the array's first to the program's last. The light loop's
+    /// preparation (11eeb27c2d15980d) fills v3..v18 from s0..s15, the
+    /// last four a UAV's first dwords; M0 is clamped to 0..11 there
+    /// (`v_med3_u32 …, 0, 11`), and v15..v18 are written again before
+    /// anything else reads them.
+    ///
+    /// The copy is followed through joins, plain copies and the elements a
+    /// `v_movreld_b32` keeps. Only its real operands are reads of an
+    /// instruction: a VGPR write lists the register's old value among its
+    /// reads ([`crate::ir`]), which is no use of it. That old value goes on
+    /// in the new one where the write keeps it (lanes outside the guard,
+    /// half writes: [`super::uniform::keeps_old`]), and refuses where the
+    /// instruction computes with it (`v_fmac_f32`, `v_writelane_b32`). Any
+    /// other read (an operand, the array's first element, the value a
+    /// `v_movreld_b32` stores, a non-VALU instruction) keeps the dword the
+    /// program's: its read stops the program as before.
+    // Ported from NuraadGit/VIctory (c1c3fbc) by NuraadGit, with the rule
+    // it amends (518c8b9, same author). Here: only on a dword with no host
+    // value (`DESCRIPTOR_WORD`, so a size the program reads stays its
+    // query); operands are `source_regs`'s; a write keeps the old value
+    // where its lowering does (`guard`, `keeps_old`); the copy is checked
+    // where it fails, not for every copy of the program.
+    fn unused_element(&self, inst: &Inst) -> bool {
+        let p = self.x.p;
+        let Fields::Valu(f) = &inst.fields else {
+            return false;
+        };
+        if f.sdwa.is_some() || f.dpp.is_some() {
+            return false;
+        }
+        let (Some(&Operand::Scalar { code, .. }), Some(Operand::Vector { reg, .. })) =
+            (f.src.first(), f.dst)
+        else {
+            return false;
+        };
+        let (Some(from), Some(copy)) = (inst.read(Reg::S(code)), inst.write(Reg::V(reg))) else {
+            return false;
+        };
+        let sites = || {
+            p.blocks.iter().enumerate().flat_map(|(b, block)| {
+                block
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, x)| ((b, i), x))
+            })
+        };
+        if !self.descriptor_dword(from) || !sites().any(|(_, x)| x.name().starts_with("v_movrel")) {
+            return false;
+        }
+        let mut readers: HashMap<Value, Vec<Site>> = HashMap::new();
+        for (site, x) in sites() {
+            for &(_, v) in &x.reads {
+                readers.entry(v).or_default().push(site);
+            }
+        }
+        let mut joins: HashMap<Value, Vec<Value>> = HashMap::new();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            for &arg in &phi.args {
+                joins.entry(arg).or_default().push(phi.value);
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut work = vec![copy];
+        while let Some(v) = work.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            work.extend(joins.get(&v).into_iter().flatten());
+            for &site in readers.get(&v).into_iter().flatten() {
+                if !self.keeps_element(site, v, &mut work) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether the instruction at `site` reads `v`, a value an unused array
+    /// element may hold ([`Self::unused_element`]), without using it; the
+    /// values that then hold it go to `work`.
+    fn keeps_element(&self, (b, i): Site, v: Value, work: &mut Vec<Value>) -> bool {
+        let x: &Inst = &self.x.p.blocks[b].insts[i];
+        let Fields::Valu(f) = &x.fields else {
+            return false;
+        };
+        let name = x.name();
+        let vector = |o: Option<Operand>| match o {
+            Some(Operand::Vector { reg, .. }) => Some(Reg::V(reg)),
+            _ => None,
+        };
+        let (src, dst) = (vector(f.src.first().copied()), vector(f.dst));
+        let holds = |r: Option<Reg>| r.is_some_and(|r| x.read(r) == Some(v));
+        let plain = f.sdwa.is_none()
+            && f.dpp.is_none()
+            && f.abs == 0
+            && f.neg == 0
+            && !f.clamp
+            && f.omod == 0;
+        let element = match name {
+            // The array's first element, or the value stored.
+            "v_movreld_b32" if !plain || holds(src) || holds(dst) => return false,
+            // Every other element keeps its value where M0 names another.
+            "v_movreld_b32" => {
+                for r in x.reads.iter().filter(|r| r.1 == v) {
+                    work.extend(x.write(r.0));
+                }
+                return true;
+            }
+            "v_movrels_b32" if !plain || holds(src) => return false,
+            "v_movrels_b32" => true,
+            "v_mov_b32" if plain && holds(src) => {
+                work.extend(dst.and_then(|r| x.write(r)));
+                return true;
+            }
+            _ => false,
+        };
+        let sources = super::uniform::source_regs(x);
+        for &(r, w) in &x.reads {
+            // An element `v_movrels_b32` names past its first: the
+            // shortcut's.
+            if w != v || element && Some(r) != dst {
+                continue;
+            }
+            // Read as an operand, or neither as one nor as the old value
+            // of a register the instruction writes.
+            if !element && sources.has(r) || x.write(r).is_none() {
+                return false;
+            }
+        }
+        // `v` is the old value of a VGPR `x` writes.
+        if computes_with_old(name) {
+            return false;
+        }
+        // Where the lowering keeps it: lanes outside the guard
+        // (`Lower::guard`), the bits a half write leaves.
+        let guarded = if self.console_cf {
+            self.x.st.execs[b]
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|e| e != Bool::TRUE)
+        } else {
+            self.x.st.guards[b][i].is_some()
+        };
+        if guarded || super::uniform::keeps_old(x) {
+            for r in x.reads.iter().filter(|r| r.1 == v) {
+                work.extend(x.write(r.0));
+            }
+        }
+        true
+    }
+}
+
+/// Whether a VALU instruction named `name` computes its result with the old
+/// value of the VGPR it writes, beyond keeping it where it does not write
+/// (an accumulator, a lane write, an interpolation's second step).
+fn computes_with_old(name: &str) -> bool {
+    name.contains("mac")
+        || name.starts_with("v_dot")
+        || name.contains("qsad")
+        || name.starts_with("v_interp")
+        || name.contains("permlane")
+        || name.contains("writelane")
 }
