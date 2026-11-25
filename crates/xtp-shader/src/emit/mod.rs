@@ -308,6 +308,43 @@ pub fn with_loop_count<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Every setting a translation depends on besides the container and the
+/// [`Target`], each in the value the translator uses (not its switch's
+/// spelling: `XTP_SHADER_LOOP_LIMIT` unset and set to 16384 give the same
+/// loop limit but not the same counted loops' limit). A shader cache keys
+/// on all of it (`xtp-gpu`'s does, field by field). A switch added to the
+/// translator must be added here, and so to the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Settings {
+    /// [`loop_limit`].
+    pub loop_limit: u32,
+    /// The counted loops' limit (`counted_loop_limit`).
+    pub counted_loop_limit: u32,
+    /// The spin waits' limit (`spin_limit`).
+    pub spin_limit: u32,
+    /// [`loop_budget`].
+    pub loop_budget: u32,
+    /// [`dxil_opt`]'s passes.
+    pub dxil_opt: u32,
+    /// [`raw_structured`].
+    pub raw_structured: bool,
+    /// [`loop_count`], on this thread.
+    pub loop_count: bool,
+}
+
+/// The [`Settings`] a translation made now on this thread runs with.
+pub fn settings() -> Settings {
+    Settings {
+        loop_limit: loop_limit(),
+        counted_loop_limit: counted_loop_limit(),
+        spin_limit: spin_limit(),
+        loop_budget: loop_budget(),
+        dxil_opt: dxil_opt(),
+        raw_structured: raw_structured(),
+        loop_count: loop_count(),
+    }
+}
+
 /// `XTP_SHADER_LOOP_LIMIT`'s value; none when it is unset, unreadable or
 /// 0. Pure, for testing.
 fn parse_limit_override(value: Option<&str>) -> Option<u32> {

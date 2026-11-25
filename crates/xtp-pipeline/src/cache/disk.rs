@@ -298,13 +298,18 @@ pub(super) fn write_index(
 
 /// Appends changes to the index file at a cache's root, one record per
 /// write. Another process may append beside it (a record is one write) or
-/// replace the file (then what this one appends goes to the file it
-/// replaced: entries the index misses, which only the byte budget sees,
-/// until the next [`super::Cache::reindex`]). A failed write leaves a
-/// record torn or missing: the next open sees damage, or misses an entry.
+/// replace the file with a snapshot of its own: each append opens the file
+/// that is there now, so what this one appends goes to the index the next
+/// open reads, not to the file the other replaced (Codex review of
+/// 12556d6, point 2: those records were lost, entries the index missed
+/// until the next [`super::Cache::reindex`]). An entry this process
+/// published before the other's snapshot and that the other did not know
+/// of is still missed until a listing; a budget is still each process's
+/// own (two may each find room for their entry): an open past the limit
+/// lists the folder before it evicts. A failed write leaves a record torn
+/// or missing: the next open sees damage, or misses an entry.
 pub(super) struct Journal {
     path: PathBuf,
-    file: Option<File>,
     failed: bool,
 }
 
@@ -312,7 +317,6 @@ impl Journal {
     pub(super) fn new(root: &Path) -> Journal {
         Journal {
             path: root.join(INDEX_FILE),
-            file: None,
             failed: false,
         }
     }
@@ -321,29 +325,22 @@ impl Journal {
         if self.failed {
             return;
         }
-        let written = (|| -> io::Result<()> {
-            if self.file.is_none() {
-                // Only to the file there is: a file made here would hold
-                // these changes without the entries before them, and the
-                // next open would trust it. Without one, the next open
-                // looks at every entry.
-                self.file = Some(fs::OpenOptions::new().append(true).open(&self.path)?);
-            }
-            self.file
-                .as_mut()
-                .expect("opened above")
-                .write_all(&change.encode())
-        })();
+        // Only to the file there is: a file made here would hold these
+        // changes without the entries before them, and the next open would
+        // trust it. Without one, the next open looks at every entry.
+        let written = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .and_then(|mut file| file.write_all(&change.encode()));
         if let Err(e) = written {
             tracing::warn!(path = %self.path.display(), error = %e, "cache index not appended to; the next open may look at every entry");
             self.failed = true;
-            self.file = None;
         }
     }
 
-    /// The file was replaced (a new snapshot): appends go to the new one.
+    /// The file was replaced (a new snapshot) by this process: appends go
+    /// to it again after a failure.
     pub(super) fn reopen(&mut self) {
-        self.file = None;
         self.failed = false;
     }
 }

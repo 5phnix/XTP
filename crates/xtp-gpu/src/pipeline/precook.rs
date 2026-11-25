@@ -760,6 +760,18 @@ pub(in crate::pipeline) mod tests {
         profile: windows::core::PCSTR,
         container: &[u8],
     ) -> Arc<Shader> {
+        translated_with(stage, kind, source, profile, container, |_| {})
+    }
+
+    /// [`translated`], its translation's bindings changed by `edit`.
+    fn translated_with(
+        stage: &'static str,
+        kind: HwStage,
+        source: Option<&str>,
+        profile: windows::core::PCSTR,
+        container: &[u8],
+        edit: impl FnOnce(&mut xtp_shader::emit::HostShader),
+    ) -> Arc<Shader> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         let translated = source.map(|source| {
             let mut blob = None;
@@ -787,20 +799,22 @@ pub(in crate::pipeline) mod tests {
                 )
                 .to_vec()
             };
+            let mut host = xtp_shader::emit::HostShader {
+                stage: kind,
+                dxil,
+                group_base: None,
+                user_data: vec![],
+                samplers: vec![],
+                static_samplers: vec![],
+                root_cbvs: vec![],
+                root_srvs: vec![],
+                root_uavs: vec![],
+                stride_table: false,
+                run_time_buffers: 0,
+            };
+            edit(&mut host);
             super::super::Translated {
-                host: xtp_shader::emit::HostShader {
-                    stage: kind,
-                    dxil,
-                    group_base: None,
-                    user_data: vec![],
-                    samplers: vec![],
-                    static_samplers: vec![],
-                    root_cbvs: vec![],
-                    root_srvs: vec![],
-                    root_uavs: vec![],
-                    stride_table: false,
-                    run_time_buffers: 0,
-                },
+                host,
                 used: vec![],
                 wave64: false,
             }
@@ -1123,5 +1137,54 @@ pub(in crate::pipeline) mod tests {
         let loaded = counts().loaded;
         assert!(HostPipeline::new(&shaders, Some(&state)).is_some());
         assert!(counts().loaded > loaded, "loaded for the same topology");
+    }
+
+    /// A pipeline is named by its root signature as well as by its
+    /// translated code: two compute programs whose DXIL is byte for byte
+    /// the same but whose bindings differ (a root CBV more) are two
+    /// pipelines, and the precook does not answer the second by the
+    /// first's name. (Whether a pipeline is answered by its name is told
+    /// by the stand-in it gets: counts are the process's.)
+    #[test]
+    fn the_same_code_with_another_root_signature_is_another_pipeline() {
+        let test = "pipeline::precook::tests::the_same_code_with_another_root_signature_is_another_pipeline";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        if !super::super::library::has_library() {
+            return;
+        }
+        let source = "[numthreads(11, 3, 1)] void main() {}";
+        let plain = translated(
+            "compute",
+            HwStage::Cs,
+            Some(source),
+            windows::core::s!("cs_5_1"),
+            b"precook root test: plain",
+        );
+        let rooted = translated_with(
+            "compute",
+            HwStage::Cs,
+            Some(source),
+            windows::core::s!("cs_5_1"),
+            b"precook root test: a root CBV more",
+            |host| host.root_cbvs = vec![0],
+        );
+        let dxil = |s: &Shader| s.translated().map(|t| t.host.dxil.clone());
+        assert_eq!(dxil(&plain), dxil(&rooted), "the same code");
+        let precooked = |shader: &Arc<Shader>| {
+            super::super::library::without_loading(|| {
+                HostPipeline::new(std::slice::from_ref(shader), None).expect("a pipeline")
+            })
+        };
+        let is_stand_in = |p: &HostPipeline| super::super::library::is_stand_in(&p.pso);
+        // Made or answered by its name, then by its name.
+        let _ = precooked(&plain);
+        assert!(is_stand_in(&precooked(&plain)), "held by its name");
+        assert!(
+            !is_stand_in(&precooked(&rooted)),
+            "another root signature: not answered by the plain one's name"
+        );
+        assert!(is_stand_in(&precooked(&rooted)), "then by its own");
     }
 }

@@ -221,7 +221,7 @@ fn precook(o: Options) -> Result<()> {
             listing.elapsed().as_secs_f64()
         ),
         Some((false, entries, bytes)) => format!(
-            "; not listed again, a folder could not be read: {entries} entries, {bytes} bytes as indexed"
+            "; index not set right, a folder could not be read or the index not written (see the log): {entries} entries, {bytes} bytes"
         ),
         None => String::new(),
     };

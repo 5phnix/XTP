@@ -151,14 +151,24 @@ impl Cache {
         let mut opened = Opened::Off;
         if limit != 0 {
             let started = std::time::Instant::now();
+            let mut trim = true;
             opened = match disk::read_index(&root) {
                 Some(changes) => {
                     let records = changes.len();
                     for change in changes {
                         index.apply(change);
                     }
-                    // Mostly changes since its snapshot: a new snapshot.
-                    if records > 2 * index.files.len() + 4096 {
+                    if index.bytes > limit {
+                        // Past the limit by the index alone, which may list
+                        // entries gone since (removed by another process or
+                        // by hand, a record of their removal lost): the
+                        // folder is listed before anything goes, so that no
+                        // live entry is evicted for one that is not there
+                        // (Codex review of 12556d6, point 2). A listing that
+                        // missed a folder evicts nothing.
+                        trim = index.relist(&root) != Relisted::Unlisted;
+                    } else if records > 2 * index.files.len() + 4096 {
+                        // Mostly changes since its snapshot: a new snapshot.
                         index.snapshot(&root);
                     }
                     Opened::Index
@@ -174,7 +184,9 @@ impl Cache {
                 }
             };
             index.journal = Some(disk::Journal::new(&root));
-            index.trim(&root, limit);
+            if trim {
+                index.trim(&root, limit);
+            }
             tracing::info!(
                 root = %root.display(),
                 entries = index.files.len(),
@@ -227,21 +239,19 @@ impl Cache {
     ///
     /// False, with the index left as it was, if a folder of the cache could
     /// not be listed: an index without its entries would be trusted after.
+    /// False too if the listing could not be written as the index file
+    /// (Codex review of 12556d6, point 5): the counts are the listing's, but
+    /// the next open reads the file as it was.
     pub fn reindex(&self) -> bool {
         if self.store.limit == 0 {
             return true;
         }
         let mut index = lock(&self.store.index);
-        let mut scanned = Index::default();
-        if !scanned.scan(&self.store.root) {
-            return false;
+        let relisted = index.relist(&self.store.root);
+        if relisted != Relisted::Unlisted {
+            index.trim(&self.store.root, self.store.limit);
         }
-        index.files = scanned.files;
-        index.oldest = scanned.oldest;
-        index.bytes = scanned.bytes;
-        index.snapshot(&self.store.root);
-        index.trim(&self.store.root, self.store.limit);
-        true
+        relisted == Relisted::Written
     }
 
     /// Returns an owned snapshot which remains readable after eviction.
@@ -393,12 +403,51 @@ impl Drop for Pin<'_> {
     }
 }
 
+/// What [`Index::relist`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relisted {
+    /// The listing is the index, and the index file.
+    Written,
+    /// The listing is the index; the index file could not be written.
+    NotWritten,
+    /// A folder could not be listed: the index is as it was.
+    Unlisted,
+}
+
 impl Index {
+    /// Lists the folder at `root` ([`Index::scan`]) and, if the listing is
+    /// whole, takes its entries in place of these and writes them as the
+    /// index file.
+    fn relist(&mut self, root: &Path) -> Relisted {
+        let mut listed = Index::default();
+        if !listed.scan(root) {
+            return Relisted::Unlisted;
+        }
+        self.files = listed.files;
+        self.oldest = listed.oldest;
+        self.bytes = listed.bytes;
+        if self.snapshot(root) {
+            Relisted::Written
+        } else {
+            Relisted::NotWritten
+        }
+    }
+
     /// Adds the entries the folder at `root` holds, by its listing (no
     /// entry opened), and removes staging files older than an hour. False
     /// if part of it could not be listed: a folder, or an entry's size or
     /// time (what was found is added all the same).
     fn scan(&mut self, root: &Path) -> bool {
+        self.scan_with(root, fs::DirEntry::file_type)
+    }
+
+    /// [`Index::scan`], which reads an entry's type with `file_type` (the
+    /// tests' way to make one fail).
+    fn scan_with(
+        &mut self,
+        root: &Path,
+        file_type: impl Fn(&fs::DirEntry) -> io::Result<fs::FileType>,
+    ) -> bool {
         fn hex(name: &std::ffi::OsStr, len: usize) -> bool {
             let s = name.as_encoded_bytes();
             s.len() == len
@@ -421,12 +470,20 @@ impl Index {
                 }
             }
         };
+        // An entry whose type cannot be read may be a folder of the cache,
+        // or an entry of one: the listing is incomplete (Codex review of
+        // 12556d6, point 5), not one without it.
+        let file_type = |entry: &fs::DirEntry| {
+            file_type(entry)
+                .inspect_err(|e| incomplete(&entry.path(), e))
+                .ok()
+        };
         for shard in children(root) {
-            if !hex(&shard.file_name(), 2) || !shard.file_type().is_ok_and(|ty| ty.is_dir()) {
+            if !hex(&shard.file_name(), 2) || !file_type(&shard).is_some_and(|ty| ty.is_dir()) {
                 continue;
             }
             for file in children(&shard.path()) {
-                if !file.file_type().is_ok_and(|ty| ty.is_file()) {
+                if !file_type(&file).is_some_and(|ty| ty.is_file()) {
                     continue;
                 }
                 let found = file
@@ -515,8 +572,9 @@ impl Index {
 
     /// Replaces the index file with these entries; appends go to the new
     /// one. One that cannot be written leaves the old one, and the cache
-    /// works as well: the next open may look at every entry.
-    fn snapshot(&mut self, root: &Path) {
+    /// works as well: the next open may look at every entry. Whether it was
+    /// written.
+    fn snapshot(&mut self, root: &Path) -> bool {
         let entries = self.files.iter().map(|(key, r)| disk::Change::Published {
             key: *key.0.as_bytes(),
             bytes: r.bytes,
@@ -527,9 +585,11 @@ impl Index {
                 if let Some(journal) = &mut self.journal {
                     journal.reopen();
                 }
+                true
             }
             Err(e) => {
-                tracing::warn!(root = %root.display(), error = %e, "cache index not written")
+                tracing::warn!(root = %root.display(), error = %e, "cache index not written");
+                false
             }
         }
     }
@@ -1350,6 +1410,141 @@ mod tests {
         assert_eq!(cache.opened(), Opened::Index);
         assert_eq!((cache.stats().entries, cache.stats().bytes), (2, 8));
         assert_eq!(conv.runs.load(Ordering::Relaxed), 3, "nothing made again");
+    }
+
+    /// Codex review of 12556d6, point 2: an index that lists an entry gone
+    /// since (removed by another process, the record of its removal lost)
+    /// is past the limit by that entry alone. The open evicted the oldest
+    /// live entry for it before any listing; it now lists the folder first,
+    /// and nothing that fits goes.
+    #[test]
+    fn an_open_past_the_limit_lists_before_it_evicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let conv = upper(1);
+        let (old, gone) = {
+            let cache = Cache::open_with_limit(&root, 10).unwrap();
+            cache.get_or_convert(&conv, b"old").unwrap();
+            // Later than "old", whatever the clock's grain.
+            std::thread::sleep(Duration::from_millis(50));
+            cache.get_or_convert(&conv, b"younger").unwrap();
+            assert_eq!(cache.stats().bytes, 10);
+            (
+                cache.path_for(&CacheKey::new(&conv, b"old")),
+                cache.path_for(&CacheKey::new(&conv, b"younger")),
+            )
+        };
+        fs::remove_file(&gone).unwrap();
+        // 10 bytes by the index, past 9; 3 on disk.
+        let cache = Cache::open_with_limit(&root, 9).unwrap();
+        assert_eq!(cache.opened(), Opened::Index);
+        assert!(old.exists(), "the oldest live entry stays");
+        assert_eq!((cache.stats().entries, cache.stats().bytes), (1, 3));
+        assert_eq!(&*cache.get_or_convert(&conv, b"old").unwrap(), b"OLD");
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 2, "read, not made");
+        drop(cache);
+        let cache = Cache::open_with_limit(&root, 9).unwrap();
+        assert_eq!(
+            (cache.stats().entries, cache.stats().bytes),
+            (1, 3),
+            "the listing was written as the index"
+        );
+    }
+
+    /// Codex review of 12556d6, point 2: another process's snapshot
+    /// replaces the index file; this process's appends after it went to the
+    /// file it replaced, and were lost. Each append now opens the file there.
+    #[test]
+    fn appends_go_to_the_index_another_process_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_600_000);
+        let published = |k: u8| disk::Change::Published {
+            key: [k; 32],
+            bytes: u64::from(k),
+            modified,
+        };
+        disk::write_index(tmp.path(), [published(1)].into_iter()).unwrap();
+        let mut journal = disk::Journal::new(tmp.path());
+        journal.append(&published(2));
+        assert_eq!(
+            disk::read_index(tmp.path()),
+            Some(vec![published(1), published(2)])
+        );
+        // Another process's snapshot, then this one's next change.
+        disk::write_index(tmp.path(), [published(3)].into_iter()).unwrap();
+        journal.append(&published(4));
+        assert_eq!(
+            disk::read_index(tmp.path()),
+            Some(vec![published(3), published(4)]),
+            "appended to the index there is"
+        );
+    }
+
+    /// Codex review of 12556d6, point 5: an entry whose type cannot be read
+    /// (a folder of the cache, or an entry of one) makes the listing
+    /// incomplete, as a folder that cannot be read does: it skipped the
+    /// entry and called the listing whole, which a reindex then wrote.
+    #[test]
+    fn an_entry_whose_type_cannot_be_read_makes_the_listing_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conv = upper(1);
+        let cache = Cache::open(tmp.path()).unwrap();
+        cache.get_or_convert(&conv, b"a").unwrap();
+        let entry = cache.path_for(&CacheKey::new(&conv, b"a"));
+        let file = entry.file_name().unwrap().to_owned();
+        let shard = entry.parent().unwrap().file_name().unwrap().to_owned();
+        drop(cache);
+        /// The type of each entry, but `name`'s, which cannot be read.
+        fn failing(
+            name: &std::ffi::OsStr,
+        ) -> impl Fn(&fs::DirEntry) -> io::Result<fs::FileType> + '_ {
+            move |e| {
+                if e.file_name() == name {
+                    Err(io::Error::other("type not read"))
+                } else {
+                    e.file_type()
+                }
+            }
+        }
+        let mut listed = Index::default();
+        assert!(listed.scan_with(tmp.path(), failing("".as_ref())));
+        assert_eq!(listed.files.len(), 1, "a whole listing");
+        for name in [&shard, &file] {
+            let mut listed = Index::default();
+            assert!(
+                !listed.scan_with(tmp.path(), failing(name)),
+                "{}",
+                name.display()
+            );
+            assert!(listed.files.is_empty());
+        }
+    }
+
+    /// Codex review of 12556d6, point 5: a reindex whose listing cannot be
+    /// written as the index file (here: a folder in its place) said it had
+    /// set the index right. It now says it did not; the counts are the
+    /// listing's all the same.
+    #[test]
+    fn a_reindex_that_cannot_write_its_index_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conv = upper(1);
+        let cache = Cache::open(tmp.path()).unwrap();
+        cache.get_or_convert(&conv, b"a").unwrap();
+        assert!(cache.reindex(), "written");
+        let index = tmp.path().join(disk::INDEX_FILE);
+        fs::remove_file(&index).unwrap();
+        fs::create_dir(&index).unwrap();
+        assert!(!cache.reindex(), "not written");
+        assert!(index.is_dir());
+        assert_eq!((cache.stats().entries, cache.stats().bytes), (1, 1));
+        fs::remove_dir(&index).unwrap();
+        // The stray temporary file of the failed write is not left behind.
+        let strays = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(strays, 0);
     }
 
     /// Opening a real cache folder (`XTP_CACHE_PROBE`), four ways: each
