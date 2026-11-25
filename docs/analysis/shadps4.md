@@ -172,11 +172,10 @@ address of a table, and the parameter the layout declares at user-data
 index N ≥ 16 is at byte 4 × (N − 16).
 
 The 16-digit BLAKE3 hashes in the 20261125-000534 run match 34 of the 52
-compute containers embedded in `XboxBvhBuilder.dll`. All 34 declare four
-user SGPRs and their first root parameter at dword 16. To reproduce, run
-`xtp shader-info --disasm` on the DLL. In containers at DLL offsets
-0x25c40, 0x28770, 0x2b5b0 and 0x34b20, the first table read is at code
-offset 0x2c, 0x2c, 0x40 and 0x30 respectively.
+compute containers embedded in the console's BVH builder library. All 34
+declare four user SGPRs and their first root parameter at dword 16, and
+each reads the table early in the program. To reproduce, run
+`xtp shader-info` on that library from your own console's system files.
 
 **shadPS4.** This is the PS4's "extended user data": user data beyond 16
 dwords lives behind a pointer in user data. `FlattenExtendedUserdataPass`
@@ -233,10 +232,10 @@ Pointers read out of memory per lane (structure nodes) are beyond the
 walker.
 
 In the same run, all 13 have their first root parameter at user-data
-dword 4. At the failing instruction, six read through an SGPR pair after
-a 64-bit left shift by eight and a bitwise OR with 48. Seven issue a
-global load through a VGPR pair. The spill-table rule applies to zero of
-the 2,682 compute programs in the title's pack.
+dword 4. At the failing instruction, six read through an SGPR address
+built from user data, and seven issue a per-lane global load. The
+spill-table rule applies to zero of the 2,682 compute programs in the
+title's pack.
 
 **Raw pointers:** the device-address path, yes.
 
