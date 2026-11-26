@@ -1,0 +1,79 @@
+name: Diagnostic artifact
+
+on:
+  workflow_dispatch:
+  # Keep an exact-branch build available if manual dispatch is unavailable.
+  push:
+    branches: [hangar/add-bounded-placed-view-b4848e]
+    paths: [.github/workflows/diag-artifact.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: false
+      - name: Build diagnostic executable
+        run: cargo build -p xtp --profile diag --features diagnostics --locked
+      - name: Record executable provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $commit = (git rev-parse HEAD).Trim()
+          if ($commit -ne $env:GITHUB_SHA) { throw 'Checkout does not match run head' }
+          $compiler = (rustc -vV | Out-String).Trim()
+          $target = ($compiler -split "`n" | Where-Object { $_ -like 'host: *' }) -replace '^host: ', ''
+          $target = $target.Trim()
+          if ($target -ne 'x86_64-pc-windows-msvc') { throw "Unexpected target: $target" }
+          New-Item -ItemType Directory -Path diag-artifact | Out-Null
+          Copy-Item target/diag/xtp.exe diag-artifact/xtp.exe
+          $exe = Get-Item diag-artifact/xtp.exe
+          $receipt = [ordered]@{
+            schema_version = 1
+            repository = $env:GITHUB_REPOSITORY
+            commit = $commit
+            workflow_ref = $env:GITHUB_WORKFLOW_REF
+            workflow_sha = $env:GITHUB_WORKFLOW_SHA
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            job = $env:GITHUB_JOB
+            runner_os = $env:RUNNER_OS
+            toolchain = (rustup show active-toolchain | Out-String).Trim()
+            compiler = $compiler
+            cargo = (cargo -V | Out-String).Trim()
+            target = $target
+            profile = 'diag'
+            features = @('diagnostics')
+            command = 'cargo build -p xtp --profile diag --features diagnostics --locked'
+            file = 'xtp.exe'
+            size_bytes = $exe.Length
+            sha256 = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash
+          }
+          $receipt | ConvertTo-Json -Depth 4 | Set-Content diag-artifact/provenance.json -Encoding utf8
+          if ((Get-FileHash $exe.FullName -Algorithm SHA256).Hash -ne $receipt.sha256) {
+            throw 'Executable changed while recording provenance'
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: xtp-diag-${{ github.sha }}
+          path: |
+            diag-artifact/xtp.exe
+            diag-artifact/provenance.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
