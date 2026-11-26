@@ -1388,6 +1388,7 @@ mod tests {
                 &format!("modules::xasync::tests::{name}"),
                 "--exact",
                 "--nocapture",
+                "--include-ignored",
             ])
             .env("XTP_XASYNC_TEST", name)
             .stdout(output.try_clone().unwrap())
@@ -1797,6 +1798,229 @@ mod tests {
             XAsyncComplete(block, S_OK, 0);
             XTaskQueueCloseHandle(q);
         }
+    }
+
+    #[test]
+    fn queued_work_is_not_admitted_during_cleanup() {
+        if !bounded_child("queued_work_is_not_admitted_during_cleanup") {
+            return;
+        }
+        use std::sync::mpsc::sync_channel;
+        struct Context {
+            entered: std::sync::mpsc::SyncSender<()>,
+            resume: Mutex<std::sync::mpsc::Receiver<()>>,
+            works: AtomicU32,
+            cleanups: AtomicU32,
+            callbacks: AtomicU32,
+            timed_out: AtomicBool,
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: runtime data points to the test's leaked context.
+            let context = unsafe { &*(*data).context.cast::<Context>() };
+            match op {
+                OP_DO_WORK => {
+                    context.works.fetch_add(1, Ordering::SeqCst);
+                    return E_PENDING;
+                }
+                OP_CLEANUP => {
+                    context.cleanups.fetch_add(1, Ordering::SeqCst);
+                    let _ = context.entered.send(());
+                    context.timed_out.store(
+                        lock(&context.resume)
+                            .recv_timeout(Duration::from_secs(10))
+                            .is_err(),
+                        Ordering::SeqCst,
+                    );
+                }
+                _ => {}
+            }
+            S_OK
+        }
+        extern "system" fn completed(block: *mut AsyncBlock) {
+            // SAFETY: both block and context are leaked for safe failure paths.
+            let context = unsafe { &*(*block).context.cast::<Context>() };
+            context.callbacks.fetch_add(1, Ordering::SeqCst);
+        }
+        for (result, callback) in [
+            (E_ABORT, false),
+            (E_ABORT, true),
+            (S_OK, false),
+            (S_OK, true),
+        ] {
+            let (entered, cleaning) = sync_channel(1);
+            let (resume, permit) = sync_channel(1);
+            let context: &Context = Box::leak(Box::new(Context {
+                entered,
+                resume: Mutex::new(permit),
+                works: AtomicU32::new(0),
+                cleanups: AtomicU32::new(0),
+                callbacks: AtomicU32::new(0),
+                timed_out: AtomicBool::new(false),
+            }));
+            let mut q = std::ptr::null();
+            assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+            let data = (context as *const Context).cast_mut().cast();
+            let block = Box::leak(Box::new(AsyncBlock {
+                queue: q,
+                context: data,
+                callback: callback.then_some(completed as CompletionRoutine),
+                internal: [0; 4],
+            }));
+            assert_eq!(
+                XAsyncBegin(
+                    block,
+                    data,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    Some(provider)
+                ),
+                S_OK
+            );
+            // Force queued work's weak upgrade to succeed after detachment.
+            let retained = call(block).unwrap();
+            assert_eq!(XAsyncSchedule(block, 0), S_OK);
+            assert_eq!(XAsyncSchedule(block, 0), S_OK);
+            let address = block as *mut AsyncBlock as usize;
+            let completing = std::thread::spawn(move || {
+                XAsyncComplete(address as *mut AsyncBlock, result, 0);
+            });
+            cleaning
+                .recv_timeout(Duration::from_secs(5))
+                .expect("completion did not enter cleanup");
+            assert_eq!(lock(&retained.done).result, Some(result));
+            assert!(call(block).is_none());
+            assert_eq!(XAsyncGetStatus(block, false), E_PENDING);
+            assert_eq!(XAsyncSchedule(block, 0), E_INVALIDARG);
+            assert!(XTaskQueueDispatch(q, WORK, 0));
+            assert!(XTaskQueueDispatch(q, WORK, 0));
+            let works = context.works.load(Ordering::SeqCst);
+            let status_during_cleanup = XAsyncGetStatus(block, false);
+            let callbacks_during_cleanup = context.callbacks.load(Ordering::SeqCst);
+            // A late competing result must not publish or clean up again.
+            retained.complete(block, E_INVALIDARG, 16);
+            assert!(!XTaskQueueDispatch(q, COMPLETION, 0));
+            assert!(!lock(&retained.done).done);
+            resume.send(()).unwrap();
+            completing.join().unwrap();
+            assert_eq!(works, 0, "queued work entered the provider during cleanup");
+            assert_eq!(status_during_cleanup, E_PENDING);
+            assert_eq!(callbacks_during_cleanup, 0);
+            assert!(!context.timed_out.load(Ordering::SeqCst));
+            assert_eq!(XAsyncGetStatus(block, false), result);
+            assert_eq!(lock(&retained.done).done, !callback);
+            if callback {
+                assert!(XTaskQueueDispatch(q, COMPLETION, 5_000));
+            }
+            assert!(lock(&retained.done).done);
+            assert_eq!(retained.wait(), result);
+            assert_eq!(context.cleanups.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                context.callbacks.load(Ordering::SeqCst),
+                u32::from(callback)
+            );
+            assert!(waiting_call(block).is_none());
+            XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    #[ignore = "fork #24: cleanup still overlaps admitted provider work"]
+    fn cleanup_waits_for_admitted_provider_work() {
+        if !bounded_child("cleanup_waits_for_admitted_provider_work") {
+            return;
+        }
+        use std::sync::mpsc::sync_channel;
+        struct Context {
+            entered: std::sync::mpsc::SyncSender<()>,
+            resume: Mutex<std::sync::mpsc::Receiver<()>>,
+            working: AtomicBool,
+            cleanups: AtomicU32,
+            overlapped: AtomicBool,
+            timed_out: AtomicBool,
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the test leaks its block and context, even if cleanup wins.
+            let data = unsafe { &*data };
+            // SAFETY: cleanup records its timing but never frees this context.
+            let context = unsafe { &*data.context.cast::<Context>() };
+            match op {
+                OP_DO_WORK => {
+                    context.working.store(true, Ordering::SeqCst);
+                    let _ = context.entered.send(());
+                    context.timed_out.store(
+                        lock(&context.resume)
+                            .recv_timeout(Duration::from_secs(10))
+                            .is_err(),
+                        Ordering::SeqCst,
+                    );
+                    context.working.store(false, Ordering::SeqCst);
+                    return E_PENDING;
+                }
+                OP_CANCEL => XAsyncComplete(data.block, E_ABORT, 0),
+                OP_CLEANUP => {
+                    context
+                        .overlapped
+                        .fetch_or(context.working.load(Ordering::SeqCst), Ordering::SeqCst);
+                    context.cleanups.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            S_OK
+        }
+        let (entered, working) = sync_channel(1);
+        let (resume, permit) = sync_channel(1);
+        let context: &Context = Box::leak(Box::new(Context {
+            entered,
+            resume: Mutex::new(permit),
+            working: AtomicBool::new(false),
+            cleanups: AtomicU32::new(0),
+            overlapped: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
+        }));
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let block = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }));
+        assert_eq!(
+            XAsyncBegin(
+                block,
+                (context as *const Context).cast_mut().cast(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(provider)
+            ),
+            S_OK
+        );
+        assert_eq!(XAsyncSchedule(block, 0), S_OK);
+        let queue_address = q as usize;
+        let worker =
+            std::thread::spawn(move || XTaskQueueDispatch(queue_address as *const Queue, WORK, 0));
+        working
+            .recv_timeout(Duration::from_secs(5))
+            .expect("provider work did not start");
+        let address = block as *mut AsyncBlock as usize;
+        let (sent, canceled) = sync_channel(1);
+        let canceler = std::thread::spawn(move || {
+            XAsyncCancel(address as *mut AsyncBlock);
+            let _ = sent.send(());
+        });
+        canceled
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation waited for provider work to return");
+        let cleanups_during_work = context.cleanups.load(Ordering::SeqCst);
+        resume.send(()).unwrap();
+        assert!(worker.join().unwrap());
+        canceler.join().unwrap();
+        XTaskQueueCloseHandle(q);
+        assert!(!context.timed_out.load(Ordering::SeqCst));
+        assert_eq!(cleanups_during_work, 0, "cleanup overtook admitted work");
+        assert!(!context.overlapped.load(Ordering::SeqCst));
+        assert_eq!(context.cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(XAsyncGetStatus(block, false), E_ABORT);
     }
 
     #[test]
