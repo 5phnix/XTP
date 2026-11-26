@@ -798,7 +798,13 @@ impl Section {
                 return false;
             }
             for p in from..page {
-                self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::Release);
+                let fresh = mark_committed(&self.committed[p / 64], 1 << (p % 64));
+                #[cfg(feature = "diagnostics")]
+                if fresh && !on_wine() && ledger::early() {
+                    ledger::SECTION_COMMITTED.fetch_add(PAGE as u64, Ordering::Relaxed);
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = fresh;
             }
             uma::committed(self.at(from) as usize, (page - from) * PAGE);
         }
@@ -826,9 +832,23 @@ impl Drop for Section {
         });
         // SAFETY: as above.
         unsafe { CloseHandle(self.handle) };
+        #[cfg(feature = "diagnostics")]
+        if !on_wine() && ledger::early() {
+            let bytes = self
+                .committed
+                .iter()
+                .map(|word| u64::from(word.load(Ordering::Relaxed).count_ones()) * PAGE as u64)
+                .sum::<u64>();
+            ledger::SECTION_DROPPED.fetch_add(bytes, Ordering::Relaxed);
+        }
         change.done(true);
         UNMAPS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+// A section page can be committed concurrently through several title views.
+fn mark_committed(word: &AtomicU64, mask: u64) -> bool {
+    word.fetch_or(mask, Ordering::Release) & mask == 0
 }
 
 /// Maps a view of all of a section, read-write, at 2^40 or above if it can:
@@ -1635,7 +1655,19 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 /// hooks. Without the variable nothing is counted.
 pub(crate) mod ledger {
     use std::collections::{BTreeMap, HashMap};
+    #[cfg(feature = "diagnostics")]
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{LazyLock, Mutex};
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) static SECTION_COMMITTED: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "diagnostics")]
+    pub(super) static SECTION_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn early() -> bool {
+        *ON
+    }
 
     /// Set (e.g. `XTP_XMEM_LEDGER=1`) to keep the ledger.
     pub const ENV: &str = "XTP_XMEM_LEDGER";
@@ -1810,7 +1842,7 @@ pub(crate) mod ledger {
         }
     }
 
-    /// Every 10 s, the kinds that changed.
+    /// Changed kinds every 10 s, or 1 s with explicitly enabled diagnostics.
     fn start_logging() {
         let spawned = std::thread::Builder::new()
             .name("xtp-xmem-ledger".into())
@@ -1818,7 +1850,22 @@ pub(crate) mod ledger {
                 let mut before = BTreeMap::new();
                 let mut budget = (0, 0, 0);
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        if cfg!(feature = "diagnostics") { 1 } else { 10 },
+                    ));
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let committed = SECTION_COMMITTED.load(Ordering::Relaxed);
+                        let dropped = SECTION_DROPPED.load(Ordering::Relaxed);
+                        tracing::info!(
+                            section_committed_bytes = committed,
+                            section_dropped_bytes = dropped,
+                            section_live_bytes = committed.saturating_sub(dropped),
+                            wine = super::on_wine(),
+                            "xmem early: successful unique section pages (Wine excluded)"
+                        );
+                        xtp_gpu::resource::log_early_memory();
+                    }
                     let ledger = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
                     let lines = ledger.changes(&before);
                     let (calls, limit, used) = ledger.budget;
@@ -1885,6 +1932,16 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_bitmap_counts_each_page_once() {
+        let word = AtomicU64::new(0);
+        assert!(mark_committed(&word, 1));
+        assert!(!mark_committed(&word, 1));
+        assert!(mark_committed(&word, 1 << 63));
+        assert!(!mark_committed(&word, 1 << 63));
+        assert_eq!(word.load(Ordering::Acquire).count_ones(), 2);
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.

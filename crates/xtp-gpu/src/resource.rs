@@ -855,6 +855,94 @@ struct Resource {
     twin: std::sync::OnceLock<Option<Arc<Twin>>>,
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod early {
+    use super::{HostTexture, TextureOrigin};
+    use std::sync::{LazyLock, Mutex, atomic::Ordering::Relaxed};
+
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("XTP_XMEM_LEDGER").is_some());
+    static BYTES: Mutex<[u64; 5]> = Mutex::new([0; 5]);
+
+    fn ownership(owners: u64) -> [bool; 3] {
+        let title = owners as u32 != 0;
+        let list = owners >> 32 != 0;
+        [title, list, list && !title]
+    }
+
+    pub(super) fn texture(copy: &HostTexture, created: bool) {
+        if *ON && matches!(copy.origin, TextureOrigin::Address) {
+            BYTES.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!created)] += copy.bytes;
+        }
+    }
+
+    pub(crate) fn owner(copy: &HostTexture, title: bool, added: bool) {
+        if !*ON || !matches!(copy.origin, TextureOrigin::Address) {
+            return;
+        }
+        let mut bytes = BYTES.lock().unwrap_or_else(|e| e.into_inner());
+        // Separate title and list counts without retaining another host-copy reference.
+        let unit = if title { 1 } else { 1 << 32 };
+        let before = if added {
+            copy.owners.fetch_add(unit, Relaxed)
+        } else {
+            copy.owners.fetch_sub(unit, Relaxed)
+        };
+        let after = if added {
+            before.wrapping_add(unit)
+        } else {
+            before.wrapping_sub(unit)
+        };
+        for (i, (old, new)) in ownership(before)
+            .into_iter()
+            .zip(ownership(after))
+            .enumerate()
+        {
+            if old != new {
+                if new {
+                    bytes[i + 2] += copy.bytes;
+                } else {
+                    bytes[i + 2] -= copy.bytes;
+                }
+            }
+        }
+    }
+
+    pub(super) fn log() {
+        let [created, dropped, title, list, list_only] =
+            *BYTES.lock().unwrap_or_else(|e| e.into_inner());
+        tracing::info!(
+            address_created_bytes = created,
+            address_dropped_bytes = dropped,
+            address_live_bytes = created.saturating_sub(dropped),
+            address_title_owned_bytes = title,
+            address_list_owned_bytes = list,
+            address_list_only_bytes = list_only,
+            "xmem early: Address host ownership"
+        );
+    }
+
+    #[test]
+    fn address_ownership_distinguishes_list_only() {
+        assert_eq!(ownership(0), [false, false, false]);
+        assert_eq!(ownership(2), [true, false, false]);
+        assert_eq!(ownership((2 << 32) | 1), [true, true, false]);
+        assert_eq!(ownership(2 << 32), [false, true, true]);
+    }
+}
+
+/// An independent snapshot for the explicitly enabled diagnostic XMem ledger.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn log_early_memory() {
+    if std::env::var_os("XTP_XMEM_LEDGER").is_none() {
+        return;
+    }
+    early::log();
+    if let Some(line) = format::report() {
+        tracing::info!("xmem early: {line}");
+    }
+    log_placed_views();
+}
+
 /// A title texture's host copy and the state it is in. The title's barriers
 /// name console states (looser than the host's), so we transition from this
 /// one. Lists that use the texture hold it until they are reset: the title
@@ -877,6 +965,8 @@ pub(crate) struct HostTexture {
     /// Which title creation path allocated this copy. Shared views do not
     /// allocate another copy.
     origin: TextureOrigin,
+    #[cfg(feature = "diagnostics")]
+    owners: std::sync::atomic::AtomicU64,
     /// Whether its memory is resident yet (its own, or its pool heap's):
     /// until then nothing hands it to the GPU ([`HostTexture::ready`]).
     residency: Arc<residency::Residency>,
@@ -898,6 +988,8 @@ impl HostTexture {
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        early::texture(self, false);
         format::note_texture(
             false,
             self.bytes,
@@ -1213,7 +1305,7 @@ fn host_texture(
     });
     format::note_texture(true, bytes, extra, slot.is_some(), origin);
     let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-    Some(HostTexture {
+    let copy = HostTexture {
         texture,
         state: state.into(),
         #[cfg(test)]
@@ -1225,9 +1317,14 @@ fn host_texture(
         bytes,
         extra,
         origin,
+        #[cfg(feature = "diagnostics")]
+        owners: Default::default(),
         residency,
         slot,
-    })
+    };
+    #[cfg(feature = "diagnostics")]
+    early::texture(&copy, true);
+    Some(copy)
 }
 
 /// Whether the host texture `d` of the title's `desc` goes to the pool: a
@@ -1622,6 +1719,10 @@ fn hand_out_resource(
             }
         }
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(copy) = &resource.host {
+        early::owner(copy, true, true);
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
@@ -1642,6 +1743,10 @@ pub(crate) fn is_resource(this: This) -> bool {
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if let Some(copy) = &self.host {
+            early::owner(copy, true, false);
+        }
         #[cfg(feature = "diagnostics")]
         if self
             .host
@@ -3103,6 +3208,8 @@ fn own_texture(
         bytes: 0,
         extra: 0,
         origin,
+        #[cfg(feature = "diagnostics")]
+        owners: Default::default(),
         residency: Arc::new(residency::Residency::resident()),
         slot: None,
     }

@@ -966,6 +966,8 @@ impl Drop for HostList {
     /// and a submission in flight still names it.
     fn drop(&mut self) {
         self.settle();
+        #[cfg(feature = "diagnostics")]
+        release_texture_owners(self.states.get_mut().unwrap_or_else(|e| e.into_inner()));
     }
 }
 
@@ -1000,6 +1002,13 @@ type Note = (String, Option<(u64, u64)>);
 
 type States =
     std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+
+#[cfg(feature = "diagnostics")]
+fn release_texture_owners(states: &States) {
+    for (_, _, copy) in states.values() {
+        crate::resource::early::owner(copy, false, false);
+    }
+}
 
 /// Whether device-removed data is on (`XTP_D3D12_DRED`, diagnostics
 /// builds).
@@ -1094,6 +1103,8 @@ impl Retired {
         let mut spare = pool(&SPARE_SCRATCH);
         let room = SPARES.saturating_sub(spare.len());
         spare.extend(self.scratch.chunks.into_iter().take(room));
+        #[cfg(feature = "diagnostics")]
+        release_texture_owners(&self.states);
         drop((self.deferred, self.states, self.budget));
     }
 }
@@ -2550,10 +2561,11 @@ impl HostList {
                     .store(self.last.load(Ordering::Acquire), Ordering::Release);
             } else {
                 *self.deferred() = Deferred::default();
-                self.states
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
+                let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                release_texture_owners(&states);
+                states.clear();
+                drop(states);
                 let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
                 (scratch.current, scratch.used) = (0, 0);
                 // SAFETY: nothing running uses the allocator.
@@ -2600,6 +2612,8 @@ impl HostList {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
+                #[cfg(feature = "diagnostics")]
+                crate::resource::early::owner(&copy, false, true);
                 v.insert((wanted, wanted, copy));
                 None
             }

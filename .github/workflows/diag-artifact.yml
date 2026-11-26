@@ -26,6 +26,18 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Lint affected crates
+        run: cargo clippy -p xtp-hle -p xtp-gpu --all-targets --locked -- -D warnings
+      - name: Lint diagnostic code
+        run: cargo clippy -p xtp-hle -p xtp-gpu --all-targets --features diagnostics --locked -- -D warnings
+      - name: Test unique committed-page counting
+        run: cargo test -p xtp-hle --lib --locked modules::xmem::tests::committed_bitmap_counts_each_page_once -- --exact
+      - name: Test diagnostic committed-page counting
+        run: cargo test -p xtp-hle --lib --features diagnostics --locked modules::xmem::tests::committed_bitmap_counts_each_page_once -- --exact
+      - name: Test diagnostic ownership accounting
+        run: cargo test -p xtp-gpu --lib --features diagnostics --locked resource::early::address_ownership_distinguishes_list_only -- --exact
       - name: Build diagnostic executable
         run: cargo build -p xtp --profile diag --features diagnostics --locked
       - name: Record executable provenance
@@ -60,6 +72,11 @@ jobs:
             profile = 'diag'
             features = @('diagnostics')
             command = 'cargo build -p xtp --profile diag --features diagnostics --locked'
+            tests = @(
+              [ordered]@{ name = 'modules::xmem::tests::committed_bitmap_counts_each_page_once'; crate = 'xtp-hle'; features = @(); conclusion = 'success' }
+              [ordered]@{ name = 'modules::xmem::tests::committed_bitmap_counts_each_page_once'; crate = 'xtp-hle'; features = @('diagnostics'); conclusion = 'success' }
+              [ordered]@{ name = 'resource::early::address_ownership_distinguishes_list_only'; crate = 'xtp-gpu'; features = @('diagnostics'); conclusion = 'success' }
+            )
             file = 'xtp.exe'
             size_bytes = $exe.Length
             sha256 = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash
