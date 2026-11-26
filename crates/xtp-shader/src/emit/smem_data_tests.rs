@@ -674,3 +674,231 @@ fn a_mask_joined_with_a_number_exports_the_arms_number() {
         }
     }
 }
+
+fn reused_mask_bit_test(guarded: bool) -> Vec<u32> {
+    let mut words = vec![
+        0x7E12_02FF,
+        1.0f32.to_bits(), // v_mov_b32 v9, 1.0
+        0x7E02_0280,      // v_mov_b32 v1, 0
+        0xBF07_8000,      // s_cmp_lg_u32 s0, 0
+        0x8502_807E,      // s_cselect_b32 s2, exec_lo, 0
+        0x8A6A_027E,      // s_andn2_b32 vcc_lo, exec_lo, s2
+        0xBF87_0002,      // s_cbranch_vccnz -> join
+        0x8102_8001,      // s_add_i32 s2, s1, 0
+        0x7E02_02C1,      // v_mov_b32 v1, -1
+    ];
+    if guarded {
+        words.extend([
+            0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+            0x8A6A_6A7E, // s_andn2_b32 vcc_lo, exec_lo, vcc_lo
+            0xBF87_0008, // s_cbranch_vccnz -> end
+        ]);
+    }
+    words.extend([
+        0x7E12_02FF,
+        2.0f32.to_bits(), // v_mov_b32 v9, 2.0
+        0x8703_FF02,
+        0x0010_0000, // s_and_b32 s3, s2, 0x00100000
+        0xBF06_8003, // s_cmp_eq_u32 s3, 0
+        0xBF85_0002, // s_cbranch_scc1 -> end
+        0x7E12_02FF,
+        4.0f32.to_bits(), // v_mov_b32 v9, 4.0
+    ]);
+    words
+}
+
+fn pixel_program_two_constants(words: &[u32]) -> NativeProgram {
+    let mut code = words.to_vec();
+    code.extend([0xF800_180F, 0x0909_0909, S_ENDPGM]); // exp mrt0, v9, v9, v9, v9 done vm; s_endpgm
+    NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        float_mode: 0xc0,
+        vgprs: 16,
+        layout: vec![RootParam {
+            sgprs: 2,
+            ..constant()
+        }],
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 0,
+            rsrc2: 2 << 1,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+fn fullscreen_vs() -> HostShader {
+    use super::bitcode::{Attr, Term};
+    let mut s = super::shader::Shader::new(false);
+    let b = s.entry;
+    let undef = s.m.undef(s.t.i32);
+    for col in 0..4u8 {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), undef];
+        let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+        let out = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
+        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &out);
+    }
+    let elem = |name: &str, kind, interp| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    };
+    s.inputs.push(elem("POSITION", 0, 0));
+    s.outputs.push(elem("SV_Position", 3, 4));
+    s.m.terminate(b, Term::Ret);
+    HostShader {
+        stage: HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        group_base: None,
+        stride_table: false,
+        run_time_buffers: 0,
+    }
+}
+
+#[test]
+fn a_reused_mask_sgpr_bit_test_translates_and_draws_in_pixel_programs() {
+    let words = reused_mask_bit_test(true);
+    let native = pixel_program_two_constants(&words);
+    let decoded = crate::gfx10::decode(&native.code).unwrap();
+    let names: Vec<_> = decoded.iter().filter_map(|i| i.name()).collect();
+    assert_eq!(
+        names,
+        [
+            "v_mov_b32",
+            "v_mov_b32",
+            "s_cmp_lg_u32",
+            "s_cselect_b32",
+            "s_andn2_b32",
+            "s_cbranch_vccnz",
+            "s_add_i32",
+            "v_mov_b32",
+            "v_cmp_eq_u32",
+            "s_andn2_b32",
+            "s_cbranch_vccnz",
+            "v_mov_b32",
+            "s_and_b32",
+            "s_cmp_eq_u32",
+            "s_cbranch_scc1",
+            "v_mov_b32",
+            "exp",
+            "s_endpgm",
+        ]
+    );
+    let ps_sig = signatures(&[
+        (crate::FourCC::ISG1, super::container::signature(&[], true)),
+        (
+            crate::FourCC::OSG1,
+            super::container::signature(&[element("SV_Target", 16, 0, 15)], false),
+        ),
+    ]);
+    let container = crate::Container::parse(&ps_sig).unwrap();
+    let target32 = Target {
+        lanes_min: 32,
+        lanes_max: 32,
+        stride_table: false,
+    };
+    for target in [Target::ANY, target32] {
+        translate(&container, &native, target).unwrap();
+    }
+    let vs = fullscreen_vs();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, host) in Host::test_hosts() {
+        let ps = translate(&container, &native, host.target())
+            .unwrap_or_else(|w| panic!("{label}: pixel program refused: {w}"));
+        let (root, pso) = host
+            .pipeline(&vs, &ps)
+            .unwrap_or_else(|e| panic!("{label}: graphics pipeline failed: {e}"));
+        let cases = [
+            (0u32, 0x0010_0000u32, 1.0f32),
+            (1, 0x0000_0000, 2.0),
+            (1, 0x0010_0000, 4.0),
+            (1, 0x000F_FFFF, 2.0),
+        ];
+        for (s0, s1, want) in cases {
+            let mut ud = vec![0u32; ps.user_data_dwords().max(1) as usize];
+            for u in &ps.user_data {
+                ud[u.index as usize] = match (u.root, u.dword) {
+                    (RootType::Constants, 0) => s0,
+                    (RootType::Constants, 1) => s1,
+                    other => panic!("{label}: unexpected user data {other:?}"),
+                };
+            }
+            let pixels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![(0, Root::Constants(vec![0])), (1, Root::Constants(ud))],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &[
+                            -1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
+                        ],
+                        stride: 16,
+                        size: (2, 2),
+                        mesh_groups: 0,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: draw failed for ({s0}, {s1:#x}): {e}"));
+            assert_eq!(pixels, vec![[want; 4]; 4], "{label} ({s0}, {s1:#x})");
+        }
+    }
+}
+
+#[test]
+fn an_unguarded_reused_mask_sgpr_bit_test_stops() {
+    let ps_sig = signatures(&[
+        (crate::FourCC::ISG1, super::container::signature(&[], true)),
+        (
+            crate::FourCC::OSG1,
+            super::container::signature(&[element("SV_Target", 16, 0, 15)], false),
+        ),
+    ]);
+    let container = crate::Container::parse(&ps_sig).unwrap();
+    let unguarded_ps = pixel_program_two_constants(&reused_mask_bit_test(false));
+    assert_eq!(
+        translate(&container, &unguarded_ps, Target::ANY).map(|_| ()),
+        Err(MASK_AS_DATA)
+    );
+    let mut cs_words = reused_mask_bit_test(true);
+    cs_words.push(S_ENDPGM);
+    let guarded_cs = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        float_mode: 0xc0,
+        vgprs: 16,
+        layout: vec![RootParam {
+            sgprs: 2,
+            ..constant()
+        }],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: cs_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    assert_eq!(
+        translate(&empty(), &guarded_cs, Target::ANY).map(|_| ()),
+        Err(MASK_AS_DATA)
+    );
+}
