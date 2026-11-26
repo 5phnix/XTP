@@ -8,17 +8,17 @@ use anyhow::Result;
 use xtp_hle::{HleResolver, HostPolicy};
 use xtp_loader::census::{Class, Counts};
 use xtp_loader::{Census, StubDb};
-use xtp_pe::ImageInfo;
+use xtp_pe::{ImageInfo, ImportSymbol};
 
 use crate::survey::quote;
 
 #[derive(Default)]
 struct DllStats {
-    functions: BTreeMap<String, Class>,
+    functions: BTreeMap<ImportSymbol, Class>,
     images: BTreeSet<PathBuf>,
 }
 
-type ImportList = BTreeMap<(String, String), BTreeSet<PathBuf>>;
+type ImportList = BTreeMap<(String, ImportSymbol), BTreeSet<PathBuf>>;
 
 #[derive(Default)]
 struct Report {
@@ -27,6 +27,7 @@ struct Report {
     dlls: BTreeMap<String, DllStats>,
     missing: ImportList,
     stubbed: ImportList,
+    unverified: ImportList,
 }
 
 impl Report {
@@ -52,6 +53,7 @@ impl Report {
             let list = match import.class {
                 Class::Missing => Some(&mut self.missing),
                 Class::Stubbed(_) => Some(&mut self.stubbed),
+                Class::Unverified => Some(&mut self.unverified),
                 _ => None,
             };
             if let Some(list) = list {
@@ -70,8 +72,9 @@ fn binding_order(class: Class) -> u8 {
         Class::Hle => 0,
         Class::Host => 1,
         Class::Title => 2,
-        Class::Stubbed(_) => 3,
-        Class::Missing => 4,
+        Class::Unverified => 3,
+        Class::Stubbed(_) => 4,
+        Class::Missing => 5,
     }
 }
 
@@ -82,6 +85,7 @@ fn counts<'a>(classes: impl Iterator<Item = &'a Class>) -> Counts {
             Class::Hle => counts.hle += 1,
             Class::Host => counts.host += 1,
             Class::Title => counts.title += 1,
+            Class::Unverified => counts.unverified += 1,
             Class::Stubbed(_) => counts.stubbed += 1,
             Class::Missing => counts.missing += 1,
         }
@@ -150,8 +154,8 @@ fn to_text(report: &Report, list_missing: bool) -> String {
     }
     let _ = writeln!(
         out,
-        "\n{:<56} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7}",
-        "dll", "funcs", "hle", "host", "title", "stubbed", "missing", "images"
+        "\n{:<56} {:>6} {:>6} {:>6} {:>6} {:>10} {:>8} {:>8} {:>7}",
+        "dll", "funcs", "hle", "host", "title", "unverified", "stubbed", "missing", "images"
     );
     for (dll, stats) in &report.dlls {
         text_counts(&mut out, dll, counts(stats.functions.values()));
@@ -167,7 +171,11 @@ fn to_text(report: &Report, list_missing: bool) -> String {
     out.push('\n');
 
     if list_missing {
-        for (label, list) in [("missing", &report.missing), ("stubbed", &report.stubbed)] {
+        for (label, list) in [
+            ("missing", &report.missing),
+            ("stubbed", &report.stubbed),
+            ("unverified", &report.unverified),
+        ] {
             let _ = writeln!(out, "\n{label} (by number of images using it)");
             for ((dll, sym), users) in sorted_rows(list) {
                 let _ = writeln!(out, "  {:>4}  {dll}!{sym}", users.len());
@@ -180,23 +188,30 @@ fn to_text(report: &Report, list_missing: bool) -> String {
 fn text_counts(out: &mut String, dll: &str, c: Counts) {
     let _ = write!(
         out,
-        "{dll:<56} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8}",
+        "{dll:<56} {:>6} {:>6} {:>6} {:>6} {:>10} {:>8} {:>8}",
         c.total(),
         c.hle,
         c.host,
         c.title,
+        c.unverified,
         c.stubbed,
         c.missing
     );
 }
 
-fn sorted_rows(list: &ImportList) -> Vec<(&(String, String), &BTreeSet<PathBuf>)> {
+fn sorted_rows(list: &ImportList) -> Vec<(&(String, ImportSymbol), &BTreeSet<PathBuf>)> {
     let mut rows: Vec<_> = list.iter().collect();
-    rows.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    rows.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then_with(|| a.0.0.cmp(&b.0.0))
+            .then_with(|| a.0.1.to_string().cmp(&b.0.1.to_string()))
+            .then_with(|| a.0.1.cmp(&b.0.1))
+    });
     rows
 }
 
-/// Stable JSON census report: totals, per-DLL counts, and unresolved pairs.
+/// Stable JSON census report: totals, per-DLL counts, and unresolved or unverified pairs.
 fn to_json(report: &Report) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{{");
@@ -227,18 +242,20 @@ fn to_json(report: &Report) -> String {
         let _ = writeln!(out, "  ],");
     }
     json_list(&mut out, "missing", &report.missing, ",");
-    json_list(&mut out, "stubbed", &report.stubbed, "");
+    json_list(&mut out, "stubbed", &report.stubbed, ",");
+    json_list(&mut out, "unverified", &report.unverified, "");
     let _ = writeln!(out, "}}");
     out
 }
 
 fn json_counts(c: Counts) -> String {
     format!(
-        "\"functions\": {}, \"hle\": {}, \"host\": {}, \"title\": {}, \"stubbed\": {}, \"missing\": {}",
+        "\"functions\": {}, \"hle\": {}, \"host\": {}, \"title\": {}, \"unverified\": {}, \"stubbed\": {}, \"missing\": {}",
         c.total(),
         c.hle,
         c.host,
         c.title,
+        c.unverified,
         c.stubbed,
         c.missing
     )
@@ -256,7 +273,7 @@ fn json_list(out: &mut String, label: &str, list: &ImportList, comma: &str) {
                 out,
                 "    {{\"dll\": {}, \"symbol\": {}, \"images\": {}}}{row_comma}",
                 quote(dll),
-                quote(sym),
+                quote(&sym.to_string()),
                 users.len(),
             );
         }
@@ -356,7 +373,7 @@ mod tests {
 
         let json = to_json(&report);
         assert!(json.contains(
-            r#""functions": 5, "hle": 1, "host": 0, "title": 2, "stubbed": 1, "missing": 1"#
+            r#""functions": 5, "hle": 1, "host": 0, "title": 2, "unverified": 0, "stubbed": 1, "missing": 1"#
         ));
         assert!(json.contains(r#""dll": "engine.dll", "symbol": "Gone", "images": 1"#));
         let text = to_text(&report, true);
@@ -378,13 +395,189 @@ mod tests {
         assert_eq!(engine.images.len(), 2);
         assert_eq!(counts(engine.functions.values()).missing, 2);
         assert_eq!(
-            report.missing[&("engine.dll".into(), "Gone".into())].len(),
+            report.missing[&("engine.dll".into(), name("Gone"))].len(),
             2
         );
         assert_eq!(
-            report.missing[&("engine.dll".into(), "Start".into())].len(),
+            report.missing[&("engine.dll".into(), name("Start"))].len(),
             1
         );
+    }
+
+    #[test]
+    fn title_forwarders_are_listed_as_unverified_even_in_strict_mode() {
+        let names = ["Present", "Absent", "Cycle"];
+        let exe = image(false, vec![imports("engine.dll", names.map(name))], &[]);
+        let mut engine = image(true, vec![], &names);
+        for (export, forward) in
+            engine
+                .exports
+                .iter_mut()
+                .zip(["target.Start", "absent.Start", "engine.Cycle"])
+        {
+            export.rva = None;
+            export.forward = Some(forward.into());
+        }
+        let images = [
+            ("sample.exe".into(), exe),
+            ("engine.dll".into(), engine),
+            ("target.dll".into(), image(true, vec![], &["Start"])),
+        ];
+        for host in [HostPolicy::default(), HostPolicy::none()] {
+            let resolver = HleResolver::new(host);
+            let wanted = |dll: &str| crate::run::title_dll(&resolver.host, dll);
+            let mut report = Report::default();
+            report.add(
+                Path::new("synthetic"),
+                Census::of_images(&images, &resolver, &wanted, StubDb::builtin()),
+            );
+
+            let c = counts(report.dlls["engine.dll"].functions.values());
+            assert_eq!(
+                c,
+                Counts {
+                    unverified: 3,
+                    ..Counts::default()
+                }
+            );
+            assert_eq!((c.total(), c.resolved()), (3, 0));
+            assert!(report.missing.is_empty());
+            assert!(report.stubbed.is_empty());
+            assert_eq!(report.unverified.len(), 3);
+            let text = to_text(&report, true);
+            let (_, unverified) = text.split_once("\nunverified (").unwrap();
+            for alias in names {
+                assert!(unverified.contains(&format!("engine.dll!{alias}")));
+                assert_eq!(
+                    report.unverified[&("engine.dll".into(), name(alias))].len(),
+                    1
+                );
+            }
+            let json = to_json(&report);
+            assert!(json.contains(r#""unverified": 3"#));
+            assert!(json.contains(r#""missing": []"#));
+            assert!(json.contains(r#""stubbed": []"#));
+            assert!(json.contains(r#""unverified": ["#));
+            assert_eq!(json.matches("\"symbol\":").count(), 3);
+        }
+    }
+
+    #[test]
+    fn an_ordinal_is_not_a_literal_hash_name() {
+        let exe = image(
+            false,
+            vec![imports(
+                "engine.dll",
+                [ImportSymbol::Ordinal(1), name("#1")],
+            )],
+            &[],
+        );
+        let mut images = [
+            ("sample.exe".into(), exe),
+            ("engine.dll".into(), image(true, vec![], &["Start"])),
+        ];
+        let resolver = HleResolver::new(HostPolicy::none());
+        let wanted = |dll: &str| crate::run::title_dll(&resolver.host, dll);
+        let census = Census::of_images(&images, &resolver, &wanted, StubDb::builtin());
+        assert_eq!(
+            census
+                .imports
+                .iter()
+                .filter(|i| i.class == Class::Title)
+                .count(),
+            1,
+        );
+        assert_eq!(
+            census
+                .imports
+                .iter()
+                .filter(|i| i.class == Class::Missing)
+                .count(),
+            1,
+        );
+        let mut report = Report::default();
+        report.add(Path::new("synthetic"), census);
+        let c = counts(report.dlls["engine.dll"].functions.values());
+        assert_eq!((c.total(), c.title, c.missing), (2, 1, 1));
+
+        images[1].1.exports[0].rva = None;
+        images[1].1.exports[0].forward = Some("absent.Start".into());
+        let mut report = Report::default();
+        report.add(
+            Path::new("synthetic"),
+            Census::of_images(&images, &resolver, &wanted, StubDb::builtin()),
+        );
+        let c = counts(report.dlls["engine.dll"].functions.values());
+        assert_eq!(
+            (c.total(), c.unverified, c.missing, c.resolved()),
+            (2, 1, 1, 0)
+        );
+        assert_eq!(report.unverified.len(), 1);
+        assert!(
+            report
+                .unverified
+                .contains_key(&("engine.dll".into(), ImportSymbol::Ordinal(1)))
+        );
+        assert_eq!(report.missing.len(), 1);
+        assert!(
+            report
+                .missing
+                .contains_key(&("engine.dll".into(), name("#1")))
+        );
+    }
+
+    #[test]
+    fn lists_keep_symbol_kinds_but_ignore_name_hints() {
+        let exe = image(
+            false,
+            vec![imports(
+                "engine.dll",
+                [
+                    ImportSymbol::Ordinal(1),
+                    name("#1"),
+                    ImportSymbol::Name {
+                        hint: u16::MAX,
+                        name: "#1".into(),
+                    },
+                ],
+            )],
+            &[],
+        );
+        let resolver = HleResolver::new(HostPolicy::none());
+        let census = Census::of_images(
+            &[("sample.exe".into(), exe)],
+            &resolver,
+            &|_| false,
+            StubDb::builtin(),
+        );
+        let mut report = Report::default();
+        report.add(Path::new("synthetic"), census);
+
+        let c = counts(report.dlls["engine.dll"].functions.values());
+        assert_eq!((c.total(), c.missing), (2, 2));
+        assert_eq!(report.missing.len(), 2);
+        assert!(report.missing.values().all(|users| users.len() == 1));
+        let json = to_json(&report);
+        assert_eq!(json.matches("\"symbol\": \"#1\"").count(), 2);
+        assert!(json.contains("\"format\": \"xtp-census 1\""));
+        assert_eq!(to_text(&report, true).matches("engine.dll!#1").count(), 2);
+    }
+
+    #[test]
+    fn typed_symbols_keep_lexical_display_order() {
+        let mut list = ImportList::new();
+        for symbol in [
+            name("Alpha"),
+            ImportSymbol::Ordinal(2),
+            ImportSymbol::Ordinal(10),
+        ] {
+            list.insert(("engine.dll".into(), symbol), BTreeSet::new());
+        }
+        let symbols: Vec<_> = sorted_rows(&list)
+            .into_iter()
+            .map(|((_, symbol), _)| symbol.to_string())
+            .collect();
+        assert_eq!(symbols, ["#10", "#2", "Alpha"]);
     }
 
     #[test]
@@ -409,5 +602,6 @@ mod tests {
         assert!(out.contains(r#""dlls": []"#));
         assert!(out.contains(r#""missing": []"#));
         assert!(out.contains(r#""stubbed": []"#));
+        assert!(out.contains(r#""unverified": []"#));
     }
 }

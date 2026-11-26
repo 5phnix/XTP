@@ -116,6 +116,10 @@ has begun, because terminated threads may still hold allocator or I/O locks.
 without mapping them or running title code. It retries unresolved
 ordinals by name and shows which remaining imports have values in the
 built-in stub table.
+Matching title export forwarders are reported as unverified, regardless
+of apparent target availability: census neither follows nor loads them and
+does not claim native binding parity. They contribute to totals but not
+resolved or missing counts.
 
 ## Shaders
 
