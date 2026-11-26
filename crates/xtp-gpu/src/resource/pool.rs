@@ -97,23 +97,56 @@ const PIECES: usize = 16;
 const HEAP_WAIT: Duration = Duration::from_millis(100);
 const PLACE_WAIT: Duration = Duration::from_millis(10);
 
-/// Whether host textures go to the pool: only with `XTP_TEXTURE_POOL` set
-/// (and not `0`). Off by default: in game (Series X, docs/analysis/vram.md
-/// §3.2) it reached the world without loading faster than committed
-/// textures, with more video memory resident (its reserve).
+/// Whether host textures go to the pool: with `XTP_TEXTURE_POOL` set (and
+/// not `0`), or, when it is not set, on a host with less than
+/// [`LOW_MEMORY_BYTES`] of RAM. On such a host every committed DEFAULT
+/// texture costs its whole size in Windows commit, resident or not
+/// (docs/analysis/vram.md §3.4), and the world pages the whole machine;
+/// pooled reserved textures cost only the tiles title memory fills. Off
+/// elsewhere: in game (Series X, docs/analysis/vram.md §3.2) it reached the
+/// world without loading faster than committed textures, with more video
+/// memory resident (its reserve).
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = asks_pool(std::env::var("XTP_TEXTURE_POOL").ok().as_deref());
+        let value = std::env::var("XTP_TEXTURE_POOL").ok();
+        let on = asks_pool(value.as_deref(), low_memory_host());
         if on {
-            tracing::info!("XTP_TEXTURE_POOL: host textures the title fills go to pooled heaps");
+            let why = if value.is_some() { "XTP_TEXTURE_POOL" } else { "less than 32 GiB of RAM" };
+            tracing::info!(why, "host textures the title fills go to pooled heaps");
         }
         on
     })
 }
 
-fn asks_pool(value: Option<&str>) -> bool {
-    value.is_some_and(|v| !v.is_empty() && v != "0")
+/// Below this much RAM, the pool and its reserved textures are on unless
+/// switched off.
+pub(crate) const LOW_MEMORY_BYTES: u64 = 32 << 30;
+
+/// Whether the machine has less than [`LOW_MEMORY_BYTES`] of RAM. Unit
+/// tests keep the pool's own defaults whatever the machine.
+pub(crate) fn low_memory_host() -> bool {
+    static LOW: OnceLock<bool> = OnceLock::new();
+    *LOW.get_or_init(|| !cfg!(test) && total_ram().is_some_and(|b| b < LOW_MEMORY_BYTES))
+}
+
+fn total_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a sized structure of ours.
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status.ullTotalPhys)
+}
+
+/// `XTP_TEXTURE_POOL`'s value: set and not empty or `0` turns it on, `0`
+/// or empty off; unset follows `low` (a low-memory host).
+fn asks_pool(value: Option<&str>, low: bool) -> bool {
+    match value {
+        None => low,
+        Some(v) => !v.is_empty() && v != "0",
+    }
 }
 
 static POOL: OnceLock<Option<Pool>> = OnceLock::new();
@@ -217,7 +250,10 @@ impl Config {
         let heap = mib("XTP_TEXTURE_HEAP_MIB").unwrap_or(256).clamp(8, 4096) * MIB;
         let reserve = mib("XTP_TEXTURE_RESERVE_MIB").map_or(heap, |v| v * MIB);
         Config {
-            tiles: asks_tiles(std::env::var("XTP_TEXTURE_TILES").ok().as_deref()),
+            tiles: asks_tiles(
+                std::env::var("XTP_TEXTURE_TILES").ok().as_deref(),
+                low_memory_host(),
+            ),
             ..Config::sized(heap, reserve)
         }
     }
@@ -238,13 +274,14 @@ impl Config {
 
 /// Whether `XTP_TEXTURE_TILES`'s value asks for reserved textures: set,
 /// and not empty, `0`, `off` or `false`.
-fn asks_tiles(value: Option<&str>) -> bool {
-    value.map(str::trim).is_some_and(|v| {
-        !(v.is_empty()
-            || v == "0"
-            || v.eq_ignore_ascii_case("off")
-            || v.eq_ignore_ascii_case("false"))
-    })
+fn asks_tiles(value: Option<&str>, low: bool) -> bool {
+    let Some(v) = value.map(str::trim) else {
+        return low;
+    };
+    !(v.is_empty()
+        || v == "0"
+        || v.eq_ignore_ascii_case("off")
+        || v.eq_ignore_ascii_case("false"))
 }
 
 /// Whether D3D12's small resource rule may give the host texture `d` a
@@ -1771,10 +1808,13 @@ pub(crate) mod tests {
 
     #[test]
     fn the_pool_is_asked_for_by_its_variable() {
-        assert!(asks_pool(Some("1")));
-        assert!(!asks_pool(Some("0")));
-        assert!(!asks_pool(Some("")));
-        assert!(!asks_pool(None), "off by default");
+        for low in [false, true] {
+            assert!(asks_pool(Some("1"), low));
+            assert!(!asks_pool(Some("0"), low));
+            assert!(!asks_pool(Some(""), low));
+        }
+        assert!(!asks_pool(None, false), "off by default");
+        assert!(asks_pool(None, true), "on by default below 32 GiB of RAM");
     }
 
     #[test]
@@ -2377,11 +2417,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tiles_are_off_unless_asked() {
-        assert!(!asks_tiles(None), "off by default");
-        assert!(asks_tiles(Some("1")));
-        for off in ["0", "off", "FALSE", " 0 ", ""] {
-            assert!(!asks_tiles(Some(off)), "{off}");
+    fn tiles_are_off_unless_asked_or_low_on_memory() {
+        assert!(!asks_tiles(None, false), "off by default");
+        assert!(asks_tiles(None, true), "on by default below 32 GiB of RAM");
+        for low in [false, true] {
+            assert!(asks_tiles(Some("1"), low));
+            for off in ["0", "off", "FALSE", " 0 ", ""] {
+                assert!(!asks_tiles(Some(off), low), "{off}");
+            }
         }
     }
 
