@@ -1960,6 +1960,16 @@ static NEXT_PLACEMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static UNMAPPED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(windows)]
 static INVALIDATED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static ENQUEUED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static REAP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static DRAINED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static RELEASE_ZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static RELEASE_NONZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Resources of placed views no longer in [`PLACED_TEXTURES`], with when
 /// they left it: released [`GRACE`] later, as a caller of `texture_at` may
@@ -1978,29 +1988,53 @@ const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 fn release_later(resources: Vec<usize>) {
     let mut waiting = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
+    ENQUEUED_VIEWS.fetch_add(resources.len() as u64, std::sync::atomic::Ordering::Relaxed);
     waiting.extend(resources.into_iter().map(|r| (now, r)));
     drop(waiting);
     release_waiting(now, GRACE);
 }
 
+#[cfg(any(windows, test))]
+fn retirement_status(
+    waiting: &std::collections::VecDeque<(std::time::Instant, usize)>,
+    now: std::time::Instant,
+    grace: std::time::Duration,
+) -> (std::time::Duration, usize) {
+    let oldest = waiting
+        .front()
+        .map(|(at, _)| now.saturating_duration_since(*at))
+        .unwrap_or_default();
+    let overdue = waiting
+        .iter()
+        .take_while(|(at, _)| now.saturating_duration_since(*at) >= grace)
+        .count();
+    (oldest, overdue)
+}
+
 /// Releases the resources that have waited `grace` or more.
 #[cfg(windows)]
 fn release_waiting(now: std::time::Instant, grace: std::time::Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
     let mut waiting = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
-    let due = waiting
-        .iter()
-        .take_while(|(at, _)| now - *at >= grace)
-        .count();
+    let (_, due) = retirement_status(&waiting, now, grace);
     let due: Vec<usize> = waiting.drain(..due).map(|(_, r)| r).collect();
+    let drained = due.len() as u64;
+    DRAINED_VIEWS.fetch_add(drained, Relaxed);
     drop(waiting);
+    let mut zero = 0;
     for r in due {
-        resource_release(r as This);
+        if resource_release(r as This) == 0 {
+            zero += 1;
+        }
     }
+    RELEASE_ZERO.fetch_add(zero, Relaxed);
+    RELEASE_NONZERO.fetch_add(drained - zero, Relaxed);
 }
 
 /// Give back expired placed views even if streaming stops remapping memory.
 #[cfg(windows)]
 pub(crate) fn reap_placed_views() {
+    REAP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     release_waiting(std::time::Instant::now(), GRACE);
 }
 
@@ -2008,11 +2042,23 @@ pub(crate) fn reap_placed_views() {
 pub(crate) fn log_placed_views() {
     use std::sync::atomic::Ordering::Relaxed;
     let cached = placed_textures().len();
-    let retiring = RELEASED.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let (retiring, oldest, overdue) = {
+        let waiting = RELEASED.lock().unwrap_or_else(|e| e.into_inner());
+        let (oldest, overdue) = retirement_status(&waiting, std::time::Instant::now(), GRACE);
+        (waiting.len(), oldest, overdue)
+    };
     let (same_address, shared) = alias::counts();
     tracing::info!(
         cached,
         retiring,
+        oldest_ms = oldest.as_millis() as u64,
+        overdue,
+        enqueued = ENQUEUED_VIEWS.load(Relaxed),
+        reaper_calls = REAP_CALLS.load(Relaxed),
+        drained = DRAINED_VIEWS.load(Relaxed),
+        // Release outcomes can lag drained while another thread releases its batch.
+        release_zero = RELEASE_ZERO.load(Relaxed),
+        release_nonzero = RELEASE_NONZERO.load(Relaxed),
         unmapped = UNMAPPED_VIEWS.load(Relaxed),
         invalidated = INVALIDATED_VIEWS.load(Relaxed),
         same_address,
@@ -3674,6 +3720,44 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn retirement_status_distinguishes_young_due_and_empty_queues() {
+        use std::collections::VecDeque;
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let grace = Duration::from_secs(2);
+        let mut waiting = VecDeque::new();
+        assert_eq!(
+            retirement_status(&waiting, start, grace),
+            (Duration::ZERO, 0)
+        );
+        waiting.push_back((start, 1));
+        assert_eq!(
+            retirement_status(&waiting, start + grace - Duration::from_nanos(1), grace),
+            (grace - Duration::from_nanos(1), 0)
+        );
+        waiting.push_back((start + Duration::from_secs(1), 2));
+        assert_eq!(
+            retirement_status(&waiting, start + grace, grace),
+            (grace, 1)
+        );
+        assert_eq!(
+            retirement_status(&waiting, start + Duration::from_secs(3), grace),
+            (Duration::from_secs(3), 2)
+        );
+        waiting.pop_front();
+        assert_eq!(
+            retirement_status(&waiting, start + grace, grace),
+            (Duration::from_secs(1), 0)
+        );
+        waiting.pop_front();
+        assert_eq!(
+            retirement_status(&waiting, start + grace, grace),
+            (Duration::ZERO, 0)
+        );
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
