@@ -7,19 +7,20 @@
 //! ships, then the same again by name for an ordinal import the stub table
 //! names; what is left is *stubbed* if the stub table gives it a value
 //! (it keeps going under `UnimplementedPolicy::Table`) and *missing*
-//! otherwise (it traps).
+//! otherwise (it traps). A matching title export that forwards elsewhere
+//! is *unverified*: its target is not checked or loaded by this census.
 //!
-//! [`Census::expectation`] writes the stubbed and missing lists as text
+//! [`Census::expectation`] writes the stubbed, missing and unverified lists as text
 //! (public API names and counts only, never anything else from the
 //! images), and [`Census::compare`] checks a later census against it, so
-//! coverage can only grow unnoticed, never shrink.
+//! known coverage losses are reported without treating uncertainty as coverage.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use xtp_pe::{ImageInfo, ImportSymbol};
+use xtp_pe::{ExportInfo, ImageInfo, ImportSymbol};
 
 use crate::{ImportResolver, Provenance, Resolution, StubDb};
 
@@ -28,8 +29,10 @@ use crate::{ImportResolver, Provenance, Resolution, StubDb};
 pub enum Class {
     Hle,
     Host,
-    /// An export of a DLL the title ships.
+    /// A direct, nonzero-RVA export of a DLL the title ships.
     Title,
+    /// A title export forwarder whose native binding has not been verified.
+    Unverified,
     /// Unresolved; the stub table gives it this value.
     Stubbed(u64),
     /// Unresolved and not in the stub table: it traps.
@@ -42,6 +45,7 @@ impl Class {
             Class::Hle => "hle",
             Class::Host => "host",
             Class::Title => "title",
+            Class::Unverified => "unverified",
             Class::Stubbed(_) => "stubbed",
             Class::Missing => "missing",
         }
@@ -55,15 +59,22 @@ pub struct Import {
     pub image: String,
     /// The DLL as the image names it.
     pub dll: String,
-    /// The function, or `#n` for an ordinal import.
-    pub symbol: String,
+    /// The function or ordinal, with name hints normalized to zero.
+    pub symbol: ImportSymbol,
     pub class: Class,
 }
 
 impl Import {
-    /// `dll!symbol`, the DLL in lower case: the key the lists use.
+    /// `dll!symbol` key, with the DLL in lower case.
+    /// Quote names starting with `#` or `"` to preserve symbol identity.
     pub fn key(&self) -> String {
-        format!("{}!{}", self.dll.to_ascii_lowercase(), self.symbol)
+        let symbol = match &self.symbol {
+            ImportSymbol::Name { name, .. } if name.starts_with('#') || name.starts_with('"') => {
+                format!("{name:?}")
+            }
+            _ => self.symbol.to_string(),
+        };
+        format!("{}!{symbol}", self.dll.to_ascii_lowercase())
     }
 }
 
@@ -73,6 +84,7 @@ pub struct Counts {
     pub hle: usize,
     pub host: usize,
     pub title: usize,
+    pub unverified: usize,
     pub stubbed: usize,
     pub missing: usize,
 }
@@ -83,13 +95,14 @@ impl Counts {
             Class::Hle => self.hle += 1,
             Class::Host => self.host += 1,
             Class::Title => self.title += 1,
+            Class::Unverified => self.unverified += 1,
             Class::Stubbed(_) => self.stubbed += 1,
             Class::Missing => self.missing += 1,
         }
     }
 
     pub fn total(&self) -> usize {
-        self.hle + self.host + self.title + self.stubbed + self.missing
+        self.hle + self.host + self.title + self.unverified + self.stubbed + self.missing
     }
 
     pub fn resolved(&self) -> usize {
@@ -125,8 +138,8 @@ pub struct Drift {
 
 /// An image's exports, to resolve imports of the title DLL it is.
 struct Exports<'a> {
-    by_name: BTreeSet<&'a str>,
-    by_ordinal: BTreeSet<u16>,
+    by_name: BTreeMap<&'a str, &'a ExportInfo>,
+    by_ordinal: BTreeMap<u16, &'a ExportInfo>,
 }
 
 impl<'a> Exports<'a> {
@@ -135,18 +148,42 @@ impl<'a> Exports<'a> {
             by_name: info
                 .exports
                 .iter()
-                .filter_map(|e| e.name.as_deref())
+                .filter_map(|e| e.name.as_deref().map(|name| (name, e)))
                 .collect(),
-            by_ordinal: info.exports.iter().map(|e| e.ordinal).collect(),
+            by_ordinal: info.exports.iter().map(|e| (e.ordinal, e)).collect(),
         }
     }
 
-    fn has(&self, symbol: &ImportSymbol) -> bool {
+    fn get(&self, symbol: &ImportSymbol) -> Option<&'a ExportInfo> {
         match symbol {
-            ImportSymbol::Name { name, .. } => self.by_name.contains(name.as_str()),
-            ImportSymbol::Ordinal(o) => self.by_ordinal.contains(o),
+            ImportSymbol::Name { name, .. } => self.by_name.get(name.as_str()),
+            ImportSymbol::Ordinal(o) => self.by_ordinal.get(o),
+        }
+        .copied()
+    }
+
+    fn class(&self, symbol: &ImportSymbol) -> Option<Class> {
+        let export = self.get(symbol)?;
+        match (&export.forward, export.rva) {
+            (None, Some(rva)) if rva != 0 => Some(Class::Title),
+            (Some(forward), None) if valid_forwarder(forward) => Some(Class::Unverified),
+            _ => None,
         }
     }
+}
+
+/// Checks syntax only; even a target found in this folder may not bind natively.
+fn valid_forwarder(forward: &str) -> bool {
+    let Some((dll, name)) = forward.rsplit_once('.') else {
+        return false;
+    };
+    !dll.is_empty()
+        && !name.is_empty()
+        && !name.contains('\0')
+        && !dll.bytes().any(|b| matches!(b, 0 | b'/' | b'\\' | b':'))
+        && name.strip_prefix('#').is_none_or(|ordinal| {
+            ordinal.bytes().all(|b| b.is_ascii_digit()) && ordinal.parse::<u16>().is_ok()
+        })
 }
 
 impl Census {
@@ -220,8 +257,7 @@ impl Census {
                 Resolution::Missing => dlls
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case(dll))
-                    .is_some_and(|(_, exports)| exports.has(symbol))
-                    .then_some(Class::Title),
+                    .and_then(|(_, exports)| exports.class(symbol)),
             }
         };
         let classify = |dll: &str, symbol: &ImportSymbol| -> Class {
@@ -248,10 +284,14 @@ impl Census {
             census.images.push(image.clone());
             for module in info.imports.iter().chain(&info.delay_imports) {
                 for entry in &module.entries {
+                    let mut symbol = entry.symbol.clone();
+                    if let ImportSymbol::Name { hint, .. } = &mut symbol {
+                        *hint = 0;
+                    }
                     census.imports.push(Import {
                         image: image.clone(),
                         dll: module.dll.clone(),
-                        symbol: entry.symbol.to_string(),
+                        symbol,
                         class: classify(&module.dll, &entry.symbol),
                     });
                 }
@@ -303,19 +343,25 @@ impl Census {
         self.listed("stubbed").into_keys().collect()
     }
 
-    /// For people: counts per image and in all, then every stubbed and
-    /// missing import with the images that use it.
+    /// Distinct `dll!symbol` keys whose title forwarders are unverified.
+    pub fn unverified(&self) -> BTreeSet<String> {
+        self.listed("unverified").into_keys().collect()
+    }
+
+    /// For people: counts per image and in all, then every stubbed, missing
+    /// and unverified import with the images that use it.
     pub fn report(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let row = |out: &mut String, name: &str, c: Counts| {
             let _ = writeln!(
                 out,
-                "{name:<40} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8}",
+                "{name:<40} {:>6} {:>6} {:>6} {:>6} {:>10} {:>8} {:>8}",
                 c.total(),
                 c.hle,
                 c.host,
                 c.title,
+                c.unverified,
                 c.stubbed,
                 c.missing
             );
@@ -335,14 +381,14 @@ impl Census {
         }
         let _ = writeln!(
             out,
-            "{:<40} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8}",
-            "image", "total", "hle", "host", "title", "stubbed", "missing"
+            "{:<40} {:>6} {:>6} {:>6} {:>6} {:>10} {:>8} {:>8}",
+            "image", "total", "hle", "host", "title", "unverified", "stubbed", "missing"
         );
         for image in &self.images {
             row(&mut out, image, self.counts_of(image));
         }
         row(&mut out, "ALL", self.counts());
-        for kind in ["stubbed", "missing"] {
+        for kind in ["stubbed", "missing", "unverified"] {
             let listed = self.listed(kind);
             let _ = writeln!(out, "\n{kind} ({} distinct)", listed.len());
             for (key, (class, users)) in &listed {
@@ -358,7 +404,7 @@ impl Census {
     }
 
     /// The text [`Self::compare`] reads: the build, counts, and every
-    /// stubbed and missing `dll!symbol`, one per line.
+    /// stubbed, missing and unverified `dll!symbol`, one per line.
     pub fn expectation(&self) -> String {
         use std::fmt::Write;
         let c = self.counts();
@@ -373,11 +419,12 @@ impl Census {
         let _ = writeln!(out, "images {}", self.images.len());
         let _ = writeln!(
             out,
-            "imports {} hle {} host {} title {} stubbed {} missing {}",
+            "imports {} hle {} host {} title {} unverified {} stubbed {} missing {}",
             c.total(),
             c.hle,
             c.host,
             c.title,
+            c.unverified,
             c.stubbed,
             c.missing
         );
@@ -387,19 +434,26 @@ impl Census {
         for key in self.missing() {
             let _ = writeln!(out, "missing {key}");
         }
+        for key in self.unverified() {
+            let _ = writeln!(out, "unverified {key}");
+        }
         out
     }
 
     /// Compares this census with an [`Self::expectation`] text.
+    /// Unverified imports on either side are neither regressions nor improvements.
     pub fn compare(&self, expected: &str) -> Drift {
         let mut build = None;
         let mut was_missing = BTreeSet::new();
+        let mut was_unverified = BTreeSet::new();
         for line in expected.lines() {
             let line = line.trim();
             if let Some(b) = line.strip_prefix("build ") {
                 build = Some(b.trim().to_owned());
             } else if let Some(key) = line.strip_prefix("missing ") {
                 was_missing.insert(key.trim().to_owned());
+            } else if let Some(key) = line.strip_prefix("unverified ") {
+                was_unverified.insert(key.trim().to_owned());
             }
         }
         if let (Some(expected), Some(ours)) = (&build, &self.build)
@@ -411,9 +465,18 @@ impl Census {
             };
         }
         let missing = self.missing();
+        let unverified = self.unverified();
         Drift {
-            regressions: missing.difference(&was_missing).cloned().collect(),
-            improvements: was_missing.difference(&missing).cloned().collect(),
+            regressions: missing
+                .difference(&was_missing)
+                .filter(|key| !was_unverified.contains(*key))
+                .cloned()
+                .collect(),
+            improvements: was_missing
+                .difference(&missing)
+                .filter(|key| !unverified.contains(*key))
+                .cloned()
+                .collect(),
             other_build: None,
         }
     }
@@ -600,6 +663,211 @@ mod tests {
         assert_eq!(refused.counts().missing, 1);
         let taken = Census::of_images(&images, &Sample, &|_| true, &stubs);
         assert_eq!(taken.counts().title, 1);
+    }
+
+    #[test]
+    fn forwarders_are_unverified_without_binding_targets() {
+        let forwards = [
+            ("ByName", "target.Target", Class::Unverified),
+            ("ByOrdinal", "target.#7", Class::Unverified),
+            ("ByChain", "engine.ByName", Class::Unverified),
+            ("ByDllName", "TARGET.dll.Target", Class::Unverified),
+            ("ByOrdinalChain", "engine.#1", Class::Unverified),
+            ("ByHost", "kernel32.GetTickCount", Class::Unverified),
+            ("ByHle", "console.Init", Class::Unverified),
+            ("ByStub", "console.Other", Class::Unverified),
+            ("MissingDll", "absent.Target", Class::Unverified),
+            ("MissingName", "target.Absent", Class::Unverified),
+            ("MissingOrdinal", "target.#8", Class::Unverified),
+            ("CycleA", "engine.CycleB", Class::Unverified),
+            ("CycleB", "engine.CycleA", Class::Unverified),
+            ("SelfCycle", "engine.SelfCycle", Class::Unverified),
+            ("BadOrdinal", "target.#65536", Class::Missing),
+            ("SignedOrdinal", "target.#+7", Class::Missing),
+            ("EmptyOrdinal", "target.#", Class::Missing),
+            ("NoSeparator", "target", Class::Missing),
+            ("EmptyDll", ".Target", Class::Missing),
+            ("EmptyName", "target.", Class::Missing),
+            ("DllPath", "folder/target.Target", Class::Missing),
+            ("DllBackslash", "folder\\target.Target", Class::Missing),
+            ("DllDrive", "C:target.Target", Class::Missing),
+            ("NulDll", "target\0.Target", Class::Missing),
+            ("NulName", "target.Target\0", Class::Missing),
+            ("ZeroRva", "target.Zero", Class::Unverified),
+            ("NoAddress", "target.Empty", Class::Unverified),
+        ];
+        let imports: Vec<_> = forwards
+            .iter()
+            .map(|(alias, _, _)| ("engine.dll", name(alias)))
+            .collect();
+        let names: Vec<_> = forwards.iter().map(|(alias, _, _)| *alias).collect();
+        let mut engine = image(true, &[], &names);
+        for (export, (_, forward, _)) in engine.exports.iter_mut().zip(&forwards) {
+            export.rva = None;
+            export.forward = Some((*forward).into());
+        }
+        let mut target = image(true, &[], &["Target", "Zero", "Empty"]);
+        target.exports[0].ordinal = 7;
+        target.exports[1].ordinal = 8;
+        target.exports[1].rva = Some(0);
+        target.exports[2].ordinal = 9;
+        target.exports[2].rva = None;
+        let images = [
+            ("sample.exe".into(), image(false, &imports, &[])),
+            ("engine.dll".into(), engine),
+            ("target.dll".into(), target),
+        ];
+        struct OriginalOnly;
+        impl ImportResolver for OriginalOnly {
+            fn resolve(&self, dll: &str, _: &ImportSymbol) -> Resolution {
+                assert_eq!(dll, "engine.dll", "forwarded targets must not be resolved");
+                Resolution::Missing
+            }
+        }
+        let stubs = StubDb::parse(STUBS).unwrap();
+        let census = Census::of_images(&images, &OriginalOnly, &|_| true, &stubs);
+
+        for (import, (alias, _, expected)) in census.imports.iter().zip(&forwards) {
+            assert_eq!(import.class, *expected, "{alias}");
+        }
+        let counts = census.counts();
+        assert_eq!(
+            (
+                counts.total(),
+                counts.resolved(),
+                counts.unverified,
+                counts.missing
+            ),
+            (27, 0, 16, 11)
+        );
+        assert_eq!(counts.stubbed, 0);
+        assert_eq!(census.unverified().len(), 16);
+        assert!(census.report().contains("unverified (16 distinct)"));
+
+        let refused = Census::of_images(&images, &OriginalOnly, &|dll| dll != "target.dll", &stubs);
+        assert_eq!(refused.counts(), counts);
+    }
+
+    #[test]
+    fn direct_exports_need_a_nonzero_rva_and_no_forwarder() {
+        let mut engine = image(true, &[], &["Direct", "Zero", "Empty", "Both"]);
+        engine.exports[1].rva = Some(0);
+        engine.exports[2].rva = None;
+        engine.exports[3].forward = Some("target.Target".into());
+        let imports =
+            ["Direct", "Zero", "Empty", "Both", "Absent"].map(|alias| ("engine.dll", name(alias)));
+        let images = [
+            ("sample.exe".into(), image(false, &imports, &[])),
+            ("engine.dll".into(), engine),
+        ];
+        let census = Census::of_images(&images, &Sample, &|_| true, &StubDb::default());
+        assert_eq!(
+            census.counts(),
+            Counts {
+                title: 1,
+                missing: 4,
+                ..Counts::default()
+            }
+        );
+        assert_eq!(census.imports[0].class, Class::Title);
+    }
+
+    #[test]
+    fn unverified_expectations_are_neither_losses_nor_improvements() {
+        for (before, after) in [
+            (Class::Missing, Class::Unverified),
+            (Class::Unverified, Class::Missing),
+            (Class::Title, Class::Unverified),
+            (Class::Unverified, Class::Title),
+            (Class::Stubbed(0), Class::Unverified),
+            (Class::Unverified, Class::Stubbed(0)),
+        ] {
+            let mut census = sample();
+            census.imports[0].class = before;
+            let expected = census.expectation();
+            if before == Class::Unverified {
+                assert!(expected.contains("\nunverified console.dll!Init\n"));
+            }
+            census.imports[0].class = after;
+            assert_eq!(
+                census.compare(&expected),
+                Drift::default(),
+                "{before:?} -> {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_lists_keep_ordinals_and_quoted_names_distinct() {
+        for class in [Class::Missing, Class::Stubbed(0), Class::Unverified] {
+            let census = Census {
+                images: vec!["sample.exe".into()],
+                imports: [ImportSymbol::Ordinal(1), name("#1"), name("\"#1\"")]
+                    .into_iter()
+                    .map(|symbol| Import {
+                        image: "sample.exe".into(),
+                        dll: "Engine.dll".into(),
+                        symbol,
+                        class,
+                    })
+                    .collect(),
+                ..Census::default()
+            };
+            let keys = [
+                "engine.dll!#1",
+                "engine.dll!\"#1\"",
+                "engine.dll!\"\\\"#1\\\"\"",
+            ];
+            let listed = census.listed(class.name());
+            assert_eq!(listed.len(), 3, "{class:?}");
+            for key in keys {
+                assert!(listed.contains_key(key), "{class:?}: {key}");
+                assert!(
+                    census
+                        .expectation()
+                        .contains(&format!("\n{} {key}\n", class.name()))
+                );
+            }
+            assert_eq!(census.counts().total(), 3);
+            assert!(
+                census
+                    .report()
+                    .contains(&format!("{} (3 distinct)", class.name()))
+            );
+            assert_eq!(census.compare(&census.expectation()), Drift::default());
+        }
+    }
+
+    #[test]
+    fn an_unverified_ordinal_does_not_mask_a_named_symbols_drift() {
+        let mut census = Census {
+            imports: vec![
+                Import {
+                    image: "sample.exe".into(),
+                    dll: "engine.dll".into(),
+                    symbol: ImportSymbol::Ordinal(1),
+                    class: Class::Unverified,
+                },
+                Import {
+                    image: "sample.exe".into(),
+                    dll: "engine.dll".into(),
+                    symbol: name("#1"),
+                    class: Class::Title,
+                },
+            ],
+            ..Census::default()
+        };
+        let expected = census.expectation();
+        census.imports[1].class = Class::Missing;
+        let drift = census.compare(&expected);
+        assert_eq!(drift.regressions, ["engine.dll!\"#1\""]);
+        assert!(drift.improvements.is_empty());
+
+        let expected = census.expectation();
+        census.imports[1].class = Class::Title;
+        let drift = census.compare(&expected);
+        assert_eq!(drift.improvements, ["engine.dll!\"#1\""]);
+        assert!(drift.regressions.is_empty());
     }
 
     #[test]

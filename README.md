@@ -142,11 +142,35 @@ fields `machine`, `image_base` and `entry_rva`, numeric fields `subsystem` and
 objects (`delay` is a boolean; `resolution` is `"hle"`, `"host"`, `"missing"`,
 with `"title"` reserved because static `inspect` does not map title-shipped
 DLLs, so those report as `"missing"`). `--json` ignores `--imports` and
-`--exports`. `xtp census --json` emits `"format": "xtp-census 1"` with numeric
-`images`, `unreadable`, `totals` (`{functions, hle, host, missing}`), a `dlls`
-array (`{dll, functions, hle, host, missing, images}`), and always includes the
-`missing` array (`{dll, symbol, images}`). The `format` version number
-increments on any breaking schema change.
+`--exports`.
+
+`xtp census` classifies imports as HLE, host, title DLL, unverified,
+table-stubbed, or missing. Each folder is scanned independently, without subfolders. A file
+is scanned as one image with no title DLLs available. With no paths, census
+uses the configured game and test-title folders. When a pair has different
+outcomes across inputs, the totals count it once under the last applicable
+class in that order. `--strict` disables host pass-through.
+
+Matching title export forwarders are **unverified** in either mode: even a
+target present in the folder does not prove Windows binding will succeed.
+Census neither traverses nor loads those targets. Direct nonzero-RVA exports
+remain title DLL imports; malformed or absent exports remain unresolved.
+Unverified imports count toward totals, not resolved or missing coverage;
+`--missing` lists them separately. Shared census expectations record them
+without counting transitions to or from uncertainty as regressions or improvements.
+Shared text keys quote names beginning with `#` or `"` to distinguish them
+from ordinals. Regenerate older expectations containing those ambiguous names.
+
+`xtp census --json` emits `"format": "xtp-census 1"` with numeric `images` and
+`unreadable` fields, a `totals` object
+(`{functions, hle, host, title, unverified, stubbed, missing}`), a `dlls` array
+(`{dll, functions, hle, host, title, unverified, stubbed, missing, images}`), and
+`missing`, `stubbed` and `unverified` arrays (each with `{dll, symbol, images}` rows).
+Each array counts the images in its class. The `format` version number
+increments on any breaking schema change; `unverified` is an additive field
+and list in this unmerged format. Symbols remain strings; ordinal `#1` and
+the literal name `"#1"` can appear as separate rows with the same display
+string, while name hints do not create distinct functions.
 
 The title sees an Xbox Series S unless `--console series-x` or
 `XTP_CONSOLE=series-x` says otherwise: with Series S budgets the world
