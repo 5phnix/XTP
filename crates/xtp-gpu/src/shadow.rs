@@ -105,9 +105,10 @@ pub(crate) struct Shadow {
     /// goes between the two.
     card: Option<Card>,
     /// For the memory line, of a window copy ([`loose`]): the submission
-    /// that last looked it up, and the offsets its lookups reached
-    /// `[low, high)` ([`loose_use`]).
-    looked: [std::sync::atomic::AtomicU64; 3],
+    /// that last looked it up, the offsets its lookups reached `[low,
+    /// high)`, the 64 KiB blocks of its first 4 MiB they touched, a bit
+    /// each, and those refreshes took ([`loose_use`]).
+    looked: [std::sync::atomic::AtomicU64; 5],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside
@@ -224,7 +225,14 @@ struct Snapshots {
 struct Mirror {
     bytes: Box<[u8]>,
     versions: Vec<u64>,
+    /// The 4 KiB pages of `bytes` snapshots wrote, a bit each, and how many
+    /// ([`MIRRORS_WRITTEN`]).
+    written: Vec<u64>,
+    pages: u64,
 }
+
+/// The pages of memory that [`MIRRORS_WRITTEN`] counts.
+const MIRROR_PAGE: usize = 4 << 10;
 
 impl Mirror {
     fn new(len: usize) -> Mirror {
@@ -238,6 +246,29 @@ impl Mirror {
         Mirror {
             bytes: vec![0; len].into_boxed_slice(),
             versions: Vec::new(),
+            written: vec![0; len.div_ceil(MIRROR_PAGE).div_ceil(64)],
+            pages: 0,
+        }
+    }
+
+    /// Notes that a snapshot wrote offsets `[from, to)`.
+    fn note_written(&mut self, from: usize, to: usize) {
+        if to <= from {
+            return;
+        }
+        let mut new = 0;
+        for page in from / MIRROR_PAGE..=(to - 1) / MIRROR_PAGE {
+            let (word, bit) = (page / 64, 1u64 << (page % 64));
+            if let Some(w) = self.written.get_mut(word)
+                && *w & bit == 0
+            {
+                *w |= bit;
+                new += 1;
+            }
+        }
+        if new > 0 {
+            self.pages += new;
+            MIRRORS_WRITTEN.fetch_add(new * MIRROR_PAGE as u64, Ordering::Relaxed);
         }
     }
 }
@@ -245,11 +276,16 @@ impl Mirror {
 impl Drop for Mirror {
     fn drop(&mut self) {
         MIRRORS.fetch_sub(self.bytes.len() as u64, Ordering::Relaxed);
+        MIRRORS_WRITTEN.fetch_sub(self.pages * MIRROR_PAGE as u64, Ordering::Relaxed);
     }
 }
 
 /// The bytes of all snapshot mirrors held (for the copystat line).
 pub(crate) static MIRRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Of [`MIRRORS`], the 4 KiB pages snapshots wrote (for the memory line):
+/// what of a mirror's commit holds memory once touched.
+pub(crate) static MIRRORS_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a finished snapshot leaves its mirror to the copy's next ones:
 /// unless `XTP_SNAPSHOT_MIRRORS=0`, which gives each snapshot fresh memory
@@ -359,11 +395,13 @@ impl Before {
         for &(a, end) in &self.taken[first..last] {
             if at < a {
                 took += take(&mut self.mirror, at, a);
+                self.mirror.note_written(at, a);
             }
             at = at.max(end);
         }
         if at < to {
             took += take(&mut self.mirror, at, to);
+            self.mirror.note_written(at, to);
         }
         let start = match self.taken.get(first) {
             Some(&(a, _)) if first < last => a.min(from),
@@ -424,6 +462,7 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
+        self.note_refreshed(address, len);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
@@ -460,16 +499,30 @@ impl Shadow {
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(u64::MAX),
                 std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
             ],
         }
     }
 
+    /// Notes the 64 KiB blocks a refresh of `len` bytes at `address` takes
+    /// ([`loose_use`]).
+    fn note_refreshed(&self, address: u64, len: u64) {
+        let from = address - self.start;
+        let mask = block_mask(from, from + len);
+        let blocks = &self.looked[4];
+        if blocks.load(Ordering::Relaxed) & mask != mask {
+            blocks.fetch_or(mask, Ordering::Relaxed);
+        }
+    }
+
     /// Notes a lookup of `[address, end)` in a window copy: the submission
-    /// numbers ([`submission`]) and the offsets reached. Read first, so that
-    /// recording threads looking up the same window share its cache line.
+    /// numbers ([`submission`]), the offsets reached and the 64 KiB blocks
+    /// touched. Read first, so that recording threads looking up the same
+    /// window share its cache line.
     fn note_lookup(&self, address: u64, end: u64) {
         let now = SUBMISSIONS.load(Ordering::Relaxed);
-        let [last, low, high] = &self.looked;
+        let [last, low, high, blocks, _] = &self.looked;
         if last.load(Ordering::Relaxed) != now {
             last.store(now, Ordering::Relaxed);
         }
@@ -479,6 +532,10 @@ impl Shadow {
         }
         if to > high.load(Ordering::Relaxed) {
             high.fetch_max(to, Ordering::Relaxed);
+        }
+        let mask = block_mask(from, to);
+        if blocks.load(Ordering::Relaxed) & mask != mask {
+            blocks.fetch_or(mask, Ordering::Relaxed);
         }
     }
 
@@ -4878,11 +4935,41 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// The 64 KiB blocks of offsets `[from, to)` in a copy's first 4 MiB, a bit
+/// each (none past them).
+fn block_mask(from: u64, to: u64) -> u64 {
+    const BLOCK: u64 = 64 << 10;
+    if to <= from || from >= 64 * BLOCK {
+        return 0;
+    }
+    let (first, last) = (from / BLOCK, (to - 1).min(64 * BLOCK - 1) / BLOCK);
+    let bits = last - first + 1;
+    let ones = if bits == 64 {
+        u64::MAX
+    } else {
+        (1 << bits) - 1
+    };
+    ones << first
+}
+
+/// The bytes of the `size`-byte blocks (a multiple of 64 KiB, at most 4 MiB)
+/// that the 64 KiB blocks of `mask` touch.
+fn blocks_bytes(mask: u64, size: u64) -> u64 {
+    let per = (size >> 16).clamp(1, 64) as u32;
+    let group = if per == 64 { u64::MAX } else { (1 << per) - 1 };
+    (0..64 / per)
+        .filter(|i| mask & (group << (i * per)) != 0)
+        .count() as u64
+        * size
+}
+
 /// For the memory line, once per line: the window copies ([`loose`]) held,
 /// those of more than one window, the title memory they cover (overlapping
 /// copies count once), how many were looked up since the previous line and
-/// since the sixth line back, and the bytes their lookups spanned (from the
-/// lowest offset looked up to the highest).
+/// since the sixth line back, the bytes their lookups spanned (from the
+/// lowest offset looked up to the highest), and the bytes windows of 1 MiB,
+/// 256 KiB and 64 KiB would hold for the blocks lookups touched and those
+/// refreshes took.
 pub(crate) fn loose_use() -> String {
     const MIB: u64 = 1 << 20;
     static MARKS: Mutex<std::collections::VecDeque<u64>> =
@@ -4897,16 +4984,18 @@ pub(crate) fn loose_use() -> String {
         let back = |n: usize| marks.len().checked_sub(n + 1).map_or(0, |i| marks[i]);
         (back(1), back(6))
     };
-    let copies: Vec<(u64, u64, u64, u64)> = lock(&LOOSE)
+    let copies: Vec<(u64, u64, u64, u64, u64, u64)> = lock(&LOOSE)
         .values()
         .map(|s| {
-            let [used, low, high] = &s.looked;
+            let [used, low, high, blocks, refreshed] = &s.looked;
             let (low, high) = (low.load(Ordering::Relaxed), high.load(Ordering::Relaxed));
             (
                 s.start,
                 s.len,
                 used.load(Ordering::Relaxed),
                 high.saturating_sub(low),
+                blocks.load(Ordering::Relaxed),
+                refreshed.load(Ordering::Relaxed),
             )
         })
         .collect();
@@ -4933,10 +5022,21 @@ pub(crate) fn loose_use() -> String {
     };
     let ((recent, recent_bytes), (older, older_bytes)) = (since(last), since(sixth));
     let spanned: u64 = copies.iter().map(|c| c.3).sum();
+    // Single-window copies only: a wider one's blocks past 4 MiB are not
+    // counted.
+    let in_blocks = |size: u64, refreshed: bool| -> u64 {
+        copies
+            .iter()
+            .filter(|c| c.1 == WINDOW)
+            .map(|c| blocks_bytes(if refreshed { c.5 } else { c.4 }, size))
+            .sum()
+    };
     format!(
         "{} copies, {} MiB ({wide} of more than one window, {} MiB), covering {} MiB of title memory; \
          looked up since the last line {recent} ({} MiB), since the sixth line back {older} ({} MiB); \
-         lookups spanned {} MiB",
+         lookups spanned {} MiB; for the blocks lookups touched, single windows of 1 MiB would hold {} MiB, \
+         of 256 KiB {} MiB, of 64 KiB {} MiB; for those refreshes took, 4 MiB ones {} MiB, 1 MiB {} MiB, \
+         256 KiB {} MiB, 64 KiB {} MiB",
         copies.len(),
         bytes / MIB,
         wide_bytes / MIB,
@@ -4944,6 +5044,13 @@ pub(crate) fn loose_use() -> String {
         recent_bytes / MIB,
         older_bytes / MIB,
         spanned / MIB,
+        in_blocks(1 << 20, false) / MIB,
+        in_blocks(256 << 10, false) / MIB,
+        in_blocks(64 << 10, false) / MIB,
+        in_blocks(4 << 20, true) / MIB,
+        in_blocks(1 << 20, true) / MIB,
+        in_blocks(256 << 10, true) / MIB,
+        in_blocks(64 << 10, true) / MIB,
     )
 }
 
@@ -5244,11 +5351,51 @@ mod tests {
         let again = existing(window + 0x100, 0x10).expect("the same copy");
         assert!(Arc::ptr_eq(&shadow, &again));
         assert_eq!((shadow.start, shadow.len), (window, WINDOW));
-        let [last, low, high] = shadow.looked.each_ref().map(|n| n.load(Ordering::Relaxed));
+        let far = existing(window + 0x2F_0000, 0x2_0000).expect("the same copy");
+        assert!(Arc::ptr_eq(&shadow, &far));
+        shadow.note_refreshed(window + 0x10_0000, 0x1000);
+        let [last, low, high, blocks, refreshed] =
+            shadow.looked.each_ref().map(|n| n.load(Ordering::Relaxed));
         assert!(last >= now, "looked up at {last}, after submission {now}");
-        assert_eq!((low, high), (0x40, 0x110));
+        assert_eq!((low, high), (0x40, 0x31_0000));
+        // Blocks 0, 47 and 48: the last lookup crosses a 64 KiB boundary.
+        assert_eq!(blocks, 1 | 1 << 47 | 1 << 48);
+        assert_eq!(refreshed, 1 << 16, "a refresh's blocks apart");
         let line = loose_use();
         assert!(line.contains(" copies, "), "{line}");
+    }
+
+    /// A mirror counts each 4 KiB page snapshots wrote once.
+    #[test]
+    fn mirrors_count_the_pages_snapshots_write() {
+        let mut mirror = Mirror::new(64 << 10);
+        mirror.note_written(0, 1);
+        mirror.note_written(4095, 4097);
+        mirror.note_written(60 << 10, 64 << 10);
+        mirror.note_written(5, 5);
+        assert_eq!(mirror.pages, 3, "pages 0, 1 and 15");
+        assert_eq!(mirror.written, vec![1 | 1 << 1 | 1 << 15]);
+    }
+
+    /// The 64 KiB blocks a range touches in a window's first 4 MiB, and the
+    /// bytes larger blocks holding them would take.
+    #[test]
+    fn window_blocks_count_what_lookups_touch() {
+        const K: u64 = 1 << 10;
+        assert_eq!(block_mask(0, 1), 1);
+        assert_eq!(block_mask(0, 64 * K), 1);
+        assert_eq!(block_mask(64 * K - 1, 64 * K + 1), 0b11);
+        assert_eq!(block_mask(0, 4096 * K), u64::MAX);
+        assert_eq!(block_mask(4032 * K, 8192 * K), 1 << 63, "cut at 4 MiB");
+        assert_eq!(block_mask(4096 * K, 4100 * K), 0, "past 4 MiB");
+        assert_eq!(block_mask(5, 5), 0, "nothing");
+        // Blocks 0, 5 and 63.
+        let mask = 1 | 1 << 5 | 1 << 63;
+        assert_eq!(blocks_bytes(mask, 64 * K), 3 * 64 * K);
+        assert_eq!(blocks_bytes(mask, 256 * K), 3 * 256 * K, "0-3, 4-7, 60-63");
+        assert_eq!(blocks_bytes(mask, 1024 * K), 2 * 1024 * K, "0-15, 48-63");
+        assert_eq!(blocks_bytes(mask, 4096 * K), 4096 * K);
+        assert_eq!(blocks_bytes(0, 4096 * K), 0);
     }
 
     /// `XTP_FULL_REFRESH=1` (a diagnostic): before a submission, a copy the

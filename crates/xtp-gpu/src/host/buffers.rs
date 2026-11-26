@@ -827,7 +827,7 @@ pub(crate) fn by_caller(kind: Kind, top: usize) -> String {
         .map(|((_, file, line), (n, bytes))| (*file, *line, *n, *bytes))
         .collect();
     drop(held);
-    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.3));
     rows.iter()
         .take(top)
         .map(|(file, line, n, bytes)| {

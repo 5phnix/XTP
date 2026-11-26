@@ -1143,8 +1143,8 @@ fn note_scratch_use(s: &Scratch) {
     };
     let class = match used {
         0..=0x4_0000 => 0,
-        ..=0x10_0000 => 1,
-        ..=0x40_0000 => 2,
+        0x4_0001..=0x10_0000 => 1,
+        0x10_0001..=0x40_0000 => 2,
         _ => 3,
     };
     SCRATCH_USE[class].fetch_add(1, Ordering::Relaxed);
@@ -3774,7 +3774,8 @@ fn log_memory(device: &ID3D12Device) {
     let new_faults = faults.saturating_sub(FAULTS.swap(faults, Ordering::Relaxed));
     tracing::info!(
         "memory: card {} of {} MiB, system for the GPU {} of {} MiB; process working set {} MiB, \
-         private {} MiB, {new_faults} page faults since the last line; snapshot mirrors {} MiB; \
+         private {} MiB, {new_faults} page faults since the last line; snapshot mirrors {} MiB \
+         ({} MiB of pages written); \
          {} spare list scratch chunks",
         mib(lu),
         mib(lb),
@@ -3783,6 +3784,7 @@ fn log_memory(device: &ID3D12Device) {
         mib(ws),
         mib(private),
         mib(crate::shadow::MIRRORS.load(Ordering::Relaxed)),
+        mib(crate::shadow::MIRRORS_WRITTEN.load(Ordering::Relaxed)),
         spare_scratch_chunks(),
     );
     tracing::info!("list scratch: {}", scratch_use());
