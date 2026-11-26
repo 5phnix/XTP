@@ -104,6 +104,10 @@ pub(crate) struct Shadow {
     /// For a copy in the card's memory ([`cards`]): its CPU side and what
     /// goes between the two.
     card: Option<Card>,
+    /// For the memory line, of a window copy ([`loose`]): the submission
+    /// that last looked it up, and the offsets its lookups reached
+    /// `[low, high)` ([`loose_use`]).
+    looked: [std::sync::atomic::AtomicU64; 3],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside
@@ -452,6 +456,29 @@ impl Shadow {
             #[cfg(any(test, feature = "diagnostics"))]
             kind: AtomicU8::new(0),
             card,
+            looked: [
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(u64::MAX),
+                std::sync::atomic::AtomicU64::new(0),
+            ],
+        }
+    }
+
+    /// Notes a lookup of `[address, end)` in a window copy: the submission
+    /// numbers ([`submission`]) and the offsets reached. Read first, so that
+    /// recording threads looking up the same window share its cache line.
+    fn note_lookup(&self, address: u64, end: u64) {
+        let now = SUBMISSIONS.load(Ordering::Relaxed);
+        let [last, low, high] = &self.looked;
+        if last.load(Ordering::Relaxed) != now {
+            last.store(now, Ordering::Relaxed);
+        }
+        let (from, to) = (address - self.start, (end - self.start).min(self.len));
+        if from < low.load(Ordering::Relaxed) {
+            low.fetch_min(from, Ordering::Relaxed);
+        }
+        if to > high.load(Ordering::Relaxed) {
+            high.fetch_max(to, Ordering::Relaxed);
         }
     }
 
@@ -4628,7 +4655,12 @@ pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
             let start = address & !(WINDOW - 1);
             let len = end.next_multiple_of(WINDOW) - start;
             let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-            map.get(&(start, len)).cloned()
+            let shadow = map.get(&(start, len)).cloned();
+            drop(map);
+            if let Some(shadow) = &shadow {
+                shadow.note_lookup(address, end);
+            }
+            shadow
         }
     }
 }
@@ -4818,12 +4850,14 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    if let Some(shadow) = LOOSE
+    let found = LOOSE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(start, len))
-    {
-        return Some(shadow.clone());
+        .cloned();
+    if let Some(shadow) = found {
+        shadow.note_lookup(address, end);
+        return Some(shadow);
     }
     // Made without the lock held, as in `find`.
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -4835,12 +4869,82 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     // The first one made stays.
     let shadow = map.entry((start, len)).or_insert(made).clone();
     drop(map);
+    shadow.note_lookup(address, end);
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
         "loose memory copied to the host"
     );
     Some(shadow)
+}
+
+/// For the memory line, once per line: the window copies ([`loose`]) held,
+/// those of more than one window, the title memory they cover (overlapping
+/// copies count once), how many were looked up since the previous line and
+/// since the sixth line back, and the bytes their lookups spanned (from the
+/// lowest offset looked up to the highest).
+pub(crate) fn loose_use() -> String {
+    const MIB: u64 = 1 << 20;
+    static MARKS: Mutex<std::collections::VecDeque<u64>> =
+        Mutex::new(std::collections::VecDeque::new());
+    let now = SUBMISSIONS.load(Ordering::Relaxed);
+    let (last, sixth) = {
+        let mut marks = lock(&MARKS);
+        marks.push_back(now);
+        while marks.len() > 7 {
+            marks.pop_front();
+        }
+        let back = |n: usize| marks.len().checked_sub(n + 1).map_or(0, |i| marks[i]);
+        (back(1), back(6))
+    };
+    let copies: Vec<(u64, u64, u64, u64)> = lock(&LOOSE)
+        .values()
+        .map(|s| {
+            let [used, low, high] = &s.looked;
+            let (low, high) = (low.load(Ordering::Relaxed), high.load(Ordering::Relaxed));
+            (
+                s.start,
+                s.len,
+                used.load(Ordering::Relaxed),
+                high.saturating_sub(low),
+            )
+        })
+        .collect();
+    let bytes: u64 = copies.iter().map(|c| c.1).sum();
+    let (wide, wide_bytes) = copies
+        .iter()
+        .filter(|c| c.1 > WINDOW)
+        .fold((0, 0), |(n, b), c| (n + 1, b + c.1));
+    let mut ranges: Vec<(u64, u64)> = copies.iter().map(|c| (c.0, c.0 + c.1)).collect();
+    ranges.sort_unstable();
+    let (mut covered, mut reach) = (0, 0);
+    for (from, to) in ranges {
+        let from = from.max(reach);
+        if to > from {
+            covered += to - from;
+            reach = to;
+        }
+    }
+    let since = |mark: u64| {
+        copies
+            .iter()
+            .filter(|c| c.2 > mark)
+            .fold((0, 0), |(n, b), c| (n + 1, b + c.1))
+    };
+    let ((recent, recent_bytes), (older, older_bytes)) = (since(last), since(sixth));
+    let spanned: u64 = copies.iter().map(|c| c.3).sum();
+    format!(
+        "{} copies, {} MiB ({wide} of more than one window, {} MiB), covering {} MiB of title memory; \
+         looked up since the last line {recent} ({} MiB), since the sixth line back {older} ({} MiB); \
+         lookups spanned {} MiB",
+        copies.len(),
+        bytes / MIB,
+        wide_bytes / MIB,
+        covered / MIB,
+        recent_bytes / MIB,
+        older_bytes / MIB,
+        spanned / MIB,
+    )
 }
 
 /// For device-removed reports: the copy of title memory whose host range
@@ -5123,6 +5227,28 @@ mod tests {
             // SAFETY: inside the mapping; tests stand in for the GPU.
             unsafe { self.data.add(from).write_bytes(byte, len) };
         }
+    }
+
+    /// A window copy notes its lookups for the memory line: the submission
+    /// that last looked it up and the offsets they reached, from the one
+    /// that made it and those that found it made.
+    #[test]
+    fn window_copies_note_their_lookups() {
+        let test = "shadow::tests::window_copies_note_their_lookups";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let window = watched(PAGE) as u64;
+        let now = submission();
+        let shadow = find(window + 0x40, 0x40).expect("a window copy");
+        let again = existing(window + 0x100, 0x10).expect("the same copy");
+        assert!(Arc::ptr_eq(&shadow, &again));
+        assert_eq!((shadow.start, shadow.len), (window, WINDOW));
+        let [last, low, high] = shadow.looked.each_ref().map(|n| n.load(Ordering::Relaxed));
+        assert!(last >= now, "looked up at {last}, after submission {now}");
+        assert_eq!((low, high), (0x40, 0x110));
+        let line = loose_use();
+        assert!(line.contains(" copies, "), "{line}");
     }
 
     /// `XTP_FULL_REFRESH=1` (a diagnostic): before a submission, a copy the

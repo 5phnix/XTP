@@ -573,6 +573,20 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
+    /// `XTP_SCRATCH_CHUNK_KIB` wins, in 64 KiB units up to 4 MiB; unset,
+    /// zero or not a number, a host with less than 32 GiB of RAM takes
+    /// 256 KiB chunks, another 4 MiB.
+    #[test]
+    fn scratch_chunks_follow_the_setting_then_the_host_memory() {
+        assert_eq!(chunk_for(None, false), SCRATCH_CHUNK);
+        assert_eq!(chunk_for(None, true), SCRATCH_CHUNK_LOW);
+        assert_eq!(chunk_for(Some("many"), true), SCRATCH_CHUNK_LOW);
+        assert_eq!(chunk_for(Some(" 0 "), false), SCRATCH_CHUNK);
+        assert_eq!(chunk_for(Some("100"), false), 128 << 10);
+        assert_eq!(chunk_for(Some("4096"), true), SCRATCH_CHUNK);
+        assert_eq!(chunk_for(Some("65536"), true), SCRATCH_CHUNK);
+    }
+
     #[test]
     fn fills_merge_only_across_contiguous_bytes_of_one_upload() {
         let Some(gpu) =
@@ -1051,7 +1065,44 @@ struct Scratch {
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
 unsafe impl Send for Scratch {}
 
+/// The upload memory of one list scratch chunk, unless [`scratch_chunk`]
+/// says less.
 const SCRATCH_CHUNK: u64 = 4 << 20;
+/// A scratch chunk on a host with less than 32 GiB of RAM
+/// (`resource::pool::low_memory_host`). In a world session on such a host
+/// (16 GiB), 96 % of the lists' recordings used up to 256 KiB of scratch
+/// (33 KiB on average) and none more than 4 MiB, while each list kept a
+/// 4 MiB chunk: 278 chunks held 1.1 GiB of upload memory for 70 MiB used.
+/// With 256 KiB chunks they held 122 to 127 MiB, at the same frame rate
+/// (fogydes/XTP#45). A recording that needs more takes more chunks, and an
+/// allocation larger than a chunk its own buffer, as before.
+const SCRATCH_CHUNK_LOW: u64 = 256 << 10;
+
+/// The bytes of a list scratch chunk: `XTP_SCRATCH_CHUNK_KIB` (rounded up to
+/// 64 KiB, D3D12's buffer placement, at most [`SCRATCH_CHUNK`]), else
+/// [`SCRATCH_CHUNK_LOW`] on a host with less than 32 GiB of RAM, else
+/// [`SCRATCH_CHUNK`].
+fn scratch_chunk() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let asked = std::env::var("XTP_SCRATCH_CHUNK_KIB").ok();
+        let bytes = chunk_for(asked.as_deref(), crate::resource::pool::low_memory_host());
+        if bytes != SCRATCH_CHUNK {
+            tracing::info!(kib = bytes >> 10, "list scratch chunks");
+        }
+        bytes
+    })
+}
+
+/// [`scratch_chunk`] for `XTP_SCRATCH_CHUNK_KIB`'s value and whether the
+/// host has less than 32 GiB of RAM.
+fn chunk_for(asked: Option<&str>, low_memory: bool) -> u64 {
+    match asked.map(str::trim).and_then(|v| v.parse::<u64>().ok()) {
+        Some(kib) if kib > 0 => (kib << 10).next_multiple_of(64 << 10).min(SCRATCH_CHUNK),
+        _ if low_memory => SCRATCH_CHUNK_LOW,
+        _ => SCRATCH_CHUNK,
+    }
+}
 
 /// What a list reset while it ran leaves to its running submission.
 struct Retired {
@@ -1074,6 +1125,52 @@ static SPARE_PRELUDES: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
 static SPARE_SCRATCH: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
 /// Spares kept of each kind at most.
 const SPARES: usize = 256;
+
+/// Recordings of lists ended (by a reset) since the last memory line, by the
+/// scratch memory they used: up to 256 KiB, 1 MiB, 4 MiB, past 4 MiB; then
+/// the chunks those lists held and the bytes they used.
+static SCRATCH_USE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Scratch allocations larger than a chunk since the last memory line, each
+/// in a buffer of its own: how many, and their bytes.
+static SCRATCH_OWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Counts the scratch memory of a recording that ends ([`SCRATCH_USE`]).
+fn note_scratch_use(s: &Scratch) {
+    let used = if s.chunks.is_empty() {
+        0
+    } else {
+        s.current as u64 * scratch_chunk() + s.used
+    };
+    let class = match used {
+        0..=0x4_0000 => 0,
+        ..=0x10_0000 => 1,
+        ..=0x40_0000 => 2,
+        _ => 3,
+    };
+    SCRATCH_USE[class].fetch_add(1, Ordering::Relaxed);
+    SCRATCH_USE[4].fetch_add(s.chunks.len() as u64, Ordering::Relaxed);
+    SCRATCH_USE[5].fetch_add(used, Ordering::Relaxed);
+}
+
+/// [`SCRATCH_USE`] since the last call, for the memory line.
+fn scratch_use() -> String {
+    let [small, mid, chunk, big, held, used] =
+        SCRATCH_USE.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    let [own, own_bytes] = SCRATCH_OWN.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    let ended = small + mid + chunk + big;
+    format!(
+        "{ended} list recordings ended ({small} used up to 256 KiB of scratch, {mid} up to 1 MiB, \
+         {chunk} up to 4 MiB, {big} more), holding {held} chunks for {} MiB used; \
+         {own} allocations larger than a chunk in buffers of their own ({} KiB)",
+        used >> 20,
+        own_bytes >> 10
+    )
+}
+
+/// The spare scratch chunks held now (for the memory line).
+fn spare_scratch_chunks() -> usize {
+    pool(&SPARE_SCRATCH).len()
+}
 
 fn pool<T>(spares: &'static Mutex<Vec<T>>) -> std::sync::MutexGuard<'static, Vec<T>> {
     spares.lock().unwrap_or_else(|e| e.into_inner())
@@ -2521,6 +2618,7 @@ impl HostList {
         if self.ours.load(Ordering::Acquire) && self.running() {
             self.settle();
         }
+        note_scratch_use(&self.scratch.lock().unwrap_or_else(|e| e.into_inner()));
         let running = if self.running() { made() } else { None };
         let allocator = {
             let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
@@ -3035,6 +3133,7 @@ impl HostList {
     /// reset.
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    #[track_caller]
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
@@ -3060,7 +3159,10 @@ impl HostList {
     fn scratch_region(&self, len: u64) -> Option<(u64, usize, usize)> {
         let host = host()?;
         let len = len.max(1).next_multiple_of(256);
-        if len > SCRATCH_CHUNK {
+        let chunk = scratch_chunk();
+        if len > chunk {
+            SCRATCH_OWN[0].fetch_add(1, Ordering::Relaxed);
+            SCRATCH_OWN[1].fetch_add(len, Ordering::Relaxed);
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
@@ -3069,7 +3171,7 @@ impl HostList {
             return Some((gpu, data as usize, 0));
         }
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        if s.used + len > chunk && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -3080,7 +3182,7 @@ impl HostList {
                     // Made without the lock held (it may wait for a heap);
                     // a list records on one thread at a time.
                     drop(s);
-                    let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
+                    let (buffer, data) = host.upload_buffer(chunk)?;
                     name(&buffer, || "list scratch".into());
                     // SAFETY: a live buffer.
                     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -3659,6 +3761,61 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     });
 }
 
+/// For the frame-rate line: the video memory the adapter gives this
+/// process and what it uses, local (the card) and non-local (system memory
+/// the adapter maps), and the process's own memory and page faults since
+/// the last line. It changes nothing.
+fn log_memory(device: &ID3D12Device) {
+    let mib = |b: u64| b >> 20;
+    let (lb, lu) = crate::dxgi::video_memory(device).unwrap_or_default();
+    let (nb, nu) = crate::dxgi::non_local_memory(device).unwrap_or_default();
+    let (ws, private, faults) = process_memory().unwrap_or_default();
+    static FAULTS: AtomicU64 = AtomicU64::new(0);
+    let new_faults = faults.saturating_sub(FAULTS.swap(faults, Ordering::Relaxed));
+    tracing::info!(
+        "memory: card {} of {} MiB, system for the GPU {} of {} MiB; process working set {} MiB, \
+         private {} MiB, {new_faults} page faults since the last line; snapshot mirrors {} MiB; \
+         {} spare list scratch chunks",
+        mib(lu),
+        mib(lb),
+        mib(nu),
+        mib(nb),
+        mib(ws),
+        mib(private),
+        mib(crate::shadow::MIRRORS.load(Ordering::Relaxed)),
+        spare_scratch_chunks(),
+    );
+    tracing::info!("list scratch: {}", scratch_use());
+    tracing::info!("title memory windows: {}", crate::shadow::loose_use());
+}
+
+/// This process's working set, private bytes and page faults so far.
+fn process_memory() -> Option<(u64, u64, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process; the structure is ours and sized as it says.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(),
+            c.cb,
+        )
+    };
+    (ok != 0).then(|| {
+        (
+            c.WorkingSetSize as u64,
+            c.PrivateUsage as u64,
+            u64::from(c.PageFaultCount),
+        )
+    })
+}
+
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
 fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
@@ -3674,6 +3831,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 impl Host {
     /// A buffer in the upload heap, mapped for writing: placed in a heap
     /// reserved ahead ([`buffers`]), else committed.
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         if let Some(placed) = buffers::buffer(buffers::Kind::Upload, size) {
             return Some(placed);
@@ -3957,6 +4115,9 @@ impl Meter {
             if let Some(pools) = buffers::summary() {
                 tracing::info!("buffer heaps: {pools}");
             }
+            if let Some(host) = host() {
+                log_memory(&host.device);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -4232,6 +4393,7 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly), zeroed. Placed
     /// in a heap reserved ahead ([`buffers`]), else committed.
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         if let Some(placed) = buffers::buffer(buffers::Kind::System, size) {
             return Some(placed);

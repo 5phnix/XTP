@@ -112,7 +112,11 @@ pub(crate) fn enabled() -> bool {
         let value = std::env::var("XTP_TEXTURE_POOL").ok();
         let on = asks_pool(value.as_deref(), low_memory_host());
         if on {
-            let why = if value.is_some() { "XTP_TEXTURE_POOL" } else { "less than 32 GiB of RAM" };
+            let why = if value.is_some() {
+                "XTP_TEXTURE_POOL"
+            } else {
+                "less than 32 GiB of RAM"
+            };
             tracing::info!(why, "host textures the title fills go to pooled heaps");
         }
         on
@@ -278,10 +282,7 @@ fn asks_tiles(value: Option<&str>, low: bool) -> bool {
     let Some(v) = value.map(str::trim) else {
         return low;
     };
-    !(v.is_empty()
-        || v == "0"
-        || v.eq_ignore_ascii_case("off")
-        || v.eq_ignore_ascii_case("false"))
+    !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false"))
 }
 
 /// Whether D3D12's small resource rule may give the host texture `d` a
