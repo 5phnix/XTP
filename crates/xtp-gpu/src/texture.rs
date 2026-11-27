@@ -238,6 +238,27 @@ struct Last {
     detiled: Option<blake3::Hash>,
 }
 
+impl Last {
+    /// Whether a snapshot should replace the staged texels and update `hash`.
+    /// A sparse read (`partial == true`) can consist entirely of zero-filled
+    /// holes; keep the digest of the texels actually staged until a usable read
+    /// replaces them.
+    // Ported from TaynanGT/Vice-Tay commit 26aeded1 (GPL-3.0-or-later).
+    fn accepts(&self, bytes: &[u8], hash: blake3::Hash, partial: bool, forced: bool) -> bool {
+        (forced || self.hash != Some(hash)) && !(partial && bytes.iter().all(|&b| b == 0))
+    }
+
+    #[cfg(test)]
+    fn accept_partial(&mut self, bytes: &[u8]) -> bool {
+        let hash = blake3::hash(bytes);
+        if !self.accepts(bytes, hash, true, false) {
+            return false;
+        }
+        self.hash = Some(hash);
+        true
+    }
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -2149,7 +2170,7 @@ impl Staging {
             {
                 return 0;
             }
-            let Some(read) = self.snapshot(size) else {
+            let Some((read, partial)) = self.snapshot(size) else {
                 // Not mapped (streamed out): nothing to detile, the host
                 // copy keeps its texels until a write tells new bytes.
                 // Before, the write watch, which answers for a reservation
@@ -2159,6 +2180,11 @@ impl Staging {
                 last.asked = now;
                 return 0;
             };
+            if partial && read.iter().all(|&b| b == 0) {
+                give_room(read);
+                last.asked = now;
+                return 0;
+            }
             if !self.stage_again() {
                 give_room(read);
                 return 0;
@@ -2234,11 +2260,11 @@ impl Staging {
         // Hashed and detiled from one snapshot (module doc), taken through
         // the kernel, which tells pages unmapped since the check above. The
         // room is shared, and not held during the wait.
-        let Some(snapshot) = self.snapshot(size) else {
+        let Some((snapshot, partial)) = self.snapshot(size) else {
             return 0;
         };
         let hash = self.hash(&snapshot);
-        if (forced || last.hash != Some(hash)) && self.stage_again() {
+        if last.accepts(&snapshot, hash, partial, forced) && self.stage_again() {
             last.hash = Some(hash);
             if unseen {
                 self.missed(size);
@@ -2259,20 +2285,20 @@ impl Staging {
 
     /// The texture's memory, `size` bytes of it, read into the room the
     /// checks share ([`take_room`]) through the kernel, which tells pages
-    /// that are not mapped: all of them mapped, or, for a reserved host
-    /// copy, some (`map_units` maps the units whose memory is, the copy
-    /// leaves the others; what is not mapped reads as zeros). `None`
-    /// otherwise: nothing is detiled from it.
+    /// that are not mapped: all of them mapped (`partial == false`), or, for
+    /// a reserved host copy, some (`partial == true`: `map_units` maps the
+    /// units whose memory is, the copy leaves the others; what is not mapped
+    /// reads as zeros). `None` otherwise: nothing is detiled from it.
     /// shortcut: a host copy that is not reserved waits for all of its
     /// memory, as it did in memory that is not write-watched.
-    fn snapshot(&self, size: usize) -> Option<Vec<u8>> {
+    fn snapshot(&self, size: usize) -> Option<(Vec<u8>, bool)> {
         let mut room = take_room(size);
         if crate::host::read_into(self.memory, &mut room) {
-            return Some(room);
+            return Some((room, false));
         }
         if self.tiles.is_some() && any_committed(self.memory, size) {
             crate::host::copy_mapped(room.as_mut_ptr(), self.memory, size, false);
-            return Some(room);
+            return Some((room, true));
         }
         give_room(room);
         None
@@ -5057,5 +5083,35 @@ mod tests {
         assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x1111_1111));
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+    }
+
+    #[test]
+    fn a_zero_sparse_read_keeps_the_digest_of_the_staged_texels() {
+        let mut last = Last::default();
+        let missing = [0u8; 128];
+        let visible = [0x7au8; 128];
+
+        assert!(!last.accept_partial(&missing));
+        assert_eq!(
+            last.hash, None,
+            "an empty first sparse read must remain eligible for another upload"
+        );
+        assert!(last.accept_partial(&visible));
+        assert!(!last.accept_partial(&missing));
+        assert!(
+            !last.accepts(&missing, blake3::hash(&missing), true, true),
+            "even a forced check ignores an all-zero sparse read"
+        );
+        assert_eq!(last.hash, Some(blake3::hash(&visible)));
+        assert_ne!(
+            last.hash,
+            Some(blake3::hash(&missing)),
+            "a later full zero texture still needs detiling"
+        );
+        assert!(
+            last.accepts(&missing, blake3::hash(&missing), false, false),
+            "a full read that really is all zero is still accepted"
+        );
+        assert!(!last.accept_partial(&visible));
     }
 }
