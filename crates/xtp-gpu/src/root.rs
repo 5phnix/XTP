@@ -51,7 +51,7 @@ type SerializeVersioned =
     unsafe extern "system" fn(*const VersionedDesc, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
 
 /// An export of the host's `d3d12.dll` in System32, looked up once.
-fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
+pub(crate) fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
     *cache.get_or_init(|| {
         #[cfg(windows)]
         {

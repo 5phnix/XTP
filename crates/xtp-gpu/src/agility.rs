@@ -13,8 +13,8 @@ use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::{
-    CLSID_D3D12SDKConfiguration, D3D12CreateDevice, D3D12GetDebugInterface, D3D12GetInterface,
-    ID3D12Device, ID3D12DeviceFactory, ID3D12SDKConfiguration1,
+    CLSID_D3D12SDKConfiguration, D3D12CreateDevice, D3D12GetDebugInterface, ID3D12Device,
+    ID3D12DeviceFactory, ID3D12SDKConfiguration1,
 };
 use windows::core::{GUID, IUnknown, Interface, PCSTR, Param};
 
@@ -52,6 +52,35 @@ fn sdk_path_cstr(dir: &Path) -> Result<CString, String> {
         .map_err(|_| format!("Agility SDK path {} contains a NUL byte", dir.display()))
 }
 
+fn sdk_configuration() -> windows::core::Result<ID3D12SDKConfiguration1> {
+    type GetInterface = unsafe extern "system" fn(
+        *const GUID,
+        *const GUID,
+        *mut *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    static ENTRY: OnceLock<Option<usize>> = OnceLock::new();
+    let entry = crate::root::host_export(&ENTRY, c"D3D12GetInterface").ok_or_else(|| {
+        windows::core::Error::from_hresult(windows::Win32::Foundation::E_NOINTERFACE)
+    })?;
+    // SAFETY: the System32 export has the D3D12GetInterface ABI and stays loaded.
+    let get: GetInterface = unsafe { std::mem::transmute(entry) };
+    let mut out = std::ptr::null_mut();
+    // SAFETY: the CLSID and IID select the configuration interface and out is writable.
+    unsafe {
+        get(
+            &CLSID_D3D12SDKConfiguration,
+            &ID3D12SDKConfiguration1::IID,
+            &mut out,
+        )
+        .ok()?
+    };
+    if out.is_null() {
+        return Err(windows::core::Error::empty());
+    }
+    // SAFETY: the successful query transferred one reference for the requested IID.
+    Ok(unsafe { ID3D12SDKConfiguration1::from_raw(out) })
+}
+
 fn load_in(dir: &Path) -> Outcome {
     load_version_in(dir, SDK_VERSION)
 }
@@ -73,10 +102,7 @@ fn load_version_in(dir: &Path, sdk_version: u32) -> Outcome {
     // singleton, and `CreateDeviceFactory` takes a valid NUL-terminated
     // directory string without mutating global D3D12 SDK selection.
     unsafe {
-        let mut config: Option<ID3D12SDKConfiguration1> = None;
-        let config = match D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut config)
-            .and_then(|()| config.ok_or_else(windows::core::Error::empty))
-        {
+        let config = match sdk_configuration() {
             Ok(config) => config,
             Err(e) => {
                 return Outcome::Failed {
