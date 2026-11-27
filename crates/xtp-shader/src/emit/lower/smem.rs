@@ -358,6 +358,8 @@ impl<'a> Lower<'a> {
             let before_end = self.s.m.cmp(c, pred::IULT, a, size);
             let left = self.s.m.bin(c, Bin::Sub, size, a);
             let fits = self.s.m.cmp(c, pred::IUGE, left, four);
+            let no_carry = self.s.m.cmp(c, pred::IUGE, a, addr);
+            let fits = self.s.m.bin(c, Bin::And, fits, no_carry);
             let inside = self.s.m.bin(c, Bin::And, before_end, fits);
             let byte = self.s.m.bin(c, Bin::Add, a, bias);
             let byte = self.s.m.select(c, inside, byte, size);

@@ -538,12 +538,15 @@ fn self_sized_scalar_load_uses_separate_raw_view_and_zeros_past_end() {
         smem(2, 16, 4, 0x20, NULL)[1], // s_load_dwordx4 s[16:19], s[4:5], 0x20 (UAV)
         WAIT_SCALAR,
         s_sub_u32(12, 10, 8), // s12 = size - 8 (wraps near 4 GiB when size == 4)
-        smem(8, 20, 8, 0, 12)[0],
-        smem(8, 20, 8, 0, 12)[1], // s_buffer_load_dword s20, s[8:11], s12
+        smem(9, 20, 8, 0, 12)[0],
+        smem(9, 20, 8, 0, 12)[1], // s_buffer_load_dwordx2 s[20:21], s[8:11], s12
         WAIT_SCALAR,
         v_mov(0, 20),
         store(0, 16, 0)[0],
         store(0, 16, 0)[1],
+        v_mov(1, 21),
+        store(1, 16, 4)[0],
+        store(1, 16, 4)[1],
         S_ENDPGM,
     ];
     assert!(text(&words).iter().any(|l| l.starts_with("s_sub_u32 s12")));
@@ -653,11 +656,11 @@ fn self_sized_scalar_load_uses_separate_raw_view_and_zeros_past_end() {
             &[0x1111_2222u32, 0x3333_4444][..],
             &raw_backing[..],
             4u32,
-            0x1111_2222u32,
+            [0x1111_2222u32, 0x3333_4444],
         ),
         // Underflow on a 4-byte view: `size - 8` wraps to 0xFFFF_FFFC; `a + bias` wraps
         // to 0 if unguarded, so both the range check and select keep it 0.
-        (&small[..], &raw_backing[..], 4u32, 0u32),
+        (&small[..], &raw_backing[..], 4u32, [0u32; 2]),
     ] {
         let mut ud = vec![0; cs_alt.user_data_dwords() as usize];
         let byte_len = std::mem::size_of_val(data) as u32;
@@ -673,7 +676,7 @@ fn self_sized_scalar_load_uses_separate_raw_view_and_zeros_past_end() {
                 data,
                 stride: Stride::Raw,
             },
-            View::RawUav(1),
+            View::RawUav(2),
             View::Buffer {
                 data: mh_data,
                 stride: Stride::Raw,
@@ -691,7 +694,7 @@ fn self_sized_scalar_load_uses_separate_raw_view_and_zeros_past_end() {
                 },
             )
             .unwrap();
-        assert_eq!(out[0][0], expected, "bias={bias}, len={}", data.len());
+        assert_eq!(out[0][..2], expected, "bias={bias}, len={}", data.len());
     }
 
     // Structured SRV with `XTP_RAW_STRUCTURED=0`: `s10` is element count (2),
