@@ -5314,10 +5314,8 @@ mod tests {
                 host.drain();
                 check(texture, 0x22);
                 // SAFETY: recommit the same reserved pages before writing the next frame.
-                assert!(
-                    !unsafe { VirtualAlloc(at as *const _, LEN, MEM_COMMIT, PAGE_READWRITE) }
-                        .is_null()
-                );
+                let again = unsafe { VirtualAlloc(at as *const _, LEN, MEM_COMMIT, PAGE_READWRITE) };
+                assert!(!again.is_null());
                 fill(0x22);
             }
             drop((list1, snap, list2));
