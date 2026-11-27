@@ -911,7 +911,11 @@ impl Pool {
         Pool::with_small(device, config, budget, small)
     }
 
-    fn with_small(device: ID3D12Device, config: Config, budget: Budget, small: bool) -> Pool {
+    fn with_small(device: ID3D12Device, mut config: Config, budget: Budget, small: bool) -> Pool {
+        if !small {
+            config.heap[Class::Small.index()] = 0;
+            config.reserve[Class::Small.index()] = 0;
+        }
         let changes = BudgetEvent::register(&device);
         let tier = tiled_tier(&device);
         if config.tiles && tier < D3D12_TILED_RESOURCES_TIER_2.0 {
@@ -1194,7 +1198,8 @@ impl Inner {
 
     /// Whether `class` has less than its reserve free.
     fn short(&self, s: &State, class: Class) -> bool {
-        Self::free(s, class) < self.config.reserve[class.index()]
+        (self.small || class != Class::Small)
+            && Self::free(s, class) < self.config.reserve[class.index()]
     }
 
     /// `len` bytes of a heap of `class`: the tightest fit in a resident
@@ -2474,6 +2479,15 @@ pub(crate) mod tests {
             Config::sized(MIB, MIB),
             unlimited(),
             false,
+        );
+        assert!(pool.settle(Duration::from_secs(5)));
+        assert!(pool.resident(Duration::from_secs(5)));
+        let settled = pool.holding();
+        assert_eq!(settled.heaps, 1, "only Class::Normal heap reserved");
+        assert_eq!(settled.bytes, MIB, "no Class::Small heap reserved");
+        assert!(
+            pool.inner.lock().classes[Class::Small.index()].is_empty(),
+            "no Class::Small heap created when disabled"
         );
         let small = texture(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
         let placed = pool
