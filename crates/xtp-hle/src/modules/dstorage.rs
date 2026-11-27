@@ -2892,8 +2892,12 @@ mod tests {
         assert_eq!(worker_count_for(Some("invalid"), Some(8), 16), 8);
         #[cfg(windows)]
         {
+            use windows_sys::Win32::System::Threading::{
+                ALL_PROCESSOR_GROUPS, GetActiveProcessorCount,
+            };
             let cores = physical_cores().expect("physical core count on Windows");
-            let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+            // SAFETY: query-only count of active logical processors across every group.
+            let logical = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) } as usize;
             assert!((1..=logical).contains(&cores));
         }
     }
