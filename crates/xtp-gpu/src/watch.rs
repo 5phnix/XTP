@@ -553,7 +553,10 @@ fn protect_span(
     }
     let many = range.len() > 1;
     for block in range {
-        if many && set_protection(block..block + 1, PAGE_READONLY) {
+        if many
+            && matches!(alike(block, block + 1), Alike::Plain(_))
+            && set_protection(block..block + 1, PAGE_READONLY)
+        {
             on_protected(g, block..block + 1);
         } else {
             WRITE_FAULTS.set(block..block + 1, false);
