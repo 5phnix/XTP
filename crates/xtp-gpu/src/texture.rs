@@ -516,17 +516,20 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         let len = len - at;
         let pitch = staging.footprints[0].Footprint.RowPitch as usize;
         let bytes = pitch * staging.rows[0] as usize;
-        let plane = staging.clone();
-        let Some(source) = list.plane_upload(bytes as u64, (at, len), move |dst| {
-            fill_plane(&plane.layout, at, len, dst, bytes, pitch);
-        }) else {
+        let Some((source, data)) = host().and_then(|h| list.upload(h, bytes as u64)) else {
             once!("no upload buffer for a CPU-written movie plane");
             return false;
         };
+        let dst = data as usize;
         let predicate = target
             .as_ref()
             .filter(|_| may_predicate())
             .and_then(|_| Predicate::take());
+        let plane = staging.clone();
+        let fill = move |direct| fill_plane(&plane.layout, at, len, dst, bytes, pitch, direct);
+        if predicate.is_none() && !fill(false) {
+            return false;
+        }
         record_predicated(
             list,
             resource,
@@ -536,9 +539,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             predicate.as_ref(),
         );
         let (bytes, key) = (bytes as u64, resource as usize);
-        list.defer_host((0, 0), move || {
+        list.defer_plane((at, len), move || {
+            let filled = fill(predicate.is_some());
             let runs = match &predicate {
-                Some(p) => p.decide(!gpu_written(key)),
+                Some(p) => p.decide(filled && !gpu_written(key)),
                 None => true,
             };
             COPIES[usize::from(runs)].fetch_add(1, Ordering::Relaxed);
@@ -705,26 +709,30 @@ fn fill_plane(
     dst: usize,
     bytes: usize,
     pitch: usize,
-) {
+    direct: bool,
+) -> bool {
     // SAFETY: the list owns this full upload buffer until its GPU work completes.
     let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
     let mip = &layout.mips[0];
-    if mip.offset == 0
+    if direct
+        && mip.offset == 0
         && mip.pitch as usize * layout.desc.element_bytes as usize == pitch
         && bytes <= len
         && crate::host::read_into(at as *const u8, out)
     {
-        return;
+        return true;
     }
     let mut read = take_room(len);
     if !crate::host::read_into(at as *const u8, &mut read) {
-        crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, len, false);
+        give_room(read);
+        return false;
     }
-    if let Err(error) = layout.detile(&read, 0, 0, out, pitch, bytes) {
-        out.fill(0);
+    let result = layout.detile(&read, 0, 0, out, pitch, bytes);
+    if let Err(ref error) = result {
         once!("could not copy a linear movie plane into the list's upload buffer: {error:?}");
     }
     give_room(read);
+    result.is_ok()
 }
 
 /// Records in `list` the copy of subresource `i` of a staging buffer
@@ -5221,7 +5229,9 @@ mod tests {
         for (width, height) in [(256u64, 4u32), (64, 4)] {
             let desc =
                 crate::resource::tests_support::linear_sampled(width, height, DXGI_FORMAT_R8_UNORM);
-            let resource = committed(&desc);
+            const LEN: usize = 64 << 10;
+            let at = private_memory(LEN, false);
+            let resource = crate::resource::tests_support::at_address(at as u64, &desc);
             let snap_res = committed(&desc);
             let started = std::time::Instant::now();
             while crate::resource::host_resource(resource).is_none()
@@ -5288,10 +5298,33 @@ mod tests {
             check(snap_tex, 0x11);
             check(texture, 0x22);
 
+            // Lose the CPU backing after recording. Both the predicated path
+            // and the unpredicated list with a primed buffer retain frame two.
+            for no_predicate in [false, true] {
+                use windows_sys::Win32::System::Memory::{
+                    MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+                };
+                let _mode = no_predicate.then(WithoutPredicates::new);
+                let reader = host.new_list().unwrap();
+                assert!(upload(&reader, resource, texture));
+                reader.close();
+                // SAFETY: these pages belong to the test and all earlier lists have drained.
+                assert_ne!(unsafe { VirtualFree(at as *mut _, LEN, MEM_DECOMMIT) }, 0);
+                host.execute(&[&reader]);
+                host.drain();
+                check(texture, 0x22);
+                // SAFETY: recommit the same reserved pages before writing the next frame.
+                assert!(
+                    !unsafe { VirtualAlloc(at as *const _, LEN, MEM_COMMIT, PAGE_READWRITE) }
+                        .is_null()
+                );
+                fill(0x22);
+            }
             drop((list1, snap, list2));
             type Release = extern "system" fn(This) -> u32;
             assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
             assert_eq!(crate::object::slot::<Release>(snap_res, 0x10)(snap_res), 0);
+            free_memory(at, LEN);
         }
     }
 }

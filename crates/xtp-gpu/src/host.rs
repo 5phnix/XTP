@@ -3203,22 +3203,11 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
-    /// Allocates a per-list upload buffer (`size` bytes, kept alive until the
-    /// list is reset) for a CPU-written linear movie plane and schedules `fill`
-    /// from title memory `read` (`(address, len)`) at submission time.
-    // Ported from edsuuu/VI-BR-PORT commit fd36f4a4 (GPL-3.0-or-later).
-    pub(crate) fn plane_upload(
-        &self,
-        size: u64,
-        read: (usize, usize),
-        fill: impl Fn(usize) + Send + 'static,
-    ) -> Option<ID3D12Resource> {
-        let (buffer, data) = self.upload(host()?, size)?;
-        let dst = data as usize;
+    /// Refreshes a list-owned movie plane after settling its title memory range.
+    pub(crate) fn defer_plane(&self, read: (usize, usize), fill: impl Fn() + Send + 'static) {
         self.deferred()
             .copies
-            .push(Step::Plane(read, Box::new(move || fill(dst))));
-        Some(buffer)
+            .push(Step::Plane(read, Box::new(fill)));
     }
 
     /// At each submission of the list, in order with its copies: what the
