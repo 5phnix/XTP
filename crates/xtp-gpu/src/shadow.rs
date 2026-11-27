@@ -508,8 +508,12 @@ impl Shadow {
     /// Notes the 64 KiB blocks a refresh of `len` bytes at `address` takes
     /// ([`loose_use`]).
     fn note_refreshed(&self, address: u64, len: u64) {
-        let from = address - self.start;
-        let mask = block_mask(from, from + len);
+        // Below the copy: nothing of it (callers never ask so; a count is no
+        // reason to panic).
+        let Some(from) = address.checked_sub(self.start) else {
+            return;
+        };
+        let mask = block_mask(from, from.saturating_add(len));
         let blocks = &self.looked[4];
         if blocks.load(Ordering::Relaxed) & mask != mask {
             blocks.fetch_or(mask, Ordering::Relaxed);
@@ -526,7 +530,12 @@ impl Shadow {
         if last.load(Ordering::Relaxed) != now {
             last.store(now, Ordering::Relaxed);
         }
-        let (from, to) = (address - self.start, (end - self.start).min(self.len));
+        // Below the copy: nothing more to note (`loose` and `existing` look
+        // up windows holding the address).
+        let Some(from) = address.checked_sub(self.start) else {
+            return;
+        };
+        let to = end.saturating_sub(self.start).min(self.len);
         if from < low.load(Ordering::Relaxed) {
             low.fetch_min(from, Ordering::Relaxed);
         }
@@ -5354,6 +5363,9 @@ mod tests {
         let far = existing(window + 0x2F_0000, 0x2_0000).expect("the same copy");
         assert!(Arc::ptr_eq(&shadow, &far));
         shadow.note_refreshed(window + 0x10_0000, 0x1000);
+        // Below the copy: ignored, not a panic.
+        shadow.note_refreshed(window - 1, 0x1000);
+        shadow.note_lookup(window - 1, window + 8);
         let [last, low, high, blocks, refreshed] =
             shadow.looked.each_ref().map(|n| n.load(Ordering::Relaxed));
         assert!(last >= now, "looked up at {last}, after submission {now}");
