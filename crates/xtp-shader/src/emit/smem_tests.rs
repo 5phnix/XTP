@@ -518,3 +518,285 @@ fn scalar_loads_read_a_structured_view_chosen_from_the_heap() {
         assert_eq!(out, console_reads(data));
     }
 }
+
+/// Self-sized scalar buffer loads (`Options::self_sized_loads_via_memory`)
+/// redirect the load through a host-supplied raw view (`SELF_SIZED_RAW_SRV`)
+/// instead of reusing the descriptor handle whose dimensions computed the
+/// offset, returning 0 when the offset wraps past the end (e.g. `size - 8`
+/// on a 4-byte buffer) while still applying the non-16-byte `bias`.
+#[test]
+fn self_sized_scalar_load_uses_separate_raw_view_and_zeros_past_end() {
+    let s_sub_u32 = |d: u8, s: u8, imm: u8| {
+        0x8080_0000 | u32::from(d) << 16 | u32::from(inline(imm)) << 8 | u32::from(s)
+    };
+    let words = [
+        s_mov(4, 0),
+        s_mov(5, inline(0)),
+        smem(2, 8, 4, 0, NULL)[0],
+        smem(2, 8, 4, 0, NULL)[1], // s_load_dwordx4 s[8:11], s[4:5], null (SRV)
+        smem(2, 16, 4, 0x20, NULL)[0],
+        smem(2, 16, 4, 0x20, NULL)[1], // s_load_dwordx4 s[16:19], s[4:5], 0x20 (UAV)
+        WAIT_SCALAR,
+        s_sub_u32(12, 10, 8), // s12 = size - 8 (wraps near 4 GiB when size == 4)
+        smem(9, 20, 8, 0, 12)[0],
+        smem(9, 20, 8, 0, 12)[1], // s_buffer_load_dwordx2 s[20:21], s[8:11], s12
+        WAIT_SCALAR,
+        v_mov(0, 20),
+        store(0, 16, 0)[0],
+        store(0, 16, 0)[1],
+        v_mov(1, 21),
+        store(1, 16, 4)[0],
+        store(1, 16, 4)[1],
+        S_ENDPGM,
+    ];
+    assert!(text(&words).iter().any(|l| l.starts_with("s_sub_u32 s12")));
+    let mut p = program(
+        &words,
+        vec![param(RootType::Table, 0)],
+        vec![entry(ResourceType::Srv, 0), entry(ResourceType::Uav, 8)],
+    );
+    p.io = StageIo::Cs(ComputeIo {
+        rsrc2: 1 << 1,
+        threads: [32, 1, 1],
+    });
+
+    let cs_default = emit_for(&p, super::Target::ANY).unwrap();
+    assert!(
+        !cs_default
+            .user_data
+            .iter()
+            .any(|u| u.root == super::SELF_SIZED_RAW_SRV),
+        "default translation must stay unchanged"
+    );
+
+    let cs_alt = super::with_options(
+        super::Options {
+            self_sized_loads_via_memory: true,
+        },
+        || emit_for(&p, super::Target::ANY).unwrap(),
+    );
+    let ud_entry = cs_alt
+        .user_data
+        .iter()
+        .find(|u| u.root == super::SELF_SIZED_RAW_SRV)
+        .expect("self-sized load must request SELF_SIZED_RAW_SRV");
+    assert_eq!((ud_entry.slot, ud_entry.dword), (0, 0));
+    assert!(
+        cs_alt
+            .user_data
+            .iter()
+            .any(|u| u.root == super::SELF_SIZED_VIEW_BYTES && (u.slot, u.dword) == (0, 0)),
+        "self-sized load must also request SELF_SIZED_VIEW_BYTES"
+    );
+
+    // Also stays active when the runtime stride table is enabled (`stride_table: true`).
+    let cs_table = super::with_options(
+        super::Options {
+            self_sized_loads_via_memory: true,
+        },
+        || {
+            emit_for(
+                &p,
+                super::Target {
+                    lanes_min: 32,
+                    lanes_max: 64,
+                    stride_table: true,
+                },
+            )
+            .unwrap()
+        },
+    );
+    assert!(
+        cs_table
+            .user_data
+            .iter()
+            .any(|u| u.root == super::SELF_SIZED_RAW_SRV)
+    );
+
+    // Negative control: a scalar load whose offset is independent of dword 2
+    // does not trigger the self-sized path even when the option is set.
+    let mut independent = words;
+    independent[7] = s_mov(12, inline(0));
+    let cs_indep = super::with_options(
+        super::Options {
+            self_sized_loads_via_memory: true,
+        },
+        || {
+            let mut p_indep = program(
+                &independent,
+                vec![param(RootType::Table, 0)],
+                vec![entry(ResourceType::Srv, 0), entry(ResourceType::Uav, 8)],
+            );
+            p_indep.io = StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [32, 1, 1],
+            });
+            emit_for(&p_indep, super::Target::ANY).unwrap()
+        },
+    );
+    assert!(
+        !cs_indep
+            .user_data
+            .iter()
+            .any(|u| u.root == super::SELF_SIZED_RAW_SRV)
+    );
+
+    let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(host) = Host::test_device() else {
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&cs_alt).unwrap();
+    let raw_backing = [0x9999_9999u32, 0x1111_2222, 0x3333_4444];
+    let small = [0xdead_beefu32];
+    for (data, mh_data, bias, expected) in [
+        // Normal read of `size - 8` on an 8-byte view, backed at slot 2 with bias 4 bytes.
+        (
+            &[0x1111_2222u32, 0x3333_4444][..],
+            &raw_backing[..],
+            4u32,
+            [0x1111_2222u32, 0x3333_4444],
+        ),
+        // Underflow on a 4-byte view: `size - 8` wraps to 0xFFFF_FFFC; `a + bias` wraps
+        // to 0 if unguarded, so both the range check and select keep it 0.
+        (&small[..], &raw_backing[..], 4u32, [0u32; 2]),
+    ] {
+        let mut ud = vec![0; cs_alt.user_data_dwords() as usize];
+        let byte_len = std::mem::size_of_val(data) as u32;
+        for u in &cs_alt.user_data {
+            match u.root {
+                super::SELF_SIZED_RAW_SRV => ud[u.index as usize] = (2 << 4) | bias,
+                super::SELF_SIZED_VIEW_BYTES => ud[u.index as usize] = byte_len,
+                _ => {}
+            }
+        }
+        let views = [
+            View::Buffer {
+                data,
+                stride: Stride::Raw,
+            },
+            View::RawUav(2),
+            View::Buffer {
+                data: mh_data,
+                stride: Stride::Raw,
+            },
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(out[0][..2], expected, "bias={bias}, len={}", data.len());
+    }
+
+    // Structured SRV with `XTP_RAW_STRUCTURED=0`: `s10` is element count (2),
+    // `(s10 - 1) * 16` = byte offset 16, and `SELF_SIZED_VIEW_BYTES` = 32 bytes
+    // (where `getDimensions(h).x` would be 2 elements and wrongly clamp `16 < 2`).
+    let structured_words = [
+        s_mov(4, 0),
+        s_mov(5, inline(0)),
+        smem(2, 8, 4, 0, NULL)[0],
+        smem(2, 8, 4, 0, NULL)[1],
+        smem(2, 16, 4, 0x20, NULL)[0],
+        smem(2, 16, 4, 0x20, NULL)[1],
+        WAIT_SCALAR,
+        s_sub_u32(12, 10, 1),
+        s_lshl(12, 12, 4),
+        smem(8, 20, 8, 0, 12)[0],
+        smem(8, 20, 8, 0, 12)[1],
+        WAIT_SCALAR,
+        v_mov(0, 20),
+        store(0, 16, 0)[0],
+        store(0, 16, 0)[1],
+        S_ENDPGM,
+    ];
+    let mut p_struct = program(
+        &structured_words,
+        vec![param(RootType::Table, 0)],
+        vec![
+            UsedResource {
+                stride: 16,
+                ..entry(ResourceType::Srv, 0)
+            },
+            entry(ResourceType::Uav, 8),
+        ],
+    );
+    p_struct.io = StageIo::Cs(ComputeIo {
+        rsrc2: 1 << 1,
+        threads: [32, 1, 1],
+    });
+    let cs_struct = super::with_options(
+        super::Options {
+            self_sized_loads_via_memory: true,
+        },
+        || {
+            super::RAW_STRUCTURED_TEST.set(Some(false));
+            let r = emit_for(&p_struct, super::Target::ANY);
+            super::RAW_STRUCTURED_TEST.set(None);
+            r.unwrap()
+        },
+    );
+    let (s_root, s_pso) = host.compute_pipeline(&cs_struct).unwrap();
+    let struct_data = [
+        0x1111_2222u32,
+        0x3333_4444,
+        0x5555_6666,
+        0x7777_8888,
+        0xaaaa_bbbb,
+        0xcccc_dddd,
+        0xeeee_ffff,
+        0x1234_5678,
+    ];
+    let struct_backing = [
+        0x9999_9999u32,
+        0x1111_2222,
+        0x3333_4444,
+        0x5555_6666,
+        0x7777_8888,
+        0xaaaa_bbbb,
+        0xcccc_dddd,
+        0xeeee_ffff,
+        0x1234_5678,
+    ];
+    let mut ud = vec![0; cs_struct.user_data_dwords() as usize];
+    for u in &cs_struct.user_data {
+        match u.root {
+            super::SELF_SIZED_RAW_SRV => ud[u.index as usize] = (2 << 4) | 4,
+            super::SELF_SIZED_VIEW_BYTES => {
+                ud[u.index as usize] = std::mem::size_of_val(&struct_data) as u32;
+            }
+            _ => {}
+        }
+    }
+    let out = host
+        .dispatch(
+            &s_root,
+            &s_pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[
+                    View::Buffer {
+                        data: &struct_data,
+                        stride: Stride::Structured(16),
+                    },
+                    View::RawUav(1),
+                    View::Buffer {
+                        data: &struct_backing,
+                        stride: Stride::Raw,
+                    },
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap();
+    assert_eq!(out[0][0], 0xaaaa_bbbb);
+}

@@ -771,6 +771,17 @@ mod tests {
     }
 
     #[test]
+    fn adapter_ids_returns_vendor_and_device() {
+        let Some(gpu) =
+            crate::testgpu::device("host::tests::adapter_ids_returns_vendor_and_device")
+        else {
+            return;
+        };
+        let (vendor, device) = gpu.host().adapter_ids().expect("adapter IDs");
+        assert!(vendor != 0 || device != 0);
+    }
+
+    #[test]
     fn the_frame_line_counts_title_submissions() {
         let ms = std::time::Duration::from_millis;
         let mut s = Submissions::new();
@@ -1469,6 +1480,25 @@ impl Host {
             tracing::info!(mesh, "host mesh shader support");
             mesh
         })
+    }
+
+    /// The adapter's PCI vendor and device IDs; `None` if the system does
+    /// not name the adapter.
+    // Ported from PastiiJay/klbf-lab commit f73233c8 (author aidzz / @BrokeAsh, GPL-3.0-or-later).
+    pub(crate) fn adapter_ids(&self) -> Option<(u32, u32)> {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+        };
+        // SAFETY: plain DXGI queries for this device's adapter.
+        let desc = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .ok()?
+                .EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid())
+                .ok()?
+                .GetDesc1()
+                .ok()?
+        };
+        Some((desc.VendorId, desc.DeviceId))
     }
 
     /// A new list, open for recording.

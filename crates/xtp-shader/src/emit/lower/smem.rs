@@ -10,7 +10,7 @@ use super::{Lower, Val, Why};
 use crate::emit::bitcode::{Attr, Bin, V, pred};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Reg, Value};
-use crate::native::{ResourceType, UsedResource};
+use crate::native::{ResourceType, RootType, UsedResource};
 use crate::resource::{Address, CODE, Role, Site, Source};
 
 /// What a descriptor dword with no host value (an address, a format,
@@ -168,6 +168,12 @@ impl<'a> Lower<'a> {
                         l.s.m.bin(c, Bin::And, addr, dword)
                     }
                 };
+                if kind == 11
+                    && crate::emit::options().self_sized_loads_via_memory
+                    && let Some((slot, dword)) = l.self_sized(inst, src, soffset)
+                {
+                    return l.self_sized_load(src, addr, count, slot, dword);
+                }
                 if l.raw_through_table(src) {
                     // Through the runtime stride table's raw view, as the
                     // slot's vector accesses by offset read it (`buffer.rs`):
@@ -259,6 +265,108 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// Whether `to` is computed from `from` by scalar or vector arithmetic
+    /// (moves included), within `depth` instructions.
+    fn reaches(&self, from: Value, to: Value, depth: u32) -> bool {
+        if from == to {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            i.reads.iter().any(|r| r.1 == from)
+                && matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
+                && i.writes.iter().any(|w| self.reaches(w.1, to, depth - 1))
+        })
+    }
+
+    /// If the scalar buffer load `inst` reads its static descriptor-table view
+    /// `src` at an offset computed from that view's own record count (dword 2
+    /// of the descriptor its scalar load read), returns `(slot, dword)` in the
+    /// table; otherwise `None`.
+    fn self_sized(&self, inst: &Inst, src: &Source, soffset: &Operand) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first: 0 } = src else {
+            return None;
+        };
+        let Operand::Scalar { code: so, .. } = *soffset else {
+            return None;
+        };
+        if so == NULL {
+            return None;
+        }
+        let off = inst.read(Reg::S(so))?;
+        let load_site = *load;
+        let load = &self.x.p.blocks[load_site.0].insts[load_site.1];
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = load.fields
+        else {
+            return None;
+        };
+        if !load
+            .write(Reg::S(code + 2))
+            .is_some_and(|size| self.reaches(size, off, 6))
+        {
+            return None;
+        }
+        self.self_sized_table(load_site)
+    }
+
+    /// Table slot and dword offset for a descriptor loaded statically from
+    /// a descriptor table, or `None` for any other source.
+    fn self_sized_table(&self, site: Site) -> Option<(u8, u32)> {
+        let a = self.scalar.get(&site).copied()?;
+        let rp = *self.x.native.layout.get(a.param)?;
+        if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
+            return None;
+        }
+        Some((rp.slot, a.offset / 4))
+    }
+
+    /// A self-sized scalar buffer load ([`Self::self_sized`]) through a
+    /// host-supplied raw view (`SELF_SIZED_RAW_SRV`) bounded by the host-supplied
+    /// byte length (`SELF_SIZED_VIEW_BYTES`): `count` dwords at `addr`, each
+    /// 0 past the view's end.
+    // Ported and adapted from PastiiJay/klbf-lab commit f73233c8 (author aidzz / @BrokeAsh, GPL-3.0-or-later).
+    fn self_sized_load(
+        &mut self,
+        src: &Source,
+        addr: V,
+        count: u32,
+        slot: u8,
+        dword: u32,
+    ) -> Result<Vec<V>, Why> {
+        self.note_run_time(src, 11);
+        let c = self.cur;
+        let size = self.host_word(crate::emit::SELF_SIZED_VIEW_BYTES, slot, dword);
+        let binding = self.host_word(crate::emit::SELF_SIZED_RAW_SRV, slot, dword);
+        let (four, fifteen) = (self.s.m.i32(4), self.s.m.i32(15));
+        let mh_slot = self.s.m.bin(c, Bin::LShr, binding, four);
+        let bias = self.s.m.bin(c, Bin::And, binding, fifteen);
+        let mh = self.s.heap_handle(c, mh_slot, false, false, (11, 0));
+        let zero = self.s.m.i32(0);
+        let mut xs = Vec::with_capacity(count as usize);
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let a = self.s.m.bin(c, Bin::Add, addr, off);
+            // Whole dword inside the view: `a < size` and `size - a >= 4`
+            // (not `a + 4 <= size`, which wraps for an offset near 4 GiB).
+            let before_end = self.s.m.cmp(c, pred::IULT, a, size);
+            let left = self.s.m.bin(c, Bin::Sub, size, a);
+            let fits = self.s.m.cmp(c, pred::IUGE, left, four);
+            let no_carry = self.s.m.cmp(c, pred::IUGE, a, addr);
+            let fits = self.s.m.bin(c, Bin::And, fits, no_carry);
+            let inside = self.s.m.bin(c, Bin::And, before_end, fits);
+            let byte = self.s.m.bin(c, Bin::Add, a, bias);
+            let byte = self.s.m.select(c, inside, byte, size);
+            let x = self.raw_words(mh, byte, 1)[0];
+            xs.push(self.s.m.select(c, inside, x, zero));
+        }
+        Ok(xs)
     }
 
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
