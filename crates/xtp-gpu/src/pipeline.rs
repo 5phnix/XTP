@@ -141,7 +141,11 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let started = std::time::Instant::now();
-                let done = translate(&self.container, self.native().map_err(str::to_owned));
+                let done = translate(
+                    &self.container,
+                    self.native().map_err(str::to_owned),
+                    self_sized_options(&self.hash),
+                );
                 let ms = started.elapsed().as_millis() as u64;
                 match &done {
                     Ok(t) => tracing::info!(
@@ -174,12 +178,125 @@ impl Shader {
     }
 }
 
+/// PCI vendor ID and RDNA 4 device IDs (Navi 48: RX 9070 XT, RX 9070, Radeon
+/// AI PRO R9700; Navi 44: RX 9060 XT / RX 9060) affected by the `amdxc64.dll`
+/// null-read compiler crash on self-sized scalar buffer loads.
+#[cfg(windows)]
+const AMD_VENDOR: u32 = 0x1002;
+#[cfg(windows)]
+const RDNA4_DEVICES: [u32; 3] = [0x7550, 0x7551, 0x7590];
+
+#[cfg(windows)]
+fn is_rdna4(ids: Option<(u32, u32)>) -> bool {
+    ids.is_some_and(|(vendor, device)| vendor == AMD_VENDOR && RDNA4_DEVICES.contains(&device))
+}
+
+#[cfg(windows)]
+enum SelfSizedMode {
+    Off,
+    All,
+    Hashes(Vec<String>),
+}
+
+#[cfg(windows)]
+fn parse_self_sized_mode(ids: Option<(u32, u32)>, override_var: Option<&str>) -> SelfSizedMode {
+    let Some(value) = override_var else {
+        return if is_rdna4(ids) {
+            SelfSizedMode::All
+        } else {
+            SelfSizedMode::Off
+        };
+    };
+    let trimmed = value.trim();
+    match trimmed {
+        "" | "0" => SelfSizedMode::Off,
+        _ if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none") => {
+            SelfSizedMode::Off
+        }
+        "1" => SelfSizedMode::All,
+        _ if trimmed.eq_ignore_ascii_case("all") => SelfSizedMode::All,
+        _ if trimmed.eq_ignore_ascii_case("rdna4") => {
+            if is_rdna4(ids) {
+                SelfSizedMode::All
+            } else {
+                SelfSizedMode::Off
+            }
+        }
+        _ => {
+            let hashes: Vec<String> = trimmed
+                .split(',')
+                .map(str::trim)
+                .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .map(str::to_ascii_lowercase)
+                .collect();
+            SelfSizedMode::Hashes(hashes)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn options_for_mode(mode: &SelfSizedMode, hash: &str) -> xtp_shader::emit::Options {
+    let via_memory = match mode {
+        SelfSizedMode::Off => false,
+        SelfSizedMode::All => true,
+        SelfSizedMode::Hashes(hashes) => hashes.iter().any(|h| h.eq_ignore_ascii_case(hash)),
+    };
+    xtp_shader::emit::Options {
+        self_sized_loads_via_memory: via_memory,
+    }
+}
+
+#[cfg(all(windows, test))]
+fn self_sized_options_from(
+    ids: Option<(u32, u32)>,
+    override_var: Option<&str>,
+    hash: &str,
+) -> xtp_shader::emit::Options {
+    options_for_mode(&parse_self_sized_mode(ids, override_var), hash)
+}
+
+/// Per-shader translation options for shader `hash`.
+///
+/// Unset `XTP_SELF_SIZED_LOADS` enables `self_sized_loads_via_memory` on AMD
+/// RDNA 4 adapters (avoiding `amdxc64.dll` crashes without hardcoding title
+/// hashes in platform crates); setting `XTP_SELF_SIZED_LOADS` to `0`/`off`,
+/// `1`/`all`, `rdna4`, or a comma-separated list of 16-hex-digit hashes
+/// overrides it on any adapter.
+///
+/// The env override is cached once, while RDNA 4 detection is only latched
+/// once `crate::host::host()` has been initialized so early callers (such as
+/// `precook` or pre-device setup) never latch `Off` prematurely.
+// Ported and adapted from PastiiJay/klbf-lab commit f73233c8 (author aidzz / @BrokeAsh, GPL-3.0-or-later).
+#[cfg(windows)]
+pub(crate) fn self_sized_options(hash: &str) -> xtp_shader::emit::Options {
+    static OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+    static RDNA4: OnceLock<bool> = OnceLock::new();
+    let override_var = OVERRIDE.get_or_init(|| std::env::var("XTP_SELF_SIZED_LOADS").ok());
+    let ids = if override_var
+        .as_deref()
+        .is_none_or(|v| v.trim().eq_ignore_ascii_case("rdna4"))
+    {
+        let rdna4 =
+            crate::host::host().is_some_and(|h| *RDNA4.get_or_init(|| is_rdna4(h.adapter_ids())));
+        rdna4.then_some((AMD_VENDOR, RDNA4_DEVICES[0]))
+    } else {
+        None
+    };
+    let mode = parse_self_sized_mode(ids, override_var.as_deref());
+    options_for_mode(&mode, hash)
+}
+
 /// The translation of `container` for the host's wave sizes
 /// ([`crate::device::host_target`]), with what its console program says
 /// of itself (`native`, [`native`]'s).
 #[cfg(windows)]
-fn translate(container: &[u8], native: Result<&Native, String>) -> Result<Translated, String> {
-    let host = crate::shader_cache::host_shader(container, crate::device::host_target())?;
+fn translate(
+    container: &[u8],
+    native: Result<&Native, String>,
+    options: xtp_shader::emit::Options,
+) -> Result<Translated, String> {
+    let host =
+        crate::shader_cache::host_shader_with(container, crate::device::host_target(), options)?;
     let native = native?.clone();
     Ok(Translated {
         host,
@@ -941,5 +1058,60 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn self_sized_options_detect_rdna4_and_respect_overrides() {
+        for device in [0x7550, 0x7551, 0x7590] {
+            assert!(
+                self_sized_options_from(Some((AMD_VENDOR, device)), None, "0123456789abcdef")
+                    .self_sized_loads_via_memory
+            );
+            assert!(
+                !self_sized_options_from(Some((AMD_VENDOR, device)), Some("0"), "0123456789abcdef")
+                    .self_sized_loads_via_memory
+            );
+            assert!(
+                !self_sized_options_from(
+                    Some((AMD_VENDOR, device)),
+                    Some("off"),
+                    "0123456789abcdef"
+                )
+                .self_sized_loads_via_memory
+            );
+        }
+        assert!(
+            !self_sized_options_from(Some((AMD_VENDOR, 0x744c)), None, "0123456789abcdef")
+                .self_sized_loads_via_memory
+        );
+        assert!(
+            !self_sized_options_from(Some((0x10de, 0x2684)), None, "0123456789abcdef")
+                .self_sized_loads_via_memory
+        );
+        assert!(
+            !self_sized_options_from(None, Some("rdna4"), "0123456789abcdef")
+                .self_sized_loads_via_memory
+        );
+        assert!(
+            self_sized_options_from(None, Some("1"), "0123456789abcdef")
+                .self_sized_loads_via_memory
+        );
+        assert!(
+            self_sized_options_from(
+                None,
+                Some("0123456789ABCDEF, fedcba9876543210"),
+                "fedcba9876543210"
+            )
+            .self_sized_loads_via_memory
+        );
+        assert!(
+            !self_sized_options_from(
+                None,
+                Some("0123456789abcdef,fedcba9876543210"),
+                "aaaaaaaaaaaaaaaa"
+            )
+            .self_sized_loads_via_memory
+        );
     }
 }

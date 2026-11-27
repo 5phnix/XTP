@@ -1559,7 +1559,8 @@ impl State {
     ) -> Result<(), &'static str> {
         let l = &list.list;
         use xtp_shader::emit::{
-            INDEXED_ADDRESS_SRV, PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, VECTOR_ADDRESS_SRV,
+            INDEXED_ADDRESS_SRV, PACKED_ADDRESS_SRV, SCALAR_ADDRESS_SRV, SELF_SIZED_RAW_SRV,
+            SELF_SIZED_VIEW_BYTES, VECTOR_ADDRESS_SRV,
         };
         list.decode_uses
             .lock()
@@ -1655,6 +1656,20 @@ impl State {
                             .find(|b| b.0 == u.slot)
                             .ok_or("missing root UAV bias")?
                             .1;
+                        continue;
+                    }
+                    if matches!(u.root, SELF_SIZED_RAW_SRV | SELF_SIZED_VIEW_BYTES) {
+                        let table = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                            Some(&Root::Table(table)) => Some(table),
+                            _ => None,
+                        };
+                        let (slot_and_bias, bytes) =
+                            self.self_sized_raw_srv(list, table, u.dword)?;
+                        values[u.index as usize] = if u.root == SELF_SIZED_RAW_SRV {
+                            slot_and_bias
+                        } else {
+                            bytes
+                        };
                         continue;
                     }
                     if matches!(
@@ -2392,6 +2407,55 @@ impl State {
 
     /// Lie la copie qui contient la base. Le shader conserve l'index GPU et
     /// l'identité du tampon, même pour une base décalée dans la copie.
+    fn raw_slice_srv(
+        &mut self,
+        list: &HostList,
+        copy: &Arc<crate::shadow::Shadow>,
+        (title, offset, len): (u64, u64, u64),
+        (too_large, no_slot): (&'static str, &'static str),
+    ) -> Result<u32, &'static str> {
+        let heap = self.host_heaps[0];
+        let host = host_heap(heap).ok_or("a raw buffer slice without a view heap")?;
+        let bias = offset % 16;
+        let span = len
+            .checked_add(bias)
+            .filter(|&n| n <= u64::from(xtp_shader::emit::RawWindow::MAX_DWORDS) * 4)
+            .ok_or(too_large)?;
+        let slot = host.shared_raw(copy, offset - bias, span).ok_or(no_slot)?;
+        self.recording.shared(list, heap, slot);
+        copy.refresh(list, title, len);
+        Ok((slot << 4) | bias as u32)
+    }
+
+    fn self_sized_raw_srv(
+        &mut self,
+        list: &HostList,
+        table: Option<u64>,
+        dword: u32,
+    ) -> Result<(u32, u32), &'static str> {
+        if let Some((copy, title, offset, len)) = table
+            .and_then(|t| crate::descriptor::view(t + u64::from(dword) * 4))
+            .and_then(|v| crate::descriptor::host::srv_range(&v))
+        {
+            let slot_and_bias = self.raw_slice_srv(
+                list,
+                &copy,
+                (title, offset, len),
+                (
+                    "a self-sized buffer view too large for a raw view",
+                    "no shared slot for a self-sized buffer load",
+                ),
+            )?;
+            return Ok((slot_and_bias, u32::try_from(len).unwrap_or(u32::MAX)));
+        }
+        let heap = self.host_heaps[0];
+        let host = host_heap(heap).ok_or("a self-sized buffer load without a view heap")?;
+        let slot = host
+            .null_raw()
+            .ok_or("no dynamic slot for a null self-sized buffer load")?;
+        Ok((slot << 4, 0))
+    }
+
     fn indexed_address_srv(
         &mut self,
         list: &HostList,
@@ -2401,21 +2465,17 @@ impl State {
             .filter(|&a| a != 0)
             .and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)))
             .ok_or("an indexed BVH buffer without a host copy")?;
-        let heap = self.host_heaps[0];
-        let host = host_heap(heap).ok_or("an indexed BVH buffer without a view heap")?;
         let offset = copy.offset(a);
-        let bias = offset % 16;
         let len = copy.left(a);
-        let span = len
-            .checked_add(bias)
-            .filter(|&n| n <= u64::from(xtp_shader::emit::RawWindow::MAX_DWORDS) * 4)
-            .ok_or("an indexed BVH buffer too large for a raw view")?;
-        let slot = host
-            .shared_raw(&copy, offset - bias, span)
-            .ok_or("no shared slot for an indexed BVH buffer")?;
-        self.recording.shared(list, heap, slot);
-        copy.refresh(list, a, len);
-        Ok((slot << 4) | bias as u32)
+        self.raw_slice_srv(
+            list,
+            &copy,
+            (a, offset, len),
+            (
+                "an indexed BVH buffer too large for a raw view",
+                "no shared slot for an indexed BVH buffer",
+            ),
+        )
     }
 
     /// The slot, in the view heap set on the host list (the title's, or
