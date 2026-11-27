@@ -1151,6 +1151,8 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Reads a CPU-written linear movie plane into a per-list upload buffer.
+    Plane((usize, usize), Box<dyn Fn() + Send>),
     /// Shaders of the list pick buffer views of a view heap's title slots
     /// when they run: the runs those views read are brought up to date, and
     /// (shaders writing through them) those they write declared written,
@@ -1377,6 +1379,9 @@ impl Pending {
                         touches
                             .staging
                             .insert(std::sync::Arc::as_ptr(staging) as usize);
+                    }
+                    Step::Plane((address, len), _) => {
+                        touches.reads.push((*address, address.saturating_add(*len)));
                     }
                     // What the submission was given of the heap's listing,
                     // taken by its first step: the runs refreshed, and the
@@ -3241,6 +3246,13 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// Refreshes a list-owned movie plane after settling its title memory range.
+    pub(crate) fn defer_plane(&self, read: (usize, usize), fill: impl Fn() + Send + 'static) {
+        self.deferred()
+            .copies
+            .push(Step::Plane(read, Box::new(fill)));
+    }
+
     /// At each submission of the list, in order with its copies: what the
     /// buffer views of a view heap's slots that its shaders pick read is
     /// brought up to date, and what they write declared written
@@ -3383,6 +3395,13 @@ impl HostList {
                         batch.work.texture_bytes +=
                             staging.refresh(|| batch.settle_staging(staging)) as u64;
                     }
+                    Kind::Texture
+                }
+                Step::Plane((from, len), fill) => {
+                    batch.settle(*from, *len, false);
+                    let _texture = Phase::Textures.enter();
+                    fill();
+                    batch.work.texture_bytes += *len as u64;
                     Kind::Texture
                 }
                 // Each run given as a `Refresh` of it, then each run written
