@@ -523,14 +523,27 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             once!("no upload buffer for a CPU-written movie plane");
             return false;
         };
-        staging
-            .recorded
-            .store(SWEEPS.load(Ordering::Relaxed), Ordering::Relaxed);
-        const COPY_DEST: u32 = 0x400;
-        crate::list::ensure_state(list, resource, COPY_DEST);
-        let timed = crate::timestamps::command(list, crate::timestamps::What::TextureUpload, None);
-        record_subresources(list, resource, texture, &staging, &source);
-        drop(timed);
+        let predicate = target
+            .as_ref()
+            .filter(|_| may_predicate())
+            .and_then(|_| Predicate::take());
+        record_predicated(
+            list,
+            resource,
+            texture,
+            &staging,
+            &source,
+            predicate.as_ref(),
+        );
+        let (bytes, key) = (bytes as u64, resource as usize);
+        list.defer_host((0, 0), move || {
+            let runs = match &predicate {
+                Some(p) => p.decide(!gpu_written(key)),
+                None => true,
+            };
+            COPIES[usize::from(runs)].fetch_add(1, Ordering::Relaxed);
+            COPIED[usize::from(runs)].fetch_add(bytes, Ordering::Relaxed);
+        });
         return true;
     }
     // Tiles its title memory fills are not mapped (left for want of room,
@@ -573,31 +586,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(buffer) = staging.buffer() else {
         return false;
     };
-    staging
-        .recorded
-        .store(SWEEPS.load(Ordering::Relaxed), Ordering::Relaxed);
-    const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
-    let timed = crate::timestamps::command(list, crate::timestamps::What::TextureUpload, None);
-    if let Some(p) = &predicate {
-        // SAFETY: an open list; the predicate's buffer lives for the run.
-        unsafe {
-            list.list
-                .SetPredication(&p.of.buffer, p.offset(), D3D12_PREDICATION_OP_EQUAL_ZERO)
-        };
-    }
-    // The staging buffer lives as long as `staging` holds it, and it is
-    // not released while the deferred refresh below holds `staging`, until
-    // the list is reset.
-    record_subresources(list, resource, texture, &staging, &buffer);
-    if predicate.is_some() {
-        // SAFETY: an open list.
-        unsafe {
-            list.list
-                .SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)
-        };
-    }
-    drop(timed);
+    record_predicated(
+        list,
+        resource,
+        texture,
+        &staging,
+        &buffer,
+        predicate.as_ref(),
+    );
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging.clone());
     // Then, for this list: whether its copy runs. Not over what a GPU write
@@ -622,6 +618,40 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             .push((staging.id, runs));
     });
     true
+}
+
+/// Copies all subresources of `staging` from `buffer` into `texture` on
+/// `list`, guarded by `predicate` when present.
+fn record_predicated(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    staging: &Staging,
+    buffer: &ID3D12Resource,
+    predicate: Option<&Predicate>,
+) {
+    staging
+        .recorded
+        .store(SWEEPS.load(Ordering::Relaxed), Ordering::Relaxed);
+    const COPY_DEST: u32 = 0x400;
+    crate::list::ensure_state(list, resource, COPY_DEST);
+    let timed = crate::timestamps::command(list, crate::timestamps::What::TextureUpload, None);
+    if let Some(p) = predicate {
+        // SAFETY: an open list; the predicate's buffer lives for the run.
+        unsafe {
+            list.list
+                .SetPredication(&p.of.buffer, p.offset(), D3D12_PREDICATION_OP_EQUAL_ZERO)
+        };
+    }
+    record_subresources(list, resource, texture, staging, buffer);
+    if predicate.is_some() {
+        // SAFETY: an open list.
+        unsafe {
+            list.list
+                .SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)
+        };
+    }
+    drop(timed);
 }
 
 /// Copies all subresources of `staging` from `buffer` into `texture` on `list`.
@@ -1920,24 +1950,38 @@ pub(crate) fn copy_converted(
     true
 }
 
+fn is_movie_plane(
+    tiles_none: bool,
+    convert_none: bool,
+    layout: &xtp_formats::texture::Layout,
+    footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
+    let desc = &layout.desc;
+    tiles_none
+        && convert_none
+        && desc.dimension == xtp_formats::texture::Dimension::Tex2d
+        && desc.swizzle == xtp_formats::texture::Swizzle::LINEAR
+        && desc.depth == 1
+        && desc.mips == 1
+        && desc.samples == 1
+        && footprints.len() == 1
+        && footprints[0].Offset == 0
+        && footprints[0].Footprint.Format == DXGI_FORMAT_R8_UNORM
+}
+
 impl Staging {
     /// Whether this texture is a CPU-written linear 2D single-mip `R8_UNORM`
     /// plane (such as a video decoder plane), uploaded into its own per-list
     /// upload buffer instead of the shared staging buffer.
     // Ported from edsuuu/VI-BR-PORT commit fd36f4a4 (GPL-3.0-or-later).
     fn movie_plane(&self) -> bool {
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
-        let desc = &self.layout.desc;
-        self.tiles.is_none()
-            && self.convert.is_none()
-            && desc.dimension == xtp_formats::texture::Dimension::Tex2d
-            && desc.swizzle == xtp_formats::texture::Swizzle::LINEAR
-            && desc.depth == 1
-            && desc.mips == 1
-            && desc.samples == 1
-            && self.footprints.len() == 1
-            && self.footprints[0].Offset == 0
-            && self.footprints[0].Footprint.Format == DXGI_FORMAT_R8_UNORM
+        is_movie_plane(
+            self.tiles.is_none(),
+            self.convert.is_none(),
+            &self.layout,
+            &self.footprints,
+        )
     }
 
     /// The title memory the texture is read from: start and end.
@@ -2137,8 +2181,12 @@ impl Staging {
     }
 
     /// Makes its staging buffer again if it was released, within `room`
-    /// bytes: the bytes made (0 if it had one). The new one is blank.
+    /// bytes: the bytes made (0 if it had one or uses per-list movie-plane
+    /// upload buffers). The new one is blank.
     fn make_upload(&self, room: u64) -> Result<u64, Staged> {
+        if self.movie_plane() {
+            return Ok(0);
+        }
         let mut upload = self.upload.lock().unwrap_or_else(|e| e.into_inner());
         if upload.is_some() {
             return Ok(0);
@@ -2661,42 +2709,53 @@ fn staging_within(
             Some(&mut total),
         );
     }
-    if total > room {
-        return Err(Staged::NoRoom(total));
-    }
-    let Some((buffer, data)) = host.upload_buffer(total) else {
-        once!(
-            ?desc,
-            total,
-            "no upload memory for a texture's staging buffer: asked again at its next upload"
+    let tiles = crate::resource::pool::tiles_of(texture).map(|t| Arc::downgrade(&t));
+    let (upload, made) = if is_movie_plane(tiles.is_none(), convert.is_none(), &layout, &footprints)
+    {
+        tracing::debug!(?desc, "movie plane uploaded via per-list upload buffers");
+        (None, 0)
+    } else {
+        if total > room {
+            return Err(Staged::NoRoom(total));
+        }
+        let Some((buffer, data)) = host.upload_buffer(total) else {
+            once!(
+                ?desc,
+                total,
+                "no upload memory for a texture's staging buffer: asked again at its next upload"
+            );
+            return Err(Staged::NotNow);
+        };
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+        tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+        // Under a target of its own, one line a texture: which title memory
+        // gets uploaded at all, through tables or by index
+        // (`XTP_LOG=info,xtp_gpu::texture_memory=debug`).
+        tracing::debug!(
+            target: "xtp_gpu::texture_memory",
+            memory = ?memory,
+            width = d.Width,
+            height = d.Height,
+            format = d.Format.0,
+            bytes = layout.size,
+            "a texture the title fills gets a staging buffer"
         );
-        return Err(Staged::NotNow);
-    };
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+        (
+            Some(Upload {
+                buffer,
+                data,
+                size: total,
+            }),
+            total,
         )
-    });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    // Under a target of its own, one line a texture: which title memory
-    // gets uploaded at all, through tables or by index
-    // (`XTP_LOG=info,xtp_gpu::texture_memory=debug`).
-    tracing::debug!(
-        target: "xtp_gpu::texture_memory",
-        memory = ?memory,
-        width = d.Width,
-        height = d.Height,
-        format = d.Format.0,
-        bytes = layout.size,
-        "a texture the title fills gets a staging buffer"
-    );
+    };
     let s = Arc::new(Staging {
-        upload: Mutex::new(Some(Upload {
-            buffer,
-            data,
-            size: total,
-        })),
+        upload: Mutex::new(upload),
         blank: AtomicBool::new(true),
         force: AtomicBool::new(false),
         recorded: AtomicU64::new(SWEEPS.load(Ordering::Relaxed)),
@@ -2714,7 +2773,7 @@ fn staging_within(
         suspect: AtomicBool::new(false),
         missed: AtomicU64::new(0),
         host_owned: AtomicBool::new(false),
-        tiles: crate::resource::pool::tiles_of(texture).map(|t| Arc::downgrade(&t)),
+        tiles,
         wanted: Mutex::new(Vec::new()),
         incomplete: AtomicBool::new(false),
         evicted: AtomicBool::new(false),
@@ -2730,9 +2789,11 @@ fn staging_within(
         #[cfg(feature = "diagnostics")]
         seen: Seen::default(),
     });
-    STAGED.fetch_add(s.size, Ordering::Relaxed);
+    if made > 0 {
+        STAGED.fetch_add(made, Ordering::Relaxed);
+    }
     map.insert(resource as usize, s.clone());
-    Ok((s, total))
+    Ok((s, made))
 }
 
 /// Every few seconds (diagnostics): per frame, the textures checked, how
@@ -5177,6 +5238,8 @@ mod tests {
             let (memory, _) = crate::resource::texture_memory(resource).unwrap();
             let state = staging(resource, texture).unwrap();
             assert!(state.movie_plane());
+            assert!(state.buffer().is_none());
+            assert_eq!(staged_bytes(resource), None);
             let size = state.layout.size as usize;
             let fill = |byte: u8| {
                 // SAFETY: the texture's own title memory, `size` bytes.
