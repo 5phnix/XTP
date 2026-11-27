@@ -482,6 +482,88 @@ struct Job {
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
+/// How many DirectStorage workers run at once. The pool reads, inflates and
+/// unpacks in parallel, so the useful count is physical cores: logical
+/// processors count SMT siblings that add little while contending with the
+/// submitting thread and host copy-backs. `XTP_DSTORAGE_WORKERS` (`1..=64`)
+/// overrides the count.
+// Ported from edsuuu/VI-BR-PORT commit 4ec5c417 (upstream 0bba7624, author Key,
+// GPL-3.0-or-later).
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let override_val = std::env::var("XTP_DSTORAGE_WORKERS").ok();
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        worker_count_for(override_val.as_deref(), physical_cores(), logical)
+    })
+}
+
+fn worker_count_for(override_val: Option<&str>, physical: Option<usize>, logical: usize) -> usize {
+    if let Some(n) = override_val
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+    {
+        return n;
+    }
+    physical
+        .unwrap_or_else(|| (logical / 2).max(2))
+        .clamp(1, 32)
+}
+
+/// The PC's physical core count (`RelationProcessorCore` returns one record per
+/// core regardless of SMT siblings).
+#[cfg(windows)]
+fn physical_cores() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut len: u32 = 0;
+    // SAFETY: a null buffer with `len = 0` queries the required byte length.
+    unsafe {
+        GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len)
+    };
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: `buf` is `len` bytes long and writable for the call.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buf.as_mut_ptr()
+                .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let valid_len = (len as usize).min(buf.len());
+    const SIZE_OFFSET: usize = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size);
+    let header_end = SIZE_OFFSET + size_of::<u32>();
+    let mut at = 0usize;
+    let mut cores = 0usize;
+    while at + header_end <= valid_len {
+        // SAFETY: `at + header_end <= valid_len` keeps the `u32` `Size` field
+        // strictly within the buffer written by `GetLogicalProcessorInformationEx`.
+        let size =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(at + SIZE_OFFSET).cast::<u32>()) }
+                as usize;
+        if size < header_end || at + size > valid_len {
+            break;
+        }
+        cores += 1;
+        at += size;
+    }
+    (cores > 0).then_some(cores)
+}
+
+#[cfg(not(windows))]
+fn physical_cores() -> Option<usize> {
+    None
+}
+
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
@@ -513,7 +595,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -2795,5 +2877,24 @@ mod tests {
         assert!(trace_keeps("memory", "memory 0x140400000"));
         assert!(!trace_keeps("common.rpf", r"G:\levels.rpf"));
         assert!(!trace_keeps("common.rpf", "memory 0x140400000"));
+    }
+
+    #[test]
+    fn worker_count_prefers_physical_cores_and_respects_override() {
+        assert_eq!(worker_count_for(None, Some(8), 16), 8);
+        assert_eq!(worker_count_for(None, Some(64), 128), 32);
+        assert_eq!(worker_count_for(None, None, 16), 8);
+        assert_eq!(worker_count_for(None, None, 2), 2);
+        assert_eq!(worker_count_for(Some("12"), Some(8), 16), 12);
+        assert_eq!(worker_count_for(Some("64"), Some(8), 16), 64);
+        assert_eq!(worker_count_for(Some("0"), Some(8), 16), 8);
+        assert_eq!(worker_count_for(Some("65"), Some(8), 16), 8);
+        assert_eq!(worker_count_for(Some("invalid"), Some(8), 16), 8);
+        #[cfg(windows)]
+        {
+            let cores = physical_cores().expect("physical core count on Windows");
+            let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+            assert!((1..=logical).contains(&cores));
+        }
     }
 }
