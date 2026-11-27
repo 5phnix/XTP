@@ -495,6 +495,15 @@ struct Lanes<'a> {
     active: HashSet<Value>,
     /// See [`Structured::resolved`].
     resolved: HashSet<Key>,
+    /// Values consumed (directly or through mask SOPs/phis) by an actual
+    /// lane-mask consumer.
+    mask_used: HashSet<Value>,
+    /// Values flowing into a non-EXEC mask op/compare against a partial constant
+    /// (`Atom::Constant` candidate).
+    const_bit_tested: HashSet<Value>,
+    /// Non-EXEC joins mixing a lane mask with computed/loaded scalar data
+    /// without feeding a lane-mask consumer; kept out of `masks`.
+    mixed_data: HashSet<Key>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -544,6 +553,59 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        let mut mask_used = HashSet::new();
+        let mut mask_work = Vec::new();
+        let mut const_bit_tested = HashSet::new();
+        let mut test_work = Vec::new();
+        for block in blocks {
+            for inst in &block.insts {
+                let name = inst.name();
+                match &inst.fields {
+                    Fields::Sop { src, .. }
+                        if inst.write(Reg::S(EXEC)).is_some()
+                            || inst.write(Reg::S(EXEC + 1)).is_some()
+                            || name.starts_with("s_wqm_")
+                            || is_mask_query(name) =>
+                    {
+                        for s in src {
+                            push_scalar_op(inst, s, p.wave64, &mut mask_used, &mut mask_work);
+                        }
+                    }
+                    Fields::Sopp { .. } if name.starts_with("s_cbranch_vcc") => {
+                        for reg in [Reg::S(VCC), Reg::S(VCC + 1)] {
+                            if let Some(v) = inst.read(reg)
+                                && mask_used.insert(v)
+                            {
+                                mask_work.push(v);
+                            }
+                        }
+                    }
+                    Fields::Valu(v) if name == "v_cndmask_b32" || name.contains("_co_ci_") => {
+                        if let Some(s) = v.src.get(2) {
+                            push_scalar_op(inst, s, p.wave64, &mut mask_used, &mut mask_work);
+                        }
+                    }
+                    Fields::Valu(v) if name.starts_with("v_mbcnt_") => {
+                        if let Some(s) = v.src.first() {
+                            push_scalar_op(inst, s, p.wave64, &mut mask_used, &mut mask_work);
+                        }
+                    }
+                    _ => {}
+                }
+                if let Fields::Sop { src, .. } = &inst.fields
+                    && (is_mask_sop(name, p.wave64) || is_mask_cmp(name, p.wave64))
+                    && inst.write(Reg::S(EXEC)).is_none()
+                    && inst.write(Reg::S(EXEC + 1)).is_none()
+                    && src.iter().any(|s| is_partial_const(s, p.wave64))
+                {
+                    for s in src {
+                        push_scalar_op(inst, s, p.wave64, &mut const_bit_tested, &mut test_work);
+                    }
+                }
+            }
+        }
+        propagate_mask_uses(p, &phis, &defs, &mut mask_used, &mut mask_work);
+        propagate_mask_uses(p, &phis, &defs, &mut const_bit_tested, &mut test_work);
         Ok(Lanes {
             p,
             console,
@@ -565,6 +627,9 @@ impl<'a> Lanes<'a> {
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             resolved: HashSet::new(),
+            mask_used,
+            const_bit_tested,
+            mixed_data: HashSet::new(),
         })
     }
 
@@ -579,6 +644,7 @@ impl<'a> Lanes<'a> {
         self.when.fill(None);
         self.active.clear();
         self.resolved.clear();
+        self.mixed_data.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -881,6 +947,7 @@ impl<'a> Lanes<'a> {
             .flatten()
             .any(|(_, i)| matches!(target.phis[i].reg, Reg::S(c) if c == EXEC || c == EXEC + 1));
         let mut derived = false;
+        let mut opaque_data = false;
         // Some mask coming in is one of `Structured::resolved`.
         let mut pinned = false;
         // (edge condition, mask) per forward edge; back edges come later.
@@ -890,10 +957,22 @@ impl<'a> Lanes<'a> {
             if self.index[q] < self.index[block] {
                 let (m, d) = self.mask(a);
                 derived |= d;
+                opaque_data |= (!d && has_defined_opaque(&self.b, &self.defs, m))
+                    || self.mixed_data.contains(&a);
                 pinned |= self.resolved.contains(&a);
                 let e = self.edge(self.first[q], q, taken);
                 forward.push((e, m));
             }
+        }
+        if !exec
+            && opaque_data
+            && (self.const_bit_tested.contains(&k.0) || self.const_bit_tested.contains(&k.1))
+            && !self.mask_used.contains(&k.0)
+            && !self.mask_used.contains(&k.1)
+        {
+            self.mixed_data.insert(k);
+            let born = self.index[block];
+            return Some((self.b.atom(Atom::Opaque(id), born), false));
         }
         if forward.len() == args.len()
             && let Some(&(_, m)) = forward.first()
@@ -1290,6 +1369,134 @@ fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), 
     }
 }
 
+fn is_mask_combine(op: &str) -> bool {
+    matches!(
+        op,
+        "and" | "or" | "xor" | "andn2" | "orn2" | "andn1" | "orn1" | "nand" | "nor" | "xnor"
+    )
+}
+
+fn is_mask_sop(name: &str, wave64: bool) -> bool {
+    let width = if wave64 { "_b64" } else { "_b32" };
+    let Some(op) = name.strip_prefix("s_").and_then(|s| s.strip_suffix(width)) else {
+        return false;
+    };
+    if let Some(op) = op
+        .strip_suffix("_saveexec")
+        .or_else(|| op.strip_suffix("_wrexec"))
+    {
+        return is_mask_combine(op);
+    }
+    matches!(op, "mov" | "not" | "wqm" | "cselect") || is_mask_combine(op)
+}
+
+fn is_mask_cmp(name: &str, wave64: bool) -> bool {
+    let width = if wave64 { "64" } else { "32" };
+    name.strip_prefix("s_cmp_")
+        .and_then(|r| r.strip_suffix(width))
+        .is_some_and(|r| r == "eq_u" || r == "lg_u")
+}
+
+fn is_mask_query(name: &str) -> bool {
+    name.starts_with("s_bcnt") || name.starts_with("s_ff") || name.starts_with("s_flbit_i32_b")
+}
+
+fn is_partial_const(op: &Operand, wave64: bool) -> bool {
+    let raw = match *op {
+        Operand::Const(c @ 128..=208) => {
+            let v = if c <= 192 {
+                i64::from(c) - 128
+            } else {
+                192 - i64::from(c)
+            };
+            v as u64
+        }
+        Operand::Literal(x) => u64::from(x),
+        _ => return false,
+    };
+    let v = if wave64 { raw } else { raw & 0xFFFF_FFFF };
+    let all = u64::MAX >> (32 * u8::from(!wave64));
+    v != 0 && v != all
+}
+
+fn push_scalar_op(
+    inst: &Inst,
+    op: &Operand,
+    wave64: bool,
+    used: &mut HashSet<Value>,
+    work: &mut Vec<Value>,
+) {
+    if let Operand::Scalar { code, .. } = *op
+        && code != NULL
+    {
+        if let Some(v) = inst.read(Reg::S(code))
+            && used.insert(v)
+        {
+            work.push(v);
+        }
+        if wave64
+            && let Some(v) = inst.read(Reg::S(code + 1))
+            && used.insert(v)
+        {
+            work.push(v);
+        }
+    }
+}
+
+fn propagate_mask_uses(
+    p: &Program,
+    phis: &Map<Value, (usize, usize)>,
+    defs: &Map<Value, (usize, usize)>,
+    used: &mut HashSet<Value>,
+    work: &mut Vec<Value>,
+) {
+    while let Some(v) = work.pop() {
+        if let Some(&(b, i)) = phis.get(&v) {
+            for &a in &p.blocks[b].phis[i].args {
+                if used.insert(a) {
+                    work.push(a);
+                }
+            }
+        } else if let Some(&(b, i)) = defs.get(&v) {
+            let inst = &p.blocks[b].insts[i];
+            if is_mask_sop(inst.name(), p.wave64)
+                && let Fields::Sop { src, .. } = &inst.fields
+            {
+                for s in src {
+                    push_scalar_op(inst, s, p.wave64, used, work);
+                }
+            }
+        }
+    }
+}
+
+fn has_defined_opaque(b: &Bools, defs: &Map<Value, (usize, usize)>, x: Bool) -> bool {
+    let Some((atom, lo, hi)) = b.node(x) else {
+        return false;
+    };
+    if lo == Bool::FALSE && hi == Bool::TRUE {
+        return matches!(atom, Atom::Opaque(v) if defs.contains_key(&v));
+    }
+    let mut stack = vec![x];
+    let mut seen = HashSet::new();
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        let Some((atom, lo, hi)) = b.node(cur) else {
+            continue;
+        };
+        if let Atom::Opaque(v) = atom
+            && defs.contains_key(&v)
+        {
+            return true;
+        }
+        stack.push(lo);
+        stack.push(hi);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1584,5 +1791,148 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn a_reused_mask_sgpr_bit_test_stays_uniform() {
+        let p = build(
+            &[
+                0xBF07_8000, // s_cmp_lg_u32 s0, 0
+                0xBF84_0003, // s_cbranch_scc0 -> 20
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0x8502_807E, // s_cselect_b32 s2, exec_lo, 0
+                0xBF82_0001, // s_branch -> 24
+                0x8102_8101, // 20: s_add_i32 s2, s1, 1
+                0x8703_FF02,
+                0x0010_0000, // 24: s_and_b32 s3, s2, 0x00100000
+                0xBF06_8003, // s_cmp_eq_u32 s3, 0
+                0xBF84_0002, // s_cbranch_scc0 -> 48
+                0x7E02_0281, // v_mov_b32 v1, 1
+                S_ENDPGM,
+                0x7E02_0282, // 48: v_mov_b32 v1, 2
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let (join, phi_s2) = p
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(b, blk)| {
+                blk.phis
+                    .iter()
+                    .find(|phi| phi.reg == Reg::S(2))
+                    .map(|phi| (b, phi.value))
+            })
+            .unwrap();
+        let s3 = p.blocks[join]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_and_b32")
+            .unwrap()
+            .write(Reg::S(3))
+            .unwrap();
+        let scc = p.blocks[join]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_cmp_eq_u32")
+            .unwrap()
+            .write(Reg::Scc)
+            .unwrap();
+        let s = structure(&p).unwrap();
+        let sc = structure_console(&p).unwrap();
+        for res in [&s, &sc] {
+            assert!(!res.masks.contains_key(&phi_s2));
+            assert!(!res.masks.contains_key(&s3));
+            assert!(!res.sccs.contains_key(&scc));
+        }
+        let LaneExit::Branch { when, .. } = s.exits[join] else {
+            panic!("{:?}", s.exits);
+        };
+        assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
+    }
+
+    #[test]
+    fn a_mixed_mask_phi_used_as_a_mask_stays_tracked() {
+        let p = build(
+            &[
+                0xBF07_8000, // s_cmp_lg_u32 s0, 0
+                0xBF84_0003, // s_cbranch_scc0 -> 20
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0x8502_807E, // s_cselect_b32 s2, exec_lo, 0
+                0xBF82_0001, // s_branch -> 24
+                0x8102_8101, // 20: s_add_i32 s2, s1, 1
+                0x8703_FF02,
+                0x0010_0000, // 24: s_and_b32 s3, s2, 0x00100000
+                0xBE84_3C03, // s_and_saveexec_b32 s4, s3
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0xBEFE_0304, // s_mov_b32 exec_lo, s4
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let (join, phi_s2) = p
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(b, blk)| {
+                blk.phis
+                    .iter()
+                    .find(|phi| phi.reg == Reg::S(2))
+                    .map(|phi| (b, phi.value))
+            })
+            .unwrap();
+        let s3 = p.blocks[join]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_and_b32")
+            .unwrap()
+            .write(Reg::S(3))
+            .unwrap();
+        for res in [structure(&p).unwrap(), structure_console(&p).unwrap()] {
+            assert!(res.masks.contains_key(&phi_s2));
+            assert!(res.masks.contains_key(&s3));
+        }
+    }
+
+    #[test]
+    fn a_zero_compare_on_a_mixed_phi_stays_tracked() {
+        let p = build(
+            &[
+                0xBF07_8000, // s_cmp_lg_u32 s0, 0
+                0xBF84_0003, // s_cbranch_scc0 -> 20
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0x8502_807E, // s_cselect_b32 s2, exec_lo, 0
+                0xBF82_0001, // s_branch -> 24
+                0x8102_8101, // 20: s_add_i32 s2, s1, 1
+                0xBF06_8002, // 24: s_cmp_eq_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> 36
+                0x7E02_0281, // v_mov_b32 v1, 1
+                S_ENDPGM,    // 36
+            ],
+            false,
+        );
+        let (join, phi_s2) = p
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(b, blk)| {
+                blk.phis
+                    .iter()
+                    .find(|phi| phi.reg == Reg::S(2))
+                    .map(|phi| (b, phi.value))
+            })
+            .unwrap();
+        let scc = p.blocks[join]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_cmp_eq_u32")
+            .unwrap()
+            .write(Reg::Scc)
+            .unwrap();
+        for res in [structure(&p).unwrap(), structure_console(&p).unwrap()] {
+            assert!(res.masks.contains_key(&phi_s2));
+            assert!(res.sccs.contains_key(&scc));
+        }
     }
 }
