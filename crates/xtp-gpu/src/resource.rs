@@ -3541,6 +3541,14 @@ pub(crate) mod tests_support {
         }
     }
 
+    /// [`sampled`] with linear layout (`layout = 1`), e.g. for movie planes.
+    pub(crate) fn linear_sampled(width: u64, height: u32, format: u32) -> ResourceDesc {
+        ResourceDesc {
+            layout: 1,
+            ..sampled(width, height, format)
+        }
+    }
+
     /// A title resource described by `desc` over memory at `address`.
     pub(crate) fn at_address(address: u64, desc: &ResourceDesc) -> This {
         let mut out = std::ptr::null();

@@ -511,6 +511,28 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Ok(staging) = staging(resource, texture) else {
         return false;
     };
+    if staging.movie_plane() {
+        let (at, len) = staging.range();
+        let len = len - at;
+        let pitch = staging.footprints[0].Footprint.RowPitch as usize;
+        let bytes = pitch * staging.rows[0] as usize;
+        let plane = staging.clone();
+        let Some(source) = list.plane_upload(bytes as u64, (at, len), move |dst| {
+            fill_plane(&plane.layout, at, len, dst, bytes, pitch);
+        }) else {
+            once!("no upload buffer for a CPU-written movie plane");
+            return false;
+        };
+        staging
+            .recorded
+            .store(SWEEPS.load(Ordering::Relaxed), Ordering::Relaxed);
+        const COPY_DEST: u32 = 0x400;
+        crate::list::ensure_state(list, resource, COPY_DEST);
+        let timed = crate::timestamps::command(list, crate::timestamps::What::TextureUpload, None);
+        record_subresources(list, resource, texture, &staging, &source);
+        drop(timed);
+        return true;
+    }
     // Tiles its title memory fills are not mapped (left for want of room,
     // or given back) and a resident heap has room for them: the check at
     // submission detiles whatever the memory says, mapping them, and the
@@ -567,36 +589,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // The staging buffer lives as long as `staging` holds it, and it is
     // not released while the deferred refresh below holds `staging`, until
     // the list is reset.
-    for (i, footprint) in staging.footprints.iter().enumerate() {
-        #[cfg(feature = "diagnostics")]
-        {
-            let f = footprint.Footprint;
-            // SAFETY: live resources.
-            let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
-            list.note_read(
-                || {
-                    format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        d.Width,
-                        d.Height,
-                        d.DepthOrArraySize,
-                        d.Format.0,
-                        d.MipLevels,
-                        staging.footprints.len(),
-                        staging.size,
-                        footprint.Offset,
-                        f.Width,
-                        f.Height,
-                        f.Depth,
-                        f.RowPitch
-                    )
-                },
-                (gpu + footprint.Offset, len),
-            );
-        }
-        copy_subresource(&list.list, texture, &buffer, i, footprint);
-    }
+    record_subresources(list, resource, texture, &staging, &buffer);
     if predicate.is_some() {
         // SAFETY: an open list.
         unsafe {
@@ -629,6 +622,79 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             .push((staging.id, runs));
     });
     true
+}
+
+/// Copies all subresources of `staging` from `buffer` into `texture` on `list`.
+fn record_subresources(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    staging: &Staging,
+    buffer: &ID3D12Resource,
+) {
+    let _ = resource;
+    for (i, footprint) in staging.footprints.iter().enumerate() {
+        #[cfg(feature = "diagnostics")]
+        {
+            let f = footprint.Footprint;
+            // SAFETY: live resources.
+            let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            list.note_read(
+                || {
+                    format!(
+                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        d.Width,
+                        d.Height,
+                        d.DepthOrArraySize,
+                        d.Format.0,
+                        d.MipLevels,
+                        staging.footprints.len(),
+                        staging.size,
+                        footprint.Offset,
+                        f.Width,
+                        f.Height,
+                        f.Depth,
+                        f.RowPitch
+                    )
+                },
+                (gpu + footprint.Offset, len),
+            );
+        }
+        copy_subresource(&list.list, texture, buffer, i, footprint);
+    }
+}
+
+/// Copies a CPU-written linear movie plane from `[at, at + len)` into a
+/// list's dedicated upload buffer `dst` (`bytes` bytes, host `pitch`).
+// Ported from edsuuu/VI-BR-PORT commit fd36f4a4 (GPL-3.0-or-later).
+fn fill_plane(
+    layout: &xtp_formats::texture::Layout,
+    at: usize,
+    len: usize,
+    dst: usize,
+    bytes: usize,
+    pitch: usize,
+) {
+    // SAFETY: the list owns this full upload buffer until its GPU work completes.
+    let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
+    let mip = &layout.mips[0];
+    if mip.offset == 0
+        && mip.pitch as usize * layout.desc.element_bytes as usize == pitch
+        && bytes <= len
+        && crate::host::read_into(at as *const u8, out)
+    {
+        return;
+    }
+    let mut read = take_room(len);
+    if !crate::host::read_into(at as *const u8, &mut read) {
+        crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, len, false);
+    }
+    if let Err(error) = layout.detile(&read, 0, 0, out, pitch, bytes) {
+        out.fill(0);
+        once!("could not copy a linear movie plane into the list's upload buffer: {error:?}");
+    }
+    give_room(read);
 }
 
 /// Records in `list` the copy of subresource `i` of a staging buffer
@@ -1855,6 +1921,25 @@ pub(crate) fn copy_converted(
 }
 
 impl Staging {
+    /// Whether this texture is a CPU-written linear 2D single-mip `R8_UNORM`
+    /// plane (such as a video decoder plane), uploaded into its own per-list
+    /// upload buffer instead of the shared staging buffer.
+    // Ported from edsuuu/VI-BR-PORT commit fd36f4a4 (GPL-3.0-or-later).
+    fn movie_plane(&self) -> bool {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
+        let desc = &self.layout.desc;
+        self.tiles.is_none()
+            && self.convert.is_none()
+            && desc.dimension == xtp_formats::texture::Dimension::Tex2d
+            && desc.swizzle == xtp_formats::texture::Swizzle::LINEAR
+            && desc.depth == 1
+            && desc.mips == 1
+            && desc.samples == 1
+            && self.footprints.len() == 1
+            && self.footprints[0].Offset == 0
+            && self.footprints[0].Footprint.Format == DXGI_FORMAT_R8_UNORM
+    }
+
     /// The title memory the texture is read from: start and end.
     pub(crate) fn range(&self) -> (usize, usize) {
         let start = self.memory as usize;
@@ -5057,5 +5142,93 @@ mod tests {
         assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x1111_1111));
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+    }
+
+    /// CPU-written linear `R8_UNORM` movie planes get their own per-list upload
+    /// buffers, so overlapping flights never overwrite an earlier frame's upload
+    /// or skip uploads when the title rewrites title memory between lists.
+    #[test]
+    fn movie_planes_use_distinct_per_list_upload_buffers() {
+        let test = "texture::tests::movie_planes_use_distinct_per_list_upload_buffers";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        const COPY_SOURCE: u32 = 0x800;
+        const DXGI_FORMAT_R8_UNORM: u32 = 61;
+
+        for (width, height) in [(256u64, 4u32), (64, 4)] {
+            let desc =
+                crate::resource::tests_support::linear_sampled(width, height, DXGI_FORMAT_R8_UNORM);
+            let resource = committed(&desc);
+            let snap_res = committed(&desc);
+            let started = std::time::Instant::now();
+            while crate::resource::host_resource(resource).is_none()
+                || crate::resource::host_resource(snap_res).is_none()
+            {
+                assert!(
+                    started.elapsed().as_secs() < 5,
+                    "the host copies never became resident"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let texture = crate::resource::host_resource(resource).unwrap();
+            let snap_tex = crate::resource::host_resource(snap_res).unwrap();
+            let (memory, _) = crate::resource::texture_memory(resource).unwrap();
+            let state = staging(resource, texture).unwrap();
+            assert!(state.movie_plane());
+            let size = state.layout.size as usize;
+            let fill = |byte: u8| {
+                // SAFETY: the texture's own title memory, `size` bytes.
+                unsafe { memory.cast_mut().write_bytes(byte, size) }
+            };
+
+            let list1 = host.new_list().unwrap();
+            let snap = host.new_list().unwrap();
+            let list2 = host.new_list().unwrap();
+
+            let mut gate = crate::host::Gate::close(host);
+            fill(0x11);
+            assert!(upload(&list1, resource, texture));
+            list1.close();
+            host.execute(&[&list1]);
+
+            crate::list::ensure_state(&snap, resource, COPY_SOURCE);
+            crate::list::ensure_state(&snap, snap_res, COPY_DEST);
+            // SAFETY: open list; both textures are live and transitioned.
+            unsafe { snap.list.CopyResource(snap_tex, texture) };
+            snap.close();
+            host.execute(&[&snap]);
+
+            fill(0x22);
+            assert!(upload(&list2, resource, texture));
+            list2.close();
+            host.execute(&[&list2]);
+
+            gate.open();
+            host.drain();
+            assert!(decided(&state).is_empty());
+
+            let row_width = width as usize;
+            let check = |tex: &ID3D12Resource, expected: u8| {
+                let raw = read_back(host, tex, COPY_DEST);
+                for y in 0..height as usize {
+                    assert!(
+                        raw[y * 256..y * 256 + row_width]
+                            .iter()
+                            .all(|&b| b == expected),
+                        "row {y} mismatch for {width}x{height}: {:x?}",
+                        &raw[y * 256..y * 256 + row_width.min(16)]
+                    );
+                }
+            };
+            check(snap_tex, 0x11);
+            check(texture, 0x22);
+
+            drop((list1, snap, list2));
+            type Release = extern "system" fn(This) -> u32;
+            assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+            assert_eq!(crate::object::slot::<Release>(snap_res, 0x10)(snap_res), 0);
+        }
     }
 }
