@@ -6,13 +6,14 @@
 //! order, or a part of its name (case ignored). Every adapter is logged at
 //! startup, then the one chosen and why.
 //!
-//! The Agility SDK is not loaded: Windows 11's own D3D12 runtime has shader
-//! model 6.6 and up, which translated shaders need (wave sizes, directly
-//! indexed heaps); the host's model is logged with its wave lanes
-//! (`device::host_shader_model`).
+//! When `D3D12\D3D12Core.dll` (`Microsoft.Direct3D.D3D12`, **exactly
+//! 1.614.0**) sits beside the executable, [`crate::agility`] loads it via
+//! `ID3D12SDKConfiguration1::CreateDeviceFactory`; otherwise XTP falls back to
+//! the Windows inbox D3D12 runtime. Translated shaders need shader model 6.6
+//! and up (wave sizes, directly indexed heaps); the host's model is logged
+//! with its wave lanes (`device::host_shader_model`).
 
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+use windows::Win32::Graphics::Direct3D12::ID3D12Device;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{IUnknown, Interface};
 
@@ -92,9 +93,8 @@ fn adapters() -> windows::core::Result<Vec<(Adapter, IDXGIAdapter1)>> {
             let Ok(adapter) = adapter else { break };
             let desc = adapter.GetDesc1()?;
             let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
-            let usable = D3D12CreateDevice(
+            let usable = crate::agility::create_device(
                 &adapter,
-                D3D_FEATURE_LEVEL_12_0,
                 std::ptr::null_mut::<Option<ID3D12Device>>(),
             )
             .is_ok();

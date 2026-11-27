@@ -553,6 +553,14 @@ fn host_shaders() -> Option<HostShaders> {
             shader_model = format_args!("{}.{}", shaders.model.0, shaders.model.1),
             "host shaders"
         );
+        if shaders.model < (6, 6) && !crate::agility::is_loaded() {
+            tracing::warn!(
+                shader_model = format_args!("{}.{}", shaders.model.0, shaders.model.1),
+                "host D3D12 runtime is below shader model 6.6; place D3D12\\D3D12Core.dll \
+                 from Microsoft.Direct3D.D3D12 (exactly 1.614.0, x64) beside the executable \
+                 on Windows 10"
+            );
+        }
         if shaders.lanes.1 < 32 {
             // WARP: 4 to 4 (VIctory #578 logs it too).
             tracing::warn!(

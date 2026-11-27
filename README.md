@@ -44,6 +44,18 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+Windows 11 includes shader model 6.6+ in the OS runtime. On Windows 10 (or
+any OS build whose inbox D3D12 runtime is below shader model 6.6), XTP
+loads the D3D12 Agility SDK dynamically through
+`ID3D12SDKConfiguration1::CreateDeviceFactory` when `D3D12\D3D12Core.dll`
+sits beside `xtp.exe`, and falls back to the Windows inbox D3D12 runtime
+otherwise:
+
+- Package: `Microsoft.Direct3D.D3D12` **exactly 1.614.0**, `x64` (`D3D12SDKVersion = 614`; another version fails to load with `0x887E0003` and falls back to inbox D3D12).
+- Placement: copy `build\native\bin\x64\D3D12Core.dll` into `target\<profile>\D3D12\` beside each `xtp.exe` you run (for example `target\release\D3D12\D3D12Core.dll` or `target\diag\D3D12\D3D12Core.dll`).
+- Debug layer: when `D3D12\D3D12Core.dll` is used, `XTP_D3D12_DEBUG=1` requires the matching `build\native\bin\x64\d3d12SDKLayers.dll` from the same `1.614.0` package beside it in `target\<profile>\D3D12\`.
+- Never commit redistributable DLLs to the repository.
+
 Pixel shaders with wave operations take shader model 6.7
 (`WaveOpsIncludeHelperLanes`, so that helper lanes take part in them as they
 do on the console). A GPU without 6.7 refuses those pixel shaders, and their
@@ -199,7 +211,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `XTP_CAPTURE=<dir>` | saves presented frames (powers of two, or `XTP_CAPTURE_FRAMES=<list>`) |
 | `XTP_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `XTP_D3D12_DEBUG=1` | host debug layer |
+| `XTP_D3D12_DEBUG=1` | host debug layer (with `D3D12\D3D12Core.dll` present, needs matching `d3d12SDKLayers.dll` from `Microsoft.Direct3D.D3D12` 1.614.0 in `D3D12\`) |
 | `XTP_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `XTP_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `XTP_D3D12_DRED=contexts` | as the above, with DRED's breadcrumb contexts (marker texts kept by the runtime; slower, and empty on NVIDIA so far: docs/analysis/device-removed.md) |
