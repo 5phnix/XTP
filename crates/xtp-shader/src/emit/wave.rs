@@ -149,7 +149,12 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
-            break;
+            // An outer `saveexec` whose restore is in another block is not a
+            // whole-wave section here, so keep scanning later sections in this
+            // block (adapted from TaynanGT/Vice-Tay commit `17e3e2c8` by shh,
+            // GPL-3.0-or-later).
+            i += 1;
+            continue;
         };
         let body = &insts[i + 1..end];
         let mut constants = HashMap::new();
@@ -790,8 +795,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_sum_with_carry_out_reduces_only_the_low_word() {
+    fn carry_out_reduction_words() -> Vec<u32> {
         let mut words: Vec<u32> = vec![
             0xbe86_3dc1, // save EXEC in s6 and enable the whole wave
             0xd501_0005,
@@ -819,6 +823,12 @@ mod tests {
             0xbefe_0306,
             0xbf81_0000, // restore EXEC and end
         ]);
+        words
+    }
+
+    #[test]
+    fn a_sum_with_carry_out_reduces_only_the_low_word() {
+        let words = carry_out_reduction_words();
         let code = words
             .iter()
             .flat_map(|w| w.to_le_bytes())
@@ -835,6 +845,32 @@ mod tests {
             Some(&Shape::Active(Op::AddU, input, mask, 0))
         );
         assert!(!sec.shapes.contains_key(&read(5)));
+    }
+
+    #[test]
+    fn an_unmatched_saveexec_leaves_later_sections_of_its_block() {
+        // Prepend `s_or_saveexec_b32 s2, -1` restored nowhere in this block.
+        let mut words = vec![0xbe82_3dc1];
+        words.extend(carry_out_reduction_words());
+        let code = words
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>();
+        let p = crate::ir::build(&code, false, 16).unwrap();
+        let sections = sections(&p, 0);
+        assert!(
+            !sections.contains_key(&0),
+            "unmatched saveexec should not form a section"
+        );
+        let sec = &sections[&1];
+        let insts = &p.blocks[0].insts;
+        let input = insts[2].read(Reg::V(0)).unwrap();
+        let mask = insts[1].write(Reg::S(6)).unwrap();
+        let out = insts.iter().find_map(|i| i.write(Reg::S(4))).unwrap();
+        assert_eq!(
+            sec.shapes.get(&out),
+            Some(&Shape::Active(Op::AddU, input, mask, 0))
+        );
     }
 
     #[test]
