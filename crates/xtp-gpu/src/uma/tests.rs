@@ -10,7 +10,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4,
 };
@@ -521,7 +520,7 @@ fn warp() -> Option<&'static ID3D12Device> {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
             let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            crate::agility::create_device(&adapter, &mut device).ok()?;
             device
         }
     })

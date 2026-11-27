@@ -155,10 +155,15 @@ cargo test -p xtp-shader -p xtp-gpu --locked
   cargo test -p xtp-gpu --features diagnostics --locked
   ```
 
-- Translated shaders need shader model 6.6. XTP does not load the Agility
-  SDK and relies on Windows 11's D3D12 runtime for it
-  (`crates/xtp-gpu/src/dxgi/adapter.rs`), so on Windows 10 tests that need
-  SM 6.6 may skip.
+- Translated shaders need shader model 6.6. When `D3D12\D3D12Core.dll`
+  (`Microsoft.Direct3D.D3D12` **exactly 1.614.0**, `x64`) sits beside the
+  executable, XTP loads it via
+  `ID3D12SDKConfiguration1::CreateDeviceFactory` (`crates/xtp-gpu/src/agility.rs`);
+  otherwise it falls back to the Windows inbox D3D12 runtime
+  (`crates/xtp-gpu/src/dxgi/adapter.rs`), so on Windows 10 without those DLLs
+  tests that need SM 6.6 may skip. When using an Agility SDK folder with
+  `XTP_D3D12_DEBUG=1`, copy `d3d12SDKLayers.dll` from the same `1.614.0`
+  package alongside `D3D12Core.dll`. Never commit Agility SDK DLLs.
 
 Long commands take `--jobs N` (`translate`, `shader-survey`, `precook`) to
 leave cores for you; `precook` also runs at below-normal priority.

@@ -37,7 +37,6 @@ use preparation::Phase;
 use timeline::{Timeline, Touches};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -440,11 +439,26 @@ fn create(software: bool) -> windows::core::Result<Host> {
         // The debug layer only in builds with diagnostics.
         let debug = cfg!(feature = "diagnostics") && std::env::var_os("XTP_D3D12_DEBUG").is_some();
         if debug {
-            let mut layer: Option<ID3D12Debug> = None;
-            match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
-                Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
-            }
+            let layer =
+                match crate::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+                    Ok(layer) => {
+                        layer.EnableDebugLayer();
+                        Some(layer)
+                    }
+                    Err(e) if crate::agility::is_loaded() => {
+                        tracing::warn!(
+                            error = %e,
+                            "no D3D12 debug layer (XTP_D3D12_DEBUG requires \
+                             d3d12SDKLayers.dll from Microsoft.Direct3D.D3D12 \
+                             exactly 1.614.0 beside D3D12Core.dll)"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no D3D12 debug layer");
+                        None
+                    }
+                };
             // GPU-based validation (`XTP_D3D12_GBV`): out-of-range
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
@@ -465,25 +479,24 @@ fn create(software: bool) -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
-            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            }
+        if dred_on()
+            && let Ok(dred) = crate::agility::configuration_interface::<
+                ID3D12DeviceRemovedExtendedDataSettings,
+            >(&CLSID_D3D12DeviceRemovedExtendedData)
+        {
+            dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         }
         // DRED 1.2: the markers' texts kept with their breadcrumbs.
         crate::dred::enable();
         let mut device: Option<ID3D12Device> = None;
         if software {
             let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            crate::agility::create_device(&adapter, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             let adapter = crate::dxgi::host_adapter();
-            D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            crate::agility::create_device(adapter.as_ref(), &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();

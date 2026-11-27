@@ -56,24 +56,23 @@ pub(crate) fn enable() {
         return;
     }
     let contexts = contexts_asked(std::env::var_os("XTP_D3D12_DRED").as_deref());
-    let mut settings: Option<ID3D12DeviceRemovedExtendedDataSettings1> = None;
     // SAFETY: a plain interface query and settings calls, before the
     // device is made (DRED reads them at device creation).
     unsafe {
-        match D3D12GetDebugInterface(&mut settings) {
-            Ok(()) => {
-                if let Some(s) = settings {
-                    s.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    s.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    if contexts {
-                        s.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    }
-                    tracing::info!(
-                        contexts,
-                        "device-removed data on: breadcrumbs, page faults, marker texts kept \
-                         by DRED only with XTP_D3D12_DRED=contexts"
-                    );
+        match crate::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings1>(
+            &CLSID_D3D12DeviceRemovedExtendedData,
+        ) {
+            Ok(s) => {
+                s.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                s.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                if contexts {
+                    s.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 }
+                tracing::info!(
+                    contexts,
+                    "device-removed data on: breadcrumbs, page faults, marker texts kept \
+                     by DRED only with XTP_D3D12_DRED=contexts"
+                );
             }
             Err(e) => tracing::warn!(error = %e, "no DRED 1.2 settings"),
         }

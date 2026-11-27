@@ -4170,8 +4170,6 @@ mod tests {
     /// with known support; `None` (and a note) without one.
     #[cfg(windows)]
     fn warp(test: &str) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Device> {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-        use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
         use windows::Win32::Graphics::Dxgi::*;
         // SAFETY: plain DXGI and D3D12 creation.
         let device = unsafe {
@@ -4179,7 +4177,7 @@ mod tests {
                 .and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>())
                 .and_then(|adapter| {
                     let mut device = None;
-                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                    crate::agility::create_device(&adapter, &mut device)?;
                     device.ok_or_else(windows::core::Error::empty)
                 })
         };
