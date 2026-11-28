@@ -1836,6 +1836,7 @@ mod tests {
             Arc::new(Shader {
                 stage,
                 hash: hash.into(),
+                ambient: None,
                 container: b"not translated".to_vec(),
                 native: std::sync::OnceLock::from(Ok(super::super::Native {
                     used: Vec::new(),
@@ -2466,6 +2467,7 @@ mod tests {
         Arc::new(Shader {
             stage,
             hash: hash.to_owned(),
+            ambient: None,
             container: Vec::new(),
             native: Default::default(),
             translated: std::sync::OnceLock::from(translated),
@@ -2716,6 +2718,7 @@ mod tests {
             let shader = Arc::new(Shader {
                 stage: "compute",
                 hash: hash.into(),
+                ambient: None,
                 container: Vec::new(),
                 native: std::sync::OnceLock::new(),
                 translated: std::sync::OnceLock::from(Some(Translated {
@@ -2929,6 +2932,7 @@ mod tests {
             let shader = Arc::new(Shader {
                 stage: "compute",
                 hash: hash.into(),
+                ambient: None,
                 container: Vec::new(),
                 native: std::sync::OnceLock::new(),
                 translated: std::sync::OnceLock::from(Some(Translated {
