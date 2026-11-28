@@ -2098,8 +2098,17 @@ impl Staging {
     /// mips' title memory is all committed (in a 3D texture, all of them if
     /// the whole texture's is).
     fn filled_units(&self, tiles: &crate::resource::pool::Tiles) -> Vec<bool> {
+        let parts = committed_parts(self.memory, self.layout.size as usize);
+        self.units_in(tiles, &parts)
+    }
+
+    /// Which units of `tiles` are covered by the committed byte ranges `parts`.
+    fn units_in(
+        &self,
+        tiles: &crate::resource::pool::Tiles,
+        parts: &[(usize, usize)],
+    ) -> Vec<bool> {
         let layout = &self.layout;
-        let parts = committed_parts(self.memory, layout.size as usize);
         let covered = |start: u64, end: u64| {
             parts
                 .iter()
@@ -2400,20 +2409,27 @@ impl Staging {
 
     /// The texture's memory, `size` bytes of it, read into the room the
     /// checks share ([`take_room`]) through the kernel, which tells pages
-    /// that are not mapped: all of them mapped, or, for a reserved host
-    /// copy, some (`map_units` maps the units whose memory is, the copy
-    /// leaves the others; what is not mapped reads as zeros). `None`
-    /// otherwise: nothing is detiled from it.
-    /// shortcut: a host copy that is not reserved waits for all of its
-    /// memory, as it did in memory that is not write-watched.
+    /// that are not mapped: all of them mapped, or, for a reserved host copy,
+    /// at least one unit of its tiles whose memory is all readable
+    /// (`map_units` maps those units, the copy leaves the others; what is not
+    /// mapped reads as zeros). `None` otherwise (including hole-only reads
+    /// with no complete committed unit): nothing is detiled from it, so the
+    /// host copy keeps its staged texels and digest.
+    // Attribution: addresses sparse hole read digest preservation from
+    // TaynanGT/Vice-Tay commit 26aeded1 (GPL-3.0-or-later) using committed
+    // range/unit coverage rather than zero-content filtering.
     fn snapshot(&self, size: usize) -> Option<Vec<u8>> {
         let mut room = take_room(size);
         if crate::host::read_into(self.memory, &mut room) {
             return Some(room);
         }
-        if self.tiles.is_some() && any_committed(self.memory, size) {
-            crate::host::copy_mapped(room.as_mut_ptr(), self.memory, size, false);
-            return Some(room);
+        if let Some(tiles) = self.tiles()
+            && any_committed(self.memory, size)
+        {
+            let parts = crate::host::copy_mapped_parts(room.as_mut_ptr(), self.memory, size, false);
+            if !parts.is_empty() && self.units_in(&tiles, &parts).into_iter().any(|u| u) {
+                return Some(room);
+            }
         }
         give_room(room);
         None
@@ -5211,6 +5227,147 @@ mod tests {
         assert!(texels_4x4(host, texture).iter().all(|&t| t == 0x1111_1111));
         type Release = extern "system" fn(This) -> u32;
         assert_eq!(crate::object::slot::<Release>(resource, 0x10)(resource), 0);
+    }
+
+    /// A hole-only sparse read (committed pages remain, but no complete unit is
+    /// readable) returns `None` from `snapshot`, leaving both the staged
+    /// texels and `last.hash` intact until a full read or complete committed
+    /// units arrive.
+    #[test]
+    fn hole_only_sparse_read_preserves_staged_texels_and_digest() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let test = "texture::tests::hole_only_sparse_read_preserves_staged_texels_and_digest";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        const LEN: usize = 1 << 20;
+        const PAGE: usize = 4096;
+        let at = private_memory(LEN, false);
+        let Some((resource, texture, tiles)) = reserved(&sampled_chain(256, 1, 9), Some(at)) else {
+            eprintln!("{test}: skipped, the device reserves no textures (tiled resources tier 2)");
+            free_memory(at, LEN);
+            return;
+        };
+        let _alone = SweptAlone::new(resource);
+        let state = staging(resource, texture).unwrap();
+        let size = state.layout.size as usize;
+        assert!(size <= LEN && size > PAGE);
+
+        // SAFETY: committed private test allocation.
+        unsafe { (at as *mut u8).write_bytes(0x22, size) };
+        sample_in(host, resource, 1);
+        assert!(mip_is(host, texture, 0, 0x22));
+        assert!(mip_is(host, texture, 1, 0x22));
+        let staged_hash = state.last.lock().unwrap().hash;
+        assert!(staged_hash.is_some());
+
+        // Decommit everything except one tail page (zero-filled), leaving
+        // `any_committed` true while no complete unit is covered.
+        let hole_end = (size - PAGE) & !(PAGE - 1);
+        assert!(hole_end > 0 && hole_end < size);
+        // SAFETY: decommitting pages inside our private test allocation.
+        let freed = unsafe { VirtualFree(at as *mut _, hole_end, MEM_DECOMMIT) };
+        assert_ne!(freed, 0);
+        // SAFETY: the last page remains committed.
+        unsafe { ((at + hole_end) as *mut u8).write_bytes(0, size - hole_end) };
+        assert!(any_committed(at as *const u8, size));
+        assert!(!super::committed(at as *const u8, size));
+        assert!(!state.filled_units(&tiles).into_iter().any(|u| u));
+        assert!(state.snapshot(size).is_none());
+
+        sample_in(host, resource, 1);
+        assert_eq!(state.last.lock().unwrap().hash, staged_hash);
+        assert!(mip_is(host, texture, 0, 0x22));
+        assert!(mip_is(host, texture, 1, 0x22));
+
+        // Recommit all pages with legitimate zeros: the full zero texture now
+        // stages and updates the digest.
+        // SAFETY: recommitting our private test allocation.
+        let again = unsafe { VirtualAlloc(at as *const _, hole_end, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!again.is_null());
+        // SAFETY: all of `[at, at + size)` is committed.
+        unsafe { (at as *mut u8).write_bytes(0, size) };
+        sample_in(host, resource, 1);
+        assert_ne!(state.last.lock().unwrap().hash, staged_hash);
+        assert!(mip_is(host, texture, 0, 0));
+        assert!(mip_is(host, texture, 1, 0));
+
+        release(resource);
+        free_memory(at, LEN);
+    }
+
+    /// A partially committed sparse texture whose committed units genuinely
+    /// contain all-zero bytes still snapshots, reaches `map_units`, and stages
+    /// those zeros into the committed units even while another unit has a hole
+    /// (tested on both guarded/unwatched and write-watched title memory).
+    #[test]
+    fn sparse_zero_committed_units_stage_and_map_despite_unmapped_hole() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let test =
+            "texture::tests::sparse_zero_committed_units_stage_and_map_despite_unmapped_hole";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        const LEN: usize = 1 << 20;
+        const PAGE: usize = 4096;
+        for watched in [false, true] {
+            let at = private_memory(LEN, watched);
+            let Some((resource, texture, tiles)) = reserved(&sampled_chain(256, 1, 9), Some(at))
+            else {
+                eprintln!(
+                    "{test}: skipped, the device reserves no textures (tiled resources tier 2)"
+                );
+                free_memory(at, LEN);
+                return;
+            };
+            let _alone = SweptAlone::new(resource);
+            let state = staging(resource, texture).unwrap();
+            let layout = state.layout.clone();
+            let size = layout.size as usize;
+            assert!(size <= LEN);
+
+            // Stage non-zero texels across the full texture first.
+            // SAFETY: committed private test allocation.
+            unsafe { (at as *mut u8).write_bytes(0x22, size) };
+            sample_in(host, resource, 1);
+            assert!(mip_is(host, texture, 0, 0x22));
+            assert!(mip_is(host, texture, 1, 0x22));
+            let initial_hash = state.last.lock().unwrap().hash;
+
+            // Leave a hole in mip 0 while writing legitimate zeros into the
+            // remaining committed units (mip 1..).
+            let (start, end) = title_mip(&layout, 0, 0).expect("mip 0");
+            let page = (start as usize).next_multiple_of(PAGE);
+            assert!(page + PAGE <= end as usize);
+            // SAFETY: decommitting one page of our private test allocation.
+            let freed = unsafe { VirtualFree((at + page) as *mut _, PAGE, MEM_DECOMMIT) };
+            assert_ne!(freed, 0);
+            // SAFETY: writing the remaining committed pages of our allocation.
+            unsafe {
+                (at as *mut u8).write_bytes(0, page);
+                ((at + page + PAGE) as *mut u8).write_bytes(0, size - page - PAGE);
+            }
+
+            sample_in(host, resource, 1);
+            let units = tiles.units().to_vec();
+            let wanted = state.wanted.lock().unwrap().clone();
+            assert_eq!(wanted.len(), units.len());
+            for (u, &w) in units.iter().zip(&wanted) {
+                assert_eq!(w, u.first_mip != 0, "watched={watched}: {u:?}");
+            }
+            assert!(mip_is(host, texture, 1, 0), "watched={watched}");
+            assert!(mip_is(host, texture, 0, 0), "watched={watched}");
+            if !watched {
+                assert_ne!(state.last.lock().unwrap().hash, initial_hash);
+            }
+
+            release(resource);
+            free_memory(at, LEN);
+        }
     }
 
     /// CPU-written linear `R8_UNORM` movie planes get their own per-list upload

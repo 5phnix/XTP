@@ -3721,11 +3721,47 @@ impl Batch<'_> {
 /// the heap view, asking first cost 70-185 ms, asking on failure 6-17 ms:
 /// `watch::tests::guarded_copy_costs`).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_inner(dst, src, len, title_dst, None);
+}
+
+/// Like [`copy_mapped`], returning the coalesced `(start, end)` byte ranges
+/// relative to `src` that were read cleanly (excluding zero-filled holes).
+pub(crate) fn copy_mapped_parts(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    copy_mapped_inner(dst, src, len, title_dst, Some(&mut parts));
+    parts
+}
+
+fn push_mapped_part(parts: Option<&mut Vec<(usize, usize)>>, start: usize, len: usize) {
+    if let Some(parts) = parts
+        && len > 0
+    {
+        let end = start + len;
+        match parts.last_mut() {
+            Some(last) if last.1 == start => last.1 = end,
+            _ => parts.push((start, end)),
+        }
+    }
+}
+
+fn copy_mapped_inner(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+    mut mapped: Option<&mut Vec<(usize, usize)>>,
+) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
             unsafe { std::ptr::copy(src, dst, len) };
+            push_mapped_part(mapped, 0, len);
             return;
         }
         2 => return,
@@ -3748,7 +3784,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         crate::copystat::C::MoveUs,
         moved.elapsed().as_micros() as u64,
     );
-    if whole || title_dst && !crate::texture::committed(dst, len) {
+    if whole {
+        push_mapped_part(mapped, 0, len);
+        return;
+    }
+    if title_dst && !crate::texture::committed(dst, len) {
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -3756,11 +3796,17 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        let offset = at - src as usize;
+        let to = dst.wrapping_add(offset);
+        if read(at as *const u8, to, n) {
+            push_mapped_part(mapped.as_deref_mut(), offset, n);
+        } else {
             for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                let offset = at - src as usize;
+                let to = dst.wrapping_add(offset);
+                if read(at as *const u8, to, n) {
+                    push_mapped_part(mapped.as_deref_mut(), offset, n);
+                } else {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
