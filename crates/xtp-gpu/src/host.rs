@@ -37,7 +37,6 @@ use preparation::Phase;
 use timeline::{Timeline, Touches};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -440,11 +439,26 @@ fn create(software: bool) -> windows::core::Result<Host> {
         // The debug layer only in builds with diagnostics.
         let debug = cfg!(feature = "diagnostics") && std::env::var_os("XTP_D3D12_DEBUG").is_some();
         if debug {
-            let mut layer: Option<ID3D12Debug> = None;
-            match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
-                Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
-            }
+            let layer =
+                match crate::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+                    Ok(layer) => {
+                        layer.EnableDebugLayer();
+                        Some(layer)
+                    }
+                    Err(e) if crate::agility::is_loaded() => {
+                        tracing::warn!(
+                            error = %e,
+                            "no D3D12 debug layer (XTP_D3D12_DEBUG requires \
+                             d3d12SDKLayers.dll from Microsoft.Direct3D.D3D12 \
+                             exactly 1.614.0 beside D3D12Core.dll)"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no D3D12 debug layer");
+                        None
+                    }
+                };
             // GPU-based validation (`XTP_D3D12_GBV`): out-of-range
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
@@ -465,25 +479,24 @@ fn create(software: bool) -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
-            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            }
+        if dred_on()
+            && let Ok(dred) = crate::agility::configuration_interface::<
+                ID3D12DeviceRemovedExtendedDataSettings,
+            >(&CLSID_D3D12DeviceRemovedExtendedData)
+        {
+            dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         }
         // DRED 1.2: the markers' texts kept with their breadcrumbs.
         crate::dred::enable();
         let mut device: Option<ID3D12Device> = None;
         if software {
             let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            crate::agility::create_device(&adapter, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             let adapter = crate::dxgi::host_adapter();
-            D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            crate::agility::create_device(adapter.as_ref(), &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
@@ -768,6 +781,17 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    #[test]
+    fn adapter_ids_returns_vendor_and_device() {
+        let Some(gpu) =
+            crate::testgpu::device("host::tests::adapter_ids_returns_vendor_and_device")
+        else {
+            return;
+        };
+        let (vendor, device) = gpu.host().adapter_ids().expect("adapter IDs");
+        assert!(vendor != 0 || device != 0);
     }
 
     #[test]
@@ -1127,6 +1151,8 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Reads a CPU-written linear movie plane into a per-list upload buffer.
+    Plane((usize, usize), Box<dyn Fn() + Send>),
     /// Shaders of the list pick buffer views of a view heap's title slots
     /// when they run: the runs those views read are brought up to date, and
     /// (shaders writing through them) those they write declared written,
@@ -1354,6 +1380,9 @@ impl Pending {
                             .staging
                             .insert(std::sync::Arc::as_ptr(staging) as usize);
                     }
+                    Step::Plane((address, len), _) => {
+                        touches.reads.push((*address, address.saturating_add(*len)));
+                    }
                     // What the submission was given of the heap's listing,
                     // taken by its first step: the runs refreshed, and the
                     // runs its shaders write, which go back as `GpuWrite`s.
@@ -1469,6 +1498,25 @@ impl Host {
             tracing::info!(mesh, "host mesh shader support");
             mesh
         })
+    }
+
+    /// The adapter's PCI vendor and device IDs; `None` if the system does
+    /// not name the adapter.
+    // Ported from PastiiJay/klbf-lab commit f73233c8 (author aidzz / @BrokeAsh, GPL-3.0-or-later).
+    pub(crate) fn adapter_ids(&self) -> Option<(u32, u32)> {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+        };
+        // SAFETY: plain DXGI queries for this device's adapter.
+        let desc = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .ok()?
+                .EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid())
+                .ok()?
+                .GetDesc1()
+                .ok()?
+        };
+        Some((desc.VendorId, desc.DeviceId))
     }
 
     /// A new list, open for recording.
@@ -3198,6 +3246,13 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// Refreshes a list-owned movie plane after settling its title memory range.
+    pub(crate) fn defer_plane(&self, read: (usize, usize), fill: impl Fn() + Send + 'static) {
+        self.deferred()
+            .copies
+            .push(Step::Plane(read, Box::new(fill)));
+    }
+
     /// At each submission of the list, in order with its copies: what the
     /// buffer views of a view heap's slots that its shaders pick read is
     /// brought up to date, and what they write declared written
@@ -3340,6 +3395,13 @@ impl HostList {
                         batch.work.texture_bytes +=
                             staging.refresh(|| batch.settle_staging(staging)) as u64;
                     }
+                    Kind::Texture
+                }
+                Step::Plane((from, len), fill) => {
+                    batch.settle(*from, *len, false);
+                    let _texture = Phase::Textures.enter();
+                    fill();
+                    batch.work.texture_bytes += *len as u64;
                     Kind::Texture
                 }
                 // Each run given as a `Refresh` of it, then each run written

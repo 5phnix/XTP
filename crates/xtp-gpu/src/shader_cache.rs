@@ -220,35 +220,68 @@ pub(crate) fn host_key() -> [u8; 32] {
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one.
 pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
-    let translate =
-        |c: &[u8]| xtp_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
+    host_shader_with(container, target, xtp_shader::emit::Options::default())
+}
+
+/// [`host_shader`] with per-shader translation `options`; non-default options
+/// are cached under a separate key so default translations remain unaffected.
+// Ported from PastiiJay/klbf-lab commit f73233c8 (author aidzz / @BrokeAsh, GPL-3.0-or-later).
+pub(crate) fn host_shader_with(
+    container: &[u8],
+    target: Target,
+    options: xtp_shader::emit::Options,
+) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| {
+        xtp_shader::emit::translate_for_with(c, target, options).map_err(|e| e.to_string())
+    };
+    let key = option_key(&key(&build(), target), options);
     match CACHE.get() {
-        Some(cache) => kept(cache, container, target, translate),
+        Some(cache) => kept_with_key(cache, &key, target, container, translate),
         None => translate(container),
     }
 }
 
 /// The translation of the export shader (ES) of a console vertex shader
 /// container, the vertex shader of a pipeline with a geometry shader
-/// (`xtp_shader::emit::translate_es_for`), from the cache when there is
+/// (`xtp_shader::emit::translate_es_for_with`), from the cache when there is
 /// one: under a key of its own, the container being the same.
-pub(crate) fn host_es_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
-    let translate =
-        |c: &[u8]| xtp_shader::emit::translate_es_for(c, target).map_err(|e| e.to_string());
+pub(crate) fn host_es_shader_with(
+    container: &[u8],
+    target: Target,
+    options: xtp_shader::emit::Options,
+) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| {
+        xtp_shader::emit::translate_es_for_with(c, target, options).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => {
-            let key = key(&build(), target);
+            let base = key(&build(), target);
+            let es_base = es_key(&base);
+            let key = option_key(&es_base, options);
             let earlier = EARLIER
                 .get()
-                .filter(|(now, _)| *now == key)
+                .filter(|(now, _)| *now == base && key == es_base)
                 .map(|(_, e)| es_key(e));
-            compared(cache, &es_key(&key), earlier.as_ref(), container, translate)
+            compared(cache, &key, earlier.as_ref(), container, translate)
         }
         None => translate(container),
     }
 }
 
-/// An ES translation's key ([`host_es_shader`]) from the container's
+/// Folds non-default per-shader [`xtp_shader::emit::Options`] into `key` so
+/// alternate translations never collide with default cache entries.
+fn option_key(base: &[u8; 32], options: xtp_shader::emit::Options) -> [u8; 32] {
+    if options == xtp_shader::emit::Options::default() {
+        return *base;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(base);
+    h.update(b"self_sized_loads_via_memory");
+    h.update(&[u8::from(options.self_sized_loads_via_memory)]);
+    *h.finalize().as_bytes()
+}
+
+/// An ES translation's key ([`host_es_shader_with`]) from the container's
 /// translation's ([`key`]).
 fn es_key(key: &[u8; 32]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
@@ -263,6 +296,7 @@ fn es_key(key: &[u8; 32]) -> [u8; 32] {
 /// caller passes both. An error of `translate` is kept too, as the
 /// container's answer for this build and target: it must be one that would
 /// come again (a refusal of the translator), never a passing condition.
+#[cfg(test)]
 pub(crate) fn kept(
     cache: &Cache,
     container: &[u8],
@@ -270,11 +304,22 @@ pub(crate) fn kept(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
     let key = key(&build(), target);
+    kept_with_key(cache, &key, target, container, translate)
+}
+
+fn kept_with_key(
+    cache: &Cache,
+    key: &[u8; 32],
+    target: Target,
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<HostShader, String> {
+    let base = crate::shader_cache::key(&build(), target);
     let earlier = EARLIER
         .get()
-        .filter(|(now, _)| *now == key)
+        .filter(|(now, _)| *now == base && *key == base)
         .map(|&(_, e)| e);
-    compared(cache, &key, earlier.as_ref(), container, translate)
+    compared(cache, key, earlier.as_ref(), container, translate)
 }
 
 /// The key this build's translations are compared under, and the key of
@@ -1260,6 +1305,27 @@ mod tests {
     #[test]
     fn the_loop_limit_counter_is_in_the_key() {
         a_changed_setting_is_rejected(|s| s.loop_count = !s.loop_count);
+    }
+
+    #[test]
+    fn self_sized_options_use_a_distinct_cache_key() {
+        let _serial = serial();
+        let translator = translator_of(xtp_shader::SOURCES, ENCODING);
+        let base = key(
+            &build_of(&translator, &xtp_shader::emit::settings()),
+            Target::ANY,
+        );
+        assert_eq!(
+            option_key(&base, xtp_shader::emit::Options::default()),
+            base
+        );
+        let alt = option_key(
+            &base,
+            xtp_shader::emit::Options {
+                self_sized_loads_via_memory: true,
+            },
+        );
+        rejected_across(base, alt);
     }
 
     /// The Codex review of 12556d6: `XTP_SHADER_LOOP_LIMIT` unset and set

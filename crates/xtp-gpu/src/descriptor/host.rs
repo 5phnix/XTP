@@ -4048,6 +4048,24 @@ fn off_16(start: u64, element: u64) {
 /// The idea of five-star-recomp's 955a679 and 7bd1ca8 (watch.md item 201:
 /// such a view becomes a raw view at its byte, not a null one), written
 /// anew.
+fn off_element_fit(
+    buffer: &ID3D12Resource,
+    start: u64,
+    elements: u32,
+    element: u64,
+) -> Option<(u64, u64)> {
+    // SAFETY: a live buffer.
+    let width = unsafe { buffer.GetDesc() }.Width;
+    let fit = width
+        .saturating_sub(start)
+        .checked_div(element)
+        .map_or(0, |left| u64::from(elements).min(left));
+    if fit == 0 || !start.is_multiple_of(4) {
+        return None;
+    }
+    Some((fit, fit * element))
+}
+
 fn off_element_view(
     copy: &Arc<Shadow>,
     origin: u64,
@@ -4056,17 +4074,11 @@ fn off_element_view(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     viewed: Option<&mut Option<Viewed>>,
 ) -> Option<Kept> {
-    // SAFETY: a live buffer.
-    let width = unsafe { copy.buffer.GetDesc() }.Width;
-    let fit = width
-        .saturating_sub(start)
-        .checked_div(element)
-        .map_or(0, |left| u64::from(elements).min(left));
-    if fit == 0 || !start.is_multiple_of(4) {
+    let Some((fit, len)) = off_element_fit(&copy.buffer, start, elements, element) else {
         off_element(unordered, start, element);
         return None;
-    }
-    let len = fit * element;
+    };
+    let _ = fit;
     if let Some(v) = viewed {
         *v = Some(Viewed {
             copy: copy.clone(),
@@ -4181,6 +4193,49 @@ fn fit_view(
         return None;
     }
     Some(())
+}
+
+/// The host copy, title address, copy offset, and byte length viewed by a
+/// buffer shader resource view `view`, or `None` for textures/samplers/null.
+pub(crate) fn srv_range(view: &View) -> Option<(Arc<Shadow>, u64, u64, u64)> {
+    let (address, len, desc) = match view {
+        View::Shader(resource, Some(desc)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            (data as u64, len, srv_desc(desc))
+        }
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+            (address, len, srv_desc(words))
+        }
+        _ => return None,
+    };
+    let shadow = crate::shadow::find(address, len)?;
+    let element = element_size(&desc);
+    let format = desc.Format.0 as u32;
+    // SAFETY: a buffer view's union member.
+    let mut buffer = unsafe { desc.Anonymous.Buffer };
+    let offset = shadow.offset(address);
+    let origin = address - offset;
+    if element == 0 || !offset.is_multiple_of(element) {
+        let start = offset.checked_add(buffer.FirstElement.checked_mul(element)?)?;
+        let (_, bytes) = off_element_fit(&shadow.buffer, start, buffer.NumElements, element)?;
+        return Some((shadow, origin + start, start, bytes));
+    }
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    let shape = (buffer.StructureByteStride, format, raw);
+    fit_view(
+        &shadow.buffer,
+        buffer.FirstElement,
+        &mut buffer.NumElements,
+        element,
+        shape,
+    )?;
+    let start = buffer.FirstElement * element;
+    let bytes = u64::from(buffer.NumElements) * element;
+    Some((shadow, origin + start, start, bytes))
 }
 
 fn buffer_srv(
@@ -4643,7 +4698,7 @@ fn make_with(
             Some(None)
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words);
+            let desc = crate::sampler::console(words, crate::sampler::aniso_point_mip(device));
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
@@ -7956,5 +8011,22 @@ void main() {
         completed_until(host, "never given back", || heap.pool_state() == (0, 1));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn srv_range_resolves_buffer_srvs_and_skips_uav_and_cbv_views() {
+        let test =
+            "descriptor::host::tests::srv_range_resolves_buffer_srvs_and_skips_uav_and_cbv_views";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let _ = gpu.host();
+        let a = crate::testgpu::TitleBuffer::new(4096);
+        let (copy, _, start, len) =
+            srv_range(&buffer_view(false, &a, structured(16), (2, 8))).expect("buffer SRV range");
+        assert_eq!(len, 8 * 16);
+        assert_eq!(start, copy.offset(a.address()) + 2 * 16);
+        assert!(srv_range(&buffer_view(true, &a, structured(16), (0, 8))).is_none());
+        assert!(srv_range(&View::Constant(a.address(), 256)).is_none());
     }
 }

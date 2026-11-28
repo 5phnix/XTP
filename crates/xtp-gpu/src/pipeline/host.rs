@@ -671,11 +671,13 @@ fn merged_half(shader: &Shader, es: bool) -> Option<Arc<Translated>> {
 fn merged_translation(container: &[u8], es: bool) -> Result<Translated, String> {
     use xtp_shader::HwStage;
     let target = crate::device::host_target();
+    let hash = blake3::hash(container).to_hex()[..16].to_owned();
+    let options = super::self_sized_options(&hash);
     let (host, stage) = if es {
-        let host = crate::shader_cache::host_es_shader(container, target)?;
+        let host = crate::shader_cache::host_es_shader_with(container, target, options)?;
         (host, HwStage::Es)
     } else {
-        let host = crate::shader_cache::host_shader(container, target)?;
+        let host = crate::shader_cache::host_shader_with(container, target, options)?;
         (host, HwStage::Gs)
     };
     if host.stage != stage {

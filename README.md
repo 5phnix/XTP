@@ -44,6 +44,18 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+Windows 11 includes shader model 6.6+ in the OS runtime. On Windows 10 (or
+any OS build whose inbox D3D12 runtime is below shader model 6.6), XTP
+loads the D3D12 Agility SDK dynamically through
+`ID3D12SDKConfiguration1::CreateDeviceFactory` when `D3D12\D3D12Core.dll`
+sits beside `xtp.exe`, and falls back to the Windows inbox D3D12 runtime
+otherwise:
+
+- Package: `Microsoft.Direct3D.D3D12` **exactly 1.614.0**, `x64` (`D3D12SDKVersion = 614`; another version fails to load with `0x887E0003` and falls back to inbox D3D12).
+- Placement: copy `build\native\bin\x64\D3D12Core.dll` into `target\<profile>\D3D12\` beside each `xtp.exe` you run (for example `target\release\D3D12\D3D12Core.dll` or `target\diag\D3D12\D3D12Core.dll`).
+- Debug layer: when `D3D12\D3D12Core.dll` is used, `XTP_D3D12_DEBUG=1` requires the matching `build\native\bin\x64\d3d12SDKLayers.dll` from the same `1.614.0` package beside it in `target\<profile>\D3D12\`.
+- Never commit redistributable DLLs to the repository.
+
 Pixel shaders with wave operations take shader model 6.7
 (`WaveOpsIncludeHelperLanes`, so that helper lanes take part in them as they
 do on the console). A GPU without 6.7 refuses those pixel shaders, and their
@@ -199,7 +211,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `XTP_CAPTURE=<dir>` | saves presented frames (powers of two, or `XTP_CAPTURE_FRAMES=<list>`) |
 | `XTP_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `XTP_D3D12_DEBUG=1` | host debug layer |
+| `XTP_D3D12_DEBUG=1` | host debug layer (with `D3D12\D3D12Core.dll` present, needs matching `d3d12SDKLayers.dll` from `Microsoft.Direct3D.D3D12` 1.614.0 in `D3D12\`) |
 | `XTP_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `XTP_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `XTP_D3D12_DRED=contexts` | as the above, with DRED's breadcrumb contexts (marker texts kept by the runtime; slower, and empty on NVIDIA so far: docs/analysis/device-removed.md) |
@@ -214,6 +226,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_SHADER_LOOP_COUNT=1` | (every build) a lane a loop limit or the budget stops adds itself to its pipeline's counter (a root UAV, `u0` in space 2; own shader cache entries); with the frame line, a line gives the lanes stopped per frame and the pipelines that stopped the most, by their shaders' hashes, and `xtp_gpu::loopstat=debug` a line per frame with stopped lanes. Off, translations are byte for byte those without it |
 | `XTP_DXIL_OPT=1` | (every build) clean-up passes over each translated shader before the driver gets it: dead code, constants and identities, one instruction for one value, what a branch taken says about its condition, one read for one place within a block; or only those named (`dead,fold,reuse,facts,loads`); a shader whose declared features they would change is kept as translated; off by default (own shader cache entries) |
 | `XTP_DXIL_CENSUS=<file>` | (every build) appends one line per translated shader module to the file: its instructions by kind as translated and as written, and whether the clean-up passes were kept |
+| `XTP_SELF_SIZED_LOADS=<mode>` | (every build) routes self-sized scalar buffer loads through a separate raw view (`0`/`off` disables, `1`/`all` enables for all shaders, `rdna4` enables only on AMD RDNA 4, or comma-separated 16-hex-digit shader hashes; unset enables automatically on AMD RDNA 4 GPUs) |
 | `XTP_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `XTP_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 | `XTP_APU_DUMP=<dir>` | saves the first 32 Opus streams' packets (up to 256 packets per stream) as `.opuscap` files outside the repository for reference comparison via `XTP_SAMPLE_OPUS` |

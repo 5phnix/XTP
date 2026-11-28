@@ -495,33 +495,112 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     Some(written)
 }
 
+/// What [`alike`] found for the blocks `[first, last)` starting at `first`.
+enum Alike {
+    /// `span` contiguous blocks (`>= 1`) starting at `first` lie in one
+    /// committed `PAGE_READONLY | PAGE_READWRITE` region.
+    Plain(usize),
+    /// Block `first` starts committed, so it either has another protection
+    /// (such as `PAGE_GUARD`) or is split across protections/states.
+    Mixed,
+    /// Block `first` does not start in committed memory.
+    Uncommitted,
+}
+
+/// How many of `[first, last)`, starting from `first`, lie in one committed
+/// region of `PAGE_READONLY` or `PAGE_READWRITE`. A `VirtualProtect` call
+/// resets the protection of every page it covers, so a block containing a
+/// page the title set `PAGE_GUARD` on must be left alone.
+// Ported from PastiiJay/klbf-lab commit 409d69cc (GPL-3.0-or-later).
+fn alike(first: usize, last: usize) -> Alike {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ViewQueries, 1);
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((first * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT {
+        return Alike::Uncommitted;
+    }
+    if !matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE) {
+        return Alike::Mixed;
+    }
+    let end = (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK;
+    let span = end.min(last).saturating_sub(first);
+    if span == 0 {
+        Alike::Mixed
+    } else {
+        Alike::Plain(span)
+    }
+}
+
+/// Makes contiguous `range` (already verified [`Alike::Plain`]) read-only,
+/// falling back block by block if a whole-range call still fails.
+fn protect_span(
+    g: &mut Guards,
+    range: Range<usize>,
+    mut on_protected: impl FnMut(&mut Guards, Range<usize>),
+    mut on_failed: impl FnMut(&mut Guards, usize),
+) {
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
+    WRITE_FAULTS.set(range.clone(), true);
+    if set_protection(range.clone(), PAGE_READONLY) {
+        on_protected(g, range);
+        return;
+    }
+    let many = range.len() > 1;
+    for block in range {
+        if many
+            && matches!(alike(block, block + 1), Alike::Plain(_))
+            && set_protection(block..block + 1, PAGE_READONLY)
+        {
+            on_protected(g, block..block + 1);
+        } else {
+            WRITE_FAULTS.set(block..block + 1, false);
+            on_failed(g, block);
+        }
+    }
+}
+
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
-/// block by block if they span views, leaving out any that fail, noting
-/// placeholders absent and the others unguardable. The other views of the
+/// spanning each uniform committed region and leaving out non-plain blocks
+/// (such as a block with a title `PAGE_GUARD` page), noting placeholders
+/// absent and other uncommitted blocks unguardable. The other views of the
 /// pages guarded are made read-only too, and linked to them.
 fn protect(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::PAGE_READONLY;
     // Counted before they are read-only (see `GUARDED`); none of them is
     // guarded yet.
     GUARDED.store(g.protected.len() + g.opening.len() + (to - from), SeqCst);
-    let note = |g: &mut Guards, from: usize, to: usize| {
-        g.protected.extend(from..to);
-        g.clean.extend(from..to);
+    let note = |g: &mut Guards, range: Range<usize>| {
+        g.protected.extend(range.clone());
+        g.clean.extend(range);
     };
-    WRITE_FAULTS.set(from..to, true);
-    if set_protection(from..to, PAGE_READONLY) {
-        note(g, from, to);
-    } else {
-        for block in from..to {
-            if set_protection(block..block + 1, PAGE_READONLY) {
-                note(g, block, block + 1);
-            } else {
-                WRITE_FAULTS.set(block..block + 1, false);
-                if placeholder(block * BLOCK) {
-                    g.absent.insert(block);
-                } else {
-                    g.unguardable.insert(block);
-                }
+    let unmapped = |g: &mut Guards, block: usize| {
+        if placeholder(block * BLOCK) {
+            g.absent.insert(block);
+        } else {
+            g.unguardable.insert(block);
+        }
+    };
+    let mut at = from;
+    while at < to {
+        match alike(at, to) {
+            Alike::Plain(span) => {
+                protect_span(g, at..at + span, note, unmapped);
+                at += span;
+            }
+            Alike::Mixed => {
+                // Leave committed non-plain blocks (e.g. a one-shot title
+                // `PAGE_GUARD`) untouched and uncached so their writes keep
+                // being reported until they clear.
+                at += 1;
+            }
+            Alike::Uncommitted => {
+                unmapped(g, at);
+                at += 1;
             }
         }
     }
@@ -533,11 +612,11 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// made read-only too, so that a write through them faults here; not clean,
 /// though: no copy of theirs took them. Each pair is linked both ways
 /// (`Guards::aliased`). Where a view of a page cannot be made read-only
-/// (gone since the runtime's index was asked), the page's other views are
-/// opened again, the block guarded included: reported at the next asking,
-/// which tries again, rather than clean and missing writes through it.
+/// (gone since the runtime's index was asked, or carrying a title guard
+/// page), the page's other views are opened again, the block guarded
+/// included: reported at the next asking, which tries again, rather than
+/// clean and missing writes through it.
 fn protect_other_views(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::PAGE_READONLY;
     let mut pairs = Vec::new();
     aliases(from..to, &mut pairs);
     // Those left open are reported at every asking anyway.
@@ -576,16 +655,22 @@ fn protect_other_views(g: &mut Guards, from: usize, to: usize) {
     // Counted before they are read-only (see `GUARDED`).
     GUARDED.store(g.protected.len() + g.opening.len() + others.len(), SeqCst);
     for run in others.chunk_by(|a, b| a + 1 == *b) {
-        // The GPU's page mappings make one view per page: then block by
-        // block.
-        WRITE_FAULTS.set(run[0]..run[run.len() - 1] + 1, true);
-        let whole = set_protection(run[0]..run[run.len() - 1] + 1, PAGE_READONLY);
-        for &block in run {
-            if whole || (run.len() > 1 && set_protection(block..block + 1, PAGE_READONLY)) {
-                g.protected.insert(block);
-            } else {
-                WRITE_FAULTS.set(block..block + 1, false);
-                failed.push(block);
+        let (mut at, end) = (run[0], run[run.len() - 1] + 1);
+        while at < end {
+            match alike(at, end) {
+                Alike::Plain(span) => {
+                    protect_span(
+                        g,
+                        at..at + span,
+                        |g, range| g.protected.extend(range),
+                        |_, block| failed.push(block),
+                    );
+                    at += span;
+                }
+                Alike::Mixed | Alike::Uncommitted => {
+                    failed.push(at);
+                    at += 1;
+                }
             }
         }
     }
@@ -2870,7 +2955,11 @@ pub(crate) mod tests {
         ];
         let before = protected();
         assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(0..3)));
-        assert_eq!(protected() - before, 4, "the run, then each block");
+        assert_eq!(
+            protected() - before,
+            2,
+            "each mapped block, skipping unmapped"
+        );
         assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
         assert!(!writable(p) && !writable(p + 2 * BLOCK));
         {
@@ -3418,5 +3507,124 @@ pub(crate) mod tests {
             );
             unmapped(view, blocks);
         }
+    }
+
+    const KERNEL_PAGE: usize = 4096;
+
+    /// The protection of the page at `at`, `PAGE_GUARD` included.
+    fn protection(at: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        assert_ne!(n, 0);
+        info.Protect
+    }
+
+    /// Sets `PAGE_GUARD` on the page at `at`, as the title does.
+    fn title_sets_guard(at: usize) {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, VirtualProtect};
+        let mut old = 0;
+        // SAFETY: a page of one of our views.
+        let set = unsafe {
+            VirtualProtect(
+                at as *const _,
+                KERNEL_PAGE,
+                PAGE_READWRITE | PAGE_GUARD,
+                &mut old,
+            )
+        };
+        assert_ne!(set, 0);
+    }
+
+    /// A page the title guards itself (`PAGE_GUARD`) inside a range that is
+    /// taken keeps its guard: its block is left as it is, and the blocks
+    /// around it are made read-only.
+    #[test]
+    fn a_page_the_title_guards_inside_a_range_keeps_its_guard() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY};
+        let _serial = serial();
+        const BLOCKS: usize = 4;
+        const SIZE: usize = BLOCKS * BLOCK;
+        let section = section(BLOCKS);
+        let one = view_of(section, BLOCKS);
+        let guarded = one + BLOCK + KERNEL_PAGE;
+        title_sets_guard(guarded);
+        assert_eq!(guard(one, one + SIZE).map(|written| written.len()), Some(4));
+        assert_eq!(
+            protection(guarded),
+            PAGE_READWRITE | PAGE_GUARD,
+            "the title's guard is gone"
+        );
+        assert_eq!(
+            protection(one + BLOCK),
+            PAGE_READWRITE,
+            "its block is left as it was"
+        );
+        for block in [0, 2, 3] {
+            assert_eq!(
+                protection(one + block * BLOCK),
+                PAGE_READONLY,
+                "block {block}"
+            );
+        }
+        // Not made read-only, so it is reported as written at every asking.
+        assert!(guard(one, one + SIZE).is_some_and(|written| written.contains(&(one / PAGE + 1))));
+        writing(one, SIZE);
+        assert_eq!(
+            protection(guarded),
+            PAGE_READWRITE | PAGE_GUARD,
+            "nor when opened"
+        );
+        unmapped(one, BLOCKS);
+        // SAFETY: our section handle.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
+    }
+
+    /// A page the title guards itself inside a block of another view of
+    /// guarded pages keeps its guard: that block is not one plain region (the
+    /// guard ends it), so it is left as it is; the blocks around it are made
+    /// read-only and the guarded view's block stays open.
+    #[test]
+    fn a_page_the_title_guards_in_another_view_keeps_its_guard() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY};
+        let _serial = serial();
+        const BLOCKS: usize = 4;
+        const SIZE: usize = BLOCKS * BLOCK;
+        let section = section(BLOCKS);
+        let (guarded, other) = (view_of(section, BLOCKS), view_of(section, BLOCKS));
+        same_pages(&[guarded, other], BLOCKS);
+        let page = other + BLOCK + KERNEL_PAGE;
+        title_sets_guard(page);
+        assert!(guard(guarded, guarded + SIZE).is_some());
+        assert_eq!(
+            protection(page),
+            PAGE_READWRITE | PAGE_GUARD,
+            "the title's guard is gone"
+        );
+        assert_eq!(
+            protection(other + BLOCK),
+            PAGE_READWRITE,
+            "its block is left as it was"
+        );
+        for block in [0, 2, 3] {
+            assert_eq!(
+                protection(other + block * BLOCK),
+                PAGE_READONLY,
+                "block {block}"
+            );
+        }
+        // A write through the other view would not fault while it holds a
+        // guard, so the guarded block stays open and is reported at every asking.
+        let again = guard(guarded, guarded + SIZE).unwrap();
+        assert!(
+            again.contains(&(guarded / PAGE + 1)),
+            "reported as written at every asking"
+        );
+        unmapped(guarded, BLOCKS);
+        unmapped(other, BLOCKS);
+        // SAFETY: our section handle.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
     }
 }

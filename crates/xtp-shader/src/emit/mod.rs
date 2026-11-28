@@ -448,6 +448,56 @@ pub const SCALAR_ADDRESS_SRV: RootType = RootType::Other(0x106);
 pub const VECTOR_ADDRESS_SRV: RootType = RootType::Other(0x107);
 /// Slot d'une SRV brute alignée, suivi en bits 0..3 du décalage de la base du titre.
 pub const INDEXED_ADDRESS_SRV: RootType = RootType::Other(0x108);
+/// Dynamic raw SRV heap slot `(slot << 4) | bias` for a self-sized table SRV
+/// (`Options::self_sized_loads_via_memory`), breaking self-sized
+/// `getDimensions` -> `rawBufferLoad` cycles on the same descriptor handle.
+pub const SELF_SIZED_RAW_SRV: RootType = RootType::Other(0x109);
+/// Byte length of the view bound for [`SELF_SIZED_RAW_SRV`], avoiding
+/// `getDimensions(h)` element-count vs byte-offset mismatches on structured SRVs.
+pub const SELF_SIZED_VIEW_BYTES: RootType = RootType::Other(0x10a);
+
+/// Choices a translation can be made with, per shader: the host asks for
+/// another form where the default one fails on its driver. The default
+/// (`Options::default()`) is what [`translate_for`] makes.
+// Ported and adapted from PastiiJay/klbf-lab commit f73233c8 (author aidzz / @BrokeAsh, GPL-3.0-or-later).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Options {
+    /// A scalar load from a buffer at an offset computed from that same
+    /// buffer's record count (the console's "last record" idiom,
+    /// `buf[(size / stride - 1) * stride]`) reads through a separate raw
+    /// view supplied via [`SELF_SIZED_RAW_SRV`] instead of reusing the
+    /// handle whose dimensions computed the offset; past the view's end it
+    /// reads 0, as the console's load does. The RX 9070 XT's compiler
+    /// (`amdxc64.dll` 32.0.32029.2010) crashes the process on some programs
+    /// with the load through the same handle (null read at
+    /// `amdxc64.dll+0x861b9f`), and compiles them when the load goes through
+    /// a separate raw handle.
+    pub self_sized_loads_via_memory: bool,
+}
+
+thread_local! {
+    static OPTIONS: std::cell::Cell<Options> = const {
+        std::cell::Cell::new(Options { self_sized_loads_via_memory: false })
+    };
+}
+
+/// The options of the translation running on this thread.
+pub(crate) fn options() -> Options {
+    OPTIONS.with(std::cell::Cell::get)
+}
+
+/// Runs `f` with `options` active on this thread, restoring the previous
+/// options even if `f` panics.
+pub(crate) fn with_options<T>(options: Options, f: impl FnOnce() -> T) -> T {
+    struct Restore(Options);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OPTIONS.with(|o| o.set(self.0));
+        }
+    }
+    let _restore = Restore(OPTIONS.with(|o| o.replace(options)));
+    f()
+}
 
 /// Entries before slot 0's in the host's runtime stride table
 /// ([`StrideEntry`]): slot `i`'s entry is at `(i + STRIDE_HEADER) * 8`. The
@@ -614,43 +664,70 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_for(container, Target::ANY)
 }
 
+/// [`translate`] with `options`.
+pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_for_with(container, Target::ANY, options)
+}
+
 /// [`translate`] for a host that runs the wave sizes of `target`.
 pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
-    let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
-            )
-        })
-        .ok_or(ShaderError::Unsupported {
-            offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
-    translate_program_for(&c, &native, target).map_err(|(_, e)| e)
+    translate_for_with(container, target, Options::default())
+}
+
+/// [`translate_for`] with per-shader `options`.
+pub fn translate_for_with(
+    container: &[u8],
+    target: Target,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    with_options(options, || {
+        let c = Container::parse(container)?;
+        let dxil = c
+            .part(FourCC::DXIL)
+            .ok_or(ShaderError::Malformed("no DXIL part"))?;
+        let native = crate::native_programs(dxil.data)?
+            .into_iter()
+            .find(|p| {
+                matches!(
+                    p.stage,
+                    HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
+                )
+            })
+            .ok_or(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container without a vertex, pixel, compute or mesh program",
+            })?;
+        translate_program_for(&c, &native, target).map_err(|(_, e)| e)
+    })
 }
 
 /// [`translate_for`] of the export shader (ES) of a vertex shader container
 /// instead of its vertex shader: the vertex shader of a pipeline that has a
 /// geometry shader (`docs/analysis/es-gs.md`).
 pub fn translate_es_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
-    let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| p.stage == HwStage::Es)
-        .ok_or(ShaderError::Unsupported {
-            offset: 0,
-            what: "a container without an export shader",
-        })?;
-    translate_program_for(&c, &native, target).map_err(|(_, e)| e)
+    translate_es_for_with(container, target, Options::default())
+}
+
+/// [`translate_es_for`] with per-shader `options`.
+pub fn translate_es_for_with(
+    container: &[u8],
+    target: Target,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    with_options(options, || {
+        let c = Container::parse(container)?;
+        let dxil = c
+            .part(FourCC::DXIL)
+            .ok_or(ShaderError::Malformed("no DXIL part"))?;
+        let native = crate::native_programs(dxil.data)?
+            .into_iter()
+            .find(|p| p.stage == HwStage::Es)
+            .ok_or(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container without an export shader",
+            })?;
+        translate_program_for(&c, &native, target).map_err(|(_, e)| e)
+    })
 }
 
 /// The step of [`translate_program`] that stopped a program, in the order
@@ -712,6 +789,16 @@ pub fn translate_program_for(
     let io = io::raise(&p, native).map_err(|e| (Step::Io, e))?;
     let st = st.map_err(|e| (Step::Structure, e))?;
     emit_for(c, native, &p, &st, &io, &res, target).map_err(|e| (Step::Emit, e))
+}
+
+/// [`translate_program_for`] with per-shader `options`.
+pub fn translate_program_for_with(
+    c: &Container,
+    native: &NativeProgram,
+    target: Target,
+    options: Options,
+) -> Result<HostShader, (Step, ShaderError)> {
+    with_options(options, || translate_program_for(c, native, target))
 }
 
 /// Emits a program whose earlier stages already ran, for any host
