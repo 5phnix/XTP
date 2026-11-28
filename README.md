@@ -194,6 +194,11 @@ passes `XTP_CONSOLE` on as `--console`.
 Logging: `XTP_LOG=xtp_loader=trace,info` (a release build logs
 info and above).
 
+Set `XTP_DSTORAGE_WORKERS` to a worker count from 1 to 64 to override the
+DirectStorage pool size. By default XTP uses the physical core count, up
+to 32 workers. If that count is unavailable, it uses half the logical
+processor count, with a minimum of two and a maximum of 32.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
