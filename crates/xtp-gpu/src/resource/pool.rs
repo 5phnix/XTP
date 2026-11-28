@@ -67,7 +67,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter3, IDXGIFactory4,
+    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIAdapter3, IDXGIFactory4,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
@@ -279,6 +279,47 @@ pub(crate) fn may_be_small(d: &D3D12_RESOURCE_DESC) -> bool {
     w.div_ceil(tw) * h.div_ceil(th) <= 16
 }
 
+/// Whether 4 KiB small-texture placement is active on `device`. Enabled by
+/// default except on AMD adapters (vendor `0x1002`), where 4 KiB placed
+/// textures caused device losses; `XTP_TEXTURE_SMALL=1` or `0`/`off`/`false`
+/// overrides on any adapter.
+// Ported from TaynanGT/Vice-Tay commit 7d62e536 (GPL-3.0-or-later).
+fn small_placement(device: &ID3D12Device) -> bool {
+    let env = std::env::var("XTP_TEXTURE_SMALL").ok();
+    let on = asks_small(env.as_deref(), is_amd(device));
+    if !on && env.is_none() {
+        tracing::info!(
+            "texture pool: 4 KiB small-texture placement disabled on AMD adapter \
+             (set XTP_TEXTURE_SMALL=1 to force)"
+        );
+    }
+    on
+}
+
+fn asks_small(value: Option<&str>, amd: bool) -> bool {
+    match value.map(str::trim) {
+        None => !amd,
+        Some(v) => {
+            !(v.is_empty()
+                || v == "0"
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("false"))
+        }
+    }
+}
+
+fn is_amd(device: &ID3D12Device) -> bool {
+    const AMD_VENDOR: u32 = 0x1002;
+    // SAFETY: queries DXGI adapter vendor ID matching `device`'s LUID.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == AMD_VENDOR)
+    }
+}
+
 /// The pool: heaps by class, and the thread that keeps their reserve.
 pub(crate) struct Pool {
     inner: Arc<Inner>,
@@ -299,6 +340,8 @@ struct Inner {
     changes: Option<BudgetEvent>,
     /// Heaps refuse `CREATE_NOT_ZEROED` (an older runtime): made without.
     zeroed: AtomicBool,
+    /// Whether eligible textures take 4 KiB (`Class::Small`) placement.
+    small: bool,
     /// The device's tiled resources tier (`D3D12_OPTIONS`).
     tier: i32,
     /// Whether each host format may be reserved (`FORMAT_SUPPORT2_TILED`),
@@ -864,6 +907,15 @@ impl Drop for BudgetEvent {
 impl Pool {
     /// A pool on `device`; its thread starts filling the reserve.
     pub(crate) fn new(device: ID3D12Device, config: Config, budget: Budget) -> Pool {
+        let small = cfg!(test) || small_placement(&device);
+        Pool::with_small(device, config, budget, small)
+    }
+
+    fn with_small(device: ID3D12Device, mut config: Config, budget: Budget, small: bool) -> Pool {
+        if !small {
+            config.heap[Class::Small.index()] = 0;
+            config.reserve[Class::Small.index()] = 0;
+        }
         let changes = BudgetEvent::register(&device);
         let tier = tiled_tier(&device);
         if config.tiles && tier < D3D12_TILED_RESOURCES_TIER_2.0 {
@@ -889,6 +941,7 @@ impl Pool {
             wake: Condvar::new(),
             changes,
             zeroed: AtomicBool::new(false),
+            small,
             tier,
             tileable: Mutex::new(HashMap::new()),
             reserved: AtomicU64::new(0),
@@ -1115,7 +1168,7 @@ impl Inner {
         };
         let mut desc = *d;
         let small = Class::Small.alignment();
-        if may_be_small(d) {
+        if self.small && may_be_small(d) {
             desc.Alignment = small;
             if let Some(info) = size(&desc)
                 && info.Alignment == small
@@ -1145,7 +1198,8 @@ impl Inner {
 
     /// Whether `class` has less than its reserve free.
     fn short(&self, s: &State, class: Class) -> bool {
-        Self::free(s, class) < self.config.reserve[class.index()]
+        (self.small || class != Class::Small)
+            && Self::free(s, class) < self.config.reserve[class.index()]
     }
 
     /// `len` bytes of a heap of `class`: the tightest fit in a resident
@@ -2398,5 +2452,50 @@ pub(crate) mod tests {
             pool.place(&big, D3D12_RESOURCE_STATE_COPY_DEST).err(),
             Some("too large for the pool")
         );
+    }
+
+    #[test]
+    fn small_placement_follows_vendor_default_and_override() {
+        assert!(!asks_small(None, true), "off by default on AMD");
+        assert!(asks_small(None, false), "on by default on non-AMD");
+        for on in ["1", "true", "on"] {
+            assert!(asks_small(Some(on), true), "{on} forces on for AMD");
+            assert!(asks_small(Some(on), false), "{on}");
+        }
+        for off in ["0", "off", "FALSE", " 0 ", ""] {
+            assert!(!asks_small(Some(off), false), "{off} disables small");
+            assert!(!asks_small(Some(off), true), "{off}");
+        }
+    }
+
+    #[test]
+    fn disabling_small_placement_routes_small_textures_to_64_kib_class() {
+        let test = "resource::pool::tests::disabling_small_placement_routes_small_textures_to_64_kib_class";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let pool = Pool::with_small(
+            gpu.device.clone(),
+            Config::sized(MIB, MIB),
+            unlimited(),
+            false,
+        );
+        assert!(pool.settle(Duration::from_secs(5)));
+        assert!(pool.resident(Duration::from_secs(5)));
+        let settled = pool.holding();
+        assert_eq!(settled.heaps, 1, "only Class::Normal heap reserved");
+        assert_eq!(settled.bytes, MIB, "no Class::Small heap reserved");
+        assert!(
+            pool.inner.lock().classes[Class::Small.index()].is_empty(),
+            "no Class::Small heap created when disabled"
+        );
+        let small = texture(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
+        let placed = pool
+            .place(&small, D3D12_RESOURCE_STATE_COPY_DEST)
+            .expect("placed");
+        let (class, offset, len) = placed.slot.place();
+        assert_eq!(class, Class::Normal);
+        assert_eq!(offset % KIB_64, 0);
+        assert_eq!(len % KIB_64, 0);
     }
 }
