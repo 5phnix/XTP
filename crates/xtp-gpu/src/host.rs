@@ -497,6 +497,7 @@ fn create(software: bool) -> windows::core::Result<Host> {
         } else {
             let adapter = crate::dxgi::host_adapter();
             crate::agility::create_device(adapter.as_ref(), &mut device)?;
+            crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();

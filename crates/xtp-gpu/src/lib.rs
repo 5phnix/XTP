@@ -90,6 +90,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(windows)]
+mod tdr;
 #[cfg(all(windows, test))]
 mod testgpu;
 #[cfg(windows)]
